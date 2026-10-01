@@ -23,9 +23,11 @@
 //! Abandoning one is safe: an unfinished transaction rolls back, and the
 //! next backup removes the temporary file of an unfinished one.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -410,13 +412,18 @@ fn run(ws: &Workspace, job: Job, open: &OpenOptions, backups: Option<&Backups>) 
     }
 }
 
+/// Output a background command may print: its `--json` list of reclaimed
+/// leases or checked gates stays far below this.
+const OUTPUT_LIMIT: usize = 4 << 20;
+
 /// The I/O of a background command: a request's capture without client
-/// input or a token. Its policy is a token's with no rights (no admin, not a
-/// person, owning no claims): reclaiming expired leases and checking gates
-/// need none, and human gates stay shut. Being in the server process, gate
-/// checks use the server's `gate.repos` default.
-fn capture() -> Capture {
-    Capture::default()
+/// input or a token, keeping stdout (up to [`OUTPUT_LIMIT`]) to read. Its
+/// policy is a token's with no rights (no admin, not a person, owning no
+/// claims): reclaiming expired leases and checking gates need none, and human
+/// gates stay shut. Being in the server process, gate checks use the server's
+/// `gate.repos` default.
+fn capture() -> (Rc<RefCell<io::Buffer>>, Capture) {
+    Capture::buffered(OUTPUT_LIMIT)
 }
 
 /// A bd command line run in a workspace as [`ACTOR`], parsed and dispatched
@@ -441,9 +448,11 @@ impl Background {
 
     /// Run it and return its `--json` output.
     fn run(mut self) -> Result<Value> {
-        let (code, out) = io::capture(capture(), || crate::dispatch(&mut self.app, &self.command));
+        let (out, capture) = capture();
+        let (code, _) = io::capture(capture, || crate::dispatch(&mut self.app, &self.command));
         code?;
-        Ok(serde_json::from_slice(&out.stdout)?)
+        let out = out.borrow();
+        Ok(serde_json::from_slice(out.output()?)?)
     }
 }
 

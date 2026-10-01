@@ -71,9 +71,10 @@ pub fn export(conn: &Connection, now: Timestamp, out: &mut dyn Write, opts: &Exp
     });
     writeln!(out, "{header}")?;
     let q = ListQuery { all: opts.include_closed, sort: crate::model::ListSort::Id, ..Default::default() };
-    for issue in issues::list(conn, &q)? {
+    // One issue at a time: an export of any size holds one issue in memory.
+    issues::for_each(conn, &q, |issue| {
         if issue.ephemeral && !opts.include_ephemeral {
-            continue;
+            return Ok(());
         }
         let mut v = serde_json::to_value(&issue)?;
         let obj = v.as_object_mut().expect("issue serializes to an object");
@@ -108,7 +109,8 @@ pub fn export(conn: &Connection, now: Timestamp, out: &mut dyn Write, opts: &Exp
         obj.insert("dependencies".into(), Value::Array(deps));
         obj.insert("comments".into(), Value::Array(comments));
         writeln!(out, "{v}")?;
-    }
+        Ok(())
+    })?;
     if opts.include_memories {
         for m in memory::list(conn, None)? {
             let mut v = serde_json::to_value(&m)?;

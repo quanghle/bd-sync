@@ -438,7 +438,7 @@ fn cmd_extract(app: &mut App, a: &ExtractArgs) -> Result<()> {
         Some(path) => {
             if io::serving() {
                 // The client checked --force against its own file before sending.
-                io::send_file(&path, text.into_bytes())?;
+                io::send_file(&path, |w| Ok(w.write_all(text.as_bytes())?))?;
             } else {
                 if path.exists() && !a.force {
                     return Err(Error::Refused(format!("{} exists; pass --force to overwrite", path.display())));

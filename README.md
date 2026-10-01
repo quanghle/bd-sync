@@ -468,7 +468,15 @@ on an encrypted private network. `GET /healthz` answers `ok` for load
 balancers. A request may carry up to `--max-body-mib` (default 64). Requests
 in progress share a 256 MiB memory budget (more if one maximum-size request
 needs it), and the server answers 503 when it is used up, which clients
-retry. The server logs one
+retry. Answers stream: past 64 KiB, a command's output goes to the client
+as the command writes it, through less than 1 MiB of buffers per request, so
+a large `bd export` costs the server no more memory than a claim. At most 8
+reads stream their answers at once (another is answered 503, which clients
+retry), so slow readers cannot take the slots of short commands like claims.
+A client that takes nothing for 60 s, or takes a streamed answer slower than
+64 KiB/s on average after its first 30 s, loses the rest of it, and its
+command ends. A write's answer is held until the write is done (see below).
+The server logs one
 line per request on stderr; set `BD_LOG` to change that. Ctrl-C or SIGTERM
 lets running commands finish first (up to 30 seconds). The server keeps
 connections to each database open, so restart it after replacing or moving a
@@ -646,18 +654,27 @@ or a playbook gets the same answer as a single command:
 `bd` on the server's host, which opens `bd.db` directly, is not limited by
 tokens (`gate.repos`, once set, applies there too).
 
-Every invocation carries a random request id. The client retries
-connection failures, timeouts and busy answers with the same id. The server
-records the id in the same transaction as the write and replays the stored
-answer to a retry, so a write whose response was lost in transit is applied
-once. Exit codes are the same as locally, plus 7 (access denied) and 8
-(server unreachable).
+Every invocation carries a random request id. The client retries connection
+failures, timeouts, busy answers and a proxy's gateway errors (such as
+Cloudflare's 524 for a command running over 100 s) with the same id; once a
+write may have run, it gets the whole retry time again to ask for its stored
+answer. The server records the id in the same transaction as the write, and
+stores the write's answer (up to 1 MiB of output) before sending it, to
+replay it to a retry, so a write whose answer was lost in transit is applied
+once. A write's answer is printed once it has arrived whole; a read prints a
+long output as it arrives, so a read whose connection breaks after that
+fails (exit 8, output incomplete) instead of being retried. Exit codes are
+the same as locally, plus 7 (access denied), 8 (server unreachable: the
+command did not take effect) and 9 (a write that may have reached the server
+lost its answer: more than 1 MiB of output, or no answer before the retries
+gave up; it may have taken effect, so check before running it again).
 
 What runs where:
 
 - Input and output files stay on the client: `import FILE` and `batch -f FILE`
   send the file, `--stdin` and `-` send stdin, and `export -o` and
-  `playbook extract -o` write the file locally.
+  `playbook extract -o` write the file locally, as `FILE.tmp` renamed into
+  place once the command succeeds (so a failed export leaves `FILE` alone).
 - Playbooks run by name from the server's playbook path: the workspace's
   `.bd/playbooks` (`<root>/<name>/.bd/playbooks`), then the server's
   `$BD_PLAYBOOK_PATH` and user config directory. File paths are refused.
@@ -675,11 +692,17 @@ local `bd` processes on the server's host, all take the same SQLite write
 lock. `bd bench --mode remote` checks this end to end
 ([Benchmarks](#benchmarks)).
 
-The protocol is one endpoint, so other clients can call it directly:
-`POST /w/<name>/v1/exec` with `Authorization: Bearer <token>` and
-`{"argv": ["claim", "--next", "--json"], "request_id": "..."}`. The answer is
-`{"exit_code", "stdout", "stderr", "replayed"}`. Failures before the command
-runs return a non-200 status with the `--json` error shape.
+The protocol (version 2) is one endpoint, so other clients can call it
+directly: `POST /w/<name>/v2/exec` with `Authorization: Bearer <token>` and
+`{"argv": ["claim", "--next", "--json"], "request_id": "..."}`. The answer
+(`application/x-ndjson`) has one JSON frame per line, in the order the command
+wrote them: `{"stdout": "..."}` for output, `{"file": {"path", "data"}}` for
+part of an output file, and last `{"exit": {"exit_code", "stderr", "replayed"}}`.
+Blank lines are keep-alives, and an answer without the exit frame was cut
+off. Failures before the command runs return a non-200 status with the
+`--json` error shape. Every answer carries a `bd-protocol: 2` header, and a
+client and server of different protocol versions refuse each other with an
+explanation.
 
 ## Observability
 
@@ -766,7 +789,8 @@ The actor comes from `--actor`, then `$BD_ACTOR`, `$BEADS_ACTOR`, `git config us
 | 5 | database busy |
 | 6 | event cursor truncated |
 | 7 | access denied: missing or invalid token, or its role, kind, workspaces or actor do not allow it |
-| 8 | bd server unreachable, its certificate not trusted, or a server failure (retrying is safe) |
+| 8 | bd server unreachable, its certificate not trusted, or a server failure: the command did not take effect (retrying is safe) |
+| 9 | a write reached the bd server, but its answer was lost: it may have taken effect, so check before running it again |
 | 13 | stale optimistic-concurrency guard |
 
 With `--json`, errors are printed to stderr as `{"error":{"code","message","exit_code"}}`.
@@ -804,6 +828,7 @@ crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) �
                       io (stdio and files, or a captured request) · serve (bd serve) · jobs (its background
                       jobs: reclaim, gate checks, backups) · auth (access tokens)
                       · remote (client) · credentials (bd remote login) · protocol (wire format)
+                      · stream (streamed answers)
 crates/bd-cli/tests/  end-to-end CLI tests; remote.rs runs real bd serve and client processes
 ```
 

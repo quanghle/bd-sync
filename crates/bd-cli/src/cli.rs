@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     name = "bd",
     version,
     about = "bd: a coordination engine for agents and humans: tasks, typed dependencies, deterministic ready work, leased claims, and an event log on SQLite WAL",
-    after_help = "Agent loop:  bd ready  ->  bd claim --next  ->  bd heartbeat <id>  ->  bd close <id>\nRun `bd prime` for workflow context. Exit codes: 2 invalid, 3 not found, 4 claim conflict, 5 busy, 6 events truncated, 7 access denied, 8 server unreachable, 13 stale guard."
+    after_help = "Agent loop:  bd ready  ->  bd claim --next  ->  bd heartbeat <id>  ->  bd close <id>\nRun `bd prime` for workflow context. Exit codes: 2 invalid, 3 not found, 4 claim conflict, 5 busy, 6 events truncated, 7 access denied, 8 server unreachable, 9 write's answer lost (may have taken effect), 13 stale guard."
 )]
 pub struct Cli {
     #[command(subcommand)]

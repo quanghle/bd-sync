@@ -1,15 +1,42 @@
-//! The wire format between `bd` clients and `bd serve`.
+//! The wire format between `bd` clients and `bd serve` (protocol 2).
 //!
-//! One endpoint, `POST /w/<workspace>/v1/exec`, runs one bd command line in
-//! the workspace and answers with what the command printed and its exit code.
-//! Transport and access failures answer with a non-200 status and an
-//! [`ErrorBody`], shaped like the CLI's `--json` errors.
+//! One endpoint, `POST /w/<workspace>/v2/exec`, runs one bd command line in
+//! the workspace; the request body is an [`ExecRequest`]. A 200 answer
+//! (`Content-Type: application/x-ndjson`) carries the command's output as a
+//! stream of JSON [`Frame`]s, one per line, in the order the command wrote
+//! them, and always ends with an exit frame:
+//!
+//! ```text
+//! {"file":{"path":"snap.jsonl","data":"{\"_type\":\"header\",...}\n"}}
+//! {"stdout":"✓ Exported 3 issues, ...\n"}
+//! {"exit":{"exit_code":0,"stderr":"","replayed":false}}
+//! ```
+//!
+//! Blank lines are keep-alives. A stream that ends without an exit frame was
+//! cut off: the command's outcome is unknown. Small answers arrive whole
+//! (with a `Content-Length`) once the command finishes; larger ones are sent
+//! while it runs, so neither side holds a whole export in memory.
+//!
+//! Failures before the command runs (transport, access) answer with a
+//! non-200 status and an [`ErrorBody`], shaped like the CLI's `--json`
+//! errors. Every answer carries the [`PROTOCOL_HEADER`]. The protocol 1
+//! endpoint (`/v1/exec`, one JSON object per answer) answers 410 Gone, so a
+//! client and a server of different protocols fail with an explanation
+//! instead of misreading each other.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Request body of `POST /w/<workspace>/v1/exec`.
+/// The protocol version in the endpoint path (`/v2/exec`) and the [`PROTOCOL_HEADER`].
+pub const PROTOCOL: u32 = 2;
+/// Response header naming the server's protocol version.
+pub const PROTOCOL_HEADER: &str = "bd-protocol";
+/// Content type of a 200 answer: newline-delimited [`Frame`]s.
+pub const FRAMES_CONTENT_TYPE: &str = "application/x-ndjson";
+
+/// Request body of `POST /w/<workspace>/v2/exec`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExecRequest {
     /// The command line after the program name, exactly as typed.
@@ -33,7 +60,34 @@ pub struct ExecRequest {
     pub location: Option<String>,
 }
 
-/// Response body of a 200 from `exec`: the command ran (it may have failed).
+/// One line of a 200 answer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Frame<'a> {
+    /// The next text the command printed on stdout.
+    Stdout(Cow<'a, str>),
+    /// The next part of an output file named on the command line (`export
+    /// -o`), keyed by the path as given; the client writes it locally.
+    File { path: Cow<'a, str>, data: Cow<'a, str> },
+    /// The command finished: always the last frame.
+    Exit(Exit),
+}
+
+/// How the command ended.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Exit {
+    pub exit_code: i32,
+    /// What the command printed on stderr (errors and warnings; long output is cut).
+    #[serde(default)]
+    pub stderr: String,
+    /// The answer of an earlier attempt with the same request id, replayed.
+    #[serde(default)]
+    pub replayed: bool,
+}
+
+/// A whole answer, gathered from its frames: what `bd serve` stores to
+/// replay a write's answer to retries, and what the client collects for its
+/// own small requests.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecResponse {
     pub exit_code: i32,
@@ -41,7 +95,7 @@ pub struct ExecResponse {
     pub stdout: String,
     #[serde(default)]
     pub stderr: String,
-    /// Output files for the client to write, keyed by the path as given.
+    /// Output files, keyed by the path as given.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, String>,
     /// This is the stored response of an earlier attempt with the same request id.

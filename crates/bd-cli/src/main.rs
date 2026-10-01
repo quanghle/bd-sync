@@ -15,6 +15,7 @@ mod playbooks;
 mod protocol;
 mod remote;
 mod serve;
+mod stream;
 
 use bd_core::{Error, Result};
 use clap::Parser;
@@ -125,7 +126,12 @@ fn hint(e: &Error) -> Option<&'static str> {
             "check the access token (BD_TOKEN, or `bd remote login`), and its role, kind, workspaces and actor (`bd remote show`; `bd serve token list` on the server)"
         }
         Error::Remote(_) => {
-            "`bd remote show` checks the URL, certificate and connection; retrying is safe (a write is applied once)"
+            "`bd remote show` checks the URL, certificate and connection; the command did not take effect, so running \
+             it again is safe"
+        }
+        Error::AnswerLost(_) => {
+            "it may have taken effect: check the current state (`bd show`, `bd events`) before running it again, which \
+             would apply it twice"
         }
         _ => return None,
     })

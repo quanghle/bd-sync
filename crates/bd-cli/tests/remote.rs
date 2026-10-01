@@ -1,9 +1,11 @@
 //! End-to-end tests of `bd serve` and remote clients: real server and client
 //! processes, each test with its own server on an ephemeral port.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -76,6 +78,15 @@ impl Server {
 
     fn launch(root: TempDir, listen: &str, extra: &[&str]) -> Server {
         Server::launch_with(root, listen, extra, |_| {})
+    }
+
+    /// A server logging at debug level to `<root>/server.log`.
+    fn start_logged() -> Server {
+        let root = Server::prepare();
+        let log = std::fs::File::create(root.path().join("server.log")).unwrap();
+        Server::launch_with(root, "127.0.0.1:0", &[], |cmd| {
+            cmd.env("BD_LOG", "bd::serve=debug").stderr(log);
+        })
     }
 
     /// Like `launch`, after `setup` adjusts the server's command (environment, stderr).
@@ -177,17 +188,60 @@ impl Client {
     }
 }
 
-/// One raw exec request.
+/// One raw exec request: the error body, or the answer's frames gathered into
+/// `{"exit_code", "stdout", "stderr", "replayed", "files"}`. Like the client,
+/// it waits out 409 "pending": an earlier attempt of the request still running.
 fn post(url: &str, token: &str, body: &Value) -> (u16, Value) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, answer) = post_once(url, token, body);
+        if status != 409 || answer["error"]["code"] != "pending" || Instant::now() > deadline {
+            return (status, answer);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn post_once(url: &str, token: &str, body: &Value) -> (u16, Value) {
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
     let mut r = agent
-        .post(format!("{url}/v1/exec"))
+        .post(format!("{url}/v2/exec"))
         .header("authorization", format!("Bearer {token}"))
         .content_type("application/json")
         .send(body.to_string().as_bytes())
         .unwrap();
     let status = r.status().as_u16();
-    (status, serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap())
+    let text = r.body_mut().with_config().limit(u64::MAX).read_to_string().unwrap();
+    if status != 200 {
+        return (status, serde_json::from_str(&text).unwrap());
+    }
+    assert_eq!(r.headers().get("content-type").unwrap(), "application/x-ndjson");
+    (status, gather(&text))
+}
+
+/// The frames of an answer, gathered into one object.
+fn gather(frames: &str) -> Value {
+    let (mut stdout, mut files, mut exit) = (String::new(), serde_json::Map::new(), None);
+    for line in frames.lines().filter(|l| !l.trim().is_empty()) {
+        assert!(exit.is_none(), "the exit frame comes last: {line}");
+        let frame: Value = serde_json::from_str(line).unwrap();
+        if let Some(text) = frame.get("stdout") {
+            stdout.push_str(text.as_str().unwrap());
+        } else if let Some(file) = frame.get("file") {
+            let data = files.entry(file["path"].as_str().unwrap()).or_insert_with(|| json!(""));
+            *data = json!(format!("{}{}", data.as_str().unwrap(), file["data"].as_str().unwrap()));
+        } else {
+            exit = Some(frame.get("exit").unwrap_or_else(|| panic!("unknown frame {line}")).clone());
+        }
+    }
+    let exit = exit.unwrap_or_else(|| panic!("no exit frame: {frames}"));
+    json!({
+        "exit_code": exit["exit_code"],
+        "stdout": stdout,
+        "stderr": exit["stderr"],
+        "replayed": exit["replayed"],
+        "files": files,
+    })
 }
 
 #[test]
@@ -854,6 +908,15 @@ fn stdin_and_files_travel_with_the_command() {
     copy.ok(&["import", "snap.jsonl", "--dry-run"]);
     check(copy.with_stdin(&["import", "-"], &snap), "import from stdin");
     assert_eq!(copy.json(&["list"]).as_array().unwrap().len(), 3);
+
+    // playbook extract -o writes where the local CLI would, creating the directory.
+    alice.ok(&["create", "Ship", "-t", "epic"]);
+    alice.ok(&["create", "Build the release", "--parent", "t-4"]);
+    alice.ok(&["playbook", "extract", "t-4", "-o", "pb/ship.toml"]);
+    let toml = std::fs::read_to_string(alice.dir.path().join("pb/ship.toml")).unwrap();
+    assert!(toml.contains("Build the release"), "{toml}");
+    assert!(!alice.dir.path().join("pb/ship.toml.tmp").exists());
+    assert_eq!(alice.code(&["playbook", "extract", "t-4", "-o", "pb/ship.toml"]), 2, "exists, without --force");
 }
 
 #[test]
@@ -1028,6 +1091,12 @@ fn https_with_a_private_ca() {
     assert!(check(out, "remote show over TLS").contains("✓ connected"));
     let out = bd(fresh.path()).args(["remote", "set", &server.url(), "--ca-cert"]).arg(&key_pem).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "a key is not a CA certificate");
+
+    // A streamed answer over TLS.
+    seed_large(&server, 300, 2);
+    let local = check(bd(&server.root.path().join("proj")).arg("export").output().unwrap(), "local export");
+    assert!(local.len() > 256 << 10, "more than the server sends whole: {}", local.len());
+    assert!(normalized(&alice.ok(&["export"])) == normalized(&local), "export over TLS");
 }
 
 #[test]
@@ -1052,7 +1121,7 @@ fn oversized_requests_are_refused_before_their_body_is_read() {
     // Headers only: the server must answer without waiting for the 2 MiB it was promised.
     write!(
         conn,
-        "POST /w/proj/v1/exec HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {secret}\r\n\
+        "POST /w/proj/v2/exec HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {secret}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
         2 << 20
     )
@@ -1085,6 +1154,8 @@ fn server_log_is_plain_text_with_one_line_per_request() {
     let server = KillOnDrop::new(child);
     let alice = Client { dir: tempfile::tempdir().unwrap(), url: format!("{base}/w/proj"), token: secret, ca: None };
     alice.ok(&["create", "Logged"]);
+    // The answer may reach the client before the server logs the request.
+    eventually("the request's log line", || std::fs::read_to_string(&log).unwrap().contains(" exec "));
     drop(server);
 
     let text = std::fs::read_to_string(&log).unwrap();
@@ -1738,4 +1809,548 @@ fn a_gate_check_opens_due_gates_beside_one_it_may_not() {
     eventually("a later timer to open as well", || alice.json(&["show", late_gate.trim()])["status"] == "closed");
     assert_eq!(alice.json(&["show", &parent])["status"], "open");
     assert_eq!(alice.json(&["show", &human])["status"], "open");
+}
+
+/// Seed workspace `proj` on the server's host with `n` issues of about `kib`
+/// KiB of text each, with multi-byte characters and characters JSON escapes.
+fn seed_large(server: &Server, n: usize, kib: usize) {
+    let text = "Ünïcödé 日本語 with \"quotes\", a tab\tand a backslash \\ in it. ".repeat(kib * 16);
+    let script: String = (0..n).map(|i| format!("create 'Issue {i}' -d '{text}'\n")).collect();
+    let mut child = bd(&server.root.path().join("proj"))
+        .arg("batch")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "seeding: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// An export without its header's timestamp, so that two exports of one state compare equal.
+fn normalized(export: &str) -> String {
+    let (header, rest) = export.split_once('\n').unwrap();
+    let mut header: Value = serde_json::from_str(header).unwrap();
+    header.as_object_mut().unwrap().remove("exported_at");
+    format!("{header}\n{rest}")
+}
+
+/// The output bytes of each streamed answer in a server log, once `want` are logged.
+fn streamed_answers(log: &Path, want: usize) -> Vec<u64> {
+    let bytes = |line: &str| -> u64 {
+        let found = line.split_whitespace().find_map(|w| w.strip_prefix("bytes="));
+        found.unwrap_or_else(|| panic!("no bytes in {line}")).parse().unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = std::fs::read_to_string(log).unwrap();
+        let found: Vec<u64> = text.lines().filter(|l| l.contains(" streamed ")).map(bytes).collect();
+        if found.len() >= want || Instant::now() > deadline {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Send `argv` to workspace `proj` over a raw connection, and read the answer's status line.
+fn raw_exec(addr: &str, secret: &str, argv: Value) -> (std::net::TcpStream, String) {
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let body = json!({ "argv": argv }).to_string();
+    let auth = format!("Authorization: Bearer {secret}\r\n");
+    write!(
+        conn,
+        "POST /w/proj/v2/exec HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut status = [0u8; 12];
+    conn.read_exact(&mut status).unwrap();
+    (conn, String::from_utf8_lossy(&status).into_owned())
+}
+
+#[test]
+fn large_outputs_stream_and_match_local_output() {
+    let server = Server::start_logged();
+    seed_large(&server, 2500, 2);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let ws = server.root.path().join("proj");
+    let local = check(bd(&ws).arg("export").output().unwrap(), "local export");
+    assert!(local.len() > 5 << 20, "a large export: {} bytes", local.len());
+
+    let remote = alice.ok(&["export"]);
+    assert!(normalized(&remote) == normalized(&local), "export to stdout matches the local one");
+    alice.ok(&["export", "-o", "snap.jsonl"]);
+    let file = std::fs::read_to_string(alice.dir.path().join("snap.jsonl")).unwrap();
+    assert!(normalized(&file) == normalized(&local), "export -o writes the same file");
+    assert!(!alice.dir.path().join("snap.jsonl.tmp").exists(), "no temporary file left");
+    let list = check(bd(&ws).args(["--json", "list", "--limit", "0"]).output().unwrap(), "local list");
+    assert!(alice.ok(&["--json", "list", "--limit", "0"]) == list, "list --json matches the local one");
+
+    let streamed = streamed_answers(&server.root.path().join("server.log"), 3);
+    assert_eq!(streamed.len(), 3, "the three answers streamed: {streamed:?}");
+    assert!(streamed.iter().all(|bytes| *bytes > 5 << 20), "{streamed:?}");
+}
+
+#[test]
+fn clients_that_go_away_mid_answer_do_not_wedge_the_server() {
+    let server = Server::start();
+    seed_large(&server, 1500, 2);
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    // More abandoned answers than commands run at once: each frees its slot.
+    // Those past the streaming lane are refused as busy.
+    let gone: Vec<_> = (0..40)
+        .map(|_| {
+            let (addr, secret) = (addr.clone(), secret.clone());
+            std::thread::spawn(move || raw_exec(&addr, &secret, json!(["export"])).1)
+        })
+        .collect();
+    let statuses: Vec<String> = gone.into_iter().map(|g| g.join().unwrap()).collect();
+    assert!(statuses.iter().all(|s| s == "HTTP/1.1 200" || s == "HTTP/1.1 503"), "{statuses:?}");
+    assert!(statuses.iter().any(|s| s == "HTTP/1.1 200"), "{statuses:?}");
+    let alice = server.client(&secret);
+    alice.ok(&["create", "Still serving"]);
+    assert!(alice.ok(&["export"]).lines().count() > 1500, "and still streaming whole answers");
+}
+
+/// A stand-in for a bd server on loopback: answers its `n`th request (from
+/// 0) with the raw HTTP bytes `answer(n)`, then hangs up.
+struct FakeServer {
+    url: String,
+    requests: Arc<AtomicUsize>,
+}
+
+impl FakeServer {
+    fn start(answer: impl Fn(usize) -> Vec<u8> + Send + 'static) -> FakeServer {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/w/proj", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                let _ = reader.read_exact(&mut body);
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                let _ = conn.write_all(&answer(n));
+            }
+        });
+        FakeServer { url, requests }
+    }
+
+    fn client(&self) -> Client {
+        Client { dir: tempfile::tempdir().unwrap(), url: self.url.clone(), token: "bdt_fake".into(), ca: None }
+    }
+}
+
+fn stdout_frame(text: &str) -> String {
+    json!({ "stdout": text }).to_string()
+}
+
+fn file_frame(path: &str, data: &str) -> String {
+    json!({ "file": { "path": path, "data": data } }).to_string()
+}
+
+fn exit_frame(code: i32, stderr: &str) -> String {
+    json!({ "exit": { "exit_code": code, "stderr": stderr, "replayed": false } }).to_string()
+}
+
+/// A 200 answer carrying `frames`: whole (with a Content-Length) or chunked.
+/// `cut` hangs up that many bytes before the end.
+fn answer(frames: &[String], chunked: bool, cut: usize) -> Vec<u8> {
+    let body: String = frames.iter().map(|f| format!("{f}\n")).collect();
+    let mut out = String::from("HTTP/1.1 200 OK\r\ncontent-type: application/x-ndjson\r\nbd-protocol: 2\r\n");
+    if chunked {
+        out.push_str("transfer-encoding: chunked\r\n\r\n");
+        for frame in frames {
+            out.push_str(&format!("{:x}\r\n{frame}\n\r\n", frame.len() + 1));
+        }
+        out.push_str("0\r\n\r\n");
+    } else {
+        out.push_str(&format!("content-length: {}\r\n\r\n{body}", body.len()));
+    }
+    let mut bytes = out.into_bytes();
+    bytes.truncate(bytes.len() - cut);
+    bytes
+}
+
+#[test]
+fn answers_cut_off_before_any_output_are_retried() {
+    let hello = vec![stdout_frame("hello\n"), exit_frame(0, "")];
+    let streamed = answer(&hello, true, 0);
+    let headers = streamed.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    let server = FakeServer::start(move |n| match n {
+        // Whole, but short of its Content-Length.
+        0 => answer(&hello, false, 10),
+        // Streamed, cut within the first frame.
+        1 => answer(&hello, true, streamed.len() - headers - 3),
+        // Streamed, without frames or its last chunk.
+        2 => answer(&[], true, 5),
+        _ => streamed.clone(),
+    });
+    let out = server.client().run(&["list"]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n", "printed once");
+    assert_eq!(server.requests.load(Ordering::SeqCst), 4, "three cut-off answers, then a complete one");
+}
+
+#[test]
+fn answers_cut_off_after_output_was_printed_are_not_retried() {
+    let partial = vec![stdout_frame("partial output\n"), stdout_frame("more\n"), exit_frame(0, "")];
+    let server = FakeServer::start(move |_| {
+        let full = answer(&partial, true, 0);
+        answer(&partial, true, full.len() - full.windows(4).position(|w| w == b"more").unwrap() + 4)
+    });
+    let out = server.client().run(&["list"]);
+    assert_eq!(out.status.code(), Some(8));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "partial output\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("incomplete"), "{stderr}");
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1, "never run again once output reached the user");
+}
+
+#[test]
+fn failures_after_partial_output_keep_their_exit_code() {
+    let big: String = (0..5000).map(|i| format!("line {i}\n")).collect();
+    let frames = vec![stdout_frame(&big[..20_000]), stdout_frame(&big[20_000..]), exit_frame(3, "error: boom\n")];
+    let server = FakeServer::start(move |_| answer(&frames, true, 0));
+    let out = server.client().run(&["list"]);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), big);
+    assert_eq!(String::from_utf8_lossy(&out.stderr), "error: boom\n");
+}
+
+#[test]
+fn output_files_appear_only_when_the_command_succeeds() {
+    let header = "{\"_type\":\"header\"}\n";
+    let ok =
+        vec![file_frame("out.jsonl", header), file_frame("out.jsonl", "{}\n"), stdout_frame("✓\n"), exit_frame(0, "")];
+    let failed = vec![file_frame("out.jsonl", header), exit_frame(1, "error: io\n")];
+    let cut = answer(&[file_frame("out.jsonl", header), exit_frame(0, "")], true, 40);
+    let server = FakeServer::start(move |n| match n {
+        0 => answer(&ok, true, 0),
+        1 => answer(&failed, true, 0),
+        _ => cut.clone(),
+    });
+    let client = server.client();
+    let target = client.dir.path().join("out.jsonl");
+    let tmp = client.dir.path().join("out.jsonl.tmp");
+    let out = client.run(&["export", "-o", "out.jsonl"]);
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "✓\n");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), format!("{header}{{}}\n"));
+
+    std::fs::write(&target, "old").unwrap();
+    assert_eq!(client.code(&["export", "-o", "out.jsonl"]), 1);
+    let out = client.cmd(&["export", "-o", "out.jsonl"]).env("BD_REMOTE_RETRY_SECS", "0").output().unwrap();
+    assert_eq!(out.status.code(), Some(8), "cut off");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "old", "a failed export leaves the old file alone");
+    assert!(!tmp.exists(), "and no temporary file");
+}
+
+#[test]
+fn mismatched_protocols_fail_with_an_explanation() {
+    // An older client, which posts to /v1/exec, against this server.
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let mut r = agent
+        .post(format!("{}/v1/exec", server.url()))
+        .header("authorization", format!("Bearer {secret}"))
+        .send(r#"{"argv":["list"]}"#)
+        .unwrap();
+    assert_eq!(r.status().as_u16(), 410);
+    let body: Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("protocol 2") && message.contains("same bd version"), "{message}");
+
+    // This client against an older server, and against something that is not a protocol 2 stream.
+    let old = FakeServer::start(|n| {
+        let body = r#"{"error":{"code":"not_found","message":"no such endpoint; workspaces are at /w/<name>/v1/exec","exit_code":3}}"#;
+        let json = r#"{"exit_code":0,"stdout":"t-1\n","stderr":"","replayed":false}"#;
+        let (status, body) = if n == 0 { ("404 Not Found", body) } else { ("200 OK", json) };
+        format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len())
+            .into_bytes()
+    });
+    let out = old.client().run(&["list"]);
+    assert_eq!(out.status.code(), Some(8));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("same bd version"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out = old.client().run(&["list"]);
+    assert_eq!(out.status.code(), Some(8));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("content type"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty());
+}
+
+/// The server's heap (anonymous memory), in KiB.
+#[cfg(target_os = "linux")]
+fn heap_kib(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let line = status.lines().find(|l| l.starts_with("RssAnon:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+#[test]
+fn slow_readers_cannot_take_every_command_slot() {
+    let server = Server::start();
+    seed_large(&server, 1000, 20);
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    alice.ok(&["list"]);
+    #[cfg(target_os = "linux")]
+    let idle = heap_kib(server.child.id());
+    let addr = server.base.trim_start_matches("http://").to_string();
+
+    // Eight 20 MiB exports whose clients never read past the status line:
+    // each command waits for its client, holding its slot.
+    let stalled: Vec<std::net::TcpStream> = (0..8)
+        .map(|_| {
+            let (conn, status) = raw_exec(&addr, &secret, json!(["export"]));
+            assert_eq!(status, "HTTP/1.1 200");
+            conn
+        })
+        .collect();
+    // The streaming lane is full: another large answer is refused as busy, for its client to retry...
+    let (_, status) = raw_exec(&addr, &secret, json!(["export"]));
+    assert_eq!(status, "HTTP/1.1 503");
+    // ...while short commands still find a slot at once.
+    let out = alice.cmd(&["create", "Short"]).env("BD_REMOTE_RETRY_SECS", "0").output().unwrap();
+    check(out, "create while answers stream");
+    // The waiting answers hold a small fixed amount of memory, not their output.
+    #[cfg(target_os = "linux")]
+    {
+        let held = heap_kib(server.child.id()).saturating_sub(idle);
+        assert!(held < 64 << 10, "8 stalled 20 MiB answers hold {held} KiB of heap");
+    }
+
+    drop(stalled);
+    assert!(alice.ok(&["export"]).lines().count() > 1000, "large answers stream again once they are gone");
+}
+
+/// What a [`Proxy`] does to an answer.
+#[derive(Clone)]
+enum Answers {
+    /// Cut off after this many bytes.
+    Cut(u64),
+    /// Replaced, `after` the server has the whole request, by `answer` (a gateway error).
+    Replace { after: Duration, answer: Vec<u8> },
+}
+
+/// A TCP proxy in front of `target` that does `first` to the answers of its
+/// first `n` connections, and passes the others through.
+struct Proxy {
+    addr: String,
+    connections: Arc<AtomicUsize>,
+}
+
+impl Proxy {
+    fn start(target: &str, n: usize, first: Answers) -> Proxy {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let (counter, target) = (connections.clone(), target.to_string());
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let Ok(mut client) = client else { return };
+                let i = counter.fetch_add(1, Ordering::SeqCst);
+                let mut server = std::net::TcpStream::connect(&target).unwrap();
+                if let (true, Answers::Replace { after, answer }) = (i < n, &first) {
+                    // Pass the whole request on, drain the server's answer, and answer instead.
+                    let mut request = BufReader::new(client.try_clone().unwrap());
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        request.read_line(&mut line).unwrap();
+                        server.write_all(line.as_bytes()).unwrap();
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                            length = v.trim().parse().unwrap();
+                        }
+                        if line == "\r\n" {
+                            break;
+                        }
+                    }
+                    let mut body = vec![0; length];
+                    request.read_exact(&mut body).unwrap();
+                    server.write_all(&body).unwrap();
+                    std::thread::spawn(move || std::io::copy(&mut server, &mut std::io::sink()));
+                    std::thread::sleep(*after);
+                    let _ = client.write_all(answer);
+                    let _ = client.shutdown(std::net::Shutdown::Both);
+                    continue;
+                }
+                let (mut requests, mut upstream) = (client.try_clone().unwrap(), server.try_clone().unwrap());
+                std::thread::spawn(move || std::io::copy(&mut requests, &mut upstream));
+                let limit = match &first {
+                    Answers::Cut(after) if i < n => *after,
+                    _ => u64::MAX,
+                };
+                std::thread::spawn(move || {
+                    let (mut answers, mut downstream) = (server, client);
+                    let _ = std::io::copy(&mut (&mut answers).take(limit), &mut downstream);
+                    let _ = downstream.shutdown(std::net::Shutdown::Both);
+                    let _ = answers.shutdown(std::net::Shutdown::Both);
+                });
+            }
+        });
+        Proxy { addr, connections }
+    }
+
+    fn client(&self, token: &str) -> Client {
+        Client {
+            dir: tempfile::tempdir().unwrap(),
+            url: format!("http://{}/w/proj", self.addr),
+            token: token.to_string(),
+            ca: None,
+        }
+    }
+}
+
+/// `n` creates for `bd batch`, each with `size` bytes of description.
+fn creates(n: usize, size: usize) -> String {
+    (1..=n).map(|i| format!("create \"Task {i}\" -d \"{}\"\n", "x".repeat(size))).collect()
+}
+
+#[test]
+fn cut_off_write_answers_are_asked_for_again_and_applied_once() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let proxy = Proxy::start(server.base.trim_start_matches("http://"), 1, Answers::Cut(100 << 10));
+    let client = proxy.client(&secret);
+    std::fs::write(client.dir.path().join("ops.txt"), creates(300, 200)).unwrap();
+
+    let out = client.run(&["--json", "batch", "-f", "ops.txt"]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.len() > 100 << 10, "longer than where the first answer was cut: {}", out.stdout.len());
+    let answer: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(answer["operations"].as_array().unwrap().len(), 300, "the whole answer, printed once");
+    assert_eq!(proxy.connections.load(Ordering::SeqCst), 2, "asked for again, with the same request id");
+    let issues = server.client(&secret).json(&["list", "--limit", "0"]);
+    assert_eq!(issues.as_array().unwrap().len(), 300, "applied once");
+}
+
+#[test]
+fn write_answers_too_large_to_keep_are_reported_lost() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let proxy = Proxy::start(server.base.trim_start_matches("http://"), 1, Answers::Cut(100 << 10));
+    let client = proxy.client(&secret);
+    std::fs::write(client.dir.path().join("ops.txt"), creates(1200, 800)).unwrap();
+
+    let out = client.run(&["--json", "batch", "-f", "ops.txt"]);
+    assert_eq!(out.status.code(), Some(9), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stdout.is_empty(), "nothing of a write's partial answer is printed");
+    let error: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "answer_lost");
+    assert!(error["error"]["message"].as_str().unwrap().contains("not kept"), "{error}");
+    let issues = server.client(&secret).json(&["list", "--limit", "0"]);
+    assert_eq!(issues.as_array().unwrap().len(), 1200, "applied once");
+}
+
+/// A raw answer with `status`, from bd serve itself when `bd` (its protocol header), else from a proxy.
+fn status_answer(status: &str, bd: bool, body: &str) -> Vec<u8> {
+    let header = if bd { "bd-protocol: 2\r\n" } else { "" };
+    format!("HTTP/1.1 {status}\r\n{header}content-length: {}\r\nconnection: close\r\n\r\n{body}", body.len())
+        .into_bytes()
+}
+
+fn error_json(code: &str, exit_code: i32) -> String {
+    json!({ "error": { "code": code, "message": format!("{code} answer"), "exit_code": exit_code } }).to_string()
+}
+
+#[test]
+fn gateway_errors_after_a_write_was_passed_on_are_retried_and_applied_once() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let target = server.base.trim_start_matches("http://").to_string();
+    // Cloudflare's 520 and 524, and Envoy's 503: the server got the request and ran it.
+    // The last answers only once the client's retry time is spent, as a real gateway timeout does.
+    for (status, after, retry_secs) in [
+        ("524 A Timeout Occurred", Duration::ZERO, "30"),
+        ("520 Unknown Error", Duration::ZERO, "30"),
+        ("503 Service Unavailable", Duration::ZERO, "30"),
+        ("524 A Timeout Occurred", Duration::from_secs(2), "1"),
+    ] {
+        let answer = status_answer(status, false, "upstream error");
+        let proxy = Proxy::start(&target, 1, Answers::Replace { after, answer });
+        let client = proxy.client(&secret);
+        let mut create = client.cmd(&["-q", "create", &format!("Behind a {status}")]);
+        let out = create.env("BD_REMOTE_RETRY_SECS", retry_secs).output().unwrap();
+        assert_eq!(out.status.code(), Some(0), "{status}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with("t-"), "{status}: the stored answer");
+        assert!(proxy.connections.load(Ordering::SeqCst) >= 2, "{status}: asked for again");
+    }
+    let issues = server.client(&secret).json(&["list", "--limit", "0"]);
+    assert_eq!(issues.as_array().unwrap().len(), 4, "each applied once: {issues}");
+}
+
+#[test]
+fn lost_write_answers_are_never_called_safe_to_run_again() {
+    let quick = |client: &Client, args: &[&str]| client.cmd(args).env("BD_REMOTE_RETRY_SECS", "1").output().unwrap();
+    let not_found = status_answer("404 Not Found", true, &error_json("not_found", 3));
+    let unauthorized = status_answer("401 Unauthorized", true, &error_json("unauthorized", 7));
+    // What happens, how the stand-in server answers its nth request, and the exit codes of a write and a read.
+    type Answering = Box<dyn Fn(usize) -> Vec<u8> + Send>;
+    let cases: Vec<(&str, Answering, i32, i32)> = vec![
+        ("cut off after its headers", Box::new(|_| answer(&[], true, 5)), 9, 8),
+        ("a gateway timeout from a proxy", Box::new(|_| status_answer("524 A Timeout Occurred", false, "")), 9, 8),
+        ("a proxy's 503 for a reset upstream", Box::new(|_| status_answer("503 Service Unavailable", false, "")), 9, 8),
+        ("bd serve busy: nothing ran", Box::new(|_| status_answer("503 Service Unavailable", true, "{}")), 8, 8),
+        ("a malformed answer head", Box::new(|_| b"HTTP/1.1 OK OK\r\n\r\n".to_vec()), 9, 8),
+        (
+            "a bad gateway, then a refusal",
+            Box::new(move |n| if n == 0 { status_answer("502 Bad Gateway", false, "") } else { unauthorized.clone() }),
+            9,
+            7,
+        ),
+        ("a refusal before anything ran", Box::new(move |_| not_found.clone()), 3, 3),
+    ];
+    for (what, answers, write_code, read_code) in cases {
+        let server = FakeServer::start(answers);
+        let out = quick(&server.client(), &["create", "Lost"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(write_code), "write, {what}: {stderr}");
+        if write_code == 9 {
+            assert!(stderr.contains("may have taken effect") && !stderr.contains("safe"), "{what}: {stderr}");
+        }
+        let out = quick(&server.client(), &["list"]);
+        assert_eq!(out.status.code(), Some(read_code), "read, {what}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    // The first attempt got through; its retries find it still running.
+    let pending = FakeServer::start(|n| {
+        if n == 0 {
+            return answer(&[], true, 5);
+        }
+        let body =
+            r#"{"error":{"code":"pending","message":"request r is still running; retry shortly","exit_code":8}}"#;
+        format!("HTTP/1.1 409 Conflict\r\nbd-protocol: 2\r\ncontent-length: {}\r\n\r\n{body}", body.len()).into_bytes()
+    });
+    assert_eq!(quick(&pending.client(), &["create", "Lost"]).status.code(), Some(9));
+
+    // A server nobody reached took nothing in.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let down = Client {
+        dir: tempfile::tempdir().unwrap(),
+        url: format!("http://127.0.0.1:{port}/w/proj"),
+        token: "bdt_x".into(),
+        ca: None,
+    };
+    assert_eq!(quick(&down, &["create", "Never sent"]).status.code(), Some(8));
 }

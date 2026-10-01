@@ -11,9 +11,12 @@
 //! The access token comes from `$BD_TOKEN`, else from the user's
 //! credentials file (`bd remote login`, see [`crate::credentials`]), never
 //! from a file in the repository. The command line travels unchanged; the
-//! server runs it and returns its output and exit code. Each invocation gets
-//! a request id that its retries reuse, so a write whose response was lost is
-//! applied once.
+//! server runs it and streams back its output and exit code. Each invocation
+//! gets a request id that its retries reuse, so a write whose answer was lost
+//! is applied once: a write's answer is held until it has arrived whole, and
+//! asked for again when it does not; one that cannot be recovered fails as
+//! [`Error::AnswerLost`] (exit 9), never as safe to run again. A read prints
+//! a large output as it arrives, so it is not retried once it has.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -30,10 +33,15 @@ use crate::cli::*;
 use crate::credentials::{self, Scope};
 use crate::fmt;
 use crate::io;
-use crate::protocol::{ErrorBody, ExecRequest, ExecResponse, valid_workspace_name};
+use crate::protocol::{
+    ErrorBody, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, Frame, PROTOCOL, PROTOCOL_HEADER,
+    valid_workspace_name,
+};
+use crate::stream::{Cut, FrameReader};
 
 /// How long a request that failed in transit is retried, unless
-/// `$BD_REMOTE_RETRY_SECS` says otherwise (0: one attempt).
+/// `$BD_REMOTE_RETRY_SECS` says otherwise (0: one attempt). A write that may
+/// have run gets it again from that failure, to ask for its stored answer.
 const RETRY_BUDGET: Duration = Duration::from_secs(30);
 /// `bd prime` runs from session hooks, which must not stall: it retries this long.
 const PRIME_RETRY_BUDGET: Duration = Duration::from_secs(3);
@@ -52,8 +60,11 @@ pub struct Remote {
     /// How long failures in transit are retried.
     retry: Duration,
     connect_timeout: Duration,
-    /// Limit for one attempt, including the server's work.
+    /// Limit for each step of an attempt: sending the request, the server's
+    /// work until its answer starts, and each wait for more of the answer.
     attempt_timeout: Duration,
+    /// Limit for a whole attempt, for commands that must answer quickly.
+    total_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -296,7 +307,7 @@ pub fn unavailable(e: &Error) -> i32 {
 pub fn run(app: &mut App, remote: Remote, cli: &Cli) -> i32 {
     let hook = is_hook(cli);
     let remote = if hook { remote.quick() } else { remote };
-    match forward(app, &remote, cli) {
+    match forward(app, &remote, cli, hook) {
         Ok(response) if hook && response.exit_code != 0 => unavailable(&response_error(&response, &remote.url)),
         Ok(response) => {
             io::out(&response.stdout);
@@ -308,7 +319,9 @@ pub fn run(app: &mut App, remote: Remote, cli: &Cli) -> i32 {
     }
 }
 
-fn forward(app: &App, remote: &Remote, cli: &Cli) -> Result<ExecResponse> {
+/// Run the command remotely. Output files are written as they arrive, and
+/// stdout printed if it is long; the result holds the rest, to print.
+fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResponse> {
     match &cli.command {
         Command::Init(_) => {
             return Err(Error::Refused(format!(
@@ -336,9 +349,9 @@ fn forward(app: &App, remote: &Remote, cli: &Cli) -> Result<ExecResponse> {
     };
     attach_inputs(&cli.command, &mut request)?;
     check_outputs(app, &cli.command)?;
-    let response = remote.exec(&request)?;
-    write_outputs(app, &cli.command, &response)?;
-    Ok(response)
+    // A session hook prints `bd prime` only once it knows the command worked.
+    let write = crate::serve::access(&cli.command) == crate::serve::Access::Write;
+    remote.exec_into(&request, &mut Delivery::new(output_files(app, &cli.command), hook, write))
 }
 
 /// The error a failed command reported (its `--json` error, or its first stderr line).
@@ -350,6 +363,7 @@ fn response_error(r: &ExecResponse, url: &str) -> Error {
     };
     match detail.map_or(r.exit_code, |d| d.exit_code) {
         7 => Error::Unauthorized(format!("{url}: {message}")),
+        9 => Error::AnswerLost(format!("{url}: {message}")),
         2 => Error::invalid(format!("{url}: {message}")),
         3 => Error::NoWorkspace(format!("{url}: {message}")),
         _ => Error::Remote(format!("{url}: {message}")),
@@ -398,29 +412,153 @@ fn check_outputs(app: &App, cmd: &Command) -> Result<()> {
     Ok(())
 }
 
-/// Write the output files the command asked for, where the local CLI would;
-/// files the server sends for any other path are ignored.
-fn write_outputs(app: &App, cmd: &Command, response: &ExecResponse) -> Result<()> {
+/// The output files the command asked for, written where the local CLI would.
+fn output_files(app: &App, cmd: &Command) -> Vec<OutputFile> {
     match cmd {
-        Command::Export(ExportArgs { output: Some(path), .. }) => {
-            if let Some(text) = response.files.get(path.to_string_lossy().as_ref()) {
-                let tmp = path.with_extension("jsonl.tmp");
-                std::fs::write(&tmp, text)?;
-                std::fs::rename(&tmp, path)?;
-            }
-        }
+        Command::Export(ExportArgs { output: Some(path), .. }) => vec![OutputFile::new(path, path.clone(), false)],
         Command::Playbook(PlaybookCommand::Extract(ExtractArgs { output: Some(path), .. })) => {
-            if let Some(text) = response.files.get(path.to_string_lossy().as_ref()) {
-                let target = extract_target(app, path);
-                if let Some(dir) = target.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                std::fs::write(&target, text)?;
+            vec![OutputFile::new(path, extract_target(app, path), true)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Where the frames of an answer go: stdout, and the output files the
+/// command asked for. Files the server sends for any other path are ignored.
+struct Delivery {
+    /// A command that may write: its output is held until it is complete,
+    /// so a lost answer can always be asked for again (same request id).
+    write: bool,
+    /// Keep stdout until the exit frame instead of printing it as it arrives.
+    hold: bool,
+    /// This attempt prints stdout as it arrives.
+    printing: bool,
+    /// Stdout of this attempt, when not printing it.
+    held: String,
+    /// Output reached the user, so the request cannot be tried again.
+    printed: bool,
+    files: Vec<OutputFile>,
+}
+
+/// An output file, written to `<target>.tmp` and renamed into place once the command succeeds.
+struct OutputFile {
+    /// The path as given on the command line, which names the file's frames.
+    key: String,
+    target: PathBuf,
+    /// Create the target's directory first (`playbook extract -o`).
+    mkdir: bool,
+    /// This attempt's temporary file.
+    temp: Option<(PathBuf, std::io::BufWriter<std::fs::File>)>,
+}
+
+impl Delivery {
+    fn new(files: Vec<OutputFile>, hold: bool, write: bool) -> Delivery {
+        // A command writing files prints a summary: it waits until the files are in place.
+        let hold = hold || write || !files.is_empty();
+        Delivery { write, hold, printing: false, held: String::new(), printed: false, files }
+    }
+
+    /// Everything kept in memory, for the client's own requests (reads).
+    fn collect() -> Delivery {
+        Delivery::new(Vec::new(), true, false)
+    }
+
+    /// An attempt's answer starts; a `whole` one is short, so it is printed when complete.
+    fn start(&mut self, whole: bool) {
+        self.discard();
+        self.held.clear();
+        self.printing = !self.hold && !whole;
+    }
+
+    fn stdout(&mut self, text: &str) -> Result<()> {
+        if !self.printing {
+            self.held.push_str(text);
+            return Ok(());
+        }
+        self.printed = true;
+        Ok(io::with_stdout(|w| w.write_all(text.as_bytes()))?)
+    }
+
+    fn file(&mut self, path: &str, data: &str) -> Result<()> {
+        match self.files.iter_mut().find(|f| f.key == path) {
+            Some(f) => f.write(data.as_bytes()),
+            None => Ok(()),
+        }
+    }
+
+    /// The command finished: its files go into place if it succeeded.
+    fn exit(&mut self, exit: Exit) -> Result<ExecResponse> {
+        if exit.exit_code == 0 {
+            for f in &mut self.files {
+                f.commit()?;
             }
         }
-        _ => {}
+        self.discard();
+        Ok(ExecResponse {
+            exit_code: exit.exit_code,
+            stdout: std::mem::take(&mut self.held),
+            stderr: exit.stderr,
+            replayed: exit.replayed,
+            ..Default::default()
+        })
     }
-    Ok(())
+
+    fn discard(&mut self) {
+        for f in &mut self.files {
+            f.discard();
+        }
+    }
+}
+
+impl Drop for Delivery {
+    fn drop(&mut self) {
+        self.discard();
+    }
+}
+
+fn path_error(path: &Path, e: std::io::Error) -> Error {
+    Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
+impl OutputFile {
+    fn new(key: &Path, target: PathBuf, mkdir: bool) -> OutputFile {
+        OutputFile { key: key.to_string_lossy().into_owned(), target, mkdir, temp: None }
+    }
+
+    fn write(&mut self, data: &[u8]) -> Result<()> {
+        if self.temp.is_none() {
+            if let Some(dir) = self.target.parent().filter(|_| self.mkdir) {
+                std::fs::create_dir_all(dir).map_err(|e| path_error(dir, e))?;
+            }
+            let mut name = self.target.file_name().unwrap_or_default().to_os_string();
+            name.push(".tmp");
+            let temp = self.target.with_file_name(name);
+            let file = std::fs::File::create(&temp).map_err(|e| path_error(&temp, e))?;
+            self.temp = Some((temp, std::io::BufWriter::new(file)));
+        }
+        let Some((temp, w)) = self.temp.as_mut() else { return Ok(()) };
+        w.write_all(data).map_err(|e| path_error(temp, e))
+    }
+
+    fn commit(&mut self) -> Result<()> {
+        let Some((temp, w)) = self.temp.take() else { return Ok(()) };
+        // Closed before the rename, which Windows refuses for an open file.
+        let moved = w.into_inner().map_err(|e| e.into_error()).and_then(|file| {
+            drop(file);
+            std::fs::rename(&temp, &self.target)
+        });
+        moved.map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
+            path_error(&self.target, e)
+        })
+    }
+
+    fn discard(&mut self) {
+        if let Some((temp, w)) = self.temp.take() {
+            drop(w);
+            let _ = std::fs::remove_file(temp);
+        }
+    }
 }
 
 /// `events --follow`: poll the server with a cursor, as the local command polls the database.
@@ -492,6 +630,7 @@ impl Remote {
             retry: retry_budget(),
             connect_timeout: Duration::from_secs(10),
             attempt_timeout: Duration::from_secs(120),
+            total_timeout: None,
         }
     }
 
@@ -503,6 +642,7 @@ impl Remote {
         }
         self.connect_timeout = Duration::from_secs(3);
         self.attempt_timeout = Duration::from_secs(15);
+        self.total_timeout = Some(self.attempt_timeout);
         self
     }
 
@@ -514,62 +654,155 @@ impl Remote {
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(self.connect_timeout))
-            .timeout_global(Some(self.attempt_timeout))
+            .timeout_send_request(Some(self.attempt_timeout))
+            .timeout_send_body(Some(self.attempt_timeout))
+            .timeout_recv_response(Some(self.attempt_timeout))
+            .timeout_global(self.total_timeout)
             .user_agent(format!("bd/{}", env!("CARGO_PKG_VERSION")))
             .tls_config(tls.build())
             .build();
         Ok(config.into())
     }
 
-    /// Send one request. Failures in transit and busy answers are retried
-    /// with the same request id, for up to the remote's retry budget.
+    /// Send one request and collect its whole answer (the client's own small requests).
     pub fn exec(&self, request: &ExecRequest) -> Result<ExecResponse> {
+        self.exec_into(request, &mut Delivery::collect())
+    }
+
+    /// Send one request; its answer goes to `out`. Failures in transit and
+    /// busy answers are retried with the same request id, for up to the
+    /// remote's retry budget, as long as no output has reached the user. A
+    /// write that may have run without its answer arriving fails with
+    /// [`Error::AnswerLost`], never as safe to run again.
+    fn exec_into(&self, request: &ExecRequest, out: &mut Delivery) -> Result<ExecResponse> {
         let agent = self.agent()?;
         let body = serde_json::to_vec(request)?;
-        let endpoint = format!("{}/v1/exec", self.url);
+        let endpoint = format!("{}/v{PROTOCOL}/exec", self.url);
         let authorization = format!("Bearer {}", self.token);
         let budget = self.retry;
-        let deadline = Instant::now() + budget;
+        let mut deadline = Instant::now() + budget;
         let mut delay = Duration::from_millis(200);
+        // Some attempt may have run the command on the server.
+        let mut reached = false;
+        let lost = |why: String| {
+            Error::AnswerLost(format!("{}: {why}; the command may have taken effect on the server", self.url))
+        };
         loop {
+            let was_reached = reached;
             let sent = agent
                 .post(&endpoint)
                 .header("authorization", &authorization)
+                .header("accept", FRAMES_CONTENT_TYPE)
                 .content_type("application/json")
                 .send(&body[..]);
             let failure = match sent {
+                Ok(response) if response.status() == 200 => match self.receive(response, out)? {
+                    Ok(done) => return Ok(done),
+                    // The command ran, but its answer cannot be read: asking again would not help.
+                    Err(Cut::Malformed(why)) if out.write => return Err(lost(format!("unexpected answer: {why}"))),
+                    Err(Cut::Malformed(why)) => {
+                        return Err(Error::Remote(format!("{}: unexpected answer: {why}", self.url)));
+                    }
+                    // Only a read prints as it arrives: running it again is harmless.
+                    Err(cut) if out.printed => {
+                        return Err(Error::Remote(format!("{}: {cut}, so the output above is incomplete", self.url)));
+                    }
+                    Err(cut) => {
+                        reached = true;
+                        cut.to_string()
+                    }
+                },
                 Ok(mut response) => {
                     let status = response.status().as_u16();
-                    match (status, response.body_mut().with_config().limit(u64::MAX).read_to_string()) {
-                        (200, Ok(text)) => {
-                            return serde_json::from_str(&text)
-                                .map_err(|e| Error::Remote(format!("{}: unexpected response: {e}", self.url)));
-                        }
+                    let bd = response.headers().contains_key(PROTOCOL_HEADER);
+                    // bd serve answers 503 before running a command (busy, shutting down). Any other
+                    // server error may come after the command ran: from bd serve, or from a proxy in
+                    // front of it (a gateway timeout, Cloudflare's 520 and 524, Envoy's 503).
+                    let may_have_run = status >= 500 && !(bd && status == 503);
+                    match (status, response.body_mut().with_config().limit(1 << 20).read_to_string()) {
                         // 409 "pending": an earlier attempt of this request is still running.
-                        (409, Ok(text)) if error_code(&text).as_deref() != Some("pending") => {
-                            return Err(http_error(status, &text, &self.url));
+                        (409, Ok(text)) if error_code(&text).as_deref() == Some("pending") => {
+                            reached = true;
+                            format!("HTTP {status}{}", error_message(&text))
                         }
-                        (409 | 429 | 502 | 503 | 504, Ok(text)) => format!("HTTP {status}{}", error_message(&text)),
-                        (_, Ok(text)) => return Err(http_error(status, &text, &self.url)),
-                        (_, Err(e)) => format!("reading the response: {e}"),
+                        // The command failed on the server, possibly after taking effect.
+                        (500, Ok(text)) if bd && out.write => {
+                            return Err(lost(format!("HTTP 500{}", error_message(&text))));
+                        }
+                        (429 | 503, Ok(text)) if !may_have_run => format!("HTTP {status}{}", error_message(&text)),
+                        (_, Ok(text)) if may_have_run && !bd => {
+                            reached = true;
+                            format!("HTTP {status}{}", error_message(&text))
+                        }
+                        (_, Ok(text)) if reached && out.write => {
+                            let why = format!("HTTP {status}{}", error_message(&text));
+                            return Err(lost(format!("{why}, after an earlier attempt that may have run")));
+                        }
+                        (_, Ok(text)) => return Err(http_error(status, &text, &self.url, bd)),
+                        (_, Err(e)) => {
+                            reached |= may_have_run || status == 409;
+                            format!("HTTP {status}, reading the response: {e}")
+                        }
                     }
                 }
-                Err(e) if retryable(&e) => e.to_string(),
+                Err(e) if retryable(&e) => {
+                    reached |= !before_sending(&e);
+                    e.to_string()
+                }
                 Err(e) => {
-                    let e = e.to_string();
-                    return Err(Error::Remote(format!("{}: {e}{}", self.url, certificate_advice(&e))));
+                    reached |= !before_sending(&e);
+                    let e = format!("{e}{}", certificate_advice(&e.to_string()));
+                    if reached && out.write {
+                        return Err(lost(e));
+                    }
+                    return Err(Error::Remote(format!("{}: {e}", self.url)));
                 }
             };
-            if Instant::now() + delay > deadline {
-                return Err(Error::Remote(format!(
-                    "{}: {failure} (gave up after retrying for {}s)",
-                    self.url,
-                    budget.as_secs()
-                )));
+            // The first failure that may have run a write restarts the retry time: a gateway timeout
+            // arrives only once the proxy's own has passed (Cloudflare's 524 after 100 s), maybe past
+            // the retry time, and the write's stored answer must still be asked for.
+            let now = Instant::now();
+            if reached && !was_reached && out.write && !budget.is_zero() {
+                deadline = deadline.max(now + budget.max(delay));
+            }
+            if now + delay > deadline {
+                let failure = format!("{failure} (gave up after retrying for {}s)", budget.as_secs());
+                if reached && out.write {
+                    return Err(lost(failure));
+                }
+                return Err(Error::Remote(format!("{}: {failure}", self.url)));
             }
             tracing::debug!(target: "bd::remote", url = %self.url, %failure, "retrying");
             std::thread::sleep(delay);
             delay = (delay * 2).min(Duration::from_secs(4));
+        }
+    }
+
+    /// Read a 200 answer into `out`: the command's outcome, or where the answer
+    /// was cut off. An error is a local failure (writing stdout or an output
+    /// file), which ends the request.
+    fn receive(
+        &self,
+        response: ureq::http::Response<ureq::Body>,
+        out: &mut Delivery,
+    ) -> Result<std::result::Result<ExecResponse, Cut>> {
+        let headers = response.headers();
+        let content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
+        if !content_type.starts_with(FRAMES_CONTENT_TYPE) {
+            return Ok(Err(Cut::Malformed(format!(
+                "content type {content_type:?}, not a protocol {PROTOCOL} stream (is the server another bd version?)"
+            ))));
+        }
+        out.start(headers.contains_key("content-length"));
+        let frames = FrameReader::spawn(response.into_body().into_reader(), self.attempt_timeout)?;
+        loop {
+            match frames.next() {
+                Ok(Some(Frame::Stdout(text))) => out.stdout(&text)?,
+                Ok(Some(Frame::File { path, data })) => out.file(&path, &data)?,
+                Ok(Some(Frame::Exit(exit))) => return out.exit(exit).map(Ok),
+                Ok(None) => return Ok(Err(Cut::Broken("the answer ended before the command did".into()))),
+                Err(cut) => return Ok(Err(cut)),
+            }
         }
     }
 
@@ -1000,6 +1233,37 @@ fn prompt_hidden(_: &str) -> Result<String> {
     Err(Error::invalid(format!("bd remote login does not prompt on this system; {}", how_to_pipe())))
 }
 
+/// Failures before the request was sent in full: the server cannot have run
+/// it. Anything else (a reset, a malformed or oversized answer head) may come
+/// after it ran.
+fn before_sending(e: &ureq::Error) -> bool {
+    use std::io::ErrorKind as K;
+    use ureq::Error as E;
+    use ureq::Timeout as T;
+    match e {
+        E::ConnectionFailed
+        | E::HostNotFound
+        | E::BadUri(_)
+        | E::Http(_)
+        | E::InvalidProxyUrl
+        | E::ConnectProxyFailed(_)
+        | E::RequireHttpsOnly(_)
+        | E::TlsRequired
+        | E::Tls(_)
+        | E::Pem(_)
+        | E::Rustls(_)
+        | E::RedirectFailed
+        | E::TooManyRedirects => true,
+        E::Timeout(t) => matches!(t, T::Resolve | T::Connect | T::SendRequest | T::SendBody),
+        // rustls reports certificate and handshake failures as InvalidData.
+        E::Io(io) => matches!(
+            io.kind(),
+            K::ConnectionRefused | K::AddrNotAvailable | K::HostUnreachable | K::NetworkUnreachable | K::InvalidData
+        ),
+        _ => false,
+    }
+}
+
 /// Failures worth retrying: the request may not have arrived, or its answer was lost.
 fn retryable(e: &ureq::Error) -> bool {
     match e {
@@ -1030,12 +1294,18 @@ fn error_code(body: &str) -> Option<String> {
     serde_json::from_str::<ErrorBody>(body).ok().map(|b| b.error.code)
 }
 
-fn http_error(status: u16, body: &str, url: &str) -> Error {
+/// The error of a non-200 answer; `bd` says whether a bd server of this protocol sent it.
+fn http_error(status: u16, body: &str, url: &str, bd: bool) -> Error {
     let detail = serde_json::from_str::<ErrorBody>(body).ok().map(|b| b.error);
     let message = detail.as_ref().map_or_else(|| format!("HTTP {status}"), |d| d.message.clone());
     match (status, detail.as_ref().map(|d| d.code.as_str())) {
         (401 | 403, _) | (_, Some("unauthorized")) => Error::Unauthorized(format!("{url}: {message}")),
-        (404, _) => Error::not_found("workspace", url),
+        (404, _) if bd => Error::not_found("workspace", url),
+        // A server of another protocol (an older bd serve), or no bd server at all.
+        (404, _) => Error::Remote(format!(
+            "{url}: no bd server of protocol {PROTOCOL} answers there ({message}); check the URL, and that the \
+             server runs the same bd version"
+        )),
         (400 | 413, _) => Error::invalid(format!("{url}: {message}")),
         _ => Error::Remote(format!("{url}: {message}")),
     }
@@ -1078,11 +1348,15 @@ mod tests {
     #[test]
     fn http_errors_keep_their_exit_codes() {
         let body = |code: &str| format!(r#"{{"error":{{"code":"{code}","message":"m","exit_code":7}}}}"#);
-        assert_eq!(http_error(401, &body("unauthorized"), "u").exit_code(), 7);
-        assert_eq!(http_error(403, &body("unauthorized"), "u").exit_code(), 7);
-        assert_eq!(http_error(404, &body("not_found"), "u").exit_code(), 3);
-        assert_eq!(http_error(413, &body("invalid"), "u").exit_code(), 2);
-        assert_eq!(http_error(500, "not json", "u").exit_code(), 8);
+        assert_eq!(http_error(401, &body("unauthorized"), "u", true).exit_code(), 7);
+        assert_eq!(http_error(403, &body("unauthorized"), "u", true).exit_code(), 7);
+        assert_eq!(http_error(404, &body("not_found"), "u", true).exit_code(), 3);
+        assert_eq!(http_error(413, &body("invalid"), "u", true).exit_code(), 2);
+        assert_eq!(http_error(500, "not json", "u", false).exit_code(), 8);
+        assert_eq!(http_error(410, &body("remote"), "u", true).exit_code(), 8, "another protocol");
+        let old = http_error(404, &body("not_found"), "u", false);
+        assert_eq!(old.exit_code(), 8, "a 404 without the protocol header is not a missing workspace");
+        assert!(old.to_string().contains("same bd version"), "{old}");
     }
 
     #[test]

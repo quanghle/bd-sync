@@ -102,6 +102,17 @@ pub fn resolve_id(conn: &Connection, input: &str) -> Result<String> {
 }
 
 pub fn list(conn: &Connection, q: &ListQuery) -> Result<Vec<Issue>> {
+    let mut issues = Vec::new();
+    for_each(conn, q, |issue| {
+        issues.push(issue);
+        Ok(())
+    })?;
+    Ok(issues)
+}
+
+/// The issues [`list`] returns, passed to `f` one at a time instead of held
+/// all at once (an export of a large workspace).
+pub fn for_each(conn: &Connection, q: &ListQuery, mut f: impl FnMut(Issue) -> Result<()>) -> Result<()> {
     let mut parts = QueryParts::default();
     if !q.statuses.is_empty() {
         parts.cond(
@@ -135,8 +146,11 @@ pub fn list(conn: &Connection, q: &ListQuery) -> Result<Vec<Issue>> {
     };
     let (sql, params) = parts.build(&format!("SELECT {ISSUE_COLUMNS} FROM issues i"), &tail, tail_params);
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), issue_from_row)?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let mut rows = stmt.query(params_from_iter(params))?;
+    while let Some(row) = rows.next()? {
+        f(issue_from_row(row)?)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn refs(conn: &Connection, ids: &[String]) -> Result<Vec<IssueRef>> {

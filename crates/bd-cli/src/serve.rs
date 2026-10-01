@@ -8,22 +8,41 @@
 //! guarantees: every write still takes SQLite's write lock.
 //!
 //! Layout: `<root>/<name>/.bd/bd.db` is workspace `<name>`, served at
-//! `POST /w/<name>/v1/exec`; `<root>/tokens.json` holds the access tokens.
-//! `GET /healthz` answers `ok` without a token.
+//! `POST /w/<name>/v2/exec` (the wire format is in `protocol.rs`);
+//! `<root>/tokens.json` holds the access tokens. `GET /healthz` answers `ok`
+//! without a token.
+//!
+//! Memory and slots: up to `MAX_RUNNING` commands run at once. Requests in
+//! progress share a budget (`MIN_BODY_BUDGET`, or more for one maximum-size
+//! request): each reserves its body, twice, and a fixed share for its answer.
+//! A read's answer streams (see `stream.rs`): its output reaches the client
+//! as it is written, through buffers of a fixed size, so an export of any
+//! size holds about the same memory as a claim. At most `MAX_STREAMING`
+//! reads stream their answers at once (another is refused as busy, and its
+//! client tries again), and their clients must keep up a minimum rate, so
+//! slow readers cannot take the slots of short commands. A write's answer,
+//! up to `REPLAY_LIMIT` of output, is held back while it runs, stored for
+//! replays, released, and only then sent whole: a retry after a lost answer
+//! always gets it. A write with more output streams, outside the lane: it is
+//! never refused once it may have taken effect. Stderr is kept up to 64 KiB,
+//! and a connection whose client takes nothing for `WRITE_STALL` is closed.
 //!
 //! Background jobs keep every workspace up without a client asking: lease
 //! reclaim, gate checks, backups and pruning of request records (`jobs.rs`).
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bd_core::{Error, OpenOptions, Result, Store};
 use clap::Parser;
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{self, HeaderMap, HeaderValue};
 use hyper::server::conn::http1;
@@ -40,7 +59,11 @@ use crate::auth::{self, Role, Token, Verifier};
 use crate::cli::*;
 use crate::io::{self, Capture};
 use crate::jobs;
-use crate::protocol::{ErrorBody, ErrorDetail, ExecRequest, ExecResponse, valid_workspace_name};
+use crate::protocol::{
+    ErrorBody, ErrorDetail, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, PROTOCOL, PROTOCOL_HEADER,
+    valid_workspace_name,
+};
+use crate::stream::{FrameWriter, Limits, ResponseBody, Stalls};
 
 /// Commands running at once; further requests wait for a slot.
 const MAX_RUNNING: usize = 32;
@@ -67,8 +90,20 @@ const MAX_POOLED: usize = 16;
 const COMMANDS_GRACE: Duration = Duration::from_secs(30);
 /// On shutdown, how long running background jobs may take to finish.
 const JOBS_GRACE: Duration = Duration::from_secs(10);
+/// A write's output, held back while it runs and stored to replay its answer
+/// to a retry; a write with more output streams, and is not kept.
+const REPLAY_LIMIT: usize = 1 << 20;
+/// Each request's share of the body budget for its answer, held until the
+/// answer is written or dropped: a streamed answer's buffers, or a held one
+/// sent whole (its output, a little larger once escaped in frames).
+const ANSWER_BUDGET: usize = max(Limits::SERVE.memory(READ_BUFFER), REPLAY_LIMIT + REPLAY_LIMIT / 4);
+/// Reads streaming their answers at once: each holds a command slot while
+/// its client reads, so slow clients cannot take all of the slots.
+const MAX_STREAMING: usize = 8;
+/// A connection whose client takes nothing for this long is closed.
+const WRITE_STALL: Duration = Duration::from_secs(60);
 
-type Body = Full<Bytes>;
+type Body = ResponseBody;
 
 pub fn cmd_serve(app: &mut App, a: &ServeArgs) -> Result<()> {
     io::require_local("bd serve")?;
@@ -192,6 +227,7 @@ async fn serve(server: Arc<Server>, addr: SocketAddr, tls: Option<TlsAcceptor>, 
 /// Serve the HTTP requests of one connection.
 async fn connection(server: Arc<Server>, stream: TcpStream, peer: SocketAddr, tls: Option<TlsAcceptor>) {
     let _ = stream.set_nodelay(true);
+    let stream = Stalls::new(stream, WRITE_STALL);
     let service = service_fn(move |req| handle(server.clone(), req));
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(READ_BUFFER);
@@ -251,6 +287,11 @@ impl Reject {
         Reject { status, code, message: message.into(), exit_code }
     }
 
+    fn failed() -> Reject {
+        let msg = "the command failed on the server; see the server log";
+        Reject::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg, 1)
+    }
+
     fn internal(e: Error) -> Reject {
         tracing::error!(target: "bd::serve", error = %e, "request failed");
         let status = if matches!(e, Error::Busy(_)) {
@@ -277,35 +318,49 @@ impl Reject {
     }
 }
 
-fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response<Body> {
-    let mut r = Response::new(Full::new(Bytes::from(serde_json::to_vec(body).unwrap_or_default())));
+fn response(status: StatusCode, content_type: &'static str, body: Body) -> Response<Body> {
+    let mut r = Response::new(body);
     *r.status_mut() = status;
-    r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    r.headers_mut().insert("bd-version", HeaderValue::from_static(env!("CARGO_PKG_VERSION")));
+    let headers = r.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert("bd-version", HeaderValue::from_static(env!("CARGO_PKG_VERSION")));
+    headers.insert(PROTOCOL_HEADER, HeaderValue::from(PROTOCOL));
     r
 }
 
-/// `[/<prefix>]/w/<name>/v1/exec` -> `<name>`: a proxy may serve bd under a path prefix without stripping it.
-fn exec_path(path: &str) -> Option<&str> {
-    let (_, name) = path.strip_suffix("/v1/exec")?.rsplit_once("/w/")?;
-    Some(name).filter(|w| !w.is_empty() && !w.contains('/'))
+fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response<Body> {
+    response(status, "application/json", Body::whole(serde_json::to_vec(body).unwrap_or_default()))
+}
+
+/// `[/<prefix>]/w/<name>/v<N>/exec` -> (`<name>`, N): a proxy may serve bd
+/// under a path prefix without stripping it.
+fn exec_path(path: &str) -> Option<(&str, u32)> {
+    let (rest, version) = path.strip_suffix("/exec")?.rsplit_once("/v")?;
+    let version = version.parse().ok()?;
+    let (_, name) = rest.rsplit_once("/w/")?;
+    Some((name, version)).filter(|(w, _)| !w.is_empty() && !w.contains('/'))
 }
 
 async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
     let response = if path == "/healthz" && req.method() == Method::GET {
-        let mut r = Response::new(Full::new(Bytes::from_static(b"ok\n")));
-        r.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
-        r
-    } else if let Some(workspace) = exec_path(&path) {
-        if req.method() == Method::POST {
+        response(StatusCode::OK, "text/plain", Body::whole(Bytes::from_static(b"ok\n")))
+    } else if let Some((workspace, version)) = exec_path(&path) {
+        if version != PROTOCOL {
+            let msg = format!(
+                "this bd server (bd {}) speaks protocol {PROTOCOL}, and this client protocol {version}: use the same \
+                 bd version on both",
+                env!("CARGO_PKG_VERSION")
+            );
+            Reject::new(StatusCode::GONE, "remote", msg, 8).response()
+        } else if req.method() == Method::POST {
             exec(&server, workspace.to_string(), req).await
         } else {
             Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
         }
     } else {
-        Reject::new(StatusCode::NOT_FOUND, "not_found", "no such endpoint; workspaces are at /w/<name>/v1/exec", 3)
-            .response()
+        let msg = format!("no such endpoint; workspaces are at /w/<name>/v{PROTOCOL}/exec");
+        Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response()
     };
     Ok(response)
 }
@@ -345,19 +400,22 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
         return Reject::new(StatusCode::NOT_FOUND, "not_found", format!("workspace not found: {workspace}"), 3)
             .response();
     };
-    // Buffered requests share one memory budget: reserve the body's declared
-    // size (or the maximum, when it is sent chunked) before reading it.
+    // Requests share one memory budget: reserve the body's declared size (or
+    // the maximum, when it is sent chunked) before reading it, and the answer's share.
     let declared = hyper::body::Body::size_hint(req.body()).exact();
     if declared.is_some_and(|n| n > server.max_body as u64) {
         return too_large(server.max_body);
     }
     let reserve = declared.map_or(server.max_body, |n| usize::try_from(n).unwrap_or(server.max_body));
-    let permits = kib(reserve.saturating_mul(BODY_COPIES));
-    let budget = match tokio::time::timeout(QUEUE_WAIT, server.body_budget.clone().acquire_many_owned(permits)).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return shutting_down(),
-        Err(_) => return busy("receiving other requests"),
-    };
+    let answer_permits = kib(ANSWER_BUDGET);
+    let permits = kib(reserve.saturating_mul(BODY_COPIES)).saturating_add(answer_permits);
+    let mut budget =
+        match tokio::time::timeout(QUEUE_WAIT, server.body_budget.clone().acquire_many_owned(permits)).await {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return shutting_down(),
+            Err(_) => return busy("receiving other requests"),
+        };
+    let answer_budget = budget.split(answer_permits as usize);
     let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(req.into_body(), server.max_body).collect()).await
     {
         Ok(Ok(b)) => b.to_bytes(),
@@ -382,22 +440,32 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
         Ok(Err(_)) => return shutting_down(),
         Err(_) => return busy("running other commands"),
     };
+    // The command sends its answer's body when the answer starts: whole once
+    // it finishes, or as soon as its output fills a chunk.
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    let out = FrameWriter::new(answer, Limits::SERVE, answer_budget, Some(server.streams.clone()));
     let srv = server.clone();
-    let joined = tokio::task::spawn_blocking(move || {
+    let job = tokio::task::spawn_blocking(move || {
         // Held until the command finishes, even if the client goes away meanwhile.
         let _held = (slot, budget);
-        srv.run(&ws, &token, request, started)
-    })
-    .await;
-    match joined {
-        Ok(Ok(response)) => json_response(StatusCode::OK, &response),
-        Ok(Err(reject)) => reject.response(),
-        Err(e) => {
-            tracing::error!(target: "bd::serve", %workspace, error = %e, "command panicked");
-            let msg = "the command failed on the server; see the server log";
-            Reject::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg, 1).response()
-        }
+        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| srv.run(&ws, &token, request, started, out)));
+        ran.unwrap_or_else(|_| {
+            tracing::error!(target: "bd::serve", workspace = %ws.name, "command panicked");
+            Err(Reject::failed())
+        })
+    });
+    match answered.await {
+        Ok(body) => response(StatusCode::OK, FRAMES_CONTENT_TYPE, body),
+        // No answer: refused before the command ran, or it panicked first.
+        Err(_) => match job.await {
+            Ok(Err(reject)) => reject.response(),
+            Ok(Ok(())) | Err(_) => Reject::failed().response(),
+        },
     }
+}
+
+const fn max(a: usize, b: usize) -> usize {
+    if a > b { a } else { b }
 }
 
 /// Semaphore permits for `bytes` of body budget (one per KiB).
@@ -426,6 +494,8 @@ struct Server {
     /// `<workspace>/<request id>` of writes running now.
     inflight: Mutex<HashSet<String>>,
     running: Arc<Semaphore>,
+    /// Commands whose answers stream, a few of the running ones.
+    streams: Arc<Semaphore>,
     /// Memory of requests in progress, in KiB permits.
     body_budget: Arc<Semaphore>,
     max_body: usize,
@@ -472,7 +542,7 @@ impl Drop for InFlight<'_> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Access {
+pub(crate) enum Access {
     /// Only on the machine holding the workspace.
     Local,
     Read,
@@ -480,7 +550,7 @@ enum Access {
     Write,
 }
 
-fn access(cmd: &Command) -> Access {
+pub(crate) fn access(cmd: &Command) -> Access {
     use Command as C;
     match cmd {
         C::Init(_) | C::Serve(_) | C::Remote(_) | C::Bench(_) | C::BenchWorker(_) => Access::Local,
@@ -549,20 +619,28 @@ fn failure(e: &Error, json: bool) -> ExecResponse {
     ExecResponse { exit_code: e.exit_code(), stderr: crate::render_error(e, json), ..Default::default() }
 }
 
+/// Answer with a response known before the command runs.
+fn respond(out: &mut FrameWriter, response: &ExecResponse) -> std::result::Result<(), Reject> {
+    out.respond(response);
+    Ok(())
+}
+
 fn lossy(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 impl Server {
     fn new(root: PathBuf, max_body: usize) -> Server {
-        let budget = max_body.saturating_mul(BODY_COPIES).max(MIN_BODY_BUDGET);
+        let budget =
+            kib(max_body.saturating_mul(BODY_COPIES)).saturating_add(kib(ANSWER_BUDGET)).max(kib(MIN_BODY_BUDGET));
         Server {
             tokens: Verifier::new(&root),
             root,
             workspaces: Mutex::default(),
             inflight: Mutex::default(),
             running: Arc::new(Semaphore::new(MAX_RUNNING)),
-            body_budget: Arc::new(Semaphore::new(kib(budget) as usize)),
+            streams: Arc::new(Semaphore::new(MAX_STREAMING)),
+            body_budget: Arc::new(Semaphore::new(budget as usize)),
             max_body,
             open: OpenOptions::default(),
         }
@@ -587,46 +665,53 @@ impl Server {
         Some(ws)
     }
 
-    /// Run one command line for `token` in `ws` (on a blocking thread).
+    /// Run one command line for `token` in `ws` (on a blocking thread),
+    /// answering through `out`. A request refused before the command runs
+    /// returns its [`Reject`] instead.
     fn run(
         &self,
         ws: &Workspace,
         token: &Token,
         request: ExecRequest,
         started: Instant,
-    ) -> std::result::Result<ExecResponse, Reject> {
+        mut out: FrameWriter,
+    ) -> std::result::Result<(), Reject> {
         let cli = match Cli::try_parse_from(std::iter::once("bd".to_string()).chain(request.argv.iter().cloned())) {
             Ok(cli) => cli,
-            Err(e) => return Ok(parse_failure(&e)),
+            Err(e) => return respond(&mut out, &parse_failure(&e)),
         };
         let json = cli.global.json;
         let name = crate::command_name(&cli.command);
         let access = access(&cli.command);
         if access == Access::Local {
-            return Ok(failure(&Error::Refused(format!("bd {name} is not available through bd serve")), json));
+            let e = Error::Refused(format!("bd {name} is not available through bd serve"));
+            return respond(&mut out, &failure(&e, json));
         }
         if access == Access::Write && token.role == Role::Read {
             let e =
                 Error::Unauthorized(format!("access token {} is read-only; bd {name} needs a write token", token.name));
-            return Ok(failure(&e, json));
+            return respond(&mut out, &failure(&e, json));
         }
         let actor = match resolve_actor(cli.global.actor.as_deref(), request.actor.as_deref(), token) {
             Ok(a) => a,
-            Err(e) => return Ok(failure(&e, json)),
+            Err(e) => return respond(&mut out, &failure(&e, json)),
         };
         // A write is applied once per request id; a retry replays its response.
         let mut _running = None;
         let mut key = None;
         if let Some(id) = request.request_id.as_deref().filter(|_| access == Access::Write) {
             if let Err(e) = bd_core::requests::validate_id(id) {
-                return Ok(failure(&e, json));
+                return respond(&mut out, &failure(&e, json));
             }
             _running = Some(self.start_request(ws, id)?);
             if let Some(replayed) = self.replay(ws, token, id, json)? {
                 tracing::info!(target: "bd::serve", workspace = %ws.name, token = %token.name, request = id, "replayed");
-                return Ok(replayed);
+                return respond(&mut out, &replayed);
             }
             key = Some(RequestKey { id: id.to_string(), principal: token.id.clone(), recorded: false });
+        }
+        if access == Access::Write {
+            out.hold(REPLAY_LIMIT);
         }
 
         let store = ws.take(&self.open).map_err(Reject::internal)?;
@@ -647,30 +732,49 @@ impl Server {
         app.request = key;
         // What the token may override: admin-only commands, other actors' claims, human gates.
         let policy = token.policy();
+        // Output streams to the client as the command writes it.
+        let out = Rc::new(RefCell::new(out));
         let capture = Capture {
             stdin: request.stdin,
             files_in: request.files,
             admin: policy.admin,
             human: policy.human,
             token_actor: policy.actor,
-            ..Default::default()
+            ..Capture::new(Box::new(out.clone()))
         };
-        let (exit_code, out) = io::capture(capture, || crate::execute(&mut app, &cli.command));
+        let (exit_code, captured) = io::capture(capture, || crate::execute(&mut app, &cli.command));
         let recorded = app.request.as_ref().filter(|k| k.recorded).map(|k| k.id.clone());
         if let Some(store) = app.take_store() {
             if !read_only || store.connection().pragma_update(None, "query_only", false).is_ok() {
                 ws.give(store);
             }
         }
-        let response = ExecResponse {
-            exit_code,
-            stdout: lossy(out.stdout),
-            stderr: lossy(out.stderr),
-            files: out.files_out,
-            replayed: false,
+        let sent = out.borrow_mut().finish(Exit { exit_code, stderr: lossy(captured.stderr), replayed: false });
+        let sent = match sent.held {
+            // A write's answer is stored before it is sent, and the request
+            // released: a retry after a lost answer gets the stored one.
+            Some(answer) => {
+                if let Some(id) = &recorded {
+                    self.save_response(ws, &actor, id, &answer);
+                }
+                drop(_running);
+                out.borrow_mut().respond(&answer)
+            }
+            None => {
+                if let Some(id) = &recorded {
+                    tracing::info!(target: "bd::serve", workspace = %ws.name, request = %id, "output too large to keep for replay");
+                }
+                sent
+            }
         };
-        if let Some(id) = recorded {
-            self.save_response(ws, &actor, &id, &response);
+        if out.borrow().refused() {
+            tracing::info!(target: "bd::serve", workspace = %ws.name, token = %token.name, command = name, "too many answers streaming");
+            return Err(Reject::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "busy",
+                "the server is busy sending other large answers; retry shortly",
+                5,
+            ));
         }
         tracing::info!(
             target: "bd::serve",
@@ -679,10 +783,14 @@ impl Server {
             %actor,
             command = name,
             exit_code,
+            bytes = sent.bytes,
             ms = started.elapsed().as_millis() as u64,
             "exec"
         );
-        Ok(response)
+        if sent.streamed {
+            tracing::debug!(target: "bd::serve", workspace = %ws.name, bytes = sent.bytes, peak = sent.peak, "streamed");
+        }
+        Ok(())
     }
 
     fn start_request(&self, ws: &Workspace, id: &str) -> std::result::Result<InFlight<'_>, Reject> {
@@ -714,10 +822,12 @@ impl Server {
         }
         let mut response = match record.response.as_deref().map(serde_json::from_str::<ExecResponse>) {
             Some(Ok(r)) => r,
-            // Applied, but the server stopped before storing the answer.
+            // Applied, but its output was too large to keep, or the server stopped before storing it.
             _ => failure(
-                &Error::Remote(format!(
-                    "request {id} was applied, but its response was lost; check the current state instead of retrying"
+                &Error::AnswerLost(format!(
+                    "request {id} was applied, but its answer was not kept (more than {} MiB of output, or the \
+                     server stopped first)",
+                    REPLAY_LIMIT >> 20
                 )),
                 json,
             ),
@@ -745,9 +855,10 @@ mod tests {
 
     #[test]
     fn exec_paths() {
-        assert_eq!(exec_path("/w/bd-sync/v1/exec"), Some("bd-sync"));
-        assert_eq!(exec_path("/bd/w/proj/v1/exec"), Some("proj"), "under an unstripped proxy prefix");
-        for bad in ["/w//v1/exec", "/w/a/b/v1/exec", "/v1/exec", "/w/x/v1/exec/", "/w/x"] {
+        assert_eq!(exec_path("/w/bd-sync/v2/exec"), Some(("bd-sync", 2)));
+        assert_eq!(exec_path("/bd/w/proj/v2/exec"), Some(("proj", 2)), "under an unstripped proxy prefix");
+        assert_eq!(exec_path("/w/v2/v1/exec"), Some(("v2", 1)), "older clients learn the protocol changed");
+        for bad in ["/w//v2/exec", "/w/a/b/v2/exec", "/v2/exec", "/w/x/v2/exec/", "/w/x/vx/exec", "/w/x"] {
             assert_eq!(exec_path(bad), None, "{bad}");
         }
     }
@@ -756,6 +867,12 @@ mod tests {
     fn body_budget_permits_are_kib() {
         assert_eq!((kib(0), kib(1), kib(1024), kib(1025)), (1, 1, 1, 2));
         assert_eq!(kib((4096 << 20) * BODY_COPIES), 8 << 20, "the largest --max-body-mib fits");
+        // A maximum-size request, with its answer's share, fits in the budget.
+        for max_body in [1 << 20, 64 << 20, 4096 << 20] {
+            let server = Server::new(PathBuf::from("."), max_body);
+            let request = kib(max_body * BODY_COPIES) + kib(ANSWER_BUDGET);
+            assert!(server.body_budget.available_permits() >= request as usize, "--max-body-mib {}", max_body >> 20);
+        }
     }
 
     fn parse(args: &[&str]) -> Command {

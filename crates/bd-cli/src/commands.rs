@@ -1233,13 +1233,8 @@ pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
         include_ephemeral: a.include_ephemeral,
     };
     let summary = match &a.output {
-        // Under bd serve the file goes back to the client, which writes it.
-        Some(path) if io::serving() => {
-            let mut buf = Vec::new();
-            let s = app.read(|r| r.export_jsonl(&mut buf, &opts))?;
-            io::send_file(path, buf)?;
-            s
-        }
+        // Under bd serve the file streams back to the client, which writes it.
+        Some(path) if io::serving() => io::send_file(path, |w| app.read(|r| r.export_jsonl(w, &opts)))?,
         Some(path) => {
             let tmp = path.with_extension("jsonl.tmp");
             let file = std::fs::File::create(&tmp)?;

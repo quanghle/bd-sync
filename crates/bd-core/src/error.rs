@@ -59,10 +59,16 @@ pub enum Error {
     #[error("{0}")]
     Unauthorized(String),
 
-    /// A bd server could not be reached or answered unexpectedly. Safe to
-    /// retry: writes carry a request id, so a retry is applied at most once.
+    /// A bd server could not be reached, refused the request, or answered
+    /// unexpectedly, and the command did not take effect: it is safe to run
+    /// again.
     #[error("{0}")]
     Remote(String),
+
+    /// A write reached a bd server, but its answer was lost: it may have
+    /// taken effect, so running it again could apply it twice.
+    #[error("{0}")]
+    AnswerLost(String),
 
     #[error("sqlite: {0}")]
     Sqlite(rusqlite::Error),
@@ -113,6 +119,7 @@ impl Error {
             Error::NoWorkspace(_) => "no_workspace",
             Error::Unauthorized(_) => "unauthorized",
             Error::Remote(_) => "remote",
+            Error::AnswerLost(_) => "answer_lost",
             Error::Sqlite(_) => "sqlite",
             Error::Json(_) => "json",
             Error::Io(_) => "io",
@@ -134,6 +141,7 @@ impl Error {
             Error::EventsTruncated { .. } => 6,
             Error::Unauthorized(_) => 7,
             Error::Remote(_) => 8,
+            Error::AnswerLost(_) => 9,
             Error::Conflict { .. } => 13,
             Error::SchemaTooNew { .. } | Error::Sqlite(_) | Error::Json(_) | Error::Io(_) => 1,
         }

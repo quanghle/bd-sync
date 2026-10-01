@@ -75,15 +75,20 @@ impl Server {
     }
 
     fn launch(root: TempDir, listen: &str, extra: &[&str]) -> Server {
-        let mut child = bd(root.path())
-            .args(["serve", "--root"])
+        Server::launch_with(root, listen, extra, |_| {})
+    }
+
+    /// Like `launch`, after `setup` adjusts the server's command (environment, stderr).
+    fn launch_with(root: TempDir, listen: &str, extra: &[&str], setup: impl FnOnce(&mut Command)) -> Server {
+        let mut cmd = bd(root.path());
+        cmd.args(["serve", "--root"])
             .arg(root.path())
             .args(["--listen", listen])
             .args(extra)
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::null());
+        setup(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
         let mut line = String::new();
         BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
         let base =
@@ -1081,4 +1086,259 @@ fn server_log_is_plain_text_with_one_line_per_request() {
     let exec: Vec<&str> = text.lines().filter(|l| l.contains("exec")).collect();
     assert_eq!(exec.len(), 1, "{text}");
     assert!(exec[0].contains("token=alice-laptop") && exec[0].contains("exit_code=0"), "{}", exec[0]);
+}
+
+/// Poll until `done` holds, with a deadline generous enough for loaded CI machines.
+fn eventually(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Leases that last a second and are reclaimable as soon as they expire.
+fn short_leases(ws: &Path) {
+    for (key, value) in [("lease.ttl", "1s"), ("lease.grace", "0s")] {
+        check(bd(ws).args(["config", "set", key, value]).output().unwrap(), "config set");
+    }
+}
+
+/// A stand-in for the server's GitHub CLI: `pr view 42` reports a merged PR,
+/// any other PR a closed one.
+fn merged_pr_gh(dir: &Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let gh = dir.join("fake-gh.cmd");
+        std::fs::write(
+            &gh,
+            "@echo off\r\nif \"%~3\"==\"42\" goto merged\r\necho {\"state\":\"CLOSED\",\"title\":\"Old\"}\r\nexit /b 0\r\n:merged\r\necho {\"state\":\"MERGED\",\"title\":\"Feature\"}\r\n",
+        )
+        .unwrap();
+        gh
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = dir.join("fake-gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\ncase \"$3\" in 42) echo '{\"state\":\"MERGED\",\"title\":\"Feature\"}' ;; *) echo '{\"state\":\"CLOSED\",\"title\":\"Old\"}' ;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        gh
+    }
+}
+
+/// `(op, issue)` of the events the server wrote itself.
+fn server_events(client: &Client) -> Vec<(String, String)> {
+    let events = client.ok(&["--json", "events", "--since", "0"]);
+    events
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|e| e["actor"] == "bd-serve")
+        .map(|e| (e["op"].as_str().unwrap().to_string(), e["issue_id"].as_str().unwrap_or_default().to_string()))
+        .collect()
+}
+
+fn has(events: &[(String, String)], op: &str, issue: &str) -> bool {
+    events.iter().any(|(o, i)| o == op && i == issue)
+}
+
+#[test]
+fn background_jobs_reclaim_leases_and_open_gates_without_clients() {
+    let root = Server::prepare();
+    short_leases(&root.path().join("proj"));
+    let tools = tempfile::tempdir().unwrap();
+    let gh = merged_pr_gh(tools.path());
+    let fast = ["--reclaim-every", "100ms", "--gate-check-every", "100ms", "--gh-check-every", "100ms"];
+    let server = Server::launch_with(root, "127.0.0.1:0", &fast, |c| {
+        c.env("BD_GH", &gh);
+    });
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "Abandoned"]);
+    alice.ok(&["create", "Baked"]);
+    alice.ok(&["create", "Merged"]);
+    alice.ok(&["claim", "t-1"]);
+    alice.ok(&["gate", "create", "-t", "timer", "--timeout", "1s", "--blocks", "t-2"]);
+    alice.ok(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--blocks", "t-3"]);
+
+    eventually("the dead worker's claim to be reclaimed", || alice.json(&["show", "t-1"])["status"] == "open");
+    eventually("the timer gate to open", || alice.json(&["show", "t-4"])["status"] == "closed");
+    // On Windows, workspace paths under bd serve are verbatim (\\?\C:\...), which cmd.exe,
+    // and so this batch-file gh, refuses as a working directory (bd-sync-wnh).
+    let github = !cfg!(windows);
+    if github {
+        eventually("the server's gh to open the PR gate", || alice.json(&["show", "t-5"])["status"] == "closed");
+    }
+    let ready: Vec<String> =
+        alice.json(&["ready"]).as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
+    assert!(ready.contains(&"t-1".to_string()) && ready.contains(&"t-2".to_string()), "{ready:?}");
+
+    let events = server_events(&alice);
+    assert!(has(&events, "reclaimed", "t-1"), "written by the server as bd-serve: {events:?}");
+    assert!(has(&events, "closed", "t-4"), "{events:?}");
+    assert!(!github || has(&events, "closed", "t-5"), "{events:?}");
+    assert_eq!(alice.json(&["show", "t-1"])["assignee"], Value::Null);
+}
+
+#[test]
+fn background_jobs_can_be_turned_off() {
+    let root = Server::prepare();
+    short_leases(&root.path().join("proj"));
+    let tools = tempfile::tempdir().unwrap();
+    let gh = merged_pr_gh(tools.path());
+    let flags = ["--reclaim-every", "0", "--gh-check-every", "off", "--gate-check-every", "100ms"];
+    let server = Server::launch_with(root, "127.0.0.1:0", &flags, |c| {
+        c.env("BD_GH", &gh);
+    });
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "Claimed"]);
+    alice.ok(&["create", "Merged"]);
+    alice.ok(&["create", "Baked"]);
+    alice.ok(&["claim", "t-1"]);
+    alice.ok(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--blocks", "t-2"]);
+    alice.ok(&["gate", "create", "-t", "timer", "--timeout", "2s", "--blocks", "t-3"]);
+
+    eventually("the timer gate to open: gate checks are on", || alice.json(&["show", "t-5"])["status"] == "closed");
+    // The lease expired a second before the timer opened, and gh checks would have run many times by now.
+    assert_eq!(alice.json(&["show", "t-1"])["status"], "in_progress", "the reclaim sweep is off");
+    assert_eq!(alice.json(&["show", "t-4"])["status"], "open", "GitHub checks are off, and --type local skips them");
+    let events = server_events(&alice);
+    assert!(has(&events, "closed", "t-5"), "{events:?}");
+    assert!(events.iter().all(|(_, issue)| !["t-1", "t-2", "t-4"].contains(&issue.as_str())), "{events:?}");
+}
+
+#[test]
+fn serve_validates_background_job_flags() {
+    let root = tempfile::tempdir().unwrap();
+    let not_a_dir = root.path().join("file");
+    std::fs::write(&not_a_dir, "x").unwrap();
+    let inside_a_file = not_a_dir.join("backups");
+    for bad in [
+        &["--reclaim-every", "soon"][..],
+        &["--gate-check-every", "10ms"],
+        &["--gh-check-every", "-1"],
+        &["--backup-every", "1h"],
+        &["--backup-keep", "3"],
+        &["--backup-dir", inside_a_file.to_str().unwrap()],
+    ] {
+        let child = bd(root.path())
+            .args(["serve", "--listen", "127.0.0.1:0", "--root"])
+            .arg(root.path())
+            .args(bad)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // A flag that is wrongly accepted starts a server: do not wait on it forever.
+        let mut child = KillOnDrop::new(child);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while child.child().try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline, "bd serve {bad:?} started instead of refusing the flags");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let out = child.wait_with_output();
+        assert_eq!(out.status.code(), Some(2), "{bad:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// Finished backups of workspace `proj`, oldest first.
+fn backups_of_proj(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir.join("proj"))
+        .map(|d| d.map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n.ends_with(".db")).collect())
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+#[test]
+fn background_backups_restore_and_keep_the_newest() {
+    let root = Server::prepare();
+    let backups = tempfile::tempdir().unwrap();
+    let flags = ["--backup-dir", backups.path().to_str().unwrap(), "--backup-every", "200ms", "--backup-keep", "2"];
+    let server = Server::launch(root, "127.0.0.1:0", &flags);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "Worth keeping"]);
+
+    // Backups started after the create hold it; retention deletes all but the newest two.
+    let before: std::collections::HashSet<String> = backups_of_proj(backups.path()).into_iter().collect();
+    let mut seen = std::collections::BTreeSet::new();
+    eventually("three new backups, then only the newest two kept", || {
+        let now = backups_of_proj(backups.path());
+        seen.extend(now.iter().cloned());
+        seen.iter().filter(|n| !before.contains(*n)).count() >= 3 && now.len() == 2
+    });
+    for name in &seen {
+        let stamp = name.strip_prefix("proj-").and_then(|n| n.strip_suffix("Z.db")).unwrap_or_default();
+        assert!(stamp.len() == 19 && stamp.as_bytes()[8] == b'T', "proj-<UTC time>.db: {name}");
+    }
+
+    // The documented restore into a new workspace while the server runs: copy, then rename into place.
+    let restored = server.root.path().join("restored");
+    std::fs::create_dir_all(restored.join(".bd")).unwrap();
+    let part = restored.join(".bd").join("bd.db.tmp");
+    eventually("a copy of the newest backup", || {
+        backups_of_proj(backups.path())
+            .last()
+            .is_some_and(|newest| std::fs::copy(backups.path().join("proj").join(newest), &part).is_ok())
+    });
+    std::fs::rename(&part, restored.join(".bd").join("bd.db")).unwrap();
+    let list = check(bd(&restored).args(["--json", "list"]).output().unwrap(), "list the restored workspace");
+    let titles: Vec<Value> =
+        serde_json::from_str::<Value>(&list).unwrap().as_array().unwrap().iter().map(|i| i["title"].clone()).collect();
+    assert_eq!(titles, vec![json!("Worth keeping")]);
+    check(bd(&restored).arg("doctor").output().unwrap(), "doctor on the restored workspace");
+}
+
+/// A GitHub CLI that never answers: it notes that it started, then sleeps.
+#[cfg(unix)]
+fn hanging_gh(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let gh = dir.join("hanging-gh");
+    std::fs::write(&gh, "#!/bin/sh\ntouch \"$(dirname \"$0\")/gh-started\"\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gh
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_stops_background_jobs_without_waiting_for_gh() {
+    let root = Server::prepare();
+    let tools = tempfile::tempdir().unwrap();
+    let gh = hanging_gh(tools.path());
+    let backups = tempfile::tempdir().unwrap();
+    let log = tools.path().join("server.log");
+    let flags =
+        ["--gh-check-every", "100ms", "--backup-dir", backups.path().to_str().unwrap(), "--backup-every", "100ms"];
+    let mut server = Server::launch_with(root, "127.0.0.1:0", &flags, |c| {
+        c.env("BD_GH", &gh).env("BD_LOG", "bd::serve=info").stderr(std::fs::File::create(&log).unwrap());
+    });
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "Waits for GitHub"]);
+    alice.ok(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--blocks", "t-1"]);
+    eventually("a gh call in progress", || tools.path().join("gh-started").exists());
+    eventually("a backup", || !backups_of_proj(backups.path()).is_empty());
+
+    let pid = server.child.id().to_string();
+    check(Command::new("kill").args(["-TERM", &pid]).output().unwrap(), "kill -TERM");
+    let stopping = Instant::now();
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(stopping.elapsed() < Duration::from_secs(30), "bd serve did not exit");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(stopping.elapsed() < Duration::from_secs(8), "the gh call is cancelled: {:?}", stopping.elapsed());
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("background jobs stopped"), "{text}");
+    let leftovers: Vec<String> = std::fs::read_dir(backups.path().join("proj"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| !n.ends_with(".db"))
+        .collect();
+    assert!(leftovers.is_empty(), "no unfinished backup: {leftovers:?}");
 }

@@ -8,6 +8,7 @@ mod credentials;
 mod fmt;
 mod gates;
 mod io;
+mod jobs;
 mod logging;
 mod paths;
 mod playbooks;

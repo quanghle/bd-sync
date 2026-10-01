@@ -323,6 +323,47 @@ impl Store {
     pub fn checkpoint(&self) -> Result<(i64, i64)> {
         Ok(self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| Ok((r.get(1)?, r.get(2)?)))?)
     }
+
+    /// Write a consistent, compacted copy of the database to `dest`, which
+    /// must not exist, with `VACUUM INTO`: one self-contained file in
+    /// rollback-journal mode. It runs as a read transaction, so writers carry
+    /// on meanwhile. The copy holds the whole workspace, so on Unix only its
+    /// owner may read it (mode 0600). It is checked (`quick_check`) and
+    /// flushed to disk before this returns; on failure it is removed.
+    pub fn snapshot(&self, dest: &Path) -> Result<()> {
+        let target = dest.to_str().ok_or_else(|| Error::invalid(format!("{}: not a UTF-8 path", dest.display())))?;
+        // Created empty first (VACUUM INTO accepts that): private from the
+        // start, and a file that already exists is never touched.
+        let mut create = std::fs::OpenOptions::new();
+        create.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut create, 0o600);
+        create.open(dest).map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => Error::invalid(format!("{} already exists", dest.display())),
+            _ => Error::Io(e),
+        })?;
+        let written =
+            self.conn.execute("VACUUM INTO ?1", [target]).map_err(Error::from).and_then(|_| verify_copy(dest));
+        if written.is_err() {
+            let mut journal = dest.as_os_str().to_owned();
+            journal.push("-journal");
+            let _ = std::fs::remove_file(journal);
+            let _ = std::fs::remove_file(dest);
+        }
+        written
+    }
+}
+
+fn verify_copy(path: &Path) -> Result<()> {
+    let copy = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let check: String = copy.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if check != "ok" {
+        return Err(Error::Io(std::io::Error::other(format!("{}: integrity check failed: {check}", path.display()))));
+    }
+    drop(copy);
+    // Write access: Windows flushes only handles that may write.
+    std::fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
+    Ok(())
 }
 
 impl Drop for Store {

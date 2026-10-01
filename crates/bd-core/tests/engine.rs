@@ -869,3 +869,33 @@ fn concurrent_workers_claim_each_issue_exactly_once() {
     }
     env.assert_healthy();
 }
+
+#[test]
+fn snapshots_are_verified_self_contained_copies() {
+    let mut env = Env::new();
+    let id = env.create("Survives the restore", 1);
+    let dir = tempfile::tempdir().unwrap();
+    let copy = dir.path().join("copy.db");
+    env.store.snapshot(&copy).unwrap();
+    env.create("After the snapshot", 2);
+    let names: Vec<String> =
+        std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    assert_eq!(names, vec!["copy.db"], "one file, no -wal or -shm");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "only the owner may read a copy of everything: {mode:o}");
+    }
+
+    let err = env.store.snapshot(&copy).unwrap_err();
+    assert_eq!(err.exit_code(), 2, "never overwrites: {err}");
+    assert!(copy.is_file(), "the existing file is left alone");
+
+    let restored = Store::open(&copy, OpenOptions::default()).unwrap();
+    let titles: Vec<String> =
+        restored.read(|r| r.list(&ListQuery::default())).unwrap().into_iter().map(|i| i.title).collect();
+    assert_eq!(titles, vec!["Survives the restore"]);
+    assert_eq!(restored.read(|r| r.issue(&id)).unwrap().priority, 1);
+    assert_eq!(restored.meta("workspace_id").unwrap(), env.store.meta("workspace_id").unwrap());
+}

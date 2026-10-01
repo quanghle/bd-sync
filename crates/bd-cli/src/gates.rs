@@ -3,10 +3,16 @@
 //! `bd gate check` reads the open gates from one snapshot, evaluates them
 //! (GitHub gates through the `gh` CLI, outside any transaction, so slow
 //! network calls never hold the write lock), then applies the verdicts in one
-//! write transaction that re-checks each gate is still open.
+//! write transaction that re-checks each gate is still open. Each `gh` call
+//! is killed after [`GH_TIMEOUT`]. `bd serve` runs the same check on a timer
+//! (see `jobs.rs`).
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use bd_core::gates::{self, GateKind, GatePhase, GateSpec, GateView, NewGate, Verdict};
 use bd_core::{Error, Queries, Result, Timestamp, WriteCtx};
@@ -213,15 +219,88 @@ fn gh_bin() -> String {
     std::env::var("BD_GH").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "gh".into())
 }
 
+/// How long one `gh` call may run before it is killed and its gate reported as an error.
+const GH_TIMEOUT: Duration = Duration::from_secs(60);
+
+static GH_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Stop running `gh` calls in this process, and fail later ones at once:
+/// `bd serve` is shutting down. Their gates are reported as errors and left as they are.
+pub fn cancel_gh_calls() {
+    GH_CANCELLED.store(true, Ordering::Relaxed);
+}
+
+/// Why [`output_within`] gave up on a command.
+#[derive(Debug)]
+enum Stopped {
+    Failed(std::io::Error),
+    TimedOut,
+    Cancelled,
+}
+
+/// Collect a child's output on its own thread, so a full pipe never stalls it.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    if let Some(mut pipe) = pipe {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = pipe.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+    }
+    rx
+}
+
+/// Run `cmd` to completion like [`Command::output`], but kill it once
+/// `timeout` passes or `cancel` is set.
+fn output_within(mut cmd: Command, timeout: Duration, cancel: &AtomicBool) -> std::result::Result<Output, Stopped> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Stopped::Cancelled);
+    }
+    let deadline = Instant::now() + timeout;
+    let mut child =
+        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(Stopped::Failed)?;
+    let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
+    let mut pause = Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(Stopped::Failed)? {
+            break status;
+        }
+        let stop = if cancel.load(Ordering::Relaxed) {
+            Some(Stopped::Cancelled)
+        } else if Instant::now() >= deadline {
+            Some(Stopped::TimedOut)
+        } else {
+            None
+        };
+        if let Some(why) = stop {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(why);
+        }
+        std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
+        pause = (pause * 2).min(Duration::from_millis(50));
+    };
+    // A grandchild may still hold a pipe open; do not wait past the deadline for it.
+    let collect = |rx: mpsc::Receiver<Vec<u8>>| {
+        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(100)))
+            .unwrap_or_default()
+    };
+    Ok(Output { status, stdout: collect(stdout), stderr: collect(stderr) })
+}
+
 fn gh_json(args: &[String], cwd: &Path) -> std::result::Result<Value, String> {
-    let out = Command::new(gh_bin())
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|e| format!("cannot run `{}`: {e} (install the GitHub CLI or set BD_GH)", gh_bin()))?;
+    let sub = args.first().map(String::as_str).unwrap_or_default();
+    let mut cmd = Command::new(gh_bin());
+    cmd.args(args).current_dir(cwd);
+    let out = output_within(cmd, GH_TIMEOUT, &GH_CANCELLED).map_err(|e| match e {
+        Stopped::Failed(e) => format!("cannot run `{}`: {e} (install the GitHub CLI or set BD_GH)", gh_bin()),
+        Stopped::TimedOut => format!("gh {sub}: no answer within {}s", GH_TIMEOUT.as_secs()),
+        Stopped::Cancelled => format!("gh {sub}: cancelled, the server is shutting down"),
+    })?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("gh {}: {}", args.first().map(String::as_str).unwrap_or_default(), err.trim()));
+        return Err(format!("gh {sub}: {}", err.trim()));
     }
     serde_json::from_slice(&out.stdout).map_err(|e| format!("gh returned invalid JSON: {e}"))
 }
@@ -398,10 +477,12 @@ fn workdir(app: &App) -> PathBuf {
 }
 
 fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
-    let kind_filter: Option<Vec<GateKind>> = match a.kind.as_deref().map(str::trim) {
-        None | Some("") | Some("all") => None,
-        Some("gh") => Some(vec![GateKind::GhRun, GateKind::GhPr]),
-        Some(k) => Some(vec![GateKind::parse(k)?]),
+    // `local`: every gate checked without `gh`, malformed ones included.
+    let (kind_filter, malformed) = match a.kind.as_deref().map(str::trim) {
+        None | Some("") | Some("all") => (None, true),
+        Some("gh") => (Some(vec![GateKind::GhRun, GateKind::GhPr]), false),
+        Some("local") => (Some(vec![GateKind::Human, GateKind::Timer, GateKind::Issue]), true),
+        Some(k) => (Some(vec![GateKind::parse(k)?]), false),
     };
     let cwd = workdir(app);
     let (candidates, local, now) = app.read(|r| {
@@ -417,7 +498,7 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
         list.retain(|g| match (&kind_filter, &g.spec) {
             (None, _) => true,
             (Some(kinds), Some(s)) => kinds.contains(&s.kind),
-            (Some(_), None) => false,
+            (Some(_), None) => malformed,
         });
         let now = r.now();
         let local = list.iter().map(|g| gates::evaluate_local(r.conn(), g, now)).collect::<Result<Vec<_>>>()?;
@@ -535,4 +616,73 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
     }
     app.print(out);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A command that runs for about ten seconds.
+    fn sleeper() -> Command {
+        #[cfg(windows)]
+        let c = {
+            let mut c = Command::new("ping");
+            c.args(["-n", "11", "127.0.0.1"]);
+            c
+        };
+        #[cfg(not(windows))]
+        let c = {
+            let mut c = Command::new("sleep");
+            c.arg("10");
+            c
+        };
+        c
+    }
+
+    #[test]
+    fn bounded_commands_return_their_output() {
+        #[cfg(windows)]
+        let (cmd, code, stderr) = {
+            let mut c = Command::new("cmd");
+            c.args(["/C", "echo out"]);
+            (c, 0, "")
+        };
+        #[cfg(not(windows))]
+        let (cmd, code, stderr) = {
+            let mut c = Command::new("sh");
+            c.args(["-c", "echo out; echo err >&2; exit 3"]);
+            (c, 3, "err")
+        };
+        let out = output_within(cmd, Duration::from_secs(30), &AtomicBool::new(false)).unwrap();
+        assert_eq!(out.status.code(), Some(code));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "out");
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), stderr);
+        let missing = Command::new("/nonexistent/bd-test-gh");
+        assert!(matches!(
+            output_within(missing, Duration::from_secs(1), &AtomicBool::new(false)),
+            Err(Stopped::Failed(_))
+        ));
+    }
+
+    #[test]
+    fn slow_commands_are_killed_at_the_timeout_or_when_cancelled() {
+        let started = Instant::now();
+        let r = output_within(sleeper(), Duration::from_millis(200), &AtomicBool::new(false));
+        assert!(matches!(r, Err(Stopped::TimedOut)), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "killed at the timeout: {:?}", started.elapsed());
+
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = cancel.clone();
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let r = output_within(sleeper(), Duration::from_secs(60), &cancel);
+        assert!(matches!(r, Err(Stopped::Cancelled)), "{r:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "killed when cancelled: {:?}", started.elapsed());
+        canceller.join().unwrap();
+        let r = output_within(sleeper(), Duration::from_secs(60), &cancel);
+        assert!(matches!(r, Err(Stopped::Cancelled)), "nothing starts once cancelled: {r:?}");
+    }
 }

@@ -10,6 +10,9 @@
 //! Layout: `<root>/<name>/.bd/bd.db` is workspace `<name>`, served at
 //! `POST /w/<name>/v1/exec`; `<root>/tokens.json` holds the access tokens.
 //! `GET /healthz` answers `ok` without a token.
+//!
+//! Background jobs keep every workspace up without a client asking: lease
+//! reclaim, gate checks, backups and pruning of request records (`jobs.rs`).
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -36,6 +39,7 @@ use crate::app::{App, RequestKey};
 use crate::auth::{self, Role, Token, Verifier};
 use crate::cli::*;
 use crate::io::{self, Capture};
+use crate::jobs;
 use crate::protocol::{ErrorBody, ErrorDetail, ExecRequest, ExecResponse, valid_workspace_name};
 
 /// Commands running at once; further requests wait for a slot.
@@ -59,9 +63,10 @@ const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const READ_BUFFER: usize = 64 << 10;
 /// Idle database connections kept per workspace.
 const MAX_POOLED: usize = 16;
-/// How long idempotency records are kept; retries come within seconds.
-const REQUEST_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
-const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
+/// On shutdown, how long running commands may take to finish.
+const COMMANDS_GRACE: Duration = Duration::from_secs(30);
+/// On shutdown, how long running background jobs may take to finish.
+const JOBS_GRACE: Duration = Duration::from_secs(10);
 
 type Body = Full<Bytes>;
 
@@ -103,9 +108,14 @@ fn run(a: &ServeArgs) -> Result<()> {
         return Err(Error::invalid(format!("--max-body-mib {}: use 1 to 4096", a.max_body_mib)));
     }
     let max_body = usize::try_from(a.max_body_mib << 20).unwrap_or(usize::MAX);
+    let jobs = jobs::Config::from_args(a)?;
     let server = Arc::new(Server::new(root, max_body));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("bd-serve").build()?;
-    runtime.block_on(serve(server, addr, tls))
+    let served = runtime.block_on(serve(server, addr, tls, jobs));
+    // Commands and jobs still running after their grace period are abandoned:
+    // SQLite rolls back an unfinished transaction.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    served
 }
 
 fn tls_acceptor(cert: &Path, key: &Path) -> Result<TlsAcceptor> {
@@ -132,13 +142,14 @@ fn tls_acceptor(cert: &Path, key: &Path) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
-async fn serve(server: Arc<Server>, addr: SocketAddr, tls: Option<TlsAcceptor>) -> Result<()> {
+async fn serve(server: Arc<Server>, addr: SocketAddr, tls: Option<TlsAcceptor>, jobs: jobs::Config) -> Result<()> {
     let listener = TcpListener::bind(addr).await.map_err(|e| Error::invalid(format!("--listen {addr}: {e}")))?;
     let local = listener.local_addr()?;
     let scheme = if tls.is_some() { "https" } else { "http" };
     // Tests and scripts read the bound address (with --listen ...:0) from this line.
     io::outln(format!("bd serve: listening on {scheme}://{local} (workspaces in {})", server.root.display()));
     tracing::info!(target: "bd::serve", %local, scheme, root = %server.root.display(), "listening");
+    let jobs = jobs::start(jobs, server.root.clone(), server.open.clone());
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -168,8 +179,11 @@ async fn serve(server: Arc<Server>, addr: SocketAddr, tls: Option<TlsAcceptor>) 
         });
     }
     tracing::info!(target: "bd::serve", "shutting down after running commands finish");
+    // GitHub gates are checked again after a restart; no need to wait for gh.
+    crate::gates::cancel_gh_calls();
     let all = u32::try_from(MAX_RUNNING).unwrap_or(u32::MAX);
-    let _ = tokio::time::timeout(Duration::from_secs(30), server.running.acquire_many(all)).await;
+    let commands = tokio::time::timeout(COMMANDS_GRACE, server.running.acquire_many(all));
+    let _ = tokio::join!(commands, jobs.stop(JOBS_GRACE));
     Ok(())
 }
 
@@ -421,7 +435,6 @@ struct Workspace {
     dir: PathBuf,
     db: PathBuf,
     pool: Mutex<Vec<Store>>,
-    pruned: Mutex<Option<Instant>>,
 }
 
 impl Workspace {
@@ -567,8 +580,7 @@ impl Server {
         if !db.is_file() {
             return None;
         }
-        let ws =
-            Arc::new(Workspace { name: name.to_string(), dir, db, pool: Mutex::default(), pruned: Mutex::default() });
+        let ws = Arc::new(Workspace { name: name.to_string(), dir, db, pool: Mutex::default() });
         map.insert(name.to_string(), ws.clone());
         Some(ws)
     }
@@ -654,7 +666,6 @@ impl Server {
         if let Some(id) = recorded {
             self.save_response(ws, &actor, &id, &response);
         }
-        self.prune(ws);
         tracing::info!(
             target: "bd::serve",
             workspace = %ws.name,
@@ -718,32 +729,6 @@ impl Server {
         });
         if let Err(e) = saved {
             tracing::warn!(target: "bd::serve", workspace = %ws.name, request = id, error = %e, "response not stored for replay");
-        }
-    }
-
-    /// Drop idempotency records past retention, at most once an hour per workspace.
-    fn prune(&self, ws: &Workspace) {
-        {
-            let mut last = lock(&ws.pruned);
-            if last.is_some_and(|t| t.elapsed() < PRUNE_EVERY) {
-                return;
-            }
-            *last = Some(Instant::now());
-        }
-        let pruned = ws.take(&self.open).and_then(|mut store| {
-            let r = store.write("requests.prune", "bd-serve", |tx| {
-                let before = tx.now().minus(REQUEST_RETENTION);
-                tx.prune_requests(before, 10_000)
-            });
-            ws.give(store);
-            r
-        });
-        match pruned {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(target: "bd::serve", workspace = %ws.name, records = n, "pruned request records"),
-            Err(e) => {
-                tracing::warn!(target: "bd::serve", workspace = %ws.name, error = %e, "pruning request records failed")
-            }
         }
     }
 }

@@ -1,7 +1,8 @@
 //! Structured diagnostics on stderr via `tracing`.
 //!
 //! Filter with `BD_LOG` (EnvFilter syntax, default `warn`; `bd serve` adds
-//! `bd::serve=info`, one line per request): `BD_LOG=bd=debug`
+//! `bd::serve=info`: one line per request, and per background job that
+//! changed something): `BD_LOG=bd=debug`
 //! shows per-transaction lock/exec/commit timings; `bd::slow` warnings report
 //! slow transactions and commands. Colors only on a terminal (and never with
 //! `NO_COLOR`), so log files stay plain text. Logs never leave the machine.

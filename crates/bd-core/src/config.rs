@@ -42,7 +42,7 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("id.mode", "hash", "Id scheme: hash | counter"),
     ("lease.ttl", "5m", "Claim lease duration; heartbeat faster than this"),
     ("lease.grace", "10m", "How long past expiry a lease must be before reclaim reverts it"),
-    ("lease.auto_reclaim", "true", "claim --next reclaims stale leases (past grace) first"),
+    ("lease.auto_reclaim", "true", "claim --next and bd serve reclaim stale leases (past grace) automatically"),
     ("claim.pools", "", "Comma-separated pool assignees anyone may claim from"),
     ("types.custom", "", "Comma-separated extra issue types"),
     ("durability", "normal", "SQLite synchronous level: off | normal | full"),

@@ -939,7 +939,7 @@ pub struct GateListArgs {
 pub struct GateCheckArgs {
     /// Only these gates (default: every open gate)
     pub ids: Vec<String>,
-    /// Only gates of this type (human, timer, issue, gh:run, gh:pr, or gh for both GitHub types)
+    /// Only gates of this type (human, timer, issue, gh:run, gh:pr; gh for both GitHub types, local for all others)
     #[arg(short = 't', long = "type")]
     pub kind: Option<String>,
     /// Report what would happen without changing anything
@@ -1084,6 +1084,24 @@ pub struct ServeArgs {
     /// Largest request accepted, in MiB (imports and batches travel in the request)
     #[arg(long, default_value_t = 64, value_name = "MIB")]
     pub max_body_mib: u64,
+    /// Reclaim leases expired past lease.grace in every workspace this often (0 = off)
+    #[arg(long, default_value = "1m", value_name = "DURATION")]
+    pub reclaim_every: String,
+    /// Check timer, issue and human gates in every workspace this often (0 = off)
+    #[arg(long, default_value = "1m", value_name = "DURATION")]
+    pub gate_check_every: String,
+    /// Check GitHub gates with this host's gh this often (0 = off)
+    #[arg(long, default_value = "5m", value_name = "DURATION")]
+    pub gh_check_every: String,
+    /// Back up every workspace into DIR/<name>/ (default: no backups)
+    #[arg(long, value_name = "DIR")]
+    pub backup_dir: Option<PathBuf>,
+    /// Time between backups of a workspace
+    #[arg(long, default_value = "1h", value_name = "DURATION", requires = "backup_dir")]
+    pub backup_every: String,
+    /// Backups kept per workspace; older ones are deleted (0 = keep all)
+    #[arg(long, default_value_t = 24, value_name = "N", requires = "backup_dir")]
+    pub backup_keep: usize,
 }
 
 #[derive(Subcommand, Debug, Clone)]

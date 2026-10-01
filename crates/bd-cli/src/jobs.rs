@@ -1,0 +1,956 @@
+//! Background jobs of `bd serve`: lease reclaim, gate checks, backups, and
+//! pruning of request records, in every workspace under the root, on timers.
+//!
+//! The scheduler scans `<root>/*/.bd/bd.db` every so often, so workspaces no
+//! client has used since the server started are kept up too: dead workers'
+//! claims are reclaimed, timers open, and backups are taken. Each
+//! (workspace, job) pair has its own timer, first fired at a random point
+//! within one interval, then every interval ±10%, so workspaces do not fire
+//! in lockstep. A job never overlaps itself. Jobs run on blocking threads in
+//! small lanes (database jobs, `gh` checks, backups) apart from the slots of
+//! client requests, and every write is a short transaction of its own: `gh`
+//! runs outside any transaction and backups are read transactions. A failed
+//! job is logged and tried again later, backing off up to 32 intervals.
+//!
+//! Jobs run the CLI's own commands (`bd reclaim`, `bd gate check --type
+//! local` or `--type gh`) as actor [`ACTOR`], with their I/O captured the way
+//! a request's is, so events, checks and policies are those of the commands.
+//! Backups are [`Store::snapshot`]s (`VACUUM INTO`) written under a temporary
+//! name and then renamed to `<backup dir>/<name>/<name>-<UTC time>.db`; the
+//! newest `keep` are kept.
+//!
+//! On shutdown no job starts any more, and running ones get a grace period.
+//! Abandoning one is safe: an unfinished transaction rolls back, and the
+//! next backup removes the temporary file of an unfinished one.
+
+use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use bd_core::time::{format_duration_ms, parse_duration};
+use bd_core::{Error, OpenOptions, Result, Store};
+use clap::Parser;
+use serde_json::Value;
+use tokio::sync::{Semaphore, mpsc, watch};
+
+use crate::app::App;
+use crate::cli::{Cli, Command, ServeArgs};
+use crate::io::{self, Capture};
+use crate::protocol::valid_workspace_name;
+
+/// The actor of background writes: reclaims, and gates opened or escalated.
+pub const ACTOR: &str = "bd-serve";
+/// The shortest and longest intervals accepted for a job.
+const MIN_EVERY: Duration = Duration::from_millis(100);
+const MAX_EVERY: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+/// How long idempotency records are kept; retries come within seconds.
+const REQUEST_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
+/// Records deleted per transaction, so pruning never holds the write lock long.
+const PRUNE_BATCH: usize = 10_000;
+/// New workspaces get their jobs within this long (or the shortest interval).
+const SCAN_EVERY: Duration = Duration::from_secs(30);
+/// A failing job waits at most this many intervals before trying again.
+const MAX_BACKOFF: u32 = 32;
+/// Backup file times: UTC, sortable, and valid in file names everywhere.
+const STAMP: &str = "%Y%m%dT%H%M%S%.3fZ";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Job {
+    Reclaim,
+    /// Timer, issue and human gates (and malformed ones): no `gh` needed.
+    Gates,
+    GhGates,
+    Backup,
+    Prune,
+}
+
+/// Jobs running at once per lane: database jobs, `gh` checks, backups.
+const LANES: [usize; 3] = [2, 2, 1];
+
+impl Job {
+    const ALL: [Job; 5] = [Job::Reclaim, Job::Gates, Job::GhGates, Job::Backup, Job::Prune];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Job::Reclaim => "reclaim",
+            Job::Gates => "gate-check",
+            Job::GhGates => "gh-check",
+            Job::Backup => "backup",
+            Job::Prune => "prune",
+        }
+    }
+
+    fn lane(self) -> usize {
+        match self {
+            Job::Reclaim | Job::Gates | Job::Prune => 0,
+            Job::GhGates => 1,
+            Job::Backup => 2,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Backups {
+    pub dir: PathBuf,
+    pub every: Duration,
+    /// Backups kept per workspace (0 keeps all).
+    pub keep: usize,
+}
+
+/// How often each job runs; `None` turns it off.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Config {
+    pub reclaim_every: Option<Duration>,
+    pub gate_check_every: Option<Duration>,
+    pub gh_check_every: Option<Duration>,
+    pub backups: Option<Backups>,
+    pub prune_every: Option<Duration>,
+}
+
+impl Config {
+    /// From `bd serve`'s flags. Creates the backup directory, so a bad one fails at startup.
+    pub fn from_args(a: &ServeArgs) -> Result<Config> {
+        let backups = match (&a.backup_dir, every("--backup-every", &a.backup_every)?) {
+            (Some(dir), Some(every)) => {
+                let bad = |e: std::io::Error| Error::invalid(format!("--backup-dir {}: {e}", dir.display()));
+                create_private_dir(dir).map_err(bad)?;
+                Some(Backups { dir: std::path::absolute(dir).map_err(bad)?, every, keep: a.backup_keep })
+            }
+            _ => None,
+        };
+        Ok(Config {
+            reclaim_every: every("--reclaim-every", &a.reclaim_every)?,
+            gate_check_every: every("--gate-check-every", &a.gate_check_every)?,
+            gh_check_every: every("--gh-check-every", &a.gh_check_every)?,
+            backups,
+            prune_every: Some(PRUNE_EVERY),
+        })
+    }
+
+    fn every(&self, job: Job) -> Option<Duration> {
+        match job {
+            Job::Reclaim => self.reclaim_every,
+            Job::Gates => self.gate_check_every,
+            Job::GhGates => self.gh_check_every,
+            Job::Backup => self.backups.as_ref().map(|b| b.every),
+            Job::Prune => self.prune_every,
+        }
+    }
+}
+
+/// An interval flag: a duration, or `0` / `off` for none.
+fn every(flag: &str, value: &str) -> Result<Option<Duration>> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("off") {
+        return Ok(None);
+    }
+    let d = parse_duration(v).map_err(|e| Error::invalid(format!("{flag} {value}: {e}")))?;
+    if d.is_zero() {
+        return Ok(None);
+    }
+    if d < MIN_EVERY || d > MAX_EVERY {
+        return Err(Error::invalid(format!(
+            "{flag} {value}: use {}ms to 365d, or 0 to turn it off",
+            MIN_EVERY.as_millis()
+        )));
+    }
+    Ok(Some(d))
+}
+
+fn show(d: Option<Duration>) -> String {
+    d.map_or_else(|| "off".into(), |d| format_duration_ms(i64::try_from(d.as_millis()).unwrap_or(i64::MAX)))
+}
+
+/// A workspace under the server root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Workspace {
+    pub name: String,
+    pub dir: PathBuf,
+    pub db: PathBuf,
+}
+
+/// The workspaces `bd serve` serves from `root`: `<root>/<name>/.bd/bd.db`.
+fn discover(root: &Path) -> std::io::Result<Vec<Workspace>> {
+    let mut found: Vec<Workspace> = std::fs::read_dir(root)?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|name| valid_workspace_name(name))
+        .filter_map(|name| {
+            let dir = root.join(&name);
+            let db = dir.join(".bd").join("bd.db");
+            db.is_file().then_some(Workspace { name, dir, db })
+        })
+        .collect();
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(found)
+}
+
+/// Runs one job in one workspace (on a blocking thread); false when it failed.
+type Runner = Arc<dyn Fn(&Workspace, Job) -> bool + Send + Sync>;
+
+/// The running scheduler.
+pub struct Jobs {
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+    lanes: Vec<Arc<Semaphore>>,
+}
+
+/// Start the background jobs (inside the server's runtime).
+pub fn start(config: Config, root: PathBuf, open: OpenOptions) -> Jobs {
+    match &config.backups {
+        Some(b) => tracing::info!(
+            target: "bd::serve",
+            reclaim_every = %show(config.reclaim_every),
+            gate_check_every = %show(config.gate_check_every),
+            gh_check_every = %show(config.gh_check_every),
+            backup_every = %show(Some(b.every)),
+            backup_keep = b.keep,
+            backup_dir = %b.dir.display(),
+            "background jobs"
+        ),
+        None => tracing::info!(
+            target: "bd::serve",
+            reclaim_every = %show(config.reclaim_every),
+            gate_check_every = %show(config.gate_check_every),
+            gh_check_every = %show(config.gh_check_every),
+            backups = "off",
+            "background jobs"
+        ),
+    }
+    let backups = config.backups.clone();
+    let runner: Runner = Arc::new(move |ws: &Workspace, job| run(ws, job, &open, backups.as_ref()));
+    spawn(config, root, runner)
+}
+
+fn spawn(config: Config, root: PathBuf, runner: Runner) -> Jobs {
+    let lanes: Vec<Arc<Semaphore>> = LANES.iter().map(|&n| Arc::new(Semaphore::new(n))).collect();
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(schedule(config, root, runner, lanes.clone(), stopped));
+    Jobs { stop, task, lanes }
+}
+
+impl Jobs {
+    /// Start no more jobs, then wait up to `grace` for running ones to finish.
+    /// Returns how many were still running; they are abandoned.
+    pub async fn stop(self, grace: Duration) -> usize {
+        let _ = self.stop.send(true);
+        let _ = self.task.await;
+        let deadline = tokio::time::Instant::now() + grace;
+        let mut running = 0;
+        for (lane, &slots) in self.lanes.iter().zip(&LANES) {
+            let all = u32::try_from(slots).unwrap_or(u32::MAX);
+            if tokio::time::timeout_at(deadline, lane.acquire_many(all)).await.is_err() {
+                running += slots.saturating_sub(lane.available_permits());
+            }
+        }
+        if running == 0 {
+            tracing::info!(target: "bd::serve", "background jobs stopped");
+        } else {
+            tracing::warn!(target: "bd::serve", running, "background jobs still running at shutdown; abandoning them");
+        }
+        running
+    }
+}
+
+struct Slot {
+    due: Instant,
+    running: bool,
+    failures: u32,
+}
+
+/// The wait before a job runs again: its interval, doubled per consecutive failure.
+fn backoff(every: Duration, failures: u32) -> Duration {
+    every.saturating_mul(2u32.saturating_pow(failures).min(MAX_BACKOFF))
+}
+
+/// `wait` after `from`, without overflowing the platform's clock.
+fn after(from: Instant, wait: Duration) -> Instant {
+    from.checked_add(wait).unwrap_or(from + MAX_EVERY)
+}
+
+async fn schedule(
+    config: Config,
+    root: PathBuf,
+    runner: Runner,
+    lanes: Vec<Arc<Semaphore>>,
+    mut stop: watch::Receiver<bool>,
+) {
+    let jobs: Vec<(Job, Duration)> = Job::ALL.into_iter().filter_map(|j| config.every(j).map(|d| (j, d))).collect();
+    let Some(shortest) = jobs.iter().map(|(_, d)| *d).min() else { return };
+    let scan_every = shortest.min(SCAN_EVERY);
+    let (done_tx, mut done) = mpsc::unbounded_channel::<(String, Job, bool)>();
+    let mut rng = Rng::new();
+    let mut workspaces: HashMap<String, Workspace> = HashMap::new();
+    let mut slots: HashMap<(String, Job), Slot> = HashMap::new();
+    let mut next_scan = Instant::now();
+    loop {
+        let now = Instant::now();
+        if now >= next_scan {
+            let dir = root.clone();
+            match tokio::task::spawn_blocking(move || discover(&dir)).await {
+                Ok(Ok(found)) => {
+                    workspaces = found.into_iter().map(|w| (w.name.clone(), w)).collect();
+                    for name in workspaces.keys() {
+                        for &(job, every) in &jobs {
+                            slots.entry((name.clone(), job)).or_insert_with(|| Slot {
+                                due: after(now, every.mul_f64(rng.unit())),
+                                running: false,
+                                failures: 0,
+                            });
+                        }
+                    }
+                    slots.retain(|(name, _), s| s.running || workspaces.contains_key(name));
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(target: "bd::serve", root = %root.display(), error = %e, "cannot list workspaces")
+                }
+                Err(e) => tracing::error!(target: "bd::serve", error = %e, "listing workspaces panicked"),
+            }
+            next_scan = after(now, scan_every);
+        }
+
+        let mut due: Vec<(Instant, String, Job)> = slots
+            .iter()
+            .filter(|(_, s)| !s.running && s.due <= now)
+            .map(|((name, job), s)| (s.due, name.clone(), *job))
+            .collect();
+        due.sort();
+        for (_, name, job) in due {
+            let Some(ws) = workspaces.get(&name).cloned() else { continue };
+            // A full lane: the job runs when one of the lane's jobs finishes.
+            let Ok(permit) = lanes[job.lane()].clone().try_acquire_owned() else { continue };
+            if let Some(slot) = slots.get_mut(&(name, job)) {
+                slot.running = true;
+            }
+            let (runner, done_tx) = (runner.clone(), done_tx.clone());
+            tokio::task::spawn_blocking(move || {
+                let ok = std::panic::catch_unwind(AssertUnwindSafe(|| runner(&ws, job))).unwrap_or_else(|_| {
+                    tracing::error!(target: "bd::serve", workspace = %ws.name, job = job.name(), "background job panicked");
+                    false
+                });
+                drop(permit);
+                let _ = done_tx.send((ws.name, job, ok));
+            });
+        }
+
+        let next_due = slots.values().filter(|s| !s.running && s.due > now).map(|s| s.due).min();
+        let wake = next_due.map_or(next_scan, |d| d.min(next_scan));
+        tokio::select! {
+            _ = stop.changed() => return,
+            Some((name, job, ok)) = done.recv() => {
+                let gone = !workspaces.contains_key(&name);
+                let key = (name, job);
+                if gone {
+                    slots.remove(&key);
+                } else if let Some(slot) = slots.get_mut(&key) {
+                    slot.running = false;
+                    slot.failures = if ok { 0 } else { slot.failures.saturating_add(1) };
+                    let every = config.every(job).unwrap_or(shortest);
+                    slot.due = after(Instant::now(), backoff(every, slot.failures).mul_f64(rng.between(0.9, 1.1)));
+                }
+            }
+            _ = tokio::time::sleep_until(wake.into()) => {}
+        }
+    }
+}
+
+/// xorshift64, for jitter only.
+struct Rng(u64);
+
+impl Rng {
+    fn new() -> Rng {
+        use std::hash::BuildHasher;
+        Rng(std::collections::hash_map::RandomState::new().hash_one(Instant::now()) | 1)
+    }
+
+    /// Uniform in [0, 1).
+    fn unit(&mut self) -> f64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn between(&mut self, low: f64, high: f64) -> f64 {
+        low + (high - low) * self.unit()
+    }
+}
+
+fn ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn run(ws: &Workspace, job: Job, open: &OpenOptions, backups: Option<&Backups>) -> bool {
+    let started = Instant::now();
+    let done = match (job, backups) {
+        (Job::Reclaim, _) => reclaim(ws, open, started),
+        (Job::Gates, _) => check_gates(ws, open, job, "local", started),
+        (Job::GhGates, _) => check_gates(ws, open, job, "gh", started),
+        (Job::Backup, Some(b)) => backup(ws, open, b, started).map(|_| ()),
+        (Job::Backup, None) => Ok(()),
+        (Job::Prune, _) => prune(ws, open, started),
+    };
+    match done {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                target: "bd::serve",
+                workspace = %ws.name,
+                job = job.name(),
+                error = %e,
+                ms = ms(started),
+                "background job failed"
+            );
+            false
+        }
+    }
+}
+
+/// The I/O of a background command: a request's capture without client
+/// input or admin rights. Policies carried by a request's capture belong here too.
+fn capture() -> Capture {
+    Capture::default()
+}
+
+/// A bd command line run in a workspace as [`ACTOR`], parsed and dispatched
+/// the way `bd serve` runs a request.
+struct Background {
+    app: App,
+    command: Command,
+}
+
+impl Background {
+    fn new(ws: &Workspace, open: &OpenOptions, argv: &[&str]) -> Result<Background> {
+        let line = ["bd", "--json", "--actor", ACTOR].into_iter().chain(argv.iter().copied());
+        let cli = Cli::try_parse_from(line).map_err(|e| Error::invalid(format!("bd {}: {e}", argv.join(" "))))?;
+        let mut g = cli.global;
+        g.db = Some(ws.db.clone());
+        g.directory = Some(ws.dir.clone());
+        g.remote = None;
+        let mut app = App::new(g)?;
+        app.set_store(Store::open(&ws.db, open.clone())?);
+        Ok(Background { app, command: cli.command })
+    }
+
+    /// Run it and return its `--json` output.
+    fn run(mut self) -> Result<Value> {
+        let (code, out) = io::capture(capture(), || crate::dispatch(&mut self.app, &self.command));
+        code?;
+        Ok(serde_json::from_slice(&out.stdout)?)
+    }
+}
+
+fn reclaim(ws: &Workspace, open: &OpenOptions, started: Instant) -> Result<()> {
+    let mut cmd = Background::new(ws, open, &["reclaim"])?;
+    // Automatic reclaim, like `claim --next`'s: a workspace can turn it off.
+    if !cmd.app.read(|r| bd_core::config::auto_reclaim(r.conn()))? {
+        tracing::debug!(target: "bd::serve", workspace = %ws.name, job = "reclaim", "lease.auto_reclaim is off");
+        return Ok(());
+    }
+    let out = cmd.run()?;
+    let ids: Vec<&str> = out.as_array().into_iter().flatten().filter_map(|r| r["issue_id"].as_str()).collect();
+    if ids.is_empty() {
+        tracing::debug!(target: "bd::serve", workspace = %ws.name, job = "reclaim", ms = ms(started), "nothing to reclaim");
+    } else {
+        tracing::info!(
+            target: "bd::serve",
+            workspace = %ws.name,
+            job = "reclaim",
+            reclaimed = ids.len(),
+            issues = %ids.join(","),
+            ms = ms(started),
+            "reclaimed expired leases"
+        );
+    }
+    Ok(())
+}
+
+/// `bd gate check --type <kind>`; gates that could not be checked are logged one by one.
+fn check_gates(ws: &Workspace, open: &OpenOptions, job: Job, kind: &str, started: Instant) -> Result<()> {
+    let out = Background::new(ws, open, &["gate", "check", "--type", kind])?.run()?;
+    let checked = out["checked"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let with = |action: &str| checked.iter().filter(|c| c["action"] == action).collect::<Vec<_>>();
+    let id = |c: &Value| c["id"].as_str().unwrap_or_default().to_string();
+    let (opened, escalated, errors) = (with("opened"), with("escalated"), with("error"));
+    for c in &errors {
+        tracing::warn!(
+            target: "bd::serve",
+            workspace = %ws.name,
+            job = job.name(),
+            gate = %id(c),
+            error = c["detail"].as_str().unwrap_or_default(),
+            "gate check failed"
+        );
+    }
+    let changed: Vec<String> = opened.iter().chain(&escalated).map(|c| id(c)).collect();
+    if changed.is_empty() {
+        tracing::debug!(
+            target: "bd::serve",
+            workspace = %ws.name,
+            job = job.name(),
+            checked = checked.len(),
+            errors = errors.len(),
+            ms = ms(started),
+            "checked gates"
+        );
+    } else {
+        tracing::info!(
+            target: "bd::serve",
+            workspace = %ws.name,
+            job = job.name(),
+            checked = checked.len(),
+            opened = opened.len(),
+            escalated = escalated.len(),
+            errors = errors.len(),
+            gates = %changed.join(","),
+            ms = ms(started),
+            "checked gates"
+        );
+    }
+    Ok(())
+}
+
+fn prune(ws: &Workspace, open: &OpenOptions, started: Instant) -> Result<()> {
+    let mut store = Store::open(&ws.db, open.clone())?;
+    let mut records = 0;
+    loop {
+        let n = store.write("requests.prune", ACTOR, |tx| {
+            let before = tx.now().minus(REQUEST_RETENTION);
+            tx.prune_requests(before, PRUNE_BATCH)
+        })?;
+        records += n;
+        if n < PRUNE_BATCH {
+            break;
+        }
+    }
+    if records > 0 {
+        tracing::info!(target: "bd::serve", workspace = %ws.name, job = "prune", records, ms = ms(started), "pruned request records");
+    }
+    Ok(())
+}
+
+/// Back up `ws`; returns the new backup file.
+fn backup(ws: &Workspace, open: &OpenOptions, b: &Backups, started: Instant) -> Result<PathBuf> {
+    let dir = b.dir.join(&ws.name);
+    create_private_dir(&dir)?;
+    remove_unfinished(&dir, &ws.name);
+    let name = format!("{}-{}.db", ws.name, chrono::Utc::now().format(STAMP));
+    let (tmp, file) = (dir.join(format!("{name}.tmp")), dir.join(&name));
+    Store::open(&ws.db, open.clone())?.snapshot(&tmp)?;
+    std::fs::rename(&tmp, &file).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    sync_dir(&dir);
+    let bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or_default();
+    let others: Vec<PathBuf> =
+        backup_files(&dir, &ws.name)?.into_iter().filter(|f| f.file_name() != file.file_name()).collect();
+    if let Some(newer) = others.last().filter(|f| f.file_name() > file.file_name()) {
+        tracing::warn!(
+            target: "bd::serve",
+            workspace = %ws.name,
+            file = %file.display(),
+            newer = %newer.display(),
+            "an existing backup is dated after the new one: check the clock (the oldest-dated backups are deleted first)"
+        );
+    }
+    let removed = retain(&others, b.keep);
+    tracing::info!(
+        target: "bd::serve",
+        workspace = %ws.name,
+        job = "backup",
+        file = %file.display(),
+        bytes,
+        removed,
+        ms = ms(started),
+        "backed up"
+    );
+    Ok(file)
+}
+
+/// `20261001T212233.123Z`, as [`STAMP`] formats it.
+fn is_stamp(s: &str) -> bool {
+    s.len() == 20
+        && s.bytes().enumerate().all(|(i, c)| match i {
+            8 => c == b'T',
+            15 => c == b'.',
+            19 => c == b'Z',
+            _ => c.is_ascii_digit(),
+        })
+}
+
+/// The finished backups of workspace `name` in `dir`, oldest first.
+fn backup_files(dir: &Path, name: &str) -> Result<Vec<PathBuf>> {
+    let prefix = format!("{name}-");
+    let mut files: Vec<(String, PathBuf)> = std::fs::read_dir(dir)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let file = e.file_name().into_string().ok()?;
+            let stamp = file.strip_prefix(&prefix)?.strip_suffix(".db")?;
+            is_stamp(stamp).then(|| (file.clone(), e.path()))
+        })
+        .collect();
+    files.sort();
+    Ok(files.into_iter().map(|(_, path)| path).collect())
+}
+
+/// Delete backups so that `keep` remain (0 keeps all), counting the one just
+/// written, which is never deleted, whatever its date. `others` are the rest,
+/// oldest first. Returns how many were deleted; one that cannot be deleted
+/// now (open elsewhere, on Windows) is logged and left for the next backup.
+fn retain(others: &[PathBuf], keep: usize) -> usize {
+    if keep == 0 {
+        return 0;
+    }
+    let excess = others.len().saturating_sub(keep - 1);
+    let mut removed = 0;
+    for old in &others[..excess] {
+        match std::fs::remove_file(old) {
+            Ok(()) => removed += 1,
+            Err(e) => {
+                tracing::warn!(target: "bd::serve", file = %old.display(), error = %e, "cannot delete an old backup")
+            }
+        }
+    }
+    removed
+}
+
+/// Create `dir` and its missing parents, on Unix readable by this user only
+/// (0700): backups hold whole workspaces. Existing directories keep their mode.
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir)
+}
+
+/// Remove what an unfinished backup left behind (the server stopped during it).
+fn remove_unfinished(dir: &Path, name: &str) {
+    let prefix = format!("{name}-");
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if e.file_name().to_str().is_some_and(|f| f.starts_with(&prefix) && f.contains(".db.tmp")) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+}
+
+/// Make a rename durable. Windows has no directory handle to flush.
+fn sync_dir(dir: &Path) {
+    #[cfg(unix)]
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::{Condvar, Mutex};
+
+    use bd_core::{InitOptions, NewIssue, Queries};
+
+    use super::*;
+
+    fn millis(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap()
+    }
+
+    /// A root whose workspaces have a (fake) database file.
+    fn root_with(names: &[&str]) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        for name in names {
+            add_workspace(root.path(), name);
+        }
+        root
+    }
+
+    fn add_workspace(root: &Path, name: &str) {
+        std::fs::create_dir_all(root.join(name).join(".bd")).unwrap();
+        std::fs::write(root.join(name).join(".bd").join("bd.db"), b"").unwrap();
+    }
+
+    fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(millis(10));
+        }
+    }
+
+    #[test]
+    fn intervals_are_durations_or_off() {
+        assert_eq!(every("--x", "0").unwrap(), None);
+        assert_eq!(every("--x", "0s").unwrap(), None);
+        assert_eq!(every("--x", " OFF ").unwrap(), None);
+        assert_eq!(every("--x", "90s").unwrap(), Some(Duration::from_secs(90)));
+        assert_eq!(every("--x", "100ms").unwrap(), Some(millis(100)));
+        assert_eq!(every("--x", "10ms").unwrap_err().exit_code(), 2, "too short");
+        assert_eq!(every("--x", "366d").unwrap_err().exit_code(), 2, "too long");
+        assert_eq!(every("--x", "365d").unwrap(), Some(MAX_EVERY));
+        let e = every("--reclaim-every", "soon").unwrap_err();
+        assert!(e.to_string().starts_with("--reclaim-every soon: invalid duration"), "{e}");
+        assert_eq!((show(None), show(Some(Duration::from_secs(90)))), ("off".to_string(), "1m30s".to_string()));
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_a_limit() {
+        let m = Duration::from_secs(60);
+        assert_eq!(backoff(m, 0), m);
+        assert_eq!(backoff(m, 1), m * 2);
+        assert_eq!(backoff(m, 3), m * 8);
+        assert_eq!(backoff(m, 40), m * MAX_BACKOFF);
+        let now = Instant::now();
+        assert!(after(now, MAX_EVERY * MAX_BACKOFF) > now, "the longest wait fits the clock");
+        let mut rng = Rng::new();
+        for _ in 0..1000 {
+            let (u, j) = (rng.unit(), rng.between(0.9, 1.1));
+            assert!((0.0..1.0).contains(&u) && (0.9..1.1).contains(&j), "{u} {j}");
+        }
+    }
+
+    #[test]
+    fn workspaces_are_found_by_their_database() {
+        let root = root_with(&["proj", "other.v2", ".hidden"]);
+        std::fs::create_dir_all(root.path().join("empty").join(".bd")).unwrap();
+        std::fs::write(root.path().join("tokens.json"), b"[]").unwrap();
+        let names: Vec<String> = discover(root.path()).unwrap().into_iter().map(|w| w.name).collect();
+        assert_eq!(names, ["other.v2", "proj"]);
+        assert!(discover(&root.path().join("missing")).is_err());
+    }
+
+    #[test]
+    fn retention_keeps_the_newest_backups_and_nothing_else_is_touched() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = [
+            "proj-20260101T000000.000Z.db",
+            "proj-20260103T000000.000Z.db",
+            "proj-20260102T000000.000Z.db",
+            "proj-20260104T000000.000Z.db.tmp",
+            "proj-20260104T000000.000Z.db.tmp-journal",
+            "proj-2-20260105T000000.000Z.db",
+            "proj-latest.db",
+            "notes.txt",
+        ];
+        for f in files {
+            std::fs::write(dir.path().join(f), b"x").unwrap();
+        }
+        let names = |dir: &Path| {
+            let mut v: Vec<String> =
+                std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            v.sort();
+            v
+        };
+        let listed: Vec<PathBuf> = backup_files(dir.path(), "proj").unwrap();
+        assert_eq!(listed.len(), 3);
+        assert!(listed[0].ends_with("proj-20260101T000000.000Z.db"), "oldest first: {listed:?}");
+
+        // The newest was just written; retention looks at the others.
+        assert_eq!(retain(&listed[..2], 0), 0, "0 keeps all");
+        assert_eq!(retain(&listed[..2], 2), 1);
+        assert_eq!(retain(&backup_files(dir.path(), "proj").unwrap()[..1], 2), 0);
+        remove_unfinished(dir.path(), "proj");
+        assert_eq!(
+            names(dir.path()),
+            [
+                "notes.txt",
+                "proj-2-20260105T000000.000Z.db",
+                "proj-20260102T000000.000Z.db",
+                "proj-20260103T000000.000Z.db",
+                "proj-latest.db"
+            ]
+        );
+        assert!(is_stamp(&chrono::Utc::now().format(STAMP).to_string()));
+    }
+
+    /// A root holding workspace `proj` with one issue.
+    fn real_workspace() -> (tempfile::TempDir, Workspace) {
+        let root = tempfile::tempdir().unwrap();
+        let db = root.path().join("proj").join(".bd").join("bd.db");
+        let init = InitOptions { prefix: "t".into(), id_mode: Default::default() };
+        let mut store = Store::init(&db, init, OpenOptions::default()).unwrap();
+        store.write("create", "alice", |tx| tx.create_issue(NewIssue::titled("Backed up"))).unwrap();
+        let ws = discover(root.path()).unwrap().remove(0);
+        (root, ws)
+    }
+
+    #[test]
+    fn backups_are_snapshots_kept_per_workspace() {
+        let (_root, ws) = real_workspace();
+        let out = tempfile::tempdir().unwrap();
+        let b = Backups { dir: out.path().to_path_buf(), every: Duration::from_secs(3600), keep: 2 };
+        for _ in 0..3 {
+            backup(&ws, &OpenOptions::default(), &b, Instant::now()).unwrap();
+            std::thread::sleep(millis(5));
+        }
+        let files = backup_files(&out.path().join("proj"), "proj").unwrap();
+        assert_eq!(files.len(), 2, "{files:?}");
+        let restore = tempfile::tempdir().unwrap();
+        let restored = restore.path().join("bd.db");
+        std::fs::copy(&files[1], &restored).unwrap();
+        let copy = Store::open(&restored, OpenOptions::default()).unwrap();
+        let titles: Vec<String> =
+            copy.read(|r| r.list(&Default::default())).unwrap().into_iter().map(|i| i.title).collect();
+        assert_eq!(titles, ["Backed up"]);
+    }
+
+    #[test]
+    fn a_new_backup_survives_backups_dated_in_the_future() {
+        let (_root, ws) = real_workspace();
+        let out = tempfile::tempdir().unwrap();
+        let dir = out.path().join("proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Taken while the clock was years ahead (a restored VM, bad NTP, a board without an RTC).
+        let future = ["proj-29990101T000000.000Z.db", "proj-29990102T000000.000Z.db"].map(|f| dir.join(f));
+        for f in &future {
+            std::fs::write(f, b"x").unwrap();
+        }
+        let mut b = Backups { dir: out.path().to_path_buf(), every: Duration::from_secs(3600), keep: 2 };
+        let first = backup(&ws, &OpenOptions::default(), &b, Instant::now()).unwrap();
+        assert!(first.is_file(), "the backup just written is kept");
+        assert_eq!(backup_files(&dir, "proj").unwrap(), [first.clone(), future[1].clone()]);
+        std::thread::sleep(millis(5));
+        let second = backup(&ws, &OpenOptions::default(), &b, Instant::now()).unwrap();
+        assert_eq!(backup_files(&dir, "proj").unwrap(), [second.clone(), future[1].clone()]);
+        b.keep = 1;
+        std::thread::sleep(millis(5));
+        let third = backup(&ws, &OpenOptions::default(), &b, Instant::now()).unwrap();
+        assert_eq!(backup_files(&dir, "proj").unwrap(), [third], "keep 1 keeps the new one");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backups_are_private_to_the_server_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let base = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = base.path().join("new").join("backups");
+        let line = ["bd", "serve", "--root", ".", "--backup-dir", dir.to_str().unwrap()];
+        let Command::Serve(args) = Cli::try_parse_from(line).unwrap().command else { panic!("not serve") };
+        let config = Config::from_args(&args).unwrap();
+        assert_eq!((mode(&base.path().join("new")), mode(&dir)), (0o700, 0o700), "created private");
+        assert_eq!(mode(base.path()), 0o755, "an existing directory keeps its mode");
+
+        let (_root, ws) = real_workspace();
+        let file = backup(&ws, &OpenOptions::default(), config.backups.as_ref().unwrap(), Instant::now()).unwrap();
+        assert_eq!((mode(&dir.join("proj")), mode(&file)), (0o700, 0o600));
+    }
+
+    /// What a test runner saw.
+    #[derive(Default)]
+    struct Seen {
+        calls: Vec<(String, Job)>,
+        running: HashSet<(String, Job)>,
+        in_lane: usize,
+        max_in_lane: usize,
+        overlaps: usize,
+    }
+
+    fn recording(seen: &Arc<Mutex<Seen>>, work: Duration) -> Runner {
+        let seen = seen.clone();
+        Arc::new(move |ws: &Workspace, job| {
+            let key = (ws.name.clone(), job);
+            {
+                let mut s = seen.lock().unwrap();
+                s.overlaps += usize::from(!s.running.insert(key.clone()));
+                s.in_lane += 1;
+                s.max_in_lane = s.max_in_lane.max(s.in_lane);
+                s.calls.push(key.clone());
+            }
+            std::thread::sleep(work);
+            let mut s = seen.lock().unwrap();
+            s.running.remove(&key);
+            s.in_lane -= 1;
+            true
+        })
+    }
+
+    #[test]
+    fn enabled_jobs_run_in_every_workspace_without_overlapping() {
+        let rt = runtime();
+        let root = root_with(&["a", "b", ".hidden"]);
+        let config = Config { reclaim_every: Some(millis(100)), prune_every: Some(millis(150)), ..Default::default() };
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let jobs = {
+            let _rt = rt.enter();
+            spawn(config, root.path().to_path_buf(), recording(&seen, millis(20)))
+        };
+        let count = |ws: &str, job: Job| seen.lock().unwrap().calls.iter().filter(|c| c.0 == ws && c.1 == job).count();
+        wait_for("each job to run 3 times in a and b", || {
+            ["a", "b"].iter().all(|ws| count(ws, Job::Reclaim) >= 3 && count(ws, Job::Prune) >= 3)
+        });
+        add_workspace(root.path(), "c");
+        wait_for("a new workspace to be picked up", || count("c", Job::Reclaim) >= 1);
+        assert_eq!(rt.block_on(jobs.stop(Duration::from_secs(10))), 0);
+
+        let s = seen.lock().unwrap();
+        assert_eq!(s.overlaps, 0, "a job never overlaps itself");
+        assert!(s.max_in_lane <= LANES[0], "at most {} database jobs at once: {}", LANES[0], s.max_in_lane);
+        assert!(s.calls.iter().all(|(ws, job)| ws != ".hidden" && matches!(job, Job::Reclaim | Job::Prune)));
+        let after = s.calls.len();
+        drop(s);
+        std::thread::sleep(millis(400));
+        assert_eq!(seen.lock().unwrap().calls.len(), after, "nothing starts after stop");
+    }
+
+    #[test]
+    fn stop_waits_for_running_jobs_only_up_to_the_grace_period() {
+        let rt = runtime();
+        let root = root_with(&["a"]);
+        let config = Config { backups: None, gate_check_every: Some(millis(100)), ..Default::default() };
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started) = std::sync::mpsc::channel();
+        let stuck: Runner = {
+            let gate = gate.clone();
+            let started_tx = Mutex::new(started_tx);
+            Arc::new(move |_: &Workspace, _| {
+                let _ = started_tx.lock().unwrap().send(());
+                let (open, cv) = &*gate;
+                let _held = cv.wait_while(open.lock().unwrap(), |open| !*open).unwrap();
+                true
+            })
+        };
+        let jobs = {
+            let _rt = rt.enter();
+            spawn(config.clone(), root.path().to_path_buf(), stuck)
+        };
+        started.recv_timeout(Duration::from_secs(20)).unwrap();
+        let t = Instant::now();
+        assert_eq!(rt.block_on(jobs.stop(millis(200))), 1, "the stuck job is abandoned");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let jobs = {
+            let _rt = rt.enter();
+            spawn(config, root.path().to_path_buf(), recording(&seen, millis(300)))
+        };
+        wait_for("a job to start", || !seen.lock().unwrap().running.is_empty());
+        assert_eq!(rt.block_on(jobs.stop(Duration::from_secs(20))), 0, "a job that finishes in time");
+        assert!(seen.lock().unwrap().running.is_empty());
+    }
+
+    #[test]
+    fn no_jobs_no_scheduler() {
+        let rt = runtime();
+        let root = root_with(&["a"]);
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let jobs = {
+            let _rt = rt.enter();
+            spawn(Config::default(), root.path().to_path_buf(), recording(&seen, Duration::ZERO))
+        };
+        assert_eq!(rt.block_on(jobs.stop(Duration::from_secs(1))), 0);
+        assert!(seen.lock().unwrap().calls.is_empty());
+    }
+}

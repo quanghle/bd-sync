@@ -415,6 +415,30 @@ fn timer_and_github_gates_via_gate_check() {
     assert!(ws.ok(&["gate", "list"]).contains("escalated: PR #7"), "an error changes nothing");
 }
 
+#[test]
+fn gate_check_type_local_leaves_github_gates_alone() {
+    let ws = Ws::new();
+    let malformed = ws.id(&["create", "Hand-made gate without a condition", "-t", "gate"]);
+    let (bake, merge) = (ws.id(&["create", "Bake"]), ws.id(&["create", "Merge"]));
+    let timer = ws.id(&["gate", "create", "-t", "timer", "--timeout", "1h", "--blocks", &bake]);
+    ws.ok(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--blocks", &merge]);
+    let env = [("BD_GH", "/nonexistent/gh")];
+    let out = ws.with_env(&env, &["--json", "gate", "check", "--type", "local"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let checked: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let seen: Vec<(&str, &str)> = checked["checked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["id"].as_str().unwrap(), c["action"].as_str().unwrap()))
+        .collect();
+    assert_eq!(seen, vec![(malformed.as_str(), "escalated"), (timer.as_str(), "unchanged")], "gh is never run");
+    let out = ws.with_env(&env, &["--json", "gate", "check", "--type", "gh"]);
+    let checked: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(checked["checked"].as_array().unwrap().len(), 1, "{checked}");
+    assert_eq!(checked["checked"][0]["action"], "error");
+}
+
 /// A stand-in for `gh run list` that prints `runs.json` from its own
 /// directory and appends its arguments to `gh-args.log`.
 fn fake_gh_runs(dir: &Path) -> std::path::PathBuf {

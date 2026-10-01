@@ -8,11 +8,11 @@ coordination engine:
 - **Typed dependency graph**: `blocks`, `conditional-blocks`, `parent-child`, `waits-for` gate readiness; informational edges (`related`, `discovered-from`, …) never do. Cycles and hierarchy deadlocks are rejected at write time.
 - **Deterministic ready work**: a materialized blocked flag maintained in the same transaction as every change, and a total queue order (policy, then id)
 - **Leased atomic claiming**: claims run under SQLite's write lock and return a lease with a fencing token
-- **Crash recovery**: expired leases are reclaimed after a grace window (automatically by `claim --next`); WAL makes every transaction atomic
+- **Crash recovery**: expired leases are reclaimed after a grace window (automatically by `claim --next`, and every minute by `bd serve`); WAL makes every transaction atomic
 - **Optimistic concurrency**: per-issue revisions and `--if-revision/--if-status/--if-assignee` guards (exit code 13 on conflict)
 - **Comments, durable memory, and transactional event history** with gapless, commit-ordered sequence numbers
 - **Playbooks and gates**: repeatable multi-step work declared once in TOML and run atomically as `<run>.<step>` issues; human, timer, issue, and GitHub gates that arm when their step could start ([Playbooks](#playbooks-repeatable-multi-step-work))
-- **Remote server**: `bd serve` shares workspaces over HTTPS with laptops, CI runners and cloud agents; the same `bd` binary is the client, with access tokens, roles, and retries that apply a write once ([Remote server](#remote-server-one-workspace-many-machines))
+- **Remote server**: `bd serve` shares workspaces over HTTPS with laptops, CI runners and cloud agents; the same `bd` binary is the client, with access tokens, roles, and retries that apply a write once. The server also reclaims dead workers' leases, checks gates and takes backups on its own ([Remote server](#remote-server-one-workspace-many-machines))
 - Extras: JSONL export/import (reads beads exports), `bd batch` (many writes, one transaction), `bd bench`, and local observability (structured logs, timing, Prometheus metrics, `bd doctor`)
 
 It ships as a library (`crates/bd-core`) and a CLI (`crates/bd-cli`, binary `bd`).
@@ -176,7 +176,7 @@ ready work (`-t gate` lists them).
 - `bd claim <id>` succeeds only if the issue is `open`, ready, and unassigned, reserved for you, or held by a `claim.pools` alias. Re-claiming your own claim is idempotent and refreshes the lease.
 - `bd claim --next` claims the head of the ready queue inside one write transaction, so two agents can never take the same issue. It first reclaims leases that expired more than `lease.grace` ago.
 - The lease `token` is the sequence number of the `claimed` event: unique and increasing. Pass it to `heartbeat`, `close`, or `release` so a stale worker cannot act on a claim it no longer holds.
-- `bd reclaim [--grace 10m]` reverts dead workers' issues to `open` and records `reclaimed` events. `bd leases` shows lease health.
+- `bd reclaim [--grace 10m]` reverts dead workers' issues to `open` and records `reclaimed` events. `bd leases` shows lease health. `bd serve` runs it in every workspace each minute ([Background jobs](#background-jobs-and-backups)).
 - Invariant (checked by `bd doctor`): a lease exists if and only if the issue is `in_progress`, and the lease holder is the assignee.
 
 ### Optimistic concurrency
@@ -382,16 +382,21 @@ clock skew with GitHub). `branch` and `event` narrow the runs considered
 the branch or tag: when a newer run is for a different commit (a new push,
 or a re-created tag), it watches that commit's first run instead, dropping
 any escalation about the old one. GitHub gates use `gh` (`BD_GH` overrides
-the binary) in the workspace's repository, or in `repo = "owner/name"`.
+the binary) in the workspace's repository, or in `repo = "owner/name"`; a
+`gh` call that takes longer than 60 seconds is killed and reported as an
+error for that gate.
 
-`bd gate check` (from cron or CI) opens the gates whose condition holds and
-escalates the ones that failed or ran past their timeout. Escalation records
+`bd gate check` (from cron or CI; `bd serve` runs it on its own, see
+[Background jobs](#background-jobs-and-backups)) opens the gates whose
+condition holds and escalates the ones that failed or ran past their
+timeout. `--type gh` checks only GitHub gates, `--type local` only the
+others. Escalation records
 the reason on the gate, comments on it, and lists it in `bd prime`; it never
 opens the gate. A person decides with `bd gate resolve`.
 
 ```bash
 bd gate list                                      # waiting, armed, escalated
-bd gate check [--dry-run] [--type gh]             # evaluate the armed gates
+bd gate check [--dry-run] [--type gh|local]       # evaluate the armed gates
 bd gate resolve t-12.gate-publish -r "approved"
 bd gate create -t gh:pr --await-id 42 --blocks t-7   # a gate in front of existing work
 bd gate create -t gh:run --await-id release.yml --branch v1.2.0 --event push --blocks t-9
@@ -447,10 +452,73 @@ in progress share a 256 MiB memory budget (more if one maximum-size request
 needs it), and the server answers 503 when it is used up, which clients
 retry. The server logs one
 line per request on stderr; set `BD_LOG` to change that. Ctrl-C or SIGTERM
-lets running commands finish first. Back up `<root>` like any SQLite data
-(`sqlite3 bd.db ".backup copy.db"`, or Litestream). The server keeps
+lets running commands finish first (up to 30 seconds). The server keeps
 connections to each database open, so restart it after replacing or moving a
 workspace's `bd.db`.
+
+### Background jobs and backups
+
+`bd serve` keeps every workspace under `--root` up to date by itself, including
+workspaces no client has used since it started (it looks for new ones every
+30 seconds):
+
+| job | default | flag | what it does |
+|---|---|---|---|
+| lease reclaim | every minute | `--reclaim-every` | `bd reclaim`: puts claimed issues back in the queue once their lease expired more than `lease.grace` ago (not in workspaces where `lease.auto_reclaim` is `false`) |
+| gate checks | every minute | `--gate-check-every` | `bd gate check --type local`: opens timer and issue gates, escalates failures and timeouts |
+| GitHub gate checks | every 5 minutes | `--gh-check-every` | `bd gate check --type gh` with the server's `gh` (its `BD_GH` and `gh auth`); each armed GitHub gate costs one or two API calls of that account per check |
+| backups | off | `--backup-dir DIR`, `--backup-every 1h`, `--backup-keep 24` | a snapshot of each workspace, below |
+| request records | every hour | | deletes idempotency records older than a day |
+
+`0` or `off` turns a job off. Jobs run the commands' own code as actor
+`bd-serve`, so their events (`reclaimed`, `closed`, `gate_escalated`) read like
+the commands'. Each workspace's timers are jittered so workspaces do not fire
+together, a job never overlaps itself, and only a few jobs run at once, on
+threads of their own, so client requests keep their slots. Writes are short
+transactions: `gh` runs outside any transaction, and a backup is a read
+transaction. A failed job is logged and retried later, backing off up to 32
+intervals; it never stops the server. On shutdown no job starts any more,
+running `gh` calls are cancelled, and running jobs get 10 seconds to finish.
+A job still running after that is abandoned safely: an unfinished transaction
+rolls back, and the next backup removes an unfinished one.
+
+With `--backup-dir /backups`, each workspace is copied to
+`/backups/<name>/<name>-<UTC time>.db` (e.g. `proj-20261001T214244.014Z.db`)
+every `--backup-every`, and all but the newest `--backup-keep` copies are
+deleted (`0` keeps them all). A copy is taken with SQLite's `VACUUM INTO`,
+which does not hold up writers, and is a compact, self-contained database
+file. It is checked (`PRAGMA quick_check`) and flushed to disk under a
+temporary name before it is renamed into place, so a file with the final name
+is always complete. The copy just written is never deleted, even when older
+copies are dated after it (the clock was wrong, then corrected); the server
+logs a warning then. Copies hold everything in a workspace, so on Unix they
+are readable by the user running `bd serve` only: files are created 0600, and
+the directories it creates 0700 (an existing `--backup-dir` keeps its mode).
+Keep the directory on another disk, or ship it elsewhere (rsync, restic,
+object storage). To restore a workspace from a copy:
+
+```bash
+# Stop bd serve first: it keeps the database open, and could open a half-copied file.
+cd /srv/bd/proj/.bd
+mkdir -p broken && mv bd.db* broken/            # the database and its -wal and -shm files
+cp /backups/proj/proj-20261001T214244.014Z.db bd.db
+bd -C /srv/bd/proj doctor                        # then start bd serve again
+```
+
+The workspace is then as it was at the time of the copy: later changes are
+gone, and the sequence numbers of their events are given out again, so
+anything following events with a cursor (`bd events --since`) should
+re-baseline from `bd export`. To bring a copy up as another workspace while
+the server runs, copy it to `<root>/<new name>/.bd/bd.db.tmp`, then rename it
+to `bd.db`: a rename is atomic, so the server never sees half a file.
+
+For continuous replication instead of (or besides) periodic copies, run
+[Litestream](https://litestream.io) next to `bd serve`, one database per
+workspace: `litestream replicate /srv/bd/proj/.bd/bd.db s3://bucket/bd/proj`
+(or a config file listing them). It suits bd's settings: WAL mode, a busy
+timeout, and `synchronous=NORMAL`. To restore, stop `bd serve`, move the old
+files aside as above, and run
+`litestream restore -o /srv/bd/proj/.bd/bd.db s3://bucket/bd/proj`.
 
 ### Clients
 
@@ -545,7 +613,8 @@ What runs where:
 - Playbooks run by name from the server's playbook path: the workspace's
   `.bd/playbooks` (`<root>/<name>/.bd/playbooks`), then the server's
   `$BD_PLAYBOOK_PATH` and user config directory. File paths are refused.
-  GitHub gates are checked by the server's `gh`.
+  GitHub gates are checked by the server's `gh`, also on the server's own
+  schedule ([Background jobs](#background-jobs-and-backups)).
 - `events --follow` polls the server. `init`, `bench`, `serve` and
   `playbook extract --save` only run on the machine that holds the database.
 - `bd prime`, which session hooks run, gives up within seconds when the
@@ -568,6 +637,7 @@ runs return a non-200 status with the `--json` error shape.
 Everything is local; nothing is sent anywhere (a remote workspace talks only to its own `bd serve`).
 
 - **Logs**: `BD_LOG=bd=debug bd …` shows per-transaction lock-wait, exec, and commit timings on stderr. `--log-format json` emits structured logs. Colors appear only on a terminal (`NO_COLOR` turns them off), so redirected logs stay plain text.
+- **Server logs**: `bd serve` logs (target `bd::serve`) one line per request, its background job settings at startup, and one line per background job that changed something (`reclaimed expired leases`, `checked gates`, `backed up`, `pruned request records`, with the workspace, counts, issue ids, and `ms`). Failures are warnings (`background job failed`, `gate check failed` with the gate and the `gh` error). `BD_LOG=bd::serve=debug` also logs the jobs that found nothing to do.
 - **Timing**: `--timing` (or `BD_TIMING=1`) prints a per-command breakdown. Commands and transactions slower than `--slow-ms` (default 250) log `bd::slow` warnings and increment the `slow_writes` counter.
 - **Metrics**: `bd metrics` prints Prometheus text, `--format json` prints JSON:
   - issues by status, ready count by priority, blocked/deferred counts
@@ -626,7 +696,7 @@ connections open, while each `cli` process opens the database again.
 | `id.mode` | `hash` | `hash` or `counter` |
 | `lease.ttl` | `5m` | claim lease duration |
 | `lease.grace` | `10m` | how long past expiry before reclaim reverts a claim |
-| `lease.auto_reclaim` | `true` | `claim --next` reclaims stale leases first |
+| `lease.auto_reclaim` | `true` | `claim --next` reclaims stale leases first, and `bd serve` reclaims them every minute |
 | `claim.pools` | | comma-separated assignees anyone may claim from |
 | `types.custom` | | extra issue types |
 | `durability` | `normal` | SQLite `synchronous`: `off`, `normal`, `full` |
@@ -681,7 +751,8 @@ crates/bd-core/src/   store (WAL, transactions, busy handling) · schema · issu
 crates/bd-core/tests/ engine integration tests (graph semantics, leases with a manual clock, concurrency,
                       playbook runs and gates)
 crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) · batch · bench · fmt · logging
-                      io (stdio and files, or a captured request) · serve (bd serve) · auth (access tokens)
+                      io (stdio and files, or a captured request) · serve (bd serve) · jobs (its background
+                      jobs: reclaim, gate checks, backups) · auth (access tokens)
                       · remote (client) · credentials (bd remote login) · protocol (wire format)
 crates/bd-cli/tests/  end-to-end CLI tests; remote.rs runs real bd serve and client processes
 ```

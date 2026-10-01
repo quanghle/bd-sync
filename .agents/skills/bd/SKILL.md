@@ -9,7 +9,7 @@ bd is this repository's shared task tracker: a dependency-aware work queue in `.
 
 ## First step
 
-Run `bd prime`. It prints the workflow, your current claims, the top of the ready queue, and project memories. Outside a workspace it prints nothing; `bd info` shows which workspace is active.
+Run `bd prime`. It prints the workflow, your current claims, the top of the ready queue, and project memories. Outside a workspace it prints nothing; `bd info` shows which workspace is active (a database path, or a server URL for a remote workspace).
 
 ## Workflow
 
@@ -30,5 +30,6 @@ Run `bd prime`. It prints the workflow, your current claims, the top of the read
 
 - Prefer `--json` when parsing output.
 - Exit code 4 is a claim conflict (held by someone else, or not ready); 13 is a stale `--if-revision` guard. Re-read instead of retrying blindly.
+- In a remote workspace (`.bd/remote.toml`), commands run on a shared bd server and claims stay atomic across every client. Exit code 7 means the access token (`BD_TOKEN`) is missing or not allowed; 8 means the server is unreachable. `bd remote show` diagnoses both, and retrying is safe.
 - Do not close or mutate tasks unless the work is actually done.
 - Store durable insights with `bd remember "..."`; search them with `bd memories <query>`.

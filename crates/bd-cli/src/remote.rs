@@ -1,0 +1,759 @@
+//! Remote workspaces: forward commands to `bd serve`.
+//!
+//! A workspace is remote when `--remote URL` or `$BD_REMOTE` is set, or when
+//! the nearest `.bd/` holds a `remote.toml` (written by `bd remote set`):
+//!
+//! ```toml
+//! url = "https://bd.example.com/w/proj"
+//! ca_cert = "ca.pem"   # optional, relative to this file: trust a private CA
+//! ```
+//!
+//! The access token comes from `$BD_TOKEN`, never from a file in the
+//! repository. The command line travels unchanged; the server runs it and
+//! returns its output and exit code. Each invocation gets a request id that
+//! its retries reuse, so a write whose response was lost is applied once.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use bd_core::{Error, Event, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::app::{App, Out};
+use crate::auth::random_hex;
+use crate::cli::*;
+use crate::fmt;
+use crate::io;
+use crate::protocol::{ErrorBody, ExecRequest, ExecResponse, valid_workspace_name};
+
+/// How long a request that failed in transit is retried, unless
+/// `$BD_REMOTE_RETRY_SECS` says otherwise (0: one attempt).
+const RETRY_BUDGET: Duration = Duration::from_secs(30);
+/// `bd prime` runs from session hooks, which must not stall: it retries this long.
+const PRIME_RETRY_BUDGET: Duration = Duration::from_secs(3);
+
+fn retry_budget() -> Duration {
+    env("BD_REMOTE_RETRY_SECS").and_then(|s| s.parse().ok()).map_or(RETRY_BUDGET, Duration::from_secs)
+}
+
+/// A workspace on a bd server.
+pub struct Remote {
+    /// Workspace URL without a trailing slash.
+    pub url: String,
+    token: String,
+    ca_cert: Option<PathBuf>,
+    /// How long failures in transit are retried.
+    retry: Duration,
+    connect_timeout: Duration,
+    /// Limit for one attempt, including the server's work.
+    attempt_timeout: Duration,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteFile {
+    url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca_cert: Option<PathBuf>,
+}
+
+/// Where the remote workspace setting came from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// `--remote URL` or `$BD_REMOTE`.
+    Flag,
+    /// A `.bd/remote.toml` file.
+    File(PathBuf),
+}
+
+/// The remote workspace an invocation uses, before its access token is looked up.
+#[derive(Clone, Debug)]
+pub struct Configured {
+    pub url: String,
+    pub source: Source,
+    pub ca_cert: Option<PathBuf>,
+}
+
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+fn env_actor() -> Option<String> {
+    env("BD_ACTOR").or_else(|| env("BEADS_ACTOR"))
+}
+
+fn missing_token(url: &str) -> Error {
+    Error::Unauthorized(format!(
+        "no access token for {url}: set BD_TOKEN (create one on the server with `bd serve token create`)"
+    ))
+}
+
+/// The remote workspace configured for this invocation, if any.
+pub fn configured(app: &App) -> Result<Option<Configured>> {
+    let g = &app.g;
+    let (url, source, ca_cert) = match g.remote.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        Some(_) if g.db.is_some() => {
+            return Err(Error::invalid("both --remote ($BD_REMOTE) and --db ($BD_DB) are set; use one"));
+        }
+        Some(url) => (url.to_string(), Source::Flag, None),
+        None if g.db.is_some() => return Ok(None),
+        None => match remote_file(&app.cwd) {
+            Some(path) => {
+                let file = read_remote_file(&path)?;
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                let ca = file.ca_cert.map(|c| if c.is_relative() { dir.join(c) } else { c });
+                (file.url, Source::File(path), ca)
+            }
+            None => return Ok(None),
+        },
+    };
+    let url = check_url(&url)?;
+    let ca_cert = env("BD_CA_CERT").map(PathBuf::from).or(ca_cert);
+    Ok(Some(Configured { url, source, ca_cert }))
+}
+
+/// The remote workspace this invocation uses, or `None` for a local one.
+pub fn detect(app: &App) -> Result<Option<Remote>> {
+    let Some(c) = configured(app)? else { return Ok(None) };
+    let token = env("BD_TOKEN").ok_or_else(|| missing_token(&c.url))?;
+    Ok(Some(Remote::new(c, token)))
+}
+
+/// The nearest `.bd/remote.toml`, unless a nearer `.bd/bd.db` comes first.
+fn remote_file(start: &Path) -> Option<PathBuf> {
+    for dir in start.ancestors() {
+        let bd = dir.join(".bd");
+        let path = bd.join("remote.toml");
+        if path.is_file() {
+            return Some(path);
+        }
+        if bd.join("bd.db").is_file() {
+            return None;
+        }
+    }
+    None
+}
+
+fn read_remote_file(path: &Path) -> Result<RemoteFile> {
+    let text = std::fs::read_to_string(path).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
+    toml::from_str(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))
+}
+
+/// `http(s)://host[:port][/prefix]/w/<workspace>`, without a trailing slash.
+fn check_url(raw: &str) -> Result<String> {
+    let url = raw.trim().trim_end_matches('/');
+    let bad =
+        |why: &str| Error::invalid(format!("remote URL {raw:?} {why}; expected https://host[:port]/w/<workspace>"));
+    let (scheme, rest) = url.split_once("://").ok_or_else(|| bad("has no scheme"))?;
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        None => (rest, String::new()),
+    };
+    if authority.is_empty() || authority.contains('@') {
+        return Err(bad("needs a host and no embedded credentials"));
+    }
+    if url.contains(['?', '#']) {
+        return Err(bad("must not have a query or fragment"));
+    }
+    if !path.rsplit_once("/w/").is_some_and(|(_, name)| valid_workspace_name(name)) {
+        return Err(bad("does not end in /w/<workspace>"));
+    }
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => Ok(url.to_string()),
+        "http" if is_loopback(authority) || env("BD_INSECURE_HTTP").as_deref() == Some("1") => Ok(url.to_string()),
+        "http" => Err(Error::invalid(format!(
+            "refusing plain HTTP to {authority}: the access token would cross the network unencrypted. Use https, \
+             or set BD_INSECURE_HTTP=1 on an encrypted private network"
+        ))),
+        _ => Err(bad("must use https or http")),
+    }
+}
+
+fn is_loopback(authority: &str) -> bool {
+    let host = match authority.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
+    };
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// `bd prime` in text mode: session hooks run it, so it gives up quickly and
+/// reports an unavailable workspace as context instead of failing the hook.
+pub fn is_hook(cli: &Cli) -> bool {
+    matches!(cli.command, Command::Prime(_)) && !cli.global.json
+}
+
+/// What `bd prime` prints in place of workspace context when the remote
+/// workspace cannot be used. Exits 0, so the session hook still succeeds.
+pub fn unavailable(e: &Error) -> i32 {
+    io::outln("# bd workflow context");
+    io::outln(format!("The remote bd workspace is unavailable: {e}"));
+    io::outln(
+        "bd commands fail until this is fixed; `bd remote show` checks the connection and the access token (BD_TOKEN).",
+    );
+    0
+}
+
+/// Run the command on the server; returns the process exit code.
+pub fn run(app: &mut App, remote: Remote, cli: &Cli) -> i32 {
+    let hook = is_hook(cli);
+    let remote = if hook { remote.quick() } else { remote };
+    match forward(app, &remote, cli) {
+        Ok(response) if hook && response.exit_code != 0 => unavailable(&response_error(&response, &remote.url)),
+        Ok(response) => {
+            io::out(&response.stdout);
+            let _ = std::io::stderr().write_all(response.stderr.as_bytes());
+            response.exit_code
+        }
+        Err(e) if hook => unavailable(&e),
+        Err(e) => crate::report(&e, app.g.json),
+    }
+}
+
+fn forward(app: &App, remote: &Remote, cli: &Cli) -> Result<ExecResponse> {
+    match &cli.command {
+        Command::Init(_) => {
+            return Err(Error::Refused(format!(
+                "this workspace is remote ({}); bd init creates a local one, so run it elsewhere or remove the remote \
+                 configuration (`bd remote unset`)",
+                remote.url
+            )));
+        }
+        Command::Events(a) if a.follow => {
+            let code = follow_events(app, remote, a)?;
+            return Ok(ExecResponse { exit_code: code, ..Default::default() });
+        }
+        _ => {}
+    }
+    let argv = std::env::args_os()
+        .skip(1)
+        .map(|a| a.into_string().map_err(|a| Error::invalid(format!("argument {a:?} is not valid UTF-8"))))
+        .collect::<Result<Vec<_>>>()?;
+    let mut request = ExecRequest {
+        argv,
+        actor: env_actor(),
+        request_id: Some(random_hex(16)?),
+        location: Some(remote.url.clone()),
+        ..Default::default()
+    };
+    attach_inputs(&cli.command, &mut request)?;
+    check_outputs(app, &cli.command)?;
+    let response = remote.exec(&request)?;
+    write_outputs(app, &cli.command, &response)?;
+    Ok(response)
+}
+
+/// The error a failed command reported (its `--json` error, or its first stderr line).
+fn response_error(r: &ExecResponse, url: &str) -> Error {
+    let detail = r.stderr.lines().find_map(|l| serde_json::from_str::<ErrorBody>(l).ok()).map(|b| b.error);
+    let message = match &detail {
+        Some(d) => d.message.clone(),
+        None => r.stderr.lines().next().unwrap_or("failed").trim_start_matches("error: ").to_string(),
+    };
+    match detail.map_or(r.exit_code, |d| d.exit_code) {
+        7 => Error::Unauthorized(format!("{url}: {message}")),
+        2 => Error::invalid(format!("{url}: {message}")),
+        3 => Error::NoWorkspace(format!("{url}: {message}")),
+        _ => Error::Remote(format!("{url}: {message}")),
+    }
+}
+
+/// Send the stdin and input files the command reads; the server never reads its own files for a client.
+fn attach_inputs(cmd: &Command, request: &mut ExecRequest) -> Result<()> {
+    fn attach(request: &mut ExecRequest, path: &str) -> Result<()> {
+        if path == "-" {
+            request.stdin = Some(io::read_stdin()?);
+        } else {
+            request.files.insert(path.to_string(), io::read_file(Path::new(path))?);
+        }
+        Ok(())
+    }
+    match cmd {
+        Command::Import(a) => attach(request, &a.file),
+        Command::Batch(a) => match &a.file {
+            Some(f) => {
+                request.files.insert(f.to_string_lossy().into_owned(), io::read_file(f)?);
+                Ok(())
+            }
+            None => attach(request, "-"),
+        },
+        Command::Comment(CommentCommand::Add(a)) if a.stdin => attach(request, "-"),
+        Command::Comment(CommentCommand::Add(a)) => match &a.file {
+            Some(f) => attach(request, &f.to_string_lossy()),
+            None => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+fn extract_target(app: &App, path: &Path) -> PathBuf {
+    if path.is_relative() { app.cwd.join(path) } else { path.to_path_buf() }
+}
+
+fn check_outputs(app: &App, cmd: &Command) -> Result<()> {
+    if let Command::Playbook(PlaybookCommand::Extract(ExtractArgs { output: Some(p), force: false, .. })) = cmd {
+        let target = extract_target(app, p);
+        if target.exists() {
+            return Err(Error::Refused(format!("{} exists; pass --force to overwrite", target.display())));
+        }
+    }
+    Ok(())
+}
+
+/// Write the output files the command asked for, where the local CLI would;
+/// files the server sends for any other path are ignored.
+fn write_outputs(app: &App, cmd: &Command, response: &ExecResponse) -> Result<()> {
+    match cmd {
+        Command::Export(ExportArgs { output: Some(path), .. }) => {
+            if let Some(text) = response.files.get(path.to_string_lossy().as_ref()) {
+                let tmp = path.with_extension("jsonl.tmp");
+                std::fs::write(&tmp, text)?;
+                std::fs::rename(&tmp, path)?;
+            }
+        }
+        Command::Playbook(PlaybookCommand::Extract(ExtractArgs { output: Some(path), .. })) => {
+            if let Some(text) = response.files.get(path.to_string_lossy().as_ref()) {
+                let target = extract_target(app, path);
+                if let Some(dir) = target.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(&target, text)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `events --follow`: poll the server with a cursor, as the local command polls the database.
+fn follow_events(app: &App, remote: &Remote, a: &EventsArgs) -> Result<i32> {
+    let interval = Duration::from_millis(a.interval_ms.max(200));
+    let mut cursor = a.since;
+    let mut first = true;
+    loop {
+        let mut argv = vec!["events".to_string(), "--json".to_string()];
+        if let Some(c) = cursor {
+            argv.extend(["--since".to_string(), c.to_string()]);
+        }
+        match (first, a.limit) {
+            (true, Some(n)) => argv.extend(["--limit".to_string(), n.to_string()]),
+            (false, _) => argv.extend(["--limit".to_string(), "1000".to_string()]),
+            (true, None) => {}
+        }
+        if let Some(issue) = &a.issue {
+            argv.extend(["--issue".to_string(), issue.clone()]);
+        }
+        for op in &a.ops {
+            argv.extend(["--op".to_string(), op.clone()]);
+        }
+        if let Some(by) = &a.by_actor {
+            argv.extend(["--by".to_string(), by.clone()]);
+        }
+        let request =
+            ExecRequest { argv, actor: env_actor(), location: Some(remote.url.clone()), ..Default::default() };
+        let response = remote.exec(&request)?;
+        if response.exit_code == 6 && !first {
+            // Retention pruned past the cursor while nothing matched: resume at the head.
+            cursor = Some(remote.event_head()?);
+            continue;
+        }
+        if response.exit_code != 0 {
+            let _ = std::io::stderr().write_all(response.stderr.as_bytes());
+            return Ok(response.exit_code);
+        }
+        let events = response
+            .stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str::<Event>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| Error::Remote(format!("{}: unexpected events output: {e}", remote.url)))?;
+        io::with_stdout(|w| {
+            for e in &events {
+                let line = if app.g.json { serde_json::to_string(e).unwrap_or_default() } else { fmt::event_line(e) };
+                let _ = writeln!(w, "{line}");
+            }
+        });
+        match events.last() {
+            Some(e) => cursor = Some(e.seq),
+            None if cursor.is_none() => cursor = Some(remote.event_head()?),
+            None => {}
+        }
+        first = false;
+        std::thread::sleep(interval);
+    }
+}
+
+impl Remote {
+    pub fn new(c: Configured, token: String) -> Remote {
+        Remote {
+            url: c.url,
+            token,
+            ca_cert: c.ca_cert,
+            retry: retry_budget(),
+            connect_timeout: Duration::from_secs(10),
+            attempt_timeout: Duration::from_secs(120),
+        }
+    }
+
+    /// Settings for commands that must answer within seconds (`bd prime` in
+    /// hooks, `bd remote show`). `$BD_REMOTE_RETRY_SECS` still wins.
+    pub fn quick(mut self) -> Remote {
+        if env("BD_REMOTE_RETRY_SECS").is_none() {
+            self.retry = PRIME_RETRY_BUDGET;
+        }
+        self.connect_timeout = Duration::from_secs(3);
+        self.attempt_timeout = Duration::from_secs(15);
+        self
+    }
+
+    fn agent(&self) -> Result<ureq::Agent> {
+        let mut tls = ureq::tls::TlsConfig::builder();
+        if let Some(path) = &self.ca_cert {
+            let pem =
+                std::fs::read(path).map_err(|e| Error::invalid(format!("CA certificate {}: {e}", path.display())))?;
+            let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(&pem)
+                .filter_map(|item| match item {
+                    Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            if certs.is_empty() {
+                return Err(Error::invalid(format!("CA certificate {}: no certificate in the file", path.display())));
+            }
+            tls = tls.root_certs(ureq::tls::RootCerts::new_with_certs(&certs));
+        }
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_connect(Some(self.connect_timeout))
+            .timeout_global(Some(self.attempt_timeout))
+            .user_agent(format!("bd/{}", env!("CARGO_PKG_VERSION")))
+            .tls_config(tls.build())
+            .build();
+        Ok(config.into())
+    }
+
+    /// Send one request. Failures in transit and busy answers are retried
+    /// with the same request id, for up to the remote's retry budget.
+    pub fn exec(&self, request: &ExecRequest) -> Result<ExecResponse> {
+        let agent = self.agent()?;
+        let body = serde_json::to_vec(request)?;
+        let endpoint = format!("{}/v1/exec", self.url);
+        let authorization = format!("Bearer {}", self.token);
+        let budget = self.retry;
+        let deadline = Instant::now() + budget;
+        let mut delay = Duration::from_millis(200);
+        loop {
+            let sent = agent
+                .post(&endpoint)
+                .header("authorization", &authorization)
+                .content_type("application/json")
+                .send(&body[..]);
+            let failure = match sent {
+                Ok(mut response) => {
+                    let status = response.status().as_u16();
+                    match (status, response.body_mut().with_config().limit(u64::MAX).read_to_string()) {
+                        (200, Ok(text)) => {
+                            return serde_json::from_str(&text)
+                                .map_err(|e| Error::Remote(format!("{}: unexpected response: {e}", self.url)));
+                        }
+                        // 409 "pending": an earlier attempt of this request is still running.
+                        (409, Ok(text)) if error_code(&text).as_deref() != Some("pending") => {
+                            return Err(http_error(status, &text, &self.url));
+                        }
+                        (409 | 429 | 502 | 503 | 504, Ok(text)) => format!("HTTP {status}{}", error_message(&text)),
+                        (_, Ok(text)) => return Err(http_error(status, &text, &self.url)),
+                        (_, Err(e)) => format!("reading the response: {e}"),
+                    }
+                }
+                Err(e) if retryable(&e) => e.to_string(),
+                Err(e) => {
+                    let e = e.to_string();
+                    return Err(Error::Remote(format!("{}: {e}{}", self.url, certificate_advice(&e))));
+                }
+            };
+            if Instant::now() + delay > deadline {
+                return Err(Error::Remote(format!(
+                    "{}: {failure} (gave up after retrying for {}s)",
+                    self.url,
+                    budget.as_secs()
+                )));
+            }
+            tracing::debug!(target: "bd::remote", url = %self.url, %failure, "retrying");
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(4));
+        }
+    }
+
+    fn event_head(&self) -> Result<i64> {
+        let request = ExecRequest {
+            argv: vec!["info".into(), "--json".into()],
+            actor: env_actor(),
+            location: Some(self.url.clone()),
+            ..Default::default()
+        };
+        let response = self.exec(&request)?;
+        if response.exit_code != 0 {
+            return Err(Error::Remote(format!("{}: bd info failed: {}", self.url, response.stderr.trim())));
+        }
+        let info: serde_json::Value = serde_json::from_str(&response.stdout)?;
+        info["events_head"].as_i64().ok_or_else(|| Error::Remote(format!("{}: bd info has no events_head", self.url)))
+    }
+}
+
+// ------------------------------------------------------------ bd remote
+
+pub fn cmd_remote(app: &mut App, cmd: &RemoteCommand) -> Result<i32> {
+    io::require_local("bd remote")?;
+    match cmd {
+        RemoteCommand::Set(a) => set(app, a).map(|_| 0),
+        RemoteCommand::Show => show(app),
+        RemoteCommand::Unset => unset(app).map(|_| 0),
+    }
+}
+
+/// The `.bd` directory `bd remote set` writes to: the nearest one, else `./.bd`.
+fn config_dir(start: &Path) -> PathBuf {
+    start.ancestors().map(|d| d.join(".bd")).find(|d| d.is_dir()).unwrap_or_else(|| start.join(".bd"))
+}
+
+fn set(app: &mut App, a: &RemoteSetArgs) -> Result<()> {
+    let url = check_url(&a.url)?;
+    let dir = config_dir(&app.cwd);
+    let db = dir.join("bd.db");
+    if db.is_file() && !a.force {
+        return Err(Error::Refused(format!(
+            "{0} is a local workspace, which a remote.toml next to it would hide. Move its issues to the server first \
+             (`bd --db {0} export -o issues.jsonl`, then `bd import issues.jsonl` with an admin token), then pass \
+             --force",
+            db.display()
+        )));
+    }
+    let pem = match &a.ca_cert {
+        Some(src) => {
+            let src = if src.is_relative() { app.cwd.join(src) } else { src.clone() };
+            let pem = std::fs::read(&src).map_err(|e| Error::invalid(format!("--ca-cert {}: {e}", src.display())))?;
+            if !ureq::tls::parse_pem(&pem).any(|item| matches!(item, Ok(ureq::tls::PemItem::Certificate(_)))) {
+                return Err(Error::invalid(format!("--ca-cert {}: no PEM certificate in the file", src.display())));
+            }
+            Some(pem)
+        }
+        None => None,
+    };
+    std::fs::create_dir_all(&dir)?;
+    crate::commands::write_bd_gitignore(&dir)?;
+    // The CA certificate is public: it goes next to remote.toml, so the checkout can commit both.
+    let ca_cert = match pem {
+        Some(pem) => {
+            std::fs::write(dir.join("ca.pem"), pem)?;
+            Some(PathBuf::from("ca.pem"))
+        }
+        None => None,
+    };
+    let path = dir.join("remote.toml");
+    let body = toml::to_string(&RemoteFile { url: url.clone(), ca_cert: ca_cert.clone() })
+        .map_err(|e| Error::invalid(format!("remote.toml: {e}")))?;
+    std::fs::write(
+        &path,
+        format!(
+            "# Commands in this checkout run on a bd server; `bd remote show` checks the connection.\n\
+             # The access token comes from $BD_TOKEN: never commit it.\n{body}"
+        ),
+    )?;
+    let checkout = dir.parent().unwrap_or(&dir).display().to_string();
+    let mut out = Out::new(json!({ "path": path, "url": url, "ca_cert": ca_cert.as_ref().map(|c| dir.join(c)) }))
+        .line(format!("✓ Commands under {checkout} now run on {url}"))
+        .line(format!("  wrote {}{}", path.display(), if ca_cert.is_some() { " and ca.pem" } else { "" }));
+    if app.g.remote.is_some() {
+        out = out.line("  note: --remote or $BD_REMOTE is set, and takes precedence over this file");
+    }
+    out = out.line(if env("BD_TOKEN").is_some() {
+        "  check the connection: bd remote show"
+    } else {
+        "  next: set BD_TOKEN to an access token, then check the connection with `bd remote show`"
+    });
+    app.print(out.id(url));
+    Ok(())
+}
+
+fn show(app: &mut App) -> Result<i32> {
+    let Some(c) = configured(app)? else {
+        let local = app.db_path().ok();
+        let line = match &local {
+            Some(p) => format!("No remote workspace: commands here use the local database {}", p.display()),
+            None => "No workspace here: `bd remote set <url>` uses a bd server, `bd init` creates a local one".into(),
+        };
+        app.print(Out::new(json!({ "remote": null, "local": local })).line(line));
+        return Ok(0);
+    };
+    let token = env("BD_TOKEN");
+    let source = match &c.source {
+        Source::Flag => "--remote or $BD_REMOTE".to_string(),
+        Source::File(p) => p.display().to_string(),
+    };
+    let mut view = json!({ "url": c.url, "source": source, "ca_cert": c.ca_cert, "token_set": token.is_some() });
+    let mut lines = vec![format!("remote      {}", c.url), format!("from        {source}")];
+    if let Some(ca) = &c.ca_cert {
+        lines.push(format!("ca cert     {}", ca.display()));
+    }
+    lines.push(format!("token       BD_TOKEN is {}", if token.is_some() { "set" } else { "not set" }));
+    let checked = match token {
+        Some(t) => check(Remote::new(c.clone(), t).quick()),
+        None => Err(missing_token(&c.url)),
+    };
+    let code = match checked {
+        Ok(info) => {
+            let s = |k: &str| info[k].as_str().map(String::from).unwrap_or_else(|| info[k].to_string());
+            lines.push(format!("server      bd {}, schema v{}", s("version"), s("schema_version")));
+            lines.push(format!(
+                "workspace   prefix {}, {} issues, events head {}",
+                s("prefix"),
+                s("issues"),
+                s("events_head")
+            ));
+            lines.push(format!("actor       {}", s("actor")));
+            lines.push("✓ connected".into());
+            view["connected"] = json!(true);
+            view["server"] = info;
+            0
+        }
+        Err(e) => {
+            lines.push(format!("✗ {e}"));
+            view["connected"] = json!(false);
+            view["error"] = json!({ "code": e.code(), "message": e.to_string(), "exit_code": e.exit_code() });
+            e.exit_code()
+        }
+    };
+    app.print(Out::new(view).lines(lines));
+    Ok(code)
+}
+
+/// `bd info` on the server: proves that the URL, certificate, token and actor all work.
+fn check(remote: Remote) -> Result<Value> {
+    let request = ExecRequest {
+        argv: vec!["info".into(), "--json".into()],
+        actor: env_actor(),
+        location: Some(remote.url.clone()),
+        ..Default::default()
+    };
+    let response = remote.exec(&request)?;
+    if response.exit_code != 0 {
+        return Err(response_error(&response, &remote.url));
+    }
+    Ok(serde_json::from_str(&response.stdout)?)
+}
+
+fn unset(app: &mut App) -> Result<()> {
+    let mut out = match remote_file(&app.cwd) {
+        Some(path) => {
+            std::fs::remove_file(&path)?;
+            let mut out = Out::new(json!({ "removed": path })).line(format!("✓ Removed {}", path.display()));
+            if let Some(db) = path.parent().map(|d| d.join("bd.db")).filter(|db| db.is_file()) {
+                out = out.line(format!("  commands here use the local database {} again", db.display()));
+            }
+            out
+        }
+        None => Out::new(json!({ "removed": null })).line("= No .bd/remote.toml applies here"),
+    };
+    if app.g.remote.is_some() {
+        out = out.line("  note: --remote or $BD_REMOTE is still set, and keeps commands remote");
+    }
+    app.print(out);
+    Ok(())
+}
+
+/// Failures worth retrying: the request may not have arrived, or its answer was lost.
+fn retryable(e: &ureq::Error) -> bool {
+    match e {
+        // rustls reports certificate and handshake failures as InvalidData; retrying cannot fix those.
+        ureq::Error::Io(io) => io.kind() != std::io::ErrorKind::InvalidData,
+        ureq::Error::Timeout(_) | ureq::Error::ConnectionFailed | ureq::Error::BodyStalled => true,
+        _ => false,
+    }
+}
+
+/// What to do about a rejected server certificate (rustls describes it only in text).
+fn certificate_advice(error: &str) -> &'static str {
+    if error.contains("CaUsedAsEndEntity") {
+        " (the server's certificate is a CA certificate: issue it with basicConstraints CA:FALSE, or sign it with a \
+         separate CA)"
+    } else if error.contains("invalid peer certificate") {
+        " (to trust a private CA or a self-signed certificate, set BD_CA_CERT or ca_cert in .bd/remote.toml)"
+    } else {
+        ""
+    }
+}
+
+fn error_message(body: &str) -> String {
+    serde_json::from_str::<ErrorBody>(body).map(|b| format!(": {}", b.error.message)).unwrap_or_default()
+}
+
+fn error_code(body: &str) -> Option<String> {
+    serde_json::from_str::<ErrorBody>(body).ok().map(|b| b.error.code)
+}
+
+fn http_error(status: u16, body: &str, url: &str) -> Error {
+    let detail = serde_json::from_str::<ErrorBody>(body).ok().map(|b| b.error);
+    let message = detail.as_ref().map_or_else(|| format!("HTTP {status}"), |d| d.message.clone());
+    match (status, detail.as_ref().map(|d| d.code.as_str())) {
+        (401 | 403, _) | (_, Some("unauthorized")) => Error::Unauthorized(format!("{url}: {message}")),
+        (404, _) => Error::not_found("workspace", url),
+        (400 | 413, _) => Error::invalid(format!("{url}: {message}")),
+        _ => Error::Remote(format!("{url}: {message}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_urls() {
+        assert_eq!(check_url("https://bd.example.com/w/proj/").unwrap(), "https://bd.example.com/w/proj");
+        assert!(check_url("https://example.com/bd/w/proj").is_ok(), "behind a path prefix");
+        assert!(check_url("http://127.0.0.1:7420/w/proj").is_ok(), "loopback may use http");
+        assert!(check_url("http://[::1]:7420/w/proj").is_ok());
+        assert!(check_url("http://localhost/w/proj").is_ok());
+        for bad in [
+            "bd.example.com/w/proj",
+            "https://bd.example.com",
+            "https://bd.example.com/w/",
+            "https://bd.example.com/w/a/b",
+            "https://user:pw@bd.example.com/w/proj",
+            "https://bd.example.com/w/proj?x=1",
+            "ftp://bd.example.com/w/proj",
+        ] {
+            assert!(check_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn plain_http_only_to_loopback() {
+        if env("BD_INSECURE_HTTP").is_none() {
+            let e = check_url("http://bd.example.com/w/proj").unwrap_err();
+            assert!(e.to_string().contains("unencrypted"), "{e}");
+        }
+        assert!(is_loopback("127.0.0.1:1") && is_loopback("[::1]:1") && is_loopback("LOCALHOST"));
+        assert!(!is_loopback("10.0.0.1:7420") && !is_loopback("bd.example.com"));
+    }
+
+    #[test]
+    fn http_errors_keep_their_exit_codes() {
+        let body = |code: &str| format!(r#"{{"error":{{"code":"{code}","message":"m","exit_code":7}}}}"#);
+        assert_eq!(http_error(401, &body("unauthorized"), "u").exit_code(), 7);
+        assert_eq!(http_error(403, &body("unauthorized"), "u").exit_code(), 7);
+        assert_eq!(http_error(404, &body("not_found"), "u").exit_code(), 3);
+        assert_eq!(http_error(413, &body("invalid"), "u").exit_code(), 2);
+        assert_eq!(http_error(500, "not json", "u").exit_code(), 8);
+    }
+
+    #[test]
+    fn certificate_errors_explain_the_fix() {
+        let ca = "io: invalid peer certificate: Other(OtherError(CaUsedAsEndEntity))";
+        assert!(certificate_advice(ca).contains("CA:FALSE"));
+        assert!(certificate_advice("io: invalid peer certificate: UnknownIssuer").contains("BD_CA_CERT"));
+        assert_eq!(certificate_advice("io: Connection refused"), "");
+    }
+}

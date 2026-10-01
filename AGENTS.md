@@ -31,7 +31,7 @@ bd remember "durable project insight"               # shown by bd prime; search 
 
 - Create or claim an issue before starting work, and close it when the work is done.
 - Use `--json` when parsing output.
-- Exit code 4 means a claim conflict (someone else holds it, or it is not ready). Exit code 13 means a stale `--if-revision`/`--if-status`/`--if-assignee` guard: re-read before retrying.
+- Exit code 4 means a claim conflict (someone else holds it, or it is not ready). Exit code 13 means a stale `--if-revision`/`--if-status`/`--if-assignee` guard: re-read before retrying. In a remote workspace (`.bd/remote.toml`), exit code 7 means the access token (`BD_TOKEN`) is missing or not allowed, and 8 means the bd server is unreachable; `bd remote show` checks both.
 - If `bd heartbeat` fails, stop working on that issue: the claim was released, reclaimed, or taken over.
 
 ### Session completion
@@ -81,8 +81,8 @@ CI (`.github/workflows/ci.yml`) runs fmt, then clippy `-D warnings` and the test
 
 Rust re-implementation of beads as a coordination engine on SQLite WAL (see README.md).
 
-- `crates/bd-core` (library): `store.rs` (WAL pragmas, busy handler, `Store::write` = one `BEGIN IMMEDIATE` transaction with a `WriteCtx`), `schema.rs` (migrations via `PRAGMA user_version`), `issues.rs` (lifecycle), `graph.rs` (typed edges, cycle/hierarchy checks, materialized `is_blocked`), `ready.rs`, `claims.rs` (leases, fencing tokens, reclaim), `events.rs`, `comments.rs`, `memory.rs`, `transfer.rs` (JSONL, beads-compatible import), `metrics.rs`, `doctor.rs`, `queries.rs` (read API trait), `gates.rs` (gate conditions in `metadata.gate`, arming via `graph::recompute`, local evaluation, escalation), `playbook/` (playbook files: strict parsing, `{{var}}` templates and conditions, `extends`/`expand` loading, compile to a `Plan`, runs, extract).
-- `crates/bd-cli` (binary `bd`): clap grammar in `cli.rs`; mutations are `exec_*` functions over `WriteCtx` in `commands.rs` so `batch.rs` can run them in one transaction; `bench.rs` is the throughput and invariant harness; `playbooks.rs` and `gates.rs` implement `bd playbook` and `bd gate` (GitHub gates shell out to `gh`, outside any write transaction).
+- `crates/bd-core` (library): `store.rs` (WAL pragmas, busy handler, `Store::write` = one `BEGIN IMMEDIATE` transaction with a `WriteCtx`), `schema.rs` (migrations via `PRAGMA user_version`), `issues.rs` (lifecycle), `graph.rs` (typed edges, cycle/hierarchy checks, materialized `is_blocked`), `ready.rs`, `claims.rs` (leases, fencing tokens, reclaim), `events.rs`, `comments.rs`, `memory.rs`, `transfer.rs` (JSONL, beads-compatible import), `metrics.rs`, `doctor.rs`, `queries.rs` (read API trait), `gates.rs` (gate conditions in `metadata.gate`, arming via `graph::recompute`, local evaluation, escalation), `requests.rs` (idempotency records: a request id stored in the same transaction as its write), `playbook/` (playbook files: strict parsing, `{{var}}` templates and conditions, `extends`/`expand` loading, compile to a `Plan`, runs, extract).
+- `crates/bd-cli` (binary `bd`): clap grammar in `cli.rs`; mutations are `exec_*` functions over `WriteCtx` in `commands.rs` so `batch.rs` can run them in one transaction; `bench.rs` is the throughput and invariant harness; `playbooks.rs` and `gates.rs` implement `bd playbook` and `bd gate` (GitHub gates shell out to `gh`, outside any write transaction). Remote workspaces: `serve.rs` (`bd serve`: tokio/hyper with rustls on `ring`; runs each request's command line in-process via `execute` with captured I/O), `auth.rs` (access tokens in `<root>/tokens.json`, roles, actor binding), `remote.rs` (client: `--remote`/`BD_REMOTE`/`.bd/remote.toml`, retries with request ids), `protocol.rs` (wire format), `io.rs` (stdio and files, or a request's capture).
 
 ### Conventions & Patterns
 
@@ -91,4 +91,5 @@ Rust re-implementation of beads as a coordination engine on SQLite WAL (see READ
 - Keep the lease invariant: a lease exists iff the issue is `in_progress` and the holder equals the assignee.
 - Keep indexes minimal: each index is extra pages written per claim/close (see `bd bench`).
 - Playbook runs and groups are identified by `metadata.playbook.role` (`run`/`group`): they close themselves when their subtree closes; keep that metadata when touching run issues.
+- Commands print and read only through `io.rs` (`outln`, `errln`, `with_stdout`, `read_input`, `send_file`), never `println!`, stdin or client-named files directly, so `bd serve` can run them in-process and capture their I/O. Admin-only operations call `io::require_admin`, machine-local ones `io::require_local`; new commands also need a class in `serve::access`.
 - AGENTS.md and CLAUDE.md are identical; edit both.

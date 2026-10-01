@@ -2,21 +2,25 @@
 //!
 //! Seeds a random DAG of issues, then runs N workers that loop
 //! `claim --next` -> (work) -> (heartbeat) -> `close --token` until the graph
-//! is drained. Three modes:
+//! is drained. Four modes:
 //! * `threads`: worker threads in this process, one connection each;
 //! * `processes`: one long-lived worker process each (cross-process locks);
 //! * `cli`: a fresh `bd` process per claim and per close, which is what
-//!   agents invoking the CLI experience end to end.
+//!   agents invoking the CLI experience end to end;
+//! * `remote`: like `cli`, but each command goes through a scratch `bd serve`
+//!   (HTTP, access token, sub-actors, the server's connection pool), as
+//!   clients on other machines would use it.
 //!
 //! Afterwards the event log is checked: every issue was claimed and closed
 //! exactly once, and never claimed before all of its blockers closed.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use bd_core::config::IdMode;
+use bd_core::config::{self, IdMode};
 use bd_core::doctor;
 use bd_core::{
     ClaimOptions, CloseOptions, DepType, Durability, Error, InitOptions, NewIssue, OpenOptions, ReadyQuery, Result,
@@ -26,7 +30,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::app::App;
+use crate::auth::{self, Role};
 use crate::cli::{BenchArgs, BenchMode, BenchWorkerArgs};
+use crate::protocol::valid_workspace_name;
 
 struct Rng(u64);
 
@@ -160,10 +166,19 @@ pub fn cmd_bench_worker(a: &BenchWorkerArgs) -> Result<()> {
     Ok(())
 }
 
-/// One `bd` process per operation, driven from a thread.
+/// Where `cli` and `remote` workers send their commands.
+#[derive(Clone, Debug)]
+enum Target {
+    Db(PathBuf),
+    Server { url: String, token: String },
+}
+
+/// One `bd` process per operation, driven from a thread. `path` is the
+/// database, read directly to tell "drained" from "nothing ready yet".
 fn run_cli_worker(
     exe: &Path,
     path: &Path,
+    target: &Target,
     actor: &str,
     work: Duration,
     heartbeat: bool,
@@ -171,9 +186,16 @@ fn run_cli_worker(
 ) -> Result<WorkerStats> {
     let probe = Store::open(path, bench_options(Durability::Normal))?;
     let bd = |args: &[&str]| -> Result<Value> {
-        let out = Command::new(exe)
-            .arg("--db")
-            .arg(path)
+        let mut cmd = Command::new(exe);
+        match target {
+            Target::Db(db) => {
+                cmd.arg("--db").arg(db).env_remove("BD_REMOTE");
+            }
+            Target::Server { url, token } => {
+                cmd.env("BD_REMOTE", url).env("BD_TOKEN", token).env_remove("BD_DB");
+            }
+        }
+        let out = cmd
             .args(["--actor", actor, "--json"])
             .args(args)
             .env("BD_LOG", "error")
@@ -218,11 +240,17 @@ fn run_cli_worker(
     Ok(s)
 }
 
-fn scratch_path(keep: &Option<PathBuf>) -> Result<(PathBuf, Option<PathBuf>)> {
+fn scratch_path(keep: &Option<PathBuf>, mode: BenchMode) -> Result<(PathBuf, Option<PathBuf>)> {
     match keep {
         Some(p) => {
             if p.exists() {
                 return Err(Error::invalid(format!("{} already exists", p.display())));
+            }
+            if mode == BenchMode::Remote && served_workspace(p).is_none() {
+                return Err(Error::invalid(format!(
+                    "--keep {}: remote mode serves <root>/<name>/.bd/bd.db, so give a path of that shape",
+                    p.display()
+                )));
             }
             Ok((p.clone(), None))
         }
@@ -231,8 +259,66 @@ fn scratch_path(keep: &Option<PathBuf>) -> Result<(PathBuf, Option<PathBuf>)> {
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
             let dir = std::env::temp_dir().join(format!("bd-bench-{}-{nanos}", std::process::id()));
             std::fs::create_dir_all(&dir)?;
-            Ok((dir.join("bench.db"), Some(dir)))
+            let path = match mode {
+                BenchMode::Remote => dir.join("bench").join(".bd").join("bd.db"),
+                _ => dir.join("bench.db"),
+            };
+            Ok((path, Some(dir)))
         }
+    }
+}
+
+/// `<root>/<name>/.bd/bd.db` -> (`<root>`, `<name>`): how `bd serve` finds a workspace.
+fn served_workspace(db: &Path) -> Option<(PathBuf, String)> {
+    let bd_dir = db.parent().filter(|_| db.file_name().is_some_and(|f| f == "bd.db"))?;
+    let ws = bd_dir.parent().filter(|_| bd_dir.file_name().is_some_and(|f| f == ".bd"))?;
+    let name = ws.file_name()?.to_str().filter(|n| valid_workspace_name(n))?.to_string();
+    let root = ws.parent().filter(|r| !r.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    Some((root.to_path_buf(), name))
+}
+
+/// A `bd serve` child process for `--mode remote`, stopped when dropped.
+struct ScratchServer {
+    child: Child,
+    url: String,
+    token: String,
+}
+
+impl ScratchServer {
+    fn start(exe: &Path, db: &Path) -> Result<ScratchServer> {
+        let (root, name) =
+            served_workspace(db).ok_or_else(|| Error::invalid("remote mode needs <root>/<name>/.bd/bd.db"))?;
+        let (_, token) = auth::issue_token(&root, "bench", "bench", Role::Write, std::slice::from_ref(&name))?;
+        let mut child = Command::new(exe)
+            .arg("serve")
+            .arg("--root")
+            .arg(&root)
+            .args(["--listen", "127.0.0.1:0"])
+            .env("BD_LOG", "error")
+            .env_remove("BD_REMOTE")
+            .env_remove("BD_DB")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut line = String::new();
+        if let Some(out) = child.stdout.take() {
+            BufReader::new(out).read_line(&mut line)?;
+        }
+        let mut server = ScratchServer { child, url: String::new(), token };
+        let base = line
+            .split_whitespace()
+            .find(|w| w.starts_with("http://"))
+            .ok_or_else(|| Error::invalid(format!("bd serve did not start: {:?}", line.trim())))?;
+        server.url = format!("{base}/w/{name}");
+        Ok(server)
+    }
+}
+
+impl Drop for ScratchServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -297,21 +383,23 @@ fn verify(store: &mut Store, n: usize) -> Result<Vec<String>> {
     Ok(violations)
 }
 
-fn run_threads(a: &BenchArgs, path: &Path, opts: &OpenOptions) -> Result<Vec<WorkerStats>> {
+fn run_threads(a: &BenchArgs, path: &Path, opts: &OpenOptions, target: &Target) -> Result<Vec<WorkerStats>> {
     let barrier = Arc::new(Barrier::new(a.workers));
     let exe = std::env::current_exe()?;
     let work = Duration::from_millis(a.work_ms);
     let handles: Vec<_> = (0..a.workers)
         .map(|w| {
             let (path, opts, barrier, exe) = (path.to_path_buf(), opts.clone(), barrier.clone(), exe.clone());
-            let (mode, heartbeat) = (a.mode, a.heartbeat);
-            std::thread::spawn(move || {
-                let actor = format!("worker-{w}");
-                if mode == BenchMode::Cli {
-                    run_cli_worker(&exe, &path, &actor, work, heartbeat, barrier)
-                } else {
-                    run_worker(&path, opts, &actor, work, heartbeat, Some(barrier))
+            let (mode, heartbeat, target) = (a.mode, a.heartbeat, target.clone());
+            std::thread::spawn(move || match mode {
+                // One access token; each worker is its own sub-actor, as agents sharing a token would be.
+                BenchMode::Remote => {
+                    run_cli_worker(&exe, &path, &target, &format!("bench/worker-{w}"), work, heartbeat, barrier)
                 }
+                BenchMode::Cli => {
+                    run_cli_worker(&exe, &path, &target, &format!("worker-{w}"), work, heartbeat, barrier)
+                }
+                _ => run_worker(&path, opts, &format!("worker-{w}"), work, heartbeat, Some(barrier)),
             })
         })
         .collect();
@@ -352,7 +440,7 @@ pub fn cmd_bench(app: &mut App, a: &BenchArgs) -> Result<()> {
         return Err(Error::invalid("--workers and --issues must be positive"));
     }
     let durability = Durability::parse(&a.durability)?;
-    let (path, cleanup) = scratch_path(&a.keep)?;
+    let (path, cleanup) = scratch_path(&a.keep, a.mode)?;
     let opts = bench_options(durability);
     let mut store = Store::init(&path, InitOptions { prefix: "b".into(), id_mode: IdMode::Counter }, opts.clone())?;
     let seed_start = Instant::now();
@@ -360,12 +448,28 @@ pub fn cmd_bench(app: &mut App, a: &BenchArgs) -> Result<()> {
     let seed_ms = seed_start.elapsed().as_secs_f64() * 1e3;
     let edges: i64 = store.connection().query_row("SELECT COUNT(*) FROM dependencies", [], |r| r.get(0))?;
 
+    // The server opens the database itself, so it reads durability from the workspace config.
+    let server = match a.mode {
+        BenchMode::Remote => {
+            store.write("bench.config", "bench", |tx| {
+                config::set(tx, "durability", &a.durability.to_ascii_lowercase())
+            })?;
+            Some(ScratchServer::start(&std::env::current_exe()?, &path)?)
+        }
+        _ => None,
+    };
+    let target = match &server {
+        Some(s) => Target::Server { url: s.url.clone(), token: s.token.clone() },
+        None => Target::Db(path.clone()),
+    };
+
     let start = Instant::now();
     let all = match a.mode {
-        BenchMode::Threads | BenchMode::Cli => run_threads(a, &path, &opts)?,
+        BenchMode::Threads | BenchMode::Cli | BenchMode::Remote => run_threads(a, &path, &opts, &target)?,
         BenchMode::Processes => run_processes(a, &path)?,
     };
     let elapsed = start.elapsed();
+    drop(server);
     let violations = verify(&mut store, a.issues)?;
 
     let total_claims: usize = all.iter().map(|s| s.claims).sum();
@@ -417,13 +521,17 @@ pub fn cmd_bench(app: &mut App, a: &BenchArgs) -> Result<()> {
         println!("  claim latency  p50 {}µs  p95 {}µs  p99 {}µs  max {}µs", l.p50_us, l.p95_us, l.p99_us, l.max_us);
         let l = &report.close_latency;
         println!("  close latency  p50 {}µs  p95 {}µs  p99 {}µs  max {}µs", l.p50_us, l.p95_us, l.p99_us, l.max_us);
-        if a.mode == BenchMode::Cli {
-            println!(
+        match a.mode {
+            BenchMode::Cli => println!(
                 "  contention     {} empty polls (busy retries happen inside child processes)",
                 report.empty_polls
-            );
-        } else {
-            println!("  contention     {} busy retries, {} empty polls", report.busy_retries, report.empty_polls);
+            ),
+            BenchMode::Remote => println!(
+                "  contention     {} empty polls (busy retries happen on the server, which also stores each write's \
+                 response for retries)",
+                report.empty_polls
+            ),
+            _ => println!("  contention     {} busy retries, {} empty polls", report.busy_retries, report.empty_polls),
         }
         println!("  per worker     {:?}", report.claims_by_worker);
         if report.verified {

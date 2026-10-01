@@ -24,6 +24,7 @@ impl Ws {
             .env("BD_ACTOR", actor)
             .env("BD_LOG", "error")
             .env_remove("BD_DB")
+            .env_remove("BD_REMOTE")
             .env_remove("BD_PLAYBOOK_PATH")
             .env_remove("BD_GH")
             .env("XDG_CONFIG_HOME", dir.join(".xdg"));

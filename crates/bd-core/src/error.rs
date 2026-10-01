@@ -54,6 +54,16 @@ pub enum Error {
     #[error("{0}")]
     NoWorkspace(String),
 
+    /// A bd server rejected the access token, or the token's role,
+    /// workspaces or actor do not allow the operation.
+    #[error("{0}")]
+    Unauthorized(String),
+
+    /// A bd server could not be reached or answered unexpectedly. Safe to
+    /// retry: writes carry a request id, so a retry is applied at most once.
+    #[error("{0}")]
+    Remote(String),
+
     #[error("sqlite: {0}")]
     Sqlite(rusqlite::Error),
 
@@ -101,6 +111,8 @@ impl Error {
             Error::Busy(_) => "busy",
             Error::SchemaTooNew { .. } => "schema_too_new",
             Error::NoWorkspace(_) => "no_workspace",
+            Error::Unauthorized(_) => "unauthorized",
+            Error::Remote(_) => "remote",
             Error::Sqlite(_) => "sqlite",
             Error::Json(_) => "json",
             Error::Io(_) => "io",
@@ -120,6 +132,8 @@ impl Error {
             | Error::LeaseLost { .. } => 4,
             Error::Busy(_) => 5,
             Error::EventsTruncated { .. } => 6,
+            Error::Unauthorized(_) => 7,
+            Error::Remote(_) => 8,
             Error::Conflict { .. } => 13,
             Error::SchemaTooNew { .. } | Error::Sqlite(_) | Error::Json(_) | Error::Io(_) => 1,
         }

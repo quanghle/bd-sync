@@ -4,7 +4,7 @@
 //! can run any sequence of them inside one transaction.
 
 use std::collections::BTreeMap;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Write};
 use std::path::Path;
 use std::time::Duration;
 
@@ -23,6 +23,7 @@ use serde_json::{Value, json};
 use crate::app::{App, Out};
 use crate::cli::*;
 use crate::fmt::{self, rel};
+use crate::io::{self, read_input};
 
 // ---------------------------------------------------------------- helpers
 
@@ -96,16 +97,6 @@ fn dep_spec<Q: Queries + ?Sized>(q: &Q, s: &str) -> Result<(DepType, String)> {
         }
     }
     Ok((DepType::Blocks, q.resolve_id(s)?))
-}
-
-fn read_input(path: &str) -> Result<String> {
-    let mut s = String::new();
-    if path == "-" {
-        std::io::stdin().read_to_string(&mut s)?;
-    } else {
-        s = std::fs::read_to_string(path).map_err(|e| Error::invalid(format!("{path}: {e}")))?;
-    }
-    Ok(s)
 }
 
 fn one_or_many<T: serde::Serialize>(items: &[T]) -> Value {
@@ -485,11 +476,13 @@ pub fn exec_forget(tx: &mut WriteCtx<'_>, a: &KeyArg) -> Result<Out> {
 pub fn exec_config(tx: &mut WriteCtx<'_>, cmd: &ConfigCommand) -> Result<Out> {
     match cmd {
         ConfigCommand::Set(a) => {
+            io::require_admin("config set")?;
             config::set(tx, a.key.trim(), &a.value)?;
             let value = config::get_or_default(tx.conn(), a.key.trim())?;
             Ok(Out::new(json!({ "key": a.key.trim(), "value": value })).line(format!("✓ {} = {value}", a.key.trim())))
         }
         ConfigCommand::Unset(a) => {
+            io::require_admin("config unset")?;
             let removed = config::unset(tx, a.key.trim())?;
             Ok(Out::new(json!({ "key": a.key.trim(), "removed": removed })).line(if removed {
                 format!("✓ Unset {}", a.key.trim())
@@ -518,7 +511,20 @@ fn default_prefix(dir: &Path) -> String {
     if p.is_empty() { "bd".into() } else { p }
 }
 
+/// `.bd/.gitignore`: the database and its WAL files are local state. Left alone if it exists.
+pub fn write_bd_gitignore(dir: &Path) -> Result<()> {
+    let gitignore = dir.join(".gitignore");
+    if !gitignore.exists() {
+        std::fs::write(
+            &gitignore,
+            "# SQLite database and WAL files are local state.\n# Share issues with `bd export -o .bd/issues.jsonl`.\nbd.db\nbd.db-wal\nbd.db-shm\n",
+        )?;
+    }
+    Ok(())
+}
+
 pub fn cmd_init(app: &mut App, a: &InitArgs) -> Result<()> {
+    io::require_local("bd init")?;
     let path = match &app.g.db {
         Some(p) if p.is_absolute() => p.clone(),
         Some(p) => app.cwd.join(p),
@@ -535,13 +541,7 @@ pub fn cmd_init(app: &mut App, a: &InitArgs) -> Result<()> {
     let store = Store::init(&path, InitOptions { prefix: prefix.clone(), id_mode }, app.open_options())?;
     if let Some(dir) = path.parent() {
         if dir.file_name().is_some_and(|n| n == ".bd") {
-            let gitignore = dir.join(".gitignore");
-            if !gitignore.exists() {
-                std::fs::write(
-                    &gitignore,
-                    "# SQLite database and WAL files are local state.\n# Share issues with `bd export -o .bd/issues.jsonl`.\nbd.db\nbd.db-wal\nbd.db-shm\n",
-                )?;
-            }
+            write_bd_gitignore(dir)?;
         }
     }
     app.set_store(store);
@@ -562,13 +562,13 @@ pub fn cmd_show(app: &mut App, a: &ShowArgs) -> Result<()> {
     if app.g.json {
         app.print_json(&one_or_many(&all));
     } else if app.g.quiet {
-        all.iter().for_each(|d| println!("{}", d.issue.id));
+        all.iter().for_each(|d| io::outln(&d.issue.id));
     } else {
         for (n, d) in all.iter().enumerate() {
             if n > 0 {
-                println!();
+                io::outln("");
             }
-            fmt::details(d, now).iter().for_each(|l| println!("{l}"));
+            fmt::details(d, now).iter().for_each(io::outln);
         }
     }
     Ok(())
@@ -837,7 +837,7 @@ pub fn cmd_memory_get(app: &mut App, key: &str) -> Result<()> {
     if app.g.json {
         app.print_json(&m);
     } else {
-        println!("{}", m.content);
+        io::outln(&m.content);
     }
     Ok(())
 }
@@ -859,6 +859,7 @@ pub fn cmd_memory_list(app: &mut App, query: Option<&str>) -> Result<()> {
 
 pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
     if let Some(EventsAction::Prune(p)) = &a.action {
+        io::require_admin("events prune")?;
         let opts = PruneOptions {
             before: p.before,
             older_than: p.older_than.as_deref().map(parse_duration).transpose()?,
@@ -873,16 +874,19 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
         Some(raw) => Some(app.read(|r| r.resolve_id(raw))?),
         None => None,
     };
+    if a.follow {
+        // Remote clients follow by polling; a request must finish.
+        io::require_local("events --follow")?;
+    }
     let mut q =
         EventQuery { since: a.since, limit: a.limit, issue_id: issue, ops: a.ops.clone(), actor: a.by_actor.clone() };
     let print = |app: &App, events: &[bd_core::Event]| {
-        let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        for e in events {
-            let line = if app.g.json { serde_json::to_string(e).unwrap_or_default() } else { fmt::event_line(e) };
-            let _ = writeln!(lock, "{line}");
-        }
-        let _ = lock.flush();
+        io::with_stdout(|w| {
+            for e in events {
+                let line = if app.g.json { serde_json::to_string(e).unwrap_or_default() } else { fmt::event_line(e) };
+                let _ = writeln!(w, "{line}");
+            }
+        });
     };
     let page = app.read(|r| r.events(&q))?;
     print(app, &page.events);
@@ -933,7 +937,7 @@ pub fn cmd_history(app: &mut App, a: &HistoryArgs) -> Result<()> {
 
 pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     let actor = app.actor();
-    let path = app.db_path()?;
+    let workspace = app.workspace_label()?;
     let (mine, ready, stats, memories, ttl, now, prefix, attention) = app.read(|r| {
         let mine = r.list(&ListQuery {
             filter: WorkFilter { assignee: Some(actor.clone()), ..Default::default() },
@@ -974,7 +978,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
         if a.max_memories > 0 { memories.iter().take(a.max_memories).collect() } else { memories.iter().collect() };
     if app.g.json {
         app.print_json(&json!({
-            "workspace": path,
+            "workspace": workspace,
             "prefix": prefix,
             "actor": actor,
             "lease_ttl": ttl,
@@ -989,7 +993,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     }
     let mut o = Vec::new();
     o.push("# bd workflow context".to_string());
-    o.push(format!("Workspace `{}` (prefix `{prefix}`); you are `{actor}`.", path.display()));
+    o.push(format!("Workspace `{workspace}` (prefix `{prefix}`); you are `{actor}`."));
     o.push(String::new());
     o.push("## Core loop".into());
     o.push("- `bd ready` lists unblocked work in queue order (priority, then age).".into());
@@ -1070,7 +1074,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             o.push(m.content.clone());
         }
     }
-    o.iter().for_each(|l| println!("{l}"));
+    o.iter().for_each(io::outln);
     Ok(())
 }
 
@@ -1170,12 +1174,13 @@ pub fn cmd_metrics(app: &mut App, a: &MetricsArgs) -> Result<()> {
     if app.g.json || a.format == MetricsFormat::Json {
         app.print_json(&m);
     } else {
-        print!("{}", prometheus(&m));
+        io::out(prometheus(&m));
     }
     Ok(())
 }
 
 pub fn cmd_doctor(app: &mut App, a: &DoctorArgs) -> Result<i32> {
+    io::require_admin("bd doctor")?;
     let report = doctor::diagnose(app.store()?, a.fix, a.full)?;
     if app.g.json {
         app.print_json(&report);
@@ -1187,9 +1192,9 @@ pub fn cmd_doctor(app: &mut App, a: &DoctorArgs) -> Result<i32> {
                 (Severity::Warn, _) => "!",
                 (Severity::Error, _) => "✗",
             };
-            println!("{icon} {:<20} {}", c.name, c.detail);
+            io::outln(format!("{icon} {:<20} {}", c.name, c.detail));
         }
-        println!("{}", if report.ok { "healthy" } else { "problems found (run `bd doctor --fix`)" });
+        io::outln(if report.ok { "healthy" } else { "problems found (run `bd doctor --fix`)" });
     }
     Ok(if report.ok { 0 } else { 1 })
 }
@@ -1201,7 +1206,7 @@ pub fn cmd_config_read(app: &mut App, cmd: &ConfigCommand) -> Result<()> {
             if app.g.json {
                 app.print_json(&json!({ "key": k.key.trim(), "value": v }));
             } else {
-                println!("{v}");
+                io::outln(v);
             }
         }
         ConfigCommand::List => {
@@ -1228,6 +1233,13 @@ pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
         include_ephemeral: a.include_ephemeral,
     };
     let summary = match &a.output {
+        // Under bd serve the file goes back to the client, which writes it.
+        Some(path) if io::serving() => {
+            let mut buf = Vec::new();
+            let s = app.read(|r| r.export_jsonl(&mut buf, &opts))?;
+            io::send_file(path, buf)?;
+            s
+        }
         Some(path) => {
             let tmp = path.with_extension("jsonl.tmp");
             let file = std::fs::File::create(&tmp)?;
@@ -1238,13 +1250,12 @@ pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
             std::fs::rename(&tmp, path)?;
             s
         }
-        None => {
-            let stdout = std::io::stdout();
-            let mut w = std::io::BufWriter::new(stdout.lock());
+        None => io::with_stdout(|out| {
+            let mut w = std::io::BufWriter::new(out);
             let s = app.read(|r| r.export_jsonl(&mut w, &opts))?;
             w.flush()?;
-            s
-        }
+            Ok::<_, Error>(s)
+        })?,
     };
     if a.output.is_some() {
         let out = Out::new(&summary).line(format!(
@@ -1257,6 +1268,7 @@ pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
 }
 
 pub fn cmd_import(app: &mut App, a: &ImportArgs) -> Result<()> {
+    io::require_admin("bd import")?;
     let data = read_input(&a.file)?;
     let opts = ImportOptions { lenient: a.lenient };
     let dry = a.dry_run;
@@ -1287,7 +1299,7 @@ pub fn cmd_import(app: &mut App, a: &ImportArgs) -> Result<()> {
 
 pub fn cmd_info(app: &mut App) -> Result<()> {
     let actor = app.actor();
-    let path = app.db_path()?;
+    let workspace = app.workspace_label()?;
     let store = app.store()?;
     let workspace_id = store.meta("workspace_id")?;
     let created = store.meta("created_at")?;
@@ -1303,7 +1315,7 @@ pub fn cmd_info(app: &mut App) -> Result<()> {
         ))
     })?;
     let info = json!({
-        "path": path,
+        "path": workspace,
         "workspace_id": workspace_id,
         "created_at": created,
         "prefix": prefix,
@@ -1318,7 +1330,7 @@ pub fn cmd_info(app: &mut App) -> Result<()> {
         "version": env!("CARGO_PKG_VERSION"),
     });
     let out = Out::new(&info)
-        .line(format!("workspace   {}", path.display()))
+        .line(format!("workspace   {workspace}"))
         .line(format!("prefix      {prefix} ({mode} ids)"))
         .line(format!(
             "storage     SQLite {sqlite_version}, journal {journal}, durability {durability}, schema v{}",

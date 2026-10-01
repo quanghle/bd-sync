@@ -456,6 +456,11 @@ impl WriteCtx<'_> {
         self.rollback_only = true;
     }
 
+    /// Whether [`WriteCtx::set_rollback_only`] was called.
+    pub fn is_rollback_only(&self) -> bool {
+        self.rollback_only
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.tx
     }

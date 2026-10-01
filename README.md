@@ -12,6 +12,7 @@ coordination engine:
 - **Optimistic concurrency**: per-issue revisions and `--if-revision/--if-status/--if-assignee` guards (exit code 13 on conflict)
 - **Comments, durable memory, and transactional event history** with gapless, commit-ordered sequence numbers
 - **Playbooks and gates**: repeatable multi-step work declared once in TOML and run atomically as `<run>.<step>` issues; human, timer, issue, and GitHub gates that arm when their step could start ([Playbooks](#playbooks-repeatable-multi-step-work))
+- **Remote server**: `bd serve` shares workspaces over HTTPS with laptops, CI runners and cloud agents; the same `bd` binary is the client, with access tokens, roles, and retries that apply a write once ([Remote server](#remote-server-one-workspace-many-machines))
 - Extras: JSONL export/import (reads beads exports), `bd batch` (many writes, one transaction), `bd bench`, and local observability (structured logs, timing, Prometheus metrics, `bd doctor`)
 
 It ships as a library (`crates/bd-core`) and a CLI (`crates/bd-cli`, binary `bd`).
@@ -390,11 +391,140 @@ bd gate resolve t-12.gate-publish -r "approved"
 bd gate create -t gh:pr --await-id 42 --blocks t-7   # a gate in front of existing work
 ```
 
+## Remote server: one workspace, many machines
+
+Several machines (laptops, CI runners, cloud agents) can share one
+workspace through `bd serve`. The database stays on the server; clients send
+whole commands, and each command runs there as it would locally, normally as
+one `Store::write` transaction. Claims stay atomic, fencing tokens and lease
+times come from one clock, and the event log stays gapless. The alternatives
+cannot keep those guarantees. Putting `bd.db` on a network file system
+breaks SQLite's WAL, which needs every process on one host. Replicating and
+merging copies (beads' `bd dolt push/pull`) lets two disconnected machines
+claim the same issue.
+
+### Server
+
+```bash
+# One directory per workspace under a root: <root>/<name>/.bd/bd.db is served at /w/<name>
+mkdir -p /srv/bd/proj && bd -C /srv/bd/proj init --prefix proj
+# Or move an existing workspace: bd export -o proj.jsonl, then bd -C /srv/bd/proj import proj.jsonl
+
+# Access tokens live in <root>/tokens.json (hashes only); each secret is printed once
+bd serve token create alice-laptop --as alice --root /srv/bd
+bd serve token create ci --as ci --workspace proj --root /srv/bd
+bd serve token create dashboard --as dash --role read --root /srv/bd
+bd serve token list --root /srv/bd
+bd serve token revoke ci --root /srv/bd          # takes effect at once, no restart
+
+bd serve --root /srv/bd --listen 0.0.0.0:7420 --tls-cert cert.pem --tls-key key.pem
+```
+
+Without a public CA, a self-signed certificate works if it is not a CA
+certificate (rustls refuses a CA certificate as a server's own); clients then
+trust it with `BD_CA_CERT=cert.pem`:
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 365 \
+  -keyout key.pem -out cert.pem -subj "/CN=bd.example.com" \
+  -addext "subjectAltName=DNS:bd.example.com" -addext "basicConstraints=critical,CA:FALSE"
+```
+
+`bd serve` refuses plain HTTP on a non-loopback address, since tokens would
+cross the network unencrypted. Either give it a certificate, or keep the
+default `--listen 127.0.0.1:7420` behind a TLS-terminating proxy (Caddy,
+nginx, a Cloudflare or Tailscale tunnel), which may also serve it under a path
+prefix (`https://example.com/bd/w/proj`). `--insecure-http` allows plain HTTP
+on an encrypted private network. `GET /healthz` answers `ok` for load
+balancers. A request may carry up to `--max-body-mib` (default 64). Requests
+in progress share a 256 MiB memory budget (more if one maximum-size request
+needs it), and the server answers 503 when it is used up, which clients
+retry. The server logs one
+line per request on stderr; set `BD_LOG` to change that. Ctrl-C or SIGTERM
+lets running commands finish first. Back up `<root>` like any SQLite data
+(`sqlite3 bd.db ".backup copy.db"`, or Litestream). The server keeps
+connections to each database open, so restart it after replacing or moving a
+workspace's `bd.db`.
+
+### Clients
+
+The same `bd` binary is the client. Point a checkout at the server once and
+commit the result, so every checkout and agent uses the shared workspace:
+
+```bash
+bd remote set https://bd.example.com/w/proj   # writes .bd/remote.toml (--ca-cert ca.pem for a private CA)
+export BD_TOKEN=bdt_...                       # never commit it; CI takes it from a secret
+bd remote show                                # checks the URL, certificate, token and actor
+bd ready                                      # every command now runs on the server
+BD_ACTOR=alice/agent-2 bd claim --next        # sub-actors: one lease holder per agent
+```
+
+```toml
+# .bd/remote.toml
+url = "https://bd.example.com/w/proj"
+# ca_cert = "ca.pem"    # a private CA, relative to this file
+```
+
+A `.bd/remote.toml` takes precedence over a `.bd/bd.db` in the same
+directory (`bd remote set` refuses to hide one unless given `--force`), `--db`
+always means a local database, and `bd remote unset` removes the file.
+
+| variable | meaning |
+|---|---|
+| `BD_TOKEN` | access token (required) |
+| `BD_REMOTE` / `--remote URL` | use this workspace URL instead of `.bd/remote.toml` |
+| `BD_CA_CERT` | PEM file of the CA that signed the server certificate |
+| `BD_ACTOR` | act as `<token actor>/<name>`; anything else is refused |
+| `BD_REMOTE_RETRY_SECS` | how long to retry an unreachable server (default 30; 0 = once) |
+| `BD_INSECURE_HTTP=1` | allow plain `http://` to a non-loopback host |
+
+A token acts as one actor (`--as`), or as that actor's sub-actors
+`<actor>/<name>`, so leases keep naming who holds them. Roles:
+
+| role | may run |
+|---|---|
+| `read` | read-only commands; its database connection is query-only |
+| `write` (default) | every command except the admin ones |
+| `admin` | also `config set/unset`, `import`, `events prune`, `doctor` |
+
+Every invocation carries a random request id. The client retries
+connection failures, timeouts and busy answers with the same id. The server
+records the id in the same transaction as the write and replays the stored
+answer to a retry, so a write whose response was lost in transit is applied
+once. Exit codes are the same as locally, plus 7 (access denied) and 8
+(server unreachable).
+
+What runs where:
+
+- Input and output files stay on the client: `import FILE` and `batch -f FILE`
+  send the file, `--stdin` and `-` send stdin, and `export -o` and
+  `playbook extract -o` write the file locally.
+- Playbooks run by name from the server's playbook path: the workspace's
+  `.bd/playbooks` (`<root>/<name>/.bd/playbooks`), then the server's
+  `$BD_PLAYBOOK_PATH` and user config directory. File paths are refused.
+  GitHub gates are checked by the server's `gh`.
+- `events --follow` polls the server. `init`, `bench`, `serve` and
+  `playbook extract --save` only run on the machine that holds the database.
+- `bd prime`, which session hooks run, gives up within seconds when the
+  server is unreachable or `BD_TOKEN` is missing, and prints a notice instead
+  of failing the hook. With `--json` it fails like any other command.
+
+Claims stay atomic however clients reach the database: remote clients, and
+local `bd` processes on the server's host, all take the same SQLite write
+lock. `bd bench --mode remote` checks this end to end
+([Benchmarks](#benchmarks)).
+
+The protocol is one endpoint, so other clients can call it directly:
+`POST /w/<name>/v1/exec` with `Authorization: Bearer <token>` and
+`{"argv": ["claim", "--next", "--json"], "request_id": "..."}`. The answer is
+`{"exit_code", "stdout", "stderr", "replayed"}`. Failures before the command
+runs return a non-200 status with the `--json` error shape.
+
 ## Observability
 
-Everything is local; nothing is sent anywhere.
+Everything is local; nothing is sent anywhere (a remote workspace talks only to its own `bd serve`).
 
-- **Logs**: `BD_LOG=bd=debug bd …` shows per-transaction lock-wait, exec, and commit timings on stderr. `--log-format json` emits structured logs.
+- **Logs**: `BD_LOG=bd=debug bd …` shows per-transaction lock-wait, exec, and commit timings on stderr. `--log-format json` emits structured logs. Colors appear only on a terminal (`NO_COLOR` turns them off), so redirected logs stay plain text.
 - **Timing**: `--timing` (or `BD_TIMING=1`) prints a per-command breakdown. Commands and transactions slower than `--slow-ms` (default 250) log `bd::slow` warnings and increment the `slow_writes` counter.
 - **Metrics**: `bd metrics` prints Prometheus text, `--format json` prints JSON:
   - issues by status, ready count by priority, blocked/deferred counts
@@ -416,11 +546,14 @@ Everything is local; nothing is sent anywhere.
 `bd bench` seeds a random DAG on a scratch database, drains it with N
 workers (claim → work → close), and verifies from the event log that every
 issue was claimed and closed exactly once and never before its blockers
-closed. It has three modes:
+closed. It has four modes:
 
 - `threads`: an embedded library, one connection per thread
 - `processes`: long-lived worker processes
 - `cli`: a fresh `bd` process per operation, which is what agents experience
+- `remote`: like `cli`, but through a scratch `bd serve` on loopback (HTTP,
+  access token, one sub-actor per worker), which is what clients of a bd
+  server experience
 
 Results on a WSL2 laptop (release build, `durability=normal`, 3,000 issues, about one blocking edge each):
 
@@ -431,11 +564,16 @@ Results on a WSL2 laptop (release build, `durability=normal`, 3,000 issues, abou
 | processes | 8 | 4,700 | 9,300 | 85 µs | 11 ms |
 | cli | 1 | 235 | 470 | 2.0 ms | 2.6 ms |
 | cli | 8 | 920 | 1,800 | 2.7 ms | 22 ms |
+| remote | 1 | 180 | 370 | 2.6 ms | 3.5 ms |
+| remote | 8 | 1,030 | 2,060 | 3.1 ms | 15 ms |
 
 SQLite has one writer, so throughput plateaus around the single-writer rate.
 Tail latency comes from contention and WAL-checkpoint fsyncs: with
 `--durability off`, p99 drops below 0.4 ms. `durability=full` fsyncs every
-commit and is bounded by the disk's fsync latency.
+commit and is bounded by the disk's fsync latency. Through a server, one
+worker pays about 0.4 ms per command for HTTP, but 8 workers outran `cli`
+(1,030 against 810 claims/s in the same run): the server keeps its database
+connections open, while each `cli` process opens the database again.
 
 ## Configuration (`bd config list|get|set|unset`)
 
@@ -451,7 +589,7 @@ commit and is bounded by the disk's fsync latency.
 | `durability` | `normal` | SQLite `synchronous`: `off`, `normal`, `full` |
 | `events.retain_days` / `events.retain_rows` | `0` | automatic event retention (`0` keeps everything) |
 
-The actor comes from `--actor`, then `$BD_ACTOR`, `$BEADS_ACTOR`, `git config user.name`, then `$USER`.
+The actor comes from `--actor`, then `$BD_ACTOR`, `$BEADS_ACTOR`, `git config user.name`, then `$USER`. In a remote workspace, the access token decides: `--actor` and `$BD_ACTOR` may only name the token's actor or one of its sub-actors.
 
 ## Exit codes
 
@@ -464,6 +602,8 @@ The actor comes from `--actor`, then `$BD_ACTOR`, `$BEADS_ACTOR`, `git config us
 | 4 | claim conflict: already claimed, not ready, not owner, or lease lost |
 | 5 | database busy |
 | 6 | event cursor truncated |
+| 7 | access denied: missing or invalid token, or its role, workspaces or actor do not allow it |
+| 8 | bd server unreachable, its certificate not trusted, or a server failure (retrying is safe) |
 | 13 | stale optimistic-concurrency guard |
 
 With `--json`, errors are printed to stderr as `{"error":{"code","message","exit_code"}}`.
@@ -493,11 +633,14 @@ point.
 crates/bd-core/src/   store (WAL, transactions, busy handling) · schema · issues · graph (deps + blocked state)
                       ready · claims (leases) · events · comments · memory · config · transfer (JSONL)
                       metrics · doctor · queries (read API) · gates (conditions, arming, evaluation)
-                      playbook/ (model + strict parsing · template · loader · compile · run · extract)
+                      requests (idempotency records) · playbook/ (model + strict parsing · template · loader
+                      · compile · run · extract)
 crates/bd-core/tests/ engine integration tests (graph semantics, leases with a manual clock, concurrency,
                       playbook runs and gates)
 crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) · batch · bench · fmt · logging
-crates/bd-cli/tests/  end-to-end CLI tests
+                      io (stdio and files, or a captured request) · serve (bd serve) · auth (access tokens)
+                      · remote (client) · protocol (wire format)
+crates/bd-cli/tests/  end-to-end CLI tests; remote.rs runs real bd serve and client processes
 ```
 
 Build and test: `cargo build --release && cargo test --workspace`.

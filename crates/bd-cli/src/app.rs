@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::cli::Global;
+use crate::io;
 
 /// What a command produced, rendered according to --json / --quiet.
 pub struct Out {
@@ -38,6 +39,16 @@ impl Out {
     }
 }
 
+/// The idempotency key of a request served by `bd serve`.
+#[derive(Clone, Debug)]
+pub struct RequestKey {
+    pub id: String,
+    /// The access token that sent it.
+    pub principal: String,
+    /// Set once a committed write transaction recorded the key.
+    pub recorded: bool,
+}
+
 pub struct App {
     pub g: Global,
     pub cwd: PathBuf,
@@ -46,6 +57,10 @@ pub struct App {
     store: Option<Store>,
     pub open_time: Duration,
     pub tx: Vec<TxStats>,
+    /// Shown instead of the database path (the workspace URL under `bd serve`).
+    pub location: Option<String>,
+    /// Recorded in the first write transaction, so a retried request applies once.
+    pub request: Option<RequestKey>,
 }
 
 impl App {
@@ -54,7 +69,17 @@ impl App {
             Some(d) => resolve_dir(d).map_err(|e| Error::invalid(format!("-C {}: {e}", d.display())))?,
             None => std::env::current_dir()?,
         };
-        Ok(App { g, cwd, started: Instant::now(), actor: None, store: None, open_time: Duration::ZERO, tx: Vec::new() })
+        Ok(App {
+            g,
+            cwd,
+            started: Instant::now(),
+            actor: None,
+            store: None,
+            open_time: Duration::ZERO,
+            tx: Vec::new(),
+            location: None,
+            request: None,
+        })
     }
 
     pub fn actor(&mut self) -> String {
@@ -101,13 +126,43 @@ impl App {
         self.store = Some(store);
     }
 
+    /// Hand back the open store (`bd serve` pools them).
+    pub fn take_store(&mut self) -> Option<Store> {
+        self.store.take()
+    }
+
+    /// Where the workspace lives, for display: the database path, or the
+    /// workspace URL when the command runs under `bd serve`.
+    pub fn workspace_label(&self) -> Result<String> {
+        match &self.location {
+            Some(l) => Ok(l.clone()),
+            None => Ok(self.db_path()?.display().to_string()),
+        }
+    }
+
     pub fn write<T>(&mut self, op: &'static str, f: impl FnOnce(&mut WriteCtx<'_>) -> Result<T>) -> Result<T> {
         let actor = self.actor();
+        let key = self.request.as_ref().filter(|k| !k.recorded).map(|k| (k.id.clone(), k.principal.clone()));
+        let mut recorded = false;
         let store = self.store()?;
-        let out = store.write(op, &actor, f);
+        let out = store.write(op, &actor, |tx| {
+            let out = f(tx)?;
+            if let Some((id, principal)) = &key {
+                if !tx.is_rollback_only() {
+                    tx.record_request(id, principal, op)?;
+                    recorded = true;
+                }
+            }
+            Ok(out)
+        });
         if let Some(stats) = store.last_tx_stats().cloned() {
             if out.is_ok() {
                 self.tx.push(stats);
+            }
+        }
+        if out.is_ok() && recorded {
+            if let Some(k) = self.request.as_mut() {
+                k.recorded = true;
             }
         }
         out
@@ -119,20 +174,20 @@ impl App {
 
     pub fn print(&self, out: Out) {
         if self.g.json {
-            println!("{}", serde_json::to_string_pretty(&out.json).unwrap_or_default());
+            io::outln(serde_json::to_string_pretty(&out.json).unwrap_or_default());
         } else if self.g.quiet {
             for id in out.ids {
-                println!("{id}");
+                io::outln(id);
             }
         } else {
             for line in out.text {
-                println!("{line}");
+                io::outln(line);
             }
         }
     }
 
     pub fn print_json(&self, v: &impl Serialize) {
-        println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+        io::outln(serde_json::to_string_pretty(v).unwrap_or_default());
     }
 }
 

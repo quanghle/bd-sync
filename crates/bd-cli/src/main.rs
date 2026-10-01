@@ -1,12 +1,17 @@
 mod app;
+mod auth;
 mod batch;
 mod bench;
 mod cli;
 mod commands;
 mod fmt;
 mod gates;
+mod io;
 mod logging;
 mod playbooks;
+mod protocol;
+mod remote;
+mod serve;
 
 use bd_core::{Error, Result};
 use clap::Parser;
@@ -18,45 +23,81 @@ use crate::commands::*;
 
 fn main() {
     let cli = Cli::parse();
-    logging::init(cli.global.log_format);
+    // A server logs one line per request unless BD_LOG says otherwise.
+    let default_filter = if matches!(cli.command, Command::Serve(_)) { "warn,bd::serve=info" } else { "warn" };
+    logging::init(cli.global.log_format, default_filter);
     std::process::exit(run(cli));
 }
 
 fn run(cli: Cli) -> i32 {
     let json = cli.global.json;
-    let timing =
-        cli.global.timing || std::env::var("BD_TIMING").is_ok_and(|v| !matches!(v.as_str(), "" | "0" | "false"));
-    let slow_ms = cli.global.slow_ms;
     let mut app = match App::new(cli.global.clone()) {
         Ok(app) => app,
         Err(e) => return report(&e, json),
     };
-    let name = command_name(&cli.command);
-    let result = dispatch(&mut app, &cli.command);
+    if !always_local(&cli.command) {
+        match remote::detect(&app) {
+            Ok(Some(r)) => return remote::run(&mut app, r, &cli),
+            Ok(None) => {}
+            // `bd prime` from a session hook: report the problem as context, never fail the hook.
+            Err(e) if remote::is_hook(&cli) => return remote::unavailable(&e),
+            Err(e) => return report(&e, json),
+        }
+    }
+    execute(&mut app, &cli.command)
+}
+
+/// Commands that never use a remote workspace.
+fn always_local(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Serve(_) | Command::Remote(_) | Command::Version | Command::Bench(_) | Command::BenchWorker(_)
+    )
+}
+
+/// Run one command and return its exit code: locally, and for each request
+/// under `bd serve` (with output captured by [`io::capture`]).
+fn execute(app: &mut App, cmd: &Command) -> i32 {
+    let timing = app.g.timing
+        || (!io::serving() && std::env::var("BD_TIMING").is_ok_and(|v| !matches!(v.as_str(), "" | "0" | "false")));
+    let slow_ms = app.g.slow_ms;
+    let name = command_name(cmd);
+    let result = dispatch(app, cmd);
     let elapsed = app.started.elapsed();
     if timing {
-        eprintln!("{}", format_timing(&app));
+        io::errln(format_timing(app));
     }
     let total_ms = elapsed.as_millis() as u64;
-    if total_ms >= slow_ms && !matches!(cli.command, Command::Events(_) | Command::Bench(_) | Command::BenchWorker(_)) {
+    if total_ms >= slow_ms
+        && !matches!(cmd, Command::Events(_) | Command::Bench(_) | Command::BenchWorker(_) | Command::Serve(_))
+    {
         tracing::warn!(target: "bd::slow", command = name, total_ms, "slow command");
     }
     tracing::debug!(target: "bd::cli", command = name, total_us = elapsed.as_micros() as u64, ok = result.is_ok(), "done");
     match result {
         Ok(code) => code,
-        Err(e) => report(&e, json),
+        Err(e) => report(&e, app.g.json),
     }
 }
 
-fn report(e: &Error, json: bool) -> i32 {
+/// The lines `report` prints for an error.
+fn render_error(e: &Error, json: bool) -> String {
     if json {
-        eprintln!("{}", json!({ "error": { "code": e.code(), "message": e.to_string(), "exit_code": e.exit_code() } }));
-    } else {
-        eprintln!("error: {e}");
-        if let Some(h) = hint(e) {
-            eprintln!("hint: {h}");
-        }
+        return format!(
+            "{}\n",
+            json!({ "error": { "code": e.code(), "message": e.to_string(), "exit_code": e.exit_code() } })
+        );
     }
+    let mut s = format!("error: {e}\n");
+    if let Some(h) = hint(e) {
+        s.push_str(&format!("hint: {h}\n"));
+    }
+    s
+}
+
+/// Print an error on stderr and return its exit code.
+fn report(e: &Error, json: bool) -> i32 {
+    io::errln(render_error(e, json).trim_end_matches('\n'));
     e.exit_code()
 }
 
@@ -74,6 +115,12 @@ fn hint(e: &Error) -> Option<&'static str> {
         Error::Busy(_) => "another process holds the write lock; retry, or raise --busy-timeout-ms",
         Error::EventsTruncated { .. } => "re-baseline with `bd export` and tail from its head_seq",
         Error::NoWorkspace(_) => "create one with `bd init`",
+        Error::Unauthorized(_) => {
+            "check BD_TOKEN, and the token's role, workspaces and actor (`bd remote show`; `bd serve token list` on the server)"
+        }
+        Error::Remote(_) => {
+            "`bd remote show` checks the URL, certificate and connection; retrying is safe (a write is applied once)"
+        }
         _ => return None,
     })
 }
@@ -139,6 +186,8 @@ fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Purge(a) => playbooks::cmd_purge(app, a).map(|_| 0),
         Command::Bench(a) => bench::cmd_bench(app, a).map(|_| 0),
         Command::BenchWorker(a) => bench::cmd_bench_worker(a).map(|_| 0),
+        Command::Serve(a) => serve::cmd_serve(app, a).map(|_| 0),
+        Command::Remote(c) => remote::cmd_remote(app, c),
         Command::Info => cmd_info(app).map(|_| 0),
         Command::Version => {
             if app.g.json {
@@ -146,7 +195,7 @@ fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
                     &json!({ "version": env!("CARGO_PKG_VERSION"), "schema_version": bd_core::SCHEMA_VERSION }),
                 );
             } else {
-                println!("bd {} (schema v{})", env!("CARGO_PKG_VERSION"), bd_core::SCHEMA_VERSION);
+                io::outln(format!("bd {} (schema v{})", env!("CARGO_PKG_VERSION"), bd_core::SCHEMA_VERSION));
             }
             Ok(0)
         }
@@ -192,6 +241,8 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Gate(_) => "gate",
         Command::Purge(_) => "purge",
         Command::Bench(_) | Command::BenchWorker(_) => "bench",
+        Command::Serve(_) => "serve",
+        Command::Remote(_) => "remote",
         Command::Info => "info",
         Command::Version => "version",
     }

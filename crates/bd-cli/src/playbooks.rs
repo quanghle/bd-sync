@@ -13,6 +13,7 @@ use serde_json::json;
 use crate::app::{App, Out};
 use crate::cli::*;
 use crate::fmt::rel;
+use crate::io;
 
 /// Where playbooks are looked up, in order: the workspace's `.bd/playbooks`,
 /// `$BD_PLAYBOOK_PATH`, then `$XDG_CONFIG_HOME/bd/playbooks` (or
@@ -47,6 +48,13 @@ fn loader(app: &App) -> Loader {
 }
 
 fn load(app: &App, reference: &str) -> Result<Playbook> {
+    let r = reference.trim();
+    if io::serving() && (r.contains(['/', '\\']) || playbook::EXTENSIONS.iter().any(|e| r.ends_with(e))) {
+        // A path would name a file on the server, not the client's.
+        return Err(Error::Refused(format!(
+            "playbook {r:?}: bd serve runs playbooks by name from the workspace's playbook directory on the server"
+        )));
+    }
     loader(app).load_from(reference, Some(&app.cwd))
 }
 
@@ -407,9 +415,14 @@ fn cmd_discard(app: &mut App, a: &DiscardArgs) -> Result<()> {
 }
 
 fn cmd_extract(app: &mut App, a: &ExtractArgs) -> Result<()> {
+    if a.save {
+        io::require_local("playbook extract --save")?;
+    }
     let pb = app.read(|r| playbook::extract(r.conn(), &r.resolve_id(&a.id)?, a.name.as_deref()))?;
     let text = playbook::to_toml(&pb)?;
     let target = match (&a.output, a.save) {
+        // Under bd serve the client writes the file, relative to its own directory.
+        (Some(p), _) if io::serving() => Some(p.clone()),
         (Some(p), _) => Some(if p.is_relative() { app.cwd.join(p) } else { p.clone() }),
         (None, true) => {
             let dir = search_paths(app).into_iter().next().ok_or_else(|| Error::invalid("no playbook directory"))?;
@@ -422,17 +435,22 @@ fn cmd_extract(app: &mut App, a: &ExtractArgs) -> Result<()> {
             if app.g.json {
                 app.print_json(&json!({ "playbook": pb, "toml": text }));
             } else {
-                print!("{text}");
+                io::out(&text);
             }
         }
         Some(path) => {
-            if path.exists() && !a.force {
-                return Err(Error::Refused(format!("{} exists; pass --force to overwrite", path.display())));
+            if io::serving() {
+                // The client checked --force against its own file before sending.
+                io::send_file(&path, text.into_bytes())?;
+            } else {
+                if path.exists() && !a.force {
+                    return Err(Error::Refused(format!("{} exists; pass --force to overwrite", path.display())));
+                }
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                std::fs::write(&path, &text)?;
             }
-            if let Some(dir) = path.parent() {
-                std::fs::create_dir_all(dir)?;
-            }
-            std::fs::write(&path, &text)?;
             let out = Out::new(json!({ "path": path, "playbook": pb.name, "steps": pb.all_steps().len() }))
                 .line(format!("✓ Wrote playbook {} to {} ({} step(s))", pb.name, path.display(), pb.all_steps().len()))
                 .line(format!("  run it with: bd playbook run {}", pb.name))

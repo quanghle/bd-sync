@@ -7,7 +7,6 @@
 //! rolls back every operation.
 
 use std::cell::Cell;
-use std::io::Read;
 
 use bd_core::{Error, Result, WriteCtx};
 use clap::{Parser, Subcommand};
@@ -16,6 +15,7 @@ use serde_json::{Value, json};
 use crate::app::{App, Out};
 use crate::cli::*;
 use crate::commands::*;
+use crate::io;
 
 #[derive(Parser, Debug)]
 #[command(name = "batch", no_binary_name = true, disable_help_flag = true, disable_version_flag = true)]
@@ -107,12 +107,8 @@ fn substitute(token: &str, produced: &[Option<String>]) -> Result<String> {
 
 pub fn cmd_batch(app: &mut App, a: &BatchArgs) -> Result<()> {
     let input = match &a.file {
-        Some(f) => std::fs::read_to_string(f).map_err(|e| Error::invalid(format!("{}: {e}", f.display())))?,
-        None => {
-            let mut s = String::new();
-            std::io::stdin().read_to_string(&mut s)?;
-            s
-        }
+        Some(f) => io::read_file(f)?,
+        None => io::read_stdin()?,
     };
     let mut ops: Vec<(usize, Vec<String>)> = Vec::new();
     for (n, raw) in input.lines().enumerate() {
@@ -156,7 +152,7 @@ pub fn cmd_batch(app: &mut App, a: &BatchArgs) -> Result<()> {
     let (results, text) = match result {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("bd batch: line {} failed; rolled back all {} operation(s)", failed_at.get(), ops.len());
+            io::errln(format!("bd batch: line {} failed; rolled back all {} operation(s)", failed_at.get(), ops.len()));
             return Err(e);
         }
     };

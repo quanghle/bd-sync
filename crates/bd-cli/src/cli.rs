@@ -9,7 +9,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
     name = "bd",
     version,
     about = "bd: a coordination engine for agents and humans: tasks, typed dependencies, deterministic ready work, leased claims, and an event log on SQLite WAL",
-    after_help = "Agent loop:  bd ready  ->  bd claim --next  ->  bd heartbeat <id>  ->  bd close <id>\nRun `bd prime` for workflow context. Exit codes: 2 invalid, 3 not found, 4 claim conflict, 5 busy, 6 events truncated, 13 stale guard."
+    after_help = "Agent loop:  bd ready  ->  bd claim --next  ->  bd heartbeat <id>  ->  bd close <id>\nRun `bd prime` for workflow context. Exit codes: 2 invalid, 3 not found, 4 claim conflict, 5 busy, 6 events truncated, 7 access denied, 8 server unreachable, 13 stale guard."
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -23,6 +23,9 @@ pub struct Global {
     /// Database file (default: nearest .bd/bd.db walking up from the current directory)
     #[arg(long, global = true, env = "BD_DB", value_name = "PATH")]
     pub db: Option<PathBuf>,
+    /// Workspace on a bd server, e.g. https://bd.example.com/w/proj (default: .bd/remote.toml); token in $BD_TOKEN
+    #[arg(long, global = true, env = "BD_REMOTE", value_name = "URL")]
+    pub remote: Option<String>,
     /// Run as if started in this directory
     #[arg(short = 'C', long = "directory", global = true, value_name = "DIR")]
     pub directory: Option<PathBuf>,
@@ -148,6 +151,11 @@ pub enum Command {
     Bench(BenchArgs),
     #[command(hide = true)]
     BenchWorker(BenchWorkerArgs),
+    /// Serve workspaces to remote bd clients over HTTPS; `bd serve token` manages access
+    Serve(ServeArgs),
+    /// Use a workspace on a bd server from this checkout: set, show (with a connection check), unset
+    #[command(subcommand)]
+    Remote(RemoteCommand),
     /// Workspace information
     Info,
     /// Print the version
@@ -999,6 +1007,8 @@ pub enum BenchMode {
     Processes,
     /// A fresh `bd` process per claim and close (what CLI agents experience)
     Cli,
+    /// Like `cli`, but every command goes through a scratch `bd serve` (HTTP, access token, server)
+    Remote,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1023,7 +1033,7 @@ pub struct BenchArgs {
     /// Durability (off | normal | full)
     #[arg(long, default_value = "normal")]
     pub durability: String,
-    /// Keep the scratch database at this path instead of a temp dir
+    /// Keep the scratch database at this path instead of a temp dir (remote mode: <root>/<name>/.bd/bd.db)
     #[arg(long)]
     pub keep: Option<PathBuf>,
     /// RNG seed for the generated graph
@@ -1043,6 +1053,102 @@ pub struct BenchWorkerArgs {
     pub heartbeat: bool,
     #[arg(long, default_value = "normal")]
     pub durability: String,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct ServeArgs {
+    #[command(subcommand)]
+    pub action: Option<ServeAction>,
+    /// Directory of workspaces: <root>/<name>/.bd/bd.db is served at /w/<name>; tokens in <root>/tokens.json
+    #[arg(long, env = "BD_SERVE_ROOT", value_name = "DIR")]
+    pub root: Option<PathBuf>,
+    /// Address and port to listen on
+    #[arg(long, default_value = "127.0.0.1:7420", value_name = "ADDR")]
+    pub listen: String,
+    /// TLS certificate chain (PEM): serve HTTPS
+    #[arg(long, requires = "tls_key", value_name = "FILE")]
+    pub tls_cert: Option<PathBuf>,
+    /// TLS private key (PEM)
+    #[arg(long, requires = "tls_cert", value_name = "FILE")]
+    pub tls_key: Option<PathBuf>,
+    /// Allow plain HTTP on a non-loopback address (behind a TLS proxy, or on an encrypted private network)
+    #[arg(long)]
+    pub insecure_http: bool,
+    /// Largest request accepted, in MiB (imports and batches travel in the request)
+    #[arg(long, default_value_t = 64, value_name = "MIB")]
+    pub max_body_mib: u64,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ServeAction {
+    /// Manage access tokens (run on the server host)
+    #[command(subcommand)]
+    Token(TokenCommand),
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum TokenCommand {
+    /// Create an access token and print its secret once
+    Create(TokenCreateArgs),
+    /// List access tokens (never their secrets)
+    #[command(alias = "ls")]
+    List(TokenRootArgs),
+    /// Revoke an access token; it stops working at once
+    Revoke(TokenRevokeArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TokenRootArgs {
+    /// Server root holding tokens.json
+    #[arg(long, env = "BD_SERVE_ROOT", value_name = "DIR")]
+    pub root: PathBuf,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TokenCreateArgs {
+    /// Unique token name, e.g. alice-laptop or ci
+    pub name: String,
+    /// The actor the token acts as; clients may also use <actor>/<agent> sub-actors
+    #[arg(long = "as", value_name = "ACTOR")]
+    pub act_as: String,
+    #[arg(long, value_enum, default_value = "write")]
+    pub role: crate::auth::Role,
+    /// Workspaces the token may use (repeatable or comma separated; default all)
+    #[arg(long = "workspace", value_delimiter = ',', value_name = "NAME")]
+    pub workspaces: Vec<String>,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TokenRevokeArgs {
+    pub name: String,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum RemoteCommand {
+    /// Point this checkout at a workspace on a bd server (writes .bd/remote.toml)
+    Set(RemoteSetArgs),
+    /// The remote workspace in use, and a check of the connection, certificate, token and actor
+    Show,
+    /// Stop using the remote workspace (removes .bd/remote.toml)
+    #[command(alias = "rm")]
+    Unset,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RemoteSetArgs {
+    /// Workspace URL, e.g. https://bd.example.com/w/proj
+    pub url: String,
+    /// CA certificate (PEM) that signed the server's certificate; copied to .bd/ca.pem
+    #[arg(long, value_name = "FILE")]
+    pub ca_cert: Option<PathBuf>,
+    /// Write it even though .bd/bd.db holds a local workspace, which remote.toml hides
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub fn parse_priority(s: &str) -> Result<u8, String> {

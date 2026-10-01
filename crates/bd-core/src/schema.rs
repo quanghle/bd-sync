@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 use crate::error::{Error, Result};
 
-pub const LATEST_VERSION: i64 = 2;
+pub const LATEST_VERSION: i64 = 3;
 
 const V1: &str = r#"
 CREATE TABLE meta (
@@ -143,7 +143,22 @@ const V2: &str = r#"
 ALTER TABLE issues ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0 CHECK (ephemeral IN (0, 1));
 "#;
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, V1), (2, V2)];
+// v3: idempotency records for writes sent through `bd serve`: a retried
+// request finds its id here and gets the stored response instead of running
+// again. Pruned oldest first in rowid order, so no index beyond the key.
+const V3: &str = r#"
+CREATE TABLE requests (
+    id         TEXT PRIMARY KEY,
+    principal  TEXT NOT NULL,
+    actor      TEXT NOT NULL,
+    op         TEXT NOT NULL,
+    tx         INTEGER,
+    created_at INTEGER NOT NULL,
+    response   TEXT
+);
+"#;
+
+const MIGRATIONS: &[(i64, &str)] = &[(1, V1), (2, V2), (3, V3)];
 
 pub fn user_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
@@ -185,5 +200,27 @@ mod tests {
         let eph: i64 = conn.query_row("SELECT ephemeral FROM issues WHERE id = 't-1'", [], |r| r.get(0)).unwrap();
         assert_eq!(eph, 0);
         assert!(conn.execute("UPDATE issues SET ephemeral = 2 WHERE id = 't-1'", []).is_err(), "0/1 only");
+    }
+
+    #[test]
+    fn v2_databases_gain_the_requests_table() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1).unwrap();
+        conn.execute_batch(V2).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        assert_eq!(migrate(&mut conn).unwrap(), LATEST_VERSION);
+        conn.execute(
+            "INSERT INTO requests (id, principal, actor, op, created_at) VALUES ('r1', 'p', 'a', 'create', 0)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(
+                "INSERT INTO requests (id, principal, actor, op, created_at) VALUES ('r1', 'p', 'a', 'x', 0)",
+                []
+            )
+            .is_err(),
+            "request ids are unique"
+        );
     }
 }

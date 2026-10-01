@@ -122,7 +122,7 @@ fn hint(e: &Error) -> Option<&'static str> {
         Error::EventsTruncated { .. } => "re-baseline with `bd export` and tail from its head_seq",
         Error::NoWorkspace(_) => "create one with `bd init`",
         Error::Unauthorized(_) => {
-            "check the access token (BD_TOKEN, or `bd remote login`), and its role, workspaces and actor (`bd remote show`; `bd serve token list` on the server)"
+            "check the access token (BD_TOKEN, or `bd remote login`), and its role, kind, workspaces and actor (`bd remote show`; `bd serve token list` on the server)"
         }
         Error::Remote(_) => {
             "`bd remote show` checks the URL, certificate and connection; retrying is safe (a write is applied once)"

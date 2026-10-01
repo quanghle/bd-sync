@@ -6,6 +6,10 @@
 //! write transaction that re-checks each gate is still open. Each `gh` call
 //! is killed after [`GH_TIMEOUT`]. `bd serve` runs the same check on a timer
 //! (see `jobs.rs`).
+//!
+//! Every GitHub probe goes through [`probe_github`], which first checks the
+//! gate's repository against the workspace's [`GateRepos`] allowlist: a gate
+//! whose repository is not allowed escalates instead of being probed.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -14,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use bd_core::gates::{self, GateKind, GatePhase, GateSpec, GateView, NewGate, Verdict};
+use bd_core::gates::{self, GateKind, GatePhase, GateRepos, GateSpec, GateView, NewGate, Verdict};
 use bd_core::{Error, Queries, Result, Timestamp, WriteCtx};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -22,6 +26,7 @@ use serde_json::{Value, json};
 use crate::app::{App, Out};
 use crate::cli::*;
 use crate::fmt::rel;
+use crate::io;
 
 fn phase_icon(p: GatePhase) -> &'static str {
     match p {
@@ -369,8 +374,18 @@ fn view_run(id: &str, spec: &GateSpec, cwd: &Path) -> std::result::Result<Value,
     gh_json(&args, cwd)
 }
 
-/// Probe a GitHub gate. Returns the verdict and, for gh:run, a run to pin.
-fn probe_github(g: &GateView, spec: &GateSpec, cwd: &Path) -> std::result::Result<(Verdict, Option<Pin>), String> {
+/// Probe a GitHub gate with this machine's `gh` credentials. Returns the
+/// verdict and, for gh:run, a run to pin. A gate whose repository `repos`
+/// does not allow is never probed: it escalates, so a person sees why.
+fn probe_github(
+    g: &GateView,
+    spec: &GateSpec,
+    cwd: &Path,
+    repos: &GateRepos,
+) -> std::result::Result<(Verdict, Option<Pin>), String> {
+    if let Err(e) = repos.check(spec) {
+        return Ok((Verdict::Escalate(e.to_string()), None));
+    }
     let target = spec.await_id.clone().unwrap_or_default();
     match spec.kind {
         GateKind::GhPr => {
@@ -476,6 +491,47 @@ fn workdir(app: &App) -> PathBuf {
         .unwrap_or_else(|| app.cwd.clone())
 }
 
+/// Apply a check's verdicts, each gate on its own: one that cannot be opened
+/// or escalated (refused by the request's policy, say) is reported as an
+/// error, and the others are applied all the same. Database failures still
+/// fail the whole check.
+fn apply_verdicts(tx: &mut WriteCtx<'_>, checked: &mut [Checked]) -> Result<()> {
+    for c in checked.iter_mut().filter(|c| c.action != "error") {
+        let Some(issue) = tx.find_issue(&c.id)? else { continue };
+        // Resolved, or no longer armed, since the snapshot: leave it.
+        if issue.status.is_terminal() || issue.is_blocked {
+            continue;
+        }
+        let applied = tx.savepoint(|tx| {
+            if let Some(run) = &c.run_id {
+                tx.pin_gate_run(&c.id, run, c.pin_reason.as_deref())?;
+            }
+            Ok(match &c.verdict {
+                Verdict::Resolve(detail) => {
+                    let r = tx.resolve_gate(&c.id, Some(detail), false)?;
+                    Some(("opened", r.unblocked.iter().map(|u| u.id.clone()).collect()))
+                }
+                Verdict::Escalate(detail) => tx.escalate_gate(&c.id, detail)?.then(|| ("escalated", Vec::new())),
+                Verdict::Pending(_) => None,
+            })
+        });
+        match applied {
+            Ok(Some((action, unblocked))) => {
+                c.action = action.into();
+                c.unblocked = unblocked;
+            }
+            Ok(None) => {}
+            Err(e @ (Error::Sqlite(_) | Error::Io(_) | Error::Busy(_) | Error::Json(_))) => return Err(e),
+            Err(e) => {
+                c.action = "error".into();
+                c.verdict = Verdict::Pending(e.to_string());
+                (c.run_id, c.previous_run_id, c.pin_reason) = (None, None, None);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
     // `local`: every gate checked without `gh`, malformed ones included.
     let (kind_filter, malformed) = match a.kind.as_deref().map(str::trim) {
@@ -485,7 +541,11 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
         Some(k) => (Some(vec![GateKind::parse(k)?]), false),
     };
     let cwd = workdir(app);
-    let (candidates, local, now) = app.read(|r| {
+    // In a bd serve process gh has the server's credentials, for requests and
+    // the server's own work alike: unless gate.repos says otherwise, gates may
+    // only watch the workspace's repository.
+    let served = io::in_server_process();
+    let (candidates, local, repos, now) = app.read(|r| {
         let ids: Vec<String> = a.ids.iter().map(|i| r.resolve_id(i)).collect::<Result<_>>()?;
         let mut list = gates::list(r.conn(), false)?;
         for id in &ids {
@@ -502,7 +562,7 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
         });
         let now = r.now();
         let local = list.iter().map(|g| gates::evaluate_local(r.conn(), g, now)).collect::<Result<Vec<_>>>()?;
-        Ok((list, local, now))
+        Ok((list, local, GateRepos::load(r.conn(), served)?, now))
     })?;
 
     let mut checked: Vec<Checked> = Vec::new();
@@ -510,10 +570,13 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
         let kind = g.spec.as_ref().map(|s| s.kind.to_string());
         let (verdict, pin, error) = match verdict {
             Some(v) => (v, None, None),
-            None => match probe_github(g, g.spec.as_ref().expect("local evaluation handles malformed gates"), &cwd) {
-                Ok((v, pin)) => (v, pin, None),
-                Err(e) => (Verdict::Pending(e.clone()), None, Some(e)),
-            },
+            None => {
+                let spec = g.spec.as_ref().expect("local evaluation handles malformed gates");
+                match probe_github(g, spec, &cwd, &repos) {
+                    Ok((v, pin)) => (v, pin, None),
+                    Err(e) => (Verdict::Pending(e.clone()), None, Some(e)),
+                }
+            }
         };
         let previous_run_id = pin.as_ref().and(g.run_id.clone());
         let (run_id, pin_reason) = pin.map(|p| (Some(p.run_id), p.why)).unwrap_or_default();
@@ -540,29 +603,7 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
         .any(|c| c.action != "error" && (c.run_id.is_some() || !matches!(c.verdict, Verdict::Pending(_))));
     if needs_write && !a.dry_run {
         checked = app.write("gate.check", |tx| {
-            for c in checked.iter_mut().filter(|c| c.action != "error") {
-                let Some(issue) = tx.find_issue(&c.id)? else { continue };
-                // Resolved, or no longer armed, since the snapshot: leave it.
-                if issue.status.is_terminal() || issue.is_blocked {
-                    continue;
-                }
-                if let Some(run) = &c.run_id {
-                    tx.pin_gate_run(&c.id, run, c.pin_reason.as_deref())?;
-                }
-                match &c.verdict {
-                    Verdict::Resolve(detail) => {
-                        let r = tx.resolve_gate(&c.id, Some(detail), false)?;
-                        c.action = "opened".into();
-                        c.unblocked = r.unblocked.iter().map(|u| u.id.clone()).collect();
-                    }
-                    Verdict::Escalate(detail) => {
-                        if tx.escalate_gate(&c.id, detail)? {
-                            c.action = "escalated".into();
-                        }
-                    }
-                    Verdict::Pending(_) => {}
-                }
-            }
+            apply_verdicts(tx, &mut checked)?;
             Ok(checked)
         })?;
     } else if a.dry_run {
@@ -621,6 +662,62 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_verdict_that_cannot_be_applied_leaves_the_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".bd").join("bd.db");
+        let init = bd_core::InitOptions { prefix: "t".into(), id_mode: bd_core::IdMode::Counter };
+        let mut store = bd_core::Store::init(&path, init, bd_core::OpenOptions::default()).unwrap();
+        let gate = |store: &mut bd_core::Store, kind: GateKind| {
+            store
+                .write("setup", "alice", |tx| {
+                    let work = tx.create_issue(bd_core::NewIssue::titled("Work"))?.id;
+                    let mut spec = GateSpec::new(kind);
+                    spec.timeout = (kind == GateKind::Timer).then(|| "1s".to_string());
+                    let gate = NewGate {
+                        spec,
+                        blocks: vec![work],
+                        title: None,
+                        description: String::new(),
+                        assignee: None,
+                        parent: None,
+                        priority: None,
+                        ephemeral: false,
+                    };
+                    Ok(tx.create_gate(gate)?.id)
+                })
+                .unwrap()
+        };
+        let (human, timer) = (gate(&mut store, GateKind::Human), gate(&mut store, GateKind::Timer));
+        let verdict = |id: &str| Checked {
+            id: id.to_string(),
+            kind: None,
+            verdict: Verdict::Resolve("condition holds".into()),
+            action: "unchanged".into(),
+            run_id: None,
+            previous_run_id: None,
+            pin_reason: None,
+            unblocked: Vec::new(),
+        };
+        // As a request of an agent token: the human gate is refused, the timer still opens.
+        let mut checked = vec![verdict(&human), verdict(&timer)];
+        let head = store.read(|r| r.event_head()).unwrap();
+        store
+            .write("gate.check", "bd-serve", |tx| {
+                tx.set_policy(Some(bd_core::Policy::default()));
+                apply_verdicts(tx, &mut checked)
+            })
+            .unwrap();
+        assert_eq!((checked[0].action.as_str(), checked[1].action.as_str()), ("error", "opened"));
+        assert!(checked[0].verdict.detail().contains("is a human gate"), "{:?}", checked[0].verdict);
+        let status = |id: &str| store.read(|r| r.issue(id)).unwrap().status;
+        assert_eq!((status(&human), status(&timer)), (bd_core::Status::Open, bd_core::Status::Closed));
+        let events =
+            store.read(|r| r.events(&bd_core::EventQuery { since: Some(head), ..Default::default() })).unwrap();
+        assert!(events.events.iter().all(|e| e.issue_id.as_deref() != Some(human.as_str())), "rolled back");
+        assert!(events.events.windows(2).all(|w| w[1].seq == w[0].seq + 1), "gapless");
+    }
 
     /// A command that runs for about ten seconds.
     fn sleeper() -> Command {

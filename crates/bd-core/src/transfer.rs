@@ -26,7 +26,7 @@ use crate::graph;
 use crate::ids;
 use crate::issues;
 use crate::memory;
-use crate::model::{DepType, Issue, ListQuery, Outcome, Status, empty_object};
+use crate::model::{DepType, GATE_TYPE, Issue, ListQuery, Outcome, Status, empty_object};
 use crate::store::WriteCtx;
 use crate::time::{Timestamp, format_duration_ms};
 
@@ -278,6 +278,7 @@ fn same_content(a: &Issue, b: &Issue) -> bool {
 impl WriteCtx<'_> {
     /// Import a JSONL stream in this transaction (all or nothing).
     pub fn import_jsonl(&mut self, input: &mut dyn BufRead, opts: &ImportOptions) -> Result<ImportSummary> {
+        let holds = self.human_holds()?;
         let mut summary = ImportSummary::default();
         let mut issues_in: Vec<ImportedIssue> = Vec::new();
         let mut memories_in: Vec<InMemory> = Vec::new();
@@ -322,11 +323,14 @@ impl WriteCtx<'_> {
             ids::validate_explicit_id(&issue.id)?;
             match issues::get(self.conn(), &issue.id)? {
                 Some(existing) if same_content(&existing, issue) => summary.unchanged += 1,
-                Some(_) => {
+                Some(existing) => {
+                    self.check_playbook_import(&existing, &issue.metadata)?;
+                    self.check_gate_repo(&issue.issue_type, &issue.metadata, Some(&existing))?;
                     self.write_imported_issue(issue, true)?;
                     summary.updated += 1;
                 }
                 None => {
+                    self.check_gate_repo(&issue.issue_type, &issue.metadata, None)?;
                     self.write_imported_issue(issue, false)?;
                     summary.created += 1;
                 }
@@ -453,6 +457,9 @@ impl WriteCtx<'_> {
             }
         }
         graph::recompute_all(self)?;
+        if let Some(holds) = &holds {
+            self.check_human_holds(holds)?;
+        }
         Ok(summary)
     }
 
@@ -498,6 +505,10 @@ impl WriteCtx<'_> {
         let assignee = raw.assignee.clone().filter(|a| !a.trim().is_empty());
         if status == Status::InProgress && assignee.is_none() {
             summary.warnings.push(format!("{}: in_progress without assignee imported as open", raw.id));
+            status = Status::Open;
+        }
+        if status == Status::InProgress && issue_type == GATE_TYPE {
+            summary.warnings.push(format!("{}: a gate is never in progress; imported as open", raw.id));
             status = Status::Open;
         }
         let created_at = raw.created_at.unwrap_or(now);

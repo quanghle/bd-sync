@@ -341,6 +341,7 @@ impl WriteCtx<'_> {
         if let Some(t) = opts.token {
             check_token(self.conn(), id, &actor, t)?;
         }
+        self.check_claim_override(&issue)?;
         let (status, started_at) =
             if issue.status == Status::InProgress { (Status::Open, None) } else { (issue.status, issue.started_at) };
         self.conn()

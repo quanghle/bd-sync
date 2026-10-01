@@ -23,6 +23,12 @@
 //! A non-timer gate with a `timeout` escalates when it is still shut that long
 //! after arming. Escalation records the reason on the gate, comments on it, and
 //! appends a `gate_escalated` event; it never opens the gate.
+//!
+//! GitHub gates are probed with the credentials of whoever checks them (the
+//! server's, under `bd serve`), so the repositories they may name in `repo`
+//! are a workspace setting, [`GateRepos`] (config `gate.repos`), enforced when
+//! a gate is written and again before it is probed. Under `bd serve`, human
+//! gates open only for a person: see [`crate::policy`].
 
 use std::fmt;
 
@@ -30,6 +36,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value, json};
 
+use crate::config;
 use crate::error::{Error, Result};
 use crate::graph::{self, BlockChange};
 use crate::issues::{self, CloseOptions, CloseOutcome};
@@ -222,6 +229,111 @@ impl GateSpec {
     }
 }
 
+/// The repositories GitHub gates may name in `repo`, from the workspace's
+/// `gate.repos` config: `OWNER/REPO`, `HOST/OWNER/REPO`, `OWNER/*` (every
+/// repository of an owner), `HOST/OWNER/*`, or `*` (any). A gate without
+/// `repo` uses the repository of the workspace's directory, which is always
+/// allowed. Case does not matter, but the host does: `OWNER/REPO` is on gh's
+/// default host (`GH_HOST`, or the one gh is logged in to), so it never
+/// matches `HOST/OWNER/REPO`, nor the other way round.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GateRepos {
+    Any,
+    Only(Vec<String>),
+}
+
+impl GateRepos {
+    /// The workspace's allowlist. Unset, it allows any repository, except
+    /// under `bd serve` (`served`), where gates may only use the workspace's
+    /// own: a client must not point the server's credentials elsewhere.
+    pub fn load(conn: &Connection, served: bool) -> Result<GateRepos> {
+        let list = config::split_list(&config::get_or_default(conn, "gate.repos")?);
+        Ok(if list.iter().any(|r| r == "*") || (list.is_empty() && !served) {
+            GateRepos::Any
+        } else {
+            GateRepos::Only(list)
+        })
+    }
+
+    pub fn allows(&self, repo: &str) -> bool {
+        match self {
+            GateRepos::Any => true,
+            GateRepos::Only(list) => list.iter().any(|p| repo_matches(p, repo)),
+        }
+    }
+
+    /// Refuse a GitHub gate whose `repo` is not allowed.
+    pub fn check(&self, spec: &GateSpec) -> Result<()> {
+        match &spec.repo {
+            Some(repo) if spec.kind.is_github() => self.check_repo(spec.kind, repo),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_repo(&self, kind: GateKind, repo: &str) -> Result<()> {
+        if self.allows(repo) {
+            return Ok(());
+        }
+        let list = match self {
+            GateRepos::Only(list) => list.clone(),
+            GateRepos::Any => Vec::new(),
+        };
+        Err(Error::Refused(if list.is_empty() {
+            format!(
+                "{kind} gate repo {repo} is not allowed: through bd serve, GitHub gates may only use the workspace's \
+                 own repository unless gate.repos allows others (`bd config set gate.repos {repo}`, an admin access token)"
+            )
+        } else {
+            format!(
+                "{kind} gate repo {repo} is not in gate.repos ({}); allow it with `bd config set gate.repos {},{repo}`",
+                list.join(", "),
+                list.join(",")
+            )
+        }))
+    }
+}
+
+fn normalize_repo(repo: &str) -> String {
+    repo.trim().to_ascii_lowercase()
+}
+
+fn repo_matches(pattern: &str, repo: &str) -> bool {
+    let (p, r) = (normalize_repo(pattern), normalize_repo(repo));
+    if p == "*" {
+        return true;
+    }
+    match p.strip_suffix("/*") {
+        Some(owner) => r.rsplit_once('/').is_some_and(|(o, _)| o == owner),
+        None => p == r,
+    }
+}
+
+/// An entry of `gate.repos`: `*`, `OWNER/*`, `HOST/OWNER/*`, or a repository.
+pub fn validate_repo_pattern(pattern: &str) -> Result<()> {
+    let ok = pattern == "*"
+        || match pattern.strip_suffix("/*") {
+            Some(owner) => validate_repo(&format!("{owner}/x")).is_ok(),
+            None => validate_repo(pattern).is_ok(),
+        };
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::invalid(format!("invalid gate.repos entry {pattern:?} (OWNER/REPO, HOST/OWNER/REPO, OWNER/* or *)")))
+    }
+}
+
+/// The kind and `repo` of a GitHub gate with a valid condition.
+fn github_repo(issue_type: &str, metadata: &Value) -> Option<(GateKind, String)> {
+    if issue_type != GATE_TYPE {
+        return None;
+    }
+    let spec = spec_from_metadata(metadata).ok()?;
+    if !spec.kind.is_github() {
+        return None;
+    }
+    Some((spec.kind, spec.repo?))
+}
+
 /// `OWNER/REPO` or `HOST/OWNER/REPO`.
 pub fn validate_repo(repo: &str) -> Result<()> {
     let parts: Vec<&str> = repo.split('/').collect();
@@ -321,7 +433,11 @@ fn meta_str(meta: Option<&Map<String, Value>>, key: &str) -> Option<String> {
 
 /// The gate's condition, or why it has none.
 pub fn spec_of(issue: &Issue) -> std::result::Result<GateSpec, String> {
-    let Some(meta) = gate_meta(issue) else {
+    spec_from_metadata(&issue.metadata)
+}
+
+fn spec_from_metadata(metadata: &Value) -> std::result::Result<GateSpec, String> {
+    let Some(meta) = metadata.get("gate").and_then(Value::as_object) else {
         return Err("no metadata.gate condition".into());
     };
     let mut fields = Map::new();
@@ -553,6 +669,19 @@ pub struct NewGate {
 }
 
 impl WriteCtx<'_> {
+    /// Refuse writing a GitHub gate (`issue_type` and `metadata` of a new or
+    /// updated issue) whose `repo` the workspace does not allow, unless the
+    /// issue already watched that repository before this update (`old`).
+    pub(crate) fn check_gate_repo(&self, issue_type: &str, metadata: &Value, old: Option<&Issue>) -> Result<()> {
+        let Some((kind, repo)) = github_repo(issue_type, metadata) else {
+            return Ok(());
+        };
+        if old.and_then(|o| github_repo(&o.issue_type, &o.metadata)).is_some_and(|(_, r)| r == repo) {
+            return Ok(());
+        }
+        GateRepos::load(self.conn(), self.policy().is_some())?.check_repo(kind, &repo)
+    }
+
     /// Create a gate holding back `blocks`. The gate also takes on their
     /// prerequisites, so it arms only once that work could otherwise start.
     pub fn create_gate(&mut self, mut g: NewGate) -> Result<Issue> {

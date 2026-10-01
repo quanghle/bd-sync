@@ -15,8 +15,8 @@ use crate::filter::{QueryParts, apply_work_filter, like_escape, placeholders};
 use crate::graph;
 use crate::ids;
 use crate::model::{
-    BUILTIN_TYPES, DepType, Guard, Issue, IssueDetails, IssuePatch, IssueRef, ListQuery, ListSort, MAX_TITLE_CHARS,
-    NewIssue, Outcome, Status, empty_object,
+    BUILTIN_TYPES, DepType, GATE_TYPE, Guard, Issue, IssueDetails, IssuePatch, IssueRef, ListQuery, ListSort,
+    MAX_TITLE_CHARS, NewIssue, Outcome, Status, empty_object,
 };
 use crate::ready;
 use crate::store::{WriteCtx, validate_actor};
@@ -173,9 +173,11 @@ fn open_children(conn: &Connection, id: &str) -> Result<Vec<String>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// A playbook run or group: an epic that closes itself when its subtree is done.
+/// A playbook run or group: an epic that closes itself when its subtree is
+/// done. A gate never is, whatever its metadata says: it opens by its condition.
 pub(crate) fn is_playbook_container(issue: &Issue) -> bool {
-    matches!(issue.metadata.pointer("/playbook/role").and_then(Value::as_str), Some("run" | "group"))
+    issue.issue_type != GATE_TYPE
+        && matches!(issue.metadata.pointer("/playbook/role").and_then(Value::as_str), Some("run" | "group"))
 }
 
 const SUBTREE_CTE: &str = "WITH RECURSIVE sub(id) AS (
@@ -389,6 +391,7 @@ impl WriteCtx<'_> {
         let labels = normalize_labels(&new.labels)?;
         let metadata = new.metadata.clone().unwrap_or_else(empty_object);
         validate_metadata(&metadata)?;
+        self.check_gate_repo(&issue_type, &metadata, None)?;
 
         let mut parent = new.parent.clone();
         let mut deps: Vec<(DepType, String)> = Vec::new();
@@ -474,6 +477,19 @@ impl WriteCtx<'_> {
     }
 
     pub fn update_issue(&mut self, id: &str, patch: &IssuePatch, guard: &Guard, force: bool) -> Result<UpdateOutcome> {
+        self.update_issue_as(id, patch, guard, force, false)
+    }
+
+    /// [`WriteCtx::update_issue`]; `playbook` when playbook runs update their
+    /// own bookkeeping (`metadata.playbook`), which callers under a policy may not.
+    pub(crate) fn update_issue_as(
+        &mut self,
+        id: &str,
+        patch: &IssuePatch,
+        guard: &Guard,
+        force: bool,
+        playbook: bool,
+    ) -> Result<UpdateOutcome> {
         let old = require(self.conn(), id)?;
         guard.check(&old)?;
         let mut new = old.clone();
@@ -554,6 +570,16 @@ impl WriteCtx<'_> {
         if is_claimed && new.assignee.is_none() {
             return Err(Error::invalid("an in_progress issue needs an assignee; use `bd release` to give up a claim"));
         }
+        // Gates are never claimed (see `claim`): they open by their condition.
+        if is_claimed && new.issue_type == GATE_TYPE && !(was_claimed && old.issue_type == GATE_TYPE) {
+            return Err(Error::Refused(if old.issue_type == GATE_TYPE {
+                format!(
+                    "{id} is a gate: it is never in progress; it opens through `bd gate check` or `bd gate resolve`"
+                )
+            } else {
+                format!("{id} is in progress: release it before making it a gate, which is never in progress")
+            }));
+        }
         if was_claimed
             && is_claimed
             && old.assignee != new.assignee
@@ -630,6 +656,9 @@ impl WriteCtx<'_> {
         if changes.is_empty() {
             return Ok(UpdateOutcome { issue: old, changed: Vec::new() });
         }
+        let moved_from = parent_change.as_ref().and_then(|(from, _)| from.as_deref());
+        self.check_update(&old, &new, moved_from, playbook)?;
+        self.check_gate_repo(&new.issue_type, &new.metadata, Some(&old))?;
 
         self.conn()
             .prepare_cached(
@@ -722,6 +751,7 @@ impl WriteCtx<'_> {
                 )));
             }
         }
+        self.check_close(&old, opts.force)?;
         let reason = opts.reason.clone().filter(|r| !r.trim().is_empty());
         let outcome = opts.outcome.unwrap_or(Outcome::Done);
         let mut freed = self.mark_closed(&old, reason, outcome, false)?;
@@ -778,6 +808,9 @@ impl WriteCtx<'_> {
                 continue;
             }
             if !is_playbook_container(&p) || has_live_descendants(self.conn(), &parent)? {
+                break;
+            }
+            if !self.check_auto_close(&p)? {
                 break;
             }
             let failed: bool = self
@@ -915,6 +948,7 @@ impl WriteCtx<'_> {
                 detached.iter().cloned().collect::<Vec<_>>().join(", ")
             )));
         }
+        self.check_removal(&set)?;
         let deleted: Vec<String> = set.iter().cloned().collect();
         let detached: Vec<String> = detached.into_iter().collect();
         if opts.dry_run {
@@ -954,6 +988,7 @@ impl WriteCtx<'_> {
         if set.is_empty() {
             return Ok(Vec::new());
         }
+        self.check_removal(set)?;
         let mut detached: BTreeSet<String> = BTreeSet::new();
         let mut seeds: Vec<String> = Vec::new();
         {

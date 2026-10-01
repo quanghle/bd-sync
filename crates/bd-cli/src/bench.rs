@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::app::App;
-use crate::auth::{self, Role};
+use crate::auth::{self, Kind, Role};
 use crate::cli::{BenchArgs, BenchMode, BenchWorkerArgs};
 use crate::protocol::valid_workspace_name;
 
@@ -288,7 +288,8 @@ impl ScratchServer {
     fn start(exe: &Path, db: &Path) -> Result<ScratchServer> {
         let (root, name) =
             served_workspace(db).ok_or_else(|| Error::invalid("remote mode needs <root>/<name>/.bd/bd.db"))?;
-        let (_, token) = auth::issue_token(&root, "bench", "bench", Role::Write, std::slice::from_ref(&name))?;
+        let (_, token) =
+            auth::issue_token(&root, "bench", "bench", Role::Write, Kind::Agent, std::slice::from_ref(&name))?;
         let mut child = Command::new(exe)
             .arg("serve")
             .arg("--root")

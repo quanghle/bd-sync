@@ -384,7 +384,7 @@ pub struct UpdateArgs {
     pub ephemeral: Option<bool>,
     #[command(flatten)]
     pub guard: GuardArgs,
-    /// Allow taking over another actor's live claim
+    /// Allow taking over another actor's live claim (through bd serve: an admin token)
     #[arg(long)]
     pub force: bool,
 }
@@ -504,7 +504,7 @@ pub struct ReleaseArgs {
     pub ids: Vec<String>,
     #[arg(short, long)]
     pub reason: Option<String>,
-    /// Release another actor's claim
+    /// Release another actor's claim (through bd serve: an admin token)
     #[arg(long)]
     pub force: bool,
     /// Release only if still held by this actor (compare-and-swap)
@@ -923,7 +923,7 @@ pub enum GateCommand {
     Show(IdArg),
     /// Evaluate armed gates: open those whose condition holds; escalate failures and timeouts
     Check(GateCheckArgs),
-    /// Open gates by hand (approvals)
+    /// Open gates by hand (approvals; through bd serve, human gates need a human token)
     Resolve(GateResolveArgs),
     /// Put a gate in front of existing work
     Create(Box<GateCreateArgs>),
@@ -972,7 +972,7 @@ pub struct GateCreateArgs {
     /// timer: how long to wait; other types: escalate when still shut this long after arming
     #[arg(long)]
     pub timeout: Option<String>,
-    /// GitHub gates: OWNER/REPO or HOST/OWNER/REPO (default: this repository)
+    /// GitHub gates: OWNER/REPO or HOST/OWNER/REPO (default: this repository; gate.repos limits others)
     #[arg(long)]
     pub repo: Option<String>,
     /// gh:run on a workflow: only runs for this branch or tag; follows its newest head
@@ -1138,6 +1138,9 @@ pub struct TokenCreateArgs {
     pub act_as: String,
     #[arg(long, value_enum, default_value = "write")]
     pub role: crate::auth::Role,
+    /// Who holds it: a person's token (human) may also resolve human gates
+    #[arg(long, value_enum, default_value = "agent")]
+    pub kind: crate::auth::Kind,
     /// Workspaces the token may use (repeatable or comma separated; default all)
     #[arg(long = "workspace", value_delimiter = ',', value_name = "NAME")]
     pub workspaces: Vec<String>,

@@ -12,7 +12,7 @@ coordination engine:
 - **Optimistic concurrency**: per-issue revisions and `--if-revision/--if-status/--if-assignee` guards (exit code 13 on conflict)
 - **Comments, durable memory, and transactional event history** with gapless, commit-ordered sequence numbers
 - **Playbooks and gates**: repeatable multi-step work declared once in TOML and run atomically as `<run>.<step>` issues; human, timer, issue, and GitHub gates that arm when their step could start ([Playbooks](#playbooks-repeatable-multi-step-work))
-- **Remote server**: `bd serve` shares workspaces over HTTPS with laptops, CI runners and cloud agents; the same `bd` binary is the client, with access tokens, roles, and retries that apply a write once. The server also reclaims dead workers' leases, checks gates and takes backups on its own ([Remote server](#remote-server-one-workspace-many-machines))
+- **Remote server**: `bd serve` shares workspaces over HTTPS with laptops, CI runners and cloud agents; the same `bd` binary is the client, with access tokens (roles, and human or agent kinds), and retries that apply a write once. The server also reclaims dead workers' leases, checks gates and takes backups on its own ([Remote server](#remote-server-one-workspace-many-machines))
 - Extras: JSONL export/import (reads beads exports), `bd batch` (many writes, one transaction), `bd bench`, and local observability (structured logs, timing, Prometheus metrics, `bd doctor`)
 
 It ships as a library (`crates/bd-core`) and a CLI (`crates/bd-cli`, binary `bd`).
@@ -178,6 +178,7 @@ ready work (`-t gate` lists them).
 - The lease `token` is the sequence number of the `claimed` event: unique and increasing. Pass it to `heartbeat`, `close`, or `release` so a stale worker cannot act on a claim it no longer holds.
 - `bd reclaim [--grace 10m]` reverts dead workers' issues to `open` and records `reclaimed` events. `bd leases` shows lease health. `bd serve` runs it in every workspace each minute ([Background jobs](#background-jobs-and-backups)).
 - Invariant (checked by `bd doctor`): a lease exists if and only if the issue is `in_progress`, and the lease holder is the assignee.
+- Through `bd serve`, only an admin token may end or take over another actor's claim ([Remote server](#remote-server-one-workspace-many-machines)).
 
 ### Optimistic concurrency
 
@@ -362,11 +363,14 @@ time, with one `purged` event instead of a snapshot per issue.
 ### Gates
 
 A gate is an issue of type `gate` in front of a step. The step waits on it
-like on any blocker; the gate itself is never ready and cannot be claimed.
+like on any blocker; the gate itself is never ready, cannot be claimed, and
+is never `in_progress` (an issue in progress cannot become a gate either).
+`bd gate check` applies each gate's verdict on its own: a gate it cannot
+open or escalate is reported as an error, and the others still are.
 
 | type | opens when | escalates when |
 |---|---|---|
-| `human` | someone runs `bd gate resolve <id>` | `timeout` passes after arming |
+| `human` | someone runs `bd gate resolve <id>` (through `bd serve`: with a human access token) | `timeout` passes after arming |
 | `timer` | `timeout` (`30m`, `24h`, `2d`) has passed since arming | never |
 | `issue` | the `await_id` issue closes as done | it closes as failed, or `timeout` passes |
 | `gh:pr` | pull request `await_id` merges | it is closed without merging, or `timeout` passes |
@@ -385,6 +389,19 @@ any escalation about the old one. GitHub gates use `gh` (`BD_GH` overrides
 the binary) in the workspace's repository, or in `repo = "owner/name"`; a
 `gh` call that takes longer than 60 seconds is killed and reported as an
 error for that gate.
+
+`gh` runs with the credentials of whoever checks the gate, so the `gate.repos`
+config lists the repositories gates may name in `repo`: `OWNER/REPO`,
+`HOST/OWNER/REPO`, `OWNER/*`, `HOST/OWNER/*`, or `*` for any. Entries match
+the way gates write the repository: `OWNER/REPO` is on `gh`'s default host
+(`GH_HOST`, or the host `gh` is logged in to), so it never matches
+`HOST/OWNER/REPO`, nor the other way round. Unset, any repository works
+locally, while through `bd serve` (whose `gh` has the server's credentials,
+for requests and its own gate checks alike) only gates without `repo`,
+which watch the workspace's own repository. A gate naming another repository
+is refused when it is created or changed (by `bd gate create`, a playbook
+run, an update or an import), and `bd gate check` escalates it instead of
+probing it.
 
 `bd gate check` (from cron or CI; `bd serve` runs it on its own, see
 [Background jobs](#background-jobs-and-backups)) opens the gates whose
@@ -423,6 +440,7 @@ mkdir -p /srv/bd/proj && bd -C /srv/bd/proj init --prefix proj
 
 # Access tokens live in <root>/tokens.json (hashes only); each secret is printed once
 bd serve token create alice-laptop --as alice --root /srv/bd
+bd serve token create alice-desk --as alice --kind human --root /srv/bd   # a person's: approves human gates
 bd serve token create ci --as ci --workspace proj --root /srv/bd
 bd serve token create dashboard --as dash --role read --root /srv/bd
 bd serve token list --root /srv/bd
@@ -596,7 +614,37 @@ A token acts as one actor (`--as`), or as that actor's sub-actors
 |---|---|
 | `read` | read-only commands; its database connection is query-only |
 | `write` (default) | every command except the admin ones |
-| `admin` | also `config set/unset`, `import`, `events prune`, `doctor` |
+| `admin` | also `config set/unset`, `import`, `events prune`, `doctor`, and taking over other actors' claims |
+
+A token's kind, independent of its role, says who holds it: `agent` (the
+default, which tokens created before kinds existed are too) or `human`
+(`--kind human`). Keep human tokens out of agents' environments, since they
+can approve. The server enforces roles and kinds in the engine, so a `bd batch`
+or a playbook gets the same answer as a single command:
+
+- Ending or taking over a live claim of another actor needs an admin token:
+  `release --force` (or `--if-assignee`), `update --assignee ... --force` or
+  moving the issue out of `in_progress`, `close`, `delete`, and discarding
+  or force-compacting a run with such a step. The token's own actor and its
+  sub-actors are not another actor. Expired leases stay reclaimable by any
+  write token (`bd reclaim`), and unclaimed work may be reassigned as before.
+  A run or group claimed by another actor stays open, still claimed, when
+  its last step closes.
+- Opening a human gate needs a human token, whatever the role: `gate
+  resolve`, `close`, pinning it, changing its type or condition, or deleting
+  it. So does getting the work it holds back past it early: removing that
+  edge, `close --force`, pinning or deleting the work (or a group, run or
+  epic around it), or moving the work or the gate out of its parent.
+  `import` is checked too. Other gates may be resolved by hand with any
+  write token.
+- `metadata.playbook`, which makes runs and groups close themselves, belongs
+  to playbook runs: only an admin token may change it on an existing issue
+  (closing such a run or group still checks claims and human gates).
+- GitHub gates may only name repositories in the workspace's `gate.repos`,
+  which only admins set ([Gates](#gates)); unset, only the workspace's own.
+
+`bd` on the server's host, which opens `bd.db` directly, is not limited by
+tokens (`gate.repos`, once set, applies there too).
 
 Every invocation carries a random request id. The client retries
 connection failures, timeouts and busy answers with the same id. The server
@@ -613,8 +661,9 @@ What runs where:
 - Playbooks run by name from the server's playbook path: the workspace's
   `.bd/playbooks` (`<root>/<name>/.bd/playbooks`), then the server's
   `$BD_PLAYBOOK_PATH` and user config directory. File paths are refused.
-  GitHub gates are checked by the server's `gh`, also on the server's own
-  schedule ([Background jobs](#background-jobs-and-backups)).
+  GitHub gates are checked by the server's `gh`, for the repositories
+  `gate.repos` allows, also on the server's own schedule
+  ([Background jobs](#background-jobs-and-backups)).
 - `events --follow` polls the server. `init`, `bench`, `serve` and
   `playbook extract --save` only run on the machine that holds the database.
 - `bd prime`, which session hooks run, gives up within seconds when the
@@ -701,6 +750,7 @@ connections open, while each `cli` process opens the database again.
 | `types.custom` | | extra issue types |
 | `durability` | `normal` | SQLite `synchronous`: `off`, `normal`, `full` |
 | `events.retain_days` / `events.retain_rows` | `0` | automatic event retention (`0` keeps everything) |
+| `gate.repos` | | repositories GitHub gates may name: `OWNER/REPO`, `HOST/OWNER/REPO`, `OWNER/*`, `*` (unset: any locally, the workspace's own through `bd serve`) |
 
 The actor comes from `--actor`, then `$BD_ACTOR`, `$BEADS_ACTOR`, `git config user.name`, then `$USER`. In a remote workspace, the access token decides: `--actor` and `$BD_ACTOR` may only name the token's actor or one of its sub-actors.
 
@@ -715,7 +765,7 @@ The actor comes from `--actor`, then `$BD_ACTOR`, `$BEADS_ACTOR`, `git config us
 | 4 | claim conflict: already claimed, not ready, not owner, or lease lost |
 | 5 | database busy |
 | 6 | event cursor truncated |
-| 7 | access denied: missing or invalid token, or its role, workspaces or actor do not allow it |
+| 7 | access denied: missing or invalid token, or its role, kind, workspaces or actor do not allow it |
 | 8 | bd server unreachable, its certificate not trusted, or a server failure (retrying is safe) |
 | 13 | stale optimistic-concurrency guard |
 
@@ -746,10 +796,10 @@ point.
 crates/bd-core/src/   store (WAL, transactions, busy handling) · schema · issues · graph (deps + blocked state)
                       ready · claims (leases) · events · comments · memory · config · transfer (JSONL)
                       metrics · doctor · queries (read API) · gates (conditions, arming, evaluation)
-                      requests (idempotency records) · playbook/ (model + strict parsing · template · loader
-                      · compile · run · extract)
+                      policy (what a request's access token may override) · requests (idempotency records)
+                      · playbook/ (model + strict parsing · template · loader · compile · run · extract)
 crates/bd-core/tests/ engine integration tests (graph semantics, leases with a manual clock, concurrency,
-                      playbook runs and gates)
+                      playbook runs and gates, write policies)
 crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) · batch · bench · fmt · logging
                       io (stdio and files, or a captured request) · serve (bd serve) · jobs (its background
                       jobs: reclaim, gate checks, backups) · auth (access tokens)

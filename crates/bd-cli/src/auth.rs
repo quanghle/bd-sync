@@ -1,9 +1,12 @@
-//! Access tokens for `bd serve`: who may call, as which actor, with which role.
+//! Access tokens for `bd serve`: who may call, as which actor, with which
+//! role, and whether a person or an agent holds it.
 //!
 //! Tokens live in `<root>/tokens.json` (mode 0600 on Unix), which stores
 //! only the SHA-256 of each secret. `bd serve token create` prints a secret
 //! once. A token acts as one actor, or as `<actor>/<name>` sub-actors (one
-//! per agent), so claims and leases keep meaning "this caller".
+//! per agent), so claims and leases keep meaning "this caller". Its role
+//! and kind become the request's [`bd_core::Policy`]: only admins end or
+//! take over other actors' claims, and only human tokens open human gates.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -42,6 +45,28 @@ impl Role {
     }
 }
 
+/// Who holds a token, independent of its role. Entries written before kinds
+/// existed are agent tokens, so approving human gates always takes a
+/// deliberately created human token.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Kind {
+    /// A person: may also resolve human gates and move work past them.
+    Human,
+    /// A program (the default).
+    #[default]
+    Agent,
+}
+
+impl Kind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Human => "human",
+            Kind::Agent => "agent",
+        }
+    }
+}
+
 /// One entry of `tokens.json`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Token {
@@ -50,6 +75,8 @@ pub struct Token {
     pub name: String,
     pub actor: String,
     pub role: Role,
+    #[serde(default)]
+    pub kind: Kind,
     /// Workspace names, or `*` for every workspace.
     pub workspaces: Vec<String>,
     /// Hex SHA-256 of the secret.
@@ -66,11 +93,12 @@ impl Token {
 
     /// The token's actor, or a sub-actor `<actor>/<name>`.
     pub fn allows_actor(&self, actor: &str) -> bool {
-        actor == self.actor
-            || actor
-                .strip_prefix(self.actor.as_str())
-                .and_then(|r| r.strip_prefix('/'))
-                .is_some_and(|r| !r.trim().is_empty())
+        bd_core::policy::is_actor_or_sub_actor(&self.actor, actor)
+    }
+
+    /// What the token's requests may override.
+    pub fn policy(&self) -> bd_core::Policy {
+        bd_core::Policy { actor: self.actor.clone(), admin: self.role == Role::Admin, human: self.kind == Kind::Human }
     }
 
     fn view(&self) -> serde_json::Value {
@@ -79,6 +107,7 @@ impl Token {
             "name": self.name,
             "actor": self.actor,
             "role": self.role,
+            "kind": self.kind,
             "workspaces": self.workspaces,
             "created_at": self.created_at,
             "revoked_at": self.revoked_at,
@@ -87,7 +116,12 @@ impl Token {
 
     fn describe(&self) -> String {
         let ws = if self.workspaces.iter().any(|w| w == "*") { "all".to_string() } else { self.workspaces.join(",") };
-        format!("acts as {0} or {0}/<agent>, role {1}, workspaces {ws}", self.actor, self.role.as_str())
+        format!(
+            "acts as {0} or {0}/<agent>, role {1}, kind {2}, workspaces {ws}",
+            self.actor,
+            self.role.as_str(),
+            self.kind.as_str()
+        )
     }
 }
 
@@ -196,7 +230,7 @@ pub fn cmd_token(app: &mut App, cmd: &TokenCommand) -> Result<()> {
 
 fn create(app: &mut App, a: &TokenCreateArgs) -> Result<()> {
     let root = root_dir(&a.root)?;
-    let (token, secret) = issue_token(&root, &a.name, &a.act_as, a.role, &a.workspaces)?;
+    let (token, secret) = issue_token(&root, &a.name, &a.act_as, a.role, a.kind, &a.workspaces)?;
     let mut view = token.view();
     view["token"] = json!(secret);
     let out = Out::new(view)
@@ -210,7 +244,14 @@ fn create(app: &mut App, a: &TokenCreateArgs) -> Result<()> {
 
 /// Add an access token to `<root>/tokens.json`. Returns it with its secret,
 /// which is not stored anywhere.
-pub fn issue_token(root: &Path, name: &str, actor: &str, role: Role, workspaces: &[String]) -> Result<(Token, String)> {
+pub fn issue_token(
+    root: &Path,
+    name: &str,
+    actor: &str,
+    role: Role,
+    kind: Kind,
+    workspaces: &[String],
+) -> Result<(Token, String)> {
     let name = name.trim();
     let name_ok = name.len() <= 64
         && name.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
@@ -248,6 +289,7 @@ pub fn issue_token(root: &Path, name: &str, actor: &str, role: Role, workspaces:
         name: name.to_string(),
         actor: actor.to_string(),
         role,
+        kind,
         workspaces,
         sha256: hash(&secret),
         created_at: Timestamp::now().to_rfc3339(),
@@ -310,6 +352,7 @@ mod tests {
             name: "n".into(),
             actor: actor.into(),
             role: Role::Write,
+            kind: Kind::Agent,
             workspaces: workspaces.iter().map(|s| s.to_string()).collect(),
             sha256: String::new(),
             created_at: String::new(),
@@ -349,5 +392,28 @@ mod tests {
         t.revoked_at = Some("2026-01-01T00:00:00Z".into());
         save_file(&path, &TokenFile { version: 1, tokens: vec![t] }).unwrap();
         assert!(v.verify("bdt_secret").unwrap().is_none(), "revocation applies without a restart");
+    }
+
+    #[test]
+    fn entries_without_a_kind_are_agent_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = json!({ "version": 1, "tokens": [{
+            "id": "0123456789abcdef", "name": "old", "actor": "alice", "role": "admin", "workspaces": ["*"],
+            "sha256": hash("bdt_old"), "created_at": "2026-01-01T00:00:00Z",
+        }]});
+        std::fs::write(tokens_path(dir.path()), legacy.to_string()).unwrap();
+        let t = Verifier::new(dir.path()).verify("bdt_old").unwrap().expect("loads");
+        assert_eq!((t.role, t.kind), (Role::Admin, Kind::Agent));
+        assert_eq!(t.policy(), bd_core::Policy { actor: "alice".into(), admin: true, human: false });
+        assert!(t.describe().contains("kind agent"), "{}", t.describe());
+
+        // Saving the file again (another token created) writes the kind out and keeps the old entry.
+        let (human, _) = issue_token(dir.path(), "alice-desk", "alice", Role::Write, Kind::Human, &[]).unwrap();
+        assert!(human.policy().human && !human.policy().admin);
+        let file = load_file(&tokens_path(dir.path())).unwrap();
+        let kinds: Vec<(&str, Kind)> = file.tokens.iter().map(|t| (t.name.as_str(), t.kind)).collect();
+        assert_eq!(kinds, vec![("old", Kind::Agent), ("alice-desk", Kind::Human)]);
+        let text = std::fs::read_to_string(tokens_path(dir.path())).unwrap();
+        assert!(text.contains("\"kind\": \"agent\"") && text.contains("\"kind\": \"human\""), "{text}");
     }
 }

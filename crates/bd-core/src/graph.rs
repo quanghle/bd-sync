@@ -574,6 +574,9 @@ impl WriteCtx<'_> {
                 return Err(Error::not_found("issue", id));
             }
         }
+        if let Some(edge) = load_edge(self.conn(), issue, target)? {
+            self.check_edge_removal(issue, target, &edge.dep_type)?;
+        }
         let removed = delete_edge(self, issue, target)?;
         if let Some(edge) = &removed {
             let seeds = seeds_for_edge(self.conn(), issue, target, &edge.dep_type)?;

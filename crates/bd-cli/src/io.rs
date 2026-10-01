@@ -11,6 +11,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bd_core::{Error, Result};
 
@@ -27,6 +28,11 @@ pub struct Capture {
     pub files_out: BTreeMap<String, String>,
     /// The request's access token may run admin-only commands.
     pub admin: bool,
+    /// The request's access token is a person's: it may open human gates.
+    pub human: bool,
+    /// The request's access token's actor: claims held by it or its
+    /// sub-actors are the caller's own.
+    pub token_actor: String,
 }
 
 thread_local! {
@@ -54,6 +60,25 @@ pub fn capture<T>(capture: Capture, f: impl FnOnce() -> T) -> (T, Capture) {
 /// True while a command runs inside `bd serve`.
 pub fn serving() -> bool {
     CAPTURE.with(|c| c.borrow().is_some())
+}
+
+static SERVER_PROCESS: AtomicBool = AtomicBool::new(false);
+
+/// Mark this process as `bd serve`: what it does on its own, outside any
+/// request, is still done for remote clients.
+pub fn mark_server_process() {
+    SERVER_PROCESS.store(true, Ordering::Relaxed);
+}
+
+/// True anywhere in a `bd serve` process: on request threads and its own.
+pub fn in_server_process() -> bool {
+    SERVER_PROCESS.load(Ordering::Relaxed) || serving()
+}
+
+/// What the request's access token may override (see [`bd_core::policy`]);
+/// `None` outside `bd serve`, where nothing is limited.
+pub fn policy() -> Option<bd_core::Policy> {
+    with_capture(|c| bd_core::Policy { actor: c.token_actor.clone(), admin: c.admin, human: c.human })
 }
 
 fn with_capture<T>(f: impl FnOnce(&mut Capture) -> T) -> Option<T> {
@@ -201,5 +226,15 @@ mod tests {
         assert_eq!(local.unwrap_err().exit_code(), 2);
         let (admin, _) = capture(Capture { admin: true, ..Default::default() }, || require_admin("config set"));
         assert!(admin.is_ok());
+    }
+
+    #[test]
+    fn requests_carry_their_token_policy() {
+        assert_eq!(policy(), None, "nothing is limited locally");
+        let (p, _) = capture(Capture::default(), policy);
+        assert_eq!(p, Some(bd_core::Policy::default()), "a capture without token facts limits everything");
+        let c = Capture { human: true, token_actor: "alice".into(), ..Default::default() };
+        let (p, _) = capture(c, policy);
+        assert_eq!(p, Some(bd_core::Policy { actor: "alice".into(), admin: false, human: true }));
     }
 }

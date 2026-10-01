@@ -109,6 +109,8 @@ fn run(a: &ServeArgs) -> Result<()> {
     }
     let max_body = usize::try_from(a.max_body_mib << 20).unwrap_or(usize::MAX);
     let jobs = jobs::Config::from_args(a)?;
+    // Before any request or background job: gate checks in this process use the server's defaults.
+    io::mark_server_process();
     let server = Arc::new(Server::new(root, max_body));
     let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("bd-serve").build()?;
     let served = runtime.block_on(serve(server, addr, tls, jobs));
@@ -643,10 +645,14 @@ impl Server {
         app.set_store(store);
         app.location = request.location;
         app.request = key;
+        // What the token may override: admin-only commands, other actors' claims, human gates.
+        let policy = token.policy();
         let capture = Capture {
             stdin: request.stdin,
             files_in: request.files,
-            admin: token.role == Role::Admin,
+            admin: policy.admin,
+            human: policy.human,
+            token_actor: policy.actor,
             ..Default::default()
         };
         let (exit_code, out) = io::capture(capture, || crate::execute(&mut app, &cli.command));
@@ -793,6 +799,7 @@ mod tests {
             name: "alice-laptop".into(),
             actor: "alice".into(),
             role: Role::Write,
+            kind: auth::Kind::Agent,
             workspaces: vec!["*".into()],
             sha256: String::new(),
             created_at: String::new(),

@@ -108,6 +108,12 @@ impl Server {
     fn client(&self, token: &str) -> Client {
         Client { dir: tempfile::tempdir().unwrap(), url: self.url(), token: token.to_string(), ca: None }
     }
+
+    /// `bd` on the server's host, opening workspace `proj`'s database directly as `actor`.
+    fn local(&self, actor: &str, args: &[&str]) -> Output {
+        let db = self.root.path().join("proj").join(".bd").join("bd.db");
+        bd(self.root.path()).arg("--db").arg(db).env("BD_ACTOR", actor).args(args).output().unwrap()
+    }
 }
 
 fn create_token(root: &Path, name: &str, actor: &str, extra: &[&str]) -> String {
@@ -1341,4 +1347,395 @@ fn shutdown_stops_background_jobs_without_waiting_for_gh() {
         .filter(|n| !n.ends_with(".db"))
         .collect();
     assert!(leftovers.is_empty(), "no unfinished backup: {leftovers:?}");
+}
+
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+#[test]
+fn only_human_tokens_resolve_human_gates() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let ops = server.client(&server.token("ops", "ops", &["--role", "admin"]));
+    let carol = server.client(&server.token("carol-desk", "carol", &["--kind", "human"]));
+
+    alice.ok(&["create", "Deploy"]);
+    assert_eq!(alice.ok(&["-q", "gate", "create", "-t", "human", "--blocks", "t-1"]).trim(), "t-2");
+    alice.ok(&["create", "Announce", "--dep", "t-1"]);
+
+    // An agent token, even an admin one, cannot open the gate or get the work past it.
+    let out = alice.run(&["--json", "gate", "resolve", "t-2", "-r", "lgtm"]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "unauthorized");
+    assert!(err["error"]["message"].as_str().unwrap().contains("t-2 is a human gate"), "{err}");
+    assert_eq!(ops.code(&["gate", "resolve", "t-2"]), 7, "admin agent token");
+    for args in [
+        &["close", "t-2"][..],
+        &["close", "t-1", "--force"],
+        &["update", "t-2", "--status", "pinned"],
+        &["update", "t-2", "--type", "task"],
+        &["update", "t-2", "--set-metadata", r#"gate={"type":"timer","timeout":"1s"}"#],
+        &["dep", "rm", "t-1", "t-2"],
+        &["delete", "t-2", "--force"],
+        &["delete", "t-1", "--force"],
+    ] {
+        let out = alice.run(args);
+        assert_eq!(out.status.code(), Some(7), "bd {args:?}: {}", stderr_of(&out));
+    }
+    let out = alice.with_stdin(&["batch"], "comment add t-2 \"looks fine\"\nclose t-2\n");
+    assert_eq!(out.status.code(), Some(7), "inside a batch too: {}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("rolled back"), "{}", stderr_of(&out));
+    assert_eq!(alice.json(&["comments", "t-2"]).as_array().unwrap().len(), 0, "the whole batch rolled back");
+    assert_eq!(alice.json(&["show", "t-2"])["status"], "open");
+    alice.ok(&["update", "t-2", "--assignee", "carol", "--title", "Approve the deploy"]);
+
+    // A person's token opens it.
+    carol.ok(&["gate", "resolve", "t-2", "-r", "approved"]);
+    assert_eq!(alice.json(&["ready"])[0]["id"], "t-1");
+
+    // Kinds show in the token list; on the server's own host nothing changes.
+    let out =
+        bd(server.root.path()).args(["--json", "serve", "token", "list", "--root"]).arg(server.root.path()).output();
+    let list: Value = serde_json::from_str(&check(out.unwrap(), "token list")).unwrap();
+    let kinds: Vec<(&str, &str)> =
+        list.as_array().unwrap().iter().map(|t| (t["name"].as_str().unwrap(), t["kind"].as_str().unwrap())).collect();
+    assert_eq!(kinds, vec![("alice-laptop", "agent"), ("ops", "agent"), ("carol-desk", "human")]);
+    let out = bd(server.root.path()).args(["serve", "token", "list", "--root"]).arg(server.root.path()).output();
+    assert!(check(out.unwrap(), "token list").contains("role write, kind human"));
+    alice.ok(&["create", "Hotfix"]);
+    alice.ok(&["gate", "create", "-t", "human", "--blocks", "t-4"]);
+    check(server.local("local-ops", &["gate", "resolve", "t-5"]), "local resolve");
+}
+
+#[test]
+fn tokens_without_a_kind_load_as_agent_tokens() {
+    let root = Server::prepare();
+    let secret = create_token(root.path(), "old-human", "dana", &["--kind", "human"]);
+    // tokens.json as written before kinds existed.
+    let path = root.path().join("tokens.json");
+    let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    file["tokens"][0].as_object_mut().unwrap().remove("kind").expect("kind is stored");
+    std::fs::write(&path, file.to_string()).unwrap();
+
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    let dana = server.client(&secret);
+    dana.ok(&["create", "Ship"]);
+    dana.ok(&["gate", "create", "-t", "human", "--blocks", "t-1"]);
+    assert_eq!(dana.code(&["gate", "resolve", "t-2"]), 7, "a token without a kind is an agent's");
+    let out =
+        bd(server.root.path()).args(["--json", "serve", "token", "list", "--root"]).arg(server.root.path()).output();
+    let list: Value = serde_json::from_str(&check(out.unwrap(), "token list")).unwrap();
+    assert_eq!(list[0]["kind"], "agent");
+}
+
+#[test]
+fn force_takeovers_need_an_admin_token() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    let ops = server.client(&server.token("ops", "ops", &["--role", "admin"]));
+    let bob_as = |agent: &str, args: &[&str]| bob.cmd(args).env("BD_ACTOR", agent).output().unwrap();
+
+    alice.ok(&["create", "Contended"]);
+    check(bob_as("bob/w1", &["claim", "t-1"]), "bob/w1 claims");
+    assert_eq!(alice.code(&["release", "t-1"]), 4, "without --force: not the owner, as before");
+    assert_eq!(alice.code(&["update", "t-1", "--assignee", "alice"]), 4, "already claimed, as before");
+    for args in [
+        &["release", "t-1", "--force"][..],
+        &["release", "t-1", "--if-assignee", "bob/w1"],
+        &["update", "t-1", "--assignee", "alice", "--force"],
+        &["update", "t-1", "--status", "open"],
+        &["close", "t-1"],
+        &["delete", "t-1"],
+    ] {
+        let out = alice.run(args);
+        assert_eq!(out.status.code(), Some(7), "bd {args:?}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains("claimed by bob/w1"), "{}", stderr_of(&out));
+    }
+    assert_eq!(alice.with_stdin(&["batch"], "release t-1 --force\n").status.code(), Some(7));
+    assert_eq!(alice.json(&["show", "t-1"])["assignee"], "bob/w1", "still bob's");
+    alice.ok(&["comment", "add", "t-1", "how is it going?"]);
+
+    // The token's other agents may take over its own claims.
+    check(bob_as("bob/w2", &["update", "t-1", "--assignee", "bob/w2", "--force"]), "sub-actor takeover");
+    // An admin token may take over anyone's.
+    ops.ok(&["update", "t-1", "--assignee", "ops", "--force"]);
+    assert_eq!(alice.json(&["show", "t-1"])["assignee"], "ops");
+    // Locally, on the server's host, --force works as it always has.
+    check(server.local("local-ops", &["release", "t-1", "--force"]), "local release --force");
+    assert_eq!(alice.json(&["show", "t-1"])["status"], "open");
+}
+
+/// A stand-in for `gh pr view` that reports PR 42 merged and appends its
+/// arguments to `gh-args.log` next to itself.
+fn logging_fake_gh(dir: &Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let gh = dir.join("fake-gh.cmd");
+        std::fs::write(
+            &gh,
+            "@echo off\r\necho %*>>\"%~dp0gh-args.log\"\r\necho {\"state\":\"MERGED\",\"title\":\"Feature\"}\r\n",
+        )
+        .unwrap();
+        gh
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = dir.join("fake-gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/gh-args.log\"\necho '{\"state\":\"MERGED\",\"title\":\"Feature\"}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        gh
+    }
+}
+
+#[test]
+fn github_gates_only_watch_allowed_repositories() {
+    let tools = tempfile::tempdir().unwrap();
+    let gh = logging_fake_gh(tools.path());
+    let server = Server::launch_with(Server::prepare(), "127.0.0.1:0", &[], |c| {
+        c.env("BD_GH", &gh);
+    });
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let ops = server.client(&server.token("ops", "ops", &["--role", "admin"]));
+    for title in ["Own repo", "Legacy", "Allowed"] {
+        alice.ok(&["create", title]);
+    }
+
+    // Through the server, a gate may not point the server's gh at another repository.
+    let out = alice.run(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--repo", "evil/x", "--blocks", "t-1"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("not allowed"), "{}", stderr_of(&out));
+    let raw = r#"{"gate":{"type":"gh:pr","await_id":"42","repo":"evil/x"}}"#;
+    assert_eq!(alice.code(&["create", "Sneaky", "-t", "gate", "--metadata", raw]), 2);
+    assert_eq!(alice.ok(&["-q", "gate", "create", "-t", "gh:pr", "--await-id", "42", "--blocks", "t-1"]).trim(), "t-4");
+    // A gate made on the server's host before any allowlist: still never probed through the server.
+    let out = server.local(
+        "local-ops",
+        &["-q", "gate", "create", "-t", "gh:pr", "--await-id", "42", "--repo", "evil/x", "--blocks", "t-2"],
+    );
+    assert_eq!(check(out, "local gate create").trim(), "t-5");
+    // Admins choose what else gates may watch.
+    assert_eq!(alice.code(&["config", "set", "gate.repos", "*"]), 7);
+    ops.ok(&["config", "set", "gate.repos", "org/*"]);
+    alice.ok(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--repo", "org/app", "--blocks", "t-3"]);
+
+    let checked = alice.json(&["gate", "check"]);
+    let actions: Vec<(&str, &str)> = checked["checked"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["id"].as_str().unwrap(), c["action"].as_str().unwrap()))
+        .collect();
+    assert_eq!(actions[1], ("t-5", "escalated"), "{checked}");
+    assert!(checked["checked"][1]["detail"].as_str().unwrap().contains("evil/x is not in gate.repos"), "{checked}");
+    let log = std::fs::read_to_string(tools.path().join("gh-args.log")).unwrap_or_default();
+    assert!(!log.contains("evil"), "evil/x was never probed: {log}");
+    // On Windows the server's batch-file gh cannot run in a verbatim workspace path (bd-sync-wnh).
+    if !cfg!(windows) {
+        assert_eq!(actions, vec![("t-4", "opened"), ("t-5", "escalated"), ("t-6", "opened")]);
+        assert_eq!(log.lines().count(), 2, "{log}");
+        assert!(log.contains("--repo=org/app"), "{log}");
+    }
+    assert!(alice.ok(&["prime"]).contains("t-5"), "a person sees why it is stuck");
+}
+
+#[test]
+fn background_gate_checks_only_probe_allowed_repositories() {
+    let root = Server::prepare();
+    let ws = root.path().join("proj");
+    let local = |args: &[&str]| check(bd(&ws).env("BD_ACTOR", "ops").args(args).output().unwrap(), "local bd");
+    for title in ["Legacy", "Allowed", "Own repo"] {
+        local(&["create", title]);
+    }
+    // Made on the server's host before the allowlist existed, then the allowlist.
+    local(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--repo", "evil/x", "--blocks", "t-1"]);
+    local(&["config", "set", "gate.repos", "org/*"]);
+    local(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--repo", "org/app", "--blocks", "t-2"]);
+    local(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--blocks", "t-3"]);
+
+    let tools = tempfile::tempdir().unwrap();
+    let gh = logging_fake_gh(tools.path());
+    let flags = ["--gh-check-every", "100ms", "--gate-check-every", "off", "--reclaim-every", "off"];
+    let server = Server::launch_with(root, "127.0.0.1:0", &flags, |c| {
+        c.env("BD_GH", &gh);
+    });
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    eventually("the server to escalate the gate on evil/x", || {
+        alice.json(&["gate", "show", "t-4"])["phase"] == "escalated"
+    });
+    let gate = alice.json(&["gate", "show", "t-4"]);
+    assert!(gate["escalation"].as_str().unwrap().contains("evil/x is not in gate.repos"), "{gate}");
+    assert!(has(&server_events(&alice), "gate_escalated", "t-4"), "the server's own check");
+    // On Windows the server's batch-file gh cannot run in a verbatim workspace path (bd-sync-wnh).
+    if !cfg!(windows) {
+        eventually("the allowed gates to be probed and open", || {
+            ["t-5", "t-6"].iter().all(|g| alice.json(&["show", g])["status"] == "closed")
+        });
+        let log = std::fs::read_to_string(tools.path().join("gh-args.log")).unwrap();
+        assert!(log.contains("--repo=org/app"), "{log}");
+    }
+    // Its escalation came from the allowlist, before any gh call: evil/x was never probed.
+    let log = std::fs::read_to_string(tools.path().join("gh-args.log")).unwrap_or_default();
+    assert!(!log.contains("evil"), "{log}");
+}
+
+#[test]
+fn self_closing_containers_get_nothing_past_policies() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    let id = |c: &Client, args: &[&str]| {
+        let mut a = vec!["-q"];
+        a.extend_from_slice(args);
+        c.ok(&a).trim().to_string()
+    };
+    let group = r#"playbook={"role":"group"}"#;
+    let mark_locally = |issue: &str| check(server.local("ops", &["update", issue, "--set-metadata", group]), "local");
+    let work = id(&alice, &["create", "Deploy"]);
+    let gate = id(&alice, &["gate", "create", "-t", "human", "--blocks", &work]);
+    let theirs = id(&bob, &["create", "Bob's group"]);
+    bob.ok(&["claim", &theirs]);
+    // Only playbook runs mark self-closing runs and groups.
+    for issue in [&gate, &work, &theirs] {
+        let out = alice.run(&["update", issue, "--set-metadata", group]);
+        assert_eq!(out.status.code(), Some(7), "{issue}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains("metadata.playbook"), "{}", stderr_of(&out));
+    }
+
+    // Marked anyway on the server's host: (a) a gate never closes itself.
+    mark_locally(&gate);
+    let under = id(&alice, &["create", "Under the gate", "--parent", &gate]);
+    alice.ok(&["close", &under]);
+    assert_eq!(alice.json(&["show", &gate])["status"], "open");
+    // (b) Work held by the gate does not close when a pinned issue moved under it closes.
+    mark_locally(&work);
+    let pinned = id(&alice, &["create", "Pinned", "--pinned"]);
+    alice.ok(&["update", &pinned, "--parent", &work]);
+    let out = alice.run(&["close", &pinned]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains(&format!("{work} waits for human gate {gate}")), "{}", stderr_of(&out));
+    assert_eq!(alice.json(&["show", &work])["status"], "open");
+    // (c) Another actor's claimed group stays open, and claimed, when its last step closes.
+    mark_locally(&theirs);
+    let step = id(&alice, &["create", "Step", "--parent", &theirs]);
+    alice.ok(&["close", &step]);
+    let group = alice.json(&["show", &theirs]);
+    assert_eq!((group["status"].as_str(), group["assignee"].as_str()), (Some("in_progress"), Some("bob")));
+    bob.ok(&["heartbeat", &theirs]);
+}
+
+#[test]
+fn held_work_and_human_gates_stay_in_their_container() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let carol = server.client(&server.token("carol-desk", "carol", &["--kind", "human"]));
+    let id = |args: &[&str]| {
+        let mut a = vec!["-q"];
+        a.extend_from_slice(args);
+        alice.ok(&a).trim().to_string()
+    };
+    let epic = id(&["create", "Release", "-t", "epic"]);
+    let work = id(&["create", "Deploy", "--parent", &epic]);
+    let gate = id(&["gate", "create", "-t", "human", "--blocks", &work]);
+    let after = id(&["create", "Announce", "--dep", &epic]);
+    for args in [
+        &["update", work.as_str(), "--parent", ""][..],
+        &["update", gate.as_str(), "--parent", ""],
+        &["dep", "rm", work.as_str(), epic.as_str()],
+        &["dep", "rm", gate.as_str(), epic.as_str()],
+        &["close", epic.as_str(), "--force"],
+        &["update", epic.as_str(), "--status", "pinned"],
+        &["delete", epic.as_str(), "--force"],
+    ] {
+        let out = alice.run(args);
+        assert_eq!(out.status.code(), Some(7), "bd {args:?}: {}", stderr_of(&out));
+    }
+    // Making the epic a gate does not change that.
+    alice.ok(&["update", &epic, "--type", "gate"]);
+    for args in [&["close", epic.as_str(), "--force"][..], &["update", epic.as_str(), "--status", "pinned"]] {
+        let out = alice.run(args);
+        assert_eq!(out.status.code(), Some(7), "bd {args:?}: {}", stderr_of(&out));
+    }
+    assert_eq!(alice.json(&["show", &after])["is_blocked"], true, "the epic's dependent still waits");
+    carol.ok(&["update", &work, "--parent", ""]);
+}
+
+#[test]
+fn claims_cannot_hide_as_gates() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    bob.ok(&["create", "Bob's work"]);
+    bob.ok(&["claim", "t-1"]);
+    // Made a gate, a claim would look unclaimed to every claim check: refused, alone or in a batch.
+    let out = alice.run(&["update", "t-1", "--type", "gate"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("release it before making it a gate"), "{}", stderr_of(&out));
+    let takeover = "update t-1 --type gate\nupdate t-1 --assignee alice --force\nupdate t-1 --type task\n";
+    let out = alice.with_stdin(&["batch"], takeover);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    let issue = alice.json(&["show", "t-1"]);
+    assert_eq!((issue["issue_type"].as_str(), issue["assignee"].as_str()), (Some("task"), Some("bob")));
+    bob.ok(&["heartbeat", "t-1"]);
+    // Nor can a gate be put in progress.
+    alice.ok(&["create", "Held"]);
+    alice.ok(&["gate", "create", "-t", "timer", "--timeout", "1h", "--blocks", "t-2"]);
+    assert_eq!(alice.code(&["update", "t-3", "--status", "in_progress", "--assignee", "alice"]), 2);
+}
+
+/// Two timer gates due a second from now, one with a child that a human gate holds: returns
+/// the plain timer, the one with the child, and the human gate.
+fn timers_with_held_work_below_one(client: &Client) -> (String, String, String) {
+    let id = |args: &[&str]| {
+        let mut a = vec!["-q"];
+        a.extend_from_slice(args);
+        client.ok(&a).trim().to_string()
+    };
+    let (a, b, c) = (id(&["create", "A"]), id(&["create", "B"]), id(&["create", "C"]));
+    let plain = id(&["gate", "create", "-t", "timer", "--timeout", "1s", "--blocks", &a]);
+    let parent = id(&["gate", "create", "-t", "timer", "--timeout", "1s", "--blocks", &b]);
+    let human = id(&["gate", "create", "-t", "human", "--blocks", &c]);
+    client.ok(&["update", &c, "--parent", &parent]);
+    (plain, parent, human)
+}
+
+#[test]
+fn a_gate_check_opens_due_gates_beside_one_it_may_not() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let carol = server.client(&server.token("carol-desk", "carol", &["--kind", "human"]));
+    let (plain, parent, human) = timers_with_held_work_below_one(&alice);
+    // Opening the timer with held work below it would close a container of work a human gate
+    // holds: an agent's check reports an error for that gate alone and opens the other.
+    let mut entry = Value::Null;
+    eventually("an agent's check to reach the timer with held work", || {
+        let checked = alice.json(&["gate", "check"]);
+        entry = checked["checked"].as_array().unwrap().iter().find(|c| c["id"] == parent.as_str()).cloned().unwrap();
+        entry["action"] == "error"
+    });
+    assert!(entry["detail"].as_str().unwrap().contains(&format!("waits for human gate {human}")), "{entry}");
+    assert_eq!(alice.json(&["show", &plain])["status"], "closed", "it was due first");
+    assert_eq!(alice.json(&["show", &parent])["status"], "open");
+    let checked = carol.json(&["gate", "check"]);
+    assert_eq!((&checked["checked"][0]["id"], &checked["checked"][0]["action"]), (&json!(parent), &json!("opened")));
+    assert_eq!(alice.json(&["show", &human])["status"], "open");
+
+    // The server's own gate checks keep opening the others too.
+    let flags = ["--gate-check-every", "100ms", "--gh-check-every", "off", "--reclaim-every", "off"];
+    let server = Server::launch_with(Server::prepare(), "127.0.0.1:0", &flags, |_| {});
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let (plain, parent, human) = timers_with_held_work_below_one(&alice);
+    eventually("the server to open the plain timer", || alice.json(&["show", &plain])["status"] == "closed");
+    let late = alice.ok(&["-q", "create", "Later"]).trim().to_string();
+    let late_gate = alice.ok(&["-q", "gate", "create", "-t", "timer", "--timeout", "1s", "--blocks", &late]);
+    eventually("a later timer to open as well", || alice.json(&["show", late_gate.trim()])["status"] == "closed");
+    assert_eq!(alice.json(&["show", &parent])["status"], "open");
+    assert_eq!(alice.json(&["show", &human])["status"], "open");
 }

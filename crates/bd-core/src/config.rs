@@ -48,6 +48,11 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("durability", "normal", "SQLite synchronous level: off | normal | full"),
     ("events.retain_days", "0", "Prune events older than N days after writes (0 = keep)"),
     ("events.retain_rows", "0", "Keep at most N events (0 = keep all)"),
+    (
+        "gate.repos",
+        "",
+        "Repos GitHub gates may name: OWNER/REPO, OWNER/*, or * (unset: any locally, the workspace's own via bd serve)",
+    ),
 ];
 
 #[derive(Clone, Debug, Serialize)]
@@ -146,6 +151,13 @@ fn validate(key: &str, value: &str) -> Result<String> {
         }
         "lease.auto_reclaim" => Ok(parse_bool(v)?.to_string()),
         "claim.pools" | "types.custom" => Ok(split_list(v).join(",")),
+        "gate.repos" => {
+            let repos = split_list(v);
+            for r in &repos {
+                crate::gates::validate_repo_pattern(r)?;
+            }
+            Ok(repos.join(","))
+        }
         "durability" => {
             Durability::parse(v)?;
             Ok(v.to_ascii_lowercase())

@@ -411,7 +411,10 @@ fn run(ws: &Workspace, job: Job, open: &OpenOptions, backups: Option<&Backups>) 
 }
 
 /// The I/O of a background command: a request's capture without client
-/// input or admin rights. Policies carried by a request's capture belong here too.
+/// input or a token. Its policy is a token's with no rights (no admin, not a
+/// person, owning no claims): reclaiming expired leases and checking gates
+/// need none, and human gates stay shut. Being in the server process, gate
+/// checks use the server's `gate.repos` default.
 fn capture() -> Capture {
     Capture::default()
 }

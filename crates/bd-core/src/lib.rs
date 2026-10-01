@@ -23,6 +23,8 @@
 //! * **Playbooks and gates** ([`playbook`], [`gates`]): repeatable multi-step
 //!   work declared in TOML and run atomically as `<run>.<step>` issues, with
 //!   wait conditions that arm when their step could start.
+//! * **Write policies** ([`policy`]): what a transaction's caller may
+//!   override (other actors' claims, human gates), enforced where it happens.
 //!
 //! ```no_run
 //! use bd_core::{ClaimOptions, InitOptions, NewIssue, OpenOptions, Queries, ReadyQuery, Store};
@@ -55,6 +57,7 @@ pub mod memory;
 pub mod metrics;
 pub mod model;
 pub mod playbook;
+pub mod policy;
 pub mod queries;
 pub mod ready;
 pub mod requests;
@@ -73,6 +76,7 @@ pub use issues::{
 };
 pub use memory::{MemoryAction, MemoryWrite};
 pub use model::*;
+pub use policy::Policy;
 pub use queries::Queries;
 pub use ready::BlockedIssue;
 pub use requests::RequestRecord;

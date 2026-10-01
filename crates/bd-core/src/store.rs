@@ -13,6 +13,7 @@ use serde_json::Value;
 
 use crate::config::{self, IdMode};
 use crate::error::{Error, Result};
+use crate::policy::Policy;
 use crate::schema;
 use crate::time::{Clock, SystemClock, Timestamp};
 
@@ -398,6 +399,7 @@ fn run_write<T>(
         first_seq: None,
         events: 0,
         rollback_only: false,
+        policy: None,
     };
     let exec_start = Instant::now();
     let out = f(&mut ctx)?;
@@ -488,6 +490,7 @@ pub struct WriteCtx<'c> {
     first_seq: Option<i64>,
     events: u32,
     rollback_only: bool,
+    policy: Option<Policy>,
 }
 
 impl WriteCtx<'_> {
@@ -500,6 +503,36 @@ impl WriteCtx<'_> {
     /// Whether [`WriteCtx::set_rollback_only`] was called.
     pub fn is_rollback_only(&self) -> bool {
         self.rollback_only
+    }
+
+    /// Limit what this transaction may override ([`crate::policy`]). `bd
+    /// serve` sets one per request; without one, nothing is limited.
+    pub fn set_policy(&mut self, policy: Option<Policy>) {
+        self.policy = policy;
+    }
+
+    pub fn policy(&self) -> Option<&Policy> {
+        self.policy.as_ref()
+    }
+
+    /// Run `f` in a savepoint: if it fails, what it wrote (its events
+    /// included) is undone and the transaction goes on without it.
+    pub fn savepoint<T>(&mut self, f: impl FnOnce(&mut WriteCtx<'_>) -> Result<T>) -> Result<T> {
+        let (first_seq, events) = (self.first_seq, self.events);
+        self.tx.execute_batch("SAVEPOINT bd_step")?;
+        match f(self) {
+            Ok(out) => {
+                self.tx.execute_batch("RELEASE bd_step")?;
+                Ok(out)
+            }
+            Err(e) => {
+                // AUTOINCREMENT's counter rolls back too, so event seqs stay gapless.
+                self.tx.execute_batch("ROLLBACK TO bd_step; RELEASE bd_step")?;
+                self.first_seq = first_seq;
+                self.events = events;
+                Err(e)
+            }
+        }
     }
 
     pub fn conn(&self) -> &Connection {

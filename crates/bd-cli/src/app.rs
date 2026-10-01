@@ -144,8 +144,11 @@ impl App {
         let actor = self.actor();
         let key = self.request.as_ref().filter(|k| !k.recorded).map(|k| (k.id.clone(), k.principal.clone()));
         let mut recorded = false;
+        // Under bd serve, the engine limits what the request's token may override.
+        let policy = io::policy();
         let store = self.store()?;
         let out = store.write(op, &actor, |tx| {
+            tx.set_policy(policy);
             let out = f(tx)?;
             if let Some((id, principal)) = &key {
                 if !tx.is_rollback_only() {

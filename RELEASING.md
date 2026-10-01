@@ -98,7 +98,10 @@ musl builds (the bundled SQLite is compiled against musl from `musl-tools`);
 `-C target-feature=+crt-static` for Windows (no Visual C++ redistributable
 needed); `MACOSX_DEPLOYMENT_TARGET=11.0`; and `RUST_TOOLCHAIN=stable` (the
 exact `rustc` version is printed in each build log; set an exact version such
-as `1.99.0` there to pin it).
+as `1.99.0` there to pin it). `ring` (the rustls crypto provider) compiles its
+C code with clang for `aarch64-pc-windows-msvc`; a step before the build puts
+the runner image's LLVM (`C:\Program Files\LLVM\bin`) on `PATH` if needed and
+fails early when clang is missing.
 
 Supply chain: every action is pinned to a full commit SHA, the default token
 is read-only and only the attest job (`id-token`, `attestations`) and the

@@ -181,6 +181,21 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
 
+      # ring (rustls) compiles its C code with clang, not cl.exe, for Windows on Arm.
+      - name: Put clang on PATH
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        run: |
+          set -euo pipefail
+          if ! command -v clang >/dev/null; then
+            llvm='C:\Program Files\LLVM\bin'
+            llvm_unix=$(cygpath -u "$llvm")
+            [[ -f $llvm_unix/clang.exe ]] || { echo "::error::$TARGET: clang is not on PATH or in $llvm"; exit 1; }
+            echo "$llvm" >>"$GITHUB_PATH"
+            export PATH="$llvm_unix:$PATH"
+          fi
+          command -v clang
+          clang --version
+
       - name: Build
         run: cargo build --release --locked -p bd --target "$TARGET"
 

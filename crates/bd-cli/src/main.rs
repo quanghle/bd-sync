@@ -4,10 +4,7 @@ mod bench;
 mod cli;
 mod commands;
 mod fmt;
-mod legacy;
 mod logging;
-
-use std::ffi::OsString;
 
 use bd_core::{Error, Result};
 use clap::Parser;
@@ -18,11 +15,7 @@ use crate::cli::{Cli, Command, CommentCommand, LabelCommand, MemoryCommand};
 use crate::commands::*;
 
 fn main() {
-    let args: Vec<OsString> = std::env::args_os().collect();
-    if let Some(code) = legacy::maybe_delegate(&args) {
-        std::process::exit(code);
-    }
-    let cli = Cli::parse_from(args);
+    let cli = Cli::parse();
     logging::init(cli.global.log_format);
     std::process::exit(run(cli));
 }

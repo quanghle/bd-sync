@@ -19,13 +19,7 @@ impl Ws {
 
     fn cmd_in(dir: &Path, actor: &str, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_bd"));
-        c.current_dir(dir)
-            .args(args)
-            .env("BD_ACTOR", actor)
-            .env("BD_LOG", "error")
-            .env("BD_LEGACY_FALLBACK", "0")
-            .env_remove("BD_DB")
-            .env_remove("BEADS_DIR");
+        c.current_dir(dir).args(args).env("BD_ACTOR", actor).env("BD_LOG", "error").env_remove("BD_DB");
         c
     }
 
@@ -214,34 +208,4 @@ fn prime_is_silent_outside_a_workspace() {
     assert!(out.stdout.is_empty());
     let out = Ws::cmd_in(dir.path(), "x", &["ready"]).output().unwrap();
     assert_eq!(out.status.code(), Some(3));
-}
-
-#[cfg(unix)]
-#[test]
-fn legacy_workspaces_forward_to_beads() {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir(dir.path().join(".beads")).unwrap();
-    let fake = dir.path().join("fake-beads");
-    std::fs::write(&fake, "#!/bin/sh\necho \"legacy:$*\"\n").unwrap();
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let run = |args: &[&str], fallback: &str| {
-        let mut c = Ws::cmd_in(dir.path(), "x", args);
-        c.env("BD_LEGACY_BIN", &fake).env("BD_LEGACY_FALLBACK", fallback);
-        c.output().unwrap()
-    };
-    let out = run(&["prime", "--hook-json"], "1");
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "legacy:prime --hook-json");
-    let out = run(&["--json", "ready"], "1");
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "legacy:--json ready");
-    // Disabled, or native-only commands, never forward.
-    let out = run(&["ready"], "0");
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("legacy:"));
-    let out = run(&["version"], "1");
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with("bd "));
-    // A native workspace at the same level wins.
-    let out = run(&["init", "--prefix", "n"], "1");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    let out = run(&["--json", "ready"], "1");
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "[]");
 }

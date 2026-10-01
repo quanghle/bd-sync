@@ -1,0 +1,113 @@
+# Cut a bd release with the tag-triggered pipeline in .github/workflows/release.yml.
+# See RELEASING.md. Preview with: bd playbook plan release --var version=X.Y.Z
+description = "Cut and ship a bd release: bump, dry run, approve, tag, wait for the release workflow, verify, announce"
+title = "Release v{{version}}"
+
+[vars.version]
+description = "Version to release, without the leading v (SemVer; a suffix like 0.2.0-rc.1 makes a GitHub pre-release)"
+required = true
+pattern = '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+
+[vars.repo]
+description = "GitHub repository that runs the release workflow"
+default = "quanghle/bd-sync"
+
+[[steps]]
+id = "bump"
+title = "Bump the version to {{version}} and land it on main"
+description = """
+1. Set [workspace.package] version = "{{version}}" in Cargo.toml (both crates inherit it).
+2. cargo update --workspace   (refreshes Cargo.lock; the workflow builds with --locked)
+3. cargo test --workspace && cargo clippy --workspace --all-targets && cargo fmt --all --check
+4. Commit "Release v{{version}}", land it on main, and wait for CI to pass.
+See RELEASING.md, "Cut a release"."""
+acceptance_criteria = "main has version {{version}} in Cargo.toml and an up-to-date Cargo.lock; CI is green on that commit."
+
+[[steps]]
+id = "notes"
+title = "Draft release notes for v{{version}}"
+description = """
+The workflow publishes notes generated from merged pull requests. Review what changed since
+the last tag (git log --oneline "$(git describe --tags --abbrev=0)"..main, merged PRs) and draft
+the highlights, breaking changes and migration steps to add after publishing.
+Leave the draft in a comment on this step."""
+
+[[steps]]
+id = "dry-run"
+title = "Dry-run the release workflow on main"
+needs = ["bump"]
+description = """
+url=$(gh workflow run release.yml --repo {{repo}} --ref main)   # gh >= 2.87 prints the new run's URL
+gh run watch "${url##*/}" --repo {{repo}} --exit-status
+(No URL printed, with an older gh? Find the new run as in RELEASING.md, "Dry run".)
+All six builds and the SHA256SUMS job must pass; the artifacts are named
+bd-v{{version}}-dev.<commit>-<target>. Finish before the "tag" step closes: the gh:run gate
+on "verify" watches the first release.yml run that starts after it arms."""
+
+[[steps]]
+id = "tag"
+title = "Tag v{{version}} locally"
+needs = ["bump", "notes", "dry-run"]
+description = """
+On the release commit on main:
+  git tag -a v{{version}} -m "bd v{{version}}"
+Do not push yet. Closing this step arms the gh:run gate on "verify" (<run>.gate-verify), which
+pins the first release.yml run created after that moment, whatever its event or branch. So close
+this step right before "push", and dispatch no dry run in between: it would be pinned instead."""
+[steps.gate]
+type = "human"
+timeout = "72h"
+title = "Approve releasing v{{version}}"
+description = "Check the bump, CI, dry run and notes, then: bd gate resolve <this gate> -r approved"
+
+[[steps]]
+id = "push"
+title = "Push tag v{{version}}"
+needs = ["tag"]
+description = """
+git push origin v{{version}}      (v* tags are admin-only; see RELEASING.md)
+This starts the release workflow (tag check, six builds, SHA256SUMS, attestations, GitHub Release).
+Then confirm the gate watches this run and not another one:
+  bd gate check                     (repeat until the next command shows a run)
+  bd gate show <run>.gate-verify    (prints "watching GitHub run <id>")
+  gh run view <id> --repo {{repo}} --json event,headBranch   (must be push / v{{version}})
+If a wrong run was pinned, or the tag is ever deleted and re-created, verify the real tag-push run
+yourself (gh run watch <id> --repo {{repo}} --exit-status), then open the gate by hand:
+  bd gate resolve <run>.gate-verify -r "release run <id> succeeded"
+If the workflow fails, follow RELEASING.md, "If something fails"."""
+
+[[steps]]
+id = "verify"
+title = "Verify the published v{{version}} assets"
+# Needs only "tag", not "push": its gate must arm before the tag is pushed (see "tag").
+needs = ["tag"]
+description = """
+gh release download v{{version}} --repo {{repo}} --dir bd-v{{version}} && cd bd-v{{version}}
+sha256sum -c SHA256SUMS                     # six archives, all OK
+for f in bd-*.tar.gz bd-*.zip; do
+  gh attestation verify "$f" --repo {{repo}} --signer-workflow {{repo}}/.github/workflows/release.yml
+done
+gh release view v{{version}} --repo {{repo}} --json isPrerelease,assets
+The release must be a pre-release exactly when {{version}} has a pre-release suffix."""
+acceptance_criteria = "Six archives and SHA256SUMS are attached; every checksum and attestation verifies; the pre-release flag is right."
+# The gate pins the first release.yml run created after it arms, with no event or branch filter
+# (bd-sync-4y7 tracks adding one); "tag" and "push" say how to check and override it.
+[steps.gate]
+type = "gh:run"
+await_id = "release.yml"
+repo = "{{repo}}"
+timeout = "3h"
+title = "Release workflow for v{{version}} succeeds"
+description = "Opened by bd gate check when the release.yml run for tag v{{version}} succeeds; escalates if it fails, is cancelled, or takes over 3h."
+
+[[steps]]
+id = "announce"
+title = "Final check and announce v{{version}}"
+needs = ["push", "verify"]
+description = """
+1. Install from the release on one machine as the README describes; bd version prints {{version}}.
+2. Put the highlights from "notes" on top of the generated notes:
+     gh release view v{{version}} --repo {{repo}} --json body --jq .body > notes.md
+     (edit notes.md)
+     gh release edit v{{version}} --repo {{repo}} --notes-file notes.md
+3. Announce it with a link to https://github.com/{{repo}}/releases/tag/v{{version}}."""

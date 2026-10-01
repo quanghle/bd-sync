@@ -1,0 +1,536 @@
+# Release pipeline for bd. See RELEASING.md.
+#
+# - Pushing a tag vX.Y.Z (equal to [workspace.package] version in Cargo.toml)
+#   builds every target, writes SHA256SUMS, attests build provenance and
+#   publishes a GitHub Release. Tags with a pre-release suffix (vX.Y.Z-rc.1)
+#   become GitHub pre-releases.
+# - Running it by hand (workflow_dispatch) is a dry run: everything is built,
+#   inspected, packaged, smoke-tested and checksummed, and uploaded as workflow
+#   artifacts only. Nothing is attested or published.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Runs for the same tag (or branch, for dry runs) queue instead of overlapping,
+# so two runs can never publish the same release concurrently.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Release builds use the current stable Rust; the exact version is logged.
+  RUST_TOOLCHAIN: stable
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  RUST_BACKTRACE: 1
+  # Strip release binaries without touching Cargo.toml.
+  CARGO_PROFILE_RELEASE_STRIP: symbols
+  # musl: compile the bundled SQLite against musl headers (from musl-tools).
+  # cc-rs would otherwise look for aarch64-linux-musl-gcc on the arm64 runner.
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
+  # Windows: link the C runtime statically so no VC++ redistributable is needed.
+  # cc-rs sees crt-static and compiles SQLite with /MT to match.
+  CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+  CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+  # macOS: macOS 11 is the oldest release that runs on Apple silicon and the
+  # oldest deployment target Xcode 26 supports. Ignored for other targets.
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: Check tag and version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      label: ${{ steps.plan.outputs.label }}
+      prerelease: ${{ steps.plan.outputs.prerelease }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the tag against Cargo.toml
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cargo --version
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])') || {
+            echo "::error file=Cargo.toml::Could not read [workspace.package] version from Cargo.toml."
+            exit 1
+          }
+          bd_version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "bd") | .version')
+          if [[ $bd_version != "$version" ]]; then
+            echo "::error file=crates/bd-cli/Cargo.toml::Package bd has version '$bd_version' but [workspace.package] version is $version. Use version.workspace = true."
+            exit 1
+          fi
+          if ! cargo metadata --format-version 1 --locked >/dev/null; then
+            echo "::error file=Cargo.lock::Cargo.lock is out of date for version $version. Run 'cargo update --workspace', commit Cargo.lock, and tag that commit."
+            exit 1
+          fi
+          if [[ $version == *+* ]]; then
+            echo "::error file=Cargo.toml::Version $version has +build metadata; release versions must not (it ends up in archive and asset names)."
+            exit 1
+          fi
+
+          if [[ $REF_TYPE == tag ]]; then
+            if [[ $REF_NAME != "v$version" ]]; then
+              echo "::error title=Tag does not match Cargo.toml::Tag $REF_NAME does not match [workspace.package] version $version in Cargo.toml (expected tag v$version). Bump the version and tag that commit, or delete the tag. See RELEASING.md."
+              exit 1
+            fi
+            label=$REF_NAME
+          else
+            label="v$version-dev.${COMMIT:0:7}"
+          fi
+
+          publish=false
+          if [[ $EVENT_NAME == push && $REF_TYPE == tag ]]; then
+            publish=true
+          fi
+          # SemVer pre-release: a hyphen after the core version (v0.2.0-rc.1).
+          prerelease=false
+          if [[ $version == *-* ]]; then
+            prerelease=true
+          fi
+
+          {
+            echo "version=$version"
+            echo "label=$label"
+            echo "prerelease=$prerelease"
+            echo "publish=$publish"
+          } >>"$GITHUB_OUTPUT"
+          {
+            echo "### bd $label"
+            echo
+            echo "- version: \`$version\`"
+            echo "- pre-release: $prerelease"
+            echo "- publish: $publish"
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "version=$version label=$label prerelease=$prerelease publish=$publish"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-26
+          # Cross-compiled on Apple silicon (GitHub's Intel macOS images end in
+          # August 2027) and smoke-tested under Rosetta 2.
+          - target: x86_64-apple-darwin
+            os: macos-26
+          - target: x86_64-pc-windows-msvc
+            os: windows-2025
+          - target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+    env:
+      TARGET: ${{ matrix.target }}
+      LABEL: ${{ needs.plan.outputs.label }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    # Scripts here also run on macOS's bash 3.2: no mapfile, no empty "${arr[@]}".
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install musl-tools
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -q
+          sudo apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends musl-tools
+          musl-gcc --version
+
+      - name: Install Rust toolchain
+        run: |
+          set -euo pipefail
+          rustup --version
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --no-self-update --target "$TARGET"
+          if [[ $RUNNER_OS == Windows ]]; then
+            # llvm-readobj, to check the C runtime is linked statically.
+            rustup component add llvm-tools --toolchain "$RUST_TOOLCHAIN"
+          fi
+          rustup default "$RUST_TOOLCHAIN"
+          rustc --version --verbose
+          cargo --version --verbose
+
+      - name: Build
+        run: cargo build --release --locked -p bd --target "$TARGET"
+
+      - name: Inspect binary
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/bd"
+          fail() { echo "::error::$TARGET: $*"; exit 1; }
+          # Command output goes through variables: with pipefail, `cmd | grep -q` can
+          # fail on SIGPIPE when grep exits early.
+          case $TARGET in
+            *-linux-musl)
+              info=$(file "$bin")
+              echo "$info"
+              ldd "$bin" || true
+              headers=$(readelf --program-headers --wide "$bin")
+              dynamic=$(readelf --dynamic --wide "$bin")
+              if grep -q 'INTERP' <<<"$headers"; then
+                fail "binary requests a dynamic loader; expected a static executable"
+              fi
+              if grep -q '(NEEDED)' <<<"$dynamic"; then
+                fail "binary needs shared libraries; expected a static executable"
+              fi
+              grep -Eq 'statically linked|static-pie linked' <<<"$info" || fail "file does not report a static executable"
+              grep -q ', stripped' <<<"$info" || fail "binary is not stripped"
+              ;;
+            *-apple-darwin)
+              file "$bin"
+              want_arch=${TARGET%%-*}
+              if [[ $want_arch == aarch64 ]]; then want_arch=arm64; fi
+              archs=$(lipo -archs "$bin")
+              [[ $archs == "$want_arch" ]] || fail "architectures are '$archs'; expected $want_arch"
+              otool -L "$bin"
+              foreign=$(otool -L "$bin" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/Library/)' || true)
+              [[ -z $foreign ]] || fail "links libraries outside the OS: $foreign"
+              minos=$(otool -l "$bin" | awk '
+                /LC_BUILD_VERSION/ {cmd = "build"}
+                /LC_VERSION_MIN_MACOSX/ {cmd = "min"}
+                !done && ((cmd == "build" && $1 == "minos") || (cmd == "min" && $1 == "version")) {print $2; done = 1}')
+              trim() { local v=$1; while [[ $v == *.0 ]]; do v=${v%.0}; done; echo "$v"; }
+              echo "minimum macOS: $minos"
+              [[ $(trim "$minos") == "$(trim "$MACOSX_DEPLOYMENT_TARGET")" ]] \
+                || fail "minimum macOS is '$minos'; expected $MACOSX_DEPLOYMENT_TARGET"
+              ;;
+            *-windows-msvc)
+              bin="$bin.exe"
+              sysroot=$(cygpath -u "$(rustc --print sysroot)")
+              host=$(rustc -vV | sed -n 's/^host: //p')
+              imports=$("$sysroot/lib/rustlib/$host/bin/llvm-readobj.exe" --coff-imports "$bin" | sed -n 's/^ *Name: //p' | sort -fu)
+              echo "Imported DLLs:"
+              echo "$imports"
+              if grep -Eiq '^(vcruntime|msvcp|ucrtbase|api-ms-win-crt-)' <<<"$imports"; then
+                fail "binary imports the dynamic C runtime; expected +crt-static"
+              fi
+              ;;
+            *)
+              fail "no inspection rule for this target"
+              ;;
+          esac
+          ls -l "$bin"
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          name="bd-$LABEL-$TARGET"
+          exe=""
+          if [[ $RUNNER_OS == Windows ]]; then exe=".exe"; fi
+          stage="dist/$name"
+          rm -rf dist
+          mkdir -p "$stage"
+          # The binary and README.md sit at the archive root; license files only if present.
+          files=("bd$exe" README.md)
+          cp "target/$TARGET/release/bd$exe" README.md "$stage/"
+          for f in LICENSE* COPYING* NOTICE*; do
+            if [[ -f $f ]]; then
+              cp "$f" "$stage/"
+              files+=("$f")
+            fi
+          done
+          chmod 0644 "$stage"/*
+          chmod 0755 "$stage/bd$exe"
+          if [[ $RUNNER_OS == Windows ]]; then
+            archive="$name.zip"
+            (cd "$stage" && 7z a -tzip -mx=9 -bd "../$archive" "${files[@]}")
+          else
+            archive="$name.tar.gz"
+            # Owned by root, so extracting with sudo never hands the files to a local uid.
+            if [[ $(tar --version 2>/dev/null) == *"GNU tar"* ]]; then
+              (cd "$stage" && tar --owner=0 --group=0 --numeric-owner -czf "../$archive" "${files[@]}")
+            else
+              # bsdtar (macOS): also leave out AppleDouble files and extended attributes.
+              (cd "$stage" && COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --numeric-owner --no-xattrs --no-mac-metadata -czf "../$archive" "${files[@]}")
+            fi
+          fi
+          rm -rf "$stage"
+          echo "Contents of $archive:"
+          if [[ $archive == *.zip ]]; then
+            7z l "dist/$archive"
+          else
+            tar -tvzf "dist/$archive"
+          fi
+          if command -v sha256sum >/dev/null; then
+            (cd dist && sha256sum "$archive")
+          else
+            (cd dist && shasum -a 256 "$archive")
+          fi
+          {
+            echo "name=$name"
+            echo "archive=$archive"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Smoke-test the packaged binary
+        env:
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+          BD_ACTOR: release-smoke-test
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$TARGET: $*"; exit 1; }
+          exe=""
+          if [[ $RUNNER_OS == Windows ]]; then exe=".exe"; fi
+          if [[ $TARGET == x86_64-apple-darwin && $(uname -m) == arm64 ]]; then
+            if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+              sudo softwareupdate --install-rosetta --agree-to-license
+            fi
+          fi
+
+          # Unpack the archive exactly as a user would, then run from a scratch workspace.
+          work=$(mktemp -d)
+          mkdir "$work/pkg" "$work/ws"
+          cp "dist/$ARCHIVE" "$work/pkg/"
+          cd "$work/pkg"
+          if [[ $ARCHIVE == *.zip ]]; then
+            7z x -bd "$ARCHIVE" >/dev/null
+          else
+            tar -xzf "$ARCHIVE"
+          fi
+          rm -f "$ARCHIVE"
+          ls -l
+          [[ -f bd$exe && -f README.md ]] || fail "bd$exe and README.md must be at the archive root"
+          [[ -x bd$exe ]] || fail "bd$exe is not executable"
+          bd="$work/pkg/bd$exe"
+
+          cd "$work/ws"
+          out=$("$bd" version | tr -d '\r')
+          echo "$out"
+          [[ $out == "bd $VERSION" || $out == "bd $VERSION "* ]] || fail "'bd version' printed '$out'; expected bd $VERSION"
+          "$bd" init --prefix smoke
+          id=$("$bd" create "Release smoke test" -p 1 --quiet | tr -d '\r')
+          ready=$("$bd" ready --quiet | tr -d '\r')
+          "$bd" ready
+          [[ -n $id && $ready == "$id" ]] || fail "'bd ready' listed '$ready'; expected '$id'"
+          echo "Smoke test passed: created and listed $id"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: dist/${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+          overwrite: true
+
+  checksums:
+    name: Write SHA256SUMS
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bd-${{ needs.plan.outputs.label }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Write and check SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          rm -f SHA256SUMS
+          mapfile -t archives < <(find . -maxdepth 1 -type f \( -name 'bd-*.tar.gz' -o -name 'bd-*.zip' \) -printf '%f\n' | LC_ALL=C sort)
+          if (( ${#archives[@]} == 0 )); then
+            echo "::error::No archives were downloaded."
+            exit 1
+          fi
+          sha256sum "${archives[@]}" >SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo "### SHA256SUMS"
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SHA256SUMS
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bd-${{ needs.plan.outputs.label }}-SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+          overwrite: true
+
+  attest:
+    name: Attest build provenance
+    needs: [plan, checksums]
+    if: github.event_name == 'push' && needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # mint the OIDC token Sigstore uses to sign the attestations
+      attestations: write # store the attestations on the repository
+    steps:
+      - name: Download archives and SHA256SUMS
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bd-${{ needs.plan.outputs.label }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check archives against SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict SHA256SUMS
+          listed=$(awk '{print $2}' SHA256SUMS | LC_ALL=C sort)
+          present=$(find . -maxdepth 1 -type f \( -name 'bd-*.tar.gz' -o -name 'bd-*.zip' \) -printf '%f\n' | LC_ALL=C sort)
+          if [[ $listed != "$present" ]]; then
+            echo "::error::The downloaded archives do not match SHA256SUMS."
+            diff <(echo "$listed") <(echo "$present") || true
+            exit 1
+          fi
+
+      - name: Attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/bd-*.tar.gz
+            dist/bd-*.zip
+
+  publish:
+    name: Publish GitHub Release
+    needs: [plan, attest]
+    if: github.event_name == 'push' && needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - name: Download archives and SHA256SUMS
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bd-${{ needs.plan.outputs.label }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check archives against SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict SHA256SUMS
+          listed=$(awk '{print $2}' SHA256SUMS | LC_ALL=C sort)
+          present=$(find . -maxdepth 1 -type f \( -name 'bd-*.tar.gz' -o -name 'bd-*.zip' \) -printf '%f\n' | LC_ALL=C sort)
+          if [[ $listed != "$present" ]]; then
+            echo "::error::The downloaded archives do not match SHA256SUMS."
+            diff <(echo "$listed") <(echo "$present") || true
+            exit 1
+          fi
+
+      - name: Create the release, or complete an interrupted one
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.label }}
+          PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find . -maxdepth 1 -type f \( -name 'bd-*.tar.gz' -o -name 'bd-*.zip' \) -printf '%f\n' | LC_ALL=C sort)
+          assets+=(SHA256SUMS)
+          flags=()
+          if [[ $PRERELEASE == true ]]; then flags+=(--prerelease); fi
+
+          notes=$(cat <<'EOF'
+          ## Install
+
+          Download the archive for your platform, check it, and put `bd` (`bd.exe` on Windows) on your `PATH`:
+
+          ```sh
+          sha256sum --check --ignore-missing SHA256SUMS
+          gh attestation verify bd-@TAG@-<target>.tar.gz --repo @REPO@
+          ```
+
+          See [Install](https://github.com/@REPO@#install) in the README.
+          EOF
+          )
+          notes=${notes//@TAG@/$TAG}
+          notes=${notes//@REPO@/$GH_REPO}
+
+          if state=$(gh release view "$TAG" --json isDraft,isImmutable --jq '"\(.isDraft) \(.isImmutable)"' 2>/dev/null); then
+            read -r is_draft is_immutable <<<"$state"
+            echo "Release $TAG already exists (draft: $is_draft, immutable: $is_immutable)."
+            if [[ $is_draft == true ]]; then
+              # An interrupted publish: nobody can have downloaded a draft's assets yet.
+              gh release upload "$TAG" "${assets[@]}" --clobber
+              gh release edit "$TAG" --draft=false "${flags[@]}"
+            else
+              # Published: never replace assets. A re-run rebuilds archives with new
+              # hashes (timestamps, a newer stable Rust), which would break the
+              # checksums users already have. Only fill in missing assets, and only
+              # when this run produced exactly the published SHA256SUMS.
+              published=$(mktemp -d)
+              if ! gh release download "$TAG" --pattern SHA256SUMS --dir "$published"; then
+                echo "::error::Release $TAG is already published, but its SHA256SUMS could not be downloaded, so its assets cannot be compared with this run's. Published assets are never replaced: release a new version instead."
+                exit 1
+              fi
+              if ! cmp -s "$published/SHA256SUMS" SHA256SUMS; then
+                echo "::error::Release $TAG is already published with different assets (its SHA256SUMS differs from this run's). Published assets are never replaced: release a new version instead."
+                diff "$published/SHA256SUMS" SHA256SUMS || true
+                exit 1
+              fi
+              declare -A have=()
+              while IFS= read -r name; do
+                have[$name]=1
+              done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+              missing=()
+              for a in "${assets[@]}"; do
+                if [[ -z ${have[$a]:-} ]]; then missing+=("$a"); fi
+              done
+              if (( ${#missing[@]} == 0 )); then
+                echo "Release $TAG is already published with these exact assets; nothing to do."
+              elif [[ $is_immutable == true ]]; then
+                echo "::error::Release $TAG is immutable and lacks ${missing[*]}; assets cannot be added to it. Release a new version instead."
+                exit 1
+              else
+                echo "Release $TAG is published with identical checksums; uploading only the missing assets: ${missing[*]}"
+                gh release upload "$TAG" "${missing[@]}"
+              fi
+            fi
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --verify-tag \
+              --title "bd $TAG" \
+              --notes "$notes" \
+              --generate-notes \
+              "${flags[@]}"
+          fi
+          gh release view "$TAG" --json url,isPrerelease,assets --jq '"\(.url) prerelease=\(.isPrerelease) assets=\([.assets[].name] | join(", "))"'

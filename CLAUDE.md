@@ -75,6 +75,8 @@ cargo clippy --workspace --all-targets && cargo fmt --all
 target/release/bd bench --workers 8   # throughput + invariant verification on a scratch DB
 ```
 
+CI (`.github/workflows/ci.yml`) runs fmt, then clippy `-D warnings` and the tests on Linux, macOS, and Windows, plus an MSRV check, so keep all three platforms building. Releases are built by `.github/workflows/release.yml` when a `vX.Y.Z` tag is pushed; see RELEASING.md (and the `release` playbook in `.bd/playbooks/`).
+
 ### Architecture Overview
 
 Rust re-implementation of beads as a coordination engine on SQLite WAL (see README.md).

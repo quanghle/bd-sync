@@ -4,10 +4,12 @@ mod batch;
 mod bench;
 mod cli;
 mod commands;
+mod credentials;
 mod fmt;
 mod gates;
 mod io;
 mod logging;
+mod paths;
 mod playbooks;
 mod protocol;
 mod remote;
@@ -69,7 +71,10 @@ fn execute(app: &mut App, cmd: &Command) -> i32 {
     }
     let total_ms = elapsed.as_millis() as u64;
     if total_ms >= slow_ms
-        && !matches!(cmd, Command::Events(_) | Command::Bench(_) | Command::BenchWorker(_) | Command::Serve(_))
+        && !matches!(
+            cmd,
+            Command::Events(_) | Command::Bench(_) | Command::BenchWorker(_) | Command::Serve(_) | Command::Remote(_)
+        )
     {
         tracing::warn!(target: "bd::slow", command = name, total_ms, "slow command");
     }
@@ -116,7 +121,7 @@ fn hint(e: &Error) -> Option<&'static str> {
         Error::EventsTruncated { .. } => "re-baseline with `bd export` and tail from its head_seq",
         Error::NoWorkspace(_) => "create one with `bd init`",
         Error::Unauthorized(_) => {
-            "check BD_TOKEN, and the token's role, workspaces and actor (`bd remote show`; `bd serve token list` on the server)"
+            "check the access token (BD_TOKEN, or `bd remote login`), and its role, workspaces and actor (`bd remote show`; `bd serve token list` on the server)"
         }
         Error::Remote(_) => {
             "`bd remote show` checks the URL, certificate and connection; retrying is safe (a write is applied once)"

@@ -8,10 +8,12 @@
 //! ca_cert = "ca.pem"   # optional, relative to this file: trust a private CA
 //! ```
 //!
-//! The access token comes from `$BD_TOKEN`, never from a file in the
-//! repository. The command line travels unchanged; the server runs it and
-//! returns its output and exit code. Each invocation gets a request id that
-//! its retries reuse, so a write whose response was lost is applied once.
+//! The access token comes from `$BD_TOKEN`, else from the user's
+//! credentials file (`bd remote login`, see [`crate::credentials`]), never
+//! from a file in the repository. The command line travels unchanged; the
+//! server runs it and returns its output and exit code. Each invocation gets
+//! a request id that its retries reuse, so a write whose response was lost is
+//! applied once.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -20,10 +22,12 @@ use std::time::{Duration, Instant};
 use bd_core::{Error, Event, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::app::{App, Out};
 use crate::auth::random_hex;
 use crate::cli::*;
+use crate::credentials::{self, Scope};
 use crate::fmt;
 use crate::io;
 use crate::protocol::{ErrorBody, ExecRequest, ExecResponse, valid_workspace_name};
@@ -43,7 +47,8 @@ pub struct Remote {
     /// Workspace URL without a trailing slash.
     pub url: String,
     token: String,
-    ca_cert: Option<PathBuf>,
+    /// The CA certificates to trust instead of the system's, as read by [`Trust::load`].
+    roots: Option<Vec<ureq::tls::Certificate<'static>>>,
     /// How long failures in transit are retried.
     retry: Duration,
     connect_timeout: Duration,
@@ -86,7 +91,8 @@ fn env_actor() -> Option<String> {
 
 fn missing_token(url: &str) -> Error {
     Error::Unauthorized(format!(
-        "no access token for {url}: set BD_TOKEN (create one on the server with `bd serve token create`)"
+        "no access token for {url}: run `bd remote login`, or set BD_TOKEN (create one on the server with `bd serve \
+         token create`)"
     ))
 }
 
@@ -114,11 +120,100 @@ pub fn configured(app: &App) -> Result<Option<Configured>> {
     Ok(Some(Configured { url, source, ca_cert }))
 }
 
+/// An access token, and where it came from.
+enum Token {
+    Env(String),
+    Saved(credentials::Saved),
+}
+
+impl Token {
+    fn secret(self) -> String {
+        match self {
+            Token::Env(t) => t,
+            Token::Saved(s) => s.token,
+        }
+    }
+}
+
+/// What a remote's server certificate is checked against, read once per
+/// process: the saved-token check and every request use this same snapshot,
+/// so a CA file changed meanwhile (a `git checkout`) cannot slip in.
+#[derive(Clone)]
+pub struct Trust {
+    /// The CA file, or `None` for the system's certificate authorities.
+    path: Option<PathBuf>,
+    certs: Option<Vec<ureq::tls::Certificate<'static>>>,
+    /// [`credentials::SYSTEM_CA`], or the SHA-256 of the certificates (DER, so
+    /// line endings do not matter): what a saved token is bound to.
+    anchor: String,
+}
+
+impl Trust {
+    pub fn load(ca_cert: Option<&Path>) -> Result<Trust> {
+        let Some(path) = ca_cert else {
+            return Ok(Trust { path: None, certs: None, anchor: credentials::SYSTEM_CA.to_string() });
+        };
+        let certs = read_ca(path)?;
+        let mut hash = Sha256::new();
+        for cert in &certs {
+            hash.update(cert.der());
+        }
+        let anchor = format!("sha256:{}", hash.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>());
+        Ok(Trust { path: Some(path.to_path_buf()), certs: Some(certs), anchor })
+    }
+}
+
+/// The access token for a workspace URL reached under `trust`: `$BD_TOKEN`,
+/// else one saved by `bd remote login`.
+fn token_for(url: &str, trust: &Trust) -> Result<Option<Token>> {
+    if let Some(t) = env("BD_TOKEN") {
+        return Ok(Some(Token::Env(t)));
+    }
+    let Some(saved) = credentials::lookup(url)? else { return Ok(None) };
+    // A CA named by a checkout's remote.toml must be the one the token was
+    // saved under, or a cloned repository could send it to a man in the
+    // middle. $BD_CA_CERT is the user's own setting.
+    if env("BD_CA_CERT").is_none() && trust.anchor != saved.ca {
+        let ca_cert = trust.path.as_deref();
+        let then = match (saved.ca.as_str(), ca_cert) {
+            (credentials::SYSTEM_CA, _) => "the system's certificate authorities",
+            (_, Some(_)) => "another CA certificate",
+            (_, None) => "a CA certificate",
+        };
+        let now = ca_cert.map_or_else(
+            || "the system's certificate authorities".to_string(),
+            |p| format!("the CA certificate {}", p.display()),
+        );
+        return Err(Error::Unauthorized(format!(
+            "the access token saved for {} is not sent to {url}: it was saved trusting {then}, and {url} is now \
+             set up to trust {now}. If you trust that, log in again here (`bd remote login`); or set BD_TOKEN",
+            saved.key
+        )));
+    }
+    Ok(Some(Token::Saved(saved)))
+}
+
+/// The certificates of a PEM CA file.
+fn read_ca(path: &Path) -> Result<Vec<ureq::tls::Certificate<'static>>> {
+    let pem = std::fs::read(path).map_err(|e| Error::invalid(format!("CA certificate {}: {e}", path.display())))?;
+    let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(&pem)
+        .filter_map(|item| match item {
+            Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
+            _ => None,
+        })
+        .collect();
+    if certs.is_empty() {
+        return Err(Error::invalid(format!("CA certificate {}: no certificate in the file", path.display())));
+    }
+    Ok(certs)
+}
+
 /// The remote workspace this invocation uses, or `None` for a local one.
 pub fn detect(app: &App) -> Result<Option<Remote>> {
     let Some(c) = configured(app)? else { return Ok(None) };
-    let token = env("BD_TOKEN").ok_or_else(|| missing_token(&c.url))?;
-    Ok(Some(Remote::new(c, token)))
+    let trust = Trust::load(c.ca_cert.as_deref())?;
+    let token = token_for(&c.url, &trust)?.ok_or_else(|| missing_token(&c.url))?;
+    Ok(Some(Remote::new(c, trust, token.secret())))
 }
 
 /// The nearest `.bd/remote.toml`, unless a nearer `.bd/bd.db` comes first.
@@ -191,7 +286,8 @@ pub fn unavailable(e: &Error) -> i32 {
     io::outln("# bd workflow context");
     io::outln(format!("The remote bd workspace is unavailable: {e}"));
     io::outln(
-        "bd commands fail until this is fixed; `bd remote show` checks the connection and the access token (BD_TOKEN).",
+        "bd commands fail until this is fixed; `bd remote show` checks the connection and the access token (BD_TOKEN \
+         or `bd remote login`).",
     );
     0
 }
@@ -387,11 +483,12 @@ fn follow_events(app: &App, remote: &Remote, a: &EventsArgs) -> Result<i32> {
 }
 
 impl Remote {
-    pub fn new(c: Configured, token: String) -> Remote {
+    /// The CA certificates come from `trust`, never from `c.ca_cert` again.
+    pub fn new(c: Configured, trust: Trust, token: String) -> Remote {
         Remote {
             url: c.url,
             token,
-            ca_cert: c.ca_cert,
+            roots: trust.certs,
             retry: retry_budget(),
             connect_timeout: Duration::from_secs(10),
             attempt_timeout: Duration::from_secs(120),
@@ -411,19 +508,8 @@ impl Remote {
 
     fn agent(&self) -> Result<ureq::Agent> {
         let mut tls = ureq::tls::TlsConfig::builder();
-        if let Some(path) = &self.ca_cert {
-            let pem =
-                std::fs::read(path).map_err(|e| Error::invalid(format!("CA certificate {}: {e}", path.display())))?;
-            let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(&pem)
-                .filter_map(|item| match item {
-                    Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
-                    _ => None,
-                })
-                .collect();
-            if certs.is_empty() {
-                return Err(Error::invalid(format!("CA certificate {}: no certificate in the file", path.display())));
-            }
-            tls = tls.root_certs(ureq::tls::RootCerts::new_with_certs(&certs));
+        if let Some(certs) = &self.roots {
+            tls = tls.root_certs(ureq::tls::RootCerts::new_with_certs(certs));
         }
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
@@ -511,6 +597,8 @@ pub fn cmd_remote(app: &mut App, cmd: &RemoteCommand) -> Result<i32> {
         RemoteCommand::Set(a) => set(app, a).map(|_| 0),
         RemoteCommand::Show => show(app),
         RemoteCommand::Unset => unset(app).map(|_| 0),
+        RemoteCommand::Login(a) => login(app, a).map(|_| 0),
+        RemoteCommand::Logout(a) => logout(app, a).map(|_| 0),
     }
 }
 
@@ -520,7 +608,8 @@ fn config_dir(start: &Path) -> PathBuf {
 }
 
 fn set(app: &mut App, a: &RemoteSetArgs) -> Result<()> {
-    let url = check_url(&a.url)?;
+    no_extra_args("set", &a.extra)?;
+    let url = check_url(url_arg(&a.url, "https://host[:port]/w/<workspace>")?)?;
     let dir = config_dir(&app.cwd);
     let db = dir.join("bd.db");
     if db.is_file() && !a.force {
@@ -559,7 +648,7 @@ fn set(app: &mut App, a: &RemoteSetArgs) -> Result<()> {
         &path,
         format!(
             "# Commands in this checkout run on a bd server; `bd remote show` checks the connection.\n\
-             # The access token comes from $BD_TOKEN: never commit it.\n{body}"
+             # The access token comes from $BD_TOKEN or `bd remote login`: never commit it.\n{body}"
         ),
     )?;
     let checkout = dir.parent().unwrap_or(&dir).display().to_string();
@@ -569,10 +658,12 @@ fn set(app: &mut App, a: &RemoteSetArgs) -> Result<()> {
     if app.g.remote.is_some() {
         out = out.line("  note: --remote or $BD_REMOTE is set, and takes precedence over this file");
     }
-    out = out.line(if env("BD_TOKEN").is_some() {
+    let ca_path = ca_cert.as_ref().map(|c| dir.join(c));
+    let has_token = Trust::load(ca_path.as_deref()).and_then(|t| token_for(&url, &t)).ok().flatten().is_some();
+    out = out.line(if has_token {
         "  check the connection: bd remote show"
     } else {
-        "  next: set BD_TOKEN to an access token, then check the connection with `bd remote show`"
+        "  next: `bd remote login` (or set BD_TOKEN), then check the connection with `bd remote show`"
     });
     app.print(out.id(url));
     Ok(())
@@ -588,20 +679,40 @@ fn show(app: &mut App) -> Result<i32> {
         app.print(Out::new(json!({ "remote": null, "local": local })).line(line));
         return Ok(0);
     };
-    let token = env("BD_TOKEN");
+    let token = Trust::load(c.ca_cert.as_deref()).and_then(|trust| Ok((token_for(&c.url, &trust)?, trust)));
     let source = match &c.source {
         Source::Flag => "--remote or $BD_REMOTE".to_string(),
         Source::File(p) => p.display().to_string(),
     };
-    let mut view = json!({ "url": c.url, "source": source, "ca_cert": c.ca_cert, "token_set": token.is_some() });
+    let mut view = json!({
+        "url": c.url,
+        "source": source,
+        "ca_cert": c.ca_cert,
+        "token_set": matches!(token, Ok((Some(_), _))),
+        "token_from": null,
+        "credentials": null,
+    });
     let mut lines = vec![format!("remote      {}", c.url), format!("from        {source}")];
     if let Some(ca) = &c.ca_cert {
         lines.push(format!("ca cert     {}", ca.display()));
     }
-    lines.push(format!("token       BD_TOKEN is {}", if token.is_some() { "set" } else { "not set" }));
+    lines.push(match &token {
+        Ok((Some(Token::Env(_)), _)) => {
+            view["token_from"] = json!("env");
+            "token       $BD_TOKEN".to_string()
+        }
+        Ok((Some(Token::Saved(s)), _)) => {
+            view["token_from"] = json!("credentials");
+            view["credentials"] = json!({ "path": s.path, "key": s.key, "scope": s.scope.as_str() });
+            format!("token       saved for {} in {}", s.key, s.path.display())
+        }
+        Ok((None, _)) => "token       none: run `bd remote login`, or set BD_TOKEN".to_string(),
+        Err(_) => "token       not usable".to_string(),
+    });
     let checked = match token {
-        Some(t) => check(Remote::new(c.clone(), t).quick()),
-        None => Err(missing_token(&c.url)),
+        Ok((Some(t), trust)) => check(Remote::new(c.clone(), trust, t.secret()).quick(), env_actor()),
+        Ok((None, _)) => Err(missing_token(&c.url)),
+        Err(e) => Err(e),
     };
     let code = match checked {
         Ok(info) => {
@@ -631,10 +742,10 @@ fn show(app: &mut App) -> Result<i32> {
 }
 
 /// `bd info` on the server: proves that the URL, certificate, token and actor all work.
-fn check(remote: Remote) -> Result<Value> {
+fn check(remote: Remote, actor: Option<String>) -> Result<Value> {
     let request = ExecRequest {
         argv: vec!["info".into(), "--json".into()],
-        actor: env_actor(),
+        actor,
         location: Some(remote.url.clone()),
         ..Default::default()
     };
@@ -662,6 +773,231 @@ fn unset(app: &mut App) -> Result<()> {
     }
     app.print(out);
     Ok(())
+}
+
+fn no_remote_here(command: &str) -> Error {
+    Error::invalid(format!(
+        "no remote workspace here: pass its URL (`bd remote {command} https://bd.example.com/w/proj`), or run `bd \
+         remote set <url>` first"
+    ))
+}
+
+/// The workspace `bd remote login` checks a token against: `url`, else the configured one.
+fn login_target(app: &App, url: Option<&str>) -> Result<Configured> {
+    let configured = configured(app);
+    let Some(raw) = url else { return configured?.ok_or_else(|| no_remote_here("login")) };
+    let url = check_url(url_arg(raw, "https://host[:port]/w/<workspace>")?)?;
+    let same = |c: &Configured| credentials::keys(&c.url).ok() == credentials::keys(&url).ok();
+    let ca_cert = match configured {
+        Ok(Some(c)) if same(&c) => c.ca_cert,
+        _ => env("BD_CA_CERT").map(PathBuf::from),
+    };
+    Ok(Configured { url, source: Source::Flag, ca_cert })
+}
+
+/// A URL argument of `bd remote login/logout`. Anything but a plain URL is
+/// refused without repeating it: it may be a token pasted in the wrong place.
+fn url_arg<'a>(raw: &'a str, expected: &str) -> Result<&'a str> {
+    let arg = raw.trim();
+    if looks_like_token(arg) {
+        return Err(Error::invalid(format!(
+            "that argument looks like an access token: never pass one on the command line, where shell history \
+             keeps it (consider revoking it); {}",
+            how_to_pipe()
+        )));
+    }
+    if !arg.contains("://") || arg.chars().any(char::is_whitespace) {
+        return Err(Error::invalid(format!("the URL argument is not a URL; expected {expected}")));
+    }
+    Ok(arg)
+}
+
+/// Refuse arguments after the URL without repeating them: clap would echo
+/// a token pasted there.
+fn no_extra_args(command: &str, extra: &[String]) -> Result<()> {
+    if extra.is_empty() {
+        return Ok(());
+    }
+    Err(Error::invalid(format!(
+        "bd remote {command} takes one URL and never a token on the command line, where shell history keeps it (if \
+         you passed one, consider revoking it); {}",
+        how_to_pipe()
+    )))
+}
+
+/// `bdt_<hex>`, the secrets `bd serve token create` prints.
+fn looks_like_token(arg: &str) -> bool {
+    arg.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("bdt_"))
+}
+
+fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
+    no_extra_args("login", &a.extra)?;
+    let c = login_target(app, a.url.as_deref())?;
+    let scope = if a.workspace_only { Scope::Workspace } else { Scope::Server };
+    let keys = credentials::keys(&c.url)?;
+    let path = credentials::default_path()?;
+    let label = match scope {
+        Scope::Server => keys.server.clone(),
+        Scope::Workspace => c.url.clone(),
+    };
+    let trust = Trust::load(c.ca_cert.as_deref())?;
+    let label = match &trust.path {
+        Some(ca) => format!("{label}, trusting the CA certificate {}", ca.display()),
+        None => label,
+    };
+    let token = read_token(&label)?;
+    credentials::check_token(&token)?;
+    let actor = if a.no_verify {
+        None
+    } else {
+        // The token alone: $BD_ACTOR is checked per command, not saved.
+        let info = check(Remote::new(c.clone(), trust.clone(), token.clone()).quick(), None).map_err(|e| match e {
+            Error::Unauthorized(m) => Error::Unauthorized(format!("{m}; nothing was saved")),
+            Error::Remote(m) => {
+                Error::Remote(format!("{m}; nothing was saved (--no-verify saves the token without checking it)"))
+            }
+            e => e,
+        })?;
+        info["actor"].as_str().map(String::from)
+    };
+    let saved = credentials::save(&path, &c.url, &token, &trust.anchor, scope)?;
+    let reach = match scope {
+        Scope::Server => format!("{} (every workspace it allows there)", saved.key),
+        Scope::Workspace => saved.key.clone(),
+    };
+    let mut out = Out::new(json!({
+        "url": c.url,
+        "path": path,
+        "key": saved.key,
+        "scope": scope.as_str(),
+        "verified": !a.no_verify,
+        "actor": actor,
+        "replaced": saved.replaced,
+        "dropped": saved.dropped,
+        "ca_cert": c.ca_cert,
+    }))
+    .line(format!("✓ Saved the access token for {reach} in {}", path.display()))
+    .line(match &actor {
+        Some(actor) => format!("  {} accepts it, as actor {actor}", c.url),
+        None => "  not checked (--no-verify): `bd remote show` checks it".to_string(),
+    });
+    if let Some(ca) = &c.ca_cert {
+        out = out.line(format!("  bound to the CA certificate {}: it is not sent trusting any other", ca.display()));
+    }
+    if saved.replaced {
+        out = out.line("  it replaces the token saved there before");
+    }
+    if let Some(k) = &saved.dropped {
+        out = out.line(format!("  removed the token saved for {k} only, which would have taken precedence"));
+    }
+    if let Some(mode) = saved.loose_mode {
+        out = out.line(format!(
+            "  note: other users could read this file (mode {mode:03o}); it is private now, but consider revoking the \
+             tokens it held"
+        ));
+    }
+    if env("BD_TOKEN").is_some() {
+        out = out.line("  note: $BD_TOKEN is set, and takes precedence over saved tokens");
+    }
+    app.print(out.id(saved.key));
+    Ok(())
+}
+
+fn logout(app: &mut App, a: &RemoteLogoutArgs) -> Result<()> {
+    no_extra_args("logout", &a.extra)?;
+    let url = match &a.url {
+        Some(url) => url_arg(url, "https://host[:port][/prefix][/w/<workspace>]")?.to_string(),
+        None => configured(app)?.ok_or_else(|| no_remote_here("logout"))?.url,
+    };
+    let path = credentials::default_path()?;
+    let r = credentials::remove(&path, &url, a.workspace_only)?;
+    let mut out = Out::new(json!({ "path": path, "removed": r.removed, "file_removed": r.file_removed }));
+    if r.removed.is_empty() {
+        out = out.line(format!("= No access token saved for {}", url.trim()));
+    }
+    for k in &r.removed {
+        out = out.line(format!("✓ Removed the access token saved for {k}"));
+        out = out.id(k.clone());
+    }
+    if r.file_removed {
+        out = out.line(format!("  removed {}, which is empty now", path.display()));
+    }
+    if !r.removed.is_empty() {
+        out = out.line("  the server still accepts the token until it is revoked there (`bd serve token revoke`)");
+    }
+    if env("BD_TOKEN").is_some() {
+        out = out.line("  note: $BD_TOKEN is still set, and keeps providing a token");
+    }
+    app.print(out);
+    Ok(())
+}
+
+/// The token to save: piped on stdin, or typed at a prompt that does not echo it.
+fn read_token(label: &str) -> Result<String> {
+    use std::io::IsTerminal;
+    let text = if std::io::stdin().is_terminal() {
+        prompt_hidden(&format!("Access token for {label} (input hidden): "))?
+    } else {
+        io::read_stdin()?
+    };
+    let token = text.trim();
+    if token.is_empty() {
+        return Err(Error::invalid(format!("no access token given; {}", how_to_pipe())));
+    }
+    Ok(token.to_string())
+}
+
+fn how_to_pipe() -> &'static str {
+    if cfg!(windows) {
+        "pipe it in, e.g. `Read-Host -MaskInput Token | bd remote login` in PowerShell 7"
+    } else {
+        "pipe it in, e.g. `printf %s \"$TOKEN\" | bd remote login`, or run it in a terminal to be prompted"
+    }
+}
+
+/// Read a line from the terminal on stdin with echo turned off by `stty`.
+/// Only for the machine-local `bd remote login`, so it uses the process's
+/// stdio directly.
+#[cfg(unix)]
+fn prompt_hidden(prompt: &str) -> Result<String> {
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
+    let stty = |arg: &str| {
+        Command::new("stty")
+            .arg(arg)
+            .stdin(Stdio::inherit())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+    };
+    struct Restore(String);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = Command::new("stty").arg(&self.0).stdin(Stdio::inherit()).stderr(Stdio::null()).status();
+        }
+    }
+    let saved = stty("-g").map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty());
+    let Some(restore) = saved.map(Restore) else {
+        return Err(Error::invalid(format!("cannot turn off echo on this terminal; {}", how_to_pipe())));
+    };
+    if stty("-echo").is_none() {
+        return Err(Error::invalid(format!("cannot turn off echo on this terminal; {}", how_to_pipe())));
+    }
+    let mut stderr = std::io::stderr();
+    let _ = write!(stderr, "{prompt}");
+    let _ = stderr.flush();
+    let mut line = String::new();
+    let read = std::io::stdin().lock().read_line(&mut line);
+    drop(restore);
+    let _ = writeln!(stderr);
+    read?;
+    Ok(line)
+}
+
+#[cfg(not(unix))]
+fn prompt_hidden(_: &str) -> Result<String> {
+    Err(Error::invalid(format!("bd remote login does not prompt on this system; {}", how_to_pipe())))
 }
 
 /// Failures worth retrying: the request may not have arrived, or its answer was lost.

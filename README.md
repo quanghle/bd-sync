@@ -459,7 +459,7 @@ commit the result, so every checkout and agent uses the shared workspace:
 
 ```bash
 bd remote set https://bd.example.com/w/proj   # writes .bd/remote.toml (--ca-cert ca.pem for a private CA)
-export BD_TOKEN=bdt_...                       # never commit it; CI takes it from a secret
+bd remote login                               # prompts for the access token, checks it, saves it for you
 bd remote show                                # checks the URL, certificate, token and actor
 bd ready                                      # every command now runs on the server
 BD_ACTOR=alice/agent-2 bd claim --next        # sub-actors: one lease holder per agent
@@ -475,9 +475,46 @@ A `.bd/remote.toml` takes precedence over a `.bd/bd.db` in the same
 directory (`bd remote set` refuses to hide one unless given `--force`), `--db`
 always means a local database, and `bd remote unset` removes the file.
 
+The access token comes from `$BD_TOKEN`, else from the tokens saved by
+`bd remote login`, never from the repository. CI and agents usually take
+`BD_TOKEN` from a secret; people log in once per machine:
+
+```bash
+bd remote login                        # the checkout's server; or: bd remote login https://bd.example.com/w/proj
+printf %s "$TOKEN" | bd remote login   # a piped token is read from stdin, not from a prompt
+bd remote login --workspace-only       # this workspace only, e.g. for a token limited to it
+bd remote logout                       # forget it (a server URL also forgets its workspaces' tokens)
+```
+
+The token is never taken from the command line, so it stays out of shell
+history and process lists, and it is never printed. `login` reads it from
+stdin when stdin is piped, and otherwise prompts without echoing it (on
+Windows, pipe it: `Read-Host -MaskInput Token | bd remote login` in
+PowerShell 7). It runs `bd info` on the server with the token first and saves
+nothing if that fails; `--no-verify` skips the check. Tokens are saved in
+`$XDG_CONFIG_HOME/bd/credentials.toml` (default `~/.config/bd/credentials.toml`,
+or `%APPDATA%\bd\credentials.toml` on Windows), one per server: the URL up to
+`/w/<workspace>`, so `https://bd.example.com/w/proj` and
+`https://bd.example.com/w/other` share the token saved for
+`https://bd.example.com`, and a path prefix (`https://example.com/bd`) is part
+of the server. A `--workspace-only` token takes precedence over its server's,
+and `$BD_TOKEN` over both; `bd remote show` says which one is used. A saved
+token is bound to the certificate authorities it was checked against: the
+system's, or the CA file in use at login (`ca_cert` in `.bd/remote.toml`, or
+`BD_CA_CERT`). It is not sent where another CA would be trusted, so a cloned
+repository whose `remote.toml` names its own CA for your server cannot
+redirect it; log in again from that checkout if you trust its CA. Setting
+`BD_CA_CERT` yourself overrides the check.
+
+On Unix, the file is replaced atomically by one with mode 0600, in a
+directory created 0700, and bd refuses to use it if other users can read it. On Windows it is
+protected by the per-user permissions of `%APPDATA%`. `bd remote logout` only
+forgets the token on this machine: revoke it on the server with
+`bd serve token revoke`.
+
 | variable | meaning |
 |---|---|
-| `BD_TOKEN` | access token (required) |
+| `BD_TOKEN` | access token; takes precedence over tokens saved by `bd remote login` |
 | `BD_REMOTE` / `--remote URL` | use this workspace URL instead of `.bd/remote.toml` |
 | `BD_CA_CERT` | PEM file of the CA that signed the server certificate |
 | `BD_ACTOR` | act as `<token actor>/<name>`; anything else is refused |
@@ -512,7 +549,7 @@ What runs where:
 - `events --follow` polls the server. `init`, `bench`, `serve` and
   `playbook extract --save` only run on the machine that holds the database.
 - `bd prime`, which session hooks run, gives up within seconds when the
-  server is unreachable or `BD_TOKEN` is missing, and prints a notice instead
+  server is unreachable or there is no access token, and prints a notice instead
   of failing the hook. With `--json` it fails like any other command.
 
 Claims stay atomic however clients reach the database: remote clients, and
@@ -645,7 +682,7 @@ crates/bd-core/tests/ engine integration tests (graph semantics, leases with a m
                       playbook runs and gates)
 crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) · batch · bench · fmt · logging
                       io (stdio and files, or a captured request) · serve (bd serve) · auth (access tokens)
-                      · remote (client) · protocol (wire format)
+                      · remote (client) · credentials (bd remote login) · protocol (wire format)
 crates/bd-cli/tests/  end-to-end CLI tests; remote.rs runs real bd serve and client processes
 ```
 

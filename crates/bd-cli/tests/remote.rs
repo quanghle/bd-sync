@@ -505,6 +505,280 @@ fn remote_command_configures_a_checkout() {
     assert_eq!(run(&sub, None, &["remote", "set", "http://bd.example.com/w/proj"]).status.code(), Some(2));
 }
 
+/// Run `cmd` with `input` on its stdin; returns its output.
+fn with_input(mut cmd: Command, input: &str) -> Output {
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn remote_login_saves_tokens_per_server() {
+    let server = Server::start();
+    let alice = server.token("alice-laptop", "alice", &[]);
+    let bob = server.token("bob-proj", "bob", &["--workspace", "proj"]);
+    let checkout = tempfile::tempdir().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    let creds = config.path().join("bd").join("credentials.toml");
+    let cmd = |token: Option<&str>, args: &[&str]| {
+        let mut c = bd(checkout.path());
+        c.env("XDG_CONFIG_HOME", config.path()).args(args);
+        if let Some(t) = token {
+            c.env("BD_TOKEN", t);
+        }
+        c
+    };
+    let run = |token: Option<&str>, args: &[&str]| with_input(cmd(token, args), "");
+    let login = |input: &str, args: &[&str]| {
+        let out = with_input(cmd(None, &[&["--json", "remote", "login"], args].concat()), input);
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!text.contains(&alice) && !text.contains(&bob), "secrets are never printed: {text}");
+        out
+    };
+    let json = |out: Output, what: &str| -> Value {
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!text.contains(&alice) && !text.contains(&bob), "secrets are never printed: {text}");
+        serde_json::from_str(&check(out, what)).unwrap()
+    };
+    let show = || json(run(None, &["--json", "remote", "show"]), "remote show");
+
+    check(run(None, &["remote", "set", &server.url()]), "remote set");
+    let out = run(None, &["list"]);
+    assert_eq!(out.status.code(), Some(7));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("bd remote login"), "the error says how to fix it");
+
+    // A token is checked before it is saved.
+    let out = login("bdt_wrong\n", &[]);
+    assert_eq!(out.status.code(), Some(7), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nothing was saved"));
+    assert_eq!(login("", &[]).status.code(), Some(2), "no token on stdin");
+    assert!(!creds.exists(), "nothing saved");
+
+    // Logged in, commands need no BD_TOKEN.
+    let v = json(login(&format!("{alice}\n"), &[]), "login");
+    assert_eq!(
+        (v["key"].as_str(), v["scope"].as_str(), v["actor"].as_str()),
+        (Some(&*server.base), Some("server"), Some("alice"))
+    );
+    assert_eq!(v["path"].as_str().map(Path::new), Some(creds.as_path()));
+    assert!(std::fs::read_to_string(&creds).unwrap().contains(&alice));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&creds), mode(creds.parent().unwrap())), (0o600, 0o700));
+    }
+    assert_eq!(check(run(None, &["-q", "create", "With a saved token"]), "create").trim(), "t-1");
+    let v = show();
+    assert_eq!((v["connected"].as_bool(), v["token_set"].as_bool()), (Some(true), Some(true)));
+    assert_eq!((v["token_from"].as_str(), v["server"]["actor"].as_str()), (Some("credentials"), Some("alice")));
+    assert_eq!(v["credentials"]["key"].as_str(), Some(&*server.base));
+    assert_eq!(v["credentials"]["path"].as_str().map(Path::new), Some(creds.as_path()));
+
+    // $BD_TOKEN takes precedence.
+    assert_eq!(run(Some("bdt_wrong"), &["list"]).status.code(), Some(7));
+    let v = json(run(Some(&bob), &["--json", "remote", "show"]), "remote show with BD_TOKEN");
+    assert_eq!((v["token_from"].as_str(), v["server"]["actor"].as_str()), (Some("env"), Some("bob")));
+
+    // A token saved for one workspace takes precedence over its server's.
+    let v = json(login(&bob, &[&server.url(), "--workspace-only"]), "login --workspace-only");
+    assert_eq!((v["key"].as_str(), v["scope"].as_str()), (Some(&*server.url()), Some("workspace")));
+    assert_eq!(show()["server"]["actor"], "bob");
+    let v = json(run(None, &["--json", "remote", "logout", "--workspace-only"]), "logout --workspace-only");
+    assert_eq!(v["removed"], json!([server.url()]));
+    assert_eq!(show()["server"]["actor"], "alice");
+
+    // A file that cannot be read is an error naming it, unless $BD_TOKEN makes it unnecessary.
+    let saved = std::fs::read_to_string(&creds).unwrap();
+    std::fs::write(&creds, "not toml at all").unwrap();
+    let out = run(None, &["list"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&*creds.to_string_lossy()));
+    check(run(Some(&alice), &["list"]), "list with BD_TOKEN");
+    std::fs::write(&creds, saved).unwrap();
+
+    let v = json(run(None, &["--json", "remote", "logout"]), "logout");
+    assert_eq!((v["removed"].clone(), v["file_removed"].as_bool()), (json!([server.base]), Some(true)));
+    assert!(!creds.exists(), "the empty file is removed");
+    assert_eq!(run(None, &["list"]).status.code(), Some(7), "logged out");
+    let v = json(run(None, &["--json", "remote", "logout"]), "logout again");
+    assert_eq!(v["removed"], json!([]));
+
+    // An unreachable server fails the check; --no-verify saves the token anyway.
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let down = format!("http://127.0.0.1:{port}/w/proj");
+    let mut c = cmd(None, &["remote", "login", &down]);
+    c.env("BD_REMOTE_RETRY_SECS", "0");
+    assert_eq!(with_input(c, "bdt_offline").status.code(), Some(8));
+    assert!(!creds.exists());
+    let v = json(login("bdt_offline", &[&down, "--no-verify"]), "login --no-verify");
+    assert_eq!((v["verified"].as_bool(), v["key"].as_str()), (Some(false), Some(&*format!("http://127.0.0.1:{port}"))));
+    assert!(std::fs::read_to_string(&creds).unwrap().contains("bdt_offline"));
+}
+
+#[test]
+fn remote_login_uses_the_platform_config_dir() {
+    // Without XDG_CONFIG_HOME: %APPDATA%\bd on Windows, ~/.config/bd elsewhere.
+    let home = tempfile::tempdir().unwrap();
+    let (var, creds) = if cfg!(windows) {
+        ("APPDATA", home.path().join("bd").join("credentials.toml"))
+    } else {
+        ("HOME", home.path().join(".config").join("bd").join("credentials.toml"))
+    };
+    let url = "https://bd.example.com/w/proj";
+    let mut c = bd(home.path());
+    c.env_remove("XDG_CONFIG_HOME").env(var, home.path()).args(["remote", "login", url, "--no-verify"]);
+    check(with_input(c, "bdt_x"), "login");
+    assert!(std::fs::read_to_string(&creds).unwrap().contains("[servers.\"https://bd.example.com\"]"));
+    let mut c = bd(home.path());
+    c.env_remove("XDG_CONFIG_HOME").env(var, home.path()).args(["remote", "logout", "https://bd.example.com"]);
+    check(with_input(c, ""), "logout");
+    assert!(!creds.exists());
+}
+
+#[test]
+fn saved_tokens_stay_bound_to_the_ca_they_were_checked_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, ca_pem, _) = https_server(dir.path());
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let config = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let cmd = |dir: &Path, args: &[&str]| {
+        let mut c = bd(dir);
+        c.env("XDG_CONFIG_HOME", config.path()).env("BD_REMOTE_RETRY_SECS", "0").args(args);
+        c
+    };
+    let run = |c: Command| {
+        let out = with_input(c, "");
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(!text.contains(&secret), "secrets are never printed: {text}");
+        (out.status.code(), text)
+    };
+    // A checkout whose remote.toml names a CA of its own for the server's URL.
+    let repo_with_ca = |pem: &[u8]| {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".bd")).unwrap();
+        std::fs::write(repo.path().join(".bd/ca.pem"), pem).unwrap();
+        std::fs::write(
+            repo.path().join(".bd/remote.toml"),
+            format!("url = \"{}\"\nca_cert = \"ca.pem\"\n", server.url()),
+        )
+        .unwrap();
+        repo
+    };
+    let repo = repo_with_ca(&std::fs::read(&ca_pem).unwrap());
+
+    // Saved trusting the system's CAs (which cannot check this test server, hence --no-verify)...
+    let login = cmd(elsewhere.path(), &["--remote", &server.url(), "remote", "login", "--no-verify"]);
+    check(with_input(login, &secret), "login --no-verify");
+    // ...the token is not sent where a checkout's CA would be trusted instead: had it been, `list` would succeed.
+    let (code, text) = run(cmd(repo.path(), &["list"]));
+    assert_eq!(code, Some(7), "{text}");
+    assert!(text.contains("is not sent") && text.contains("bd remote login"), "{text}");
+    let (code, text) = run(cmd(repo.path(), &["prime"]));
+    assert_eq!(code, Some(0), "hooks still succeed: {text}");
+    assert!(text.contains("unavailable"), "{text}");
+    let (code, text) = run(cmd(repo.path(), &["remote", "show"]));
+    assert_eq!(code, Some(7), "{text}");
+    assert!(text.contains("not usable") && text.contains("is not sent"), "{text}");
+
+    // The user's own settings still apply: $BD_TOKEN, and $BD_CA_CERT.
+    let mut c = cmd(repo.path(), &["-q", "create", "With BD_TOKEN"]);
+    c.env("BD_TOKEN", &secret);
+    assert_eq!(run(c), (Some(0), "t-1\n".to_string()));
+    let mut c = cmd(elsewhere.path(), &["--remote", &server.url(), "-q", "list"]);
+    c.env("BD_CA_CERT", &ca_pem);
+    assert_eq!(run(c), (Some(0), "t-1\n".to_string()));
+
+    // Logged in from the checkout, the token is checked and bound to its CA, whatever its line endings.
+    let login = check(with_input(cmd(repo.path(), &["--json", "remote", "login"]), &secret), "login with the CA");
+    let v: Value = serde_json::from_str(&login).unwrap();
+    assert_eq!((v["verified"].as_bool(), v["actor"].as_str()), (Some(true), Some("alice")));
+    assert_eq!(run(cmd(repo.path(), &["-q", "list"])), (Some(0), "t-1\n".to_string()));
+    let other = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    let other = other.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+
+    // A process reads the CA once: replacing the checkout's ca.pem (a `git checkout`) does not change what a
+    // running `events --follow` trusts, so its next polls neither skip the check nor fail.
+    let mut follow = cmd(repo.path(), &["--json", "events", "--follow", "--interval-ms", "200"]);
+    let mut follower = KillOnDrop::new(follow.stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap());
+    let (tx, rx) = std::sync::mpsc::channel::<Value>();
+    let stdout = follower.child().stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+            if tx.send(serde_json::from_str(&line).unwrap()).is_err() {
+                return;
+            }
+        }
+    });
+    let wait_for = |op: &str, issue: &str| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match rx.recv_timeout(left) {
+                Ok(e) if e["op"] == op && e["issue_id"] == issue => return true,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+        }
+        false
+    };
+    assert!(wait_for("created", "t-1"));
+    std::fs::write(repo.path().join(".bd/ca.pem"), other.pem()).unwrap();
+    std::thread::sleep(Duration::from_millis(600));
+    let mut c = cmd(elsewhere.path(), &["--remote", &server.url(), "-q", "update", "t-1", "--title", "Renamed"]);
+    c.env("BD_TOKEN", &secret).env("BD_CA_CERT", &ca_pem);
+    assert_eq!(run(c).0, Some(0));
+    assert!(wait_for("updated", "t-1"), "the follower kept the CA it started with");
+    drop(follower);
+    std::fs::copy(&ca_pem, repo.path().join(".bd/ca.pem")).unwrap();
+
+    let crlf = std::fs::read_to_string(&ca_pem).unwrap().replace("\r\n", "\n").replace('\n', "\r\n");
+    let crlf_repo = repo_with_ca(crlf.as_bytes());
+    assert_eq!(run(cmd(crlf_repo.path(), &["-q", "list"])), (Some(0), "t-1\n".to_string()));
+
+    // ...and no longer sent trusting the system's CAs, or another CA (which would fail with 8 if it were tried).
+    let (code, text) = run(cmd(elsewhere.path(), &["--remote", &server.url(), "list"]));
+    assert_eq!(code, Some(7), "{text}");
+    let other_repo = repo_with_ca(other.pem().as_bytes());
+    let (code, text) = run(cmd(other_repo.path(), &["list"]));
+    assert_eq!(code, Some(7), "{text}");
+    assert!(text.contains("another CA certificate"), "{text}");
+}
+
+#[test]
+fn tokens_passed_as_arguments_are_never_echoed() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = "https://bd.example.com/w/proj";
+    for (args, why) in [
+        (vec!["remote", "login", "bdt_fakesecret123"], "looks like an access token"),
+        (vec!["remote", "logout", "bdt_fakesecret123"], "looks like an access token"),
+        (vec!["remote", "login", url, "bdt_fakesecret123"], "never a token on the command line"),
+        (vec!["remote", "logout", url, "bdt_fakesecret123"], "never a token on the command line"),
+        (vec!["remote", "set", url, "bdt_fakesecret123"], "never a token on the command line"),
+        (vec!["remote", "set", "bdt_fakesecret123"], "looks like an access token"),
+        (vec!["remote", "set", "fakesecret123"], "not a URL"),
+        (vec!["remote", "login", "fakesecret123"], "not a URL"),
+        (vec!["remote", "logout", "fakesecret123"], "not a URL"),
+    ] {
+        for json in [false, true] {
+            let mut c = bd(dir.path());
+            if json {
+                c.arg("--json");
+            }
+            c.args(&args);
+            let out = with_input(c, "");
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {text}");
+            assert!(text.contains(why), "{args:?}: {text}");
+            assert!(!text.contains("fakesecret"), "{args:?} echoed the argument: {text}");
+            if json {
+                let err: Value = serde_json::from_slice(&out.stderr).unwrap();
+                assert_eq!(err["error"]["exit_code"], 2, "{text}");
+            }
+        }
+    }
+}
+
 #[test]
 fn prime_in_session_hooks_never_fails() {
     let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
@@ -691,9 +965,8 @@ fn events_follow_polls_the_server() {
     assert!(wait_for("t-2"), "the follower printed the new event");
 }
 
-#[test]
-fn https_with_a_private_ca() {
-    let dir = tempfile::tempdir().unwrap();
+/// An HTTPS server whose certificate a private CA signed; returns the server and the CA and key PEM files in `dir`.
+fn https_server(dir: &Path) -> (Server, std::path::PathBuf, std::path::PathBuf) {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -701,8 +974,7 @@ fn https_with_a_private_ca() {
     let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
     let key = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()]).unwrap().signed_by(&key, &issuer).unwrap();
-    let (ca_pem, cert_pem, key_pem) =
-        (dir.path().join("ca.pem"), dir.path().join("cert.pem"), dir.path().join("key.pem"));
+    let (ca_pem, cert_pem, key_pem) = (dir.join("ca.pem"), dir.join("cert.pem"), dir.join("key.pem"));
     std::fs::write(&ca_pem, ca_cert.pem()).unwrap();
     std::fs::write(&cert_pem, cert.pem()).unwrap();
     std::fs::write(&key_pem, key.serialize_pem()).unwrap();
@@ -710,6 +982,13 @@ fn https_with_a_private_ca() {
     let server =
         Server::start_with(&["--tls-cert", cert_pem.to_str().unwrap(), "--tls-key", key_pem.to_str().unwrap()]);
     assert!(server.base.starts_with("https://"), "{}", server.base);
+    (server, ca_pem, key_pem)
+}
+
+#[test]
+fn https_with_a_private_ca() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, ca_pem, key_pem) = https_server(dir.path());
     let mut alice = server.client(&server.token("alice-laptop", "alice", &[]));
 
     let started = Instant::now();

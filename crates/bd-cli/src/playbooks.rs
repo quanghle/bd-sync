@@ -14,6 +14,7 @@ use crate::app::{App, Out};
 use crate::cli::*;
 use crate::fmt::rel;
 use crate::io;
+use crate::paths::user_config_dir;
 
 /// Where playbooks are looked up, in order: the workspace's `.bd/playbooks`,
 /// `$BD_PLAYBOOK_PATH`, then `$XDG_CONFIG_HOME/bd/playbooks` (or
@@ -31,16 +32,6 @@ pub fn search_paths(app: &App) -> Vec<PathBuf> {
         paths.push(c.join("bd").join("playbooks"));
     }
     paths
-}
-
-/// `$XDG_CONFIG_HOME` on every OS, else the platform's per-user config dir.
-fn user_config_dir() -> Option<PathBuf> {
-    let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
-    var("XDG_CONFIG_HOME").or_else(
-        || {
-            if cfg!(windows) { var("APPDATA") } else { var("HOME").map(|h| h.join(".config")) }
-        },
-    )
 }
 
 fn loader(app: &App) -> Loader {

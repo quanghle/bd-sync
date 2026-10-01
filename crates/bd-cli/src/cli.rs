@@ -23,7 +23,7 @@ pub struct Global {
     /// Database file (default: nearest .bd/bd.db walking up from the current directory)
     #[arg(long, global = true, env = "BD_DB", value_name = "PATH")]
     pub db: Option<PathBuf>,
-    /// Workspace on a bd server, e.g. https://bd.example.com/w/proj (default: .bd/remote.toml); token in $BD_TOKEN
+    /// Workspace on a bd server, e.g. https://bd.example.com/w/proj (default: .bd/remote.toml); token: $BD_TOKEN or `bd remote login`
     #[arg(long, global = true, env = "BD_REMOTE", value_name = "URL")]
     pub remote: Option<String>,
     /// Run as if started in this directory
@@ -153,7 +153,7 @@ pub enum Command {
     BenchWorker(BenchWorkerArgs),
     /// Serve workspaces to remote bd clients over HTTPS; `bd serve token` manages access
     Serve(ServeArgs),
-    /// Use a workspace on a bd server from this checkout: set, show (with a connection check), unset
+    /// Use a workspace on a bd server from this checkout: set, show (with a connection check), unset, login, logout
     #[command(subcommand)]
     Remote(RemoteCommand),
     /// Workspace information
@@ -1143,6 +1143,41 @@ pub enum RemoteCommand {
     /// Stop using the remote workspace (removes .bd/remote.toml)
     #[command(alias = "rm")]
     Unset,
+    /// Save an access token for a bd server in your user config directory, so BD_TOKEN is not needed
+    ///
+    /// The token is read from stdin when it is piped (`printf %s "$TOKEN" | bd remote login`), else from a
+    /// prompt that does not echo it; never from the command line. It is checked against the server first.
+    Login(RemoteLoginArgs),
+    /// Forget access tokens saved by `bd remote login`
+    Logout(RemoteLogoutArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RemoteLoginArgs {
+    /// Workspace URL, e.g. https://bd.example.com/w/proj (default: this checkout's remote workspace)
+    pub url: Option<String>,
+    /// Save the token for this workspace only, instead of for every workspace on its server
+    #[arg(long)]
+    pub workspace_only: bool,
+    /// Save the token without checking it against the server
+    #[arg(long)]
+    pub no_verify: bool,
+    /// Refused without being echoed: a token pasted after the URL
+    #[arg(hide = true)]
+    pub extra: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct RemoteLogoutArgs {
+    /// Workspace or server URL (default: this checkout's remote workspace); a server URL also forgets
+    /// tokens saved for its workspaces
+    pub url: Option<String>,
+    /// Forget only the token saved for this workspace with `login --workspace-only`
+    #[arg(long)]
+    pub workspace_only: bool,
+    /// Refused without being echoed: a token pasted after the URL
+    #[arg(hide = true)]
+    pub extra: Vec<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1155,6 +1190,9 @@ pub struct RemoteSetArgs {
     /// Write it even though .bd/bd.db holds a local workspace, which remote.toml hides
     #[arg(long)]
     pub force: bool,
+    /// Refused without being echoed: a token pasted after the URL
+    #[arg(hide = true)]
+    pub extra: Vec<String>,
 }
 
 pub fn parse_priority(s: &str) -> Result<u8, String> {

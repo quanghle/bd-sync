@@ -202,7 +202,7 @@ fn create(app: &mut App, a: &TokenCreateArgs) -> Result<()> {
     let out = Out::new(view)
         .line(format!("✓ Created access token {}: {}", token.name, token.describe()))
         .line(secret.clone())
-        .line("Shown only once. Set it as BD_TOKEN on the client.")
+        .line("Shown only once. On the client, save it with `bd remote login`, or set it as BD_TOKEN.")
         .id(secret);
     app.print(out);
     Ok(())

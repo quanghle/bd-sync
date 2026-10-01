@@ -50,6 +50,9 @@ pub struct Global {
     /// How long a writer waits for the database write lock
     #[arg(long, global = true, env = "BD_BUSY_TIMEOUT_MS", default_value_t = 10_000, value_name = "MS")]
     pub busy_timeout_ms: u64,
+    /// Read playbooks only from this bundle (how a remote client sends the playbooks of its checkout)
+    #[arg(long, global = true, hide = true, value_name = "FILE")]
+    pub playbook_bundle: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -802,7 +805,7 @@ pub struct BatchArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum PlaybookCommand {
-    /// Playbooks in .bd/playbooks, $BD_PLAYBOOK_PATH, then the user config dir (bd/playbooks)
+    /// Playbooks in .bd/playbooks, $BD_PLAYBOOK_PATH, then the user config dir (bd/playbooks); remote: then the server's
     #[command(alias = "ls")]
     List,
     /// Validate a playbook and show its variables and steps

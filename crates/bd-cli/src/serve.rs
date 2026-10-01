@@ -50,7 +50,7 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, TryAcquireError};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls;
 
@@ -86,6 +86,15 @@ const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(15 * 60);
 const READ_BUFFER: usize = 64 << 10;
 /// Idle database connections kept per workspace.
 const MAX_POOLED: usize = 16;
+/// Stack of the threads that run commands. Playbooks nest at most
+/// `playbook::MAX_DEPTH` levels, far below this; it is address space,
+/// committed only as it is used.
+const THREAD_STACK: usize = 8 << 20;
+/// Commands planning playbooks sent with them at once. Each may hold a few
+/// tens of MiB while it parses and plans (bounded by the bundle and planning
+/// limits); further ones are answered 503 at once, which clients retry, so
+/// none waits holding memory or holds up other requests.
+const MAX_PLANNING: usize = 4;
 /// On shutdown, how long running commands may take to finish.
 const COMMANDS_GRACE: Duration = Duration::from_secs(30);
 /// On shutdown, how long running background jobs may take to finish.
@@ -147,7 +156,11 @@ fn run(a: &ServeArgs) -> Result<()> {
     // Before any request or background job: gate checks in this process use the server's defaults.
     io::mark_server_process();
     let server = Arc::new(Server::new(root, max_body));
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().thread_name("bd-serve").build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("bd-serve")
+        .thread_stack_size(THREAD_STACK)
+        .build()?;
     let served = runtime.block_on(serve(server, addr, tls, jobs));
     // Commands and jobs still running after their grace period are abandoned:
     // SQLite rolls back an unfinished transaction.
@@ -435,6 +448,15 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
         }
     };
     drop(body);
+    let bundled = request.argv.iter().any(|a| a == "--playbook-bundle" || a.starts_with("--playbook-bundle="));
+    let planning = match bundled {
+        false => None,
+        true => match server.planning.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(TryAcquireError::NoPermits) => return busy("planning other playbooks"),
+            Err(TryAcquireError::Closed) => return shutting_down(),
+        },
+    };
     let slot = match tokio::time::timeout(QUEUE_WAIT, server.running.clone().acquire_owned()).await {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => return shutting_down(),
@@ -447,7 +469,7 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
     let srv = server.clone();
     let job = tokio::task::spawn_blocking(move || {
         // Held until the command finishes, even if the client goes away meanwhile.
-        let _held = (slot, budget);
+        let _held = (slot, budget, planning);
         let ran = std::panic::catch_unwind(AssertUnwindSafe(|| srv.run(&ws, &token, request, started, out)));
         ran.unwrap_or_else(|_| {
             tracing::error!(target: "bd::serve", workspace = %ws.name, "command panicked");
@@ -496,6 +518,8 @@ struct Server {
     running: Arc<Semaphore>,
     /// Commands whose answers stream, a few of the running ones.
     streams: Arc<Semaphore>,
+    /// Commands planning playbooks sent with them.
+    planning: Arc<Semaphore>,
     /// Memory of requests in progress, in KiB permits.
     body_budget: Arc<Semaphore>,
     max_body: usize,
@@ -640,6 +664,7 @@ impl Server {
             inflight: Mutex::default(),
             running: Arc::new(Semaphore::new(MAX_RUNNING)),
             streams: Arc::new(Semaphore::new(MAX_STREAMING)),
+            planning: Arc::new(Semaphore::new(MAX_PLANNING)),
             body_budget: Arc::new(Semaphore::new(budget as usize)),
             max_body,
             open: OpenOptions::default(),
@@ -901,6 +926,10 @@ mod tests {
             (&["events", "prune", "--keep", "1"][..], Access::Write),
             (&["config", "set", "lease.ttl", "1m"][..], Access::Write),
             (&["playbook", "plan", "x"][..], Access::Write),
+            // A client's playbooks travel with the command and change nothing about it.
+            (&["--playbook-bundle", "b.json", "playbook", "show", "x"][..], Access::Read),
+            (&["--playbook-bundle", "b.json", "playbook", "plan", "x"][..], Access::Write),
+            (&["--playbook-bundle", "b.json", "playbook", "run", "x"][..], Access::Write),
             (&["gate", "check"][..], Access::Write),
             (&["doctor"][..], Access::Write),
             (&["batch"][..], Access::Write),

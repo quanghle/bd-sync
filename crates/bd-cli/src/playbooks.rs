@@ -1,30 +1,47 @@
 //! `bd playbook ...` and `bd purge`.
+//!
+//! In a remote workspace a name is looked up in the checkout's
+//! `.bd/playbooks` first, then on the server's playbook path, then in the
+//! client's `$BD_PLAYBOOK_PATH` and user config directory; file paths are the
+//! client's. `show`, `plan` and `run` of a playbook found on the client send
+//! its files with the command (a bundle, named by `--playbook-bundle`), and
+//! the server loads it from the bundle alone. `list` shows all of them, and
+//! `extract --save` writes into the checkout.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bd_core::playbook::{
-    self, CompactOptions, Loader, Playbook, RunRequest, RunStatus, RunsQuery, StartOptions, Step, StepState,
+    self, Bundle, CompactOptions, Listed, Loader, MAX_BUNDLE_FILE_BYTES, Playbook, RunRequest, RunStatus, RunsQuery,
+    StartOptions, Step, StepState,
 };
 use bd_core::time::parse_duration;
 use bd_core::{Error, Queries, Result};
-use serde_json::json;
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 use crate::app::{App, Out};
 use crate::cli::*;
 use crate::fmt::rel;
 use crate::io;
 use crate::paths::user_config_dir;
+use crate::protocol::{ErrorBody, ExecRequest, ExecResponse};
+use crate::remote::{self, Remote};
 
 /// Where playbooks are looked up, in order: the workspace's `.bd/playbooks`,
 /// `$BD_PLAYBOOK_PATH`, then `$XDG_CONFIG_HOME/bd/playbooks` (or
 /// `~/.config/bd/playbooks`; `%APPDATA%\bd\playbooks` on Windows).
 pub fn search_paths(app: &App) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
     match app.db_path() {
-        Ok(db) => paths.extend(db.parent().map(|d| d.join("playbooks"))),
-        Err(_) => paths.push(app.cwd.join(".bd").join("playbooks")),
+        Ok(db) => with_user_paths(db.parent().map(|d| d.join("playbooks"))),
+        Err(_) => with_user_paths(Some(app.cwd.join(".bd").join("playbooks"))),
     }
+}
+
+/// `first`, then `$BD_PLAYBOOK_PATH` and the user config directory.
+fn with_user_paths(first: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = first.into_iter().collect();
     if let Some(extra) = std::env::var_os("BD_PLAYBOOK_PATH") {
         paths.extend(std::env::split_paths(&extra).filter(|p| !p.as_os_str().is_empty()));
     }
@@ -34,19 +51,44 @@ pub fn search_paths(app: &App) -> Vec<PathBuf> {
     paths
 }
 
-fn loader(app: &App) -> Loader {
-    Loader::new(search_paths(app))
+/// The playbooks a command naming `reference` reads: the bundle named by
+/// `--playbook-bundle` (sent by a remote client; under bd serve it is never
+/// read from disk), or the search path.
+fn loader(app: &App, reference: &str) -> Result<Loader> {
+    let Some(file) = &app.g.playbook_bundle else { return Ok(Loader::new(search_paths(app))) };
+    let bundle = Bundle::from_json(&io::read_file(file)?)?;
+    // A playbook from the client's own path gives way to the workspace's of
+    // the same name. Names only: a path a client names is never looked up here.
+    if bundle.server_first && !playbook::is_path_like(reference.trim()) {
+        let own = Loader::new(search_paths(app));
+        if own.locate(reference, None).is_ok() {
+            return Ok(own);
+        }
+    }
+    Loader::from_bundle(bundle)
 }
 
-fn load(app: &App, reference: &str) -> Result<Playbook> {
+/// Under bd serve without a bundle, playbooks come from the server's own playbook path.
+fn on_server(loader: &Loader) -> bool {
+    io::serving() && !loader.is_bundle()
+}
+
+fn load(app: &App, loader: &Loader, reference: &str) -> Result<Playbook> {
     let r = reference.trim();
-    if io::serving() && (r.contains(['/', '\\']) || playbook::EXTENSIONS.iter().any(|e| r.ends_with(e))) {
+    let on_server = on_server(loader);
+    if on_server && playbook::is_path_like(r) {
         // A path would name a file on the server, not the client's.
         return Err(Error::Refused(format!(
-            "playbook {r:?}: bd serve runs playbooks by name from the workspace's playbook directory on the server"
+            "playbook {r:?}: bd serve runs playbooks by name from the workspace's playbook directory on the server \
+             (a bd client sends the playbooks of its checkout with the command)"
         )));
     }
-    loader(app).load_from(reference, Some(&app.cwd))
+    loader.load_from(reference, Some(&app.cwd)).map_err(|e| match e {
+        Error::NotFound { kind, id } if on_server => {
+            Error::NotFound { kind, id: format!("{id} on the bd server (bd clients look in their checkout first)") }
+        }
+        e => e,
+    })
 }
 
 fn parse_vars(raw: &[String]) -> Result<BTreeMap<String, String>> {
@@ -77,18 +119,29 @@ pub fn cmd_playbook(app: &mut App, cmd: &PlaybookCommand) -> Result<()> {
 }
 
 fn cmd_list(app: &mut App) -> Result<()> {
-    let loader = loader(app);
+    let loader = Loader::new(search_paths(app));
     let listed = loader.list();
-    let mut out = Out::new(json!({ "search_paths": loader.search_paths, "playbooks": listed }));
-    if listed.is_empty() {
+    let json = json!({ "search_paths": loader.search_paths, "playbooks": listed });
+    let entries: Vec<(Listed, bool)> = listed.into_iter().map(|l| (l, false)).collect();
+    let searched: Vec<(PathBuf, bool)> = loader.search_paths.iter().map(|p| (p.clone(), false)).collect();
+    app.print(list_out(json, &entries, &searched));
+    Ok(())
+}
+
+/// What `bd playbook list` prints. Entries and searched directories marked
+/// `true` are on the server.
+fn list_out(json: Value, entries: &[(Listed, bool)], searched: &[(PathBuf, bool)]) -> Out {
+    let mut out = Out::new(json);
+    if entries.is_empty() {
         out = out.line("No playbooks found. Searched:");
-        for p in &loader.search_paths {
-            out = out.line(format!("  {}", p.display()));
+        for (p, on_server) in searched {
+            out = out.line(format!("  {}{}", p.display(), if *on_server { " (on the server)" } else { "" }));
         }
         out = out.line("Create one at .bd/playbooks/<name>.toml (see `bd playbook show <file>` to validate it).");
     }
-    for l in &listed {
-        let mut line = format!("{:<20} {}", l.name, l.path.display());
+    for (l, on_server) in entries {
+        let place = if *on_server { " (on the server)" } else { "" };
+        let mut line = format!("{:<20} {}{place}", l.name, l.path.display());
         if let Some(e) = &l.error {
             line = format!("✗ {line}\n    {}", e.replace('\n', "\n    "));
         } else {
@@ -105,11 +158,10 @@ fn cmd_list(app: &mut App) -> Result<()> {
         }
         out = out.line(line).id(l.name.clone());
     }
-    app.print(out);
-    Ok(())
+    out
 }
 
-fn step_lines(steps: &[Step], depth: usize, out: &mut Vec<String>) {
+fn step_lines(steps: &[Arc<Step>], depth: usize, out: &mut Vec<String>) {
     for s in steps {
         let mut notes = Vec::new();
         if !s.needs.is_empty() {
@@ -161,12 +213,17 @@ fn step_lines(steps: &[Step], depth: usize, out: &mut Vec<String>) {
 }
 
 fn cmd_show(app: &mut App, a: &PlaybookRefArgs) -> Result<()> {
-    let pb = load(app, &a.playbook)?;
+    let loader = loader(app, &a.playbook)?;
+    let pb = load(app, &loader, &a.playbook)?;
+    let server = on_server(&loader);
     let mut text = vec![format!(
         "{}{}{}",
         pb.name,
         if pb.description.is_empty() { String::new() } else { format!(" — {}", pb.description) },
-        pb.source.as_ref().map(|p| format!("  ({})", p.display())).unwrap_or_default()
+        pb.source
+            .as_ref()
+            .map(|p| format!("  ({}{})", p.display(), if server { " on the server" } else { "" }))
+            .unwrap_or_default()
     )];
     let mut facts = Vec::new();
     if pb.is_ephemeral() {
@@ -206,7 +263,11 @@ fn cmd_show(app: &mut App, a: &PlaybookRefArgs) -> Result<()> {
     }
     text.push("Steps:".into());
     step_lines(&pb.steps, 0, &mut text);
-    let out = Out::new(json!({ "source": pb.source, "playbook": pb })).lines(text).id(pb.name.clone());
+    let mut json = json!({ "source": pb.source, "playbook": pb });
+    if server {
+        json["server"] = json!(true);
+    }
+    let out = Out::new(json).lines(text).id(pb.name.clone());
     app.print(out);
     Ok(())
 }
@@ -262,7 +323,8 @@ fn status_lines(s: &RunStatus) -> Vec<String> {
 }
 
 fn cmd_run(app: &mut App, a: &RunArgs, dry_run: bool) -> Result<()> {
-    let pb = load(app, &a.playbook)?;
+    let loader = loader(app, &a.playbook)?;
+    let pb = load(app, &loader, &a.playbook)?;
     let req = RunRequest {
         vars: parse_vars(&a.vars)?,
         ephemeral: if a.ephemeral {
@@ -275,7 +337,7 @@ fn cmd_run(app: &mut App, a: &RunArgs, dry_run: bool) -> Result<()> {
         assignee: a.assignee.clone().filter(|s| !s.trim().is_empty()),
         title: a.title.clone().filter(|s| !s.trim().is_empty()),
     };
-    let plan = playbook::compile(&pb, &req, &loader(app))?;
+    let plan = playbook::compile(&pb, &req, &loader)?;
     let (started, status) = app.write("playbook.run", |tx| {
         let opts = StartOptions {
             parent: a.parent.as_deref().map(|p| tx.resolve_id(p)).transpose()?,
@@ -417,6 +479,7 @@ fn cmd_extract(app: &mut App, a: &ExtractArgs) -> Result<()> {
     }
     let pb = app.read(|r| playbook::extract(r.conn(), &r.resolve_id(&a.id)?, a.name.as_deref()))?;
     let text = playbook::to_toml(&pb)?;
+    too_large_to_send(app, &text);
     let target = match (&a.output, a.save) {
         // Under bd serve the client writes the file, relative to its own directory.
         (Some(p), _) if io::serving() => Some(p.clone()),
@@ -440,22 +503,43 @@ fn cmd_extract(app: &mut App, a: &ExtractArgs) -> Result<()> {
                 // The client checked --force against its own file before sending.
                 io::send_file(&path, |w| Ok(w.write_all(text.as_bytes())?))?;
             } else {
-                if path.exists() && !a.force {
-                    return Err(Error::Refused(format!("{} exists; pass --force to overwrite", path.display())));
-                }
-                if let Some(dir) = path.parent() {
-                    std::fs::create_dir_all(dir)?;
-                }
-                std::fs::write(&path, &text)?;
+                write_playbook(&path, &text, a.force)?;
             }
-            let out = Out::new(json!({ "path": path, "playbook": pb.name, "steps": pb.all_steps().len() }))
-                .line(format!("✓ Wrote playbook {} to {} ({} step(s))", pb.name, path.display(), pb.all_steps().len()))
-                .line(format!("  run it with: bd playbook run {}", pb.name))
-                .id(path.display().to_string());
-            app.print(out);
+            app.print(wrote(&path, &pb));
         }
     }
     Ok(())
+}
+
+/// A playbook this large runs where it is a file, but a bd client cannot send
+/// it to a server: say so where it is made.
+fn too_large_to_send(app: &App, text: &str) {
+    if text.len() > MAX_BUNDLE_FILE_BYTES && !app.g.json {
+        io::errln(format!(
+            "note: this playbook is {} KiB, more than the {} KiB a bd client sends to a server in one file: run it \
+             locally, or from the server's playbook directory",
+            text.len() >> 10,
+            MAX_BUNDLE_FILE_BYTES >> 10
+        ));
+    }
+}
+
+fn write_playbook(path: &Path, text: &str, force: bool) -> Result<()> {
+    if path.exists() && !force {
+        return Err(Error::Refused(format!("{} exists; pass --force to overwrite", path.display())));
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, text)?;
+    Ok(())
+}
+
+fn wrote(path: &Path, pb: &Playbook) -> Out {
+    Out::new(json!({ "path": path, "playbook": pb.name, "steps": pb.all_steps().len() }))
+        .line(format!("✓ Wrote playbook {} to {} ({} step(s))", pb.name, path.display(), pb.all_steps().len()))
+        .line(format!("  run it with: bd playbook run {}", pb.name))
+        .id(path.display().to_string())
 }
 
 pub fn cmd_purge(app: &mut App, a: &PurgeArgs) -> Result<()> {
@@ -476,4 +560,208 @@ pub fn cmd_purge(app: &mut App, a: &PurgeArgs) -> Result<()> {
     }
     app.print(out);
     Ok(())
+}
+
+// ------------------------------------------------------------ remote clients
+
+/// Where a client puts the bundle among a request's files.
+const BUNDLE_FILE: &str = "playbooks.bundle.json";
+/// Names the bundle on the command line. A server too old for bundles
+/// rejects it as an unknown argument instead of running another playbook.
+const BUNDLE_FLAG: &str = "--playbook-bundle";
+
+/// A remote workspace's checkout playbooks: `.bd/playbooks` next to
+/// `remote.toml`, else in the nearest `.bd` directory.
+fn checkout_playbooks(app: &App) -> Result<PathBuf> {
+    let bd = match remote::configured(app)?.map(|c| c.source) {
+        Some(remote::Source::File(file)) => file.parent().map(Path::to_path_buf),
+        _ => app.cwd.ancestors().map(|d| d.join(".bd")).find(|d| d.is_dir()),
+    };
+    Ok(bd.unwrap_or_else(|| app.cwd.join(".bd")).join("playbooks"))
+}
+
+/// Runs the `bd playbook` commands a remote workspace's client handles
+/// itself: `list` (the checkout's playbooks, the server's, then the user's
+/// own) and `extract --save` (into the checkout). `None`: the server runs it.
+pub fn client_command(app: &App, remote: &Remote, cmd: &PlaybookCommand) -> Result<Option<i32>> {
+    match cmd {
+        PlaybookCommand::List => client_list(app, remote).map(Some),
+        PlaybookCommand::Extract(a) if a.save => client_extract(app, remote, a).map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// `show`, `plan` and `run` of a playbook found on the client: send its
+/// files (a bundle) with the command. A name not found here is left to the
+/// server's playbook path; a path not found here is an error.
+pub fn attach_bundle(app: &App, cmd: &Command, request: &mut ExecRequest) -> Result<()> {
+    let Command::Playbook(
+        PlaybookCommand::Show(PlaybookRefArgs { playbook: reference })
+        | PlaybookCommand::Plan(RunArgs { playbook: reference, .. })
+        | PlaybookCommand::Run(RunArgs { playbook: reference, .. }),
+    ) = cmd
+    else {
+        return Ok(());
+    };
+    if let Some(file) = &app.g.playbook_bundle {
+        // A bundle named on the command line travels like any input file.
+        request.files.insert(file.to_string_lossy().into_owned(), io::read_file(file)?);
+        return Ok(());
+    }
+    // The checkout's playbooks and file paths shadow the server's; the user's
+    // own ($BD_PLAYBOOK_PATH, the config directory) only stand in for names
+    // the server lacks, which the server decides. Inside a playbook found
+    // here, references resolve on the whole client path, as locally.
+    let checkout = checkout_playbooks(app)?;
+    let loader = Loader::new(with_user_paths(Some(checkout.clone())));
+    let r = reference.trim();
+    let server_first = if playbook::is_path_like(r) || Loader::new(vec![checkout]).locate(r, None).is_ok() {
+        false
+    } else {
+        match loader.locate(r, None) {
+            Ok(_) => true,
+            // Not on the client: a playbook on the server's path.
+            Err(Error::NotFound { .. }) => return Ok(()),
+            Err(e) => return Err(e),
+        }
+    };
+    let mut bundle = match server_first {
+        true => loader.bundle_lenient(reference, Some(&app.cwd))?,
+        false => loader.bundle(reference, Some(&app.cwd))?,
+    };
+    bundle.server_first = server_first;
+    let bundle = bundle.to_json()?;
+    request.files.insert(BUNDLE_FILE.to_string(), bundle);
+    request.argv.splice(0..0, [BUNDLE_FLAG.to_string(), BUNDLE_FILE.to_string()]);
+    Ok(())
+}
+
+/// Explains the answer of a server too old to read bundles.
+pub fn check_server(request: &ExecRequest, response: &ExecResponse, url: &str) -> Result<()> {
+    let sent = request.argv.first().is_some_and(|a| a == BUNDLE_FLAG);
+    if sent && response.exit_code == 2 && response.stderr.contains(&format!("'{BUNDLE_FLAG}'")) {
+        return Err(Error::Refused(format!(
+            "{url}: this bd server cannot run playbooks from a client's checkout (it runs an older bd); upgrade it"
+        )));
+    }
+    Ok(())
+}
+
+/// A read the client composes (in JSON) rather than the user's command line.
+fn server_read(app: &App, remote: &Remote, mut argv: Vec<String>) -> Result<ExecResponse> {
+    if let Some(actor) = &app.g.actor {
+        argv.splice(0..0, ["--actor".to_string(), actor.clone()]);
+    }
+    let request =
+        ExecRequest { argv, actor: remote::env_actor(), location: Some(remote.url.clone()), ..Default::default() };
+    remote.exec(&request)
+}
+
+/// Print the error of a read the client composed, in the user's format; returns its exit code.
+fn relay_failure(app: &App, response: &ExecResponse) -> i32 {
+    match response.stderr.lines().find_map(|l| serde_json::from_str::<ErrorBody>(l).ok()) {
+        Some(body) if !app.g.json => io::errln(format!("error: {}", body.error.message)),
+        _ => io::errln(response.stderr.trim_end()),
+    }
+    response.exit_code
+}
+
+fn client_list(app: &App, remote: &Remote) -> Result<i32> {
+    #[derive(Deserialize)]
+    struct ServerList {
+        search_paths: Vec<PathBuf>,
+        playbooks: Vec<Listed>,
+    }
+    let checkout = checkout_playbooks(app)?;
+    let users = with_user_paths(None);
+    let response = server_read(app, remote, vec!["--json".into(), "playbook".into(), "list".into()])?;
+    if response.exit_code != 0 {
+        return Ok(relay_failure(app, &response));
+    }
+    let theirs: ServerList = serde_json::from_str(&response.stdout)
+        .map_err(|e| Error::Remote(format!("{}: unexpected playbook list: {e}", remote.url)))?;
+    // In lookup order: the checkout's, the server's, then the user's own.
+    let mut entries: Vec<(Listed, bool)> = Vec::new();
+    let found = Loader::new(vec![checkout.clone()]).list().into_iter().map(|l| (l, false));
+    let found = found.chain(theirs.playbooks.into_iter().map(|l| (l, true)));
+    for (mut l, server) in found.chain(Loader::new(users.clone()).list().into_iter().map(|l| (l, false))) {
+        l.shadowed_by = entries.iter().find(|(m, _)| m.name == l.name).map(|(m, _)| m.path.clone());
+        entries.push((l, server));
+    }
+    let playbooks: Vec<Value> = entries
+        .iter()
+        .map(|(l, server)| {
+            let mut v = json!(l);
+            if *server {
+                v["server"] = json!(true);
+            }
+            v
+        })
+        .collect();
+    let mut searched = vec![(checkout.clone(), false)];
+    searched.extend(theirs.search_paths.iter().map(|p| (p.clone(), true)));
+    searched.extend(users.iter().map(|p| (p.clone(), false)));
+    let client: Vec<&PathBuf> = std::iter::once(&checkout).chain(&users).collect();
+    let json = json!({
+        "search_paths": client,
+        "server": { "url": remote.url, "search_paths": theirs.search_paths },
+        "playbooks": playbooks,
+    });
+    app.print(list_out(json, &entries, &searched));
+    Ok(0)
+}
+
+/// `extract --save` in a remote workspace: the server extracts, the client
+/// writes the file into its checkout's playbook directory.
+fn client_extract(app: &App, remote: &Remote, a: &ExtractArgs) -> Result<i32> {
+    let mut argv: Vec<String> = vec!["--json".into(), "playbook".into(), "extract".into()];
+    if let Some(name) = &a.name {
+        argv.extend(["--name".into(), name.clone()]);
+    }
+    argv.extend(["--".into(), a.id.clone()]);
+    let response = server_read(app, remote, argv)?;
+    if response.exit_code != 0 {
+        return Ok(relay_failure(app, &response));
+    }
+    let unexpected =
+        |e: &dyn std::fmt::Display| Error::Remote(format!("{}: unexpected extract output: {e}", remote.url));
+    let extracted: Value = serde_json::from_str(&response.stdout).map_err(|e| unexpected(&e))?;
+    let text = extracted["toml"].as_str().ok_or_else(|| unexpected(&"no toml"))?;
+    // Parsing checks the playbook, and its name before it becomes a file name here.
+    let pb = playbook::parse_toml(text, "the extracted playbook", "extracted")?;
+    let path = checkout_playbooks(app)?.join(format!("{}.toml", pb.name));
+    write_playbook(&path, text, a.force)?;
+    too_large_to_send(app, text);
+    app.print(wrote(&path, &pb));
+    Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn a_server_too_old_for_bundles_is_named_as_the_problem() {
+        // What such a server answers: clap's error for an argument it does not know.
+        let unknown = Cli::try_parse_from(["bd", "--no-such-flag", "x", "playbook", "list"]).unwrap_err();
+        let rendered = unknown.render().to_string();
+        assert!(rendered.contains("'--no-such-flag'"), "{rendered}");
+        let old = ExecResponse {
+            exit_code: 2,
+            stderr: rendered.replace("--no-such-flag", BUNDLE_FLAG),
+            ..Default::default()
+        };
+        let argv = [BUNDLE_FLAG, BUNDLE_FILE, "playbook", "run", "x"].map(String::from).to_vec();
+        let request = ExecRequest { argv, ..Default::default() };
+        let err = check_server(&request, &old, "http://h/w/p").unwrap_err();
+        assert!(err.to_string().contains("older bd") && err.exit_code() == 2, "{err}");
+
+        let failed =
+            ExecResponse { exit_code: 2, stderr: "error: playbook x: has no steps\n".into(), ..Default::default() };
+        assert!(check_server(&request, &failed, "u").is_ok(), "other failures pass through");
+        let plain = ExecRequest { argv: vec!["playbook".into(), "run".into(), "x".into()], ..Default::default() };
+        assert!(check_server(&plain, &old, "u").is_ok(), "only requests that carried a bundle");
+        assert!(Cli::try_parse_from(["bd", BUNDLE_FLAG, BUNDLE_FILE, "playbook", "list"]).is_ok());
+    }
 }

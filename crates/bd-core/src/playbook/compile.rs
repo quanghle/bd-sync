@@ -13,14 +13,16 @@
 //! * A gate becomes a sibling issue `gate-<step>` that blocks the step and
 //!   carries the step's prerequisites, so it arms when the step could start.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::loader::Loader;
-use super::model::{Loop, LoopOver, MAX_RUN_ISSUES, Playbook, Step, StepGate, VarDef};
+use super::model::{Loop, LoopOver, MAX_DEPTH, MAX_RUN_ISSUES, Playbook, Step, StepGate, VarDef};
 use super::template::{self, Condition, render};
 use crate::error::{Error, Result};
 use crate::gates::{GateKind, GateSpec};
@@ -28,6 +30,20 @@ use crate::model::{DepType, GATE_TYPE, MAX_TITLE_CHARS};
 
 /// How deep `expand` may nest.
 pub const MAX_EXPAND_DEPTH: usize = 8;
+/// Most dependencies (edges between its issues) a run may create.
+pub const MAX_RUN_EDGES: usize = 10 * MAX_RUN_ISSUES;
+/// Most work planning a run may take: each loop iteration considered (even
+/// one a condition leaves out), each expansion, and each dependency looked up
+/// (one, plus one for each issue it stands for) counts one. A run within the
+/// other limits needs well under this.
+pub const MAX_PLANNING_WORK: usize = 5 * MAX_RUN_EDGES;
+/// Most text the variables of a run, or of one expansion, may hold together.
+pub const MAX_VARS_BYTES: usize = 256 << 10;
+/// Most text a run's issues may hold: each rendered value (title,
+/// description, label, metadata value, ...) counts its length plus 16 bytes.
+/// Loops and variables cannot blow a small playbook up into gigabytes.
+pub const MAX_PLAN_BYTES: usize = 16 << 20;
+const VALUE_COST: usize = 16;
 
 /// Inputs of a run besides the playbook itself.
 #[derive(Clone, Debug, Default)]
@@ -151,7 +167,7 @@ impl Plan {
 /// Apply defaults and check values. Unknown names and missing required
 /// variables are errors (all reported at once).
 pub fn resolve_vars(
-    defs: &BTreeMap<String, VarDef>,
+    defs: &BTreeMap<String, Arc<VarDef>>,
     given: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
     let unknown: Vec<&str> = given.keys().filter(|k| !defs.contains_key(*k)).map(String::as_str).collect();
@@ -196,13 +212,43 @@ pub fn resolve_vars(
     if !problems.is_empty() {
         return Err(Error::invalid(problems.join("; ")));
     }
+    let size: usize = out.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if size > MAX_VARS_BYTES {
+        return Err(Error::invalid(format!("variables hold {size} bytes (at most {} KiB)", MAX_VARS_BYTES >> 10)));
+    }
     Ok(out)
+}
+
+/// What a compile may still render (see [`MAX_PLAN_BYTES`]).
+struct Budget(Cell<usize>);
+
+impl Budget {
+    fn new() -> Budget {
+        Budget(Cell::new(MAX_PLAN_BYTES))
+    }
+
+    fn spend(&self, bytes: usize) -> std::result::Result<(), String> {
+        match self.0.get().checked_sub(bytes.saturating_add(VALUE_COST)) {
+            Some(left) => {
+                self.0.set(left);
+                Ok(())
+            }
+            None => Err(format!("the run would hold more than {} MiB of text", MAX_PLAN_BYTES >> 20)),
+        }
+    }
+
+    fn render(&self, text: &str, vars: &BTreeMap<String, String>) -> std::result::Result<String, String> {
+        let out = render(text, vars)?;
+        self.spend(out.len())?;
+        Ok(out)
+    }
 }
 
 /// Compile `pb` with `req` into the issues and edges of a run.
 pub fn compile(pb: &Playbook, req: &RunRequest, loader: &Loader) -> Result<Plan> {
     let vars = resolve_vars(&pb.vars, &req.vars)?;
-    let r = |what: &str, text: &str| render(text, &vars).map_err(|e| Error::invalid(format!("{what}: {e}")));
+    let budget = Budget::new();
+    let r = |what: &str, text: &str| budget.render(text, &vars).map_err(|e| Error::invalid(format!("{what}: {e}")));
     let title = match (&req.title, &pb.title) {
         (Some(t), _) => t.trim().to_string(),
         (None, Some(t)) => r("title", t)?,
@@ -228,6 +274,8 @@ pub fn compile(pb: &Playbook, req: &RunRequest, loader: &Loader) -> Result<Plan>
     };
     let mut b = Builder {
         loader,
+        budget: &budget,
+        work: 0,
         issues: Vec::new(),
         edges: Vec::new(),
         keys: HashSet::new(),
@@ -235,8 +283,7 @@ pub fn compile(pb: &Playbook, req: &RunRequest, loader: &Loader) -> Result<Plan>
         assignee: req.assignee.clone(),
         stack: vec![pb.name.clone()],
     };
-    let dir = pb.source.as_deref().and_then(Path::parent).map(Path::to_path_buf);
-    b.namespace(&pb.steps, &vars, "", run.priority, dir.as_deref())?;
+    b.namespace(&pb.steps, &vars, "", run.priority, pb.source.as_deref(), 1)?;
     if b.issues.is_empty() {
         return Err(Error::invalid(format!(
             "playbook {}: every step was left out by its condition or loop; nothing to run",
@@ -283,7 +330,11 @@ fn slug(s: &str) -> String {
 }
 
 /// Loop values with id suffixes (unique within the loop).
-fn loop_values(l: &Loop, vars: &BTreeMap<String, String>) -> std::result::Result<Vec<(String, String)>, String> {
+fn loop_values(
+    l: &Loop,
+    vars: &BTreeMap<String, String>,
+    budget: &Budget,
+) -> std::result::Result<Vec<(String, String)>, String> {
     let numbers = |a: i64, b: i64| -> std::result::Result<Vec<String>, String> {
         if b >= a && (b - a) as usize >= MAX_RUN_ISSUES {
             return Err(format!("loop of {} iterations is too large (max {MAX_RUN_ISSUES})", b - a + 1));
@@ -292,7 +343,7 @@ fn loop_values(l: &Loop, vars: &BTreeMap<String, String>) -> std::result::Result
     };
     let values: Vec<String> = match &l.over {
         LoopOver::Count(c) => {
-            let text = render(c, vars)?;
+            let text = budget.render(c, vars)?;
             let n: i64 = text.trim().parse().map_err(|_| format!("loop count must be a whole number, got {text:?}"))?;
             if n < 0 {
                 return Err(format!("loop count must not be negative, got {n}"));
@@ -300,7 +351,7 @@ fn loop_values(l: &Loop, vars: &BTreeMap<String, String>) -> std::result::Result
             numbers(1, n)?
         }
         LoopOver::Range(r) => {
-            let text = render(r, vars)?;
+            let text = budget.render(r, vars)?;
             let (a, b) = text
                 .split_once("..=")
                 .or_else(|| text.split_once(".."))
@@ -309,9 +360,11 @@ fn loop_values(l: &Loop, vars: &BTreeMap<String, String>) -> std::result::Result
                 |s: &str| s.trim().parse::<i64>().map_err(|_| format!("loop range bound {s:?} is not a number"));
             numbers(parse(a)?, parse(b)?)?
         }
-        LoopOver::Items(items) => items.iter().map(|i| render(i, vars)).collect::<std::result::Result<_, _>>()?,
+        LoopOver::Items(items) => {
+            items.iter().map(|i| budget.render(i, vars)).collect::<std::result::Result<_, _>>()?
+        }
         LoopOver::Over(o) => {
-            render(o, vars)?.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
+            budget.render(o, vars)?.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
         }
     };
     let mut seen: HashMap<String, usize> = HashMap::new();
@@ -351,6 +404,9 @@ struct Namespace<'a> {
 
 struct Builder<'l> {
     loader: &'l Loader,
+    budget: &'l Budget,
+    /// Work done so far (see [`MAX_PLANNING_WORK`]).
+    work: usize,
     issues: Vec<PlannedIssue>,
     edges: Vec<PlannedEdge>,
     keys: HashSet<String>,
@@ -360,16 +416,30 @@ struct Builder<'l> {
 }
 
 impl Builder<'_> {
+    fn charge(&mut self, units: usize) -> Result<()> {
+        self.work = self.work.saturating_add(units);
+        if self.work > MAX_PLANNING_WORK {
+            return Err(Error::invalid(format!(
+                "planning needs more than {MAX_PLANNING_WORK} units of work (loop iterations, even ones a condition \
+                 leaves out, expansions, and dependency lookups); loop over fewer values, or expand or depend on less"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Place and wire `steps`, the steps of the playbook file `from` (its
+    /// `expand` references resolve against it), `depth` levels below the run.
     fn namespace(
         &mut self,
-        steps: &[Step],
+        steps: &[Arc<Step>],
         vars: &BTreeMap<String, String>,
         parent_key: &str,
         priority: u8,
-        dir: Option<&Path>,
+        from: Option<&Path>,
+        depth: usize,
     ) -> Result<()> {
         let mut ns = Namespace::default();
-        self.place(steps, vars, parent_key, priority, &[], &[], dir, &mut ns)?;
+        self.place(steps, vars, parent_key, priority, &[], &[], from, depth, &mut ns)?;
         self.wire(&ns)
     }
 
@@ -386,38 +456,45 @@ impl Builder<'_> {
     #[allow(clippy::too_many_arguments)]
     fn place<'a>(
         &mut self,
-        steps: &'a [Step],
+        steps: &'a [Arc<Step>],
         vars: &BTreeMap<String, String>,
         parent_key: &str,
         priority: u8,
         iterations: &[(&'a str, String)],
         ancestors: &[&'a str],
-        dir: Option<&Path>,
+        from: Option<&Path>,
+        depth: usize,
         ns: &mut Namespace<'a>,
     ) -> Result<()> {
         for step in steps {
             ns.steps.insert(&step.id, step);
             ns.ancestors.insert(&step.id, ancestors.to_vec());
             let at = |e: String| Error::invalid(format!("step {}: {e}", join(parent_key, &step.id)));
-            let iters: Vec<(String, BTreeMap<String, String>)> = match &step.repeat {
-                None => vec![(String::new(), vars.clone())],
-                Some(l) => loop_values(l, vars)
+            if depth > MAX_DEPTH {
+                return Err(at(format!("steps nest more than {MAX_DEPTH} levels deep, counting expansions")));
+            }
+            let iters: Vec<(String, Option<String>)> = match &step.repeat {
+                None => vec![(String::new(), None)],
+                Some(l) => loop_values(l, vars, self.budget)
                     .map_err(at)?
                     .into_iter()
-                    .map(|(suffix, value)| {
-                        let mut v = vars.clone();
-                        v.insert(l.var.clone(), value);
-                        (format!("-{suffix}"), v)
-                    })
+                    .map(|(suffix, value)| (format!("-{suffix}"), Some(value)))
                     .collect(),
             };
             let condition = step.condition.as_deref().map(Condition::parse).transpose().map_err(at)?;
             let mut prev: Option<String> = None;
-            for (suffix, ivars) in iters {
+            for (suffix, value) in iters {
+                self.charge(1)?;
                 if let Some(c) = &condition {
-                    if !c.eval(&ivars).map_err(at)? {
+                    let extra = step.repeat.as_ref().zip(value.as_deref()).map(|(l, v)| (l.var.as_str(), v));
+                    if !c.eval(vars, extra).map_err(at)? {
                         continue;
                     }
+                }
+                // Variables are copied only for iterations that stay, one at a time.
+                let mut ivars = vars.clone();
+                if let (Some(l), Some(value)) = (&step.repeat, value) {
+                    ivars.insert(l.var.clone(), value);
                 }
                 let local = format!("{}{suffix}", step.id);
                 let key = join(parent_key, &local);
@@ -453,16 +530,16 @@ impl Builder<'_> {
                 if !step.children.is_empty() {
                     let mut inner = ancestors.to_vec();
                     inner.push(&step.id);
-                    self.place(&step.children, &ivars, &key, prio, &its, &inner, dir, ns)?;
+                    self.place(&step.children, &ivars, &key, prio, &its, &inner, from, depth + 1, ns)?;
                 }
                 if let Some(target) = &step.expand {
-                    self.expand(step, target, &ivars, &key, prio, dir)?;
+                    self.expand(step, target, &ivars, &key, prio, from, depth + 1)?;
                 }
             }
             // A step left out entirely still lists its children, so needs on
             // them resolve (to nothing, inheriting through the chain).
             if !ns.by_step.contains_key(step.id.as_str()) {
-                fn register<'a>(steps: &'a [Step], anc: &mut Vec<&'a str>, ns: &mut Namespace<'a>) {
+                fn register<'a>(steps: &'a [Arc<Step>], anc: &mut Vec<&'a str>, ns: &mut Namespace<'a>) {
                     for s in steps {
                         ns.steps.insert(&s.id, s);
                         ns.ancestors.insert(&s.id, anc.clone());
@@ -479,6 +556,7 @@ impl Builder<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand(
         &mut self,
         step: &Step,
@@ -486,24 +564,25 @@ impl Builder<'_> {
         vars: &BTreeMap<String, String>,
         key: &str,
         priority: u8,
-        dir: Option<&Path>,
+        from: Option<&Path>,
+        depth: usize,
     ) -> Result<()> {
         let at = |e: String| Error::invalid(format!("step {key}: expand {target}: {e}"));
         if self.stack.len() > MAX_EXPAND_DEPTH {
             return Err(at(format!("expansions nest deeper than {MAX_EXPAND_DEPTH}")));
         }
-        let pb = self.loader.load_from(target, dir).map_err(|e| at(e.to_string()))?;
+        self.charge(1)?;
+        let pb = self.loader.expansion(target, from).map_err(|e| at(e.to_string()))?;
         if self.stack.contains(&pb.name) {
             return Err(at(format!("circular expand: {} -> {}", self.stack.join(" -> "), pb.name)));
         }
         let mut given = BTreeMap::new();
         for (k, v) in &step.expand_vars {
-            given.insert(k.clone(), render(v, vars).map_err(at)?);
+            given.insert(k.clone(), self.budget.render(v, vars).map_err(at)?);
         }
         let inner = resolve_vars(&pb.vars, &given).map_err(|e| at(e.to_string()))?;
-        let inner_dir = pb.source.as_deref().and_then(Path::parent).map(Path::to_path_buf);
         self.stack.push(pb.name.clone());
-        self.namespace(&pb.steps, &inner, key, pb.priority.unwrap_or(priority), inner_dir.as_deref())?;
+        self.namespace(&pb.steps, &inner, key, pb.priority.unwrap_or(priority), pb.source.as_deref(), depth)?;
         self.stack.pop();
         Ok(())
     }
@@ -517,7 +596,7 @@ impl Builder<'_> {
         priority: u8,
     ) -> Result<PlannedIssue> {
         let r = |field: &str, text: &str| {
-            render(text, vars).map_err(|e| Error::invalid(format!("step {key} {field}: {e}")))
+            self.budget.render(text, vars).map_err(|e| Error::invalid(format!("step {key} {field}: {e}")))
         };
         let mut title = r("title", &step.title)?;
         if let Some(l) = &step.repeat {
@@ -539,7 +618,8 @@ impl Builder<'_> {
         for (k, v) in &step.metadata {
             metadata.insert(
                 k.clone(),
-                render_value(v, vars).map_err(|e| Error::invalid(format!("step {key} metadata.{k}: {e}")))?,
+                render_value(v, vars, self.budget)
+                    .map_err(|e| Error::invalid(format!("step {key} metadata.{k}: {e}")))?,
             );
         }
         Ok(PlannedIssue {
@@ -578,7 +658,7 @@ impl Builder<'_> {
         step_title: &str,
     ) -> Result<PlannedIssue> {
         let at = |e: String| Error::invalid(format!("step {key}: {e}"));
-        let r = |text: &str| render(text, vars).map_err(at);
+        let r = |text: &str| self.budget.render(text, vars).map_err(at);
         let opt = |v: &Option<String>| -> Result<Option<String>> {
             Ok(match v {
                 Some(s) => Some(r(s)?.trim().to_string()).filter(|s| !s.is_empty()),
@@ -622,10 +702,14 @@ impl Builder<'_> {
         })
     }
 
-    fn edge(&mut self, from: &str, to: &str, dep_type: DepType, metadata: Value) {
+    fn edge(&mut self, from: &str, to: &str, dep_type: DepType, metadata: Value) -> Result<()> {
         if from != to && self.pairs.insert((from.to_string(), to.to_string())) {
+            if self.edges.len() >= MAX_RUN_EDGES {
+                return Err(Error::invalid(format!("a run may create at most {MAX_RUN_EDGES} dependencies")));
+            }
             self.edges.push(PlannedEdge { from: from.into(), to: to.into(), dep_type, metadata });
         }
+        Ok(())
     }
 
     /// Keys of `need` as seen from `from`: inside a shared loop iteration only
@@ -643,44 +727,54 @@ impl Builder<'_> {
         all.into_iter().map(|n| n.key.clone()).collect()
     }
 
+    /// The keys `need` stands for, seen from `from`, added to `out` (once
+    /// each, tracked in `listed`). A step left out here stands for what it
+    /// needed (and what its groups needed), transitively: depth first, with an
+    /// explicit stack, since a chain of left-out steps can be as long as the
+    /// playbook.
     fn resolve_need<'a>(
+        &mut self,
         ns: &Namespace<'a>,
         need: &'a str,
         from: &Node<'a>,
         out: &mut Vec<String>,
-        visiting: &mut HashSet<&'a str>,
-    ) {
-        let keys = Builder::select(ns, need, from);
-        if !keys.is_empty() {
-            for k in keys {
-                if !out.contains(&k) {
-                    out.push(k);
+        listed: &mut HashSet<String>,
+    ) -> Result<()> {
+        let mut visiting: HashSet<&'a str> = HashSet::new();
+        let mut stack = vec![need];
+        while let Some(need) = stack.pop() {
+            let keys = Builder::select(ns, need, from);
+            self.charge(1 + keys.len())?;
+            if !keys.is_empty() {
+                for k in keys {
+                    if listed.insert(k.clone()) {
+                        out.push(k);
+                    }
+                }
+                continue;
+            }
+            if !visiting.insert(need) {
+                continue;
+            }
+            let Some(step) = ns.steps.get(need) else { continue };
+            let mut inherited: Vec<&'a str> = step.needs.iter().map(String::as_str).collect();
+            for a in ns.ancestors.get(need).into_iter().flatten() {
+                if let Some(s) = ns.steps.get(a) {
+                    inherited.extend(s.needs.iter().map(String::as_str));
                 }
             }
-            return;
+            stack.extend(inherited.into_iter().rev());
         }
-        // Left out here: inherit what it needed (and what its groups needed).
-        if !visiting.insert(need) {
-            return;
-        }
-        let Some(step) = ns.steps.get(need) else { return };
-        let mut inherited: Vec<&'a str> = step.needs.iter().map(String::as_str).collect();
-        for a in ns.ancestors.get(need).into_iter().flatten() {
-            if let Some(s) = ns.steps.get(a) {
-                inherited.extend(s.needs.iter().map(String::as_str));
-            }
-        }
-        for n in inherited {
-            Builder::resolve_need(ns, n, from, out, visiting);
-        }
+        Ok(())
     }
 
     fn wire(&mut self, ns: &Namespace<'_>) -> Result<()> {
         for node in &ns.nodes {
             let step = node.step;
             let mut needs: Vec<String> = Vec::new();
+            let mut listed: HashSet<String> = HashSet::new();
             for n in &step.needs {
-                Builder::resolve_need(ns, n, node, &mut needs, &mut HashSet::new());
+                self.resolve_need(ns, n, node, &mut needs, &mut listed)?;
             }
             // An inherited need may point into this step's own subtree or at
             // one of its groups; an edge there would deadlock.
@@ -713,18 +807,18 @@ impl Builder<'_> {
                 }
             }
             for k in &needs {
-                self.edge(&node.key, k, DepType::Blocks, json!({}));
+                self.edge(&node.key, k, DepType::Blocks, json!({}))?;
             }
             if let Some((k, meta)) = &waits {
-                self.edge(&node.key, k, DepType::WaitsFor, meta.clone());
+                self.edge(&node.key, k, DepType::WaitsFor, meta.clone())?;
             }
             if let Some(g) = &node.gate {
-                self.edge(&node.key, g, DepType::Blocks, json!({}));
+                self.edge(&node.key, g, DepType::Blocks, json!({}))?;
                 for k in &needs {
-                    self.edge(g, k, DepType::Blocks, json!({}));
+                    self.edge(g, k, DepType::Blocks, json!({}))?;
                 }
                 if let Some((k, meta)) = &waits {
-                    self.edge(g, k, DepType::WaitsFor, meta.clone());
+                    self.edge(g, k, DepType::WaitsFor, meta.clone())?;
                 }
             }
         }
@@ -732,18 +826,28 @@ impl Builder<'_> {
     }
 }
 
-fn render_value(v: &Value, vars: &BTreeMap<String, String>) -> std::result::Result<Value, String> {
+fn render_value(v: &Value, vars: &BTreeMap<String, String>, budget: &Budget) -> std::result::Result<Value, String> {
     Ok(match v {
-        Value::String(s) => Value::String(render(s, vars)?),
+        Value::String(s) => Value::String(budget.render(s, vars)?),
         Value::Array(items) => {
-            Value::Array(items.iter().map(|i| render_value(i, vars)).collect::<std::result::Result<_, _>>()?)
+            budget.spend(0)?;
+            Value::Array(items.iter().map(|i| render_value(i, vars, budget)).collect::<std::result::Result<_, _>>()?)
         }
-        Value::Object(m) => Value::Object(
-            m.iter()
-                .map(|(k, v)| Ok((k.clone(), render_value(v, vars)?)))
-                .collect::<std::result::Result<_, String>>()?,
-        ),
-        other => other.clone(),
+        Value::Object(m) => {
+            budget.spend(0)?;
+            Value::Object(
+                m.iter()
+                    .map(|(k, v)| {
+                        budget.spend(k.len())?;
+                        Ok((k.clone(), render_value(v, vars, budget)?))
+                    })
+                    .collect::<std::result::Result<_, String>>()?,
+            )
+        }
+        other => {
+            budget.spend(0)?;
+            other.clone()
+        }
     })
 }
 
@@ -873,6 +977,68 @@ mod tests {
         let text = "[[steps]]\nid = \"spawn\"\n[[steps]]\nid = \"first\"\nwaits_for = \"any-children-of(spawn)\"\n";
         let p = plan(text, &[]).unwrap();
         assert_eq!(p.edges[0].metadata, json!({ "gate": "any-children", "also_blocks": true }));
+    }
+
+    #[test]
+    fn runs_have_size_limits() {
+        // The longest chain a playbook may hold validates and compiles on a server thread's stack.
+        let chain: String = (0..MAX_RUN_ISSUES)
+            .map(|n| match n {
+                0 => "[[steps]]\nid = \"s0\"\n".to_string(),
+                n => format!("[[steps]]\nid = \"s{n}\"\nneeds = [\"s{}\"]\n", n - 1),
+            })
+            .collect();
+        let longest = chain.clone();
+        // Every step but the ends left out: `last` inherits needs down the whole chain.
+        let omitted: String = (1..MAX_RUN_ISSUES - 1)
+            .map(|n| format!("[[steps]]\nid = \"s{n}\"\nneeds = [\"s{}\"]\ncondition = \"0\"\n", n - 1))
+            .collect();
+        let omitted = format!(
+            "[[steps]]\nid = \"s0\"\n{omitted}[[steps]]\nid = \"last\"\nneeds = [\"s{}\"]\n",
+            MAX_RUN_ISSUES - 2
+        );
+        let compiled = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || {
+                let shape = |p: Plan| (p.issues.len(), p.edges.len());
+                (plan(&longest, &[]).map(shape), plan(&omitted, &[]).map(shape))
+            })
+            .unwrap();
+        let (longest, omitted) = compiled.join().unwrap();
+        assert_eq!(longest.unwrap(), (MAX_RUN_ISSUES, MAX_RUN_ISSUES - 1));
+        assert_eq!(omitted.unwrap(), (2, 1), "last needs s0");
+        let err = plan(&format!("{chain}[[steps]]\nid = \"one-more\"\n"), &[]).unwrap_err().to_string();
+        assert!(err.contains("more than 2000 steps"), "refused while parsing: {err}");
+
+        let wordy =
+            format!("[[steps]]\nid = \"s\"\ndescription = \"{}\"\n[steps.loop]\ncount = 2000\n", "x".repeat(20_000));
+        assert!(plan(&wordy, &[]).unwrap_err().to_string().contains("more than 16 MiB of text"));
+        let meta = "[[steps]]\nid = \"s\"\nmetadata = { list = [[], [], [], [], [], [], [], [], [], []] }\n[steps.loop]\ncount = 2000\n";
+        assert!(plan(meta, &[]).is_ok(), "small values are cheap");
+
+        let all_to_all = "[[steps]]\nid = \"a\"\n[steps.loop]\ncount = 150\n\
+            [[steps]]\nid = \"b\"\nneeds = [\"a\"]\n[steps.loop]\ncount = 150\n";
+        let err = plan(all_to_all, &[]).unwrap_err().to_string();
+        assert!(err.contains("at most 20000 dependencies"), "{err}");
+
+        // A run at the limits plans: 2,000 issues, each needing the 10 before it.
+        let dense: String = (0..MAX_RUN_ISSUES)
+            .map(|n| {
+                let needs: Vec<String> = (n.saturating_sub(10)..n).map(|m| format!("\"s{m}\"")).collect();
+                format!("[[steps]]\nid = \"s{n}\"\nneeds = [{}]\n", needs.join(", "))
+            })
+            .collect();
+        let p = plan(&dense, &[]).unwrap();
+        assert_eq!(p.issues.len(), MAX_RUN_ISSUES);
+        assert_eq!(p.edges.len(), 10 * MAX_RUN_ISSUES - 55);
+
+        let text = "[vars.v]\n[[steps]]\nid = \"a\"\ntitle = \"x{{v}}\"\n";
+        let big = "x".repeat(MAX_VARS_BYTES);
+        assert!(plan(text, &[("v", &big)]).unwrap_err().to_string().contains("variables hold"));
+        assert!(plan(text, &[("v", &big[..MAX_VARS_BYTES - 1])]).is_ok());
+
+        let twice = "[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\nneeds = [\"a\", \"a\"]\ndepends_on = [\"a\"]\n";
+        assert_eq!(parse_toml(twice, "t.toml", "t").unwrap().steps[1].needs, vec!["a"]);
     }
 
     #[test]

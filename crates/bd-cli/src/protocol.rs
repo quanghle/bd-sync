@@ -39,7 +39,9 @@ pub const FRAMES_CONTENT_TYPE: &str = "application/x-ndjson";
 /// Request body of `POST /w/<workspace>/v2/exec`.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExecRequest {
-    /// The command line after the program name, exactly as typed.
+    /// The command line after the program name, exactly as typed, except
+    /// that a client running a playbook from its checkout puts
+    /// `--playbook-bundle <file>` in front and sends that file.
     pub argv: Vec<String>,
     /// Actor named by the client's environment (`$BD_ACTOR`, `$BEADS_ACTOR`);
     /// an `--actor` flag travels in `argv`. Must be allowed by the token.

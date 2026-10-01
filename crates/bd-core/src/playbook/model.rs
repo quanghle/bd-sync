@@ -5,9 +5,11 @@
 //! accepted where they mean the same thing (`formula`, `depends_on`,
 //! `expand_vars`, gate `id`, `phase = "vapor"`, `type = "workflow"`).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
@@ -20,6 +22,9 @@ use crate::time::parse_duration;
 
 /// Most steps (after loops and expansions) a single run may create.
 pub const MAX_RUN_ISSUES: usize = 2_000;
+/// How deep steps may nest below a run: groups, their children, and the
+/// steps of the playbooks they expand.
+pub const MAX_DEPTH: usize = 32;
 
 /// A reusable multi-step process. Running it creates a *run*: one epic with
 /// an issue per step, wired by the steps' `needs`.
@@ -45,11 +50,22 @@ pub struct Playbook {
     pub ephemeral: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extends: Vec<String>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    pub vars: BTreeMap<String, VarDef>,
-    pub steps: Vec<Step>,
+    /// Variable definitions and steps are shared (`Arc`) with the playbooks
+    /// that extend this one, so inheriting them copies pointers, not text.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", serialize_with = "ser_vars")]
+    pub vars: BTreeMap<String, Arc<VarDef>>,
+    #[serde(serialize_with = "ser_steps")]
+    pub steps: Vec<Arc<Step>>,
     #[serde(skip)]
     pub source: Option<PathBuf>,
+}
+
+fn ser_vars<S: serde::Serializer>(vars: &BTreeMap<String, Arc<VarDef>>, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.collect_map(vars.iter().map(|(k, v)| (k, &**v)))
+}
+
+fn ser_steps<S: serde::Serializer>(steps: &[Arc<Step>], s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.collect_seq(steps.iter().map(|step| &**step))
 }
 
 impl Playbook {
@@ -59,7 +75,7 @@ impl Playbook {
 
     /// Every step, depth first (children before the next sibling).
     pub fn all_steps(&self) -> Vec<&Step> {
-        fn walk<'a>(steps: &'a [Step], out: &mut Vec<&'a Step>) {
+        fn walk<'a>(steps: &'a [Arc<Step>], out: &mut Vec<&'a Step>) {
             for s in steps {
                 out.push(s);
                 walk(&s.children, out);
@@ -288,8 +304,8 @@ pub struct Step {
     pub gate: Option<StepGate>,
     #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]
     pub repeat: Option<Loop>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub children: Vec<Step>,
+    #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "ser_steps")]
+    pub children: Vec<Arc<Step>>,
 }
 
 fn ser_waits_for<S: serde::Serializer>(w: &Option<WaitsFor>, s: S) -> std::result::Result<S::Ok, S::Error> {
@@ -426,6 +442,51 @@ fn one_or_many<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<Strin
     d.deserialize_any(V)
 }
 
+thread_local! {
+    /// Steps the file being parsed on this thread may still declare.
+    static STEPS_LEFT: Cell<usize> = const { Cell::new(usize::MAX) };
+}
+
+/// Counts the steps of one file while it parses, so a file with too many
+/// fails before they are all in memory.
+struct StepCount(usize);
+
+impl StepCount {
+    fn start() -> StepCount {
+        StepCount(STEPS_LEFT.replace(MAX_RUN_ISSUES))
+    }
+}
+
+impl Drop for StepCount {
+    fn drop(&mut self) {
+        STEPS_LEFT.set(self.0);
+    }
+}
+
+/// A list of steps, each counted against the file's [`MAX_RUN_ISSUES`].
+fn counted_steps<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Vec<RawStep>, D::Error> {
+    struct V;
+    impl<'de> Visitor<'de> for V {
+        type Value = Vec<RawStep>;
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a list of steps")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<Vec<RawStep>, A::Error> {
+            let mut out = Vec::new();
+            while let Some(step) = seq.next_element::<RawStep>()? {
+                let left = STEPS_LEFT.get();
+                if left == 0 {
+                    return Err(de::Error::custom(format!("more than {MAX_RUN_ISSUES} steps")));
+                }
+                STEPS_LEFT.set(left - 1);
+                out.push(step);
+            }
+            Ok(out)
+        }
+    }
+    d.deserialize_seq(V)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPlaybook {
@@ -448,7 +509,7 @@ struct RawPlaybook {
     extends: Vec<String>,
     #[serde(default)]
     vars: BTreeMap<String, RawVar>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "counted_steps")]
     steps: Vec<RawStep>,
 }
 
@@ -502,7 +563,7 @@ struct RawStep {
     #[serde(default, alias = "with")]
     expand_vars: BTreeMap<String, Scalar>,
     gate: Option<RawGate>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "counted_steps")]
     children: Vec<RawStep>,
 }
 
@@ -586,12 +647,9 @@ fn convert_step(raw: RawStep, path: &str) -> std::result::Result<Step, String> {
             return Err(at(&format!("metadata key {reserved:?} is reserved")));
         }
     }
-    let mut needs = raw.needs;
-    for d in raw.depends_on {
-        if !needs.contains(&d) {
-            needs.push(d);
-        }
-    }
+    // Duplicates mean nothing, and would multiply the work of every run.
+    let mut seen = HashSet::new();
+    let needs: Vec<String> = raw.needs.into_iter().chain(raw.depends_on).filter(|n| seen.insert(n.clone())).collect();
     let waits_for = raw.waits_for.as_deref().map(WaitsFor::parse).transpose().map_err(|e| at(&e))?;
     if let Some(c) = &raw.condition {
         Condition::parse(c).map_err(|e| at(&e))?;
@@ -665,7 +723,7 @@ fn convert_step(raw: RawStep, path: &str) -> std::result::Result<Step, String> {
         .into_iter()
         .map(|c| {
             let child_path = format!("{path}.{}", c.id);
-            convert_step(c, &child_path)
+            convert_step(c, &child_path).map(Arc::new)
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let title = raw.title.unwrap_or_else(|| raw.id.replace(['-', '_'], " "));
@@ -745,11 +803,11 @@ fn convert(raw: RawPlaybook, default_name: &str) -> std::result::Result<Playbook
         if let Some(d) = &def.default {
             def.check(&vname, d).map_err(|e| format!("default of {e}"))?;
         }
-        vars.insert(vname, def);
+        vars.insert(vname, Arc::new(def));
     }
     let steps = raw.steps.into_iter().map(|s| {
         let path = s.id.clone();
-        convert_step(s, &path)
+        convert_step(s, &path).map(Arc::new)
     });
     Ok(Playbook {
         name,
@@ -769,13 +827,19 @@ fn convert(raw: RawPlaybook, default_name: &str) -> std::result::Result<Playbook
 /// Parse a playbook from TOML. `origin` names it in errors and supplies the
 /// default name (a file stem).
 pub fn parse_toml(text: &str, origin: &str, default_name: &str) -> Result<Playbook> {
-    let raw: RawPlaybook = toml::from_str(text).map_err(|e| Error::invalid(format!("{origin}: {e}")))?;
+    let raw: RawPlaybook = {
+        let _count = StepCount::start();
+        toml::from_str(text).map_err(|e| Error::invalid(format!("{origin}: {e}")))?
+    };
     convert(raw, default_name).map_err(|e| Error::invalid(format!("{origin}: {e}")))
 }
 
 /// Parse a playbook from JSON (same shape as TOML).
 pub fn parse_json(text: &str, origin: &str, default_name: &str) -> Result<Playbook> {
-    let raw: RawPlaybook = serde_json::from_str(text).map_err(|e| Error::invalid(format!("{origin}: {e}")))?;
+    let raw: RawPlaybook = {
+        let _count = StepCount::start();
+        serde_json::from_str(text).map_err(|e| Error::invalid(format!("{origin}: {e}")))?
+    };
     convert(raw, default_name).map_err(|e| Error::invalid(format!("{origin}: {e}")))
 }
 
@@ -800,14 +864,22 @@ impl Playbook {
         if self.steps.is_empty() {
             return Err("has no steps".into());
         }
+        // A run could not create more; this also bounds the depth of the walks below.
+        let total = self.all_steps().len();
+        if total > MAX_RUN_ISSUES {
+            return Err(format!("has {total} steps (at most {MAX_RUN_ISSUES})"));
+        }
         // id -> (ancestor ids, step)
         let mut index: HashMap<&str, (Vec<&str>, &Step)> = HashMap::new();
         fn walk<'a>(
-            steps: &'a [Step],
+            steps: &'a [Arc<Step>],
             ancestors: &mut Vec<&'a str>,
             index: &mut HashMap<&'a str, (Vec<&'a str>, &'a Step)>,
         ) -> std::result::Result<(), String> {
             for s in steps {
+                if ancestors.len() >= MAX_DEPTH {
+                    return Err(format!("step {} is nested more than {MAX_DEPTH} levels deep", s.id));
+                }
                 if index.insert(&s.id, (ancestors.clone(), s)).is_some() {
                     return Err(format!("duplicate step id {:?} (ids are unique across the playbook)", s.id));
                 }
@@ -856,46 +928,50 @@ impl Playbook {
             }
         }
         // Cycles over `needs`, with a group standing for its whole subtree.
-        let mut state: HashMap<&str, u8> = HashMap::new();
-        fn visit<'a>(
-            id: &'a str,
-            index: &HashMap<&'a str, (Vec<&'a str>, &'a Step)>,
-            state: &mut HashMap<&'a str, u8>,
-            path: &mut Vec<&'a str>,
-        ) -> std::result::Result<(), String> {
-            match state.get(id) {
-                Some(2) => return Ok(()),
-                Some(1) => {
-                    let start = path.iter().position(|p| *p == id).unwrap_or(0);
-                    let mut cycle: Vec<&str> = path[start..].to_vec();
-                    cycle.push(id);
-                    return Err(format!("needs form a cycle: {}", cycle.join(" -> ")));
-                }
-                _ => {}
-            }
-            state.insert(id, 1);
-            path.push(id);
+        fn next_of<'a>(id: &str, index: &HashMap<&'a str, (Vec<&'a str>, &'a Step)>) -> Vec<&'a str> {
             let (ancestors, step) = &index[id];
-            let mut next: Vec<&str> = step.needs.iter().map(String::as_str).collect();
+            let mut next: Vec<&'a str> = step.needs.iter().map(String::as_str).collect();
             // A step also waits for whatever its groups wait for, and a group
             // finishes only after its children.
             for a in ancestors {
                 next.extend(index[a].1.needs.iter().map(String::as_str));
             }
             next.extend(step.children.iter().map(|c| c.id.as_str()));
-            for n in next {
-                if index.contains_key(n) {
-                    visit(n, index, state, path)?;
-                }
-            }
-            path.pop();
-            state.insert(id, 2);
-            Ok(())
+            next.retain(|n| index.contains_key(n));
+            next
         }
+        // Depth first with an explicit stack (step, what it waits on, position):
+        // a chain of needs can be as long as the playbook.
+        let mut state: HashMap<&str, u8> = HashMap::new();
         let mut ids: Vec<&str> = index.keys().copied().collect();
         ids.sort_unstable();
-        for id in ids {
-            visit(id, &index, &mut state, &mut Vec::new())?;
+        for root in ids {
+            if state.contains_key(root) {
+                continue;
+            }
+            state.insert(root, 1);
+            let mut stack: Vec<(&str, Vec<&str>, usize)> = vec![(root, next_of(root, &index), 0)];
+            while let Some(top) = stack.last_mut() {
+                let Some(&n) = top.1.get(top.2) else {
+                    state.insert(top.0, 2);
+                    stack.pop();
+                    continue;
+                };
+                top.2 += 1;
+                match state.get(n) {
+                    Some(2) => {}
+                    Some(_) => {
+                        let start = stack.iter().position(|f| f.0 == n).unwrap_or(0);
+                        let mut cycle: Vec<&str> = stack[start..].iter().map(|f| f.0).collect();
+                        cycle.push(n);
+                        return Err(format!("needs form a cycle: {}", cycle.join(" -> ")));
+                    }
+                    None => {
+                        state.insert(n, 1);
+                        stack.push((n, next_of(n, &index), 0));
+                    }
+                }
+            }
         }
 
         // Variables: templates and conditions may only use declared vars and
@@ -917,7 +993,7 @@ impl Playbook {
             check_text("labels", l, &declared)?;
         }
         fn check_steps(
-            steps: &[Step],
+            steps: &[Arc<Step>],
             scope: &BTreeSet<String>,
             declared: &BTreeSet<String>,
             check_text: &TextCheck,

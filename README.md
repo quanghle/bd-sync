@@ -327,9 +327,22 @@ group are all errors. Playbooks are found by name in the workspace's
 `.bd/playbooks/`, then in `$BD_PLAYBOOK_PATH` (colon separated; semicolons on
 Windows), then in `$XDG_CONFIG_HOME/bd/playbooks` (default
 `~/.config/bd/playbooks`, or `%APPDATA%\bd\playbooks` on Windows); a file path
-works too. beads formula files load as they are (`formula`, `depends_on`,
-`expand_vars`, gate `id`, `phase = "vapor"`); a `type = "human"` step is
-rejected with a pointer to human gates.
+works too. In a remote workspace the checkout's playbooks come first, then the
+server's, then your own ([Clients](#clients)). beads formula files load as they are
+(`formula`, `depends_on`, `expand_vars`, gate `id`, `phase = "vapor"`); a
+`type = "human"` step is rejected with a pointer to human gates.
+
+Limits keep a run, and the work of planning it, bounded: a playbook holds at
+most 2,000 steps, which nest at most 32 levels deep (counting expansions), and
+a run at most 2,000 issues, 20,000 dependencies and 16 MiB of text. Variables
+hold at most 256 KiB together, one field renders to at most 1 MiB, and a
+condition is at most 1,024 bytes long. One command loads at most 20,000 steps
+and variables (read from files or inherited through `extends`), and copies at
+most 16 MiB of the descriptions, titles, labels and variable names playbooks
+inherit (inherited steps and variable definitions are shared, not copied).
+Planning a run takes at most 100,000 units of work: each loop iteration (even
+one a condition leaves out), each expansion, and each dependency looked up
+(one, plus one for each issue it stands for).
 
 ### Runs
 
@@ -476,7 +489,8 @@ retry), so slow readers cannot take the slots of short commands like claims.
 A client that takes nothing for 60 s, or takes a streamed answer slower than
 64 KiB/s on average after its first 30 s, loses the rest of it, and its
 command ends. A write's answer is held until the write is done (see below).
-The server logs one
+At most four requests that bring their own playbooks plan at once (another
+is answered 503, which clients retry). The server logs one
 line per request on stderr; set `BD_LOG` to change that. Ctrl-C or SIGTERM
 lets running commands finish first (up to 30 seconds). The server keeps
 connections to each database open, so restart it after replacing or moving a
@@ -675,14 +689,24 @@ What runs where:
   send the file, `--stdin` and `-` send stdin, and `export -o` and
   `playbook extract -o` write the file locally, as `FILE.tmp` renamed into
   place once the command succeeds (so a failed export leaves `FILE` alone).
-- Playbooks run by name from the server's playbook path: the workspace's
-  `.bd/playbooks` (`<root>/<name>/.bd/playbooks`), then the server's
-  `$BD_PLAYBOOK_PATH` and user config directory. File paths are refused.
-  GitHub gates are checked by the server's `gh`, for the repositories
-  `gate.repos` allows, also on the server's own schedule
-  ([Background jobs](#background-jobs-and-backups)).
-- `events --follow` polls the server. `init`, `bench`, `serve` and
-  `playbook extract --save` only run on the machine that holds the database.
+- A playbook name is looked up in the checkout's `.bd/playbooks` first (next
+  to `remote.toml`, or in the nearest `.bd` directory with `--remote` or
+  `BD_REMOTE`), then on the server's playbook path (the workspace's
+  `.bd/playbooks`, `<root>/<name>/.bd/playbooks`, then the server's
+  `$BD_PLAYBOOK_PATH` and user config directory), and only then in your own
+  `$BD_PLAYBOOK_PATH` and user config directory. File paths are relative to
+  the client's current directory. `playbook show`, `plan` and `run` of a
+  playbook found on the client send it along with every file it extends or
+  expands, resolved on the client as locally (at most 256 files of 512 KiB,
+  8 MiB in all), and the server checks and compiles it as a local run would,
+  without reading any other file for it. `playbook list` shows them all in that
+  order, marking the server's, and `show` marks a playbook from the server.
+  `playbook extract --save` writes into the checkout, with a note when the
+  playbook is too large to send. GitHub gates are checked by the server's
+  `gh`, for the repositories `gate.repos` allows, also on the server's own
+  schedule ([Background jobs](#background-jobs-and-backups)).
+- `events --follow` polls the server. `init`, `bench` and `serve` only run
+  on the machine that holds the database.
 - `bd prime`, which session hooks run, gives up within seconds when the
   server is unreachable or there is no access token, and prints a notice instead
   of failing the hook. With `--json` it fails like any other command.
@@ -821,7 +845,8 @@ crates/bd-core/src/   store (WAL, transactions, busy handling) · schema · issu
                       ready · claims (leases) · events · comments · memory · config · transfer (JSONL)
                       metrics · doctor · queries (read API) · gates (conditions, arming, evaluation)
                       policy (what a request's access token may override) · requests (idempotency records)
-                      · playbook/ (model + strict parsing · template · loader · compile · run · extract)
+                      · playbook/ (model + strict parsing · template · loader · bundle (a remote client's
+                      playbook files) · compile · run · extract)
 crates/bd-core/tests/ engine integration tests (graph semantics, leases with a manual clock, concurrency,
                       playbook runs and gates, write policies)
 crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) · batch · bench · fmt · logging

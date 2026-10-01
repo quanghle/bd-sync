@@ -7,6 +7,7 @@
 //! metadata. Steps of a playbook run keep their original step ids.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use rusqlite::Connection;
 use serde_json::{Map, Value};
@@ -146,7 +147,7 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
         by_parent: &HashMap<Option<String>, Vec<Issue>>,
         step_ids: &HashMap<String, String>,
         gates_for: &HashMap<String, StepGate>,
-    ) -> Result<Vec<Step>> {
+    ) -> Result<Vec<Arc<Step>>> {
         let mut out = Vec::new();
         for issue in by_parent.get(&parent).into_iter().flatten() {
             if issue.issue_type == GATE_TYPE {
@@ -193,7 +194,7 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
             }
             step.gate = gates_for.get(&issue.id).cloned();
             step.children = if is_group { children } else { Vec::new() };
-            out.push(step);
+            out.push(Arc::new(step));
         }
         Ok(out)
     }

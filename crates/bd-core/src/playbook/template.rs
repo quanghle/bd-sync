@@ -20,6 +20,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Most text one template may render to.
+pub(crate) const MAX_RENDERED_BYTES: usize = 1 << 20;
+/// Longest step condition: keeps parsing and evaluating one shallow.
+pub(crate) const MAX_CONDITION_LEN: usize = 1024;
+
 pub(crate) fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
@@ -74,19 +79,28 @@ pub(crate) fn refs(text: &str) -> Result<BTreeSet<String>, String> {
         .collect())
 }
 
-/// Substitute every `{{var}}`; unknown variables are errors.
+/// Substitute every `{{var}}`; unknown variables are errors, and so is a
+/// result longer than [`MAX_RENDERED_BYTES`] (checked before it is built).
 pub(crate) fn render(text: &str, vars: &BTreeMap<String, String>) -> Result<String, String> {
     if !text.contains("{{") {
         return Ok(text.to_string());
     }
-    let mut out = String::with_capacity(text.len());
-    for seg in segments(text)? {
+    let segs = segments(text)?;
+    let mut size = 0usize;
+    for seg in &segs {
+        size = size.saturating_add(match seg {
+            Seg::Lit(l) => l.len(),
+            Seg::Var(v) => vars.get(v).ok_or_else(|| format!("unknown variable `{v}` in {text:?}"))?.len(),
+        });
+    }
+    if size > MAX_RENDERED_BYTES {
+        return Err(format!("renders to {size} bytes (at most {} MiB)", MAX_RENDERED_BYTES >> 20));
+    }
+    let mut out = String::with_capacity(size);
+    for seg in &segs {
         match seg {
-            Seg::Lit(l) => out.push_str(&l),
-            Seg::Var(v) => match vars.get(&v) {
-                Some(value) => out.push_str(value),
-                None => return Err(format!("unknown variable `{v}` in {text:?}")),
-            },
+            Seg::Lit(l) => out.push_str(l),
+            Seg::Var(v) => out.push_str(&vars[v]),
         }
     }
     Ok(out)
@@ -297,6 +311,9 @@ impl Parser<'_> {
 
 impl Condition {
     pub(crate) fn parse(src: &str) -> Result<Condition, String> {
+        if src.len() > MAX_CONDITION_LEN {
+            return Err(format!("condition is {} bytes long (at most {MAX_CONDITION_LEN})", src.len()));
+        }
         let toks = tokenize(src)?;
         if toks.is_empty() {
             return Err("empty condition".into());
@@ -335,16 +352,21 @@ impl Condition {
         out
     }
 
-    pub(crate) fn eval(&self, vars: &BTreeMap<String, String>) -> Result<bool, String> {
-        fn val<'a>(v: &'a Val, vars: &'a BTreeMap<String, String>) -> Result<&'a str, String> {
+    /// Evaluate with `vars`, where `extra` (a loop variable and its value)
+    /// takes precedence: an iteration can be decided before its variables are
+    /// copied.
+    pub(crate) fn eval(&self, vars: &BTreeMap<String, String>, extra: Option<(&str, &str)>) -> Result<bool, String> {
+        type Vars<'a> = (&'a BTreeMap<String, String>, Option<(&'a str, &'a str)>);
+        fn val<'a>(v: &'a Val, (vars, extra): Vars<'a>) -> Result<&'a str, String> {
             match v {
                 Val::Text(t) => Ok(t),
-                Val::Var(name) => {
-                    vars.get(name).map(String::as_str).ok_or_else(|| format!("unknown variable `{name}`"))
-                }
+                Val::Var(name) => match extra {
+                    Some((k, value)) if k == name => Ok(value),
+                    _ => vars.get(name).map(String::as_str).ok_or_else(|| format!("unknown variable `{name}`")),
+                },
             }
         }
-        fn eval(e: &Expr, vars: &BTreeMap<String, String>) -> Result<bool, String> {
+        fn eval<'a>(e: &'a Expr, vars: Vars<'a>) -> Result<bool, String> {
             Ok(match e {
                 Expr::Or(a, b) => eval(a, vars)? || eval(b, vars)?,
                 Expr::And(a, b) => eval(a, vars)? && eval(b, vars)?,
@@ -353,7 +375,7 @@ impl Condition {
                 Expr::Cmp(a, eq, b) => (val(a, vars)? == val(b, vars)?) == *eq,
             })
         }
-        eval(&self.expr, vars)
+        eval(&self.expr, (vars, extra))
     }
 }
 
@@ -379,7 +401,7 @@ mod tests {
     #[test]
     fn beads_condition_forms() {
         let v = vars(&[("env", "production"), ("dry", "false"), ("name", "")]);
-        let check = |src: &str| Condition::parse(src).unwrap().eval(&v).unwrap();
+        let check = |src: &str| Condition::parse(src).unwrap().eval(&v, None).unwrap();
         assert!(check("{{env}}"));
         assert!(!check("{{dry}}"));
         assert!(check("!{{dry}}"));
@@ -392,15 +414,36 @@ mod tests {
     #[test]
     fn boolean_conditions() {
         let v = vars(&[("env", "production"), ("canary", "yes"), ("region", "eu")]);
-        let check = |src: &str| Condition::parse(src).unwrap().eval(&v).unwrap();
+        let check = |src: &str| Condition::parse(src).unwrap().eval(&v, None).unwrap();
         assert!(check("{{env}} == production && {{canary}}"));
         assert!(!check("{{env}} == staging || !{{canary}}"));
         assert!(check("({{region}} == us || {{region}} == eu) && !({{env}} == staging)"));
         let c = Condition::parse("{{env}} == x || {{other}}").unwrap();
         assert_eq!(c.vars().into_iter().collect::<Vec<_>>(), vec!["env", "other"]);
-        assert!(c.eval(&v).unwrap_err().contains("other"));
+        assert!(c.eval(&v, None).unwrap_err().contains("other"));
         for bad in ["", "{{env}} ==", "({{env}}", "{{env}} == a b", "'open"] {
             assert!(Condition::parse(bad).is_err(), "{bad:?} should not parse");
         }
+    }
+
+    #[test]
+    fn limits_keep_untrusted_templates_small_and_shallow() {
+        let v = vars(&[("big", &"x".repeat(1000))]);
+        let ok = "{{big}}".repeat(MAX_RENDERED_BYTES / 1000);
+        assert_eq!(render(&ok, &v).unwrap().len(), MAX_RENDERED_BYTES / 1000 * 1000);
+        let err = render(&format!("{ok}{{{{big}}}}"), &v).unwrap_err();
+        assert!(err.contains("at most 1 MiB"), "{err}");
+
+        // Deep nesting would overflow the stack of a server thread; long conditions are refused.
+        let deep = format!("{}a", "!".repeat(MAX_CONDITION_LEN));
+        assert!(Condition::parse(&deep).unwrap_err().contains("at most"));
+        let chain = ["a"; 400].join(" && ");
+        assert!(chain.len() > MAX_CONDITION_LEN && Condition::parse(&chain).is_err());
+        let longest = format!("{}a", "!".repeat(MAX_CONDITION_LEN - 1));
+        let handle = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(move || Condition::parse(&longest).unwrap().eval(&BTreeMap::new(), None).unwrap())
+            .unwrap();
+        assert!(!handle.join().unwrap(), "1023 negations of a truthy word");
     }
 }

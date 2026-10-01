@@ -33,6 +33,7 @@ use crate::cli::*;
 use crate::credentials::{self, Scope};
 use crate::fmt;
 use crate::io;
+use crate::playbooks;
 use crate::protocol::{
     ErrorBody, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, Frame, PROTOCOL, PROTOCOL_HEADER,
     valid_workspace_name,
@@ -96,7 +97,7 @@ fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-fn env_actor() -> Option<String> {
+pub fn env_actor() -> Option<String> {
     env("BD_ACTOR").or_else(|| env("BEADS_ACTOR"))
 }
 
@@ -334,6 +335,11 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
             let code = follow_events(app, remote, a)?;
             return Ok(ExecResponse { exit_code: code, ..Default::default() });
         }
+        Command::Playbook(cmd) => {
+            if let Some(code) = playbooks::client_command(app, remote, cmd)? {
+                return Ok(ExecResponse { exit_code: code, ..Default::default() });
+            }
+        }
         _ => {}
     }
     let argv = std::env::args_os()
@@ -348,10 +354,13 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
         ..Default::default()
     };
     attach_inputs(&cli.command, &mut request)?;
+    playbooks::attach_bundle(app, &cli.command, &mut request)?;
     check_outputs(app, &cli.command)?;
     // A session hook prints `bd prime` only once it knows the command worked.
     let write = crate::serve::access(&cli.command) == crate::serve::Access::Write;
-    remote.exec_into(&request, &mut Delivery::new(output_files(app, &cli.command), hook, write))
+    let response = remote.exec_into(&request, &mut Delivery::new(output_files(app, &cli.command), hook, write))?;
+    playbooks::check_server(&request, &response, &remote.url)?;
+    Ok(response)
 }
 
 /// The error a failed command reported (its `--json` error, or its first stderr line).

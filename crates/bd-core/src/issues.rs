@@ -1,0 +1,828 @@
+//! Issue lifecycle: create, read, list, update, close, reopen, defer, delete.
+
+use std::collections::{BTreeSet, VecDeque};
+
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
+use serde::Serialize;
+use serde_json::{Map, Value, json};
+
+use crate::claims;
+use crate::comments;
+use crate::config;
+use crate::error::{Error, Result};
+use crate::filter::{QueryParts, apply_work_filter, like_escape, placeholders};
+use crate::graph;
+use crate::ids;
+use crate::model::{
+    BUILTIN_TYPES, DepType, Guard, Issue, IssueDetails, IssuePatch, IssueRef, ListQuery, ListSort, MAX_TITLE_CHARS,
+    NewIssue, Outcome, Status, empty_object,
+};
+use crate::ready;
+use crate::store::{WriteCtx, validate_actor};
+use crate::time::Timestamp;
+
+pub(crate) const ISSUE_COLUMNS: &str = "i.id, i.title, i.description, i.design, i.acceptance_criteria, i.notes,
+    i.status, i.priority, i.issue_type, i.assignee, i.created_by, i.external_ref, i.estimated_minutes,
+    i.metadata, i.created_at, i.updated_at, i.started_at, i.closed_at, i.close_reason, i.close_outcome,
+    i.due_at, i.defer_until, i.is_blocked, i.revision,
+    (SELECT json_group_array(label) FROM (SELECT label FROM labels l WHERE l.issue_id = i.id ORDER BY label))";
+
+pub(crate) fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<Issue> {
+    let metadata: String = r.get(13)?;
+    let labels: String = r.get(24)?;
+    Ok(Issue {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        description: r.get(2)?,
+        design: r.get(3)?,
+        acceptance_criteria: r.get(4)?,
+        notes: r.get(5)?,
+        status: r.get(6)?,
+        priority: r.get::<_, i64>(7)? as u8,
+        issue_type: r.get(8)?,
+        assignee: r.get(9)?,
+        created_by: r.get(10)?,
+        external_ref: r.get(11)?,
+        estimated_minutes: r.get(12)?,
+        metadata: serde_json::from_str(&metadata).unwrap_or_else(|_| empty_object()),
+        created_at: r.get(14)?,
+        updated_at: r.get(15)?,
+        started_at: r.get(16)?,
+        closed_at: r.get(17)?,
+        close_reason: r.get(18)?,
+        close_outcome: r.get(19)?,
+        due_at: r.get(20)?,
+        defer_until: r.get(21)?,
+        is_blocked: r.get::<_, i64>(22)? != 0,
+        revision: r.get(23)?,
+        labels: serde_json::from_str(&labels).unwrap_or_default(),
+    })
+}
+
+pub fn get(conn: &Connection, id: &str) -> Result<Option<Issue>> {
+    let sql = format!("SELECT {ISSUE_COLUMNS} FROM issues i WHERE i.id = ?1");
+    Ok(conn.prepare_cached(&sql)?.query_row([id], issue_from_row).optional()?)
+}
+
+pub fn require(conn: &Connection, id: &str) -> Result<Issue> {
+    get(conn, id)?.ok_or_else(|| Error::not_found("issue", id))
+}
+
+/// Resolve user input to an issue id: exact id, then `<prefix>-<input>`, then
+/// a unique id prefix.
+pub fn resolve_id(conn: &Connection, input: &str) -> Result<String> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(Error::invalid("issue id must not be empty"));
+    }
+    if ids::exists(conn, input)? {
+        return Ok(input.to_string());
+    }
+    let prefixed = format!("{}-{input}", config::prefix(conn)?);
+    if ids::exists(conn, &prefixed)? {
+        return Ok(prefixed);
+    }
+    let mut matches: Vec<String> = Vec::new();
+    for candidate in [input, prefixed.as_str()] {
+        let mut stmt = conn.prepare_cached("SELECT id FROM issues WHERE id LIKE ?1 ESCAPE '\\' ORDER BY id LIMIT 6")?;
+        for row in stmt.query_map([format!("{}%", like_escape(candidate))], |r| r.get::<_, String>(0))? {
+            let id = row?;
+            if !matches.contains(&id) {
+                matches.push(id);
+            }
+        }
+    }
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(Error::not_found("issue", input)),
+        _ => Err(Error::invalid(format!("ambiguous id {input:?}: matches {}", matches.join(", ")))),
+    }
+}
+
+pub fn list(conn: &Connection, q: &ListQuery) -> Result<Vec<Issue>> {
+    let mut parts = QueryParts::default();
+    if !q.statuses.is_empty() {
+        parts.cond(
+            &format!("i.status IN {}", placeholders(q.statuses.len())),
+            q.statuses.iter().map(|s| SqlValue::Text(s.as_str().into())),
+        );
+    } else if !q.all {
+        parts.cond("i.status NOT IN ('closed','pinned')", []);
+    }
+    apply_work_filter(&mut parts, &q.filter);
+    if q.blocked_only {
+        parts.cond("i.is_blocked = 1", []);
+    }
+    if let Some(s) = q.search.as_deref().filter(|s| !s.trim().is_empty()) {
+        let pat = SqlValue::Text(format!("%{}%", like_escape(s.trim())));
+        parts.cond(
+            "(i.id LIKE ? ESCAPE '\\' OR i.title LIKE ? ESCAPE '\\' OR i.description LIKE ? ESCAPE '\\' OR i.notes LIKE ? ESCAPE '\\')",
+            [pat.clone(), pat.clone(), pat.clone(), pat],
+        );
+    }
+    let (asc, desc) = if q.reverse { ("DESC", "ASC") } else { ("ASC", "DESC") };
+    let order = match q.sort {
+        ListSort::Priority => format!("ORDER BY i.priority {asc}, i.created_at {asc}, i.id {asc}"),
+        ListSort::Created => format!("ORDER BY i.created_at {desc}, i.id {desc}"),
+        ListSort::Updated => format!("ORDER BY i.updated_at {desc}, i.id {desc}"),
+        ListSort::Id => format!("ORDER BY i.id {asc}"),
+    };
+    let (tail, tail_params) = match q.limit {
+        Some(n) => (format!("{order} LIMIT ?"), vec![SqlValue::Integer(n as i64)]),
+        None => (order, vec![]),
+    };
+    let (sql, params) = parts.build(&format!("SELECT {ISSUE_COLUMNS} FROM issues i"), &tail, tail_params);
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), issue_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub(crate) fn refs(conn: &Connection, ids: &[String]) -> Result<Vec<IssueRef>> {
+    ids.iter().map(|id| require(conn, id).map(|i| i.to_ref())).collect()
+}
+
+pub fn children(conn: &Connection, id: &str) -> Result<Vec<IssueRef>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, c.title, c.status, c.priority, c.issue_type, c.assignee
+         FROM dependencies d JOIN issues c ON c.id = d.issue_id
+         WHERE d.depends_on_id = ?1 AND d.dep_type = 'parent-child'
+         ORDER BY c.created_at, c.id",
+    )?;
+    let rows = stmt.query_map([id], |r| {
+        Ok(IssueRef {
+            id: r.get(0)?,
+            title: r.get(1)?,
+            status: r.get(2)?,
+            priority: r.get::<_, i64>(3)? as u8,
+            issue_type: r.get(4)?,
+            assignee: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn open_children(conn: &Connection, id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id FROM dependencies d JOIN issues c ON c.id = d.issue_id
+         WHERE d.depends_on_id = ?1 AND d.dep_type = 'parent-child' AND c.status <> 'closed'
+         ORDER BY c.id",
+    )?;
+    let rows = stmt.query_map([id], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn details(conn: &Connection, id: &str, now: Timestamp) -> Result<IssueDetails> {
+    let issue = require(conn, id)?;
+    let mut dependencies = graph::dependencies_of(conn, id)?;
+    dependencies.retain(|e| e.dep_type != DepType::ParentChild);
+    let mut dependents = graph::dependents_of(conn, id)?;
+    dependents.retain(|e| e.dep_type != DepType::ParentChild);
+    Ok(IssueDetails {
+        parent: graph::parent_of(conn, id)?,
+        children: children(conn, id)?,
+        dependencies,
+        dependents,
+        blockers: graph::blockers(conn, id)?,
+        lease: claims::get_lease(conn, id)?,
+        comments: comments::list(conn, id)?,
+        deferred_by: ready::deferral_source(conn, id, now)?,
+        issue,
+    })
+}
+
+/// Distinct labels with usage counts.
+pub fn label_counts(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare_cached("SELECT label, COUNT(*) FROM labels GROUP BY label ORDER BY label")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// JSON snapshot of an issue with its outgoing edges (for events and export).
+pub(crate) fn snapshot(conn: &Connection, id: &str) -> Result<Value> {
+    let issue = require(conn, id)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT depends_on_id, dep_type, metadata FROM dependencies WHERE issue_id = ?1 ORDER BY depends_on_id",
+    )?;
+    let deps: Vec<Value> = stmt
+        .query_map([id], |r| {
+            let metadata: String = r.get(2)?;
+            Ok(json!({
+                "target": r.get::<_, String>(0)?,
+                "type": r.get::<_, String>(1)?,
+                "metadata": serde_json::from_str::<Value>(&metadata).unwrap_or_else(|_| empty_object()),
+            }))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut v = serde_json::to_value(issue)?;
+    v["dependencies"] = Value::Array(deps);
+    Ok(v)
+}
+
+pub(crate) fn validate_title(title: &str) -> Result<String> {
+    let t = title.trim();
+    if t.is_empty() {
+        return Err(Error::invalid("title is required"));
+    }
+    if t.chars().count() > MAX_TITLE_CHARS {
+        return Err(Error::invalid(format!("title must be at most {MAX_TITLE_CHARS} characters")));
+    }
+    Ok(t.to_string())
+}
+
+pub(crate) fn validate_priority(p: u8) -> Result<u8> {
+    if p > 4 {
+        return Err(Error::invalid(format!("priority must be 0-4 (got {p})")));
+    }
+    Ok(p)
+}
+
+pub(crate) fn validate_type(conn: &Connection, t: &str) -> Result<String> {
+    let norm = t.trim().to_ascii_lowercase();
+    let norm = match norm.as_str() {
+        "feat" | "enhancement" => "feature".to_string(),
+        "adr" | "dec" => "decision".to_string(),
+        _ => norm,
+    };
+    if BUILTIN_TYPES.contains(&norm.as_str()) || config::custom_types(conn)?.contains(&norm) {
+        return Ok(norm);
+    }
+    Err(Error::invalid(format!(
+        "unknown issue type {t:?} (built-in: {}; add more with `bd config set types.custom <a,b>`)",
+        BUILTIN_TYPES.join(", ")
+    )))
+}
+
+/// Trim, drop empties, de-duplicate (first occurrence wins). Case is kept.
+pub fn normalize_labels(labels: &[String]) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in labels {
+        let l = raw.trim();
+        if l.is_empty() {
+            continue;
+        }
+        if l.contains(',') || l.chars().any(char::is_control) || l.chars().count() > 128 {
+            return Err(Error::invalid(format!("invalid label {l:?} (no commas or control characters, max 128)")));
+        }
+        if !out.iter().any(|x| x == l) {
+            out.push(l.to_string());
+        }
+    }
+    Ok(out)
+}
+
+fn validate_metadata(v: &Value) -> Result<()> {
+    if v.is_object() { Ok(()) } else { Err(Error::invalid("metadata must be a JSON object")) }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CloseOptions {
+    pub reason: Option<String>,
+    pub outcome: Option<Outcome>,
+    /// Close despite open children or live blockers.
+    pub force: bool,
+    pub guard: Guard,
+    /// Fencing token from `claim`: close only while that lease is still held.
+    pub token: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CloseOutcome {
+    pub issue: Issue,
+    pub already_closed: bool,
+    /// Issues whose last blocker this close released.
+    pub unblocked: Vec<IssueRef>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ReopenOutcome {
+    pub issue: Issue,
+    pub already_open: bool,
+    /// Dependents that are blocked again because this issue is live.
+    pub newly_blocked: Vec<IssueRef>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UpdateOutcome {
+    pub issue: Issue,
+    /// Names of the fields that changed (empty = no-op, nothing written).
+    pub changed: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DeleteOptions {
+    /// Also delete everything that transitively depends on the targets
+    /// through readiness edges (blocks, conditional-blocks, parent-child, waits-for).
+    pub cascade: bool,
+    /// Delete even though other issues depend on the targets (drops those edges).
+    pub force: bool,
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct DeleteOutcome {
+    pub deleted: Vec<String>,
+    /// Surviving issues that lost an edge to a deleted issue.
+    pub detached: Vec<String>,
+    pub dry_run: bool,
+}
+
+fn record_change<T: Serialize + PartialEq>(changes: &mut Map<String, Value>, field: &str, old: &T, new: &T) {
+    if old != new {
+        changes.insert(
+            field.to_string(),
+            json!({ "old": serde_json::to_value(old).unwrap_or(Value::Null), "new": serde_json::to_value(new).unwrap_or(Value::Null) }),
+        );
+    }
+}
+
+impl WriteCtx<'_> {
+    pub fn create_issue(&mut self, new: NewIssue) -> Result<Issue> {
+        let title = validate_title(&new.title)?;
+        let issue_type = validate_type(self.conn(), new.issue_type.as_deref().unwrap_or("task"))?;
+        let priority = validate_priority(new.priority.unwrap_or(2))?;
+        let status = new.status.unwrap_or(Status::Open);
+        if matches!(status, Status::InProgress | Status::Closed) {
+            return Err(Error::invalid(
+                "new issues start open, blocked, deferred or pinned; claim or close them afterwards",
+            ));
+        }
+        if let Some(a) = &new.assignee {
+            validate_actor(a)?;
+        }
+        if new.estimated_minutes.is_some_and(|m| m < 0) {
+            return Err(Error::invalid("estimate must be non-negative"));
+        }
+        let labels = normalize_labels(&new.labels)?;
+        let metadata = new.metadata.clone().unwrap_or_else(empty_object);
+        validate_metadata(&metadata)?;
+
+        let mut parent = new.parent.clone();
+        let mut deps: Vec<(DepType, String)> = Vec::new();
+        for (t, target) in &new.deps {
+            if *t == DepType::ParentChild {
+                if parent.as_ref().is_some_and(|p| p != target) {
+                    return Err(Error::invalid("an issue can have only one parent"));
+                }
+                parent = Some(target.clone());
+            } else if !deps.iter().any(|(_, x)| x == target) {
+                deps.push((t.clone(), target.clone()));
+            } else {
+                return Err(Error::invalid(format!("duplicate dependency on {target}")));
+            }
+        }
+        for target in parent.iter().chain(deps.iter().map(|(_, t)| t)) {
+            if !ids::exists(self.conn(), target)? {
+                return Err(Error::not_found("issue", target.as_str()));
+            }
+        }
+
+        let id = match &new.id {
+            Some(id) => {
+                ids::validate_explicit_id(id)?;
+                if ids::exists(self.conn(), id)? {
+                    return Err(Error::invalid(format!("issue {id} already exists")));
+                }
+                id.clone()
+            }
+            None => match &parent {
+                Some(p) => ids::next_child_id(self.conn(), p)?,
+                None => ids::next_issue_id(self.conn(), &title, &new.description, self.actor())?,
+            },
+        };
+
+        let now = self.now();
+        self.conn()
+            .prepare_cached(
+                "INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority,
+                    issue_type, assignee, created_by, external_ref, estimated_minutes, metadata, created_at,
+                    updated_at, due_at, defer_until, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15, ?16, ?17, 1)",
+            )?
+            .execute(params![
+                id,
+                title,
+                new.description,
+                new.design,
+                new.acceptance_criteria,
+                new.notes,
+                status,
+                priority,
+                issue_type,
+                new.assignee,
+                self.actor(),
+                new.external_ref.clone().filter(|s| !s.trim().is_empty()),
+                new.estimated_minutes,
+                metadata.to_string(),
+                now,
+                new.due_at,
+                new.defer_until,
+            ])?;
+        for label in &labels {
+            self.conn()
+                .prepare_cached("INSERT INTO labels (issue_id, label) VALUES (?1, ?2)")?
+                .execute([&id, label])?;
+        }
+        let issue_json = serde_json::to_value(require(self.conn(), &id)?)?;
+        self.emit("created", Some(&id), json!({ "issue": issue_json }))?;
+
+        let mut seeds = Vec::new();
+        if let Some(p) = &parent {
+            graph::insert_edge_checked(self, &id, p, &DepType::ParentChild, empty_object())?;
+            seeds.extend(graph::seeds_for_edge(self.conn(), &id, p, &DepType::ParentChild)?);
+        }
+        for (t, target) in &deps {
+            graph::insert_edge_checked(self, &id, target, t, empty_object())?;
+            seeds.extend(graph::seeds_for_edge(self.conn(), &id, target, t)?);
+        }
+        graph::recompute(self, seeds)?;
+        require(self.conn(), &id)
+    }
+
+    pub fn update_issue(&mut self, id: &str, patch: &IssuePatch, guard: &Guard, force: bool) -> Result<UpdateOutcome> {
+        let old = require(self.conn(), id)?;
+        guard.check(&old)?;
+        let mut new = old.clone();
+
+        if let Some(t) = &patch.title {
+            new.title = validate_title(t)?;
+        }
+        if let Some(v) = &patch.description {
+            new.description = v.clone();
+        }
+        if let Some(v) = &patch.design {
+            new.design = v.clone();
+        }
+        if let Some(v) = &patch.acceptance_criteria {
+            new.acceptance_criteria = v.clone();
+        }
+        match (&patch.notes, &patch.append_notes) {
+            (Some(_), Some(_)) => return Err(Error::invalid("use either notes or append_notes, not both")),
+            (Some(n), None) => new.notes = n.clone(),
+            (None, Some(a)) => {
+                new.notes = if old.notes.is_empty() { a.clone() } else { format!("{}\n{a}", old.notes) };
+            }
+            (None, None) => {}
+        }
+        if let Some(p) = patch.priority {
+            new.priority = validate_priority(p)?;
+        }
+        if let Some(t) = &patch.issue_type {
+            new.issue_type = validate_type(self.conn(), t)?;
+        }
+        if let Some(a) = &patch.assignee {
+            if let Some(name) = a {
+                validate_actor(name)?;
+            }
+            new.assignee = a.clone();
+        }
+        if let Some(r) = &patch.external_ref {
+            new.external_ref = r.clone().filter(|s| !s.trim().is_empty());
+        }
+        if let Some(m) = patch.estimated_minutes {
+            if m.is_some_and(|v| v < 0) {
+                return Err(Error::invalid("estimate must be non-negative"));
+            }
+            new.estimated_minutes = m;
+        }
+        if let Some(d) = patch.due_at {
+            new.due_at = d;
+        }
+        if let Some(d) = patch.defer_until {
+            new.defer_until = d;
+        }
+        if patch.metadata.is_some() || !patch.set_metadata.is_empty() || !patch.unset_metadata.is_empty() {
+            let mut meta = patch.metadata.clone().unwrap_or_else(|| old.metadata.clone());
+            let obj = meta.as_object_mut().ok_or_else(|| Error::invalid("metadata must be a JSON object"))?;
+            for (k, v) in &patch.set_metadata {
+                obj.insert(k.clone(), v.clone());
+            }
+            for k in &patch.unset_metadata {
+                obj.remove(k);
+            }
+            new.metadata = meta;
+        }
+        if let Some(s) = patch.status {
+            if s == Status::Closed && old.status != Status::Closed {
+                return Err(Error::invalid("use `bd close` to close an issue"));
+            }
+            if old.status == Status::Closed && s != Status::Closed {
+                return Err(Error::invalid("use `bd reopen` to reopen a closed issue"));
+            }
+            new.status = s;
+        }
+
+        let was_claimed = old.status == Status::InProgress;
+        let is_claimed = new.status == Status::InProgress;
+        if is_claimed && new.assignee.is_none() {
+            return Err(Error::invalid("an in_progress issue needs an assignee; use `bd release` to give up a claim"));
+        }
+        if was_claimed
+            && is_claimed
+            && old.assignee != new.assignee
+            && !force
+            && old.assignee.as_deref() != Some(self.actor())
+        {
+            return Err(Error::AlreadyClaimed { id: id.to_string(), holder: old.assignee.clone().unwrap_or_default() });
+        }
+        if is_claimed && new.started_at.is_none() {
+            new.started_at = Some(self.now());
+        }
+        if was_claimed && new.status == Status::Open {
+            new.started_at = None;
+        }
+
+        let mut labels = match &patch.set_labels {
+            Some(set) => normalize_labels(set)?,
+            None => old.labels.clone(),
+        };
+        for l in normalize_labels(&patch.add_labels)? {
+            if !labels.contains(&l) {
+                labels.push(l);
+            }
+        }
+        let remove = normalize_labels(&patch.remove_labels)?;
+        labels.retain(|l| !remove.contains(l));
+        labels.sort();
+        new.labels = labels;
+        let added: Vec<String> = new.labels.iter().filter(|l| !old.labels.contains(l)).cloned().collect();
+        let removed: Vec<String> = old.labels.iter().filter(|l| !new.labels.contains(l)).cloned().collect();
+
+        let parent_change = match &patch.parent {
+            Some(target) => {
+                let current = graph::parent_of(self.conn(), id)?;
+                if current.as_deref() == target.as_deref() {
+                    None
+                } else {
+                    if let Some(t) = target {
+                        if t == id {
+                            return Err(Error::invalid(format!("{id} cannot be its own parent")));
+                        }
+                        if !ids::exists(self.conn(), t)? {
+                            return Err(Error::not_found("issue", t.as_str()));
+                        }
+                    }
+                    Some((current, target.clone()))
+                }
+            }
+            None => None,
+        };
+
+        let mut changes = Map::new();
+        record_change(&mut changes, "title", &old.title, &new.title);
+        record_change(&mut changes, "description", &old.description, &new.description);
+        record_change(&mut changes, "design", &old.design, &new.design);
+        record_change(&mut changes, "acceptance_criteria", &old.acceptance_criteria, &new.acceptance_criteria);
+        record_change(&mut changes, "notes", &old.notes, &new.notes);
+        record_change(&mut changes, "status", &old.status, &new.status);
+        record_change(&mut changes, "priority", &old.priority, &new.priority);
+        record_change(&mut changes, "issue_type", &old.issue_type, &new.issue_type);
+        record_change(&mut changes, "assignee", &old.assignee, &new.assignee);
+        record_change(&mut changes, "external_ref", &old.external_ref, &new.external_ref);
+        record_change(&mut changes, "estimated_minutes", &old.estimated_minutes, &new.estimated_minutes);
+        record_change(&mut changes, "due_at", &old.due_at, &new.due_at);
+        record_change(&mut changes, "defer_until", &old.defer_until, &new.defer_until);
+        record_change(&mut changes, "metadata", &old.metadata, &new.metadata);
+        if !added.is_empty() || !removed.is_empty() {
+            changes.insert("labels".into(), json!({ "added": added, "removed": removed }));
+        }
+        if let Some((o, n)) = &parent_change {
+            changes.insert("parent".into(), json!({ "old": o, "new": n }));
+        }
+        if changes.is_empty() {
+            return Ok(UpdateOutcome { issue: old, changed: Vec::new() });
+        }
+
+        self.conn()
+            .prepare_cached(
+                "UPDATE issues SET title = ?1, description = ?2, design = ?3, acceptance_criteria = ?4, notes = ?5,
+                    status = ?6, priority = ?7, issue_type = ?8, assignee = ?9, external_ref = ?10,
+                    estimated_minutes = ?11, metadata = ?12, started_at = ?13, due_at = ?14, defer_until = ?15,
+                    updated_at = ?16, revision = revision + 1
+                 WHERE id = ?17",
+            )?
+            .execute(params![
+                new.title,
+                new.description,
+                new.design,
+                new.acceptance_criteria,
+                new.notes,
+                new.status,
+                new.priority,
+                new.issue_type,
+                new.assignee,
+                new.external_ref,
+                new.estimated_minutes,
+                new.metadata.to_string(),
+                new.started_at,
+                new.due_at,
+                new.defer_until,
+                self.now(),
+                id,
+            ])?;
+        for l in &removed {
+            self.conn().prepare_cached("DELETE FROM labels WHERE issue_id = ?1 AND label = ?2")?.execute([id, l])?;
+        }
+        for l in &added {
+            self.conn().prepare_cached("INSERT INTO labels (issue_id, label) VALUES (?1, ?2)")?.execute([id, l])?;
+        }
+        let changed: Vec<String> = changes.keys().cloned().collect();
+        let seq = self.emit("updated", Some(id), json!({ "changes": changes }))?;
+
+        let mut seeds = Vec::new();
+        if let Some((old_parent, new_parent)) = parent_change {
+            if let Some(p) = &old_parent {
+                graph::delete_edge(self, id, p)?;
+                seeds.extend(graph::seeds_for_edge(self.conn(), id, p, &DepType::ParentChild)?);
+            }
+            if let Some(p) = &new_parent {
+                graph::insert_edge_checked(self, id, p, &DepType::ParentChild, empty_object())?;
+                seeds.extend(graph::seeds_for_edge(self.conn(), id, p, &DepType::ParentChild)?);
+            }
+        }
+        if was_claimed && (!is_claimed || old.assignee != new.assignee) {
+            claims::delete_lease(self.conn(), id)?;
+        }
+        if is_claimed && (!was_claimed || old.assignee != new.assignee) {
+            let ttl = config::lease_ttl(self.conn())?;
+            let holder = new.assignee.clone().expect("checked above");
+            claims::upsert_lease(self.conn(), id, &holder, seq, self.now(), ttl)?;
+        }
+        if old.status.is_terminal() != new.status.is_terminal() {
+            seeds.extend(graph::seeds_for_terminal_flip(self.conn(), id)?);
+        }
+        graph::recompute(self, seeds)?;
+        Ok(UpdateOutcome { issue: require(self.conn(), id)?, changed })
+    }
+
+    pub fn close_issue(&mut self, id: &str, opts: &CloseOptions) -> Result<CloseOutcome> {
+        let old = require(self.conn(), id)?;
+        opts.guard.check(&old)?;
+        if old.status == Status::Closed {
+            return Ok(CloseOutcome { issue: old, already_closed: true, unblocked: Vec::new() });
+        }
+        if let Some(token) = opts.token {
+            claims::check_token(self.conn(), id, self.actor(), token)?;
+        }
+        if !opts.force {
+            let open = open_children(self.conn(), id)?;
+            if !open.is_empty() {
+                return Err(Error::Refused(format!(
+                    "{id} has {} open child issue(s): {}; close them first or pass --force",
+                    open.len(),
+                    open.join(", ")
+                )));
+            }
+            if old.is_blocked {
+                let blockers: Vec<String> = graph::blockers(self.conn(), id)?.into_iter().map(|b| b.id).collect();
+                return Err(Error::Refused(format!(
+                    "{id} is blocked by {}; pass --force to close it anyway",
+                    blockers.join(", ")
+                )));
+            }
+        }
+        let reason = opts.reason.clone().filter(|r| !r.trim().is_empty());
+        let outcome = opts.outcome.unwrap_or(Outcome::Done);
+        self.conn()
+            .prepare_cached(
+                "UPDATE issues SET status = 'closed', closed_at = ?1, close_reason = ?2, close_outcome = ?3,
+                    updated_at = ?1, revision = revision + 1
+                 WHERE id = ?4",
+            )?
+            .execute(params![self.now(), reason, outcome, id])?;
+        claims::delete_lease(self.conn(), id)?;
+        self.emit(
+            "closed",
+            Some(id),
+            json!({ "reason": reason, "outcome": outcome, "previous_status": old.status, "assignee": old.assignee }),
+        )?;
+        let seeds = graph::seeds_for_terminal_flip(self.conn(), id)?;
+        let changes = graph::recompute(self, seeds)?;
+        let freed: Vec<String> = changes.into_iter().filter(|c| !c.blocked && c.id != id).map(|c| c.id).collect();
+        Ok(CloseOutcome {
+            issue: require(self.conn(), id)?,
+            already_closed: false,
+            unblocked: refs(self.conn(), &freed)?,
+        })
+    }
+
+    pub fn reopen_issue(&mut self, id: &str, reason: Option<&str>) -> Result<ReopenOutcome> {
+        let old = require(self.conn(), id)?;
+        if old.status != Status::Closed {
+            return Ok(ReopenOutcome { issue: old, already_open: true, newly_blocked: Vec::new() });
+        }
+        self.conn()
+            .prepare_cached(
+                "UPDATE issues SET status = 'open', closed_at = NULL, close_reason = NULL, close_outcome = NULL,
+                    updated_at = ?1, revision = revision + 1
+                 WHERE id = ?2",
+            )?
+            .execute(params![self.now(), id])?;
+        let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+        self.emit("reopened", Some(id), json!({ "reason": reason }))?;
+        let seeds = graph::seeds_for_terminal_flip(self.conn(), id)?;
+        let changes = graph::recompute(self, seeds)?;
+        let blocked: Vec<String> = changes.into_iter().filter(|c| c.blocked && c.id != id).map(|c| c.id).collect();
+        Ok(ReopenOutcome {
+            issue: require(self.conn(), id)?,
+            already_open: false,
+            newly_blocked: refs(self.conn(), &blocked)?,
+        })
+    }
+
+    /// `until = Some(t)`: hide from ready until `t` (status unchanged).
+    /// `until = None`: park indefinitely (status `deferred`).
+    pub fn defer_issue(&mut self, id: &str, until: Option<Timestamp>) -> Result<UpdateOutcome> {
+        let issue = require(self.conn(), id)?;
+        match issue.status {
+            Status::Closed => return Err(Error::invalid(format!("{id} is closed"))),
+            Status::InProgress => {
+                return Err(Error::invalid(format!("{id} is in progress; release it first (`bd release {id}`)")));
+            }
+            _ => {}
+        }
+        let patch = match until {
+            Some(t) => IssuePatch { defer_until: Some(Some(t)), ..Default::default() },
+            None => IssuePatch { status: Some(Status::Deferred), ..Default::default() },
+        };
+        self.update_issue(id, &patch, &Guard::default(), false)
+    }
+
+    pub fn undefer_issue(&mut self, id: &str) -> Result<UpdateOutcome> {
+        let issue = require(self.conn(), id)?;
+        let patch = IssuePatch {
+            defer_until: issue.defer_until.map(|_| None),
+            status: (issue.status == Status::Deferred).then_some(Status::Open),
+            ..Default::default()
+        };
+        self.update_issue(id, &patch, &Guard::default(), false)
+    }
+
+    pub fn delete_issues(&mut self, ids_in: &[String], opts: &DeleteOptions) -> Result<DeleteOutcome> {
+        let mut set: BTreeSet<String> = BTreeSet::new();
+        for id in ids_in {
+            if !ids::exists(self.conn(), id)? {
+                return Err(Error::not_found("issue", id.as_str()));
+            }
+            set.insert(id.clone());
+        }
+        if opts.cascade {
+            let mut queue: VecDeque<String> = set.iter().cloned().collect();
+            let mut stmt = self.conn().prepare_cached(
+                "SELECT issue_id FROM dependencies WHERE depends_on_id = ?1
+                 AND dep_type IN ('blocks','conditional-blocks','parent-child','waits-for')",
+            )?;
+            while let Some(x) = queue.pop_front() {
+                for row in stmt.query_map([&x], |r| r.get::<_, String>(0))? {
+                    let d = row?;
+                    if set.insert(d.clone()) {
+                        queue.push_back(d);
+                    }
+                }
+            }
+        }
+        let mut detached: BTreeSet<String> = BTreeSet::new();
+        {
+            let mut stmt = self.conn().prepare_cached("SELECT issue_id FROM dependencies WHERE depends_on_id = ?1")?;
+            for s in &set {
+                for row in stmt.query_map([s], |r| r.get::<_, String>(0))? {
+                    let d = row?;
+                    if !set.contains(&d) {
+                        detached.insert(d);
+                    }
+                }
+            }
+        }
+        if !detached.is_empty() && !opts.force && !opts.cascade {
+            return Err(Error::Refused(format!(
+                "{} other issue(s) depend on the issue(s) being deleted ({}); pass --cascade to delete them too or --force to drop those edges",
+                detached.len(),
+                detached.iter().cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let deleted: Vec<String> = set.iter().cloned().collect();
+        let detached: Vec<String> = detached.into_iter().collect();
+        if opts.dry_run {
+            return Ok(DeleteOutcome { deleted, detached, dry_run: true });
+        }
+        let mut seeds: Vec<String> = detached.clone();
+        for s in &deleted {
+            if let Some(p) = graph::parent_of(self.conn(), s)? {
+                if !set.contains(&p) {
+                    seeds.extend(graph::waiters_on(self.conn(), &p)?);
+                }
+            }
+        }
+        for s in &deleted {
+            let snap = snapshot(self.conn(), s)?;
+            self.emit("deleted", Some(s), json!({ "issue": snap }))?;
+        }
+        for chunk in deleted.chunks(500) {
+            let sql = format!("DELETE FROM issues WHERE id IN {}", placeholders(chunk.len()));
+            self.conn().execute(&sql, params_from_iter(chunk.iter()))?;
+        }
+        seeds.retain(|x| !set.contains(x));
+        graph::recompute(self, seeds)?;
+        Ok(DeleteOutcome { deleted, detached, dry_run: false })
+    }
+}

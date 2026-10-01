@@ -47,6 +47,31 @@ cp -rf source dest          # NOT: cp -r source dest
 - `apt-get` - use `-y` flag
 - `brew` - use `HOMEBREW_NO_AUTO_UPDATE=1` env var
 
+## Project: Rust `bd` coordination engine
+
+### Build & Test
+
+```bash
+cargo build --release                 # target/release/bd
+cargo test --workspace                # engine + CLI tests
+cargo clippy --workspace --all-targets && cargo fmt --all
+target/release/bd bench --workers 8   # throughput + invariant verification on a scratch DB
+```
+
+### Architecture Overview
+
+Rust re-implementation of beads as a coordination engine on SQLite WAL (see README.md).
+
+- `crates/bd-core` (library): `store.rs` (WAL pragmas, busy handler, `Store::write` = one `BEGIN IMMEDIATE` transaction with a `WriteCtx`), `schema.rs` (migrations via `PRAGMA user_version`), `issues.rs` (lifecycle), `graph.rs` (typed edges, cycle/hierarchy checks, materialized `is_blocked`), `ready.rs`, `claims.rs` (leases, fencing tokens, reclaim), `events.rs`, `comments.rs`, `memory.rs`, `transfer.rs` (JSONL, beads-compatible import), `metrics.rs`, `doctor.rs`, `queries.rs` (read API trait).
+- `crates/bd-cli` (binary `bd`): clap grammar in `cli.rs`; mutations are `exec_*` functions over `WriteCtx` in `commands.rs` so `batch.rs` can run them in one transaction; `legacy.rs` forwards to the Go `beads` binary in `.beads/` workspaces.
+
+### Conventions & Patterns
+
+- Every mutation goes through `Store::write` and appends its events with `WriteCtx::emit` in the same transaction; never write SQL outside a write transaction.
+- Any change that can affect readiness must call `graph::recompute` with the right seeds; `bd doctor` (`blocked_drift`) verifies against a full recompute.
+- Keep the lease invariant: a lease exists iff the issue is `in_progress` and the holder equals the assignee.
+- Keep indexes minimal: each index is extra pages written per claim/close (see `bd bench`).
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:1105d646 -->
 ## Beads Issue Tracker
 

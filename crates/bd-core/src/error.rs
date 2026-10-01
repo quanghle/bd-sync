@@ -1,0 +1,139 @@
+use crate::model::Status;
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// Every failure the engine can report. Each variant maps to a stable
+/// machine-readable [`Error::code`] and a process [`Error::exit_code`].
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("{0}")]
+    Invalid(String),
+
+    #[error("{kind} not found: {id}")]
+    NotFound { kind: &'static str, id: String },
+
+    #[error("{id} is already claimed by {holder}")]
+    AlreadyClaimed { id: String, holder: String },
+
+    #[error("{id} is not claimable (status {status})")]
+    NotClaimable { id: String, status: Status },
+
+    #[error("{id} is not ready: {}", reasons.join("; "))]
+    NotReady { id: String, reasons: Vec<String> },
+
+    #[error("{id} is held by {}, not {actor}", holder.as_deref().unwrap_or("nobody"))]
+    NotOwner { id: String, holder: Option<String>, actor: String },
+
+    #[error("lease lost on {id}: {detail}")]
+    LeaseLost { id: String, detail: String },
+
+    /// An optimistic-concurrency guard (`if_revision`, `if_status`,
+    /// `if_assignee`) no longer holds. Nothing was written.
+    #[error("precondition failed on {id}: expected {field} {expected}, found {actual}")]
+    Conflict { id: String, field: &'static str, expected: String, actual: String },
+
+    #[error("dependency cycle: {}", path.join(" -> "))]
+    Cycle { path: Vec<String> },
+
+    /// A policy refusal (closing an issue with open children, deleting an
+    /// issue other issues depend on, ...). Usually overridable with `force`.
+    #[error("{0}")]
+    Refused(String),
+
+    #[error(
+        "event cursor {since} is behind retained history (oldest retained seq is {floor}); re-baseline from an export"
+    )]
+    EventsTruncated { since: i64, floor: i64 },
+
+    #[error("database is busy: {0}")]
+    Busy(String),
+
+    #[error("database schema v{found} is newer than this binary supports (v{supported}); upgrade bd")]
+    SchemaTooNew { found: i64, supported: i64 },
+
+    #[error("{0}")]
+    NoWorkspace(String),
+
+    #[error("sqlite: {0}")]
+    Sqlite(rusqlite::Error),
+
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(e: rusqlite::Error) -> Self {
+        match e.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::DatabaseBusy) | Some(rusqlite::ErrorCode::DatabaseLocked) => {
+                Error::Busy(e.to_string())
+            }
+            _ => Error::Sqlite(e),
+        }
+    }
+}
+
+impl Error {
+    pub fn invalid(msg: impl Into<String>) -> Self {
+        Error::Invalid(msg.into())
+    }
+
+    pub fn not_found(kind: &'static str, id: impl Into<String>) -> Self {
+        Error::NotFound { kind, id: id.into() }
+    }
+
+    /// Stable machine-readable error code (used in JSON error output).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Error::Invalid(_) => "invalid",
+            Error::NotFound { .. } => "not_found",
+            Error::AlreadyClaimed { .. } => "already_claimed",
+            Error::NotClaimable { .. } => "not_claimable",
+            Error::NotReady { .. } => "not_ready",
+            Error::NotOwner { .. } => "not_owner",
+            Error::LeaseLost { .. } => "lease_lost",
+            Error::Conflict { .. } => "conflict",
+            Error::Cycle { .. } => "cycle",
+            Error::Refused(_) => "refused",
+            Error::EventsTruncated { .. } => "events_truncated",
+            Error::Busy(_) => "busy",
+            Error::SchemaTooNew { .. } => "schema_too_new",
+            Error::NoWorkspace(_) => "no_workspace",
+            Error::Sqlite(_) => "sqlite",
+            Error::Json(_) => "json",
+            Error::Io(_) => "io",
+        }
+    }
+
+    /// Process exit code. 13 matches beads' "stale guard" code so scripts
+    /// can tell "another actor won the race" apart from other failures.
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Error::Invalid(_) | Error::Cycle { .. } | Error::Refused(_) => 2,
+            Error::NotFound { .. } | Error::NoWorkspace(_) => 3,
+            Error::AlreadyClaimed { .. }
+            | Error::NotClaimable { .. }
+            | Error::NotReady { .. }
+            | Error::NotOwner { .. }
+            | Error::LeaseLost { .. } => 4,
+            Error::Busy(_) => 5,
+            Error::EventsTruncated { .. } => 6,
+            Error::Conflict { .. } => 13,
+            Error::SchemaTooNew { .. } | Error::Sqlite(_) | Error::Json(_) | Error::Io(_) => 1,
+        }
+    }
+
+    /// True for errors that mean "another actor changed shared state first".
+    pub fn is_contention(&self) -> bool {
+        matches!(
+            self,
+            Error::AlreadyClaimed { .. }
+                | Error::NotClaimable { .. }
+                | Error::Conflict { .. }
+                | Error::LeaseLost { .. }
+                | Error::NotOwner { .. }
+        )
+    }
+}

@@ -1,0 +1,13 @@
+[workspace]
+resolver = "2"
+members = ["crates/bd-core", "crates/bd-cli"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT"
+rust-version = "1.85"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

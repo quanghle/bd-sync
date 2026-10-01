@@ -1,0 +1,838 @@
+//! Command-line grammar.
+
+use std::path::PathBuf;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "bd",
+    version,
+    about = "bd: a coordination engine for agents and humans: tasks, typed dependencies, deterministic ready work, leased claims, and an event log on SQLite WAL",
+    after_help = "Agent loop:  bd ready  ->  bd claim --next  ->  bd heartbeat <id>  ->  bd close <id>\nRun `bd prime` for workflow context. Exit codes: 2 invalid, 3 not found, 4 claim conflict, 5 busy, 6 events truncated, 13 stale guard."
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+    #[command(flatten)]
+    pub global: Global,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct Global {
+    /// Database file (default: nearest .bd/bd.db walking up from the current directory)
+    #[arg(long, global = true, env = "BD_DB", value_name = "PATH")]
+    pub db: Option<PathBuf>,
+    /// Run as if started in this directory
+    #[arg(short = 'C', long = "directory", global = true, value_name = "DIR")]
+    pub directory: Option<PathBuf>,
+    /// Actor name (default: $BD_ACTOR, $BEADS_ACTOR, git user.name, $USER)
+    #[arg(long, global = true, value_name = "NAME")]
+    pub actor: Option<String>,
+    /// Machine-readable JSON output
+    #[arg(long, global = true)]
+    pub json: bool,
+    /// Minimal output (ids only)
+    #[arg(short, long, global = true)]
+    pub quiet: bool,
+    /// Log format for diagnostics on stderr (filter with BD_LOG, e.g. BD_LOG=bd=debug)
+    #[arg(long, global = true, value_enum, env = "BD_LOG_FORMAT", default_value = "text")]
+    pub log_format: LogFormat,
+    /// Print per-command timing to stderr (also BD_TIMING=1)
+    #[arg(long, global = true)]
+    pub timing: bool,
+    /// Warn about operations slower than this many milliseconds
+    #[arg(long, global = true, env = "BD_SLOW_MS", default_value_t = 250, value_name = "MS")]
+    pub slow_ms: u64,
+    /// How long a writer waits for the database write lock
+    #[arg(long, global = true, env = "BD_BUSY_TIMEOUT_MS", default_value_t = 10_000, value_name = "MS")]
+    pub busy_timeout_ms: u64,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LogFormat {
+    Text,
+    Json,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    /// Create a workspace (.bd/bd.db) in the current directory
+    Init(InitArgs),
+    /// Create an issue
+    Create(CreateArgs),
+    /// Show issue details
+    Show(ShowArgs),
+    /// List issues
+    List(ListArgs),
+    /// Update fields of an issue
+    Update(UpdateArgs),
+    /// Close issues (atomically, all or none)
+    Close(CloseArgs),
+    /// Reopen closed issues
+    Reopen(ReopenArgs),
+    /// Hide an issue from ready work, until a time or indefinitely
+    Defer(DeferArgs),
+    /// Undo a deferral
+    Undefer(IdArg),
+    /// Delete issues
+    Delete(DeleteArgs),
+    /// Ready work in queue order: open, unblocked, not deferred
+    Ready(ReadyArgs),
+    /// Blocked issues and what blocks them
+    Blocked(BlockedArgs),
+    /// Atomically claim an issue, or the next ready one, under a lease
+    Claim(ClaimArgs),
+    /// Renew the lease on an issue you hold
+    #[command(alias = "hb")]
+    Heartbeat(HeartbeatArgs),
+    /// Give up a claim (or an assignment)
+    #[command(alias = "unclaim")]
+    Release(ReleaseArgs),
+    /// Revert claims whose lease expired past the grace window (dead-worker recovery)
+    Reclaim(ReclaimArgs),
+    /// List live leases
+    Leases(LeasesArgs),
+    /// Manage dependencies
+    #[command(subcommand)]
+    Dep(DepCommand),
+    /// Manage labels
+    #[command(subcommand)]
+    Label(LabelCommand),
+    /// Add or list comments
+    #[command(subcommand)]
+    Comment(CommentCommand),
+    /// List the comments on an issue
+    Comments(IdArg),
+    /// Durable workspace memory
+    #[command(subcommand)]
+    Memory(MemoryCommand),
+    /// Store a memory (same as `memory add`)
+    Remember(MemoryAddArgs),
+    /// Print a memory (same as `memory get`)
+    Recall(KeyArg),
+    /// List or search memories (same as `memory list`)
+    Memories(MemoryListArgs),
+    /// Delete a memory (same as `memory rm`)
+    Forget(KeyArg),
+    /// Read the transactional event history
+    Events(EventsArgs),
+    /// Event history of one issue
+    History(HistoryArgs),
+    /// Agent context: workflow, your claims, ready work, memories
+    Prime(PrimeArgs),
+    /// Workspace statistics
+    Stats,
+    /// Operational metrics (Prometheus text or JSON)
+    Metrics(MetricsArgs),
+    /// Check database health and invariants; --fix repairs what it safely can
+    Doctor(DoctorArgs),
+    /// Read or change workspace configuration
+    #[command(subcommand)]
+    Config(ConfigCommand),
+    /// Export a consistent JSONL snapshot
+    Export(ExportArgs),
+    /// Import a JSONL snapshot (bd or beads format), all or nothing
+    Import(ImportArgs),
+    /// Run many write operations in one transaction
+    Batch(BatchArgs),
+    /// Benchmark concurrent claim throughput on a scratch database
+    Bench(BenchArgs),
+    #[command(hide = true)]
+    BenchWorker(BenchWorkerArgs),
+    /// Workspace information
+    Info,
+    /// Print the version
+    Version,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct IdArg {
+    pub id: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct KeyArg {
+    pub key: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct InitArgs {
+    /// Issue id prefix (default: derived from the directory name)
+    #[arg(long)]
+    pub prefix: Option<String>,
+    /// Id scheme
+    #[arg(long, value_enum, default_value = "hash")]
+    pub id_mode: IdModeArg,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum IdModeArg {
+    Hash,
+    Counter,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CreateArgs {
+    /// Title (words are joined)
+    #[arg(required = true, num_args = 1..)]
+    pub title: Vec<String>,
+    #[arg(short, long)]
+    pub description: Option<String>,
+    #[arg(long)]
+    pub design: Option<String>,
+    #[arg(long)]
+    pub acceptance: Option<String>,
+    #[arg(long)]
+    pub notes: Option<String>,
+    /// task, bug, feature, epic, chore, decision, spike, story, milestone
+    #[arg(short = 't', long = "type")]
+    pub issue_type: Option<String>,
+    /// 0 (critical) .. 4 (backlog); P0..P4 accepted
+    #[arg(short, long, value_parser = parse_priority)]
+    pub priority: Option<u8>,
+    /// Reserve for an assignee (only they, or a pool, can claim it)
+    #[arg(short, long)]
+    pub assignee: Option<String>,
+    #[arg(short, long = "label", value_delimiter = ',')]
+    pub labels: Vec<String>,
+    /// Parent issue (creates a hierarchical child id)
+    #[arg(long)]
+    pub parent: Option<String>,
+    /// Dependencies of the new issue: ID (blocks) or TYPE:ID, e.g. discovered-from:bd-12
+    #[arg(long = "dep", value_delimiter = ',')]
+    pub deps: Vec<String>,
+    #[arg(long)]
+    pub external_ref: Option<String>,
+    /// Estimate in minutes
+    #[arg(long)]
+    pub estimate: Option<i64>,
+    /// Due time (2026-01-15, +2d, RFC 3339)
+    #[arg(long)]
+    pub due: Option<String>,
+    /// Hide from ready work until this time
+    #[arg(long)]
+    pub defer: Option<String>,
+    /// Metadata JSON object
+    #[arg(long)]
+    pub metadata: Option<String>,
+    /// Explicit id
+    #[arg(long)]
+    pub id: Option<String>,
+    /// Create as pinned (persistent context, never ready, releases dependents)
+    #[arg(long)]
+    pub pinned: bool,
+    /// Claim the new issue for yourself in the same transaction
+    #[arg(long)]
+    pub claim: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ShowArgs {
+    #[arg(required = true, num_args = 1..)]
+    pub ids: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct FilterArgs {
+    /// Only issues assigned to this actor
+    #[arg(short, long)]
+    pub assignee: Option<String>,
+    /// Only unassigned issues
+    #[arg(long)]
+    pub unassigned: bool,
+    #[arg(short = 't', long = "type", value_delimiter = ',')]
+    pub types: Vec<String>,
+    #[arg(long = "exclude-type", value_delimiter = ',')]
+    pub exclude_types: Vec<String>,
+    #[arg(short, long, value_parser = parse_priority)]
+    pub priority: Option<u8>,
+    /// Only priorities at or above this one (e.g. 1 = P0 and P1)
+    #[arg(long, value_parser = parse_priority)]
+    pub max_priority: Option<u8>,
+    /// Must have ALL these labels
+    #[arg(short, long = "label", value_delimiter = ',')]
+    pub labels: Vec<String>,
+    /// Must have ANY of these labels
+    #[arg(long = "label-any", value_delimiter = ',')]
+    pub labels_any: Vec<String>,
+    /// Must have NONE of these labels
+    #[arg(long = "exclude-label", value_delimiter = ',')]
+    pub exclude_labels: Vec<String>,
+    /// Only issues below this one in the hierarchy
+    #[arg(long)]
+    pub parent: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ListArgs {
+    #[command(flatten)]
+    pub filter: FilterArgs,
+    /// Status filter (repeatable or comma separated); default hides closed and pinned
+    #[arg(short, long, value_delimiter = ',')]
+    pub status: Vec<String>,
+    /// Include closed and pinned issues
+    #[arg(long)]
+    pub all: bool,
+    /// Only issues blocked by dependencies
+    #[arg(long)]
+    pub blocked: bool,
+    /// Case-insensitive text search over id, title, description, notes
+    #[arg(long)]
+    pub search: Option<String>,
+    /// priority | created | updated | id
+    #[arg(long, default_value = "priority")]
+    pub sort: String,
+    #[arg(long)]
+    pub reverse: bool,
+    /// Maximum rows (0 = unlimited)
+    #[arg(short = 'n', long, default_value_t = 100)]
+    pub limit: usize,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub struct GuardArgs {
+    /// Apply only if the issue is still at this revision
+    #[arg(long, value_name = "N")]
+    pub if_revision: Option<i64>,
+    /// Apply only if the status still equals this
+    #[arg(long, value_name = "STATUS")]
+    pub if_status: Option<String>,
+    /// Apply only if the assignee still equals this ('' = unassigned)
+    #[arg(long, value_name = "ACTOR")]
+    pub if_assignee: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct UpdateArgs {
+    pub id: String,
+    #[arg(long)]
+    pub title: Option<String>,
+    #[arg(short, long)]
+    pub description: Option<String>,
+    #[arg(long)]
+    pub design: Option<String>,
+    #[arg(long)]
+    pub acceptance: Option<String>,
+    /// Replace notes
+    #[arg(long)]
+    pub notes: Option<String>,
+    /// Append a line to notes
+    #[arg(long)]
+    pub append_notes: Option<String>,
+    /// open | blocked | deferred | pinned | in_progress (needs an assignee)
+    #[arg(short, long)]
+    pub status: Option<String>,
+    #[arg(short, long, value_parser = parse_priority)]
+    pub priority: Option<u8>,
+    #[arg(short = 't', long = "type")]
+    pub issue_type: Option<String>,
+    /// New assignee ('' to unassign)
+    #[arg(short, long)]
+    pub assignee: Option<String>,
+    /// '' clears
+    #[arg(long)]
+    pub external_ref: Option<String>,
+    /// Minutes ('' clears)
+    #[arg(long)]
+    pub estimate: Option<String>,
+    /// Due time ('' clears)
+    #[arg(long)]
+    pub due: Option<String>,
+    /// Hide from ready until this time ('' clears)
+    #[arg(long)]
+    pub defer: Option<String>,
+    /// Replace metadata with this JSON object
+    #[arg(long)]
+    pub metadata: Option<String>,
+    /// Set metadata key=value (value parsed as JSON when valid)
+    #[arg(long = "set-metadata", value_name = "K=V")]
+    pub set_metadata: Vec<String>,
+    #[arg(long = "unset-metadata", value_name = "KEY")]
+    pub unset_metadata: Vec<String>,
+    #[arg(long = "add-label", value_delimiter = ',')]
+    pub add_labels: Vec<String>,
+    #[arg(long = "remove-label", value_delimiter = ',')]
+    pub remove_labels: Vec<String>,
+    /// Replace all labels
+    #[arg(long = "set-labels", value_delimiter = ',')]
+    pub set_labels: Option<Vec<String>>,
+    /// Move under a new parent ('' detaches)
+    #[arg(long)]
+    pub parent: Option<String>,
+    #[command(flatten)]
+    pub guard: GuardArgs,
+    /// Allow taking over another actor's live claim
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CloseArgs {
+    #[arg(required = true, num_args = 1..)]
+    pub ids: Vec<String>,
+    #[arg(short, long, alias = "message")]
+    pub reason: Option<String>,
+    /// Record the outcome as failed (releases conditional-blocks dependents)
+    #[arg(long)]
+    pub failed: bool,
+    /// Close despite open children or live blockers
+    #[arg(long)]
+    pub force: bool,
+    /// Fencing token from `claim`: close only while that lease is held
+    #[arg(long)]
+    pub token: Option<i64>,
+    #[command(flatten)]
+    pub guard: GuardArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReopenArgs {
+    #[arg(required = true, num_args = 1..)]
+    pub ids: Vec<String>,
+    #[arg(short, long)]
+    pub reason: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DeferArgs {
+    pub id: String,
+    /// Until when (2026-01-15, +3d, RFC 3339); omit to defer indefinitely
+    #[arg(long)]
+    pub until: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DeleteArgs {
+    #[arg(required = true, num_args = 1..)]
+    pub ids: Vec<String>,
+    /// Also delete everything that depends on them
+    #[arg(long)]
+    pub cascade: bool,
+    /// Delete even if other issues depend on them (drops those edges)
+    #[arg(long)]
+    pub force: bool,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReadyArgs {
+    #[command(flatten)]
+    pub filter: FilterArgs,
+    /// priority | hybrid | oldest
+    #[arg(long, default_value = "priority")]
+    pub sort: String,
+    /// Maximum rows (0 = unlimited)
+    #[arg(short = 'n', long, default_value_t = 50)]
+    pub limit: usize,
+    /// Include issues deferred to a future time
+    #[arg(long)]
+    pub include_deferred: bool,
+    /// Include epics (containers are excluded by default)
+    #[arg(long)]
+    pub include_epics: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BlockedArgs {
+    #[command(flatten)]
+    pub filter: FilterArgs,
+    #[arg(short = 'n', long, default_value_t = 100)]
+    pub limit: usize,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ClaimArgs {
+    /// Issue to claim (omit with --next)
+    #[arg(required_unless_present = "next", conflicts_with = "next")]
+    pub id: Option<String>,
+    /// Claim the head of the ready queue (filters apply)
+    #[arg(long)]
+    pub next: bool,
+    #[command(flatten)]
+    pub filter: FilterArgs,
+    /// priority | hybrid | oldest (with --next)
+    #[arg(long, default_value = "priority")]
+    pub sort: String,
+    /// Lease duration (default: lease.ttl)
+    #[arg(long)]
+    pub ttl: Option<String>,
+    /// Claim even if blocked or deferred (by id only)
+    #[arg(long)]
+    pub allow_blocked: bool,
+    #[arg(long, value_name = "N")]
+    pub if_revision: Option<i64>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HeartbeatArgs {
+    #[arg(required = true, num_args = 1..)]
+    pub ids: Vec<String>,
+    /// Fencing token from `claim` (fails if the lease was re-granted)
+    #[arg(long)]
+    pub token: Option<i64>,
+    #[arg(long)]
+    pub ttl: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReleaseArgs {
+    #[arg(required = true, num_args = 1..)]
+    pub ids: Vec<String>,
+    #[arg(short, long)]
+    pub reason: Option<String>,
+    /// Release another actor's claim
+    #[arg(long)]
+    pub force: bool,
+    /// Release only if still held by this actor (compare-and-swap)
+    #[arg(long, value_name = "ACTOR")]
+    pub if_assignee: Option<String>,
+    #[arg(long)]
+    pub token: Option<i64>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ReclaimArgs {
+    /// Only leases expired at least this long ago (default: lease.grace)
+    #[arg(long)]
+    pub grace: Option<String>,
+    /// Only these holders
+    #[arg(short, long)]
+    pub assignee: Option<String>,
+    #[arg(short, long = "label", value_delimiter = ',')]
+    pub labels: Vec<String>,
+    #[arg(long = "id", value_delimiter = ',')]
+    pub ids: Vec<String>,
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LeasesArgs {
+    /// Only expired leases
+    #[arg(long)]
+    pub expired: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DepCommand {
+    /// ISSUE depends on DEPENDS_ON
+    Add(DepAddArgs),
+    /// Remove the edge between ISSUE and DEPENDS_ON
+    #[command(alias = "remove")]
+    Rm(DepPairArgs),
+    /// Edges of an issue
+    List(DepListArgs),
+    /// Dependency tree
+    Tree(DepTreeArgs),
+    /// Report cycles among scheduling edges
+    Cycles,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DepAddArgs {
+    pub issue: String,
+    pub depends_on: String,
+    /// blocks, conditional-blocks, parent-child, waits-for, related, discovered-from, ...
+    #[arg(short = 't', long = "type", default_value = "blocks")]
+    pub dep_type: String,
+    /// waits-for gate: all-children | any-children
+    #[arg(long)]
+    pub gate: Option<String>,
+    /// Edge metadata JSON object
+    #[arg(long)]
+    pub metadata: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DepPairArgs {
+    pub issue: String,
+    pub depends_on: String,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DirectionArg {
+    /// What the issue depends on
+    Down,
+    /// What depends on the issue
+    Up,
+    Both,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DepListArgs {
+    pub id: String,
+    #[arg(long, value_enum, default_value = "both")]
+    pub direction: DirectionArg,
+    #[arg(short = 't', long = "type")]
+    pub dep_type: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DepTreeArgs {
+    pub id: String,
+    #[arg(long, value_enum, default_value = "down")]
+    pub direction: DirectionArg,
+    #[arg(long, default_value_t = 50)]
+    pub max_depth: usize,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum LabelCommand {
+    Add(LabelEditArgs),
+    #[command(alias = "remove")]
+    Rm(LabelEditArgs),
+    /// Labels of an issue, or all labels with counts
+    List(LabelListArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LabelEditArgs {
+    pub id: String,
+    #[arg(required = true, num_args = 1.., value_delimiter = ',')]
+    pub labels: Vec<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct LabelListArgs {
+    pub id: Option<String>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum CommentCommand {
+    Add(CommentAddArgs),
+    List(IdArg),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct CommentAddArgs {
+    pub id: String,
+    /// Comment text (words are joined); or use --file / --stdin
+    #[arg(num_args = 0..)]
+    pub text: Vec<String>,
+    #[arg(long, conflicts_with = "stdin")]
+    pub file: Option<PathBuf>,
+    #[arg(long)]
+    pub stdin: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum MemoryCommand {
+    /// Store or update a memory
+    Add(MemoryAddArgs),
+    Get(KeyArg),
+    /// List all, or search by substring
+    List(MemoryListArgs),
+    #[command(alias = "remove")]
+    Rm(KeyArg),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MemoryAddArgs {
+    /// Content (words are joined)
+    #[arg(required = true, num_args = 1..)]
+    pub content: Vec<String>,
+    /// Explicit key (default: derived from content)
+    #[arg(long)]
+    pub key: Option<String>,
+    /// Compare-and-set: write only at this revision (0 = create only)
+    #[arg(long, value_name = "N")]
+    pub if_revision: Option<i64>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MemoryListArgs {
+    pub query: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(args_conflicts_with_subcommands = true)]
+pub struct EventsArgs {
+    #[command(subcommand)]
+    pub action: Option<EventsAction>,
+    /// Strict cursor: events with seq > N (fails if pruned past it)
+    #[arg(long)]
+    pub since: Option<i64>,
+    /// Maximum events (default 50 without --since, unlimited with it)
+    #[arg(short = 'n', long)]
+    pub limit: Option<usize>,
+    /// Keep polling for new events
+    #[arg(short, long)]
+    pub follow: bool,
+    /// Poll interval for --follow
+    #[arg(long, default_value_t = 500, value_name = "MS")]
+    pub interval_ms: u64,
+    #[arg(long)]
+    pub issue: Option<String>,
+    /// Only these ops (repeatable or comma separated)
+    #[arg(long = "op", value_delimiter = ',')]
+    pub ops: Vec<String>,
+    #[arg(long = "by")]
+    pub by_actor: Option<String>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum EventsAction {
+    /// Delete old events (criteria combine conservatively)
+    Prune(PruneArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PruneArgs {
+    /// Delete events with seq below N
+    #[arg(long)]
+    pub before: Option<i64>,
+    /// Delete events older than this (e.g. 30d)
+    #[arg(long)]
+    pub older_than: Option<String>,
+    /// Keep the newest N events
+    #[arg(long)]
+    pub keep: Option<u64>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct HistoryArgs {
+    pub id: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct PrimeArgs {
+    /// Cap the number of memories shown (0 = all)
+    #[arg(long, default_value_t = 0)]
+    pub max_memories: usize,
+    /// Number of ready items shown
+    #[arg(long, default_value_t = 10)]
+    pub ready: usize,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum MetricsFormat {
+    Prometheus,
+    Json,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct MetricsArgs {
+    #[arg(long, value_enum, default_value = "prometheus")]
+    pub format: MetricsFormat,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct DoctorArgs {
+    #[arg(long)]
+    pub fix: bool,
+    /// Full integrity_check instead of quick_check
+    #[arg(long)]
+    pub full: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum ConfigCommand {
+    Get(KeyArg),
+    Set(ConfigSetArgs),
+    Unset(KeyArg),
+    List,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ConfigSetArgs {
+    pub key: String,
+    pub value: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ExportArgs {
+    /// Output file (default stdout)
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+    #[arg(long)]
+    pub no_memories: bool,
+    /// Skip closed and pinned issues
+    #[arg(long)]
+    pub open_only: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ImportArgs {
+    /// JSONL file, or - for stdin
+    pub file: String,
+    /// Validate and report without writing
+    #[arg(long)]
+    pub dry_run: bool,
+    /// Keep unknown issue types and map unknown statuses to open
+    #[arg(long)]
+    pub lenient: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BatchArgs {
+    /// Read operations from this file (default stdin)
+    #[arg(short, long)]
+    pub file: Option<PathBuf>,
+    /// Run everything, report, then roll back
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum BenchMode {
+    /// Worker threads in this process, one connection each (embedded library)
+    Threads,
+    /// One long-lived worker process each (cross-process locking)
+    Processes,
+    /// A fresh `bd` process per claim and close (what CLI agents experience)
+    Cli,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BenchArgs {
+    /// Concurrent workers
+    #[arg(short, long, default_value_t = 8)]
+    pub workers: usize,
+    #[arg(long, value_enum, default_value = "threads")]
+    pub mode: BenchMode,
+    /// Issues to seed
+    #[arg(short = 'n', long, default_value_t = 2000)]
+    pub issues: usize,
+    /// Average blocking dependencies per issue (random DAG)
+    #[arg(long, default_value_t = 1.0)]
+    pub deps: f64,
+    /// Simulated work per claim
+    #[arg(long, default_value_t = 0, value_name = "MS")]
+    pub work_ms: u64,
+    /// Heartbeat once per claim before closing
+    #[arg(long)]
+    pub heartbeat: bool,
+    /// Durability (off | normal | full)
+    #[arg(long, default_value = "normal")]
+    pub durability: String,
+    /// Keep the scratch database at this path instead of a temp dir
+    #[arg(long)]
+    pub keep: Option<PathBuf>,
+    /// RNG seed for the generated graph
+    #[arg(long, default_value_t = 42)]
+    pub seed: u64,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BenchWorkerArgs {
+    #[arg(long)]
+    pub path: PathBuf,
+    #[arg(long)]
+    pub name: String,
+    #[arg(long, default_value_t = 0)]
+    pub work_ms: u64,
+    #[arg(long)]
+    pub heartbeat: bool,
+    #[arg(long, default_value = "normal")]
+    pub durability: String,
+}
+
+pub fn parse_priority(s: &str) -> Result<u8, String> {
+    let t = s.trim().trim_start_matches(['P', 'p']);
+    match t.parse::<u8>() {
+        Ok(p) if p <= 4 => Ok(p),
+        _ => Err(format!("invalid priority {s:?} (0-4 or P0-P4)")),
+    }
+}

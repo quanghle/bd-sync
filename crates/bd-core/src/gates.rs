@@ -16,7 +16,9 @@
 //! * `timer`: opens once `timeout` has elapsed since arming.
 //! * `issue`: opens when the `await_id` issue closes as done; a failed close escalates.
 //! * `gh:run`, `gh:pr`: a GitHub Actions run succeeding, a pull request
-//!   merging; probed by the CLI with `gh`. Failures escalate.
+//!   merging; probed by the CLI with `gh`. Failures escalate. A `gh:run`
+//!   gate on a workflow can narrow the runs it considers with `branch` and
+//!   `event`; with `branch` it follows the newest head of that branch or tag.
 //!
 //! A non-timer gate with a `timeout` escalates when it is still shut that long
 //! after arming. Escalation records the reason on the gate, comments on it, and
@@ -115,11 +117,23 @@ pub struct GateSpec {
     /// GitHub gates: `OWNER/REPO` or `HOST/OWNER/REPO` (default: the current repository).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
+    /// `gh:run` on a workflow: only runs for this branch or tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// `gh:run` on a workflow: only runs triggered by this event (`push`, `workflow_dispatch`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
 }
 
 impl GateSpec {
     pub fn new(kind: GateKind) -> GateSpec {
-        GateSpec { kind, await_id: None, timeout: None, repo: None }
+        GateSpec { kind, await_id: None, timeout: None, repo: None, branch: None, event: None }
+    }
+
+    /// For `gh:run`: the awaited run id when `await_id` is one, rather than a workflow.
+    pub fn run_id(&self) -> Option<&str> {
+        let target = self.await_id.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+        (self.kind == GateKind::GhRun && target.chars().all(|c| c.is_ascii_digit())).then_some(target)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -157,6 +171,28 @@ impl GateSpec {
                 return Err(Error::invalid(format!("repo only applies to gh:run and gh:pr gates, not {}", self.kind)));
             }
             validate_repo(repo)?;
+        }
+        if self.branch.is_some() || self.event.is_some() {
+            if self.kind != GateKind::GhRun {
+                return Err(Error::invalid(format!("branch and event only apply to gh:run gates, not {}", self.kind)));
+            }
+            if let Some(id) = self.run_id() {
+                return Err(Error::invalid(format!(
+                    "branch and event only apply when await_id is a workflow, not run {id}"
+                )));
+            }
+        }
+        if let Some(b) = &self.branch {
+            if b.is_empty() || b.len() > 255 || b.chars().any(|c| c.is_whitespace() || c.is_control()) {
+                return Err(Error::invalid(format!("invalid branch {b:?}")));
+            }
+        }
+        if let Some(e) = &self.event {
+            if e.is_empty() || !e.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+                return Err(Error::invalid(format!(
+                    "invalid event {e:?} (a GitHub event name such as push or workflow_dispatch)"
+                )));
+            }
         }
         Ok(())
     }
@@ -289,7 +325,7 @@ pub fn spec_of(issue: &Issue) -> std::result::Result<GateSpec, String> {
         return Err("no metadata.gate condition".into());
     };
     let mut fields = Map::new();
-    for key in ["type", "await_id", "timeout", "repo"] {
+    for key in ["type", "await_id", "timeout", "repo", "branch", "event"] {
         if let Some(v) = meta.get(key).filter(|v| !v.is_null()) {
             fields.insert(key.into(), v.clone());
         }
@@ -656,20 +692,38 @@ impl WriteCtx<'_> {
         Ok(true)
     }
 
-    /// Remember which GitHub run a `gh:run` gate watches.
-    pub fn pin_gate_run(&mut self, id: &str, run_id: &str) -> Result<()> {
-        let changed = self
-            .conn()
-            .prepare_cached(
-                "UPDATE issues SET metadata = json_set(metadata, '$.gate.run_id', ?1)
-                 WHERE id = ?2 AND issue_type = 'gate' AND json_type(metadata, '$.gate') = 'object'
-                   AND COALESCE(json_extract(metadata, '$.gate.run_id'), '') <> ?1",
-            )?
-            .execute(params![run_id, id])?;
-        if changed > 0 {
-            self.emit("gate_updated", Some(id), json!({ "run_id": run_id }))?;
+    /// Remember which GitHub run a `gh:run` gate watches. Re-pinning to
+    /// another run drops an escalation, which was about the previous run, and
+    /// comments on the gate. Returns whether anything changed.
+    pub fn pin_gate_run(&mut self, id: &str, run_id: &str, why: Option<&str>) -> Result<bool> {
+        let issue = issues::require(self.conn(), id)?;
+        if issue.issue_type != GATE_TYPE || gate_meta(&issue).is_none() {
+            return Err(Error::invalid(format!("{id} is not a gate")));
         }
-        Ok(())
+        let previous = meta_str(gate_meta(&issue), "run_id");
+        if previous.as_deref() == Some(run_id) {
+            return Ok(false);
+        }
+        if previous.is_some() {
+            let now = self.now();
+            self.conn()
+                .prepare_cached(
+                    "UPDATE issues SET metadata = json_remove(json_set(metadata, '$.gate.run_id', ?1),
+                         '$.gate.escalation', '$.gate.escalated_at'), updated_at = ?2, revision = revision + 1
+                     WHERE id = ?3",
+                )?
+                .execute(params![run_id, now, id])?;
+        } else {
+            self.conn()
+                .prepare_cached("UPDATE issues SET metadata = json_set(metadata, '$.gate.run_id', ?1) WHERE id = ?2")?
+                .execute(params![run_id, id])?;
+        }
+        self.emit("gate_updated", Some(id), json!({ "run_id": run_id, "previous_run_id": previous }))?;
+        if let Some(prev) = &previous {
+            let why = why.map(|w| format!(": {w}")).unwrap_or_default();
+            self.add_comment(id, &format!("Now watching GitHub run {run_id} instead of {prev}{why}"))?;
+        }
+        Ok(true)
     }
 }
 
@@ -694,6 +748,24 @@ mod tests {
         pr.validate().unwrap();
         pr.repo = Some("not a repo".into());
         assert!(pr.validate().is_err());
+        pr.repo = None;
+        pr.branch = Some("main".into());
+        assert!(pr.validate().is_err(), "branch is gh:run-only");
+
+        let mut run = GateSpec::new(GateKind::GhRun);
+        run.await_id = Some("release.yml".into());
+        run.branch = Some("v1.2.3".into());
+        run.event = Some("push".into());
+        run.validate().unwrap();
+        run.event = Some("Push now".into());
+        assert!(run.validate().is_err());
+        run.event = None;
+        run.branch = Some("two words".into());
+        assert!(run.validate().is_err());
+        run.branch = Some("main".into());
+        run.await_id = Some("12345".into());
+        assert_eq!(run.run_id(), Some("12345"));
+        assert!(run.validate().is_err(), "a run id pins one run; filters make no sense");
 
         let mut human = GateSpec::new(GateKind::Human);
         human.repo = Some("org/repo".into());

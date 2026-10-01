@@ -131,6 +131,8 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
                 await_id: spec.await_id.clone(),
                 timeout: spec.timeout.clone(),
                 repo: spec.repo.clone(),
+                branch: spec.branch.clone(),
+                event: spec.event.clone(),
                 title: None,
                 description: g.description.clone(),
                 assignee: g.assignee.clone(),

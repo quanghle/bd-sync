@@ -41,8 +41,8 @@ url=$(gh workflow run release.yml --repo {{repo}} --ref main)   # gh >= 2.87 pri
 gh run watch "${url##*/}" --repo {{repo}} --exit-status
 (No URL printed, with an older gh? Find the new run as in RELEASING.md, "Dry run".)
 All six builds and the SHA256SUMS job must pass; the artifacts are named
-bd-v{{version}}-dev.<commit>-<target>. Finish before the "tag" step closes: the gh:run gate
-on "verify" watches the first release.yml run that starts after it arms."""
+bd-v{{version}}-dev.<commit>-<target>. The gh:run gate on "verify" ignores dry runs: it only
+considers push runs for tag v{{version}}."""
 
 [[steps]]
 id = "tag"
@@ -52,8 +52,8 @@ description = """
 On the release commit on main:
   git tag -a v{{version}} -m "bd v{{version}}"
 Do not push yet. Closing this step arms the gh:run gate on "verify" (<run>.gate-verify), which
-pins the first release.yml run created after that moment, whatever its event or branch. So close
-this step right before "push", and dispatch no dry run in between: it would be pinned instead."""
+then watches the first release.yml push run for tag v{{version}} created after that moment.
+So close this step before "push"."""
 [steps.gate]
 type = "human"
 timeout = "72h"
@@ -67,12 +67,13 @@ needs = ["tag"]
 description = """
 git push origin v{{version}}      (v* tags are admin-only; see RELEASING.md)
 This starts the release workflow (tag check, six builds, SHA256SUMS, attestations, GitHub Release).
-Then confirm the gate watches this run and not another one:
+Then confirm the gate found the run:
   bd gate check                     (repeat until the next command shows a run)
   bd gate show <run>.gate-verify    (prints "watching GitHub run <id>")
-  gh run view <id> --repo {{repo}} --json event,headBranch   (must be push / v{{version}})
-If a wrong run was pinned, or the tag is ever deleted and re-created, verify the real tag-push run
-yourself (gh run watch <id> --repo {{repo}} --exit-status), then open the gate by hand:
+If the tag is deleted and re-created on another commit, the gate moves to the new tag's run on
+the next bd gate check. If the run cannot be found (for example the tag was pushed more than a
+minute before "tag" closed), verify the tag-push run yourself
+(gh run watch <id> --repo {{repo}} --exit-status), then open the gate by hand:
   bd gate resolve <run>.gate-verify -r "release run <id> succeeded"
 If the workflow fails, follow RELEASING.md, "If something fails"."""
 
@@ -90,11 +91,13 @@ done
 gh release view v{{version}} --repo {{repo}} --json isPrerelease,assets
 The release must be a pre-release exactly when {{version}} has a pre-release suffix."""
 acceptance_criteria = "Six archives and SHA256SUMS are attached; every checksum and attestation verifies; the pre-release flag is right."
-# The gate pins the first release.yml run created after it arms, with no event or branch filter
-# (bd-sync-4y7 tracks adding one); "tag" and "push" say how to check and override it.
+# The gate watches the first push run of release.yml for the tag created after it arms, and
+# follows the tag if it is re-created on another commit.
 [steps.gate]
 type = "gh:run"
 await_id = "release.yml"
+branch = "v{{version}}"
+event = "push"
 repo = "{{repo}}"
 timeout = "3h"
 title = "Release workflow for v{{version}} succeeds"

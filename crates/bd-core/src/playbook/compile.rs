@@ -589,7 +589,14 @@ impl Builder<'_> {
         if g.kind == GateKind::GhPr {
             await_id = await_id.map(|a| a.trim_start_matches('#').to_string());
         }
-        let spec = GateSpec { kind: g.kind, await_id, timeout: opt(&g.timeout)?, repo: opt(&g.repo)? };
+        let spec = GateSpec {
+            kind: g.kind,
+            await_id,
+            timeout: opt(&g.timeout)?,
+            repo: opt(&g.repo)?,
+            branch: opt(&g.branch)?,
+            event: opt(&g.event)?,
+        };
         spec.validate().map_err(|e| at(e.to_string()))?;
         let title = match &g.title {
             Some(t) => r(t)?,

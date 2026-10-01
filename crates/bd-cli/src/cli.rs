@@ -926,7 +926,7 @@ pub enum GateCommand {
     /// Open gates by hand (approvals)
     Resolve(GateResolveArgs),
     /// Put a gate in front of existing work
-    Create(GateCreateArgs),
+    Create(Box<GateCreateArgs>),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -975,6 +975,12 @@ pub struct GateCreateArgs {
     /// GitHub gates: OWNER/REPO or HOST/OWNER/REPO (default: this repository)
     #[arg(long)]
     pub repo: Option<String>,
+    /// gh:run on a workflow: only runs for this branch or tag; follows its newest head
+    #[arg(long)]
+    pub branch: Option<String>,
+    /// gh:run on a workflow: only runs triggered by this event (push, workflow_dispatch, ...)
+    #[arg(long)]
+    pub event: Option<String>,
     #[arg(long)]
     pub title: Option<String>,
     #[arg(short, long)]

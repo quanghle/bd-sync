@@ -189,6 +189,10 @@ pub struct StepGate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub description: String,
@@ -206,11 +210,13 @@ impl StepGate {
             await_id: self.await_id.clone(),
             timeout: if templated(&self.timeout) { Some("1s".into()) } else { self.timeout.clone() },
             repo: if templated(&self.repo) { None } else { self.repo.clone() },
+            branch: self.branch.clone(),
+            event: if templated(&self.event) { Some("push".into()) } else { self.event.clone() },
         };
-        let spec = if self.kind == GateKind::GhPr && templated(&self.await_id) {
-            GateSpec { await_id: Some("1".into()), ..spec }
-        } else {
-            spec
+        let spec = match self.kind {
+            GateKind::GhPr if templated(&self.await_id) => GateSpec { await_id: Some("1".into()), ..spec },
+            GateKind::GhRun if templated(&self.await_id) => GateSpec { await_id: Some("workflow".into()), ..spec },
+            _ => spec,
         };
         spec.validate().map_err(|e| e.to_string())
     }
@@ -343,6 +349,8 @@ impl Step {
                 ("gate.await_id", &g.await_id),
                 ("gate.timeout", &g.timeout),
                 ("gate.repo", &g.repo),
+                ("gate.branch", &g.branch),
+                ("gate.event", &g.event),
                 ("gate.title", &g.title),
                 ("gate.assignee", &g.assignee),
             ] {
@@ -509,6 +517,8 @@ struct RawGate {
     #[serde(alias = "duration")]
     timeout: Option<String>,
     repo: Option<String>,
+    branch: Option<String>,
+    event: Option<String>,
     title: Option<String>,
     #[serde(default)]
     description: String,
@@ -601,6 +611,8 @@ fn convert_step(raw: RawStep, path: &str) -> std::result::Result<Step, String> {
                 await_id,
                 timeout: g.timeout,
                 repo: g.repo,
+                branch: g.branch,
+                event: g.event,
                 title: g.title,
                 description: g.description,
                 assignee: g.assignee,
@@ -1011,6 +1023,8 @@ depends_on = ["bump"]
 [steps.gate]
 type = "gh:run"
 id = "release.yml"
+branch = "v{{version}}"
+event = "push"
 timeout = "30m"
 "#,
         )
@@ -1020,6 +1034,7 @@ timeout = "30m"
         assert_eq!(pb.steps[1].needs, vec!["bump"]);
         let gate = pb.steps[1].gate.as_ref().unwrap();
         assert_eq!((gate.kind, gate.await_id.as_deref()), (GateKind::GhRun, Some("release.yml")));
+        assert_eq!((gate.branch.as_deref(), gate.event.as_deref()), (Some("v{{version}}"), Some("push")));
         assert!(pb.vars["version"].check("version", "1.2").is_err());
         assert_eq!(pb.vars["version"].check("version", "1.2.3").unwrap(), "1.2.3");
     }
@@ -1032,6 +1047,10 @@ timeout = "30m"
         assert!(err.contains("approvers") && err.contains("line"), "{err}");
         let err = parse("[[steps]]\nid = \"a\"\nneeds_typo = []\n").unwrap_err().to_string();
         assert!(err.contains("needs_typo"), "{err}");
+        let err = parse("[[steps]]\nid = \"a\"\n[steps.gate]\ntype = \"human\"\nbranch = \"main\"\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only apply to gh:run"), "{err}");
     }
 
     #[test]

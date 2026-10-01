@@ -415,6 +415,110 @@ fn timer_and_github_gates_via_gate_check() {
     assert!(ws.ok(&["gate", "list"]).contains("escalated: PR #7"), "an error changes nothing");
 }
 
+/// A stand-in for `gh run list` that prints `runs.json` from its own
+/// directory and appends its arguments to `gh-args.log`.
+fn fake_gh_runs(dir: &Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let gh = dir.join("fake-gh-runs.cmd");
+        std::fs::write(&gh, "@echo off\r\necho %*>>\"%~dp0gh-args.log\"\r\ntype \"%~dp0runs.json\"\r\n").unwrap();
+        gh
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = dir.join("fake-gh-runs");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\nd=$(dirname \"$0\")\necho \"$*\" >> \"$d/gh-args.log\"\ncat \"$d/runs.json\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        gh
+    }
+}
+
+#[test]
+fn gh_run_gates_filter_by_branch_and_event_and_follow_the_head() {
+    let ws = Ws::new();
+    let gh = fake_gh_runs(ws.dir.path());
+    let env = [("BD_GH", gh.to_str().unwrap())];
+    let work = ws.id(&["create", "Verify"]);
+    let gate = ws.json(&[
+        "gate",
+        "create",
+        "-t",
+        "gh:run",
+        "--await-id",
+        "release.yml",
+        "--branch",
+        "v1.2.3",
+        "--event",
+        "push",
+        "--blocks",
+        &work,
+    ])["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        ws.code_as("tester", &["gate", "create", "-t", "gh:pr", "--await-id", "1", "--branch", "x", "--blocks", &work]),
+        2
+    );
+
+    let now = bd_core::Timestamp::now().millis();
+    let at = |offset_s: i64| bd_core::Timestamp(now + offset_s * 1000).to_rfc3339();
+    let run = |id: u64, created: String, branch: &str, event: &str, sha: &str, status: &str, conclusion: &str| {
+        serde_json::json!({"databaseId": id, "name": "Release", "createdAt": created, "headBranch": branch,
+            "event": event, "headSha": sha, "status": status, "conclusion": conclusion})
+    };
+    let write_runs = |runs: &[Value]| {
+        std::fs::write(ws.dir.path().join("runs.json"), Value::from(runs.to_vec()).to_string()).unwrap()
+    };
+    let check = || {
+        let out = ws.with_env(&env, &["--json", "gate", "check"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["checked"][0].clone()
+    };
+
+    // Too old, then a dry run on main, then (a little before arming, by GitHub's clock) the tag push.
+    let old = run(1, at(-600), "v1.2.3", "push", "aaa", "completed", "success");
+    let dry = run(2, at(-40), "main", "workflow_dispatch", "bbb", "completed", "success");
+    let mut tag = run(3, at(-20), "v1.2.3", "push", "ccc", "in_progress", "");
+    write_runs(&[old.clone(), dry.clone(), tag.clone()]);
+    let c = check();
+    assert_eq!((c["verdict"].as_str(), c["run_id"].as_str()), (Some("pending"), Some("3")), "{c}");
+    let args = std::fs::read_to_string(ws.dir.path().join("gh-args.log")).unwrap();
+    assert!(args.contains("--branch=v1.2.3") && args.contains("--event=push"), "{args}");
+
+    tag["status"] = "completed".into();
+    tag["conclusion"] = "failure".into();
+    write_runs(&[old.clone(), dry.clone(), tag.clone()]);
+    assert_eq!(check()["action"], "escalated");
+
+    // The tag is re-created on another commit: the gate follows its new run.
+    let retag = run(4, at(5), "v1.2.3", "push", "ddd", "in_progress", "");
+    write_runs(&[old.clone(), dry.clone(), tag.clone(), retag.clone()]);
+    let c = check();
+    assert_eq!((c["run_id"].as_str(), c["previous_run_id"].as_str()), (Some("4"), Some("3")), "{c}");
+    let shown = ws.json(&["gate", "show", &gate]);
+    assert_eq!(
+        (shown["phase"].as_str(), shown["run_id"].as_str()),
+        (Some("armed"), Some("4")),
+        "re-pinning drops the escalation"
+    );
+    assert!(ws.ok(&["show", &gate]).contains("Now watching GitHub run 4 instead of 3"));
+    assert_eq!(check()["action"], "unchanged", "a pinned run on the current head stays pinned");
+
+    let mut retag = retag;
+    retag["status"] = "completed".into();
+    retag["conclusion"] = "success".into();
+    write_runs(&[old, dry, tag, retag]);
+    assert_eq!(check()["action"], "opened");
+    assert_eq!(ws.json(&["ready"])[0]["id"], work.as_str());
+}
+
 #[test]
 fn ephemeral_runs_are_kept_out_of_exports_and_purged() {
     let ws = Ws::new();

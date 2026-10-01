@@ -376,8 +376,13 @@ A gate **arms** when the step it guards could otherwise start (the step's
 `needs` are closed), and timers and timeouts count from that moment, not from
 when the run was created. For `gh:run`, `await_id` is a run id or a workflow
 name or file; for a workflow, the first run started after arming is watched
-and pinned. GitHub gates use `gh` (`BD_GH` overrides the binary) in the
-workspace's repository, or in `repo = "owner/name"`.
+and pinned (runs created up to a minute before arming count, to allow for
+clock skew with GitHub). `branch` and `event` narrow the runs considered
+(`branch = "v{{version}}"`, `event = "push"`); with `branch`, the gate follows
+the branch or tag: when a newer run is for a different commit (a new push,
+or a re-created tag), it watches that commit's first run instead, dropping
+any escalation about the old one. GitHub gates use `gh` (`BD_GH` overrides
+the binary) in the workspace's repository, or in `repo = "owner/name"`.
 
 `bd gate check` (from cron or CI) opens the gates whose condition holds and
 escalates the ones that failed or ran past their timeout. Escalation records
@@ -389,6 +394,7 @@ bd gate list                                      # waiting, armed, escalated
 bd gate check [--dry-run] [--type gh]             # evaluate the armed gates
 bd gate resolve t-12.gate-publish -r "approved"
 bd gate create -t gh:pr --await-id 42 --blocks t-7   # a gate in front of existing work
+bd gate create -t gh:run --await-id release.yml --branch v1.2.0 --event push --blocks t-9
 ```
 
 ## Remote server: one workspace, many machines

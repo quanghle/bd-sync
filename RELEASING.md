@@ -16,11 +16,12 @@ bd playbook run release --var version=0.2.0     # then: bd ready --run <run-id>
 bd gate check                                   # opens the gh:run gate once the release run succeeds
 ```
 
-The `gh:run` gate pins the first `release.yml` run created after it arms,
-whatever its event or branch, and it arms when the playbook's `tag` step
-closes. So close `tag` right before pushing the tag, do not dispatch dry runs
-between the two, and after pushing confirm that the gate watches the tag-push
-run (the playbook's `push` step shows how).
+The `gh:run` gate watches the first `release.yml` run for the tag push
+(`branch = "v<version>"`, `event = "push"`) created after it arms, and it
+arms when the playbook's `tag` step closes, so close `tag` before pushing the
+tag. Dry runs are ignored. If the tag is deleted and re-created on another
+commit, the gate moves to the new tag's run (the playbook's `push` step shows
+how to check).
 
 ## Cut a release
 

@@ -147,6 +147,12 @@ fn step_lines(steps: &[Step], depth: usize, out: &mut Vec<String>) {
             if let Some(a) = &g.await_id {
                 gate.push_str(&format!(" {a}"));
             }
+            if let Some(b) = &g.branch {
+                gate.push_str(&format!(" on {b}"));
+            }
+            if let Some(e) = &g.event {
+                gate.push_str(&format!(" for {e}"));
+            }
             if let Some(t) = &g.timeout {
                 gate.push_str(&format!(" ({t})"));
             }

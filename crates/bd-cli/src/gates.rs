@@ -33,6 +33,12 @@ fn condition(g: &GateView) -> String {
             if let Some(a) = &s.await_id {
                 c.push_str(&format!(" {a}"));
             }
+            if let Some(b) = &s.branch {
+                c.push_str(&format!(" on {b}"));
+            }
+            if let Some(e) = &s.event {
+                c.push_str(&format!(" for {e}"));
+            }
             if let Some(r) = &s.repo {
                 c.push_str(&format!(" in {r}"));
             }
@@ -159,6 +165,8 @@ pub fn exec_create(tx: &mut WriteCtx<'_>, a: &GateCreateArgs) -> Result<Out> {
         await_id: a.await_id.clone().filter(|s| !s.trim().is_empty()),
         timeout: a.timeout.clone().filter(|s| !s.trim().is_empty()),
         repo: a.repo.clone().filter(|s| !s.trim().is_empty()),
+        branch: a.branch.clone().filter(|s| !s.trim().is_empty()),
+        event: a.event.clone().filter(|s| !s.trim().is_empty()),
     };
     let blocks =
         a.blocks.iter().filter(|b| !b.trim().is_empty()).map(|b| tx.resolve_id(b)).collect::<Result<Vec<_>>>()?;
@@ -192,6 +200,11 @@ struct Checked {
     action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     run_id: Option<String>,
+    /// The run watched before a re-pin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pin_reason: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     unblocked: Vec<String>,
 }
@@ -236,8 +249,49 @@ fn run_verdict(run: &Value) -> Verdict {
     }
 }
 
-/// Probe a GitHub gate. Returns the verdict and, for gh:run, the run to pin.
-fn probe_github(g: &GateView, spec: &GateSpec, cwd: &Path) -> std::result::Result<(Verdict, Option<String>), String> {
+/// Runs created this long before a `gh:run` gate armed still count: the gate
+/// arms on this machine's clock, GitHub stamps runs with its own.
+const RUN_CLOCK_SKEW_MS: i64 = 60_000;
+
+const RUN_FIELDS: &str = "databaseId,status,conclusion,name,createdAt,url,headBranch,headSha,event";
+
+/// A run for a `gh:run` gate to watch (newly or instead of another).
+struct Pin {
+    run_id: String,
+    why: Option<String>,
+}
+
+fn run_id_of(run: &Value) -> Option<String> {
+    run.get("databaseId")
+        .filter(|v| !v.is_null())
+        .map(|v| v.as_str().map(String::from).unwrap_or_else(|| v.to_string()))
+}
+
+fn run_created(run: &Value) -> Option<Timestamp> {
+    run.get("createdAt").and_then(Value::as_str).and_then(|s| Timestamp::parse_rfc3339(s).ok())
+}
+
+fn run_field<'a>(run: &'a Value, key: &str) -> Option<&'a str> {
+    run.get(key).and_then(Value::as_str)
+}
+
+/// `gh` filters by branch and event already; this guards against a run it
+/// let through anyway. A field `gh` did not return matches.
+fn run_matches(run: &Value, key: &str, want: &Option<String>) -> bool {
+    match (want, run_field(run, key)) {
+        (Some(w), Some(v)) => v == w,
+        _ => true,
+    }
+}
+
+fn view_run(id: &str, spec: &GateSpec, cwd: &Path) -> std::result::Result<Value, String> {
+    let mut args: Vec<String> = ["run", "view", id, "--json", RUN_FIELDS].iter().map(|s| s.to_string()).collect();
+    args.extend(repo_args(spec));
+    gh_json(&args, cwd)
+}
+
+/// Probe a GitHub gate. Returns the verdict and, for gh:run, a run to pin.
+fn probe_github(g: &GateView, spec: &GateSpec, cwd: &Path) -> std::result::Result<(Verdict, Option<Pin>), String> {
     let target = spec.await_id.clone().unwrap_or_default();
     match spec.kind {
         GateKind::GhPr => {
@@ -257,54 +311,79 @@ fn probe_github(g: &GateView, spec: &GateSpec, cwd: &Path) -> std::result::Resul
             ))
         }
         GateKind::GhRun => {
-            let pinned = g
-                .run_id
-                .clone()
-                .or_else(|| (!target.is_empty() && target.chars().all(|c| c.is_ascii_digit())).then(|| target.clone()));
-            if let Some(id) = pinned {
-                let mut args: Vec<String> = ["run", "view", &id, "--json", "databaseId,status,conclusion,name,url"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                args.extend(repo_args(spec));
-                return Ok((run_verdict(&gh_json(&args, cwd)?), None));
+            if let Some(id) = spec.run_id() {
+                return Ok((run_verdict(&view_run(id, spec, cwd)?), None));
             }
-            // A workflow name: the first run that started after the gate armed.
-            let workflow = format!("--workflow={target}");
-            let mut args: Vec<String> = [
-                "run",
-                "list",
-                &workflow,
-                "--json",
-                "databaseId,status,conclusion,name,createdAt,url",
-                "--limit",
-                "50",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+            // Without a branch, a pinned run stays pinned: no need to list runs again.
+            if let (Some(id), None) = (&g.run_id, &spec.branch) {
+                return Ok((run_verdict(&view_run(id, spec, cwd)?), None));
+            }
+            // A workflow: the first run created after the gate armed. With a
+            // branch, the first run for the branch's newest head, so a
+            // re-created tag or a newer push moves the gate to its run.
+            let mut args: Vec<String> = vec!["run".into(), "list".into(), format!("--workflow={target}")];
+            if let Some(b) = &spec.branch {
+                args.push(format!("--branch={b}"));
+            }
+            if let Some(e) = &spec.event {
+                args.push(format!("--event={e}"));
+            }
+            args.extend(["--json", RUN_FIELDS, "--limit", "50"].iter().map(|s| s.to_string()));
             args.extend(repo_args(spec));
-            let runs = gh_json(&args, cwd)?;
+            let listed = gh_json(&args, cwd)?;
             let armed = g.armed_at.unwrap_or(g.created_at);
-            let first = runs
+            let since = Timestamp(armed.millis().saturating_sub(RUN_CLOCK_SKEW_MS));
+            let runs: Vec<(Timestamp, &Value)> = listed
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|r| {
-                    let created =
-                        r.get("createdAt").and_then(Value::as_str).and_then(|s| Timestamp::parse_rfc3339(s).ok())?;
-                    (created >= armed).then_some((created, r))
-                })
-                .min_by_key(|(created, _)| *created);
+                .filter(|r| run_matches(r, "headBranch", &spec.branch) && run_matches(r, "event", &spec.event))
+                .filter_map(|r| run_created(r).filter(|c| *c >= since).map(|c| (c, r)))
+                .collect();
+            let head = spec
+                .branch
+                .as_ref()
+                .and_then(|_| runs.iter().max_by_key(|(c, _)| *c))
+                .and_then(|(_, r)| run_field(r, "headSha"));
+            let first = runs
+                .iter()
+                .filter(|(_, r)| head.is_none() || run_field(r, "headSha") == head)
+                .min_by_key(|(c, _)| *c)
+                .map(|(_, r)| *r);
+
+            if let Some(pinned) = &g.run_id {
+                let current = match runs.iter().find(|(_, r)| run_id_of(r).as_deref() == Some(pinned.as_str())) {
+                    Some((_, r)) => (*r).clone(),
+                    None => view_run(pinned, spec, cwd)?,
+                };
+                let moved = head.is_some() && run_field(&current, "headSha") != head;
+                return match first.filter(|_| moved) {
+                    Some(run) => {
+                        let why = format!(
+                            "{} now points at {}",
+                            spec.branch.as_deref().unwrap_or_default(),
+                            head.map(|h| &h[..h.len().min(12)]).unwrap_or_default()
+                        );
+                        Ok((run_verdict(run), run_id_of(run).map(|run_id| Pin { run_id, why: Some(why) })))
+                    }
+                    None => Ok((run_verdict(&current), None)),
+                };
+            }
             match first {
-                None => Ok((
-                    Verdict::Pending(format!("no run of {target} has started since the gate armed ({armed})")),
-                    None,
-                )),
-                Some((_, run)) => {
-                    let id = run.get("databaseId").map(|v| v.to_string());
-                    Ok((run_verdict(run), id))
+                None => {
+                    let mut which = target.clone();
+                    if let Some(b) = &spec.branch {
+                        which.push_str(&format!(" on {b}"));
+                    }
+                    if let Some(e) = &spec.event {
+                        which.push_str(&format!(" for {e}"));
+                    }
+                    Ok((
+                        Verdict::Pending(format!("no run of {which} has started since the gate armed ({armed})")),
+                        None,
+                    ))
                 }
+                Some(run) => Ok((run_verdict(run), run_id_of(run).map(|run_id| Pin { run_id, why: None }))),
             }
         }
         _ => Err(format!("{} gates are not GitHub gates", spec.kind)),
@@ -348,20 +427,31 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
     let mut checked: Vec<Checked> = Vec::new();
     for (g, verdict) in candidates.iter().zip(local) {
         let kind = g.spec.as_ref().map(|s| s.kind.to_string());
-        let (verdict, run_id, error) = match verdict {
+        let (verdict, pin, error) = match verdict {
             Some(v) => (v, None, None),
             None => match probe_github(g, g.spec.as_ref().expect("local evaluation handles malformed gates"), &cwd) {
                 Ok((v, pin)) => (v, pin, None),
                 Err(e) => (Verdict::Pending(e.clone()), None, Some(e)),
             },
         };
+        let previous_run_id = pin.as_ref().and(g.run_id.clone());
+        let (run_id, pin_reason) = pin.map(|p| (Some(p.run_id), p.why)).unwrap_or_default();
         // Timeouts escalate whatever is still shut.
         let verdict = match (&verdict, gates::overdue(g, now)) {
             (Verdict::Pending(_), Some(reason)) if g.is_armed() => Verdict::Escalate(reason),
             _ => verdict,
         };
         let action = if error.is_some() { "error" } else { "unchanged" };
-        checked.push(Checked { id: g.id.clone(), kind, verdict, action: action.into(), run_id, unblocked: Vec::new() });
+        checked.push(Checked {
+            id: g.id.clone(),
+            kind,
+            verdict,
+            action: action.into(),
+            run_id,
+            previous_run_id,
+            pin_reason,
+            unblocked: Vec::new(),
+        });
     }
 
     let needs_write = checked
@@ -376,7 +466,7 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
                     continue;
                 }
                 if let Some(run) = &c.run_id {
-                    tx.pin_gate_run(&c.id, run)?;
+                    tx.pin_gate_run(&c.id, run, c.pin_reason.as_deref())?;
                 }
                 match &c.verdict {
                     Verdict::Resolve(detail) => {
@@ -424,6 +514,11 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
             other => other.to_string(),
         };
         out = out.line(format!("{icon} {} {verb}: {}", c.id, c.verdict.detail())).id(c.id.clone());
+        if let (Some(run), Some(prev)) = (&c.run_id, &c.previous_run_id) {
+            let why = c.pin_reason.as_ref().map(|w| format!(" ({w})")).unwrap_or_default();
+            let verb = if a.dry_run { "would watch" } else { "now watching" };
+            out = out.line(format!("  ↻ {verb} run {run} instead of {prev}{why}"));
+        }
         for u in &c.unblocked {
             out = out.line(format!("  ↳ unblocked {u}"));
         }

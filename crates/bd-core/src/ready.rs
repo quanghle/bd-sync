@@ -16,7 +16,7 @@ use crate::error::Result;
 use crate::filter::{QueryParts, apply_work_filter, placeholders, text_values};
 use crate::graph;
 use crate::issues::{ISSUE_COLUMNS, issue_from_row};
-use crate::model::{Blocker, Issue, ReadyQuery, SortPolicy, Status, WorkFilter};
+use crate::model::{Blocker, GATE_TYPE, Issue, ReadyQuery, SortPolicy, Status, WorkFilter};
 use crate::time::{Timestamp, format_duration_ms};
 
 const HYBRID_WINDOW: Duration = Duration::from_secs(48 * 3600);
@@ -63,6 +63,10 @@ pub(crate) fn ready_for(
     }
     if !q.include_epics && !q.filter.types.iter().any(|t| t == "epic") {
         parts.cond("i.issue_type <> 'epic'", []);
+    }
+    // Gates are wait conditions resolved by `bd gate`, never work to claim.
+    if !q.filter.types.iter().any(|t| t == GATE_TYPE) {
+        parts.cond("i.issue_type <> 'gate'", []);
     }
     apply_work_filter(&mut parts, &q.filter);
     if let Some((actor, pools)) = claimant {
@@ -170,14 +174,15 @@ pub fn count_ready(conn: &Connection, now: Timestamp) -> Result<i64> {
     if !any_deferred(conn, now)? {
         return Ok(conn
             .prepare_cached(
-                "SELECT COUNT(*) FROM issues WHERE status = 'open' AND is_blocked = 0 AND issue_type <> 'epic'",
+                "SELECT COUNT(*) FROM issues
+                 WHERE status = 'open' AND is_blocked = 0 AND issue_type NOT IN ('epic','gate')",
             )?
             .query_row([], |r| r.get(0))?);
     }
     let sql = format!(
         "WITH RECURSIVE {DEFERRED_CTE}
          SELECT COUNT(*) FROM issues i
-         WHERE i.status = 'open' AND i.is_blocked = 0 AND i.issue_type <> 'epic'
+         WHERE i.status = 'open' AND i.is_blocked = 0 AND i.issue_type NOT IN ('epic','gate')
            AND i.id NOT IN (SELECT id FROM deferred)"
     );
     Ok(conn.prepare_cached(&sql)?.query_row([now.millis()], |r| r.get(0))?)

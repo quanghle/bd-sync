@@ -79,8 +79,8 @@ target/release/bd bench --workers 8   # throughput + invariant verification on a
 
 Rust re-implementation of beads as a coordination engine on SQLite WAL (see README.md).
 
-- `crates/bd-core` (library): `store.rs` (WAL pragmas, busy handler, `Store::write` = one `BEGIN IMMEDIATE` transaction with a `WriteCtx`), `schema.rs` (migrations via `PRAGMA user_version`), `issues.rs` (lifecycle), `graph.rs` (typed edges, cycle/hierarchy checks, materialized `is_blocked`), `ready.rs`, `claims.rs` (leases, fencing tokens, reclaim), `events.rs`, `comments.rs`, `memory.rs`, `transfer.rs` (JSONL, beads-compatible import), `metrics.rs`, `doctor.rs`, `queries.rs` (read API trait).
-- `crates/bd-cli` (binary `bd`): clap grammar in `cli.rs`; mutations are `exec_*` functions over `WriteCtx` in `commands.rs` so `batch.rs` can run them in one transaction; `bench.rs` is the throughput and invariant harness.
+- `crates/bd-core` (library): `store.rs` (WAL pragmas, busy handler, `Store::write` = one `BEGIN IMMEDIATE` transaction with a `WriteCtx`), `schema.rs` (migrations via `PRAGMA user_version`), `issues.rs` (lifecycle), `graph.rs` (typed edges, cycle/hierarchy checks, materialized `is_blocked`), `ready.rs`, `claims.rs` (leases, fencing tokens, reclaim), `events.rs`, `comments.rs`, `memory.rs`, `transfer.rs` (JSONL, beads-compatible import), `metrics.rs`, `doctor.rs`, `queries.rs` (read API trait), `gates.rs` (gate conditions in `metadata.gate`, arming via `graph::recompute`, local evaluation, escalation), `playbook/` (playbook files: strict parsing, `{{var}}` templates and conditions, `extends`/`expand` loading, compile to a `Plan`, runs, extract).
+- `crates/bd-cli` (binary `bd`): clap grammar in `cli.rs`; mutations are `exec_*` functions over `WriteCtx` in `commands.rs` so `batch.rs` can run them in one transaction; `bench.rs` is the throughput and invariant harness; `playbooks.rs` and `gates.rs` implement `bd playbook` and `bd gate` (GitHub gates shell out to `gh`, outside any write transaction).
 
 ### Conventions & Patterns
 
@@ -88,4 +88,5 @@ Rust re-implementation of beads as a coordination engine on SQLite WAL (see READ
 - Any change that can affect readiness must call `graph::recompute` with the right seeds; `bd doctor` (`blocked_drift`) verifies against a full recompute.
 - Keep the lease invariant: a lease exists iff the issue is `in_progress` and the holder equals the assignee.
 - Keep indexes minimal: each index is extra pages written per claim/close (see `bd bench`).
+- Playbook runs and groups are identified by `metadata.playbook.role` (`run`/`group`): they close themselves when their subtree closes; keep that metadata when touching run issues.
 - AGENTS.md and CLAUDE.md are identical; edit both.

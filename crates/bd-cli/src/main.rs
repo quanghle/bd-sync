@@ -4,7 +4,9 @@ mod bench;
 mod cli;
 mod commands;
 mod fmt;
+mod gates;
 mod logging;
+mod playbooks;
 
 use bd_core::{Error, Result};
 use clap::Parser;
@@ -132,6 +134,9 @@ fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Export(a) => cmd_export(app, a).map(|_| 0),
         Command::Import(a) => cmd_import(app, a).map(|_| 0),
         Command::Batch(a) => batch::cmd_batch(app, a).map(|_| 0),
+        Command::Playbook(c) => playbooks::cmd_playbook(app, c).map(|_| 0),
+        Command::Gate(c) => gates::cmd_gate(app, c).map(|_| 0),
+        Command::Purge(a) => playbooks::cmd_purge(app, a).map(|_| 0),
         Command::Bench(a) => bench::cmd_bench(app, a).map(|_| 0),
         Command::BenchWorker(a) => bench::cmd_bench_worker(a).map(|_| 0),
         Command::Info => cmd_info(app).map(|_| 0),
@@ -183,6 +188,9 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Export(_) => "export",
         Command::Import(_) => "import",
         Command::Batch(_) => "batch",
+        Command::Playbook(_) => "playbook",
+        Command::Gate(_) => "gate",
+        Command::Purge(_) => "purge",
         Command::Bench(_) | Command::BenchWorker(_) => "bench",
         Command::Info => "info",
         Command::Version => "version",

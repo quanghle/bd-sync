@@ -19,7 +19,14 @@ impl Ws {
 
     fn cmd_in(dir: &Path, actor: &str, args: &[&str]) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_bd"));
-        c.current_dir(dir).args(args).env("BD_ACTOR", actor).env("BD_LOG", "error").env_remove("BD_DB");
+        c.current_dir(dir)
+            .args(args)
+            .env("BD_ACTOR", actor)
+            .env("BD_LOG", "error")
+            .env_remove("BD_DB")
+            .env_remove("BD_PLAYBOOK_PATH")
+            .env_remove("BD_GH")
+            .env("XDG_CONFIG_HOME", dir.join(".xdg"));
         c
     }
 
@@ -208,4 +215,218 @@ fn prime_is_silent_outside_a_workspace() {
     assert!(out.stdout.is_empty());
     let out = Ws::cmd_in(dir.path(), "x", &["ready"]).output().unwrap();
     assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn directory_flag_resolves_the_workspace() {
+    let ws = Ws::new();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let dir = ws.dir.path().to_str().unwrap();
+    let out = Ws::cmd_in(elsewhere.path(), "tester", &["-C", dir, "--json", "info"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let info: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let path = info["path"].as_str().unwrap();
+    assert!(!path.starts_with(r"\\?\"), "no verbatim Windows path: {path}");
+    // Compare canonical forms: macOS temp dirs live under /var -> /private/var.
+    let expected = ws.dir.path().join(".bd").join("bd.db");
+    assert_eq!(std::fs::canonicalize(path).unwrap(), std::fs::canonicalize(expected).unwrap());
+}
+
+#[test]
+fn user_playbooks_come_from_the_config_dir() {
+    let ws = Ws::new();
+    let step = "[[steps]]\nid = \"a\"\n";
+    let xdg = ws.dir.path().join(".xdg").join("bd").join("playbooks");
+    std::fs::create_dir_all(&xdg).unwrap();
+    std::fs::write(xdg.join("mine.toml"), step).unwrap();
+    assert_eq!(ws.json(&["playbook", "list"])["playbooks"][0]["name"], "mine");
+
+    // Without XDG_CONFIG_HOME: %APPDATA%\bd\playbooks on Windows, ~/.config/bd/playbooks elsewhere.
+    let home = ws.dir.path().join("home");
+    let (var, dir) = if cfg!(windows) {
+        ("APPDATA", home.join("bd").join("playbooks"))
+    } else {
+        ("HOME", home.join(".config").join("bd").join("playbooks"))
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("theirs.toml"), step).unwrap();
+    let mut c = Ws::cmd_in(ws.dir.path(), "tester", &["--json", "playbook", "list"]);
+    c.env_remove("XDG_CONFIG_HOME").env(var, &home);
+    let out = c.output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let listed: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let names: Vec<&str> =
+        listed["playbooks"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec!["theirs"], "{listed}");
+}
+
+impl Ws {
+    fn playbook(&self, name: &str, text: &str) {
+        let dir = self.dir.path().join(".bd").join("playbooks");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.toml")), text).unwrap();
+    }
+
+    fn with_env(&self, env: &[(&str, &str)], args: &[&str]) -> Output {
+        let mut c = Ws::cmd_in(self.dir.path(), "tester", args);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    }
+}
+
+/// A stand-in for the GitHub CLI: `pr view 42` reports a merged PR, any other
+/// PR a closed one. A batch file on Windows (std runs those through cmd.exe
+/// and escapes the arguments), a shell script elsewhere.
+fn fake_gh(dir: &Path) -> std::path::PathBuf {
+    #[cfg(windows)]
+    {
+        let gh = dir.join("fake-gh.cmd");
+        std::fs::write(
+            &gh,
+            "@echo off\r\nif \"%~3\"==\"42\" goto merged\r\necho {\"state\":\"CLOSED\",\"title\":\"Old\"}\r\nexit /b 0\r\n:merged\r\necho {\"state\":\"MERGED\",\"title\":\"Feature\"}\r\n",
+        )
+        .unwrap();
+        gh
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let gh = dir.join("fake-gh");
+        std::fs::write(
+            &gh,
+            "#!/bin/sh\ncase \"$3\" in 42) echo '{\"state\":\"MERGED\",\"title\":\"Feature\"}' ;; *) echo '{\"state\":\"CLOSED\",\"title\":\"Old\"}' ;; esac\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        gh
+    }
+}
+
+const DEPLOY: &str = r#"
+description = "Build, approve, deploy"
+[vars.service]
+required = true
+[[steps]]
+id = "build"
+title = "Build {{service}}"
+[[steps]]
+id = "deploy"
+title = "Deploy {{service}}"
+needs = ["build"]
+[steps.gate]
+type = "human"
+"#;
+
+#[test]
+fn playbook_runs_flow_through_ready_and_gates() {
+    let ws = Ws::new();
+    ws.playbook("deploy", DEPLOY);
+    let listed = ws.json(&["playbook", "list"]);
+    assert_eq!(listed["playbooks"][0]["name"], "deploy");
+    assert_eq!(listed["playbooks"][0]["vars"], serde_json::json!(["service!"]));
+    assert_eq!(ws.code_as("tester", &["playbook", "run", "deploy"]), 2, "missing required var");
+    assert_eq!(ws.code_as("tester", &["playbook", "run", "nope"]), 3, "unknown playbook");
+
+    let plan = ws.json(&["playbook", "plan", "deploy", "--var", "service=api"]);
+    assert_eq!(plan["dry_run"], true);
+    assert!(ws.json(&["list"]).as_array().unwrap().is_empty(), "plan writes nothing");
+
+    let run = ws.json(&["playbook", "run", "deploy", "--var", "service=api"]);
+    let id = run["run"]["id"].as_str().unwrap().to_string();
+    assert_eq!(run["ready"][0]["id"], format!("{id}.build"));
+    let ready = ws.json(&["ready", "--run", &id]);
+    assert_eq!(ready.as_array().unwrap().len(), 1, "gates and the run itself are not work");
+    assert_eq!(ws.code_as("tester", &["claim", &format!("{id}.gate-deploy")]), 2, "gates are not claimed");
+
+    ws.ok(&["close", &format!("{id}.build")]);
+    let gates = ws.json(&["gate", "list"]);
+    assert_eq!(gates[0]["phase"], "armed");
+    assert!(ws.ok(&["prime"]).contains("Gates needing a person"), "approvals show up in prime");
+    ws.ok(&["gate", "resolve", &format!("{id}.gate-deploy"), "-r", "ship it"]);
+    let closed = ws.json(&["close", &format!("{id}.deploy")]);
+    assert_eq!(closed["completed"][0]["id"], id.as_str());
+
+    let status = ws.json(&["playbook", "status", &id]);
+    assert_eq!(status["progress"]["done"], 2);
+    assert_eq!(status["nodes"].as_array().unwrap().len(), 3);
+    let runs = ws.json(&["playbook", "runs", "--all"]);
+    assert_eq!(runs[0]["playbook"], "deploy");
+    assert!(ws.json(&["playbook", "runs"]).as_array().unwrap().is_empty(), "finished runs are hidden by default");
+
+    ws.ok(&["playbook", "extract", &id, "--save", "--name", "deploy-copy"]);
+    let again = ws.json(&["playbook", "run", "deploy-copy"]);
+    assert_eq!(again["steps"], 2);
+    assert_eq!(again["gates"], 1);
+    ws.ok(&["playbook", "compact", &id]);
+    assert!(ws.json(&["show", &id])["notes"].as_str().unwrap().contains("ship it"));
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn playbook_files_are_parsed_strictly() {
+    let ws = Ws::new();
+    ws.playbook("typo", "[[steps]]\nid = \"a\"\n[steps.gate]\ntype = \"human\"\napprovers = [\"lead\"]\n");
+    let out = ws.run_as("tester", &["playbook", "show", "typo"]);
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("approvers") && err.contains("line 5"), "{err}");
+    let listed = ws.json(&["playbook", "list"]);
+    assert!(listed["playbooks"][0]["error"].as_str().unwrap().contains("approvers"));
+}
+
+#[test]
+fn timer_and_github_gates_via_gate_check() {
+    let ws = Ws::new();
+    let work = ws.id(&["create", "Bake"]);
+    // The timer counts from `gate create`; a 2s timer leaves slow CI runners
+    // room to spawn two processes before the first check.
+    let armed = std::time::Instant::now();
+    ws.ok(&["gate", "create", "-t", "timer", "--timeout", "2s", "--blocks", &work]);
+    let checked = ws.json(&["gate", "check"]);
+    assert_eq!(checked["checked"][0]["verdict"], "pending");
+    std::thread::sleep(std::time::Duration::from_millis(2100).saturating_sub(armed.elapsed()));
+    let checked = ws.json(&["gate", "check"]);
+    assert_eq!(checked["checked"][0]["action"], "opened");
+    assert_eq!(ws.json(&["ready"])[0]["id"], work.as_str());
+
+    let gh = fake_gh(ws.dir.path());
+    let merge = ws.id(&["create", "Merge"]);
+    let revive = ws.id(&["create", "Revive"]);
+    ws.ok(&["gate", "create", "-t", "gh:pr", "--await-id", "42", "--blocks", &merge]);
+    ws.ok(&["gate", "create", "-t", "gh:pr", "--await-id", "#7", "--blocks", &revive]);
+    let env = [("BD_GH", gh.to_str().unwrap())];
+    let out = ws.with_env(&env, &["--json", "gate", "check", "--type", "gh"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let checked: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let actions: Vec<&str> =
+        checked["checked"].as_array().unwrap().iter().map(|c| c["action"].as_str().unwrap()).collect();
+    assert_eq!(actions, vec!["opened", "escalated"]);
+    let ready: Vec<String> =
+        ws.json(&["ready"]).as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
+    assert!(ready.contains(&merge) && !ready.contains(&revive));
+    assert!(ws.ok(&["prime"]).contains("escalated: PR #7 was closed"));
+    let out = ws.with_env(&[("BD_GH", "/nonexistent/gh")], &["--json", "gate", "check"]);
+    let checked: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(checked["checked"][0]["action"], "error", "escalated gates are still probed");
+    assert!(checked["checked"][0]["detail"].as_str().unwrap().contains("cannot run"));
+    assert!(ws.ok(&["gate", "list"]).contains("escalated: PR #7"), "an error changes nothing");
+}
+
+#[test]
+fn ephemeral_runs_are_kept_out_of_exports_and_purged() {
+    let ws = Ws::new();
+    ws.playbook("patrol", "ephemeral = true\n[[steps]]\nid = \"check\"\n");
+    let run = ws.json(&["playbook", "run", "patrol"]);
+    let id = run["run"]["id"].as_str().unwrap().to_string();
+    assert_eq!(run["ephemeral"], true);
+    assert!(!ws.ok(&["export"]).contains(&id));
+    assert!(ws.ok(&["export", "--include-ephemeral"]).contains(&id));
+    let kept = ws.json(&["playbook", "run", "patrol", "--persistent"]);
+    assert_eq!(kept["ephemeral"], false);
+    ws.ok(&["close", &format!("{id}.check")]);
+    let purged = ws.json(&["purge"]);
+    assert_eq!(purged["deleted"].as_array().unwrap().len(), 2);
+    assert_eq!(ws.code_as("tester", &["show", &id]), 3);
 }

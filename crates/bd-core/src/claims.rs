@@ -23,7 +23,7 @@ use crate::config;
 use crate::error::{Error, Result};
 use crate::filter::{QueryParts, apply_work_filter};
 use crate::issues;
-use crate::model::{Guard, Issue, Lease, ReadyQuery, Status, WorkFilter};
+use crate::model::{GATE_TYPE, Guard, Issue, Lease, ReadyQuery, Status, WorkFilter};
 use crate::ready;
 use crate::store::WriteCtx;
 use crate::time::{Timestamp, duration_ms};
@@ -194,6 +194,11 @@ impl WriteCtx<'_> {
     fn claim_checked(&mut self, id: &str, opts: &ClaimOptions, ready_verified: bool) -> Result<Claim> {
         let issue = issues::require(self.conn(), id)?;
         opts.guard.check(&issue)?;
+        if issue.issue_type == GATE_TYPE {
+            return Err(Error::Refused(format!(
+                "{id} is a gate: it opens through `bd gate check` or `bd gate resolve {id}`, not a claim"
+            )));
+        }
         let actor = self.actor().to_string();
         let ttl = self.lease_ttl(opts.ttl)?;
         let now = self.now();

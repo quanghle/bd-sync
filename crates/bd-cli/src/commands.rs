@@ -141,6 +141,7 @@ pub fn exec_create(tx: &mut WriteCtx<'_>, a: &CreateArgs) -> Result<Out> {
         due_at: a.due.as_deref().map(|s| parse_when(s, now)).transpose()?,
         defer_until: a.defer.as_deref().map(|s| parse_when(s, now)).transpose()?,
         metadata: a.metadata.as_deref().map(|m| json_object(m, "--metadata")).transpose()?,
+        ephemeral: a.ephemeral,
     };
     let issue = tx.create_issue(new)?;
     let mut out = if a.claim {
@@ -193,6 +194,7 @@ pub fn exec_update(tx: &mut WriteCtx<'_>, a: &UpdateArgs) -> Result<Out> {
             Some(p) if p.trim().is_empty() => Some(None),
             Some(p) => Some(Some(tx.resolve_id(p)?)),
         },
+        ephemeral: a.ephemeral,
     };
     if patch.is_empty() {
         return Err(Error::invalid("nothing to update: pass at least one field flag"));
@@ -235,6 +237,9 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         for u in &r.unblocked {
             out = out.line(format!("  ↳ unblocked {} [P{}] {}", u.id, u.priority, u.title));
         }
+        for c in &r.completed {
+            out = out.line(format!("  ✓ completed {} {}", c.id, c.title));
+        }
         out = out.id(id);
         results.push(r);
     }
@@ -255,6 +260,9 @@ pub fn exec_reopen(tx: &mut WriteCtx<'_>, a: &ReopenArgs) -> Result<Out> {
         });
         for b in &r.newly_blocked {
             out = out.line(format!("  ↳ blocks again {} {}", b.id, b.title));
+        }
+        for p in &r.reopened {
+            out = out.line(format!("  ↺ reopened {} {}", p.id, p.title));
         }
         out = out.id(id);
         results.push(r);
@@ -926,7 +934,7 @@ pub fn cmd_history(app: &mut App, a: &HistoryArgs) -> Result<()> {
 pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     let actor = app.actor();
     let path = app.db_path()?;
-    let (mine, ready, stats, memories, ttl, now, prefix) = app.read(|r| {
+    let (mine, ready, stats, memories, ttl, now, prefix, attention) = app.read(|r| {
         let mine = r.list(&ListQuery {
             filter: WorkFilter { assignee: Some(actor.clone()), ..Default::default() },
             statuses: vec![Status::InProgress],
@@ -942,6 +950,15 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             })
             .collect();
         let ready = r.ready(&ReadyQuery { limit: Some(a.ready.max(1)), ..Default::default() })?;
+        // Gates a person has to act on: armed approvals and escalations.
+        let attention: Vec<bd_core::gates::GateView> = bd_core::gates::list(r.conn(), false)?
+            .into_iter()
+            .filter(|g| {
+                g.phase == bd_core::gates::GatePhase::Escalated
+                    || (g.phase == bd_core::gates::GatePhase::Armed
+                        && g.spec.as_ref().is_some_and(|s| s.kind == bd_core::gates::GateKind::Human))
+            })
+            .collect();
         Ok((
             mine,
             ready,
@@ -950,6 +967,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             r.config_value("lease.ttl")?,
             r.now(),
             r.config_value("issue_prefix")?,
+            attention,
         ))
     })?;
     let shown_memories: Vec<&bd_core::Memory> =
@@ -964,6 +982,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             "ready": ready,
             "ready_total": stats.ready,
             "stats": stats,
+            "gates_needing_attention": attention,
             "memories": shown_memories,
         }));
         return Ok(());
@@ -989,6 +1008,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             .into(),
     );
     o.push("- `--json` on any command gives machine output; `--if-revision N` makes an update compare-and-set (exit 13 on conflict).".into());
+    o.push("- `bd playbook run <name> --var k=v` starts repeatable multi-step work (`bd playbook list`); `bd playbook status <run>` shows its steps; gates in front of steps are listed by `bd gate list`.".into());
     o.push(String::new());
     o.push(format!(
         "## Status: {} ready · {} in progress · {} blocked · {} deferred · {} open total",
@@ -1016,6 +1036,24 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     }
     for i in &ready {
         o.push(format!("- {} [P{}] [{}] {}", i.id, i.priority, i.issue_type, i.title));
+    }
+    if !attention.is_empty() {
+        o.push(String::new());
+        o.push(format!("## Gates needing a person ({})", attention.len()));
+        for g in &attention {
+            let what = match (&g.escalation, g.phase) {
+                (Some(reason), bd_core::gates::GatePhase::Escalated) => format!("escalated: {reason}"),
+                _ => "awaiting approval".to_string(),
+            };
+            let holds: Vec<&str> = g.blocks.iter().map(|b| b.id.as_str()).collect();
+            o.push(format!(
+                "- {} {} — {what} (holds {}); open with `bd gate resolve {}`",
+                g.id,
+                g.title,
+                holds.join(", "),
+                g.id
+            ));
+        }
     }
     if !memories.is_empty() {
         o.push(String::new());
@@ -1184,7 +1222,11 @@ pub fn cmd_config_read(app: &mut App, cmd: &ConfigCommand) -> Result<()> {
 }
 
 pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
-    let opts = ExportOptions { include_memories: !a.no_memories, include_closed: !a.open_only };
+    let opts = ExportOptions {
+        include_memories: !a.no_memories,
+        include_closed: !a.open_only,
+        include_ephemeral: a.include_ephemeral,
+    };
     let summary = match &a.output {
         Some(path) => {
             let tmp = path.with_extension("jsonl.tmp");

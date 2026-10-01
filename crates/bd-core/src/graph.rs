@@ -245,6 +245,7 @@ pub(crate) fn recompute(ctx: &mut WriteCtx<'_>, seeds: Vec<String>) -> Result<Ve
             }
         }
     }
+    crate::gates::note_block_changes(ctx, &changes)?;
     Ok(changes)
 }
 
@@ -264,6 +265,7 @@ pub(crate) fn recompute_all(ctx: &mut WriteCtx<'_>) -> Result<Vec<BlockChange>> 
             ctx.emit(op, Some(&change.id), json!({ "repair": true }))?;
         }
     }
+    crate::gates::note_block_changes(ctx, &drift)?;
     Ok(drift)
 }
 

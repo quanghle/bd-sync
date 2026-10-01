@@ -51,7 +51,7 @@ pub struct App {
 impl App {
     pub fn new(g: Global) -> Result<App> {
         let cwd = match &g.directory {
-            Some(d) => std::fs::canonicalize(d).map_err(|e| Error::invalid(format!("-C {}: {e}", d.display())))?,
+            Some(d) => resolve_dir(d).map_err(|e| Error::invalid(format!("-C {}: {e}", d.display())))?,
             None => std::env::current_dir()?,
         };
         Ok(App { g, cwd, started: Instant::now(), actor: None, store: None, open_time: Duration::ZERO, tx: Vec::new() })
@@ -133,6 +133,22 @@ impl App {
 
     pub fn print_json(&self, v: &impl Serialize) {
         println!("{}", serde_json::to_string_pretty(v).unwrap_or_default());
+    }
+}
+
+/// The absolute form of an existing directory given with `-C`.
+fn resolve_dir(d: &Path) -> std::io::Result<PathBuf> {
+    // canonicalize returns a verbatim `\\?\C:\...` path on Windows, which
+    // cmd.exe (and so a `.cmd` BD_GH) refuses as a working directory.
+    #[cfg(windows)]
+    {
+        let p = std::path::absolute(d)?;
+        std::fs::metadata(&p)?;
+        Ok(p)
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::canonicalize(d)
     }
 }
 

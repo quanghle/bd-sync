@@ -14,20 +14,21 @@ use std::io::{BufRead, Write};
 
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::claims;
 use crate::comments;
 use crate::config;
 use crate::error::{Error, Result};
 use crate::events;
+use crate::gates::GateKind;
 use crate::graph;
 use crate::ids;
 use crate::issues;
 use crate::memory;
 use crate::model::{DepType, Issue, ListQuery, Outcome, Status, empty_object};
 use crate::store::WriteCtx;
-use crate::time::Timestamp;
+use crate::time::{Timestamp, format_duration_ms};
 
 pub const FORMAT: &str = "bd-jsonl";
 pub const FORMAT_VERSION: u32 = 1;
@@ -36,11 +37,14 @@ pub const FORMAT_VERSION: u32 = 1;
 pub struct ExportOptions {
     pub include_memories: bool,
     pub include_closed: bool,
+    /// Ephemeral issues (scratch runs) are left out unless asked for, along
+    /// with edges that point at them.
+    pub include_ephemeral: bool,
 }
 
 impl Default for ExportOptions {
     fn default() -> Self {
-        ExportOptions { include_memories: true, include_closed: true }
+        ExportOptions { include_memories: true, include_closed: true, include_ephemeral: false }
     }
 }
 
@@ -68,16 +72,20 @@ pub fn export(conn: &Connection, now: Timestamp, out: &mut dyn Write, opts: &Exp
     writeln!(out, "{header}")?;
     let q = ListQuery { all: opts.include_closed, sort: crate::model::ListSort::Id, ..Default::default() };
     for issue in issues::list(conn, &q)? {
+        if issue.ephemeral && !opts.include_ephemeral {
+            continue;
+        }
         let mut v = serde_json::to_value(&issue)?;
         let obj = v.as_object_mut().expect("issue serializes to an object");
         obj.remove("is_blocked");
         obj.remove("revision");
         let deps: Vec<Value> = {
             let mut stmt = conn.prepare_cached(
-                "SELECT depends_on_id, dep_type, metadata, created_at, created_by
-                 FROM dependencies WHERE issue_id = ?1 ORDER BY depends_on_id",
+                "SELECT d.depends_on_id, d.dep_type, d.metadata, d.created_at, d.created_by
+                 FROM dependencies d JOIN issues t ON t.id = d.depends_on_id
+                 WHERE d.issue_id = ?1 AND (?2 OR t.ephemeral = 0) ORDER BY d.depends_on_id",
             )?;
-            let rows = stmt.query_map([&issue.id], |r| {
+            let rows = stmt.query_map(params![issue.id, opts.include_ephemeral], |r| {
                 let metadata: String = r.get(2)?;
                 Ok(json!({
                     "depends_on_id": r.get::<_, String>(0)?,
@@ -182,6 +190,25 @@ struct InIssue {
     dependencies: Option<Vec<InDep>>,
     #[serde(default)]
     comments: Option<Vec<InComment>>,
+    #[serde(default)]
+    ephemeral: bool,
+    // beads workflow fields: protos are skipped (playbooks replace them),
+    // gate conditions move to `metadata.gate`, molecule kinds to `metadata.beads`.
+    #[serde(default)]
+    is_template: bool,
+    #[serde(default)]
+    await_type: Option<String>,
+    #[serde(default)]
+    await_id: Option<String>,
+    /// Go `time.Duration`: nanoseconds.
+    #[serde(default)]
+    timeout: Option<i64>,
+    #[serde(default)]
+    waiters: Option<Vec<String>>,
+    #[serde(default)]
+    mol_type: Option<String>,
+    #[serde(default)]
+    wisp_type: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -439,6 +466,10 @@ impl WriteCtx<'_> {
         lineno: usize,
     ) -> Result<Option<ImportedIssue>> {
         let raw_status = raw.status.clone().unwrap_or_else(|| "open".into());
+        if raw.is_template {
+            summary.warnings.push(format!("{}: skipped beads template (proto); playbooks replace protos", raw.id));
+            return Ok(None);
+        }
         let mut status = match raw_status.as_str() {
             "tombstone" => return Ok(None),
             "hooked" => Status::InProgress,
@@ -486,6 +517,33 @@ impl WriteCtx<'_> {
         };
         let mut labels = issues::normalize_labels(&raw.labels.clone().unwrap_or_default())?;
         labels.sort();
+        let mut metadata = object_metadata(raw.metadata);
+        if let Some(kind) = raw.await_type.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+            let mut gate = Map::new();
+            let kind = GateKind::parse(kind).map(|k| k.as_str().to_string()).unwrap_or_else(|_| kind.to_string());
+            gate.insert("type".into(), json!(kind));
+            if let Some(id) = raw.await_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                gate.insert("await_id".into(), json!(id));
+            }
+            if let Some(ns) = raw.timeout.filter(|ns| *ns > 0) {
+                gate.insert("timeout".into(), json!(format_duration_ms((ns / 1_000_000).max(1))));
+            }
+            if let Some(w) = raw.waiters.as_ref().filter(|w| !w.is_empty()) {
+                gate.insert("waiters".into(), json!(w));
+            }
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.entry("gate").or_insert(Value::Object(gate));
+            }
+        }
+        let beads: Map<String, Value> = [("mol_type", &raw.mol_type), ("wisp_type", &raw.wisp_type)]
+            .into_iter()
+            .filter_map(|(k, v)| v.as_ref().filter(|s| !s.is_empty()).map(|s| (k.to_string(), json!(s))))
+            .collect();
+        if !beads.is_empty() {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.entry("beads").or_insert(Value::Object(beads));
+            }
+        }
         let issue = Issue {
             id: raw.id.trim().to_string(),
             title,
@@ -500,7 +558,7 @@ impl WriteCtx<'_> {
             created_by: raw.created_by.unwrap_or_else(|| actor.to_string()),
             external_ref: raw.external_ref.filter(|s| !s.trim().is_empty()),
             estimated_minutes: raw.estimated_minutes.filter(|m| *m >= 0),
-            metadata: object_metadata(raw.metadata),
+            metadata,
             created_at,
             updated_at,
             started_at: raw.started_at,
@@ -509,6 +567,7 @@ impl WriteCtx<'_> {
             close_outcome,
             due_at: raw.due_at,
             defer_until: raw.defer_until,
+            ephemeral: raw.ephemeral,
             is_blocked: false,
             revision: 0,
             labels,
@@ -524,16 +583,16 @@ impl WriteCtx<'_> {
                     status = ?7, priority = ?8, issue_type = ?9, assignee = ?10, created_by = ?11, external_ref = ?12,
                     estimated_minutes = ?13, metadata = ?14, created_at = ?15, updated_at = ?16, started_at = ?17,
                     closed_at = ?18, close_reason = ?19, close_outcome = ?20, due_at = ?21, defer_until = ?22,
-                    revision = revision + 1
+                    ephemeral = ?23, revision = revision + 1
                  WHERE id = ?1",
             )?
         } else {
             conn.prepare_cached(
                 "INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority,
                     issue_type, assignee, created_by, external_ref, estimated_minutes, metadata, created_at, updated_at,
-                    started_at, closed_at, close_reason, close_outcome, due_at, defer_until, revision)
+                    started_at, closed_at, close_reason, close_outcome, due_at, defer_until, ephemeral, revision)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                    ?21, ?22, 1)",
+                    ?21, ?22, ?23, 1)",
             )?
         }
         .execute(params![
@@ -559,6 +618,7 @@ impl WriteCtx<'_> {
             issue.close_outcome,
             issue.due_at,
             issue.defer_until,
+            issue.ephemeral as i64,
         ])?;
         conn.prepare_cached("DELETE FROM labels WHERE issue_id = ?1")?.execute([&issue.id])?;
         for l in &issue.labels {

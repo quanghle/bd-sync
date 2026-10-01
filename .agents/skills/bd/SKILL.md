@@ -20,6 +20,12 @@ Run `bd prime`. It prints the workflow, your current claims, the top of the read
 5. Record follow-up work: `bd create "Title" -d "why and what" --dep discovered-from:<id>`; order work with `bd dep add <issue> <depends-on>`.
 6. Finish: `bd close <id> --reason "..."` (add `--failed` if it failed), or give it back with `bd release <id>`.
 
+## Playbooks and gates
+
+- Repeatable multi-step work lives in `.bd/playbooks/*.toml`: `bd playbook list`, then `bd playbook run <name> --var key=value` (preview with `bd playbook plan`). Its steps are ordinary issues `<run>.<step>`: work them with `bd ready --run <run>`, claim, close.
+- `bd playbook status <run>` shows every step and what it waits on. Runs close themselves when their last step closes.
+- Gates (`<run>.gate-<step>`) hold a step until a person approves, a timer passes, an issue closes, or a GitHub PR/run finishes. Never claim them: `bd gate list`, `bd gate check`, and `bd gate resolve <id>` when a person has approved. `bd prime` lists gates waiting on a person.
+
 ## Rules
 
 - Prefer `--json` when parsing output.

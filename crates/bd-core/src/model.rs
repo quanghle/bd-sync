@@ -261,9 +261,13 @@ string_enum_serde!(DepType);
 string_enum_serde!(Outcome);
 
 /// Built-in issue types. Extra types may be allowed with the
-/// `types.custom` config key (comma separated).
-pub const BUILTIN_TYPES: [&str; 9] =
-    ["task", "bug", "feature", "epic", "chore", "decision", "spike", "story", "milestone"];
+/// `types.custom` config key (comma separated). `gate` issues are wait
+/// conditions (see [`crate::gates`]): never ready, never claimed.
+pub const BUILTIN_TYPES: [&str; 10] =
+    ["task", "bug", "feature", "epic", "chore", "decision", "spike", "story", "milestone", "gate"];
+
+/// Issue type of gates.
+pub const GATE_TYPE: &str = "gate";
 
 /// Maximum title length (characters).
 pub const MAX_TITLE_CHARS: usize = 500;
@@ -308,6 +312,9 @@ pub struct Issue {
     pub due_at: Option<Timestamp>,
     #[serde(default)]
     pub defer_until: Option<Timestamp>,
+    /// Scratch work: excluded from exports and deleted by `purge` once closed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub ephemeral: bool,
     /// Materialized: true while a live blocking edge (or a blocked ancestor)
     /// holds this issue back.
     #[serde(default)]
@@ -321,6 +328,10 @@ pub struct Issue {
 
 pub(crate) fn empty_object() -> Value {
     Value::Object(Default::default())
+}
+
+pub(crate) fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Issue {
@@ -495,6 +506,8 @@ pub struct NewIssue {
     pub due_at: Option<Timestamp>,
     pub defer_until: Option<Timestamp>,
     pub metadata: Option<Value>,
+    /// Scratch work, excluded from exports and purged once closed.
+    pub ephemeral: bool,
 }
 
 impl NewIssue {
@@ -529,6 +542,7 @@ pub struct IssuePatch {
     pub set_labels: Option<Vec<String>>,
     /// Reparent: `Some(Some(p))` moves under `p`, `Some(None)` detaches.
     pub parent: Option<Option<String>>,
+    pub ephemeral: Option<bool>,
 }
 
 impl IssuePatch {
@@ -554,6 +568,7 @@ impl IssuePatch {
             && self.remove_labels.is_empty()
             && self.set_labels.is_none()
             && self.parent.is_none()
+            && self.ephemeral.is_none()
     }
 }
 
@@ -744,6 +759,7 @@ mod tests {
             close_outcome: None,
             due_at: None,
             defer_until: None,
+            ephemeral: false,
             is_blocked: false,
             revision: 3,
             labels: vec![],

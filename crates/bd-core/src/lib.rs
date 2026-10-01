@@ -20,6 +20,9 @@
 //!   (`if_revision`, `if_status`, `if_assignee`).
 //! * **Comments, durable memory, and a transactional event history** with
 //!   gapless, commit-ordered sequence numbers.
+//! * **Playbooks and gates** ([`playbook`], [`gates`]): repeatable multi-step
+//!   work declared in TOML and run atomically as `<run>.<step>` issues, with
+//!   wait conditions that arm when their step could start.
 //!
 //! ```no_run
 //! use bd_core::{ClaimOptions, InitOptions, NewIssue, OpenOptions, Queries, ReadyQuery, Store};
@@ -44,12 +47,14 @@ pub mod doctor;
 pub mod error;
 pub mod events;
 mod filter;
+pub mod gates;
 pub mod graph;
 mod ids;
 pub mod issues;
 pub mod memory;
 pub mod metrics;
 pub mod model;
+pub mod playbook;
 pub mod queries;
 pub mod ready;
 mod schema;
@@ -62,7 +67,9 @@ pub use config::IdMode;
 pub use error::{Error, Result};
 pub use events::{EventPage, EventQuery, PruneOptions, PruneOutcome};
 pub use graph::{BlockChange, DepChange, Direction, TreeNode};
-pub use issues::{CloseOptions, CloseOutcome, DeleteOptions, DeleteOutcome, ReopenOutcome, UpdateOutcome};
+pub use issues::{
+    CloseOptions, CloseOutcome, DeleteOptions, DeleteOutcome, PurgeOutcome, ReopenOutcome, UpdateOutcome,
+};
 pub use memory::{MemoryAction, MemoryWrite};
 pub use model::*;
 pub use queries::Queries;

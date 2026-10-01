@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 use crate::error::{Error, Result};
 
-pub const LATEST_VERSION: i64 = 1;
+pub const LATEST_VERSION: i64 = 2;
 
 const V1: &str = r#"
 CREATE TABLE meta (
@@ -137,7 +137,13 @@ CREATE TABLE counters (
 ) WITHOUT ROWID;
 "#;
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, V1)];
+// v2: ephemeral issues (scratch work such as ephemeral playbook runs): kept
+// out of exports and deleted by `purge` once closed. No index: purge scans.
+const V2: &str = r#"
+ALTER TABLE issues ADD COLUMN ephemeral INTEGER NOT NULL DEFAULT 0 CHECK (ephemeral IN (0, 1));
+"#;
+
+const MIGRATIONS: &[(i64, &str)] = &[(1, V1), (2, V2)];
 
 pub fn user_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
@@ -163,4 +169,21 @@ pub fn migrate(conn: &mut Connection) -> Result<i64> {
     }
     tx.commit()?;
     Ok(LATEST_VERSION)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_databases_migrate_to_ephemeral_column() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(V1).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute("INSERT INTO issues (id, title, created_at, updated_at) VALUES ('t-1', 'old', 0, 0)", []).unwrap();
+        assert_eq!(migrate(&mut conn).unwrap(), LATEST_VERSION);
+        let eph: i64 = conn.query_row("SELECT ephemeral FROM issues WHERE id = 't-1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(eph, 0);
+        assert!(conn.execute("UPDATE issues SET ephemeral = 2 WHERE id = 't-1'", []).is_err(), "0/1 only");
+    }
 }

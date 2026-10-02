@@ -41,6 +41,11 @@
 //! - A file or entry bd did not record that already matches the server's
 //!   is adopted: recorded, not written (a fresh clone of committed files).
 //!   One that differs is a conflict, reported and left alone.
+//! - Line endings alone never make a skill file differ: one with the text
+//!   of the server's file, or of the one bd wrote, once each CRLF in either
+//!   is read as LF (git's `core.autocrlf` checks text files out with CRLF
+//!   line endings on Windows) counts as that file, and keeps its line
+//!   endings, also when the server changes only those.
 //! - A file or entry bd wrote that was edited here is kept: reported as
 //!   edited, or as a conflict when the server changed or removed it (a
 //!   change of a file's executable bit alone is applied to the edited file).

@@ -40,6 +40,9 @@ pub enum Found {
     /// executable bit (never, where files have none).
     File {
         sha256: String,
+        /// The SHA-256 of it with each CRLF as LF, if it has any: as
+        /// [`bd_core::agents::lf_sha256`] gives it for a text.
+        lf_sha256: Option<String>,
         executable: bool,
     },
     /// Something bd never writes over or through: at `at` (checkout-relative) is `what`.
@@ -47,6 +50,17 @@ pub enum Found {
         at: String,
         what: &'static str,
     },
+}
+
+impl Found {
+    /// Whether it is a file with the text whose digests are `sha256` and
+    /// `lf_sha256` (see [`bd_core::agents::FileDigest`]): its bytes, or them
+    /// with other line endings, as git checks text files out with CRLF ones
+    /// on Windows (`core.autocrlf`).
+    pub fn holds(&self, sha256: &str, lf_sha256: Option<&str>) -> bool {
+        matches!(self, Found::File { sha256: s, lf_sha256: lf, .. }
+            if s == sha256 || lf.as_deref().unwrap_or(s) == lf_sha256.unwrap_or(sha256))
+    }
 }
 
 /// The checkout's mutex, held: released when dropped, or when the process ends.
@@ -159,7 +173,8 @@ impl Checkout {
             };
             let last = i + 1 == parts.len();
             if last && meta.is_file() {
-                return Ok(Found::File { sha256: hash_file(&path)?, executable: executable(&meta) });
+                let (sha256, lf_sha256) = hash_file(&path)?;
+                return Ok(Found::File { sha256, lf_sha256, executable: executable(&meta) });
             }
             let what = if meta.file_type().is_symlink() {
                 "a symlink"
@@ -370,19 +385,63 @@ fn ensure_dir(dir: &Path) -> Result<()> {
     }
 }
 
-/// SHA-256 of a file's bytes, in lowercase hex.
-pub fn hash_file(path: &Path) -> Result<String> {
+/// SHA-256 of a file's bytes, in lowercase hex, and of them with each CRLF
+/// as LF if it has any ([`Hashes`]).
+pub fn hash_file(path: &Path) -> Result<(String, Option<String>)> {
     let mut file = File::open(path).map_err(|e| path_error(path, e))?;
-    let mut hasher = Sha256::new();
+    let mut hashes = Hashes::default();
     let mut buf = vec![0u8; 64 << 10];
     loop {
         let n = file.read(&mut buf).map_err(|e| path_error(path, e))?;
         if n == 0 {
             break;
         }
-        hasher.update(&buf[..n]);
+        hashes.update(&buf[..n]);
     }
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(hashes.finish())
+}
+
+/// The SHA-256 of bytes fed in pieces, and of them with each CRLF as LF, as
+/// [`bd_core::agents::lf_sha256`] reads a text.
+#[derive(Default)]
+struct Hashes {
+    bytes: Sha256,
+    lf: Sha256,
+    /// The last byte fed is a CR, which the next may make a CRLF: not in `lf` yet.
+    cr: bool,
+    has_crlf: bool,
+}
+
+impl Hashes {
+    fn update(&mut self, data: &[u8]) {
+        self.bytes.update(data);
+        let mut lf = Vec::with_capacity(data.len() + 1);
+        for &b in data {
+            if std::mem::take(&mut self.cr) {
+                if b == b'\n' {
+                    self.has_crlf = true;
+                    lf.push(b'\n');
+                    continue;
+                }
+                lf.push(b'\r');
+            }
+            if b == b'\r' {
+                self.cr = true;
+            } else {
+                lf.push(b);
+            }
+        }
+        self.lf.update(&lf);
+    }
+
+    /// The SHA-256 of the bytes, and of them with each CRLF as LF if they have any.
+    fn finish(mut self) -> (String, Option<String>) {
+        if self.cr {
+            self.lf.update(b"\r");
+        }
+        let hex = |h: Sha256| h.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>();
+        (hex(self.bytes), self.has_crlf.then(|| hex(self.lf)))
+    }
 }
 
 /// Write `data` to `target` at once: into a temp file next to it (hidden,
@@ -505,7 +564,7 @@ mod tests {
         let sha = sha256_hex(b"#!/bin/sh\r\n");
         assert_eq!(
             c.find_skill_file(h, "deploy", "scripts/deep/run.sh").unwrap(),
-            Found::File { sha256: sha.clone(), executable: cfg!(unix) }
+            Found::File { sha256: sha.clone(), lf_sha256: Some(sha256_hex(b"#!/bin/sh\n")), executable: cfg!(unix) }
         );
         let names: Vec<_> =
             std::fs::read_dir(script.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -539,6 +598,54 @@ mod tests {
         let mut tampered = skill_file("x", false);
         tampered.text = "y".into();
         assert!(c.write_skill_file(h, "lint", "SKILL.md", &tampered).is_err());
+    }
+
+    #[test]
+    fn files_are_hashed_with_crlf_line_endings_as_lf_too() {
+        use bd_core::agents::lf_sha256;
+        let hashes = |text: &str| (sha256_hex(text.as_bytes()), lf_sha256(text));
+        let texts = ["", "a", "a\n", "a\r\n", "\r", "\n", "\r\n", "a\rb", "a\r\nb\nc\rd\r", "\r\r\n\n\r", "\n\r\n\r\r"];
+        for text in texts {
+            // In pieces of every size: a CR may end one, and its LF begin the next.
+            for size in 1..=text.len().max(1) {
+                let mut h = Hashes::default();
+                for piece in text.as_bytes().chunks(size) {
+                    h.update(piece);
+                }
+                assert_eq!(h.finish(), hashes(text), "{text:?} in pieces of {size}");
+            }
+        }
+
+        // A file is read in 64 KiB pieces: here a CRLF spans two.
+        let (_dir, c) = checkout();
+        let text = format!("{}\r\nend\n", "a".repeat((64 << 10) - 1));
+        std::fs::create_dir_all(c.root.join(".claude/skills/big")).unwrap();
+        std::fs::write(c.root.join(".claude/skills/big/SKILL.md"), &text).unwrap();
+        let found = c.find_skill_file(Harness::Claude, "big", "SKILL.md").unwrap();
+        let Found::File { sha256, lf_sha256: lf, .. } = &found else { panic!("{found:?}") };
+        assert_eq!((sha256.clone(), lf.clone()), hashes(&text));
+
+        // A file holds a text whatever the line endings of either.
+        let holds = |local: &str, server: &str| {
+            let (sha256, lf) = hashes(local);
+            let found = Found::File { sha256, lf_sha256: lf, executable: false };
+            found.holds(&sha256_hex(server.as_bytes()), lf_sha256(server).as_deref())
+        };
+        let same = [
+            ("a\nb", "a\nb"),
+            ("a\r\nb\r\n", "a\nb\n"),
+            ("a\nb\n", "a\r\nb\r\n"),
+            ("a\r\nb\r\n", "a\r\nb\n"),
+            ("a\rb\r\n", "a\rb\n"),
+        ];
+        for (local, server) in same {
+            assert!(holds(local, server), "{local:?} holds {server:?}");
+        }
+        // Not with a CR of its own: a CR that ends no line is text.
+        for (local, server) in [("a\r\r\n", "a\r\n"), ("a\r\n", "a\r\r\n"), ("a\r\n", "a\r"), ("a\nb", "a\nB")] {
+            assert!(!holds(local, server), "{local:?} does not hold {server:?}");
+        }
+        assert!(!Found::Missing.holds(&sha256_hex(b""), None));
     }
 
     #[test]

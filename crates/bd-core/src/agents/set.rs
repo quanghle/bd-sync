@@ -12,7 +12,8 @@ use serde_json::json;
 use super::mcp::{McpServer, canonical_json, check_definition, check_server_name, mcp_digest, parse_mcp};
 use super::{
     Harness, MAX_FILE_BYTES, MAX_MCP_SERVERS, MAX_NAME_BYTES, MAX_PATH_BYTES, MAX_PATH_DEPTH, MAX_SET_BYTES,
-    MAX_SET_DIRS, MAX_SET_FILES, McpFormat, SKILL_FILE, SKILLS_DIR, context, invalid, sha256_hex,
+    MAX_SET_DIRS, MAX_SET_FILES, McpFormat, SKILL_FILE, SKILLS_DIR, check_sha256, context, invalid, lf_sha256,
+    sha256_hex,
 };
 use crate::error::{Error, Result};
 
@@ -77,6 +78,9 @@ pub struct SkillFile {
 /// }
 /// ```
 ///
+/// A skill file with CRLF line endings also has `lf_sha256`, the SHA-256
+/// of its text with them as LF ([`lf_sha256`]).
+///
 /// The revision is the SHA-256 of the [`canonical_json`] of
 /// `{"mcp_servers": ..., "skills": ...}`, as shown here: any change to a
 /// skill file, its executable bit, or an MCP definition changes it.
@@ -92,6 +96,10 @@ pub struct Manifest {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileDigest {
     pub sha256: String,
+    /// [`lf_sha256`] of its text, which has CRLF line endings: what a
+    /// client compares its file with, line endings aside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lf_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub executable: bool,
 }
@@ -226,9 +234,14 @@ impl AgentSet {
             .skills
             .iter()
             .map(|(name, files)| {
-                let files = files
-                    .iter()
-                    .map(|(path, f)| (path.clone(), FileDigest { sha256: f.sha256.clone(), executable: f.executable }));
+                let files = files.iter().map(|(path, f)| {
+                    let digest = FileDigest {
+                        sha256: f.sha256.clone(),
+                        lf_sha256: lf_sha256(&f.text),
+                        executable: f.executable,
+                    };
+                    (path.clone(), digest)
+                });
                 (name.clone(), files.collect())
             })
             .collect();
@@ -247,22 +260,28 @@ impl Manifest {
         self.skills.is_empty() && self.mcp_servers.is_empty()
     }
 
-    /// Check a manifest received from a server: names, paths, limits and the revision.
+    /// Check a manifest received from a server: names, paths, digests, limits and the revision.
     pub fn check(&self) -> Result<()> {
         let set = format!("{} set", self.harness);
         let mut files = 0;
         for (name, skill) in &self.skills {
             check_skill_name(name).map_err(|e| context(&set, e))?;
             let loc = format!("{set}: skill {name}");
-            for path in skill.keys() {
-                check_skill_path(path).map_err(|e| context(&format!("{loc}: {path}"), e))?;
+            for (path, digest) in skill {
+                let loc = format!("{loc}: {path}");
+                check_skill_path(path).map_err(|e| context(&loc, e))?;
+                check_sha256(&digest.sha256).map_err(|e| context(&loc, e))?;
+                if let Some(lf) = &digest.lf_sha256 {
+                    check_sha256(lf).map_err(|e| context(&format!("{loc}: lf_sha256"), e))?;
+                }
             }
             check_skill_files(skill.keys()).map_err(|e| context(&loc, e))?;
             files += skill.len();
         }
         check_totals(&set, files, 0, self.mcp_servers.len())?;
-        for name in self.mcp_servers.keys() {
+        for (name, digest) in &self.mcp_servers {
             check_server_name(name).map_err(|e| context(&set, e))?;
+            check_sha256(&digest.sha256).map_err(|e| context(&format!("{set}: MCP server {name}"), e))?;
         }
         if revision_of(&(self.skills.clone(), self.mcp_servers.clone())) != self.revision {
             return Err(invalid(format!("{set}: its revision does not match its contents")));
@@ -757,6 +776,10 @@ mod tests {
         assert_eq!(deploy["scripts/run.sh"].text, "#!/bin/sh\necho deploy\r\n", "verbatim, line endings too");
         assert_eq!(deploy["SKILL.md"].sha256, sha256_hex(SKILL.as_bytes()));
         assert_eq!(deploy["scripts/run.sh"].executable, cfg!(unix));
+        let manifest = set.manifest();
+        let lf = |path: &str| manifest.skills["deploy"][path].lf_sha256.clone();
+        assert_eq!(lf("scripts/run.sh"), Some(sha256_hex(b"#!/bin/sh\necho deploy\n")), "its text as LF");
+        assert_eq!(lf("SKILL.md"), None, "LF already");
         assert!(!deploy["SKILL.md"].executable);
         assert_eq!(set.mcp_servers.keys().collect::<Vec<_>>(), ["github"]);
         assert_eq!(set.mcp_servers["github"].definition["env"]["GITHUB_TOKEN"], "${GITHUB_TOKEN}");
@@ -1119,11 +1142,31 @@ mod tests {
             .skills
             .get_mut("deploy")
             .unwrap()
-            .insert("../x".into(), FileDigest { sha256: String::new(), executable: false });
+            .insert("../x".into(), FileDigest { sha256: String::new(), lf_sha256: None, executable: false });
         assert!(manifest.check().unwrap_err().to_string().contains("invalid path \"../x\""));
         let mut manifest = set.manifest();
         manifest.mcp_servers.clear();
         assert!(manifest.check().unwrap_err().to_string().contains("revision does not match"));
+        // Digests that are not SHA-256s, even under a revision that covers them.
+        let resealed = |mut m: Manifest| {
+            m.revision = revision_of(&(m.skills.clone(), m.mcp_servers.clone()));
+            m.check().unwrap_err().to_string()
+        };
+        fn skill_md(m: &mut Manifest) -> &mut FileDigest {
+            m.skills.get_mut("deploy").and_then(|s| s.get_mut("SKILL.md")).unwrap()
+        }
+        let mut manifest = set.manifest();
+        skill_md(&mut manifest).sha256 = "x".into();
+        let e = resealed(manifest);
+        assert!(e.contains("skill deploy: SKILL.md: \"x\" is not a SHA-256"), "{e}");
+        let mut manifest = set.manifest();
+        skill_md(&mut manifest).lf_sha256 = Some("\u{1b}".repeat(70));
+        let e = resealed(manifest);
+        assert!(e.contains(&format!("SKILL.md: lf_sha256: \"{}\"... is not", "\\u{1b}".repeat(64))), "{e}");
+        let mut manifest = set.manifest();
+        manifest.mcp_servers.get_mut("github").unwrap().sha256 = "X".repeat(64);
+        let e = resealed(manifest);
+        assert!(e.contains("MCP server github: \"XXXX"), "{e}");
     }
 
     #[test]

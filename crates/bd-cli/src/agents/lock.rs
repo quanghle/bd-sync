@@ -9,6 +9,7 @@
 //!       "revision": "<the server revision last pulled>",
 //!       "skills": {
 //!         ".claude/skills/deploy/SKILL.md": {"sha256": "<sha256>"},
+//!         ".claude/skills/deploy/notes.md": {"sha256": "<sha256>", "lf_sha256": "<sha256>"},
 //!         ".claude/skills/deploy/scripts/run.sh": {"sha256": "<sha256>", "executable": true},
 //!         ".claude/skills/deploy/check.sh": {"sha256": "<sha256>", "executable": true, "executable_not_kept": true}
 //!       },
@@ -21,8 +22,10 @@
 //! ```
 //!
 //! Per harness, `skills` holds every skill file bd wrote or adopted, by its
-//! `/`-separated path in the checkout, and `mcp_servers` every MCP server
-//! entry bd wrote or adopted (so approved), with its definition as approved
+//! `/`-separated path in the checkout, with the server's digests of its
+//! text (and `lf_sha256` for a text with CRLF line endings: see
+//! [`FileDigest::lf_sha256`]), and `mcp_servers` every MCP server entry bd
+//! wrote or adopted (so approved), with its definition as approved
 //! (canonical JSON; codex: its table as JSON), to show what a newer version
 //! changes. Only applied and approved state is recorded: MCP changes that
 //! wait for approval are worked out from the server each time.
@@ -36,7 +39,9 @@
 
 use std::collections::BTreeMap;
 
-use bd_core::agents::{FileDigest, Harness, check_server_name, check_skill_name, check_skill_path, mcp_digest};
+use bd_core::agents::{
+    FileDigest, Harness, check_server_name, check_sha256, check_skill_name, check_skill_path, mcp_digest,
+};
 use bd_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -79,6 +84,9 @@ pub struct Applied {
 #[serde(deny_unknown_fields)]
 pub struct OwnedFile {
     pub sha256: String,
+    /// The server's [`FileDigest::lf_sha256`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lf_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub executable: bool,
     /// The file system did not keep the executable bit bd set on it.
@@ -92,9 +100,16 @@ impl OwnedFile {
     pub fn of(digest: &FileDigest, not_kept: bool) -> OwnedFile {
         OwnedFile {
             sha256: digest.sha256.clone(),
+            lf_sha256: digest.lf_sha256.clone(),
             executable: digest.executable,
             executable_not_kept: digest.executable && not_kept,
         }
+    }
+
+    /// Whether the server's file `digest` has the text recorded, line endings aside.
+    pub fn same_text(&self, digest: &FileDigest) -> bool {
+        self.sha256 == digest.sha256
+            || self.lf_sha256.as_ref().unwrap_or(&self.sha256) == digest.lf_sha256.as_ref().unwrap_or(&digest.sha256)
     }
 }
 
@@ -124,6 +139,9 @@ impl LockFile {
                     )));
                 }
                 check_sha256(&file.sha256).map_err(|e| Error::invalid(format!("{h}: {path}: {e}")))?;
+                if let Some(lf) = &file.lf_sha256 {
+                    check_sha256(lf).map_err(|e| Error::invalid(format!("{h}: {path}: lf_sha256: {e}")))?;
+                }
                 if file.executable_not_kept && !file.executable {
                     return Err(Error::invalid(format!("{h}: {path}: executable_not_kept, and not executable")));
                 }
@@ -139,13 +157,6 @@ impl LockFile {
         }
         Ok(())
     }
-}
-
-fn check_sha256(s: &str) -> Result<()> {
-    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
-        return Err(Error::invalid(format!("{s:?} is not a SHA-256 in lowercase hex")));
-    }
-    Ok(())
 }
 
 /// The checkout-relative path of file `rel` of skill `name` of `harness`.
@@ -194,6 +205,7 @@ mod tests {
                 "revision": "r",
                 "skills": {
                     ".claude/skills/deploy/SKILL.md": {"sha256": SHA},
+                    ".claude/skills/deploy/notes.md": {"sha256": SHA, "lf_sha256": SHA},
                     ".claude/skills/deploy/run.sh": {"sha256": SHA, "executable": true, "executable_not_kept": true}
                 },
                 "mcp_servers": {"github": {"sha256": mcp_digest(&definition), "definition": definition}}
@@ -210,6 +222,10 @@ mod tests {
         let mut bad = good.clone();
         bad["harnesses"]["claude"]["skills"] = json!({".claude/skills/deploy/SKILL.md": {"sha256": "x"}});
         assert!(serde_json::from_value::<LockFile>(bad).unwrap().check().is_err());
+        let mut bad = good.clone();
+        bad["harnesses"]["claude"]["skills"][".claude/skills/deploy/notes.md"]["lf_sha256"] = json!("x");
+        let e = serde_json::from_value::<LockFile>(bad).unwrap().check().unwrap_err().to_string();
+        assert!(e.contains("lf_sha256: \"x\" is not a SHA-256"), "{e}");
         let mut bad = good.clone();
         bad["harnesses"]["claude"]["skills"][".claude/skills/deploy/run.sh"]["executable"] = json!(false);
         let e = serde_json::from_value::<LockFile>(bad).unwrap().check().unwrap_err().to_string();

@@ -1084,7 +1084,8 @@ codex: revision 48596ad57c35 (clients place it in .agents/skills/ and .codex/con
 copilot: nothing served
 ```
 
-A manifest holds a SHA-256 per skill file and per MCP entry (over its
+A manifest holds a SHA-256 per skill file (and, for a text with CRLF line
+endings, `lf_sha256`: its hash with them as LF) and per MCP entry (over its
 canonical JSON, so reformatting an MCP file changes no hash), and a set's
 revision is the hash of its manifest. The server's agents job
 (`--agents-every`, default 30 s, `0` or `off` to turn it off;
@@ -1168,8 +1169,9 @@ copilot: conflict: .github/skills/triage/SKILL.md: differs from the server's and
 ```
 
 `.bd/agents.lock` records, per harness, the server revision last pulled,
-each skill file bd wrote or adopted (`sha256`, `executable`, and
-`executable_not_kept` where the file system did not keep that bit), and
+each skill file bd wrote or adopted (`sha256`, `lf_sha256` for a text with
+CRLF line endings, `executable`, and `executable_not_kept` where the file
+system did not keep that bit), and
 each MCP entry bd wrote or adopted, with the definition approved. It is
 local state: the first lock written adds `agents.lock*` to `.bd/.gitignore`
 (covering `agents.lock.mutex`, the checkout's OS-locked mutex, and temp
@@ -1182,6 +1184,12 @@ with exit 5. The rules a pull follows:
   the server's is adopted: recorded, not written (a fresh clone with the
   skills committed). One that differs is a conflict, reported and left
   alone; moving it away lets the next pull write the server's.
+- **Line endings.** A skill file that differs from the server's, or from
+  the one bd wrote, only in line endings (the same text once each CRLF in
+  either is read as LF, as when git's `core.autocrlf` checks text files out
+  with CRLF line endings on Windows) counts as the same file: adopted,
+  never an edit, and kept with its line endings, also when the server
+  changes only those.
 - **Local edits.** A file or entry bd wrote that was edited here is kept and
   reported as edited, or as a conflict when the server changed or removed it
   too. `pull --force` replaces or removes such edits; it never touches what
@@ -1468,17 +1476,6 @@ The hook's lines and `approve`'s output name the step to take.
   and `.mcp.json` wins over `.github/mcp.json` when a server name is in
   both. Pull only the sets of the harnesses used in a checkout, or a
   Copilot CLI session there also gets the Claude and Codex sets.
-- Windows with `core.autocrlf=true` checks committed skill files out with
-  CRLF line endings, which differ from the server's text: each is reported
-  as a conflict, never adopted. Keep the skill directories out of line-ending
-  conversion in `.gitattributes`:
-
-  ```
-  .claude/skills/** -text
-  .agents/skills/** -text
-  .github/skills/** -text
-  ```
-
 - On mounts that keep no executable bits (vfat, exfat, or SMB mounts with
   an `fmask` that clears them), scripts the server marks executable stay
   without them: run them through their interpreter (`sh run.sh`). Mounts

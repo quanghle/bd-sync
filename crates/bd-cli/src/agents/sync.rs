@@ -185,8 +185,8 @@ enum SkillOp {
     /// still has this hash, and record it as the server's. `quiet`: a retry
     /// of a bit the file system did not keep, reported only if it now does.
     Mode { skill: String, rel: String, sha256: String, digest: FileDigest, quiet: bool },
-    /// Record a file as bd's.
-    Record { path: String, digest: FileDigest },
+    /// Record a file as bd's: `not_kept` if the file system did not keep its executable bit.
+    Record { path: String, digest: FileDigest, not_kept: bool },
     /// Drop a file from the record.
     Forget { path: String },
 }
@@ -377,8 +377,9 @@ enum FileDecision {
     Write(SkillChange),
     /// Record it as bd's: adopt it.
     Record,
-    /// Record the server's digest for it: nothing changes on disk.
-    Rerecord,
+    /// Record the server's digest for it: nothing changes on disk. `true`:
+    /// the file system still did not keep its executable bit.
+    Rerecord(bool),
     /// Delete it, which has this hash.
     Remove(String),
     /// Give it the server's executable bits; it has the server's text, with this hash.
@@ -430,8 +431,8 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
     // name the server changed only in case (`Notes.md` to `notes.md`).
     let removing = Paths::new(found.iter().filter_map(|(path, (_, _, f))| {
         let owned = applied.skills.get(*path)?;
-        let goes =
-            !server.contains_key(*path) && matches!(f, Found::File { sha256, .. } if force || *sha256 == owned.sha256);
+        let holds = f.holds(&owned.sha256, owned.lf_sha256.as_deref());
+        let goes = !server.contains_key(*path) && matches!(f, Found::File { .. } if force || holds);
         goes.then_some(*path)
     }));
     for (path, (skill, rel, mut local)) in found {
@@ -453,7 +454,11 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
         // every file executable).
         let mode_ok = |executable: bool, digest: &FileDigest| !cfg!(unix) || executable || !digest.executable;
         let digest = entry.map(|e| e.2);
-        let decision = match (digest, applied.skills.get(path), local) {
+        let owned = applied.skills.get(path);
+        // Whether the file has the server's text, and the text bd recorded: line endings aside.
+        let is_server = digest.is_some_and(|s| local.holds(&s.sha256, s.lf_sha256.as_deref()));
+        let is_owned = owned.is_some_and(|o| local.holds(&o.sha256, o.lf_sha256.as_deref()));
+        let decision = match (digest, owned, local) {
             (Some(_), _, Found::Blocked { at, what }) => {
                 D::Conflict(at, format!("{what}, which bd never writes over or through; left as it is"))
             }
@@ -461,7 +466,7 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
                 D::Left(at, format!("{what}, where the server removed a file; left as it is"))
             }
             (Some(_), None, Found::Missing) => D::Write(SkillChange::Added),
-            (Some(s), None, Found::File { sha256: sha, executable: x }) if sha == s.sha256 => {
+            (Some(s), None, Found::File { sha256: sha, executable: x, .. }) if is_server => {
                 if mode_ok(x, s) {
                     D::Record
                 } else {
@@ -476,26 +481,29 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
             ),
             (Some(_), Some(_), Found::Missing) => D::Write(SkillChange::Restored),
             // The server's text is here, as bd left it: only the mode may need a change.
-            (Some(s), Some(o), Found::File { sha256: sha, executable: x }) if sha == o.sha256 && sha == s.sha256 => {
+            (Some(s), Some(o), Found::File { sha256: sha, executable: x, .. }) if is_owned && is_server => {
                 match (o.executable != s.executable, mode_ok(x, s)) {
                     // The server changed the executable bit: applied either way.
                     (true, _) if cfg!(unix) => D::Mode(sha),
-                    (true, _) => D::Rerecord,
-                    // It has the bit the file system did not keep before (set by hand, or kept now).
-                    (false, true) if o.executable_not_kept => D::Rerecord,
+                    (true, _) => D::Rerecord(false),
+                    // It has the bit the file system did not keep before (set by hand, or kept
+                    // now), or the server changed only the line endings, which stay as they are.
+                    (false, true) if o.executable_not_kept || o.sha256 != s.sha256 => D::Rerecord(false),
                     (false, true) => D::Nothing,
                     // The file system did not keep the bit: up to date without it. Tried
-                    // again with --force, or quietly when the server's set changes.
+                    // again with --force, or quietly when the server's set changes; a server
+                    // change of the line endings alone is recorded, still without it.
                     (false, false) if o.executable_not_kept && force => D::Mode(sha),
                     (false, false) if o.executable_not_kept && applied.revision != manifest.revision => {
                         D::RetryMode(sha)
                     }
+                    (false, false) if o.executable_not_kept && o.sha256 != s.sha256 => D::Rerecord(true),
                     (false, false) if o.executable_not_kept => D::Nothing,
                     (false, false) => D::Mode(sha),
                 }
             }
-            (Some(_), Some(o), Found::File { sha256: sha, .. }) if sha == o.sha256 => D::Write(SkillChange::Updated),
-            (Some(s), Some(_), Found::File { sha256: sha, executable: x }) if sha == s.sha256 => {
+            (Some(_), Some(_), Found::File { .. }) if is_owned => D::Write(SkillChange::Updated),
+            (Some(s), Some(_), Found::File { sha256: sha, executable: x, .. }) if is_server => {
                 if mode_ok(x, s) {
                     D::Record
                 } else {
@@ -505,7 +513,7 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
             (Some(_), Some(_), Found::File { .. }) if force => D::Write(SkillChange::Replaced),
             // Edited here, with the text bd wrote still the server's: a change of the executable
             // bit alone touches no text, so it never conflicts with the edit.
-            (Some(s), Some(o), Found::File { sha256: sha, .. }) if o.sha256 == s.sha256 => {
+            (Some(s), Some(o), Found::File { sha256: sha, .. }) if o.same_text(s) => {
                 match (o.executable != s.executable, cfg!(unix)) {
                     (false, _) => D::Edited,
                     (true, true) => D::EditedMode(sha),
@@ -517,7 +525,7 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
                 "edited here and changed on the server; kept (`bd agents pull --force` replaces it)".into(),
             ),
             (None, Some(_), Found::Missing) => D::Forget,
-            (None, Some(o), Found::File { sha256: sha, .. }) if force || sha == o.sha256 => D::Remove(sha),
+            (None, Some(_), Found::File { sha256: sha, .. }) if force || is_owned => D::Remove(sha),
             (None, Some(_), Found::File { .. }) => D::Conflict(
                 path.clone(),
                 "edited here and removed from the server; kept (`bd agents pull --force` removes it)".into(),
@@ -541,12 +549,12 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
             }
             D::Record => {
                 let digest = digest.expect("recorded as the server's").clone();
-                p.skills.push(SkillOp::Record { path: path.clone(), digest });
+                p.skills.push(SkillOp::Record { path: path.clone(), digest, not_kept: false });
                 r.adopted.push(file_ref);
             }
-            D::Rerecord => {
+            D::Rerecord(not_kept) => {
                 let digest = digest.expect("recorded as the server's").clone();
-                p.skills.push(SkillOp::Record { path: path.clone(), digest });
+                p.skills.push(SkillOp::Record { path: path.clone(), digest, not_kept });
             }
             D::Remove(sha256) => {
                 p.skills.push(SkillOp::Remove { skill: skill.to_string(), rel: rel.to_string(), sha256 });
@@ -577,7 +585,7 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
             }
             D::EditedRecord => {
                 let digest = digest.expect("recorded as the server's").clone();
-                p.skills.push(SkillOp::Record { path: path.clone(), digest });
+                p.skills.push(SkillOp::Record { path: path.clone(), digest, not_kept: false });
                 r.edited.push(file_ref);
             }
             D::Nothing => {}
@@ -802,8 +810,8 @@ fn apply(checkout: &Checkout, p: &mut Plan, set: Option<&AgentSet>, applied: &mu
                     applied.skills.insert(skill_path(h, skill, rel), owned);
                 }
             }
-            SkillOp::Record { path, digest } => {
-                applied.skills.insert(path.clone(), OwnedFile::of(digest, false));
+            SkillOp::Record { path, digest, not_kept } => {
+                applied.skills.insert(path.clone(), OwnedFile::of(digest, *not_kept));
             }
             SkillOp::Forget { path } => {
                 applied.skills.remove(path);
@@ -1527,6 +1535,116 @@ mod tests {
         let r = f.pull(H);
         assert_eq!(paths(&r.skills.adopted), [".claude/skills/edited/SKILL.md"]);
         assert!(r.skills.changed.is_empty());
+    }
+
+    #[test]
+    fn line_endings_alone_never_make_a_skill_file_differ() {
+        use bd_core::agents::{lf_sha256, sha256_hex};
+        let owned = |text: &str| OwnedFile {
+            sha256: sha256_hex(text.as_bytes()),
+            lf_sha256: lf_sha256(text),
+            executable: false,
+            executable_not_kept: false,
+        };
+        let conflicted = |r: &HarnessReport| conflicts(r).into_iter().map(|c| c.0.to_string()).collect::<Vec<_>>();
+        let mut f = Fixture::new();
+        // A clone of committed skills, checked out with CRLF line endings (git's core.autocrlf
+        // on Windows), and with LF ones where the server's file has CRLF ones, or both.
+        f.serve("claude/skills/deploy/SKILL.md", "# Deploy\nSteps\n");
+        f.serve("claude/skills/deploy/mixed.md", "a\r\nb\n");
+        f.serve("claude/skills/deploy/notes.md", "from\r\nWindows\r\n");
+        f.serve("claude/skills/lint/SKILL.md", "# Lint\n");
+        f.put(".claude/skills/deploy/SKILL.md", "# Deploy\r\nSteps\r\n");
+        f.put(".claude/skills/deploy/mixed.md", "a\r\nb\r\n");
+        f.put(".claude/skills/deploy/notes.md", "from\nWindows\n");
+        f.put(".claude/skills/lint/SKILL.md", "# Lint\r\nedited\r\n");
+        let r = f.pull(H);
+        let deploy =
+            [".claude/skills/deploy/SKILL.md", ".claude/skills/deploy/mixed.md", ".claude/skills/deploy/notes.md"];
+        assert_eq!(paths(&r.skills.adopted), deploy);
+        let lint = ".claude/skills/lint/SKILL.md";
+        assert_eq!(conflicted(&r), [lint], "an edit still differs");
+        assert!(r.skills.changed.is_empty(), "{r:?}");
+        assert_eq!(f.get(deploy[0]).as_deref(), Some("# Deploy\r\nSteps\r\n"), "left as it is");
+        let recorded = f.recorded(H).skills;
+        assert_eq!(recorded[deploy[0]], owned("# Deploy\nSteps\n"), "the server's");
+        assert_eq!(recorded[deploy[2]], owned("from\r\nWindows\r\n"));
+        let r = f.pull(H);
+        assert!(r.skills.adopted.is_empty() && r.skills.edited.is_empty() && r.skills.changed.is_empty(), "{r:?}");
+
+        // A file bd wrote that git checks out again with CRLF line endings is no edit: the
+        // server's changes replace it, and its removal removes it.
+        f.serve("claude/skills/triage/SKILL.md", "# Triage\n");
+        assert_eq!(paths(&f.pull(H).skills.added), [".claude/skills/triage/SKILL.md"]);
+        f.put(".claude/skills/triage/SKILL.md", "# Triage\r\n");
+        let r = f.status(H);
+        assert!(r.skills.edited.is_empty() && r.skills.changed.is_empty(), "{r:?}");
+        f.serve("claude/skills/deploy/SKILL.md", "# Deploy\nSteps v2\n");
+        f.unserve("claude/skills/triage");
+        let r = f.pull(H);
+        assert_eq!(paths(&r.skills.updated), [deploy[0]]);
+        assert_eq!(paths(&r.skills.removed), [".claude/skills/triage/SKILL.md"]);
+        assert_eq!(conflicted(&r), [lint]);
+        assert_eq!(f.get(deploy[0]).as_deref(), Some("# Deploy\nSteps v2\n"));
+        assert!(f.get(".claude/skills/triage/SKILL.md").is_none());
+
+        // A server change of line endings alone leaves the file as it is, recorded as the server's.
+        f.serve("claude/skills/deploy/SKILL.md", "# Deploy\r\nSteps v2\r\n");
+        let r = f.pull(H);
+        assert!(r.skills.changed.is_empty() && r.skills.updated.is_empty() && r.skills.edited.is_empty(), "{r:?}");
+        assert_eq!(f.get(deploy[0]).as_deref(), Some("# Deploy\nSteps v2\n"));
+        assert_eq!(f.recorded(H).skills[deploy[0]], owned("# Deploy\r\nSteps v2\r\n"));
+        let r = f.pull(H);
+        assert!(r.skills.changed.is_empty() && r.skills.edited.is_empty(), "{r:?}");
+
+        // A CR that ends no line is text: an edit, kept, and in conflict with a change on the server.
+        let crlf = ".claude/skills/crlf/SKILL.md";
+        f.serve("claude/skills/crlf/SKILL.md", "x\r\n");
+        assert_eq!(paths(&f.pull(H).skills.added), [crlf]);
+        f.put(crlf, "x\r\r\n");
+        assert_eq!(paths(&f.pull(H).skills.edited), [crlf]);
+        f.serve("claude/skills/crlf/SKILL.md", "y\r\n");
+        let r = f.pull(H);
+        assert_eq!(conflicted(&r), [crlf, lint]);
+        assert!(conflicts(&r)[0].1.contains("changed on the server"), "{r:?}");
+        assert_eq!(f.get(crlf).as_deref(), Some("x\r\r\n"));
+    }
+
+    /// The executable bit of an unedited file is not kept here, and the server changed its line endings.
+    #[cfg(unix)]
+    #[test]
+    fn a_change_of_line_endings_alone_is_recorded_without_the_executable_bit() {
+        use super::super::checkout::CHMOD_IGNORED;
+        use bd_core::agents::sha256_hex;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = Fixture::new();
+        if !super::super::checkout::modes_stick(&f.checkout.root) {
+            return; // Every file shows as executable here, whatever its mode is set to.
+        }
+        let run = ".claude/skills/deploy/run.sh";
+        let serve = |f: &Fixture, text: &str| {
+            f.serve("claude/skills/deploy/run.sh", text);
+            let path = under(&f.source.dir, "claude/skills/deploy/run.sh");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        serve(&f, "#!/bin/sh\necho run\n");
+        f.serve("claude/skills/deploy/SKILL.md", "deploy");
+        CHMOD_IGNORED.set(true);
+        assert_eq!(paths(&f.pull(H).skills.not_executable), [run]);
+        // Edited when the server's line endings change: kept, as the server's text did not change.
+        f.put(run, "#!/bin/sh\necho edited\n");
+        serve(&f, "#!/bin/sh\r\necho run\r\n");
+        let r = f.pull(H);
+        assert_eq!(paths(&r.skills.edited), [run]);
+        assert!(r.skills.conflicts.is_empty(), "{r:?}");
+        // The edit undone: up to date, recorded as the server's file, still without the bit.
+        f.put(run, "#!/bin/sh\necho run\n");
+        let r = f.pull(H);
+        assert!(r.skills.changed.is_empty() && r.skills.not_executable.is_empty() && r.skills.edited.is_empty());
+        let recorded = &f.recorded(H).skills[run];
+        assert_eq!(recorded.sha256, sha256_hex(b"#!/bin/sh\r\necho run\r\n"));
+        assert!(recorded.executable && recorded.executable_not_kept);
+        CHMOD_IGNORED.set(false);
     }
 
     #[test]

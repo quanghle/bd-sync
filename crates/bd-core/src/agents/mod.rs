@@ -184,6 +184,24 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// SHA-256 of `text` with each CRLF line ending as LF, in lowercase hex;
+/// `None` if it has no CRLF (it is then [`sha256_hex`] of `text`). Two texts
+/// that differ only in LF and CRLF line endings have the same, as when git
+/// (`core.autocrlf`) checks a text file out with CRLF ones on Windows.
+pub fn lf_sha256(text: &str) -> Option<String> {
+    text.contains("\r\n").then(|| sha256_hex(text.replace("\r\n", "\n").as_bytes()))
+}
+
+/// Check that `s` is a SHA-256 in lowercase hex, as [`sha256_hex`] gives it.
+pub fn check_sha256(s: &str) -> Result<()> {
+    if s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+        return Ok(());
+    }
+    let shown: String = s.chars().take(64).flat_map(char::escape_default).collect();
+    let more = if s.chars().count() > 64 { "..." } else { "" };
+    Err(invalid(format!("\"{shown}\"{more} is not a SHA-256 in lowercase hex")))
+}
+
 fn invalid(msg: impl Into<String>) -> Error {
     Error::invalid(msg)
 }
@@ -218,6 +236,16 @@ mod tests {
         }
         assert!("Claude".parse::<Harness>().is_err());
         assert!("cursor".parse::<Harness>().unwrap_err().to_string().contains("claude, codex or copilot"));
+    }
+
+    #[test]
+    fn texts_that_differ_only_in_line_endings_hash_alike() {
+        assert_eq!(lf_sha256("a\nb\n"), None, "LF already");
+        assert_eq!(lf_sha256("a\r\nb\n"), Some(sha256_hex(b"a\nb\n")));
+        assert_eq!(lf_sha256("a\r\nb\r\n"), lf_sha256("a\r\nb\n"));
+        // A CR that ends no line is text, and stays.
+        assert_eq!(lf_sha256("a\r\r\n"), Some(sha256_hex(b"a\r\n")));
+        assert_eq!(lf_sha256("a\rb"), None);
     }
 
     #[test]

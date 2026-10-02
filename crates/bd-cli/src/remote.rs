@@ -554,7 +554,7 @@ impl OutputFile {
         // Closed before the rename, which Windows refuses for an open file.
         let moved = w.into_inner().map_err(|e| e.into_error()).and_then(|file| {
             drop(file);
-            std::fs::rename(&temp, &self.target)
+            crate::io::replace_file(&temp, &self.target)
         });
         moved.map_err(|e| {
             let _ = std::fs::remove_file(&temp);

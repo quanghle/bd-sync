@@ -159,8 +159,8 @@ fn save_file(path: &Path, file: &TokenFile) -> Result<()> {
         f.write_all(text.as_bytes())?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    crate::io::replace_file(&tmp, path)
+        .map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))))
 }
 
 fn hex(bytes: &[u8]) -> String {

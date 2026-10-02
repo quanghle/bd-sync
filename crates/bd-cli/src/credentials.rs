@@ -314,7 +314,8 @@ fn write(path: &Path, file: &File) -> Result<()> {
     builder.create(dir).map_err(|e| io_error(dir, e))?;
     let body = toml::to_string(file).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
     let tmp = dir.join(format!(".credentials.{}.tmp", random_hex(8)?));
-    let written = write_new(&tmp, format!("{HEADER}{body}").as_bytes()).and_then(|_| std::fs::rename(&tmp, path));
+    let written =
+        write_new(&tmp, format!("{HEADER}{body}").as_bytes()).and_then(|_| crate::io::replace_file(&tmp, path));
     if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(io_error(path, e));

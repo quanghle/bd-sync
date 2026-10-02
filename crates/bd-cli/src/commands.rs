@@ -1226,6 +1226,10 @@ pub fn cmd_config_read(app: &mut App, cmd: &ConfigCommand) -> Result<()> {
     Ok(())
 }
 
+fn path_error(path: &Path, e: std::io::Error) -> Error {
+    Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
 pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
     let opts = ExportOptions {
         include_memories: !a.no_memories,
@@ -1237,12 +1241,17 @@ pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
         Some(path) if io::serving() => io::send_file(path, |w| app.read(|r| r.export_jsonl(w, &opts)))?,
         Some(path) => {
             let tmp = path.with_extension("jsonl.tmp");
-            let file = std::fs::File::create(&tmp)?;
+            let file = std::fs::File::create(&tmp).map_err(|e| path_error(&tmp, e))?;
             let mut w = std::io::BufWriter::new(file);
-            let s = app.read(|r| r.export_jsonl(&mut w, &opts))?;
-            w.flush()?;
-            drop(w);
-            std::fs::rename(&tmp, path)?;
+            let written = app.read(|r| r.export_jsonl(&mut w, &opts)).and_then(|s| {
+                // Closed before the rename, which Windows refuses for an open file.
+                w.into_inner().map_err(|e| e.into_error())?;
+                Ok(s)
+            });
+            let s = written.inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })?;
+            io::replace_file(&tmp, path).map_err(|e| path_error(path, e))?;
             s
         }
         None => io::with_stdout(|out| {

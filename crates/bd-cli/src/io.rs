@@ -274,6 +274,58 @@ pub fn send_file<T>(path: &Path, f: impl FnOnce(&mut dyn Write) -> Result<T>) ->
     Ok(out)
 }
 
+/// Waits between attempts of [`replace_file`] while the target is busy:
+/// about 0.6 s in all.
+const REPLACE_DELAYS_MS: [u64; 6] = [10, 20, 40, 80, 160, 320];
+
+/// Move the finished temp file `tmp` over `target`. On Windows the rename
+/// fails while another program (an editor, an indexer, antivirus) has
+/// `target` open, so it is retried briefly. On failure `tmp` is removed.
+pub fn replace_file(tmp: &Path, target: &Path) -> std::io::Result<()> {
+    let delays = REPLACE_DELAYS_MS.map(std::time::Duration::from_millis);
+    let moved = retry_busy(|| std::fs::rename(tmp, target), &delays, is_busy).map_err(|e| {
+        if is_busy(&e) {
+            std::io::Error::new(e.kind(), format!("{e} (is the file open in another program?)"))
+        } else {
+            e
+        }
+    });
+    if moved.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    moved
+}
+
+/// Run `op`, again after each of `delays` while it fails with an error `busy` accepts.
+fn retry_busy<T>(
+    mut op: impl FnMut() -> std::io::Result<T>,
+    delays: &[std::time::Duration],
+    busy: impl Fn(&std::io::Error) -> bool,
+) -> std::io::Result<T> {
+    let mut delays = delays.iter();
+    loop {
+        match op() {
+            Err(e) if busy(&e) => match delays.next() {
+                Some(d) => std::thread::sleep(*d),
+                None => return Err(e),
+            },
+            done => return done,
+        }
+    }
+}
+
+/// A sharing or lock violation: another process has the file open.
+#[cfg(windows)]
+fn is_busy(e: &std::io::Error) -> bool {
+    // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION.
+    matches!(e.raw_os_error(), Some(5 | 32 | 33))
+}
+
+#[cfg(not(windows))]
+fn is_busy(_: &std::io::Error) -> bool {
+    false
+}
+
 /// Refuse an admin-only operation when the request's token is not an admin.
 pub fn require_admin(what: &str) -> Result<()> {
     match with_capture(|c| c.admin) {
@@ -312,6 +364,82 @@ mod tests {
     fn recording() -> (Rc<RefCell<Recorded>>, Capture) {
         let sink = Rc::new(RefCell::new(Recorded::default()));
         (sink.clone(), Capture::new(Box::new(sink)))
+    }
+
+    #[test]
+    fn retry_busy_retries_only_busy_errors_and_gives_up() {
+        use std::io::{Error as IoError, ErrorKind};
+        let delays = [std::time::Duration::ZERO; 3];
+        let busy = |e: &IoError| e.kind() == ErrorKind::PermissionDenied;
+
+        let mut calls = 0;
+        let r = retry_busy(
+            || {
+                calls += 1;
+                if calls < 3 { Err(IoError::from(ErrorKind::PermissionDenied)) } else { Ok(calls) }
+            },
+            &delays,
+            busy,
+        );
+        assert_eq!(r.unwrap(), 3);
+
+        let mut calls = 0;
+        let r: std::io::Result<()> = retry_busy(
+            || {
+                calls += 1;
+                Err(IoError::from(ErrorKind::PermissionDenied))
+            },
+            &delays,
+            busy,
+        );
+        assert_eq!(r.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert_eq!(calls, 4);
+
+        let mut calls = 0;
+        let r: std::io::Result<()> = retry_busy(
+            || {
+                calls += 1;
+                Err(IoError::from(ErrorKind::NotFound))
+            },
+            &delays,
+            busy,
+        );
+        assert_eq!(r.unwrap_err().kind(), ErrorKind::NotFound);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn replace_file_replaces_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tmp, target) = (dir.path().join("out.jsonl.tmp"), dir.path().join("out.jsonl"));
+        std::fs::write(&target, "old").unwrap();
+        std::fs::write(&tmp, "new").unwrap();
+        replace_file(&tmp, &target).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        assert!(!tmp.exists());
+
+        std::fs::write(&tmp, "orphan").unwrap();
+        assert!(replace_file(&tmp, &dir.path().join("missing").join("out.jsonl")).is_err());
+        assert!(!tmp.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn replace_file_waits_for_a_reader_to_close_the_target() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (tmp, target) = (dir.path().join("out.jsonl.tmp"), dir.path().join("out.jsonl"));
+        std::fs::write(&target, "old").unwrap();
+        std::fs::write(&tmp, "new").unwrap();
+        // FILE_SHARE_READ only, as many editors open files: renaming over it fails meanwhile.
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(&target).unwrap();
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(held);
+        });
+        replace_file(&tmp, &target).unwrap();
+        reader.join().unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
     }
 
     #[test]

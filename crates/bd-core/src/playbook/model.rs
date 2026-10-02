@@ -875,12 +875,15 @@ impl Playbook {
         if total > MAX_RUN_ISSUES {
             return Err(format!("has {total} steps (at most {MAX_RUN_ISSUES})"));
         }
-        // id -> (ancestor ids, step)
+        // id -> (ancestor ids, step); `order` keeps declaration order so the
+        // first error reported does not depend on hash iteration.
+        let mut order: Vec<&str> = Vec::with_capacity(total);
         let mut index: HashMap<&str, (Vec<&str>, &Step)> = HashMap::new();
         fn walk<'a>(
             steps: &'a [Arc<Step>],
             ancestors: &mut Vec<&'a str>,
             index: &mut HashMap<&'a str, (Vec<&'a str>, &'a Step)>,
+            order: &mut Vec<&'a str>,
         ) -> std::result::Result<(), String> {
             for s in steps {
                 if ancestors.len() >= MAX_DEPTH {
@@ -889,15 +892,17 @@ impl Playbook {
                 if index.insert(&s.id, (ancestors.clone(), s)).is_some() {
                     return Err(format!("duplicate step id {:?} (ids are unique across the playbook)", s.id));
                 }
+                order.push(&s.id);
                 ancestors.push(&s.id);
-                walk(&s.children, ancestors, index)?;
+                walk(&s.children, ancestors, index, order)?;
                 ancestors.pop();
             }
             Ok(())
         }
-        walk(&self.steps, &mut Vec::new(), &mut index)?;
+        walk(&self.steps, &mut Vec::new(), &mut index, &mut order)?;
 
-        for (id, (ancestors, step)) in &index {
+        for id in &order {
+            let (ancestors, step) = &index[id];
             for n in &step.needs {
                 let Some((n_ancestors, _)) = index.get(n.as_str()) else {
                     return Err(format!("step {id} needs unknown step {n:?}"));
@@ -1119,6 +1124,31 @@ timeout = "30m"
         assert_eq!((gate.branch.as_deref(), gate.event.as_deref()), (Some("v{{version}}"), Some("push")));
         assert!(pb.vars["version"].check("version", "1.2").is_err());
         assert_eq!(pb.vars["version"].check("version", "1.2.3").unwrap(), "1.2.3");
+    }
+
+    #[test]
+    fn check_reports_the_first_error_in_declaration_order() {
+        let text = r#"
+[[steps]]
+id = "a"
+needs = ["missing-a"]
+
+[[steps]]
+id = "b"
+needs = ["b"]
+
+[[steps]]
+id = "c"
+needs = ["missing-c"]
+
+[[steps]]
+id = "d"
+needs = ["missing-d"]
+"#;
+        for _ in 0..50 {
+            let err = parse(text).unwrap_err().to_string();
+            assert!(err.contains(r#"step a needs unknown step "missing-a""#), "{err}");
+        }
     }
 
     #[test]

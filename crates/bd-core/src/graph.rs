@@ -268,10 +268,61 @@ pub(crate) fn recompute_above(
     seeds: Vec<String>,
     settled: Option<&str>,
 ) -> Result<Vec<BlockChange>> {
+    let changes = settle(ctx.conn(), seeds, settled)?;
+    publish(ctx, changes)
+}
+
+/// [`recompute`] for `seeds` when the subtree below `current`, a child of an
+/// issue among them, is up to date but for what the seeds change: an issue
+/// there can only flip if one of the seeds inside it does, or `current`
+/// does. Unless one of them flips, nothing below `current` is visited, and
+/// the changes and their events are exactly [`recompute`]'s: the other
+/// issues are visited in the same order. Otherwise it recomputes in full.
+/// Keeps a reopen cascading up a deep chain of groups linear.
+pub(crate) fn recompute_beside(ctx: &mut WriteCtx<'_>, seeds: Vec<String>, current: &str) -> Result<Vec<BlockChange>> {
+    let conn = ctx.conn();
+    let mut changes = settle(conn, seeds.clone(), Some(current))?;
+    let mut descend = false;
+    for (c, _) in &changes {
+        if c.id == current || (seeds.contains(&c.id) && is_below(conn, &c.id, current)?) {
+            descend = true;
+            break;
+        }
+    }
+    if descend {
+        let mut undo = conn.prepare_cached("UPDATE issues SET is_blocked = ?1 WHERE id = ?2")?;
+        for (c, _) in &changes {
+            undo.execute(params![!c.blocked as i64, c.id])?;
+        }
+        drop(undo);
+        changes = settle(conn, seeds, None)?;
+    }
+    publish(ctx, changes)
+}
+
+/// Whether `id` is a descendant of `ancestor`. Stops at `ancestor`'s parent:
+/// the hierarchy has no cycles, so nothing above it is below `ancestor`.
+fn is_below(conn: &Connection, id: &str, ancestor: &str) -> Result<bool> {
+    let stop = parent_of(conn, ancestor)?;
+    let mut seen = HashSet::new();
+    let mut cur = id.to_string();
+    while Some(&cur) != stop.as_ref() && seen.insert(cur.clone()) {
+        match parent_of(conn, &cur)? {
+            Some(p) if p == ancestor => return Ok(true),
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    Ok(false)
+}
+
+/// Brings `is_blocked` up to date for `seeds` and their descendants (not
+/// below `stop`). Returns the net changes, in visiting order, with each
+/// issue's status.
+fn settle(conn: &Connection, seeds: Vec<String>, stop: Option<&str>) -> Result<Vec<(BlockChange, Status)>> {
     if seeds.is_empty() {
         return Ok(Vec::new());
     }
-    let conn = ctx.conn();
     // BFS from the seeds down the hierarchy: parents precede children, so
     // one pass usually converges; the loop below guarantees a fixpoint.
     //
@@ -298,7 +349,7 @@ pub(crate) fn recompute_above(
             continue;
         }
         state.insert(id.clone(), (blocked, status));
-        if settled != Some(id.as_str()) {
+        if stop != Some(id.as_str()) {
             queue.extend(children(conn, &id)?);
         }
         order.push(id);
@@ -323,18 +374,28 @@ pub(crate) fn recompute_above(
     }
     drop(update);
     let mut changes = Vec::new();
-    for id in &order {
-        let (now_blocked, status) = state[id];
-        if original[id] != now_blocked {
-            changes.push(BlockChange { id: id.clone(), blocked: now_blocked });
-            if !status.is_terminal() {
-                let op = if now_blocked { "blocked" } else { "unblocked" };
-                ctx.emit(op, Some(id), json!({}))?;
-            }
+    for id in order {
+        let (now_blocked, status) = state[&id];
+        if original[&id] != now_blocked {
+            changes.push((BlockChange { id, blocked: now_blocked }, status));
         }
     }
-    crate::gates::note_block_changes(ctx, &changes)?;
     Ok(changes)
+}
+
+/// Emits `blocked` / `unblocked` events for `changes` on live issues and
+/// arms or disarms the gates among them.
+fn publish(ctx: &mut WriteCtx<'_>, changes: Vec<(BlockChange, Status)>) -> Result<Vec<BlockChange>> {
+    let mut out = Vec::with_capacity(changes.len());
+    for (change, status) in changes {
+        if !status.is_terminal() {
+            let op = if change.blocked { "blocked" } else { "unblocked" };
+            ctx.emit(op, Some(&change.id), json!({}))?;
+        }
+        out.push(change);
+    }
+    crate::gates::note_block_changes(ctx, &out)?;
+    Ok(out)
 }
 
 /// Rebuild every flag from scratch (repair path for `doctor --fix`).

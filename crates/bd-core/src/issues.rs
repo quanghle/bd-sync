@@ -911,8 +911,10 @@ impl WriteCtx<'_> {
             });
         }
         let reason = reason.map(str::trim).filter(|r| !r.is_empty());
-        let mut blocked = self.mark_reopened(id, reason.map(String::from))?;
-        // A finished run or group is unfinished again once one of its steps is.
+        let mut blocked = self.mark_reopened(id, reason.map(String::from), None)?;
+        // A finished run or group is unfinished again once one of its steps
+        // is. Linear however deep: each recompute leaves out the subtree
+        // reopened just before, unless the flag of its top changes.
         let mut reopened = Vec::new();
         let mut cur = id.to_string();
         while let Some(parent) = graph::parent_of(self.conn(), &cur)? {
@@ -920,11 +922,12 @@ impl WriteCtx<'_> {
             if p.status != Status::Closed || !is_playbook_container(&p) {
                 break;
             }
-            blocked.extend(self.mark_reopened(&parent, Some(format!("{id} was reopened")))?);
+            blocked.extend(self.mark_reopened(&parent, Some(format!("{id} was reopened")), Some(&cur))?);
             reopened.push(parent.clone());
             cur = parent;
         }
-        blocked.retain(|b| !reopened.contains(b));
+        let done: HashSet<&String> = reopened.iter().collect();
+        blocked.retain(|b| !done.contains(b));
         Ok(ReopenOutcome {
             issue: require(self.conn(), id)?,
             already_open: false,
@@ -933,7 +936,9 @@ impl WriteCtx<'_> {
         })
     }
 
-    fn mark_reopened(&mut self, id: &str, reason: Option<String>) -> Result<Vec<String>> {
+    /// Reopen `id`. `current`: its child reopened just before, whose subtree
+    /// is up to date.
+    fn mark_reopened(&mut self, id: &str, reason: Option<String>, current: Option<&str>) -> Result<Vec<String>> {
         self.conn()
             .prepare_cached(
                 "UPDATE issues SET status = 'open', closed_at = NULL, close_reason = NULL, close_outcome = NULL,
@@ -943,7 +948,10 @@ impl WriteCtx<'_> {
             .execute(params![self.now(), id])?;
         self.emit("reopened", Some(id), json!({ "reason": reason }))?;
         let seeds = graph::seeds_for_terminal_flip(self.conn(), id)?;
-        let changes = graph::recompute(self, seeds)?;
+        let changes = match current {
+            Some(child) => graph::recompute_beside(self, seeds, child)?,
+            None => graph::recompute(self, seeds)?,
+        };
         Ok(changes.into_iter().filter(|c| c.blocked && c.id != id).map(|c| c.id).collect())
     }
 

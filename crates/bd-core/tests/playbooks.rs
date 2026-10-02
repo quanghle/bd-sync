@@ -817,3 +817,197 @@ fn deeply_nested_runs_take_linear_time() {
     // Generous for slow CI machines; the quadratic version took minutes.
     assert!(took < Duration::from_secs(60), "runs took {took:?}");
 }
+
+/// A run `{prefix}0` closed with `levels` closed groups `{prefix}1..` below
+/// it, each the only child of the one before, and a closed step `{prefix}-step`
+/// below the last one, as a finished run leaves them. Plain SQL with table
+/// statistics, as in [`group_chain`]. Returns the step.
+fn closed_group_chain(env: &mut Env, prefix: &str, levels: usize) -> String {
+    let issues = "WITH RECURSIVE n(k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO issues (id, title, issue_type, status, metadata, created_at, updated_at, closed_at,
+                            close_reason, close_outcome)
+        SELECT ?3 || k, 'Level ' || k, 'epic', 'closed',
+               json_object('playbook', json_object('role', CASE k WHEN 0 THEN 'run' ELSE 'group' END)),
+               ?2 + k, ?2 + k, ?2 + k, 'every step closed', 'done'
+        FROM n";
+    let edges = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+        SELECT ?3 || k, ?3 || (k - 1), 'parent-child', ?2 FROM n";
+    let step = format!("{prefix}-step");
+    env.store
+        .write("chain", "alice", |tx| {
+            tx.conn().execute(issues, (levels as i64, T0, prefix))?;
+            tx.conn().execute(edges, (levels as i64, T0, prefix))?;
+            tx.conn().execute(
+                "INSERT INTO issues (id, title, status, created_at, updated_at, closed_at, close_reason, close_outcome)
+                 VALUES (?1, 'Last step', 'closed', ?2, ?2, ?2, 'done', 'done')",
+                (&step, T0),
+            )?;
+            tx.conn().execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+                 VALUES (?1, ?2, 'parent-child', ?3)",
+                (&step, format!("{prefix}{levels}"), T0),
+            )?;
+            tx.conn().execute_batch("ANALYZE")?;
+            Ok(())
+        })
+        .unwrap();
+    step
+}
+
+#[test]
+fn reopening_a_step_under_deep_closed_groups_reopens_them_in_linear_time() {
+    const LEVELS: usize = 20_000;
+    let mut env = Env::new();
+    let (plain, held) = (closed_group_chain(&mut env, "a", LEVELS), closed_group_chain(&mut env, "b", LEVELS));
+    // Halfway up the second chain, a group waits on an open issue: once it
+    // reopens, it blocks everything reopened below it.
+    let blocker = env.store.write("create", "alice", |tx| tx.create_issue(NewIssue::titled("Blocker"))).unwrap().id;
+    let mid = format!("b{}", LEVELS / 2);
+    env.store
+        .write("dep", "alice", |tx| {
+            tx.conn().execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at) VALUES (?1, ?2, 'blocks', ?3)",
+                (&mid, &blocker, T0),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let env = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            for (step, prefix) in [(plain, "a"), (held, "b")] {
+                let since = env.store.read(|r| r.events(&EventQuery::default())).unwrap().head;
+                let started = std::time::Instant::now();
+                let out = env.store.write("reopen", "alice", |tx| tx.reopen_issue(&step, None)).unwrap();
+                let took = started.elapsed();
+                eprintln!("reopening {step} under {LEVELS} groups took {took:?}");
+                // Quadratic, this took minutes; linear, well under a second.
+                assert!(took < Duration::from_secs(60), "reopening {step} took {took:?}");
+                assert_eq!(out.reopened.len(), LEVELS + 1);
+                assert_eq!(out.reopened[0].id, format!("{prefix}{LEVELS}"));
+                assert_eq!(out.reopened[LEVELS].id, format!("{prefix}0"));
+                assert!(out.reopened.iter().all(|i| i.status == Status::Open));
+                let blocked: Vec<&str> = out.newly_blocked.iter().map(|i| i.id.as_str()).collect();
+                let events = env
+                    .store
+                    .read(|r| r.events(&EventQuery { since: Some(since), ..Default::default() }))
+                    .unwrap()
+                    .events;
+                let reopened = events.iter().filter(|e| e.op == "reopened").count();
+                let blocks: Vec<&str> =
+                    events.iter().filter(|e| e.op == "blocked").map(|e| e.issue_id.as_deref().unwrap()).collect();
+                assert_eq!(reopened, LEVELS + 2);
+                if prefix == "a" {
+                    assert!(blocked.is_empty() && blocks.is_empty(), "{blocked:?}");
+                } else {
+                    assert_eq!(blocked, [step.as_str()]);
+                    // The group itself, then down its subtree: every group
+                    // reopened below it and the step.
+                    assert_eq!(blocks.len(), LEVELS / 2 + 2);
+                    assert_eq!((blocks[0], blocks[1]), (mid.as_str(), format!("b{}", LEVELS / 2 + 1).as_str()));
+                    assert_eq!(blocks[LEVELS / 2 + 1], step);
+                }
+            }
+            env
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let mut env = env;
+    // Groups are not work; the second step waits on the blocker.
+    assert_eq!(env.ready_ids(), ["a-step".to_string(), blocker]);
+    env.assert_healthy();
+}
+
+#[test]
+fn reopening_up_closed_groups_blocks_what_it_should_in_order() {
+    let mut env = Env::new();
+    let mut make = |title: &str, parent: Option<&str>, role: Option<&str>| {
+        let new = NewIssue { parent: parent.map(String::from), ..NewIssue::titled(title) };
+        env.store
+            .write("create", "alice", |tx| {
+                let id = tx.create_issue(new)?.id;
+                if let Some(role) = role {
+                    tx.conn().execute(
+                        "UPDATE issues SET metadata = json_object('playbook', json_object('role', ?1)) WHERE id = ?2",
+                        (role, &id),
+                    )?;
+                }
+                Ok(id)
+            })
+            .unwrap()
+    };
+    // A run with a failed step and, two groups down, a step; G2 waits on an
+    // open issue, D on G1 failing, W on the run's steps.
+    let run = make("Run", None, Some("run"));
+    let g1 = make("G1", Some(&run), Some("group"));
+    let g2 = make("G2", Some(&g1), Some("group"));
+    let step = make("Step", Some(&g2), None);
+    let failed = make("Failed", Some(&g1), None);
+    let x = make("X", None, None);
+    let d = make("D", None, None);
+    let w = make("W", None, None);
+    // Another run three groups deep, whose step waits for the steps of the
+    // top group.
+    let run2 = make("Run 2", None, Some("run"));
+    let h1 = make("H1", Some(&run2), Some("group"));
+    let h2 = make("H2", Some(&h1), Some("group"));
+    let h3 = make("H3", Some(&h2), Some("group"));
+    let leaf = make("Leaf", Some(&h3), None);
+    env.close_failed(&failed);
+    env.close(&step);
+    env.close(&leaf);
+    assert_eq!((env.issue(&run).status, env.issue(&run2).status), (Status::Closed, Status::Closed));
+    let edges = [(&g2, &x, DepType::Blocks), (&d, &g1, DepType::ConditionalBlocks), (&w, &run, DepType::WaitsFor)];
+    for (issue, target, t) in edges.into_iter().chain([(&leaf, &h1, DepType::WaitsFor)]) {
+        env.store.write("dep", "alice", |tx| tx.add_dependency(issue, target, t, None)).unwrap();
+    }
+    assert_eq!(env.ready_ids(), [x.clone(), d.clone(), w.clone()]);
+
+    for (reopen, reopened, blocked, expected) in [
+        (
+            &step,
+            vec![&g2, &g1, &run],
+            vec![&step, &d, &w],
+            vec![
+                ("reopened", &step, json!({ "reason": null })),
+                ("reopened", &g2, json!({ "reason": format!("{step} was reopened") })),
+                ("blocked", &g2, json!({})),
+                ("blocked", &step, json!({})),
+                ("reopened", &g1, json!({ "reason": format!("{step} was reopened") })),
+                ("blocked", &d, json!({})),
+                ("blocked", &w, json!({})),
+                ("reopened", &run, json!({ "reason": format!("{step} was reopened") })),
+            ],
+        ),
+        (
+            &leaf,
+            vec![&h3, &h2, &h1, &run2],
+            vec![&leaf],
+            vec![
+                ("reopened", &leaf, json!({ "reason": null })),
+                ("reopened", &h3, json!({ "reason": format!("{leaf} was reopened") })),
+                ("reopened", &h2, json!({ "reason": format!("{leaf} was reopened") })),
+                // H1 has a live step again.
+                ("blocked", &leaf, json!({})),
+                ("reopened", &h1, json!({ "reason": format!("{leaf} was reopened") })),
+                ("reopened", &run2, json!({ "reason": format!("{leaf} was reopened") })),
+            ],
+        ),
+    ] {
+        let since = env.store.read(|r| r.events(&EventQuery::default())).unwrap().head;
+        let out = env.store.write("reopen", "alice", |tx| tx.reopen_issue(reopen, None)).unwrap();
+        let ids = |refs: &[IssueRef]| refs.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&out.reopened), reopened.into_iter().cloned().collect::<Vec<_>>());
+        assert_eq!(ids(&out.newly_blocked), blocked.into_iter().cloned().collect::<Vec<_>>());
+        let events = env.store.read(|r| r.events(&EventQuery { since: Some(since), ..Default::default() })).unwrap();
+        let events: Vec<_> =
+            events.events.into_iter().map(|e| (e.op, e.issue_id.unwrap_or_default(), e.data)).collect();
+        let expected: Vec<_> = expected.into_iter().map(|(op, id, data)| (op.to_string(), id.clone(), data)).collect();
+        assert_eq!(events, expected);
+    }
+    // X holds G2 and its step; D, W and the leaf wait.
+    assert_eq!(env.ready_ids(), [run, g1, x, run2, h1, h2, h3]);
+    env.assert_healthy();
+}

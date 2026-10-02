@@ -550,3 +550,30 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
     }
     assert!(failures.is_empty(), "{} failures:\n\n{}", failures.len(), failures.join("\n\n"));
 }
+
+#[test]
+fn opening_never_waits_to_drop_statistics() {
+    let mut ws = Ws::new();
+    ws.create(NewIssue::titled("First"));
+    ws.sql(YOUNG);
+    let path = ws.store.path().to_path_buf();
+    // Another process is writing: opening leaves the statistics for later rather than wait for it.
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = std::time::Instant::now();
+    let opts = OpenOptions { clock: ws.clock.clone(), busy_timeout: Duration::from_secs(5), ..Default::default() };
+    let busy = Store::open(&path, opts.clone()).unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "waited {:?}", started.elapsed());
+    let held = Ws { _dir: tempfile::tempdir().unwrap(), store: busy, clock: ws.clock.clone() };
+    assert!(held.analyzed(), "left for later");
+    // The busy handler is back: a write waits for the writer, as it always did.
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        writer.execute_batch("COMMIT").unwrap();
+    });
+    let mut held = held;
+    held.create(NewIssue::titled("Second"));
+    release.join().unwrap();
+    // Free again, the next open drops them.
+    assert!(!ws.reopen().analyzed());
+}

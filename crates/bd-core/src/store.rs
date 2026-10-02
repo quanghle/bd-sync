@@ -221,13 +221,29 @@ impl Store {
     }
 
     /// Drop the planner's statistics, if the database holds any (see the
-    /// module docs). A database that cannot be written keeps them.
+    /// module docs). Best effort, never waiting: a database another process
+    /// is writing, or one that cannot be written, keeps them until a later
+    /// open finds it free.
     fn drop_statistics(&mut self) {
-        match schema::drop_statistics(&mut self.conn) {
+        if let Err(e) = self.conn.busy_handler(None) {
+            tracing::warn!(target: "bd::store", error = %e, "cannot drop planner statistics");
+            return;
+        }
+        let dropped = schema::drop_statistics(&mut self.conn);
+        if let Err(e) = self.conn.busy_handler(Some(busy_handler)) {
+            tracing::warn!(target: "bd::store", error = %e, "cannot restore the busy handler");
+        }
+        match dropped {
             Ok(tables) if !tables.is_empty() => {
                 tracing::debug!(target: "bd::store", ?tables, "dropped planner statistics");
             }
             Ok(_) => {}
+            Err(Error::Busy(e)) => {
+                tracing::debug!(target: "bd::store", error = %e, "planner statistics left for later")
+            }
+            Err(Error::Sqlite(e)) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::ReadOnly) => {
+                tracing::debug!(target: "bd::store", error = %e, "planner statistics kept: read-only database");
+            }
             Err(e) => tracing::warn!(target: "bd::store", error = %e, "cannot drop planner statistics"),
         }
     }

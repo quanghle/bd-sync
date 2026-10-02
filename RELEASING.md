@@ -89,8 +89,9 @@ on push), so the tag steps above and the tag deletions under
 | `x86_64-pc-windows-msvc` | `windows-2025` | `bd-<tag>-x86_64-pc-windows-msvc.zip` |
 | `aarch64-pc-windows-msvc` | `windows-11-arm` | `bd-<tag>-aarch64-pc-windows-msvc.zip` |
 
-Each archive holds the binary and `README.md` at its root, plus any `LICENSE*`,
-`COPYING*` or `NOTICE*` files present in the repository root.
+Each archive holds the binary, `README.md` and the `docs/` directory it links
+to at its root, plus any `LICENSE*`, `COPYING*` or `NOTICE*` files present in
+the repository root.
 
 Build settings live in the workflow's `env`, not in `Cargo.toml`:
 `CARGO_PROFILE_RELEASE_STRIP=symbols`; `CC_<target>=musl-gcc` for the static

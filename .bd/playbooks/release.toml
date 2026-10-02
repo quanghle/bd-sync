@@ -108,7 +108,7 @@ id = "announce"
 title = "Final check and announce v{{version}}"
 needs = ["push", "verify"]
 description = """
-1. Install from the release on one machine as the README describes; bd version prints {{version}}.
+1. Install from the release on one machine as docs/install.md describes; bd version prints {{version}}.
 2. Put the highlights from "notes" on top of the generated notes:
      gh release view v{{version}} --repo {{repo}} --json body --jq .body > notes.md
      (edit notes.md)

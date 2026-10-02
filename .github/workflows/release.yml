@@ -267,16 +267,18 @@ jobs:
           stage="dist/$name"
           rm -rf dist
           mkdir -p "$stage"
-          # The binary and README.md sit at the archive root; license files only if present.
-          files=("bd$exe" README.md)
+          # The binary, README.md and docs/ (which README.md links to) sit at the archive root;
+          # license files only if present.
+          files=("bd$exe" README.md docs)
           cp "target/$TARGET/release/bd$exe" README.md "$stage/"
+          cp -R docs "$stage/"
           for f in LICENSE* COPYING* NOTICE*; do
             if [[ -f $f ]]; then
               cp "$f" "$stage/"
               files+=("$f")
             fi
           done
-          chmod 0644 "$stage"/*
+          chmod -R u=rwX,go=rX "$stage"   # files 0644, directories 0755
           chmod 0755 "$stage/bd$exe"
           if [[ $RUNNER_OS == Windows ]]; then
             archive="$name.zip"
@@ -336,6 +338,7 @@ jobs:
           rm -f "$ARCHIVE"
           ls -l
           [[ -f bd$exe && -f README.md ]] || fail "bd$exe and README.md must be at the archive root"
+          [[ -f docs/install.md ]] || fail "docs/ (linked from README.md) must be in the archive"
           [[ -x bd$exe ]] || fail "bd$exe is not executable"
           bd="$work/pkg/bd$exe"
 
@@ -516,7 +519,7 @@ jobs:
           gh attestation verify bd-@TAG@-<target>.tar.gz --repo @REPO@
           ```
 
-          See [Install](https://github.com/@REPO@#install) in the README.
+          See [Install](https://github.com/@REPO@/blob/@TAG@/docs/install.md).
           EOF
           )
           notes=${notes//@TAG@/$TAG}

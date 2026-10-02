@@ -135,5 +135,6 @@ check both.
 
 ## Reporting a vulnerability
 
-Please do not open a public issue for a vulnerability. Contact the
-maintainer, [@quanghle](https://github.com/quanghle), privately first.
+Please do not open a public issue for a vulnerability. Report it privately
+through [GitHub's private vulnerability reporting](https://github.com/quanghle/bd-sync/security/advisories/new)
+(the repository's Security tab, then "Report a vulnerability").

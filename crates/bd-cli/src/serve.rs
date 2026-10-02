@@ -772,7 +772,7 @@ fn parse_failure(e: &clap::Error) -> ExecResponse {
 }
 
 fn failure(e: &Error, json: bool) -> ExecResponse {
-    ExecResponse { exit_code: e.exit_code(), stderr: crate::render_error(e, json), ..Default::default() }
+    ExecResponse { exit_code: e.exit_code(), stderr: crate::render_error(e, json, None), ..Default::default() }
 }
 
 /// Answer with a response known before the command runs.

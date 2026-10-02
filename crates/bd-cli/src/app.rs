@@ -94,6 +94,11 @@ impl App {
         self.actor.clone().expect("set above")
     }
 
+    /// The actor, if a command resolved it already.
+    pub fn known_actor(&self) -> Option<String> {
+        self.actor.as_ref().map(|a| a.actor.clone())
+    }
+
     /// Run as `actor` (`bd serve` sets each request's).
     pub fn set_actor(&mut self, actor: actor::Resolved) {
         self.g.actor = Some(actor.actor.clone());

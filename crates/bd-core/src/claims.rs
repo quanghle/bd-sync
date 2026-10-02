@@ -94,10 +94,12 @@ pub(crate) fn check_token(conn: &Connection, id: &str, _actor: &str, token: i64)
         Some(l) => Err(Error::LeaseLost {
             id: id.to_string(),
             detail: format!("token {token} is stale; current lease (token {}) is held by {}", l.token, l.holder),
+            holder: Some(l.holder),
         }),
         None => Err(Error::LeaseLost {
             id: id.to_string(),
             detail: format!("no live lease; token {token} was released or reclaimed"),
+            holder: None,
         }),
     }
 }
@@ -339,6 +341,7 @@ impl WriteCtx<'_> {
                     return Err(Error::LeaseLost {
                         id: id.to_string(),
                         detail: format!("now held by {}", lease.holder),
+                        holder: Some(lease.holder),
                     });
                 }
                 if let Some(t) = token {
@@ -346,6 +349,7 @@ impl WriteCtx<'_> {
                         return Err(Error::LeaseLost {
                             id: id.to_string(),
                             detail: format!("token {t} is stale (current token {})", lease.token),
+                            holder: Some(lease.holder),
                         });
                     }
                 }
@@ -360,11 +364,11 @@ impl WriteCtx<'_> {
                 upsert_lease(self.conn(), id, &actor, seq, now, ttl)
             }
             None => {
-                let detail = match (&issue.status, &issue.assignee) {
-                    (Status::InProgress, Some(h)) if *h != actor => format!("claimed by {h}"),
-                    (s, _) => format!("issue is {s}; the claim was released or reclaimed"),
+                let (detail, holder) = match (&issue.status, &issue.assignee) {
+                    (Status::InProgress, Some(h)) if *h != actor => (format!("claimed by {h}"), Some(h.clone())),
+                    (s, _) => (format!("issue is {s}; the claim was released or reclaimed"), None),
                 };
-                Err(Error::LeaseLost { id: id.to_string(), detail })
+                Err(Error::LeaseLost { id: id.to_string(), detail, holder })
             }
         }
     }

@@ -33,8 +33,9 @@ pub enum Error {
     )]
     ClaimsHeld { what: String, held: Vec<(String, String)> },
 
+    /// `holder` is whoever holds the claim now, if anyone does.
     #[error("lease lost on {id}: {detail}")]
-    LeaseLost { id: String, detail: String },
+    LeaseLost { id: String, detail: String, holder: Option<String> },
 
     /// An optimistic-concurrency guard (`if_revision`, `if_status`,
     /// `if_assignee`) no longer holds. Nothing was written.

@@ -1020,20 +1020,98 @@ fn session_start_hook_gives_claude_sessions_their_own_actor() {
     let out = hook(&[], input);
     assert!(out.status.success());
     assert!(String::from_utf8_lossy(&out.stdout).contains("claude-3b4c5d6e"));
-    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), "export BD_SESSION='claude-3b4c5d6e'\n");
+    let line = "export CLAUDE_CODE_SESSION_ID=8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e\n";
+    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), line);
     // Later Bash commands source the file: they act as the session's sub-actor.
-    let info = as_user(&ws, Some(("BD_SESSION", "claude-3b4c5d6e")), &["--json", "info"]);
+    let info =
+        as_user(&ws, Some(("CLAUDE_CODE_SESSION_ID", "8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e")), &["--json", "info"]);
     assert_eq!(serde_json::from_slice::<Value>(&info.stdout).unwrap()["actor"], "tester/claude-3b4c5d6e");
 
-    // A named actor or session is kept; bad input writes nothing and never fails the hook.
-    for (extra, input) in
-        [(&[("BD_ACTOR", "alice")][..], input), (&[("BD_SESSION", "mine")], input), (&[], "{}"), (&[], "not json")]
-    {
-        let out = hook(extra, input);
-        assert!(out.status.success(), "{extra:?} {input}");
+    // A worker started from a coordinator's shell inherits its variables, yet
+    // its hook writes its own id, which then replaces the inherited one.
+    let worker = r#"{"session_id":"0000-child-1111","hook_event_name":"SessionStart"}"#;
+    let inherited = [("CLAUDE_CODE_SESSION_ID", "8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e"), ("BD_SESSION", "crew")];
+    assert!(hook(&inherited, worker).status.success());
+    let written = std::fs::read_to_string(&env_file).unwrap();
+    assert_eq!(written, format!("{line}export CLAUDE_CODE_SESSION_ID=0000-child-1111\n"));
+    // Bad input writes nothing and never fails the hook.
+    for input in ["{}", "not json", r#"{"session_id":"x\ny"}"#] {
+        assert!(hook(&[], input).status.success(), "{input}");
     }
-    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), "export BD_SESSION='claude-3b4c5d6e'\n");
+    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), written);
+    // Ids are quoted for the shell that sources the file.
+    assert!(hook(&[], r#"{"session_id":"a'b c"}"#).status.success());
+    assert!(std::fs::read_to_string(&env_file).unwrap().ends_with("export CLAUDE_CODE_SESSION_ID='a'\\''b c'\n"));
     // Without $CLAUDE_ENV_FILE (other harnesses) it does nothing.
     let out = Ws::cmd_in(ws.dir.path(), "x", &["hook", "session-start"]).stdin(std::process::Stdio::null()).output();
     assert!(out.unwrap().status.success());
+}
+
+#[test]
+fn nested_sessions_do_not_act_as_their_parent() {
+    let ws = Ws::new();
+    let actor = |vars: &[(&str, &str)]| {
+        let mut c = Ws::cmd_in(ws.dir.path(), "", &["--json", "info"]);
+        c.env_remove("BD_ACTOR")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "user.name")
+            .env("GIT_CONFIG_VALUE_0", "tester");
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        let v: Value = serde_json::from_slice(&c.output().unwrap().stdout).unwrap();
+        v["actor"].as_str().unwrap().to_string()
+    };
+    // An inherited BD_SESSION never outranks the session's own id.
+    assert_eq!(
+        actor(&[("BD_SESSION", "claude-parent"), ("CLAUDE_CODE_SESSION_ID", "child")]),
+        "tester/claude-child.claude-parent"
+    );
+    assert_eq!(actor(&[("BD_SESSION", "claude-parent")]), "tester/claude-parent");
+    // Codex started from a Claude Code shell keeps Claude's id and adds its own.
+    let claude = actor(&[("CLAUDE_CODE_SESSION_ID", "aaaa-1111")]);
+    let codex = actor(&[("CLAUDE_CODE_SESSION_ID", "aaaa-1111"), ("CODEX_THREAD_ID", "zzzz-9999")]);
+    assert_eq!((claude.as_str(), codex.as_str()), ("tester/claude-aaaa1111", "tester/claude-aaaa1111.codex-zzzz9999"));
+}
+
+#[test]
+fn claims_of_other_sessions_of_yours_are_listed_with_their_takeover() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Started before /clear"]);
+    ws.ok(&["create", "Someone else's"]);
+    assert!(as_user(&ws, Some(SESSION_A), &["claim", "t-1"]).status.success());
+    assert!(ws.run_as("bob", &["claim", "t-2"]).status.success());
+
+    // The next session of the same user (a new id) sees it, and how to take it over.
+    let prime = String::from_utf8(as_user(&ws, Some(SESSION_B), &["prime"]).stdout).unwrap();
+    let take_over = "bd update t-1 --assignee tester/copilot-15a04348 --take-over";
+    assert!(prime.contains("## Held by other sessions of yours (1)"), "{prime}");
+    assert!(prime.contains("held by tester/copilot-b9bb2788, lease expires in "), "{prime}");
+    assert!(prime.contains(take_over) && !prime.contains("t-2"), "{prime}");
+    let v: Value = serde_json::from_slice(&as_user(&ws, Some(SESSION_B), &["prime", "--json"]).stdout).unwrap();
+    assert_eq!(v["other_sessions_claims"][0]["issue"]["id"], "t-1");
+    assert_eq!(v["other_sessions_claims"][0]["take_over"], take_over);
+    assert_eq!(v["claims"].as_array().unwrap().len(), 0);
+    // The plain user (a terminal, or claims from before sessions had actors) is one of them too.
+    let prime = String::from_utf8(as_user(&ws, None, &["prime"]).stdout).unwrap();
+    assert!(prime.contains("bd update t-1 --assignee tester --take-over"), "{prime}");
+
+    // Exit 4 against another session of yours says so, with the takeover.
+    for args in [&["heartbeat", "t-1"][..], &["close", "t-1"], &["release", "t-1"], &["claim", "t-1"]] {
+        let out = as_user(&ws, Some(SESSION_B), args);
+        let err = String::from_utf8(out.stderr).unwrap();
+        assert_eq!(out.status.code(), Some(4), "{args:?}: {err}");
+        assert!(err.contains("held by another session of yours (tester/copilot-b9bb2788"), "{args:?}: {err}");
+        assert!(err.contains(take_over), "{args:?}: {err}");
+    }
+    // Not against another user's claim.
+    let err = String::from_utf8(as_user(&ws, Some(SESSION_B), &["close", "t-2"]).stderr).unwrap();
+    assert!(err.contains("pick other work") && !err.contains("session of yours"), "{err}");
+
+    // The takeover it names works, and moves the lease.
+    let mut cmd: Vec<&str> = take_over.split(' ').skip(1).collect();
+    cmd.retain(|a| !a.is_empty());
+    assert!(as_user(&ws, Some(SESSION_B), &cmd).status.success());
+    assert!(as_user(&ws, Some(SESSION_B), &["heartbeat", "t-1"]).status.success());
+    assert_eq!(as_user(&ws, Some(SESSION_A), &["heartbeat", "t-1"]).status.code(), Some(4));
 }

@@ -11,7 +11,9 @@ bd is this repository's shared task tracker: a dependency-aware work queue in `.
 
 Run `bd prime`. It prints the workflow, your current claims, the top of the ready queue, and project memories. Outside a workspace it prints nothing; `bd info` shows which workspace is active (a database path, or a server URL for a remote workspace).
 
-Your actor: each agent session acts as its own actor, `<user>/<session>`, derived from the session id the agent harness sets (`$CLAUDE_CODE_SESSION_ID`, `$COPILOT_AGENT_SESSION_ID`, `$CODEX_THREAD_ID`) or from `$BD_SESSION`, so claims of concurrent sessions never mix. `bd prime` shows yours. If it warns that you are the plain default actor and that actor holds claims, run each of your bd commands with `BD_SESSION=<name>` before claiming anything, and leave those claims to their holder. Do not set `BD_ACTOR` to a name other sessions use.
+Your actor: each agent session acts as its own actor, `<user>/<session>`, derived from the session id the agent harness sets (`$CLAUDE_CODE_SESSION_ID`, `$COPILOT_AGENT_SESSION_ID`, `$CODEX_THREAD_ID`) and `$BD_SESSION`, so claims of concurrent sessions never mix. `bd prime` shows yours. If it warns that you are the plain default actor and that actor holds claims, run each of your bd commands with `BD_SESSION=<name>` before claiming anything, and leave those claims to their holder. Do not set `BD_ACTOR` to a name other sessions use.
+
+After `/clear`, a resume, or in a subagent with its own session id, claims you took earlier belong to another actor of your user: `bd prime` lists them under "Held by other sessions of yours", with the command that takes each over (`bd update <id> --assignee <you> --take-over`), and exit-4 hints name it too. Take one over only if this session is continuing that work; otherwise another session is on it. To hand a claimed issue to a subagent, have the subagent take it over, or run its bd commands with `BD_ACTOR=<your actor>`.
 
 ## Workflow
 

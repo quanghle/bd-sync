@@ -135,7 +135,7 @@ lease was lost (reclaimed or taken over): stop working on that issue. A
 claim is protected from every other actor name, not from other sessions
 sharing its own, so each agent session acts as its own actor
 `<you>/<session>`, derived from the session id its agent harness sets
-(Claude Code, Copilot CLI, Codex) or from `BD_SESSION`; see
+(Claude Code, Copilot CLI, Codex) or `BD_SESSION`; see
 [Actors](#actors).
 
 ## Concepts
@@ -589,7 +589,7 @@ bd remote login                               # prompts for the access token, ch
 bd remote show                                # checks the URL, certificate, token and actor
 bd ready                                      # every command now runs on the server
 BD_ACTOR=alice/agent-2 bd claim --next        # sub-actors: one lease holder per agent
-BD_SESSION=agent-3 bd claim --next            # the same: acts as <token actor>/agent-3
+BD_SESSION=agent-3 bd claim --next            # outside an agent harness: acts as <token actor>/agent-3
 ```
 
 ```toml
@@ -645,7 +645,7 @@ forgets the token on this machine: revoke it on the server with
 | `BD_REMOTE` / `--remote URL` | use this workspace URL instead of `.bd/remote.toml` |
 | `BD_CA_CERT` | PEM file of the CA that signed the server certificate |
 | `BD_ACTOR` | act as `<token actor>/<name>`; anything else is refused |
-| `BD_SESSION` | act as `<token actor>/<name>`; agent sessions send theirs on their own ([Actors](#actors)) |
+| `BD_SESSION` | act as `<token actor>/<name>` (added to the session's part in an agent session); agent sessions send theirs on their own ([Actors](#actors)) |
 | `BD_REMOTE_RETRY_SECS` | how long to retry an unreachable server (default 30; 0 = once) |
 | `BD_INSECURE_HTTP=1` | allow plain `http://` to a non-loopback host |
 
@@ -876,12 +876,13 @@ comes from the first of:
 1. `--actor`
 2. `$BD_ACTOR`, then `$BEADS_ACTOR`
 3. the user, `git config user.name` (then `$USER`, `$USERNAME`), as the
-   sub-actor `<user>/<session>` when the command runs in an agent session:
-   - `$BD_SESSION=<name>`: `<user>/<name>` (characters other than letters,
-     digits, `.`, `_` and `-` become `-`)
-   - `$CLAUDE_CODE_SESSION_ID` (Claude Code 2.1.132+): `<user>/claude-<id>`
-   - `$COPILOT_AGENT_SESSION_ID` (Copilot CLI 1.0.29+): `<user>/copilot-<id>`
-   - `$CODEX_THREAD_ID`, then `$CODEX_SESSION_ID` (Codex): `<user>/codex-<id>`
+   sub-actor `<user>/<session>` when the command runs in an agent session.
+   The session joins, with `.`, a part for each of these that is set:
+   - `$CLAUDE_CODE_SESSION_ID` (Claude Code 2.1.132+): `claude-<id>`
+   - `$COPILOT_AGENT_SESSION_ID` (Copilot CLI 1.0.29+): `copilot-<id>`
+   - `$CODEX_THREAD_ID`, else `$CODEX_SESSION_ID` (Codex): `codex-<id>`
+   - `$BD_SESSION=<name>`: `<name>` (characters other than letters, digits,
+     `.`, `_` and `-` become `-`), for scripts and other harnesses
 
    where `<id>` is the last 8 letters and digits of the session id, so
    `Quang Le/copilot-b9bb2788`. Harnesses set these in every shell command
@@ -889,17 +890,35 @@ comes from the first of:
    do. A terminal without them keeps the plain user.
 
 Concurrent sessions of one user thus never share claims, with no setup.
+Environment variables are inherited, so an agent started from another
+agent's shell sees its parent's variables as well as its own: a harness
+sets its own variable afresh (a nested Claude Code session has its own
+`$CLAUDE_CODE_SESSION_ID`), while another harness's stays, so Codex started
+from Claude Code acts as `<user>/claude-<id>.codex-<id>`. Joining every part
+keeps a nested session apart from its parent and its siblings without
+guessing which harness is the innermost. `$BD_SESSION` only adds a part, so
+one exported in a shell that starts agents does not merge them.
+
 Naming the actor outright (`--actor`, `$BD_ACTOR`) turns this off: every
-session with the same `$BD_ACTOR` shares its claims again. A claim taken in
-one session is another actor's in the next (or after Claude Code's
-`/clear`, which starts a new session id): finish it there, or take it over
-with `--take-over`. Subagents get their own actor where the harness gives
-them their own id (Codex threads, Copilot CLI); Claude Code subagents share
-their session's. For an older Claude Code, the `SessionStart` hook `bd hook
-session-start` (in this repository's `.claude/settings.json`) writes
-`export BD_SESSION=claude-<id>` to `$CLAUDE_ENV_FILE`, from the hook's
-input. Other harnesses can set `BD_SESSION` per session. `bd info` and
-`bd prime` show the actor and where it came from, and `bd claim` prints it.
+session with the same `$BD_ACTOR` shares its claims again. For an older
+Claude Code, the `SessionStart` hook `bd hook session-start` (in this
+repository's `.claude/settings.json`) writes the session's own id, from the
+hook's input, as `export CLAUDE_CODE_SESSION_ID=<id>` to `$CLAUDE_ENV_FILE`,
+replacing any id inherited from a parent session. `bd info` and `bd prime`
+show the actor and where it came from, and `bd claim` prints it.
+
+A claim taken in one session is another actor's in the next: after Claude
+Code's `/clear` or a resume that starts a new session id, and in a subagent
+that has its own id (Codex threads, Copilot CLI; Claude Code subagents share
+their session's). `bd prime` lists the in-progress claims of your user's
+other actors (`<user>` and `<user>/*`) under "Held by other sessions of
+yours", each with the command that takes it over, `bd update <id>
+--assignee <you> --take-over`, and a claim conflict (exit 4) with one of
+them names that command in its hint. Take a claim over only if this session
+is continuing that work; otherwise another session is on it. To delegate a
+claimed issue to a subagent with its own session id, either have the
+subagent take it over that way, or run the subagent's bd commands with
+`BD_ACTOR=<your actor>` so that it acts as you.
 
 In a remote workspace, the access token decides: `--actor` and `$BD_ACTOR`
 may only name the token's actor or one of its sub-actors. Without them, a

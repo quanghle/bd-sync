@@ -1017,21 +1017,22 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     let me = app.resolved_actor();
     let actor = me.actor.clone();
     let workspace = app.workspace_label()?;
-    let (mine, ready, stats, memories, ttl, now, prefix, attention) = app.read(|r| {
-        let mine = r.list(&ListQuery {
-            filter: WorkFilter { assignee: Some(actor.clone()), ..Default::default() },
-            statuses: vec![Status::InProgress],
-            ..Default::default()
-        })?;
+    let (mine, others, ready, stats, memories, ttl, now, prefix, attention) = app.read(|r| {
+        let claimed = r.list(&ListQuery { statuses: vec![Status::InProgress], ..Default::default() })?;
         let leases: BTreeMap<String, bd_core::Lease> =
             r.leases()?.into_iter().map(|l| (l.lease.issue_id.clone(), l.lease)).collect();
-        let mine: Vec<(bd_core::Issue, Option<bd_core::Lease>)> = mine
+        let with_lease = |i: bd_core::Issue| {
+            let l = leases.get(&i.id).cloned();
+            (i, l)
+        };
+        // Claims of this user's other sessions: ones this session may be continuing.
+        let (mine, others): (Vec<_>, Vec<_>) = claimed
             .into_iter()
-            .map(|i| {
-                let l = leases.get(&i.id).cloned();
-                (i, l)
+            .filter(|i| {
+                i.assignee.as_deref().is_some_and(|a| a == actor || crate::actor::other_session_of_user(&actor, a))
             })
-            .collect();
+            .map(with_lease)
+            .partition(|(i, _)| i.assignee.as_deref() == Some(actor.as_str()));
         let ready = r.ready(&ReadyQuery { limit: Some(a.ready.max(1)), ..Default::default() })?;
         // Gates a person has to act on: armed approvals and escalations.
         let attention: Vec<bd_core::gates::GateView> = bd_core::gates::list(r.conn(), false)?
@@ -1044,6 +1045,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             .collect();
         Ok((
             mine,
+            others,
             ready,
             r.stats()?,
             r.memories(None)?,
@@ -1065,6 +1067,10 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             "shared_actor_claims": shared_actor_warning(&me, mine.len()).is_some(),
             "lease_ttl": ttl,
             "claims": mine.iter().map(|(i, l)| json!({ "issue": i, "lease": l })).collect::<Vec<_>>(),
+            "other_sessions_claims": others
+                .iter()
+                .map(|(i, l)| json!({ "issue": i, "lease": l, "take_over": crate::actor::take_over_command(&i.id, &actor) }))
+                .collect::<Vec<_>>(),
             "ready": ready,
             "ready_total": stats.ready,
             "stats": stats,
@@ -1128,6 +1134,27 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
                 .map(|l| format!(" (token {}, lease expires {})", l.token, rel(l.expires_at, now)))
                 .unwrap_or_default();
             o.push(format!("- {} [P{}] {}{lease}", i.id, i.priority, i.title));
+        }
+    }
+    if !others.is_empty() {
+        o.push(String::new());
+        o.push(format!("## Held by other sessions of yours ({})", others.len()));
+        o.push(
+            "Claims of your user's other actors: an earlier session (before /clear or a resume), a parent or \
+             subagent with its own session, or a concurrent one. Take one over only if this session is continuing \
+             that work; otherwise leave it to its session."
+                .into(),
+        );
+        for (i, l) in &others {
+            let lease = l.as_ref().map(|l| format!(", lease expires {}", rel(l.expires_at, now))).unwrap_or_default();
+            o.push(format!(
+                "- {} [P{}] {} (held by {}{lease}): `{}`",
+                i.id,
+                i.priority,
+                i.title,
+                i.assignee.as_deref().unwrap_or_default(),
+                crate::actor::take_over_command(&i.id, &actor)
+            ));
         }
     }
     o.push(String::new());

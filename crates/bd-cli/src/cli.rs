@@ -30,7 +30,7 @@ pub struct Global {
     /// Run as if started in this directory
     #[arg(short = 'C', long = "directory", global = true, value_name = "DIR")]
     pub directory: Option<PathBuf>,
-    /// Actor name (default: $BD_ACTOR, $BEADS_ACTOR, else git user.name or $USER, as `<user>/<session>` in an agent session: $BD_SESSION, $CLAUDE_CODE_SESSION_ID, $COPILOT_AGENT_SESSION_ID, $CODEX_THREAD_ID)
+    /// Actor name (default: $BD_ACTOR, $BEADS_ACTOR, else git user.name or $USER, as `<user>/<session>` in an agent session: $CLAUDE_CODE_SESSION_ID, $COPILOT_AGENT_SESSION_ID, $CODEX_THREAD_ID, $BD_SESSION)
     #[arg(long, global = true, value_name = "NAME")]
     pub actor: Option<String>,
     /// Machine-readable JSON output
@@ -1213,7 +1213,7 @@ pub struct TokenRevokeArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum HookCommand {
-    /// Claude Code SessionStart hook: give the session its own actor by writing `export BD_SESSION=claude-<id>` to $CLAUDE_ENV_FILE (from the hook's JSON input on stdin); does nothing elsewhere, or when $BD_ACTOR, $BEADS_ACTOR or $BD_SESSION is set
+    /// Claude Code SessionStart hook: give the session its own actor by writing `export CLAUDE_CODE_SESSION_ID=<id>` (the session's own id, from the hook's JSON input on stdin) to $CLAUDE_ENV_FILE, for Claude Code versions that do not set it; does nothing without $CLAUDE_ENV_FILE
     SessionStart,
 }
 

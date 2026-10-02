@@ -3484,6 +3484,15 @@ fn agent_sessions_act_as_sub_actors_of_the_token_actor() {
     assert_eq!(alice.json(&["show", "t-1"])["assignee"], "alice/copilot-b9bb2788");
     let out = session("5139d45d-1aec-41fb-a65b-5e2515a04348", &["close", "t-1"]);
     assert_eq!(out.status.code(), Some(4), "another session of the same token: {}", stderr_of(&out));
+    let take_over = "bd update t-1 --assignee alice/copilot-15a04348 --take-over";
+    assert!(
+        stderr_of(&out).contains("held by another session of yours (alice/copilot-b9bb2788"),
+        "{}",
+        stderr_of(&out)
+    );
+    assert!(stderr_of(&out).contains(take_over), "{}", stderr_of(&out));
+    let prime = check(session("5139d45d-1aec-41fb-a65b-5e2515a04348", &["prime"]), "prime");
+    assert!(prime.contains("## Held by other sessions of yours (1)") && prime.contains(take_over), "{prime}");
     assert_eq!(alice.code(&["close", "t-1"]), 4, "nor the token's plain actor");
     let text = check(alice.cmd(&["prime"]).output().unwrap(), "prime");
     assert!(!text.contains('⚠'), "the plain actor holds nothing: {text}");

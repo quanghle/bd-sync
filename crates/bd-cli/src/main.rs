@@ -90,12 +90,13 @@ fn execute(app: &mut App, cmd: &Command) -> i32 {
     tracing::debug!(target: "bd::cli", command = name, total_us = elapsed.as_micros() as u64, ok = result.is_ok(), "done");
     match result {
         Ok(code) => code,
-        Err(e) => report(&e, app.g.json),
+        Err(e) => report_as(&e, app.g.json, app.known_actor().as_deref()),
     }
 }
 
-/// The lines `report` prints for an error.
-fn render_error(e: &Error, json: bool) -> String {
+/// The lines `report` prints for an error; `actor` is who the command ran
+/// as, if it got that far.
+fn render_error(e: &Error, json: bool, actor: Option<&str>) -> String {
     if json {
         return format!(
             "{}\n",
@@ -103,7 +104,7 @@ fn render_error(e: &Error, json: bool) -> String {
         );
     }
     let mut s = format!("error: {e}\n");
-    if let Some(h) = hint(e) {
+    if let Some(h) = actor.and_then(|a| other_session_hint(e, a)).or_else(|| hint(e).map(String::from)) {
         s.push_str(&format!("hint: {h}\n"));
     }
     s
@@ -111,8 +112,32 @@ fn render_error(e: &Error, json: bool) -> String {
 
 /// Print an error on stderr and return its exit code.
 fn report(e: &Error, json: bool) -> i32 {
-    io::errln(render_error(e, json).trim_end_matches('\n'));
+    report_as(e, json, None)
+}
+
+fn report_as(e: &Error, json: bool, actor: Option<&str>) -> i32 {
+    io::errln(render_error(e, json, actor).trim_end_matches('\n'));
     e.exit_code()
+}
+
+/// The hint for a claim conflict with another session of the caller's own
+/// user (after /clear or a resume, or in a subagent with its own session),
+/// which the caller may be continuing.
+fn other_session_hint(e: &Error, me: &str) -> Option<String> {
+    let (id, holder) = match e {
+        Error::NotOwner { id, holder: Some(h), .. } | Error::LeaseLost { id, holder: Some(h), .. } => (id, h),
+        Error::AlreadyClaimed { id, holder } => (id, holder),
+        _ => return None,
+    };
+    if !actor::other_session_of_user(me, holder) {
+        return None;
+    }
+    Some(format!(
+        "{id} is held by another session of yours ({holder}; you are {me}). If this session is continuing that work \
+         (after /clear or a resume, or as the subagent it was handed to), take the claim over: `{}` (recorded in the \
+         event history). Otherwise another session is working on it: leave it to that session and pick other work.",
+        actor::take_over_command(id, me)
+    ))
 }
 
 fn hint(e: &Error) -> Option<&'static str> {

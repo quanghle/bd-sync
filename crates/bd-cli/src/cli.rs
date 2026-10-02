@@ -1304,6 +1304,8 @@ pub enum TokenCommand {
     /// List access tokens (never their secrets), including those GitHub sign-in issued
     #[command(alias = "ls")]
     List(TokenRootArgs),
+    /// List the GitHub accounts that signed in, and the actor each is bound to
+    Accounts(TokenRootArgs),
     /// Revoke an access token, or every token a GitHub user got by signing in; it stops working at once
     Revoke(TokenRevokeArgs),
 }
@@ -1339,9 +1341,14 @@ pub struct TokenRevokeArgs {
     /// The token's name
     #[arg(required_unless_present = "github")]
     pub name: Option<String>,
-    /// Revoke every token this GitHub user (a login) got by signing in, instead of a named one
+    /// Revoke every token this GitHub user (a login, or the actor an account is bound to) got by signing in,
+    /// instead of a named one
     #[arg(long, value_name = "LOGIN", conflicts_with = "name")]
     pub github: Option<String>,
+    /// With --github: also release the account's actor, which another account (or the same one, under its
+    /// login then) gets at its next sign-in
+    #[arg(long, requires = "github", conflicts_with = "name")]
+    pub forget: bool,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }

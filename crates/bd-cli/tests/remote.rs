@@ -4445,6 +4445,8 @@ struct GithubState {
     codes: std::collections::HashMap<String, (String, usize, bool)>,
     /// Device codes given out, each unique, as GitHub's are.
     minted: usize,
+    /// User ids by login, where not derived from the login: a renamed account keeps its id.
+    ids: std::collections::HashMap<String, u64>,
     /// `METHOD /path` of each request, with its form body.
     log: Vec<String>,
 }
@@ -4469,6 +4471,11 @@ impl FakeGithub {
     fn next(&self, login: &str, pending: usize) {
         let mut s = self.state.lock().unwrap();
         (s.next, s.pending, s.deny) = (login.to_string(), pending, false);
+    }
+
+    /// `login` is the account with this id (a rename keeps it; another account taking a login has another).
+    fn set_id(&self, login: &str, id: u64) {
+        self.state.lock().unwrap().ids.insert(login.to_string(), id);
     }
 
     fn member(&self, login: &str, of: &str) {
@@ -4550,9 +4557,10 @@ fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubS
             }
         }
         ("GET", "/user") => match &login {
-            // A distinct id per login, as GitHub's are.
             Some(l) => {
-                (200, json!({ "login": l, "id": l.bytes().fold(7u64, |h, b| h * 31 + u64::from(b)), "type": "User" }))
+                // A distinct id per login, as GitHub's are, unless set.
+                let id = s.ids.get(l).copied().unwrap_or_else(|| l.bytes().fold(7u64, |h, b| h * 31 + u64::from(b)));
+                (200, json!({ "login": l, "id": id, "type": "User" }))
             }
             None => (401, json!({ "message": "Bad credentials" })),
         },
@@ -4866,4 +4874,62 @@ fn sign_ins_waiting_on_github_keep_their_places_when_their_clients_leave() {
 
     github.state.lock().unwrap().hold = Duration::ZERO;
     eventually("the places back", || sign_in_post(&server, "device", json!({ "workspace": "proj" })).0 == 200);
+}
+
+#[test]
+fn github_accounts_keep_their_actor_until_an_admin_releases_it() {
+    let github = FakeGithub::start();
+    let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"alice\", \"alice-smith\"]\n");
+    let url = server.url();
+    let root = server.root.path().to_path_buf();
+    let admin = |args: &[&str]| -> Value {
+        let out =
+            bd(&root).arg("--json").args(["serve", "token"]).args(args).arg("--root").arg(&root).output().unwrap();
+        serde_json::from_str(&check(out, &format!("token {args:?}"))).unwrap()
+    };
+    let sign_in = |login: &str, id: u64| {
+        github.next(login, 0);
+        github.set_id(login, id);
+        let dir = tempfile::tempdir().unwrap();
+        let out = github_login(dir.path(), &url);
+        (dir, out)
+    };
+    let signed_in_as = |out: Output, what: &str| -> Value { serde_json::from_str(&check(out, what)).unwrap() };
+
+    let (alice, out) = sign_in("alice", 1);
+    assert_eq!(signed_in_as(out, "alice signs in")["actor"], "alice");
+    check(signed_in(alice.path(), &url, &["create", "Alice's work"]), "create");
+
+    // Renamed at GitHub: the same account, still alice in bd.
+    let (renamed, out) = sign_in("alice-smith", 1);
+    let v = signed_in_as(out, "renamed alice signs in");
+    assert_eq!((v["actor"].as_str(), v["github"]["login"].as_str()), (Some("alice"), Some("alice-smith")));
+    let accounts = admin(&["accounts"]);
+    assert_eq!(accounts.as_array().unwrap().len(), 1, "{accounts}");
+    let account = &accounts[0];
+    assert_eq!((account["actor"].as_str(), account["login"].as_str()), (Some("alice"), Some("alice-smith")));
+    assert_eq!((account["id"].as_u64(), account["live_tokens"].as_u64()), (Some(1), Some(2)));
+
+    // Whoever registers the login given up gets nothing while its actor is bound.
+    let (_impostor, out) = sign_in("alice", 2);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    assert!(stderr.contains("actor alice belongs to another GitHub account"), "{stderr}");
+    assert_eq!(admin(&["accounts"]).as_array().unwrap().len(), 1, "a refused sign-in binds nothing");
+
+    // Revoked, the account keeps the actor; released by an admin, the next sign-in as alice binds it.
+    let v = admin(&["revoke", "--github", "alice"]);
+    assert_eq!((v["revoked"].as_array().unwrap().len(), v["forgot"].as_bool()), (2, Some(false)));
+    assert_eq!(signed_in(renamed.path(), &url, &["list"]).status.code(), Some(7), "revoked at once");
+    assert_eq!(sign_in("alice", 2).1.status.code(), Some(7), "still bound");
+    let v = admin(&["revoke", "--github", "alice-smith", "--forget"]);
+    assert_eq!((v["accounts"][0]["id"].as_u64(), v["forgot"].as_bool()), (Some(1), Some(true)));
+    assert!(admin(&["accounts"]).as_array().unwrap().is_empty());
+    let (newcomer, out) = sign_in("alice", 2);
+    assert_eq!(signed_in_as(out, "the newcomer signs in")["actor"], "alice");
+    assert_eq!(admin(&["accounts"])[0]["id"].as_u64(), Some(2));
+    check(signed_in(newcomer.path(), &url, &["list"]), "list as the newcomer");
+
+    let out = bd(&root).args(["serve", "token", "revoke", "x", "--forget", "--root"]).arg(&root).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "--forget goes with --github");
 }

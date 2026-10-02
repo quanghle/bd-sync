@@ -570,21 +570,27 @@ server log only.
   sign-on only for a GitHub token authorized for it (GitHub offers that on its
   authorization page); until then its members count as no members, and the
   server log says why.
-- The token acts as the GitHub login, or its sub-actors `<login>/<agent>`. It
-  is named `github-<login>-<random>` and expires after `token_ttl`; each
-  sign-in gets a token of its own, so one account may sign in on several
-  machines. Once it expires, commands fail with exit 7 naming the time, and
-  `bd remote login --github` gets a new one.
-- An actor belongs to one account: a sign-in is refused while a live token of
-  another principal acts as the login, or as one of its sub-actors (a token
-  an admin created, or one of another GitHub account that had the login
-  before), and `bd serve token create` refuses an actor of a signed-in
-  account in the same way. Revoke the other tokens to let the sign-in through.
+- The token acts as the account's actor, or its sub-actors `<actor>/<agent>`:
+  the account's login when it first signed in, which it keeps when its login
+  changes. The token is named `github-<actor>-<random>` and expires after
+  `token_ttl`; each sign-in gets a token of its own, so one account may sign
+  in on several machines. Once it expires, commands fail with exit 7 naming
+  the time, and `bd remote login --github` gets a new one.
+- An actor belongs to one principal, and to an account for good: the server
+  binds each account (by its GitHub user id) to its actor at its first
+  sign-in, in `tokens.json`, and keeps the binding when the account's tokens
+  expire or are revoked. A sign-in is refused while its login's actor belongs
+  to another account (one that had the login before), or while a live token
+  an admin created acts as it or one of its sub-actors; `bd serve token
+  create` refuses an account's actor in the same way. `bd serve token
+  accounts` lists the bindings, and `bd serve token revoke --github <login>
+  --forget` releases one: it revokes the account's tokens, and the next
+  account to sign in as that login binds the actor again.
 - A change to `auth.toml` applies to the next sign-ins: tokens already issued
   keep their permissions until they expire. To cut an account off at once,
   `bd serve token revoke --github alice --root /srv/bd` revokes every token it
-  got by signing in, including those from before a rename (accounts are told
-  apart by their GitHub user id). `bd serve token list` shows each token's
+  got by signing in, including those from before a rename (`alice` may be its
+  latest login or its actor). `bd serve token list` shows each token's
   GitHub account and expiry; expired ones leave the list a week later.
 - An account that a rule lets in, but not into the workspace the sign-in is
   for, is refused, and so is a workspace the server does not have: nothing is
@@ -595,9 +601,11 @@ the bd server, and the GitHub token never leaves the server: it reads the
 account and its memberships during the sign-in, and is never stored or
 logged. A few things to keep in mind:
 
-- `users` matches logins, and a login given up by renaming an account can be
-  registered by someone else; memberships of organizations and teams follow
-  the account itself. The login is also the actor's name in the history.
+- `users` matches current logins: after a rename, update the rule (the
+  account keeps its actor). A login given up by renaming can be registered by
+  someone else, who is refused while the old account's actor is bound, but
+  whom `users` lets in once that binding is released; memberships of
+  organizations and teams follow the account itself.
 - Tokens saved by `bd remote login` serve every process of that user on that
   machine, agents included, so a rule's `kind = "human"` lets those agents
   resolve human gates too. `agent` is the default.
@@ -758,9 +766,9 @@ it expires).
 | `BD_REMOTE_RETRY_SECS` | how long to retry an unreachable server (default 30; 0 = once) |
 | `BD_INSECURE_HTTP=1` | allow plain `http://` to a non-loopback host |
 
-A token acts as one actor (`--as`, or the GitHub login of a token from GitHub
-sign-in), or as that actor's sub-actors `<actor>/<name>`, so leases keep
-naming who holds them. Roles:
+A token acts as one actor (`--as`; for a token from GitHub sign-in, the actor
+its account is bound to), or as that actor's sub-actors `<actor>/<name>`, so
+leases keep naming who holds them. Roles:
 
 | role | may run |
 |---|---|

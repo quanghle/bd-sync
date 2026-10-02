@@ -486,6 +486,7 @@ pub fn poll(root: &Path, poll: &SignInPoll) -> Result<SignInAnswer> {
         target: "bd::serve",
         login = %user.login,
         id = user.id,
+        actor = %token.actor,
         token = %token.name,
         role = token.role.as_str(),
         kind = token.kind.as_str(),
@@ -505,12 +506,14 @@ pub fn poll(root: &Path, poll: &SignInPoll) -> Result<SignInAnswer> {
     })))
 }
 
-/// The account a GitHub token belongs to.
+/// The account a GitHub token belongs to, at the GitHub `api` talks to.
 fn account(api: &Api, token: &str) -> Result<GithubUser> {
     let (status, body) = api.get(token, "/user")?;
     let login = body["login"].as_str().filter(|l| github_name(l));
     match (status, login, body["id"].as_u64()) {
-        (200, Some(login), Some(id)) => Ok(GithubUser { login: login.to_string(), id }),
+        (200, Some(login), Some(id)) => {
+            Ok(GithubUser { url: api.url.to_ascii_lowercase(), login: login.to_string(), id })
+        }
         _ => Err(Error::Remote(format!("GitHub answered {status}{} for the account that signed in", message(&body)))),
     }
 }

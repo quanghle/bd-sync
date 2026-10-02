@@ -18,11 +18,19 @@
 //! the nested session differs from its parent and from its siblings, without
 //! guessing which harness is the innermost. `$BD_SESSION`, which any shell
 //! may have exported, only ever adds to it.
+//!
+//! A Claude Code subagent runs its commands with its parent session's
+//! environment, `$CLAUDE_CODE_SESSION_ID` included, and nothing in that
+//! environment tells it apart: only hook inputs carry its `agent_id`. So
+//! `bd hook subagent-start` tells the subagent to pass `--session
+//! agent-<id>` (which stands in for `$BD_SESSION`), and `bd hook
+//! pre-tool-use` refuses its bd commands that do not.
 
 use std::io::IsTerminal;
 use std::process::Command;
+use std::sync::OnceLock;
 
-use bd_core::Result;
+use bd_core::{Error, Result};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -101,8 +109,29 @@ pub type Env<'a> = dyn Fn(&str) -> Option<String> + 'a;
 /// The user's name, and where it came from.
 pub type UserName<'a> = dyn Fn(&Env<'_>) -> (String, &'static str) + 'a;
 
-/// A non-empty, trimmed environment variable.
+/// This process's `--session`, which stands in for `$BD_SESSION`.
+static SESSION_FLAG: OnceLock<String> = OnceLock::new();
+
+/// Set this process's `--session` (once, before any command runs; never
+/// under `bd serve`, whose requests send their session with the request).
+pub fn set_session_flag(name: &str) -> Result<()> {
+    let label = sanitize_label(name, MAX_NAME).filter(|l| l == name.trim()).ok_or_else(|| {
+        Error::invalid(format!(
+            "invalid --session {name:?}: letters, digits, '.', '_' and '-', at most {MAX_NAME} characters"
+        ))
+    })?;
+    let _ = SESSION_FLAG.set(label);
+    Ok(())
+}
+
+/// A non-empty, trimmed environment variable; for `$BD_SESSION`, this
+/// process's `--session` if it has one.
 pub fn env(name: &str) -> Option<String> {
+    if name == SESSION_VAR {
+        if let Some(s) = SESSION_FLAG.get() {
+            return Some(s.clone());
+        }
+    }
     std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
@@ -113,7 +142,11 @@ pub fn resolve(flag: Option<&str>) -> Resolved {
     if io::in_server_process() {
         return resolve_with(flag, &|_| None, &user_name);
     }
-    resolve_with(flag, &env, &user_name)
+    let mut r = resolve_with(flag, &env, &user_name);
+    if r.source == Source::Session && SESSION_FLAG.get().is_some() {
+        r.from = r.from.replace(&format!("${SESSION_VAR}"), "--session");
+    }
+    r
 }
 
 /// `--actor`, `$BD_ACTOR`, `$BEADS_ACTOR`, else the user (from `user`), as
@@ -289,6 +322,266 @@ fn append_export(path: &std::path::Path, var: &str, value: &str) -> std::io::Res
     writeln!(f, "export {var}={}", shell_word(value))
 }
 
+/// The `--session` of a Claude Code subagent: `agent-<last 8 letters and
+/// digits of its agent_id>` (Claude Code 2.1.287's are 17 hex digits).
+fn subagent_session(agent_id: &str) -> Option<String> {
+    short_id(agent_id.strip_prefix("agent-").unwrap_or(agent_id)).map(|id| format!("agent-{id}"))
+}
+
+/// A Claude Code subagent, from a hook's JSON input (`agent_id` is present
+/// only in hooks that fire inside a subagent).
+struct Subagent {
+    /// Its `--session`.
+    name: String,
+    agent_type: Option<String>,
+    /// What its bd commands act as without `--session`: the parent session's actor.
+    parent: String,
+    /// What they act as with it.
+    own: String,
+}
+
+/// The subagent a hook's input names, unless the hook ran outside one or
+/// the actor is named outright (`$BD_ACTOR`, `$BEADS_ACTOR`): then every bd
+/// command acts as that actor, which `--session` does not change.
+fn subagent(input: &Value) -> Option<Subagent> {
+    let field = |k: &str| {
+        input
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty() && v.len() <= MAX_SESSION_ID && !v.chars().any(char::is_control))
+            .map(String::from)
+    };
+    let name = field("agent_id").as_deref().and_then(subagent_session)?;
+    if env("BD_ACTOR").is_some() || env("BEADS_ACTOR").is_some() {
+        return None;
+    }
+    // The parent's id comes with the input too, for Claude Code versions without it in the environment.
+    let session_id = field("session_id");
+    let base = |k: &str| if k == CLAUDE_SESSION_VAR { session_id.clone().or_else(|| env(k)) } else { env(k) };
+    let user = user_name(&env);
+    let user = |_: &Env<'_>| user.clone();
+    let parent = resolve_with(None, &base, &user).actor;
+    let own = resolve_with(None, &|k: &str| if k == SESSION_VAR { Some(name.clone()) } else { base(k) }, &user).actor;
+    Some(Subagent { name, agent_type: field("agent_type"), parent, own })
+}
+
+fn hook_input() -> Value {
+    let input = if std::io::stdin().is_terminal() { String::new() } else { io::read_stdin().unwrap_or_default() };
+    serde_json::from_str(input.trim()).unwrap_or(Value::Null)
+}
+
+/// `bd hook subagent-start`: run by Claude Code when it starts (or resumes)
+/// a subagent. The subagent's shell commands carry its parent session's
+/// id, so its bd commands would act as the parent, able to end the parent's
+/// claims by name. Its `agent_id` reaches hooks only, so this hook adds to
+/// the subagent's context the `--session` that gives it an actor of its
+/// own. Never fails the hook.
+pub fn cmd_subagent_start(app: &mut App) -> Result<i32> {
+    io::require_local("bd hook subagent-start")?;
+    let Some(s) = subagent(&hook_input()) else { return Ok(0) };
+    let own = remote_actor(app, &s.own);
+    // A placeholder for the token's actor is for the agent to fill in, not a shell word.
+    let assignee = if own.starts_with('<') { own.clone() } else { shell_word(&own) };
+    let context = format!(
+        "bd: you are a subagent{}. Your shell commands carry your parent session's id, so a plain `bd` command \
+         acts as your parent, `{}`, and could end its claims. Pass `--session {name}` to every bd command you run \
+         (`bd --session {name} claim --next`, `bd --session {name} close <id> --reason \"...\"`): you then act as \
+         your own actor, `{own}`. If your parent handed you an issue it claimed, take that claim over once with \
+         `bd --session {name} update <id> --assignee {} --take-over` and use the lease token it prints; leave its \
+         other claims alone. Close or release what you claimed before you finish.",
+        s.agent_type.map(|t| format!(" ({t})")).unwrap_or_default(),
+        remote_actor(app, &s.parent),
+        assignee,
+        name = s.name,
+    );
+    io::outln(
+        serde_json::json!({
+            "hookSpecificOutput": { "hookEventName": "SubagentStart", "additionalContext": context }
+        })
+        .to_string(),
+    );
+    Ok(0)
+}
+
+/// `bd hook pre-tool-use`: run by Claude Code before a Bash command. In a
+/// subagent, a command that runs bd without `--session`, `$BD_SESSION` or
+/// an actor of its own (`--actor`, `$BD_ACTOR`) would act as the parent
+/// session: this denies it, naming the command to run instead. It never
+/// rewrites or approves a command, so the permission rules apply as they
+/// are. Never fails the hook.
+pub fn cmd_pre_tool_use(app: &mut App) -> Result<i32> {
+    io::require_local("bd hook pre-tool-use")?;
+    let input = hook_input();
+    if input.get("tool_name").and_then(Value::as_str) != Some("Bash") {
+        return Ok(0);
+    }
+    let Some(command) = input.pointer("/tool_input/command").and_then(Value::as_str) else { return Ok(0) };
+    let Some(s) = subagent(&input) else { return Ok(0) };
+    let unnamed = bd_without_actor(command);
+    if unnamed.is_empty() {
+        return Ok(0);
+    }
+    let mut fixed = command.to_string();
+    for &at in unnamed.iter().rev() {
+        fixed.insert_str(at, &format!(" --session {}", s.name));
+    }
+    let instead = if fixed.len() <= 400 { format!(": `{fixed}`") } else { String::new() };
+    let reason = format!(
+        "bd: this subagent's commands carry its parent session's id, so this bd command would act as the parent, \
+         `{}`, whose claims are not yours to end. Pass `--session {name}` to every bd command here, which makes you \
+         your own actor `{}`{instead}",
+        remote_actor(app, &s.parent),
+        remote_actor(app, &s.own),
+        name = s.name,
+    );
+    io::outln(
+        serde_json::json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        })
+        .to_string(),
+    );
+    Ok(0)
+}
+
+/// `actor` as a remote workspace knows it: the access token's actor in place of the local user.
+fn remote_actor(app: &App, actor: &str) -> String {
+    match (crate::remote::configured(app).ok().flatten().is_some(), actor.rsplit_once('/')) {
+        (true, Some((_, label))) => format!("<token actor>/{label}"),
+        (true, None) => "<token actor>".into(),
+        (false, _) => actor.to_string(),
+    }
+}
+
+/// Where `command` (a shell command line) runs bd without naming a session
+/// or an actor: the byte offset just past each such `bd` word. A rough
+/// reading of the shell's grammar: quotes and escapes, command separators,
+/// leading assignments and wrappers (`env`, `sudo`, `then`, ...). A bd run
+/// it cannot see (from a script, through `xargs`) passes.
+fn bd_without_actor(command: &str) -> Vec<usize> {
+    let words = shell_words(command);
+    let names = |w: &str| {
+        ["BD_SESSION=", "BD_ACTOR=", "BEADS_ACTOR=", "--session=", "--actor="]
+            .iter()
+            .any(|p| w.strip_prefix(p).is_some_and(|v| !v.is_empty()))
+    };
+    // `export BD_SESSION=...` (or an actor) earlier in the line covers what follows.
+    if words.iter().any(|w| matches!(w, Token::Word { text, .. } if names(text))) {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for segment in words.split(|t| matches!(t, Token::Sep)) {
+        let mut at_command = true;
+        let mut bd = None;
+        let mut named = false;
+        for (i, t) in segment.iter().enumerate() {
+            let Token::Word { text, end } = t else {
+                at_command = true;
+                continue;
+            };
+            let next = segment.get(i + 1).and_then(|t| match t {
+                Token::Word { text, .. } => Some(text.as_str()),
+                _ => None,
+            });
+            if matches!(text.as_str(), "--session" | "--actor") && next.is_some() {
+                named = true;
+            }
+            if !at_command {
+                continue;
+            }
+            let assignment = text.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty()
+                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !k.starts_with(|c: char| c.is_ascii_digit())
+            });
+            const WRAPPERS: &[&str] = &[
+                "if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time", "command", "exec",
+                "nohup", "env", "sudo", "nice", "builtin",
+            ];
+            if assignment || WRAPPERS.contains(&text.as_str()) || text.starts_with('-') {
+                continue;
+            }
+            at_command = false;
+            let program = text.rsplit(['/', '\\']).next().unwrap_or(text);
+            if bd.is_none() && matches!(program, "bd" | "bd.exe") {
+                bd = Some(*end);
+            }
+        }
+        if let (Some(end), false) = (bd, named) {
+            found.push(end);
+        }
+    }
+    found
+}
+
+#[derive(Debug, PartialEq)]
+enum Token {
+    /// A word, unquoted, and the byte offset just past it.
+    Word { text: String, end: usize },
+    /// Where a new command starts within the same command list: `(`, `$(`, a backtick.
+    Sub,
+    /// Between command lists: `;`, `&`, `|`, a newline.
+    Sep,
+}
+
+/// `command` split into words and separators, roughly as a POSIX shell
+/// would; `#` comments are dropped.
+fn shell_words(command: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut word: Option<String> = None;
+    let mut quote: Option<char> = None;
+    let mut chars = command.char_indices().peekable();
+    let finish = |word: &mut Option<String>, tokens: &mut Vec<Token>, end: usize| {
+        if let Some(text) = word.take() {
+            tokens.push(Token::Word { text, end });
+        }
+    };
+    while let Some((i, c)) = chars.next() {
+        match (quote, c) {
+            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
+            (Some('"'), '\\') => {
+                if let Some((_, n)) = chars.next() {
+                    word.get_or_insert_default().push(n);
+                }
+            }
+            (Some(_), c) => word.get_or_insert_default().push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                word.get_or_insert_default();
+            }
+            (None, '\\') => match chars.next() {
+                Some((_, '\n')) => {}
+                Some((_, n)) => word.get_or_insert_default().push(n),
+                None => {}
+            },
+            (None, '#') if word.is_none() => while chars.next_if(|&(_, n)| n != '\n').is_some() {},
+            (None, ';' | '&' | '|' | '\n') => {
+                finish(&mut word, &mut tokens, i);
+                tokens.push(Token::Sep);
+            }
+            (None, '(' | ')' | '`') => {
+                // `$(`: the `$` belongs to the substitution, not to a word.
+                if word.as_deref() == Some("$") {
+                    word = None;
+                } else if let Some(w) = word.as_mut().filter(|w| w.ends_with('$') && c == '(') {
+                    w.pop();
+                }
+                finish(&mut word, &mut tokens, i);
+                tokens.push(Token::Sub);
+            }
+            (None, '<' | '>') => finish(&mut word, &mut tokens, i),
+            (None, c) if c.is_whitespace() => finish(&mut word, &mut tokens, i),
+            (None, c) => word.get_or_insert_default().push(c),
+        }
+    }
+    finish(&mut word, &mut tokens, command.len());
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -440,6 +733,63 @@ mod tests {
             for holder in ["pool/w2", "pool", "pool/w1/x"] {
                 assert!(!other_session_of_user(&me, holder), "{source:?} {holder}");
             }
+        }
+    }
+
+    #[test]
+    fn subagents_get_a_session_of_their_own() {
+        assert_eq!(subagent_session("acfc95cf1792257ed").as_deref(), Some("agent-792257ed"));
+        assert_eq!(subagent_session("agent-abc123").as_deref(), Some("agent-abc123"), "the docs' example");
+        assert_eq!(subagent_session("--"), None);
+        let child = resolve(None, &[CLAUDE, (SESSION_VAR, "agent-792257ed")]).actor;
+        assert_eq!(child, "Quang Le/claude-3b4c5d6e.agent-792257ed");
+        assert!(other_session_of_user(&resolve(None, &[CLAUDE]), &child), "its parent may take it over");
+    }
+
+    /// The commands [`bd_without_actor`] flags, with ` --session X` inserted where it would go.
+    fn flagged(command: &str) -> String {
+        let mut fixed = command.to_string();
+        for at in bd_without_actor(command).into_iter().rev() {
+            fixed.insert_str(at, " --session X");
+        }
+        fixed
+    }
+
+    #[test]
+    fn bd_commands_without_a_session_are_found() {
+        for (command, fixed) in [
+            ("bd claim --next", "bd --session X claim --next"),
+            ("bd", "bd --session X"),
+            ("cd /w && bd close t-1 --reason 'done; ok'", "cd /w && bd --session X close t-1 --reason 'done; ok'"),
+            ("FOO=1 ~/.cargo/bin/bd ready | head", "FOO=1 ~/.cargo/bin/bd --session X ready | head"),
+            ("bd ready; bd show t-1 --session X", "bd --session X ready; bd show t-1 --session X"),
+            ("echo $(bd ready -q)", "echo $(bd --session X ready -q)"),
+            (
+                "if true; then sudo -E bd list
+fi",
+                "if true; then sudo -E bd --session X list
+fi",
+            ),
+            ("\"bd\" show t-1", "\"bd\" --session X show t-1"),
+            ("bd.exe show t-1>out", "bd.exe --session X show t-1>out"),
+        ] {
+            assert_eq!(flagged(command), fixed, "{command}");
+        }
+        for command in [
+            "bd --session agent-1 claim --next",
+            "bd claim --next --session=agent-1",
+            "BD_SESSION=agent-1 bd claim --next",
+            "export BD_SESSION=agent-1; bd ready && bd claim t-1",
+            "bd --actor me close t-1",
+            "BD_ACTOR=me bd close t-1",
+            "echo bd ready",
+            "git commit -m 'bd close; bd claim'",
+            "grep -r \"bd ready\" .",
+            "ls bd/ # bd ready",
+            "cargo build && ./target/release/bdx ready",
+            "rg bd",
+        ] {
+            assert_eq!(bd_without_actor(command), Vec::<usize>::new(), "{command}");
         }
     }
 }

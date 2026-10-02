@@ -14,6 +14,29 @@
           }
         ]
       }
+    ],
+    "SubagentStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bd hook subagent-start || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(bd *)",
+            "command": "bd hook pre-tool-use || true"
+          }
+        ]
+      }
     ]
   }
 }

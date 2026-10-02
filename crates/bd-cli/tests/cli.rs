@@ -1179,3 +1179,133 @@ fn prime_text_says_new_token(ws: &Ws) -> bool {
     let prime = String::from_utf8(as_user(ws, Some(SESSION_B), &["prime"]).stdout).unwrap();
     prime.contains("then use the new lease token it prints")
 }
+
+const CLAUDE: (&str, &str) = ("CLAUDE_CODE_SESSION_ID", "8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e");
+
+/// `bd hook <hook>` as user `tester` in a Claude Code session, with `input` on stdin.
+fn hook(ws: &Ws, hook: &str, vars: &[(&str, &str)], input: &str) -> Output {
+    let mut c = Ws::cmd_in(ws.dir.path(), "", &["hook", hook]);
+    c.env_remove("BD_ACTOR")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "user.name")
+        .env("GIT_CONFIG_VALUE_0", "tester")
+        .env(CLAUDE.0, CLAUDE.1)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in vars {
+        c.env(k, v);
+    }
+    let mut child = c.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "a hook never fails: {}", String::from_utf8_lossy(&out.stderr));
+    out
+}
+
+#[test]
+fn session_flag_names_the_session_like_bd_session() {
+    let ws = Ws::new();
+    let run = |vars: &[(&str, &str)], args: &[&str], command: &str| {
+        let mut c = Ws::cmd_in(ws.dir.path(), "", &[&["--json"][..], args, &[command]].concat());
+        c.env_remove("BD_ACTOR")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "user.name")
+            .env("GIT_CONFIG_VALUE_0", "tester");
+        for (k, v) in vars {
+            c.env(k, v);
+        }
+        c.output().unwrap()
+    };
+    let info = |vars: &[(&str, &str)], args: &[&str]| run(vars, args, "info");
+    let v = json_of(run(&[CLAUDE], &["--session", "agent-792257ed"], "prime"));
+    assert_eq!(v["actor"], "tester/claude-3b4c5d6e.agent-792257ed");
+    assert_eq!(v["actor_source"], "session");
+    assert_eq!(v["actor_from"], "git user.name + $CLAUDE_CODE_SESSION_ID + --session");
+    assert_eq!(json_of(info(&[], &["--session", "w1"]))["actor"], "tester/w1");
+    assert_eq!(json_of(info(&[("BD_SESSION", "crew")], &["--session", "w1"]))["actor"], "tester/w1", "instead of it");
+    assert_eq!(json_of(info(&[("BD_ACTOR", "pool/w1")], &["--session", "w1"]))["actor"], "pool/w1");
+    let bad = info(&[], &["--session", "a b"]);
+    assert_eq!(bad.status.code(), Some(2), "{}", String::from_utf8_lossy(&bad.stderr));
+}
+
+#[test]
+fn claude_subagents_are_told_their_own_session() {
+    let ws = Ws::new();
+    let input = r#"{"session_id":"8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e","hook_event_name":"SubagentStart",
+        "agent_id":"acfc95cf1792257ed","agent_type":"general-purpose"}"#;
+    let out = hook(&ws, "subagent-start", &[], input);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SubagentStart");
+    let context = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(context.contains("you are a subagent (general-purpose)"), "{context}");
+    assert!(context.contains("acts as your parent, `tester/claude-3b4c5d6e`"), "{context}");
+    assert!(context.contains("`bd --session agent-792257ed claim --next`"), "{context}");
+    assert!(context.contains("your own actor, `tester/claude-3b4c5d6e.agent-792257ed`"), "{context}");
+    assert!(context.contains("--assignee tester/claude-3b4c5d6e.agent-792257ed --take-over"), "{context}");
+    // The main conversation, an actor named outright, or input it cannot read: nothing to say.
+    let main = r#"{"session_id":"8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e","hook_event_name":"SubagentStart"}"#;
+    assert!(hook(&ws, "subagent-start", &[], main).stdout.is_empty());
+    assert!(hook(&ws, "subagent-start", &[("BD_ACTOR", "pool/w1")], input).stdout.is_empty());
+    assert!(hook(&ws, "subagent-start", &[], "not json").stdout.is_empty());
+}
+
+#[test]
+fn claude_subagents_bd_commands_without_a_session_are_denied() {
+    let ws = Ws::new();
+    let input = |agent: Option<&str>, tool: &str, command: &str| {
+        let mut v = serde_json::json!({
+            "session_id": CLAUDE.1, "hook_event_name": "PreToolUse", "tool_name": tool,
+            "tool_input": { "command": command, "description": "x" },
+        });
+        if let Some(a) = agent {
+            v["agent_id"] = a.into();
+            v["agent_type"] = "general-purpose".into();
+        }
+        v.to_string()
+    };
+    let out = hook(&ws, "pre-tool-use", &[], &input(Some("acfc95cf1792257ed"), "Bash", "cd w && bd close t-1"));
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let decision = &v["hookSpecificOutput"];
+    assert_eq!(
+        (decision["hookEventName"].as_str(), decision["permissionDecision"].as_str()),
+        (Some("PreToolUse"), Some("deny"))
+    );
+    assert!(decision.get("updatedInput").is_none(), "never rewrites");
+    let reason = decision["permissionDecisionReason"].as_str().unwrap();
+    assert!(reason.contains("act as the parent, `tester/claude-3b4c5d6e`"), "{reason}");
+    assert!(reason.contains("`cd w && bd --session agent-792257ed close t-1`"), "{reason}");
+    assert!(reason.contains("`tester/claude-3b4c5d6e.agent-792257ed`"), "{reason}");
+    for allowed in [
+        input(Some("acfc95cf1792257ed"), "Bash", "bd --session agent-792257ed close t-1"),
+        input(Some("acfc95cf1792257ed"), "Bash", "cargo test"),
+        input(Some("acfc95cf1792257ed"), "PowerShell", "bd close t-1"),
+        input(None, "Bash", "bd close t-1"),
+        "{}".to_string(),
+        "not json".to_string(),
+    ] {
+        assert!(hook(&ws, "pre-tool-use", &[], &allowed).stdout.is_empty(), "{allowed}");
+    }
+    let named = input(Some("acfc95cf1792257ed"), "Bash", "bd close t-1");
+    assert!(hook(&ws, "pre-tool-use", &[("BD_ACTOR", "pool/w1")], &named).stdout.is_empty());
+}
+
+#[test]
+fn a_subagent_with_its_own_session_cannot_end_its_parents_claim() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Coordinator's"]);
+    let run = |args: &[&str]| as_user(&ws, Some(CLAUDE), args);
+    let sub = |args: &[&str]| run(&[&["--session", "agent-792257ed"][..], args].concat());
+    assert!(run(&["claim", "t-1"]).status.success());
+    let out = sub(&["close", "t-1"]);
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(4), "{err}");
+    assert!(err.contains("held by another session of yours (tester/claude-3b4c5d6e;"), "{err}");
+    let take_over = "bd update t-1 --assignee tester/claude-3b4c5d6e.agent-792257ed --take-over";
+    assert!(err.contains(take_over), "{err}");
+    // Handed over on purpose, the claim is the subagent's: the parent no longer ends it by name.
+    let cmd: Vec<&str> = take_over.split(' ').skip(1).collect();
+    assert!(sub(&cmd).status.success());
+    assert_eq!(run(&["close", "t-1"]).status.code(), Some(4));
+    assert!(sub(&["close", "t-1"]).status.success());
+}

@@ -882,7 +882,8 @@ comes from the first of:
    - `$COPILOT_AGENT_SESSION_ID` (Copilot CLI 1.0.29+): `copilot-<id>`
    - `$CODEX_THREAD_ID`, else `$CODEX_SESSION_ID` (Codex): `codex-<id>`
    - `$BD_SESSION=<name>`: `<name>` (characters other than letters, digits,
-     `.`, `_` and `-` become `-`), for scripts and other harnesses
+     `.`, `_` and `-` become `-`), for scripts and other harnesses; the
+     global flag `--session <name>` stands in for it on one command
 
    where `<id>` is the last 8 letters and digits of the session id, so
    `Quang Le/copilot-b9bb2788`. Harnesses set these in every shell command
@@ -907,10 +908,39 @@ hook's input, as `export CLAUDE_CODE_SESSION_ID=<id>` to `$CLAUDE_ENV_FILE`,
 replacing any id inherited from a parent session. `bd info` and `bd prime`
 show the actor and where it came from, and `bd claim` prints it.
 
+Claude Code subagents need hooks. A subagent (the Agent/Task tool) runs its shell commands with
+its parent session's environment: the same `$CLAUDE_CODE_SESSION_ID`, and
+no variable of its own (checked with Claude Code 2.1.287, whose main and
+subagent Bash environments were identical). Left alone, its bd commands act
+as the parent, and the parent and its subagents can end each other's
+claims by name. Only hook inputs tell a subagent apart, by `agent_id`, so
+two hooks (in this repository's `.claude/settings.json`) give each subagent
+an actor of its own, `<user>/claude-<id>.agent-<id>`:
+
+- `SubagentStart` runs `bd hook subagent-start`, which adds to the
+  subagent's context that every bd command it runs takes `--session
+  agent-<id>` (the last 8 letters and digits of its `agent_id`), the actor
+  that gives it, and how to take over a claim its parent hands it.
+- `PreToolUse` on Bash (with `"if": "Bash(bd *)"`, Claude Code 2.1.85+)
+  runs `bd hook pre-tool-use`, which, inside a subagent, denies a command
+  that runs bd without `--session`, `BD_SESSION=`, `--actor` or
+  `BD_ACTOR=`, with the corrected command as the reason. It never
+  rewrites or approves a command: a flag rather than a variable keeps
+  allow rules such as `Bash(bd *)` matching, which a `BD_SESSION=...`
+  prefix would not.
+
+Both do nothing in the main conversation, when `$BD_ACTOR` or
+`$BEADS_ACTOR` names the actor, and on input they cannot read; `|| true`
+keeps an older bd without them from failing the hook. A bd run the hook
+cannot see in the command line (from a script, through `xargs`) still
+acts as the parent. Without the hooks, give each subagent its own session
+in its prompt: "run every bd command as `bd --session <name> ...`", with a
+distinct `<name>` per subagent.
+
 A claim taken in one session is another actor's in the next: after Claude
 Code's `/clear` or a resume that starts a new session id, and in a subagent
-that has its own id (Codex threads, Copilot CLI; Claude Code subagents share
-their session's). `bd prime` lists the in-progress claims of your user's
+that has its own id (Codex threads, Copilot CLI, and Claude Code subagents
+with their `--session`). `bd prime` lists the in-progress claims of your user's
 other actors (`<user>` and `<user>/*`) under "Held by other sessions of
 yours", each with the command that takes it over, `bd update <id>
 --assignee <you> --take-over` (it prints the new lease token to renew and
@@ -933,7 +963,9 @@ may only name the token's actor or one of its sub-actors. Without them, a
 client in an agent session sends its session, not its user name, and acts
 as `<token actor>/<session>`; `bd serve` never derives an actor from its own
 environment. Servers older than this ignore the session and use the
-token's actor. The token's actor is then the user: its sub-actors are the
+token's actor. The client sends `--session` as part of its session; a
+server older than that flag refuses it as unknown, so use `BD_SESSION`
+with one. The token's actor is then the user: its sub-actors are the
 "other sessions" of a request that names no actor, while a request whose
 actor comes from `--actor` or the client's `$BD_ACTOR` has none.
 

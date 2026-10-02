@@ -41,6 +41,11 @@ fn run(cli: Cli) -> i32 {
         Ok(app) => app,
         Err(e) => return report(&e, json),
     };
+    if let Some(name) = &cli.global.session {
+        if let Err(e) = actor::set_session_flag(name) {
+            return report(&e, json);
+        }
+    }
     if !always_local(&cli.command) {
         match remote::detect(&app) {
             Ok(Some(r)) => return remote::run(&mut app, r, &cli),
@@ -230,6 +235,8 @@ fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
             other => other.map(|_| 0),
         },
         Command::Hook(HookCommand::SessionStart) => actor::cmd_session_start(app),
+        Command::Hook(HookCommand::SubagentStart) => actor::cmd_subagent_start(app),
+        Command::Hook(HookCommand::PreToolUse) => actor::cmd_pre_tool_use(app),
         Command::Stats => cmd_stats(app).map(|_| 0),
         Command::Metrics(a) => cmd_metrics(app, a).map(|_| 0),
         Command::Doctor(a) => cmd_doctor(app, a),

@@ -15,6 +15,8 @@ Your actor: each agent session acts as its own actor, `<user>/<session>`, derive
 
 After `/clear`, a resume, or in a subagent with its own session id, claims you took earlier belong to another actor of your user: `bd prime` lists them under "Held by other sessions of yours", with the command that takes each over (`bd update <id> --assignee <you> --take-over`, which prints the new lease token to use from then on), and exit-4 hints name it too. Take one over only if this session is continuing that work; otherwise another session is on it. An actor named outright (`--actor`, `BD_ACTOR`) has no other sessions: `pool/w2` is another actor to `pool/w1`. To hand a claimed issue to a subagent, have the subagent take it over, or run its bd commands with `BD_ACTOR=<your actor>`.
 
+Claude Code subagents share their parent session's id, so their plain `bd` commands act as the parent. If your context says to pass `--session agent-<id>` to bd (the `bd hook subagent-start` hook), do so on every bd command; a bd command refused for lacking it names the corrected command to run. When you delegate to subagents without those hooks, tell each to run every bd command as `bd --session <distinct name> ...`.
+
 ## Workflow
 
 1. Find work: `bd ready` (queue order), `bd list --status in_progress`, `bd blocked`.

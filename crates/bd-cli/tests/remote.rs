@@ -3522,3 +3522,38 @@ fn agent_sessions_act_as_sub_actors_of_the_token_actor() {
     let out = session("5139d45d-1aec-41fb-a65b-5e2515a04348", &["close", "t-2"]);
     assert!(stderr_of(&out).contains("held by another session of yours (alice/w1"), "{}", stderr_of(&out));
 }
+
+#[test]
+fn a_session_flag_reaches_the_server_with_the_session() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let claude = |args: &[&str]| {
+        alice.cmd(args).env("CLAUDE_CODE_SESSION_ID", "8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e").output().unwrap()
+    };
+    let json = |out: Output| serde_json::from_str::<Value>(&check(out, "bd --json")).unwrap();
+    let sub = ["--session", "agent-792257ed"];
+    let info = json(claude(&[&sub[..], &["--json", "info"]].concat()));
+    assert_eq!(info["actor"], "alice/claude-3b4c5d6e.agent-792257ed");
+    assert_eq!(info["actor_source"], "session");
+
+    // A Claude Code subagent (same session id, its own --session) cannot end its parent's claim.
+    alice.ok(&["create", "Coordinator's"]);
+    check(claude(&["claim", "t-1"]), "parent claims");
+    let out = claude(&[&sub[..], &["close", "t-1"]].concat());
+    assert_eq!(out.status.code(), Some(4), "{}", stderr_of(&out));
+    assert!(
+        stderr_of(&out).contains("held by another session of yours (alice/claude-3b4c5d6e;"),
+        "{}",
+        stderr_of(&out)
+    );
+
+    // The hooks run locally, and name the remote actors by the token's.
+    let mut hook = alice.cmd(&["hook", "subagent-start"]);
+    hook.env("CLAUDE_CODE_SESSION_ID", "8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e");
+    let mut child = hook.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+    child.stdin.take().unwrap().write_all(br#"{"agent_id":"acfc95cf1792257ed"}"#).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let context = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+    assert!(context.contains("your own actor, `<token actor>/claude-3b4c5d6e.agent-792257ed`"), "{context}");
+}

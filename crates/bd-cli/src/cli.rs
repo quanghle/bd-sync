@@ -33,6 +33,9 @@ pub struct Global {
     /// Actor name (default: $BD_ACTOR, $BEADS_ACTOR, else git user.name or $USER, as `<user>/<session>` in an agent session: $CLAUDE_CODE_SESSION_ID, $COPILOT_AGENT_SESSION_ID, $CODEX_THREAD_ID, $BD_SESSION)
     #[arg(long, global = true, value_name = "NAME")]
     pub actor: Option<String>,
+    /// Name this session, as $BD_SESSION does (and instead of it): act as `<user>/<harness session>.<NAME>`, e.g. a Claude Code subagent's `--session agent-<id>`; no effect when the actor is named outright
+    #[arg(long, global = true, value_name = "NAME")]
+    pub session: Option<String>,
     /// Machine-readable JSON output
     #[arg(long, global = true)]
     pub json: bool,
@@ -1215,6 +1218,10 @@ pub struct TokenRevokeArgs {
 pub enum HookCommand {
     /// Claude Code SessionStart hook: give the session its own actor by writing `export CLAUDE_CODE_SESSION_ID=<id>` (the session's own id, from the hook's JSON input on stdin) to $CLAUDE_ENV_FILE, for Claude Code versions that do not set it; does nothing without $CLAUDE_ENV_FILE
     SessionStart,
+    /// Claude Code SubagentStart hook: tell the subagent (in its context) to pass `--session agent-<id>` to its bd commands, so that it acts as its own actor rather than as its parent session, whose session id its commands carry
+    SubagentStart,
+    /// Claude Code PreToolUse hook for Bash: in a subagent, refuse a command that runs bd without `--session`, $BD_SESSION or an actor of its own, giving the command to run instead; never approves anything
+    PreToolUse,
 }
 
 #[derive(Subcommand, Debug, Clone)]

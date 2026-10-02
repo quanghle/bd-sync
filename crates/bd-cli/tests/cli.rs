@@ -6,6 +6,16 @@ use std::process::{Command, Output};
 use serde_json::Value;
 use tempfile::TempDir;
 
+/// Variables that name an agent session (and so a per-session actor).
+const SESSION_ENV: [&str; 6] = [
+    "BD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "COPILOT_AGENT_SESSION_ID",
+    "CODEX_THREAD_ID",
+    "CODEX_SESSION_ID",
+    "CLAUDE_ENV_FILE",
+];
+
 struct Ws {
     dir: TempDir,
 }
@@ -28,6 +38,9 @@ impl Ws {
             .env_remove("BD_PLAYBOOK_PATH")
             .env_remove("BD_GH")
             .env("XDG_CONFIG_HOME", dir.join(".xdg"));
+        for var in SESSION_ENV {
+            c.env_remove(var);
+        }
         c
     }
 
@@ -908,4 +921,119 @@ fn ephemeral_runs_are_kept_out_of_exports_and_purged() {
     let purged = ws.json(&["purge"]);
     assert_eq!(purged["deleted"].as_array().unwrap().len(), 2);
     assert_eq!(ws.code_as("tester", &["show", &id]), 3);
+}
+
+/// `bd` as user `tester` with no actor named: a terminal, or with `session`
+/// set, a command of an agent session.
+fn as_user(ws: &Ws, session: Option<(&str, &str)>, args: &[&str]) -> Output {
+    let mut c = Ws::cmd_in(ws.dir.path(), "", args);
+    c.env_remove("BD_ACTOR")
+        .env_remove("BEADS_ACTOR")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "user.name")
+        .env("GIT_CONFIG_VALUE_0", "tester");
+    if let Some((var, id)) = session {
+        c.env(var, id);
+    }
+    c.output().unwrap()
+}
+
+const SESSION_A: (&str, &str) = ("COPILOT_AGENT_SESSION_ID", "286f56fd-c22e-458a-93ac-dfcfb9bb2788");
+const SESSION_B: (&str, &str) = ("COPILOT_AGENT_SESSION_ID", "5139d45d-1aec-41fb-a65b-5e2515a04348");
+
+#[test]
+fn concurrent_agent_sessions_act_as_distinct_sub_actors() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Shared work"]);
+    let json = |session, args: &[&str]| -> Value {
+        let out = as_user(&ws, session, &[&["--json"], args].concat());
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap()
+    };
+    assert_eq!(json(None, &["info"])["actor"], "tester", "a terminal keeps the plain user");
+    assert_eq!(json(None, &["info"])["actor_source"], "default");
+    let a = json(Some(SESSION_A), &["info"]);
+    assert_eq!((a["actor"].as_str(), a["actor_source"].as_str()), (Some("tester/copilot-b9bb2788"), Some("session")));
+    assert_eq!(json(Some(SESSION_A), &["info"])["actor"], a["actor"], "every command of a session acts the same");
+    assert_eq!(json(Some(("CLAUDE_CODE_SESSION_ID", "abc-123")), &["info"])["actor"], "tester/claude-abc123");
+    assert_eq!(json(Some(("BD_SESSION", "worker 1")), &["info"])["actor"], "tester/worker-1");
+
+    let claimed = as_user(&ws, Some(SESSION_A), &["claim", "t-1"]);
+    let text = String::from_utf8(claimed.stdout).unwrap();
+    assert!(text.contains("Claimed t-1 as tester/copilot-b9bb2788"), "{text}");
+    let held = json(None, &["show", "t-1"]);
+    assert_eq!(held["assignee"], "tester/copilot-b9bb2788");
+
+    // Another session of the same user is another actor: it cannot end the claim by name.
+    for args in [&["close", "t-1"][..], &["release", "t-1"], &["update", "t-1", "--status", "open"]] {
+        assert_eq!(as_user(&ws, Some(SESSION_B), args).status.code(), Some(4), "{args:?}");
+        assert_eq!(as_user(&ws, None, args).status.code(), Some(4), "{args:?} from a terminal");
+    }
+    let refused = String::from_utf8(as_user(&ws, Some(SESSION_B), &["close", "t-1"]).stderr).unwrap();
+    assert!(refused.contains("held by tester/copilot-b9bb2788, not tester/copilot-15a04348"), "{refused}");
+    assert_eq!(json(None, &["show", "t-1"])["status"], "in_progress");
+    // Its own session closes it; a takeover stays possible on purpose.
+    assert!(as_user(&ws, Some(SESSION_A), &["close", "t-1"]).status.success());
+    ws.ok(&["create", "Other work"]);
+    assert!(as_user(&ws, Some(SESSION_A), &["claim", "t-2"]).status.success());
+    assert!(as_user(&ws, Some(SESSION_B), &["close", "t-2", "--take-over"]).status.success());
+}
+
+#[test]
+fn prime_shows_the_actor_and_warns_when_it_may_be_shared() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Work"]);
+    let prime = |session| String::from_utf8(as_user(&ws, session, &["prime"]).stdout).unwrap();
+    let text = prime(Some(SESSION_A));
+    assert!(text.contains("you are `tester/copilot-b9bb2788` (this agent session's own actor"), "{text}");
+    assert!(!prime(None).contains('⚠'), "no claims, nothing to share");
+
+    assert!(as_user(&ws, None, &["claim", "t-1"]).status.success());
+    let text = prime(None);
+    assert!(text.contains("you are `tester` (from git user.name; no agent session detected)"), "{text}");
+    assert!(text.contains("⚠ `tester` is the default actor") && text.contains("BD_SESSION=<name>"), "{text}");
+    let out = as_user(&ws, None, &["prime", "--json"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((v["actor_source"].as_str(), v["shared_actor_claims"].as_bool()), (Some("default"), Some(true)));
+    assert!(!prime(Some(SESSION_A)).contains('⚠'), "a session's own actor holds none of them");
+    // An actor named outright is the user's choice.
+    assert!(!ws.ok(&["prime"]).contains('⚠'));
+}
+
+#[test]
+fn session_start_hook_gives_claude_sessions_their_own_actor() {
+    let ws = Ws::new();
+    let env_file = ws.dir.path().join("claude-env.sh");
+    let hook = |extra: &[(&str, &str)], input: &str| {
+        let mut c = Ws::cmd_in(ws.dir.path(), "", &["hook", "session-start"]);
+        c.env_remove("BD_ACTOR").env("CLAUDE_ENV_FILE", &env_file).stdin(std::process::Stdio::piped());
+        c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        for (k, v) in extra {
+            c.env(k, v);
+        }
+        let mut child = c.spawn().unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let input =
+        r#"{"session_id":"8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e","hook_event_name":"SessionStart","source":"startup"}"#;
+    let out = hook(&[], input);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("claude-3b4c5d6e"));
+    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), "export BD_SESSION='claude-3b4c5d6e'\n");
+    // Later Bash commands source the file: they act as the session's sub-actor.
+    let info = as_user(&ws, Some(("BD_SESSION", "claude-3b4c5d6e")), &["--json", "info"]);
+    assert_eq!(serde_json::from_slice::<Value>(&info.stdout).unwrap()["actor"], "tester/claude-3b4c5d6e");
+
+    // A named actor or session is kept; bad input writes nothing and never fails the hook.
+    for (extra, input) in
+        [(&[("BD_ACTOR", "alice")][..], input), (&[("BD_SESSION", "mine")], input), (&[], "{}"), (&[], "not json")]
+    {
+        let out = hook(extra, input);
+        assert!(out.status.success(), "{extra:?} {input}");
+    }
+    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), "export BD_SESSION='claude-3b4c5d6e'\n");
+    // Without $CLAUDE_ENV_FILE (other harnesses) it does nothing.
+    let out = Ws::cmd_in(ws.dir.path(), "x", &["hook", "session-start"]).stdin(std::process::Stdio::null()).output();
+    assert!(out.unwrap().status.success());
 }

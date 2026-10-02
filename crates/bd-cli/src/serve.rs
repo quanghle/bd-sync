@@ -61,6 +61,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls;
 
+use crate::actor::{self, Resolved, Source};
 use crate::app::{App, RequestKey};
 use crate::auth::{self, Role, Token, Verifier};
 use crate::cli::*;
@@ -499,7 +500,9 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
         drop((budget.take(), answer_budget.take()));
         (request.stdin, request.files) = Default::default();
         // A request its token may not make is refused at once, by `run`.
-        if resolve_actor(cli.global.actor.as_deref(), request.actor.as_deref(), &token).is_ok() {
+        if resolve_actor(cli.global.actor.as_deref(), request.actor.as_deref(), request.session.as_deref(), &token)
+            .is_ok()
+        {
             match server.wait_for_events(&ws, wait).await {
                 Ok(w) => waited = Some(w),
                 Err(reject) => return reject.response(),
@@ -690,7 +693,7 @@ pub(crate) enum Access {
 pub(crate) fn access(cmd: &Command) -> Access {
     use Command as C;
     match cmd {
-        C::Init(_) | C::Serve(_) | C::Remote(_) | C::Bench(_) | C::BenchWorker(_) => Access::Local,
+        C::Init(_) | C::Serve(_) | C::Remote(_) | C::Hook(_) | C::Bench(_) | C::BenchWorker(_) => Access::Local,
         C::Events(a) if a.follow => Access::Local,
         C::Events(a) if a.action.is_none() => Access::Read,
         C::Playbook(PlaybookCommand::Extract(a)) if a.save => Access::Local,
@@ -727,19 +730,35 @@ pub(crate) fn access(cmd: &Command) -> Access {
 }
 
 /// The actor a request runs as: the one it asks for (`--actor`, then the
-/// client's `$BD_ACTOR`) if the token allows it, else the token's.
-fn resolve_actor(flag: Option<&str>, env: Option<&str>, token: &Token) -> Result<String> {
-    match flag.or(env).map(str::trim).filter(|a| !a.is_empty()) {
-        None => Ok(token.actor.clone()),
+/// client's `$BD_ACTOR`) if the token allows it; else the token's actor, as
+/// `<token actor>/<session>` when the client runs in an agent session.
+fn resolve_actor(flag: Option<&str>, env: Option<&str>, session: Option<&str>, token: &Token) -> Result<Resolved> {
+    let named = |a: &str, source, from: &str| match a {
         // Actors end up in the server log and the event history.
-        Some(a) if a.chars().any(char::is_control) => {
-            Err(Error::invalid("actor names must not contain control characters"))
-        }
-        Some(a) if token.allows_actor(a) => Ok(a.to_string()),
-        Some(a) => Err(Error::Unauthorized(format!(
+        a if a.chars().any(char::is_control) => Err(Error::invalid("actor names must not contain control characters")),
+        a if token.allows_actor(a) => Ok(Resolved::new(a, source, from)),
+        a => Err(Error::Unauthorized(format!(
             "access token {} acts as {1} or {1}/<agent>, not {a}",
             token.name, token.actor
         ))),
+    };
+    if let Some(a) = flag.map(str::trim).filter(|a| !a.is_empty()) {
+        return named(a, Source::Flag, "--actor");
+    }
+    if let Some(a) = env.map(str::trim).filter(|a| !a.is_empty()) {
+        return named(a, Source::Env, "the client's $BD_ACTOR");
+    }
+    match session.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) if !actor::is_label(s) => Err(Error::invalid(format!(
+            "invalid session name {s:?}: letters, digits, '.', '_' and '-', at most {} characters",
+            actor::MAX_LABEL
+        ))),
+        Some(s) => {
+            let a = format!("{}/{s}", token.actor);
+            bd_core::store::validate_actor(&a)?;
+            named(&a, Source::Session, "the access token's actor + the client's session")
+        }
+        None => Ok(Resolved::new(token.actor.clone(), Source::Default, "the access token's actor")),
     }
 }
 
@@ -911,10 +930,16 @@ impl Server {
                 Error::Unauthorized(format!("access token {} is read-only; bd {name} needs a write token", token.name));
             return respond(&mut out, &failure(&e, json));
         }
-        let actor = match resolve_actor(cli.global.actor.as_deref(), request.actor.as_deref(), token) {
+        let resolved = match resolve_actor(
+            cli.global.actor.as_deref(),
+            request.actor.as_deref(),
+            request.session.as_deref(),
+            token,
+        ) {
             Ok(a) => a,
             Err(e) => return respond(&mut out, &failure(&e, json)),
         };
+        let actor = resolved.actor.clone();
         // A write is applied once per request id; a retry replays its response.
         let mut _running = None;
         let mut key = None;
@@ -944,8 +969,8 @@ impl Server {
         g.db = Some(ws.db.clone());
         g.directory = Some(ws.dir.clone());
         g.remote = None;
-        g.actor = Some(actor.clone());
         let mut app = App::new(g).map_err(Reject::internal)?;
+        app.set_actor(resolved);
         app.set_store(store);
         app.location = request.location;
         app.request = key;
@@ -1153,11 +1178,24 @@ mod tests {
             created_at: String::new(),
             revoked_at: None,
         };
-        assert_eq!(resolve_actor(None, None, &t).unwrap(), "alice");
-        assert_eq!(resolve_actor(None, Some("alice/agent-2"), &t).unwrap(), "alice/agent-2");
-        assert_eq!(resolve_actor(Some("alice/x"), Some("bob"), &t).unwrap(), "alice/x", "--actor wins over the env");
-        assert_eq!(resolve_actor(Some("bob"), None, &t).unwrap_err().exit_code(), 7);
-        assert_eq!(resolve_actor(Some("  "), None, &t).unwrap(), "alice");
-        assert_eq!(resolve_actor(Some("alice/x\nforged log line"), None, &t).unwrap_err().exit_code(), 2);
+        let actor = |flag, env, session| resolve_actor(flag, env, session, &t).map(|r| (r.actor, r.source));
+        let code = |flag, env, session| resolve_actor(flag, env, session, &t).unwrap_err().exit_code();
+        assert_eq!(actor(None, None, None).unwrap(), ("alice".into(), Source::Default));
+        assert_eq!(actor(None, Some("alice/agent-2"), None).unwrap(), ("alice/agent-2".into(), Source::Env));
+        assert_eq!(actor(Some("alice/x"), Some("bob"), None).unwrap().0, "alice/x", "--actor wins over the env");
+        assert_eq!(code(Some("bob"), None, None), 7);
+        assert_eq!(actor(Some("  "), None, None).unwrap().0, "alice");
+        assert_eq!(code(Some("alice/x\nforged log line"), None, None), 2);
+        // A client's agent session is a sub-actor of the token's actor, never another actor.
+        assert_eq!(
+            actor(None, None, Some("copilot-b9bb2788")).unwrap(),
+            ("alice/copilot-b9bb2788".into(), Source::Session)
+        );
+        assert_eq!(actor(None, Some("alice/w1"), Some("copilot-1")).unwrap().0, "alice/w1", "$BD_ACTOR wins");
+        assert_eq!(actor(Some("alice"), None, Some("copilot-1")).unwrap().0, "alice", "--actor wins");
+        assert_eq!(actor(None, None, Some(" ")).unwrap().0, "alice");
+        for bad in ["../bob", "a/b", "x\nforged", "-x"] {
+            assert_eq!(code(None, None, Some(bad)), 2, "{bad:?}");
+        }
     }
 }

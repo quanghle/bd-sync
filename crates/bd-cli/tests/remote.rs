@@ -28,6 +28,11 @@ fn bd(dir: &Path) -> Command {
         "BD_GH",
         "BD_TIMING",
         "BD_REMOTE_RETRY_SECS",
+        "BD_SESSION",
+        "CLAUDE_CODE_SESSION_ID",
+        "COPILOT_AGENT_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CODEX_SESSION_ID",
         "ALL_PROXY",
         "HTTPS_PROXY",
         "HTTP_PROXY",
@@ -3449,4 +3454,38 @@ fn answers_outside_the_protocol_are_errors() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(8), "{stderr}");
     assert!(stderr.contains("unexpected answer") && stderr.contains("not a bd frame"), "{stderr}");
+}
+
+#[test]
+fn agent_sessions_act_as_sub_actors_of_the_token_actor() {
+    // The server's own session, if it has one, is nobody's: requests carry the client's.
+    let server = Server::launch_with(Server::prepare(), "127.0.0.1:0", &[], |cmd| {
+        cmd.env("COPILOT_AGENT_SESSION_ID", "0f0f0f0f-server").env("BD_SESSION", "server");
+    });
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let session = |id: &str, args: &[&str]| alice.cmd(args).env("COPILOT_AGENT_SESSION_ID", id).output().unwrap();
+    let json = |out: Output| serde_json::from_str::<Value>(&check(out, "bd --json")).unwrap();
+
+    // The client sends its session, not a local user name: the token's actor decides the root.
+    let info = json(session("286f56fd-c22e-458a-93ac-dfcfb9bb2788", &["--json", "info"]));
+    assert_eq!(
+        (info["actor"].as_str(), info["actor_source"].as_str()),
+        (Some("alice/copilot-b9bb2788"), Some("session"))
+    );
+    assert_eq!(alice.json(&["info"])["actor"], "alice", "no session: the token's actor");
+    let mut named = alice.cmd(&["--json", "info"]);
+    named.env("COPILOT_AGENT_SESSION_ID", "x").env("BD_ACTOR", "alice/w1");
+    assert_eq!(json(named.output().unwrap())["actor"], "alice/w1", "$BD_ACTOR wins");
+    let shown = check(session("286f56fd-c22e-458a-93ac-dfcfb9bb2788", &["remote", "show"]), "remote show");
+    assert!(shown.contains("actor       alice/copilot-b9bb2788"), "{shown}");
+
+    alice.ok(&["create", "Contended"]);
+    check(session("286f56fd-c22e-458a-93ac-dfcfb9bb2788", &["claim", "t-1"]), "session A claims");
+    assert_eq!(alice.json(&["show", "t-1"])["assignee"], "alice/copilot-b9bb2788");
+    let out = session("5139d45d-1aec-41fb-a65b-5e2515a04348", &["close", "t-1"]);
+    assert_eq!(out.status.code(), Some(4), "another session of the same token: {}", stderr_of(&out));
+    assert_eq!(alice.code(&["close", "t-1"]), 4, "nor the token's plain actor");
+    let text = check(alice.cmd(&["prime"]).output().unwrap(), "prime");
+    assert!(!text.contains('⚠'), "the plain actor holds nothing: {text}");
+    check(session("5139d45d-1aec-41fb-a65b-5e2515a04348", &["close", "t-1", "--take-over"]), "own token's sub-actor");
 }

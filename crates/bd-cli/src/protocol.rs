@@ -53,6 +53,11 @@ pub struct ExecRequest {
     /// an `--actor` flag travels in `argv`. Must be allowed by the token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
+    /// The client's agent session (`$BD_SESSION`, or one its agent harness
+    /// names), sent when it names no actor: the request then runs as
+    /// `<token actor>/<session>`. Servers that predate it ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
     /// Idempotency key: every retry of one invocation sends the same id, and
     /// a write is applied once however many attempts reach the server.
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -394,7 +394,8 @@ pub fn exec_comment_add(tx: &mut WriteCtx<'_>, a: &CommentAddArgs) -> Result<Out
 
 fn claim_out(c: &Claim, now: Timestamp) -> Out {
     let verb = if c.already_held { "Already holding" } else { "Claimed" };
-    let mut out = Out::new(c).line(format!("✓ {verb} {}: {}", c.issue.id, c.issue.title));
+    let holder = c.issue.assignee.as_deref().map(|a| format!(" as {a}")).unwrap_or_default();
+    let mut out = Out::new(c).line(format!("✓ {verb} {}{holder}: {}", c.issue.id, c.issue.title));
     if let Some(r) = &c.reclaimed {
         out = out.line(format!(
             "  reclaimed from {} (lease token {} expired {})",
@@ -1013,7 +1014,8 @@ pub fn cmd_history(app: &mut App, a: &HistoryArgs) -> Result<()> {
 }
 
 pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
-    let actor = app.actor();
+    let me = app.resolved_actor();
+    let actor = me.actor.clone();
     let workspace = app.workspace_label()?;
     let (mine, ready, stats, memories, ttl, now, prefix, attention) = app.read(|r| {
         let mine = r.list(&ListQuery {
@@ -1058,6 +1060,9 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             "workspace": workspace,
             "prefix": prefix,
             "actor": actor,
+            "actor_source": me.source,
+            "actor_from": me.from,
+            "shared_actor_claims": shared_actor_warning(&me, mine.len()).is_some(),
             "lease_ttl": ttl,
             "claims": mine.iter().map(|(i, l)| json!({ "issue": i, "lease": l })).collect::<Vec<_>>(),
             "ready": ready,
@@ -1070,7 +1075,16 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     }
     let mut o = Vec::new();
     o.push("# bd workflow context".to_string());
-    o.push(format!("Workspace `{workspace}` (prefix `{prefix}`); you are `{actor}`."));
+    let whence = match me.source {
+        crate::actor::Source::Session => format!("this agent session's own actor: {}", me.from),
+        crate::actor::Source::Default => format!("from {}; no agent session detected", me.from),
+        _ => format!("from {}", me.from),
+    };
+    o.push(format!("Workspace `{workspace}` (prefix `{prefix}`); you are `{actor}` ({whence})."));
+    if let Some(w) = shared_actor_warning(&me, mine.len()) {
+        o.push(String::new());
+        o.push(w);
+    }
     o.push(String::new());
     o.push("## Core loop".into());
     o.push("- `bd ready` lists unblocked work in queue order (priority, then age).".into());
@@ -1159,6 +1173,24 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     }
     o.iter().for_each(io::outln);
     Ok(())
+}
+
+/// `bd prime`'s warning when this session may share its actor, and so its
+/// claims, with another: the actor is the plain default (no `--actor`,
+/// `$BD_ACTOR` or agent session) and holds claims.
+fn shared_actor_warning(me: &crate::actor::Resolved, claims: usize) -> Option<String> {
+    if me.source != crate::actor::Source::Default || claims == 0 {
+        return None;
+    }
+    let actor = &me.actor;
+    Some(format!(
+        "⚠ `{actor}` is the default actor, shared by every session of this user that has no session of its own, and \
+         it holds {claims} claim{} (below) that may be another session's. If this is an agent session, give it its \
+         own actor before claiming or closing anything: run each of its bd commands with `{}=<name>` (acting as \
+         `{actor}/<name>`) or `--actor '{actor}/<name>'`. Leave claims you did not take to their holder.",
+        if claims == 1 { "" } else { "s" },
+        crate::actor::SESSION_VAR,
+    ))
 }
 
 pub fn cmd_stats(app: &mut App) -> Result<()> {
@@ -1385,7 +1417,8 @@ pub fn cmd_import(app: &mut App, a: &ImportArgs) -> Result<()> {
 }
 
 pub fn cmd_info(app: &mut App) -> Result<()> {
-    let actor = app.actor();
+    let me = app.resolved_actor();
+    let actor = me.actor.clone();
     let workspace = app.workspace_label()?;
     let store = app.store()?;
     let workspace_id = store.meta("workspace_id")?;
@@ -1412,6 +1445,7 @@ pub fn cmd_info(app: &mut App) -> Result<()> {
         "journal_mode": journal,
         "durability": durability,
         "actor": actor,
+        "actor_source": me.source,
         "issues": stats.total,
         "events_head": head,
         "version": env!("CARGO_PKG_VERSION"),
@@ -1423,7 +1457,7 @@ pub fn cmd_info(app: &mut App) -> Result<()> {
             "storage     SQLite {sqlite_version}, journal {journal}, durability {durability}, schema v{}",
             bd_core::SCHEMA_VERSION
         ))
-        .line(format!("actor       {actor}"))
+        .line(format!("actor       {actor} (from {})", me.from))
         .line(format!("issues      {} ({} ready)   events head {head}", stats.total, stats.ready))
         .line(format!("bd          {}", env!("CARGO_PKG_VERSION")));
     app.print(out);

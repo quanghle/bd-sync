@@ -641,8 +641,8 @@ fn server_read(app: &App, remote: &Remote, mut argv: Vec<String>) -> Result<Exec
     if let Some(actor) = &app.g.actor {
         argv.splice(0..0, ["--actor".to_string(), actor.clone()]);
     }
-    let request =
-        ExecRequest { argv, actor: remote::env_actor(), location: Some(remote.url.clone()), ..Default::default() };
+    let (actor, session) = remote::identity();
+    let request = ExecRequest { argv, actor, session, location: Some(remote.url.clone()), ..Default::default() };
     remote.exec(&request)
 }
 

@@ -131,9 +131,12 @@ bd prime                                    # agent context: claims, ready work,
 
 Agent loop: `bd claim --next --json` → work, heartbeating every few minutes
 → `bd close <id> --token <t>` (or `--failed`). If `heartbeat` exits 4, the
-lease was lost (reclaimed or taken over): stop working on that issue. Give
-each agent its own actor (`BD_ACTOR=<you>/<agent>`): a claim is protected
-from every other actor name, not from other sessions sharing its own.
+lease was lost (reclaimed or taken over): stop working on that issue. A
+claim is protected from every other actor name, not from other sessions
+sharing its own, so each agent session acts as its own actor
+`<you>/<session>`, derived from the session id its agent harness sets
+(Claude Code, Copilot CLI, Codex) or from `BD_SESSION`; see
+[Actors](#actors).
 
 ## Concepts
 
@@ -238,8 +241,10 @@ bd remember "Integration tests need docker running"   # key derived: integration
 bd memories docker ; bd recall <key> ; bd forget <key>
 ```
 
-`bd prime` prints workflow context, your claims, top ready work, and all
-memories. Outside a workspace it prints nothing (safe in session hooks).
+`bd prime` prints workflow context, your actor and claims, top ready work,
+and all memories. Outside a workspace it prints nothing (safe in session
+hooks). It warns when you act as the plain default actor, shared by every
+session without one of its own, and that actor holds claims.
 
 ## Playbooks: repeatable multi-step work
 
@@ -584,6 +589,7 @@ bd remote login                               # prompts for the access token, ch
 bd remote show                                # checks the URL, certificate, token and actor
 bd ready                                      # every command now runs on the server
 BD_ACTOR=alice/agent-2 bd claim --next        # sub-actors: one lease holder per agent
+BD_SESSION=agent-3 bd claim --next            # the same: acts as <token actor>/agent-3
 ```
 
 ```toml
@@ -639,6 +645,7 @@ forgets the token on this machine: revoke it on the server with
 | `BD_REMOTE` / `--remote URL` | use this workspace URL instead of `.bd/remote.toml` |
 | `BD_CA_CERT` | PEM file of the CA that signed the server certificate |
 | `BD_ACTOR` | act as `<token actor>/<name>`; anything else is refused |
+| `BD_SESSION` | act as `<token actor>/<name>`; agent sessions send theirs on their own ([Actors](#actors)) |
 | `BD_REMOTE_RETRY_SECS` | how long to retry an unreachable server (default 30; 0 = once) |
 | `BD_INSECURE_HTTP=1` | allow plain `http://` to a non-loopback host |
 
@@ -860,7 +867,46 @@ connections open, while each `cli` process opens the database again.
 | `events.retain_days` / `events.retain_rows` | `0` | automatic event retention (`0` keeps everything) |
 | `gate.repos` | | repositories GitHub gates may name: `OWNER/REPO`, `HOST/OWNER/REPO`, `OWNER/*`, `*` (unset: any locally, the workspace's own through `bd serve`) |
 
-The actor comes from `--actor`, then `$BD_ACTOR`, `$BEADS_ACTOR`, `git config user.name`, then `$USER`. In a remote workspace, the access token decides: `--actor` and `$BD_ACTOR` may only name the token's actor or one of its sub-actors.
+### Actors
+
+Every write records its actor, and a live claim belongs to the actor that
+took it: another actor name cannot end it without `--take-over`. The actor
+comes from the first of:
+
+1. `--actor`
+2. `$BD_ACTOR`, then `$BEADS_ACTOR`
+3. the user, `git config user.name` (then `$USER`, `$USERNAME`), as the
+   sub-actor `<user>/<session>` when the command runs in an agent session:
+   - `$BD_SESSION=<name>`: `<user>/<name>` (characters other than letters,
+     digits, `.`, `_` and `-` become `-`)
+   - `$CLAUDE_CODE_SESSION_ID` (Claude Code 2.1.132+): `<user>/claude-<id>`
+   - `$COPILOT_AGENT_SESSION_ID` (Copilot CLI 1.0.29+): `<user>/copilot-<id>`
+   - `$CODEX_THREAD_ID`, then `$CODEX_SESSION_ID` (Codex): `<user>/codex-<id>`
+
+   where `<id>` is the last 8 letters and digits of the session id, so
+   `Quang Le/copilot-b9bb2788`. Harnesses set these in every shell command
+   of a session, so all of its bd commands act alike, and two sessions never
+   do. A terminal without them keeps the plain user.
+
+Concurrent sessions of one user thus never share claims, with no setup.
+Naming the actor outright (`--actor`, `$BD_ACTOR`) turns this off: every
+session with the same `$BD_ACTOR` shares its claims again. A claim taken in
+one session is another actor's in the next (or after Claude Code's
+`/clear`, which starts a new session id): finish it there, or take it over
+with `--take-over`. Subagents get their own actor where the harness gives
+them their own id (Codex threads, Copilot CLI); Claude Code subagents share
+their session's. For an older Claude Code, the `SessionStart` hook `bd hook
+session-start` (in this repository's `.claude/settings.json`) writes
+`export BD_SESSION=claude-<id>` to `$CLAUDE_ENV_FILE`, from the hook's
+input. Other harnesses can set `BD_SESSION` per session. `bd info` and
+`bd prime` show the actor and where it came from, and `bd claim` prints it.
+
+In a remote workspace, the access token decides: `--actor` and `$BD_ACTOR`
+may only name the token's actor or one of its sub-actors. Without them, a
+client in an agent session sends its session, not its user name, and acts
+as `<token actor>/<session>`; `bd serve` never derives an actor from its own
+environment. Servers older than this ignore the session and use the
+token's actor.
 
 ## Exit codes
 

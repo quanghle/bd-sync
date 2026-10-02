@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::actor;
 use crate::app::{App, Out};
 use crate::auth::random_hex;
 use crate::cli::*;
@@ -105,6 +106,16 @@ fn env(name: &str) -> Option<String> {
 
 pub fn env_actor() -> Option<String> {
     env("BD_ACTOR").or_else(|| env("BEADS_ACTOR"))
+}
+
+/// Who a request asks to act as, besides an `--actor` in its argv: the
+/// client's `$BD_ACTOR`, else its agent session ([`actor::session`]), which
+/// the server turns into the sub-actor `<token actor>/<session>`.
+pub fn identity() -> (Option<String>, Option<String>) {
+    match env_actor() {
+        Some(a) => (Some(a), None),
+        None => (None, actor::session(&actor::env).map(|s| s.label)),
+    }
 }
 
 fn missing_token(url: &str) -> Error {
@@ -356,9 +367,11 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
         .skip(1)
         .map(|a| a.into_string().map_err(|a| Error::invalid(format!("argument {a:?} is not valid UTF-8"))))
         .collect::<Result<Vec<_>>>()?;
+    let (actor, session) = identity();
     let mut request = ExecRequest {
         argv,
-        actor: env_actor(),
+        actor,
+        session,
         request_id: Some(random_hex(16)?),
         location: Some(remote.url.clone()),
         ..Default::default()
@@ -637,7 +650,8 @@ fn events_request(
     if let Some(by) = &a.by_actor {
         argv.extend(["--by".into(), by.clone()]);
     }
-    ExecRequest { argv, actor: env_actor(), location: Some(remote.url.clone()), ..Default::default() }
+    let (actor, session) = identity();
+    ExecRequest { argv, actor, session, location: Some(remote.url.clone()), ..Default::default() }
 }
 
 /// Print the events of an answer; returns where they end (the cursor to
@@ -934,9 +948,11 @@ impl Remote {
     }
 
     fn event_head(&self) -> Result<i64> {
+        let (actor, session) = identity();
         let request = ExecRequest {
             argv: vec!["info".into(), "--json".into()],
-            actor: env_actor(),
+            actor,
+            session,
             location: Some(self.url.clone()),
             ..Default::default()
         };
@@ -1070,7 +1086,7 @@ fn show(app: &mut App) -> Result<i32> {
         Err(_) => "token       not usable".to_string(),
     });
     let checked = match token {
-        Ok((Some(t), trust)) => check(Remote::new(c.clone(), trust, t.secret()).quick(), env_actor()),
+        Ok((Some(t), trust)) => check(Remote::new(c.clone(), trust, t.secret()).quick(), identity()),
         Ok((None, _)) => Err(missing_token(&c.url)),
         Err(e) => Err(e),
     };
@@ -1102,10 +1118,11 @@ fn show(app: &mut App) -> Result<i32> {
 }
 
 /// `bd info` on the server: proves that the URL, certificate, token and actor all work.
-fn check(remote: Remote, actor: Option<String>) -> Result<Value> {
+fn check(remote: Remote, (actor, session): (Option<String>, Option<String>)) -> Result<Value> {
     let request = ExecRequest {
         argv: vec!["info".into(), "--json".into()],
         actor,
+        session,
         location: Some(remote.url.clone()),
         ..Default::default()
     };
@@ -1211,13 +1228,14 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
         None
     } else {
         // The token alone: $BD_ACTOR is checked per command, not saved.
-        let info = check(Remote::new(c.clone(), trust.clone(), token.clone()).quick(), None).map_err(|e| match e {
-            Error::Unauthorized(m) => Error::Unauthorized(format!("{m}; nothing was saved")),
-            Error::Remote(m) => {
-                Error::Remote(format!("{m}; nothing was saved (--no-verify saves the token without checking it)"))
-            }
-            e => e,
-        })?;
+        let info =
+            check(Remote::new(c.clone(), trust.clone(), token.clone()).quick(), (None, None)).map_err(|e| match e {
+                Error::Unauthorized(m) => Error::Unauthorized(format!("{m}; nothing was saved")),
+                Error::Remote(m) => {
+                    Error::Remote(format!("{m}; nothing was saved (--no-verify saves the token without checking it)"))
+                }
+                e => e,
+            })?;
         info["actor"].as_str().map(String::from)
     };
     let saved = credentials::save(&path, &c.url, &token, &trust.anchor, scope)?;

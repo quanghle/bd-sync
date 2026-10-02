@@ -11,6 +11,8 @@ bd is this repository's shared task tracker: a dependency-aware work queue in `.
 
 Run `bd prime`. It prints the workflow, your current claims, the top of the ready queue, and project memories. Outside a workspace it prints nothing; `bd info` shows which workspace is active (a database path, or a server URL for a remote workspace).
 
+Your actor: each agent session acts as its own actor, `<user>/<session>`, derived from the session id the agent harness sets (`$CLAUDE_CODE_SESSION_ID`, `$COPILOT_AGENT_SESSION_ID`, `$CODEX_THREAD_ID`) or from `$BD_SESSION`, so claims of concurrent sessions never mix. `bd prime` shows yours. If it warns that you are the plain default actor and that actor holds claims, run each of your bd commands with `BD_SESSION=<name>` before claiming anything, and leave those claims to their holder. Do not set `BD_ACTOR` to a name other sessions use.
+
 ## Workflow
 
 1. Find work: `bd ready` (queue order), `bd list --status in_progress`, `bd blocked`.

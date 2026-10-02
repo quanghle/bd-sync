@@ -1,3 +1,4 @@
+mod actor;
 mod app;
 mod auth;
 mod batch;
@@ -23,7 +24,7 @@ use clap::Parser;
 use serde_json::json;
 
 use crate::app::App;
-use crate::cli::{Cli, Command, CommentCommand, LabelCommand, MemoryCommand};
+use crate::cli::{Cli, Command, CommentCommand, HookCommand, LabelCommand, MemoryCommand};
 use crate::commands::*;
 
 fn main() {
@@ -56,7 +57,12 @@ fn run(cli: Cli) -> i32 {
 fn always_local(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Serve(_) | Command::Remote(_) | Command::Version | Command::Bench(_) | Command::BenchWorker(_)
+        Command::Serve(_)
+            | Command::Remote(_)
+            | Command::Hook(_)
+            | Command::Version
+            | Command::Bench(_)
+            | Command::BenchWorker(_)
     )
 }
 
@@ -189,6 +195,7 @@ fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
             Err(Error::NoWorkspace(_)) => Ok(0),
             other => other.map(|_| 0),
         },
+        Command::Hook(HookCommand::SessionStart) => actor::cmd_session_start(app),
         Command::Stats => cmd_stats(app).map(|_| 0),
         Command::Metrics(a) => cmd_metrics(app, a).map(|_| 0),
         Command::Doctor(a) => cmd_doctor(app, a),
@@ -245,6 +252,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Events(_) => "events",
         Command::History(_) => "history",
         Command::Prime(_) => "prime",
+        Command::Hook(_) => "hook",
         Command::Stats => "stats",
         Command::Metrics(_) => "metrics",
         Command::Doctor(_) => "doctor",

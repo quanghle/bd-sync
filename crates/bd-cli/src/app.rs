@@ -1,13 +1,13 @@
 //! Per-invocation context: global options, actor, the open store, output.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, Instant};
 
 use bd_core::{Error, OpenOptions, ReadCtx, Result, Store, TxStats, WriteCtx};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::actor;
 use crate::cli::Global;
 use crate::io;
 
@@ -53,7 +53,7 @@ pub struct App {
     pub g: Global,
     pub cwd: PathBuf,
     pub started: Instant,
-    actor: Option<String>,
+    actor: Option<actor::Resolved>,
     store: Option<Store>,
     pub open_time: Duration,
     pub tx: Vec<TxStats>,
@@ -83,10 +83,21 @@ impl App {
     }
 
     pub fn actor(&mut self) -> String {
+        self.resolved_actor().actor
+    }
+
+    /// The actor, and where it came from (see [`crate::actor`]).
+    pub fn resolved_actor(&mut self) -> actor::Resolved {
         if self.actor.is_none() {
-            self.actor = Some(resolve_actor(self.g.actor.clone()));
+            self.actor = Some(actor::resolve(self.g.actor.as_deref()));
         }
         self.actor.clone().expect("set above")
+    }
+
+    /// Run as `actor` (`bd serve` sets each request's).
+    pub fn set_actor(&mut self, actor: actor::Resolved) {
+        self.g.actor = Some(actor.actor.clone());
+        self.actor = Some(actor);
     }
 
     pub fn open_options(&self) -> OpenOptions {
@@ -215,27 +226,4 @@ pub fn resolve_dir(d: &Path) -> std::io::Result<PathBuf> {
 /// Nearest `.bd/bd.db` walking up from `start`.
 pub fn find_workspace(start: &Path) -> Option<PathBuf> {
     start.ancestors().map(|d| d.join(".bd").join("bd.db")).find(|p| p.is_file())
-}
-
-/// `--actor`, then $BD_ACTOR, $BEADS_ACTOR, `git config user.name`, $USER.
-pub fn resolve_actor(flag: Option<String>) -> String {
-    let clean = |s: String| {
-        let t = s.trim().to_string();
-        (!t.is_empty()).then_some(t)
-    };
-    flag.and_then(clean)
-        .or_else(|| std::env::var("BD_ACTOR").ok().and_then(clean))
-        .or_else(|| std::env::var("BEADS_ACTOR").ok().and_then(clean))
-        .or_else(|| {
-            Command::new("git")
-                .args(["config", "user.name"])
-                .output()
-                .ok()
-                .filter(|o| o.status.success())
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(clean)
-        })
-        .or_else(|| std::env::var("USER").ok().and_then(clean))
-        .or_else(|| std::env::var("USERNAME").ok().and_then(clean))
-        .unwrap_or_else(|| "unknown".into())
 }

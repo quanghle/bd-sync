@@ -16,7 +16,7 @@ use crate::model::{
     DepType, GATE_TYPE, Guard, Issue, IssuePatch, IssueRef, NewIssue, Outcome, ReadyQuery, Status, WorkFilter,
 };
 use crate::queries::Queries;
-use crate::ready;
+use crate::ready::DeferralSources;
 use crate::store::WriteCtx;
 use crate::time::{Timestamp, format_duration_ms};
 
@@ -187,8 +187,11 @@ pub struct CompactOutcome {
 }
 
 fn children_in_order(conn: &Connection, id: &str) -> Result<Vec<Issue>> {
+    // CROSS JOIN keeps this an index lookup of the children whatever the
+    // planner's statistics say: stale ones (a `bd serve` pool rarely runs
+    // `PRAGMA optimize`) can make it scan every issue instead, per node.
     let sql = format!(
-        "SELECT {ISSUE_COLUMNS} FROM issues i JOIN dependencies d ON d.issue_id = i.id
+        "SELECT {ISSUE_COLUMNS} FROM dependencies d CROSS JOIN issues i ON i.id = d.issue_id
          WHERE d.depends_on_id = ?1 AND d.dep_type = 'parent-child' ORDER BY i.created_at, i.rowid"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
@@ -196,34 +199,69 @@ fn children_in_order(conn: &Connection, id: &str) -> Result<Vec<Issue>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Depth-first walk below `id` in creation order: (depth, issue). Uses an
-/// explicit stack (depth, children left to visit): a hierarchy has no depth
+/// A depth-first walk below an issue, in creation order.
+struct Walk {
+    /// (depth, issue), parents before their children.
+    nodes: Vec<(usize, Issue)>,
+    /// Index in `nodes` of each node's parent (None below the root).
+    parents: Vec<Option<usize>>,
+    /// No issue was reached twice (or back at the root): the walk is the
+    /// whole subtree, each issue once under its only parent. Only a damaged
+    /// database (a second parent, a parent cycle) breaks this.
+    is_tree: bool,
+}
+
+/// Depth-first walk below `id` in creation order. Uses an explicit stack
+/// (depth, children left to visit, their parent): a hierarchy has no depth
 /// limit, and this runs on `bd serve`'s small-stack threads.
-fn walk(conn: &Connection, id: &str) -> Result<Vec<(usize, Issue)>> {
-    let mut out = Vec::new();
+fn walk_tree(conn: &Connection, id: &str) -> Result<Walk> {
+    let mut walk = Walk { nodes: Vec::new(), parents: Vec::new(), is_tree: true };
     let mut seen = BTreeSet::new();
-    let mut stack = vec![(1, children_in_order(conn, id)?.into_iter())];
-    while let Some((depth, children)) = stack.last_mut() {
-        let depth = *depth;
+    let mut stack = vec![(1, children_in_order(conn, id)?.into_iter(), None)];
+    while let Some((depth, children, parent)) = stack.last_mut() {
+        let (depth, parent) = (*depth, *parent);
         let Some(child) = children.next() else {
             stack.pop();
             continue;
         };
         if !seen.insert(child.id.clone()) {
+            walk.is_tree = false;
             continue;
         }
+        walk.is_tree &= child.id != id;
         let below = children_in_order(conn, &child.id)?;
-        out.push((depth, child));
-        stack.push((depth + 1, below.into_iter()));
+        stack.push((depth + 1, below.into_iter(), Some(walk.nodes.len())));
+        walk.nodes.push((depth, child));
+        walk.parents.push(parent);
     }
-    Ok(out)
+    Ok(walk)
+}
+
+fn walk(conn: &Connection, id: &str) -> Result<Vec<(usize, Issue)>> {
+    Ok(walk_tree(conn, id)?.nodes)
 }
 
 fn is_container(issue: &Issue) -> bool {
     role_of(issue).is_some_and(Role::is_container)
 }
 
-fn state_of(conn: &Connection, issue: &Issue, now: Timestamp) -> Result<(StepState, Option<String>)> {
+/// Work items (everything but containers) below `id`, and how many are closed.
+fn work_below(conn: &Connection, id: &str) -> Result<(usize, usize)> {
+    let kids = issues::descendants(conn, id)?;
+    let work: Vec<&Issue> = kids.iter().filter(|k| !is_container(k)).collect();
+    Ok((work.len(), work.iter().filter(|k| k.status.is_terminal()).count()))
+}
+
+/// An issue's state in its run. `counts` gives an open container's
+/// [`work_below`], and `deferrals` remembers deferral sources across the
+/// issues of one status, so neither needs a walk of the hierarchy per issue.
+fn state_of(
+    conn: &Connection,
+    issue: &Issue,
+    now: Timestamp,
+    deferrals: &mut DeferralSources,
+    counts: impl FnOnce() -> Result<(usize, usize)>,
+) -> Result<(StepState, Option<String>)> {
     if issue.issue_type == GATE_TYPE && !issue.status.is_terminal() {
         let g = gates::view_of(conn, issue)?;
         let kind = g.spec.as_ref().map(|s| s.kind.to_string()).unwrap_or_else(|| "gate".into());
@@ -256,10 +294,8 @@ fn state_of(conn: &Connection, issue: &Issue, now: Timestamp) -> Result<(StepSta
         Status::Deferred => (StepState::Deferred, None),
         Status::Blocked => (StepState::Blocked, Some("marked blocked".into())),
         Status::Open if is_container(issue) && !issue.is_blocked => {
-            let kids = issues::descendants(conn, &issue.id)?;
-            let work: Vec<&Issue> = kids.iter().filter(|k| !is_container(k)).collect();
-            let done = work.iter().filter(|k| k.status.is_terminal()).count();
-            (StepState::Open, Some(format!("{done}/{} closed", work.len())))
+            let (work, done) = counts()?;
+            (StepState::Open, Some(format!("{done}/{work} closed")))
         }
         Status::Open if issue.is_blocked => {
             let mut on: Vec<String> = Vec::new();
@@ -275,7 +311,7 @@ fn state_of(conn: &Connection, issue: &Issue, now: Timestamp) -> Result<(StepSta
             };
             (StepState::Blocked, Some(detail))
         }
-        Status::Open => match ready::deferral_source(conn, &issue.id, now)? {
+        Status::Open => match deferrals.get(conn, &issue.id)? {
             Some(src) => (StepState::Deferred, Some(format!("deferred by {src}"))),
             None => (StepState::Ready, None),
         },
@@ -309,10 +345,32 @@ fn tally(progress: &mut Progress, issue: &Issue, state: StepState) {
 /// Every issue of a run (or any issue with children) with its state.
 pub fn run_status(conn: &Connection, run: &str, now: Timestamp) -> Result<RunStatus> {
     let root = issues::require(conn, run)?;
+    let walk = walk_tree(conn, run)?;
+    // Every container's counts in one pass from the leaves up; a damaged
+    // hierarchy, where the walk is not the whole subtree, asks the database.
+    let below = walk.is_tree.then(|| {
+        let mut below = vec![(0, 0); walk.nodes.len()];
+        for (i, (_, issue)) in walk.nodes.iter().enumerate().rev() {
+            let Some(p) = walk.parents[i] else { continue };
+            let (mut work, mut done) = below[i];
+            if !is_container(issue) {
+                work += 1;
+                done += usize::from(issue.status.is_terminal());
+            }
+            below[p].0 += work;
+            below[p].1 += done;
+        }
+        below
+    });
+    let mut deferrals = DeferralSources::new(now);
     let mut progress = Progress::default();
     let mut nodes = Vec::new();
-    for (depth, issue) in walk(conn, run)? {
-        let (state, detail) = state_of(conn, &issue, now)?;
+    for (i, (depth, issue)) in walk.nodes.into_iter().enumerate() {
+        let counts = || match &below {
+            Some(below) => Ok(below[i]),
+            None => work_below(conn, &issue.id),
+        };
+        let (state, detail) = state_of(conn, &issue, now, &mut deferrals, counts)?;
         tally(&mut progress, &issue, state);
         nodes.push(StatusNode {
             depth,
@@ -331,9 +389,13 @@ pub fn run_status(conn: &Connection, run: &str, now: Timestamp) -> Result<RunSta
 }
 
 fn progress_of(conn: &Connection, run: &str, now: Timestamp) -> Result<Progress> {
+    let mut deferrals = DeferralSources::new(now);
     let mut progress = Progress::default();
     for issue in issues::descendants(conn, run)? {
-        let (state, _) = state_of(conn, &issue, now)?;
+        if is_container(&issue) && issue.issue_type != GATE_TYPE {
+            continue; // counts nothing whatever its state
+        }
+        let (state, _) = state_of(conn, &issue, now, &mut deferrals, || work_below(conn, &issue.id))?;
         tally(&mut progress, &issue, state);
     }
     Ok(progress)
@@ -415,7 +477,8 @@ fn digest(root: &Issue, tree: &[(usize, Issue)], summary: Option<&str>, now: Tim
             (Status::Closed | Status::Pinned, _) => "✓",
             _ => "○",
         };
-        let mut line = format!("{}- {icon} {}: {}", "  ".repeat(depth.saturating_sub(1)), short_key(root, i), i.title);
+        let mut line =
+            format!("{}- {icon} {}: {}", graph::indent(depth.saturating_sub(1)), short_key(root, i), i.title);
         let mut extra = Vec::new();
         if let Some(a) = &i.assignee {
             extra.push(format!("@{a}"));

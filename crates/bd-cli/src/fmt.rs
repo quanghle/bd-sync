@@ -170,7 +170,7 @@ pub fn details(d: &IssueDetails, now: Timestamp) -> Vec<String> {
 }
 
 pub fn tree_line(n: &TreeNode) -> String {
-    let indent = "  ".repeat(n.depth);
+    let indent = bd_core::graph::indent(n.depth);
     let via = n.via.as_ref().map(|v| format!("[{v}] ")).unwrap_or_default();
     let blocked = if n.is_blocked && !n.status.is_terminal() { " (blocked)" } else { "" };
     let repeated = if n.repeated { " (see above)" } else { "" };

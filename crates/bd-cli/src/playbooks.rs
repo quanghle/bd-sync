@@ -300,10 +300,10 @@ fn status_lines(s: &RunStatus) -> Vec<String> {
         s.playbook.as_ref().map(|p| format!(" · playbook {p}")).unwrap_or_default(),
         parts.join(", ")
     )];
-    let width = s.nodes.iter().map(|n| n.id.len() + 2 * n.depth).max().unwrap_or(0);
+    let width = s.nodes.iter().map(|n| n.id.len() + bd_core::graph::indent(n.depth).len()).max().unwrap_or(0);
     for n in &s.nodes {
-        let indent = "  ".repeat(n.depth);
-        let pad = width.saturating_sub(n.id.len() + 2 * n.depth);
+        let indent = bd_core::graph::indent(n.depth);
+        let pad = width.saturating_sub(n.id.len() + indent.len());
         let mut line = format!("{indent}{} {}{} {}", n.state.icon(), n.id, " ".repeat(pad), n.title);
         let mut detail = Vec::new();
         if let Some(a) = n.assignee.as_ref().filter(|_| n.state != StepState::Active) {

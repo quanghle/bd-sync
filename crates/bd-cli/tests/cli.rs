@@ -1317,3 +1317,59 @@ fn a_subagent_with_its_own_session_cannot_end_its_parents_claim() {
     assert_eq!(run(&["close", "t-1"]).status.code(), Some(4));
     assert!(sub(&["close", "t-1"]).status.success());
 }
+
+#[test]
+fn deep_hierarchies_print_linear_text() {
+    // Indenting every line to its depth made a chain's text quadratic:
+    // gigabytes for `playbook status` or `dep tree` of a long enough chain.
+    use std::time::{Duration, Instant};
+    const LEVELS: usize = 20_000;
+    let ws = Ws::new();
+    let root = ws.id(&["create", "Root"]);
+    let issues = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO issues (id, title, status, created_at, updated_at)
+        SELECT 'c' || k, 'Level ' || k, 'open', ?2 + k, ?2 + k FROM n";
+    let edges = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+        SELECT 'c' || k, CASE k WHEN 1 THEN ?3 ELSE 'c' || (k - 1) END, 'parent-child', ?2 FROM n";
+    let db = ws.dir.path().join(".bd").join("bd.db");
+    let mut store = bd_core::Store::open(&db, bd_core::OpenOptions::default()).unwrap();
+    let t0 = 1_700_000_000_000_i64;
+    store
+        .write("chain", "tester", |tx| {
+            tx.conn().execute(issues, (LEVELS as i64, t0))?;
+            tx.conn().execute(edges, (LEVELS as i64, t0, &root))?;
+            Ok(())
+        })
+        .unwrap();
+    drop(store);
+
+    let started = Instant::now();
+    let lines = |text: &str, n: usize, deep: &str, deeper: &str| {
+        assert!(text.len() < 300 * LEVELS, "{} bytes", text.len());
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), LEVELS + 1);
+        // 64 levels of indentation at most; deeper lines say their depth.
+        let pad = "  ".repeat(64);
+        assert!(lines[n].starts_with(&format!("{pad}{deep}")), "{}", lines[n]);
+        assert!(lines[n + 1].starts_with(&format!("{pad}{deeper}")), "{}", lines[n + 1]);
+        let last = lines[LEVELS];
+        assert!(last.starts_with(&format!("{pad}[depth {LEVELS}] ")), "{last}");
+    };
+    let status = ws.ok(&["playbook", "status", &root]);
+    lines(&status, 64, "○ c64 ", "[depth 65] ○ c65 ");
+    let up = ws.ok(&["dep", "tree", &root, "--direction", "up", "--max-depth", "1000000"]);
+    lines(&up, 64, "[parent-child] ○ c64 ", "[depth 65] [parent-child] ○ c65 ");
+    let leaf = format!("c{LEVELS}");
+    let down = ws.ok(&["dep", "tree", &leaf, "--max-depth", "1000000"]);
+    let (c, d) = (LEVELS - 64, LEVELS - 65);
+    lines(&down, 64, &format!("[parent-child] ○ c{c} "), &format!("[depth 65] [parent-child] ○ c{d} "));
+    // JSON carries the depth as a number and is never padded.
+    let json = ws.ok(&["--json", "playbook", "status", &root]);
+    assert!(json.len() < 300 * LEVELS, "{} bytes", json.len());
+    let v: Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(v["nodes"][LEVELS - 1]["depth"], LEVELS);
+    let json = ws.ok(&["--json", "dep", "tree", &leaf, "--max-depth", "1000000"]);
+    assert!(json.len() < 300 * LEVELS, "{} bytes", json.len());
+    assert!(started.elapsed() < Duration::from_secs(60), "{:?}", started.elapsed());
+}

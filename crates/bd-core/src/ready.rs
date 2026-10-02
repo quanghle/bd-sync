@@ -6,6 +6,7 @@
 //! ordered by the sort policy with `id` as the final tiebreaker, so the same
 //! database state and clock always yield the same queue.
 
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use rusqlite::types::Value as SqlValue;
@@ -106,19 +107,55 @@ pub(crate) fn ready_for(
 /// The issue (itself or the nearest ancestor) whose deferral hides `id` from
 /// the ready queue, if any.
 pub fn deferral_source(conn: &Connection, id: &str, now: Timestamp) -> Result<Option<String>> {
-    let mut stmt = conn.prepare_cached("SELECT status, defer_until FROM issues WHERE id = ?1")?;
-    let mut chain = vec![id.to_string()];
-    chain.extend(graph::ancestors(conn, id)?);
-    for candidate in chain {
-        let row: Option<(Status, Option<Timestamp>)> =
-            stmt.query_row([&candidate], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-        if let Some((status, until)) = row {
-            if status == Status::Deferred || until.is_some_and(|t| t > now) {
-                return Ok(Some(candidate));
-            }
-        }
+    DeferralSources::new(now).get(conn, id)
+}
+
+/// [`deferral_source`] for many issues of one hierarchy: remembers the
+/// answer for every issue on the way up, so asking for each issue of a
+/// subtree costs one step per issue instead of one per ancestor.
+pub(crate) struct DeferralSources {
+    now: Timestamp,
+    known: HashMap<String, Option<String>>,
+}
+
+impl DeferralSources {
+    pub(crate) fn new(now: Timestamp) -> DeferralSources {
+        DeferralSources { now, known: HashMap::new() }
     }
-    Ok(None)
+
+    pub(crate) fn get(&mut self, conn: &Connection, id: &str) -> Result<Option<String>> {
+        let mut stmt = conn.prepare_cached("SELECT status, defer_until FROM issues WHERE id = ?1")?;
+        // Up the parents until an issue whose answer is known or that is
+        // deferred itself: every issue on the way has that answer. A parent
+        // cycle (a damaged database) ends the climb with no answer.
+        let mut path: Vec<String> = Vec::new();
+        let mut on_path = HashSet::new();
+        let mut cur = id.to_string();
+        let found = loop {
+            if let Some(known) = self.known.get(&cur) {
+                break known.clone();
+            }
+            if !on_path.insert(cur.clone()) {
+                break None;
+            }
+            let row: Option<(Status, Option<Timestamp>)> =
+                stmt.query_row([&cur], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+            if row.is_some_and(|(status, until)| status == Status::Deferred || until.is_some_and(|t| t > self.now)) {
+                path.push(cur.clone());
+                break Some(cur);
+            }
+            let parent = graph::parent_of(conn, &cur)?;
+            path.push(cur);
+            match parent {
+                Some(p) => cur = p,
+                None => break None,
+            }
+        };
+        for issue in path {
+            self.known.insert(issue, found.clone());
+        }
+        Ok(found)
+    }
 }
 
 /// Human-readable reasons an open issue is not ready (empty = ready).

@@ -283,7 +283,11 @@ pub(crate) fn recompute_all(ctx: &mut WriteCtx<'_>) -> Result<Vec<BlockChange>> 
     Ok(drift)
 }
 
-/// Explain why `id` is blocked (empty when it is not).
+/// Explain why `id` is blocked (empty when it is not). Its queries, like the
+/// tree walks', start from the edges with CROSS JOIN: SQLite then never plans
+/// a scan of every issue per call, whatever its statistics (stale in a
+/// long-lived `bd serve` connection) say, so callers can ask once per issue
+/// of a large hierarchy.
 pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     let status: Option<Status> =
         conn.prepare_cached("SELECT status FROM issues WHERE id = ?1")?.query_row([id], |r| r.get(0)).optional()?;
@@ -295,7 +299,7 @@ pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     let mut out = Vec::new();
     {
         let mut stmt = conn.prepare_cached(
-            "SELECT t.id, t.title, t.status FROM dependencies d JOIN issues t ON t.id = d.depends_on_id
+            "SELECT t.id, t.title, t.status FROM dependencies d CROSS JOIN issues t ON t.id = d.depends_on_id
              WHERE d.issue_id = ?1 AND d.dep_type = 'blocks' AND t.status NOT IN ('closed','pinned')
              ORDER BY t.id",
         )?;
@@ -314,7 +318,7 @@ pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     }
     {
         let mut stmt = conn.prepare_cached(
-            "SELECT t.id, t.title, t.status FROM dependencies d JOIN issues t ON t.id = d.depends_on_id
+            "SELECT t.id, t.title, t.status FROM dependencies d CROSS JOIN issues t ON t.id = d.depends_on_id
              WHERE d.issue_id = ?1 AND d.dep_type = 'conditional-blocks'
                AND NOT (t.status = 'closed' AND t.close_outcome = 'failed')
              ORDER BY t.id",
@@ -334,10 +338,10 @@ pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     {
         let sql = format!(
             "SELECT s.id, s.title, s.status, COALESCE(json_extract(w.metadata, '$.gate'), 'all-children'),
-                    (SELECT COUNT(*) FROM dependencies c JOIN issues ci ON ci.id = c.issue_id
+                    (SELECT COUNT(*) FROM dependencies c CROSS JOIN issues ci ON ci.id = c.issue_id
                      WHERE c.depends_on_id = s.id AND c.dep_type = 'parent-child'
                        AND ci.status NOT IN ('closed','pinned'))
-             FROM dependencies w JOIN issues s ON s.id = w.depends_on_id
+             FROM dependencies w CROSS JOIN issues s ON s.id = w.depends_on_id
              WHERE w.issue_id = ?1 AND w.dep_type = 'waits-for' AND {WAITS_GATE_SHUT}
              ORDER BY s.id"
         );
@@ -362,7 +366,7 @@ pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     }
     {
         let mut stmt = conn.prepare_cached(
-            "SELECT p.id, p.title, p.status FROM dependencies d JOIN issues p ON p.id = d.depends_on_id
+            "SELECT p.id, p.title, p.status FROM dependencies d CROSS JOIN issues p ON p.id = d.depends_on_id
              WHERE d.issue_id = ?1 AND d.dep_type = 'parent-child' AND p.is_blocked = 1
              ORDER BY p.id",
         )?;
@@ -663,14 +667,26 @@ pub struct TreeNode {
     pub repeated: bool,
 }
 
+/// Indentation levels text output draws for a hierarchy: past this depth
+/// lines stay at this indentation and say their depth instead, so the
+/// output of a deep chain grows linearly with it, not quadratically.
+pub const MAX_INDENT: usize = 64;
+
+/// Two spaces per level of `depth`, at most [`MAX_INDENT`] levels; a deeper
+/// line gets `[depth N] ` after them.
+pub fn indent(depth: usize) -> String {
+    if depth <= MAX_INDENT { "  ".repeat(depth) } else { format!("{}[depth {depth}] ", "  ".repeat(MAX_INDENT)) }
+}
+
 /// Depth-first dependency tree from `root`, cycle-safe (each node expands once).
 /// Symmetric `related` links are skipped.
 pub fn dep_tree(conn: &Connection, root: &str, direction: Direction, max_depth: usize) -> Result<Vec<TreeNode>> {
+    // CROSS JOIN, as in `blockers`: one index lookup per node, whatever the statistics.
     let sql_out = "SELECT o.id, o.title, o.status, o.priority, o.is_blocked, d.dep_type
-                   FROM dependencies d JOIN issues o ON o.id = d.depends_on_id
+                   FROM dependencies d CROSS JOIN issues o ON o.id = d.depends_on_id
                    WHERE d.issue_id = ?1 AND d.dep_type <> 'related' ORDER BY d.dep_type, o.id";
     let sql_in = "SELECT o.id, o.title, o.status, o.priority, o.is_blocked, d.dep_type
-                  FROM dependencies d JOIN issues o ON o.id = d.issue_id
+                  FROM dependencies d CROSS JOIN issues o ON o.id = d.issue_id
                   WHERE d.depends_on_id = ?1 AND d.dep_type <> 'related' ORDER BY d.dep_type, o.id";
     let root_issue = crate::issues::require(conn, root)?;
     let mut out = vec![TreeNode {

@@ -632,3 +632,61 @@ fn closing_the_last_step_under_deep_groups_closes_them_in_linear_time() {
     let mut env = env;
     env.assert_healthy();
 }
+
+/// An open chain of `levels` issues below `root`: even levels are playbook
+/// groups, and level `deferred` is deferred for a day.
+fn open_chain_below(env: &mut Env, root: &str, prefix: &str, levels: usize, deferred: usize) {
+    let issues = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO issues (id, title, status, created_at, updated_at, defer_until, metadata)
+        SELECT ?3 || k, 'Level ' || k, 'open', ?2 + k, ?2 + k, CASE k WHEN ?4 THEN ?2 + 86400000 END,
+               CASE k % 2 WHEN 0 THEN '{\"playbook\":{\"role\":\"group\"}}' ELSE '{}' END FROM n";
+    let edges = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+        SELECT ?3 || k, CASE k WHEN 1 THEN ?4 ELSE ?3 || (k - 1) END, 'parent-child', ?2 FROM n";
+    env.store
+        .write("chain", "alice", |tx| {
+            tx.conn().execute(issues, (levels as i64, T0, prefix, deferred as i64))?;
+            tx.conn().execute(edges, (levels as i64, T0, prefix, root))?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn deep_open_chains_take_linear_time() {
+    // Each group's counts used to walk its whole subtree, and each step's
+    // deferral check all its ancestors: hours for this chain, not seconds.
+    const LEVELS: usize = 100_000;
+    const DEFERRED: usize = LEVELS / 2 + 1;
+    let mut env = Env::new();
+    let root = env.store.write("create", "alice", |tx| tx.create_issue(NewIssue::titled("Deep"))).unwrap().id;
+    open_chain_below(&mut env, &root, "d", LEVELS, DEFERRED);
+    let started = std::time::Instant::now();
+    let status = env.store.read(|r| playbook::run_status(r.conn(), &root, r.now())).unwrap();
+    assert_eq!(status.nodes.len(), LEVELS);
+    let p = &status.progress;
+    assert_eq!((p.total, p.ready, p.blocked, p.done), (LEVELS / 2, DEFERRED / 2, LEVELS / 2 - DEFERRED / 2, 0));
+    let node = |level: usize| {
+        let n = &status.nodes[level - 1];
+        assert_eq!((n.depth, n.id.as_str()), (level, format!("d{level}").as_str()));
+        (n.state, n.detail.clone().unwrap_or_default())
+    };
+    assert_eq!(node(1), (StepState::Ready, String::new()));
+    assert_eq!(node(2), (StepState::Open, format!("0/{} closed", (LEVELS - 2) / 2)));
+    assert_eq!(node(DEFERRED - 2), (StepState::Ready, String::new()));
+    assert_eq!(node(DEFERRED), (StepState::Deferred, format!("deferred by d{DEFERRED}")));
+    assert_eq!(node(LEVELS - 1), (StepState::Deferred, format!("deferred by d{DEFERRED}")));
+    assert_eq!(node(LEVELS), (StepState::Open, "0/0 closed".to_string()));
+    // The same counts as a run's progress (`bd playbook runs`).
+    let as_run = "UPDATE issues SET metadata = '{\"playbook\":{\"role\":\"run\"}}' WHERE id = ?1";
+    env.store.write("mark", "alice", |tx| Ok(tx.conn().execute(as_run, [&root])?)).unwrap();
+    let runs = env.store.read(|r| playbook::runs(r.conn(), &Default::default(), r.now())).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(
+        (runs[0].progress.total, runs[0].progress.ready, runs[0].progress.blocked),
+        (p.total, p.ready, p.blocked)
+    );
+    // Generous for slow CI machines; the quadratic version took hours.
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(60), "status and progress took {took:?}");
+}

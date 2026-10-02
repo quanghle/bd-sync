@@ -1504,7 +1504,7 @@ pub fn cmd_info(app: &mut App) -> Result<()> {
             r.conn().query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))?,
         ))
     })?;
-    let info = json!({
+    let mut info = json!({
         "path": workspace,
         "workspace_id": workspace_id,
         "created_at": created,
@@ -1520,14 +1520,21 @@ pub fn cmd_info(app: &mut App) -> Result<()> {
         "events_head": head,
         "version": env!("CARGO_PKG_VERSION"),
     });
-    let out = Out::new(&info)
+    // Under bd serve: what the client's access token may do, so that a refusal can be told apart.
+    let token = io::request_token();
+    info["token"] = token.as_ref().map_or(Value::Null, crate::auth::Token::summary);
+    let mut out = Out::new(&info)
         .line(format!("workspace   {workspace}"))
         .line(format!("prefix      {prefix} ({mode} ids)"))
         .line(format!(
             "storage     SQLite {sqlite_version}, journal {journal}, durability {durability}, schema v{}",
             bd_core::SCHEMA_VERSION
         ))
-        .line(format!("actor       {actor} (from {})", me.from))
+        .line(format!("actor       {actor} (from {})", me.from));
+    if token.is_some() {
+        out = out.line(format!("access      {}", crate::auth::access_line(&info["token"])));
+    }
+    let out = out
         .line(format!("issues      {} ({} ready)   events head {head}", stats.total, stats.ready))
         .line(format!("bd          {}", env!("CARGO_PKG_VERSION")));
     app.print(out);

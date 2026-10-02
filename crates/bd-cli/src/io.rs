@@ -65,6 +65,9 @@ pub struct Capture {
     /// The request's access token's actor: claims held by it or its
     /// sub-actors are the caller's own.
     pub token_actor: String,
+    /// The request's access token itself, which `bd info` describes to its
+    /// client; the fields above are what it may override.
+    pub token: Option<crate::auth::Token>,
 }
 
 impl Capture {
@@ -80,6 +83,7 @@ impl Capture {
             admin: false,
             human: false,
             token_actor: String::new(),
+            token: None,
         }
     }
 
@@ -168,6 +172,11 @@ pub fn in_server_process() -> bool {
 /// `None` outside `bd serve`, where nothing is limited.
 pub fn policy() -> Option<bd_core::Policy> {
     with_capture(|c| bd_core::Policy { actor: c.token_actor.clone(), admin: c.admin, human: c.human })
+}
+
+/// The access token of the request being served, if any.
+pub fn request_token() -> Option<crate::auth::Token> {
+    with_capture(|c| c.token.clone()).flatten()
 }
 
 fn with_capture<T>(f: impl FnOnce(&mut Capture) -> T) -> Option<T> {

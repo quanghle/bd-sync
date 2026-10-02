@@ -178,6 +178,31 @@ fn workspaces_text(workspaces: &[String]) -> String {
     if workspaces.iter().any(|w| w == "*") { "all".to_string() } else { workspaces.join(",") }
 }
 
+/// A token as one line, from its [`Token::summary`] (maybe a server's):
+/// `role write, kind human, workspaces all; token <name>, expires <time>,
+/// GitHub user <login>`.
+pub fn access_line(summary: &serde_json::Value) -> String {
+    let text = |k: &str| summary[k].as_str().unwrap_or("?").to_string();
+    let workspaces: Vec<String> = summary["workspaces"]
+        .as_array()
+        .map(|list| list.iter().filter_map(|w| w.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let mut line = format!(
+        "role {}, kind {}, workspaces {}; token {}",
+        text("role"),
+        text("kind"),
+        workspaces_text(&workspaces),
+        text("name")
+    );
+    if let Some(at) = summary["expires_at"].as_str() {
+        line.push_str(&format!(", expires {at}"));
+    }
+    if let Some(login) = summary["github"]["login"].as_str() {
+        line.push_str(&format!(", GitHub user {login}"));
+    }
+    line
+}
+
 impl Token {
     pub fn allows_workspace(&self, workspace: &str) -> bool {
         self.workspaces.iter().any(|w| w == "*" || w == workspace)
@@ -196,6 +221,20 @@ impl Token {
     /// Whether the token no longer works at `now` because it expired.
     pub fn expired(&self, now: Timestamp) -> bool {
         self.expires_at.is_some_and(|at| at <= now)
+    }
+
+    /// What `bd info` tells a client of the token it used: never its id or
+    /// hash.
+    pub fn summary(&self) -> serde_json::Value {
+        json!({
+            "name": self.name,
+            "actor": self.actor,
+            "role": self.role,
+            "kind": self.kind,
+            "workspaces": self.workspaces,
+            "expires_at": self.expires_at,
+            "github": self.github,
+        })
     }
 
     fn view(&self) -> serde_json::Value {
@@ -1037,6 +1076,26 @@ mod tests {
         drop(held);
         writer.join().unwrap().unwrap();
         assert_eq!(load_file(&tokens_path(dir.path())).unwrap().tokens.len(), 1);
+    }
+
+    #[test]
+    fn clients_see_what_their_token_may_do_but_never_its_hash() {
+        let mut t = token("alice", &["proj", "ops"]);
+        t.kind = Kind::Human;
+        t.sha256 = hash("bdt_secret");
+        let summary = t.summary();
+        let text = summary.to_string();
+        assert!(!text.contains(&t.sha256) && summary.get("id").is_none(), "{text}");
+        assert_eq!(access_line(&summary), "role write, kind human, workspaces proj,ops; token n");
+
+        t.workspaces = vec!["*".into()];
+        t.expires_at = Some(Timestamp::parse_rfc3339("2026-11-01T00:00:00Z").unwrap());
+        t.github = Some(gh("alice", 1));
+        assert_eq!(
+            access_line(&t.summary()),
+            "role write, kind human, workspaces all; token n, expires 2026-11-01T00:00:00.000Z, GitHub user alice"
+        );
+        assert_eq!(access_line(&json!({})), "role ?, kind ?, workspaces ; token ?", "whatever a server sends");
     }
 
     #[test]

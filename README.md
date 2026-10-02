@@ -693,7 +693,7 @@ commit the result, so every checkout and agent uses the shared workspace:
 bd remote set https://bd.example.com/w/proj   # writes .bd/remote.toml (--ca-cert ca.pem for a private CA)
 bd remote login --github                      # signs in with GitHub, where the server allows it; the server issues the token
 bd remote login                               # or: prompts for a token from the server's admin, checks it, saves it
-bd remote show                                # checks the URL, certificate, token and actor
+bd remote show                                # checks the URL, certificate, token and actor; shows what the token may do
 bd ready                                      # every command now runs on the server
 BD_ACTOR=alice/agent-2 bd claim --next        # sub-actors: one lease holder per agent
 BD_SESSION=agent-3 bd claim --next            # outside an agent harness: acts as <token actor>/agent-3
@@ -779,7 +779,11 @@ leases keep naming who holds them. Roles:
 A token's kind, independent of its role, says who holds it: `agent` (the
 default) or `human` (`--kind human`, or `kind = "human"` in an `auth.toml`
 rule). Keep human tokens out of agents' environments, since they
-can approve. The server enforces roles and kinds in the engine, so a `bd batch`
+can approve. A client sees its own token's name, role, kind, workspaces,
+expiry and GitHub account in `bd remote show` (its `access` line) and in
+`bd info` (`token` in its JSON), never the secret: that tells a refusal
+(exit 7) by role or kind apart from one by actor or workspace. The server
+enforces roles and kinds in the engine, so a `bd batch`
 or a playbook gets the same answer as a single command:
 
 - Taking over a live claim of another actor needs `--take-over`, as

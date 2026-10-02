@@ -4668,6 +4668,9 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let shown: Value =
         serde_json::from_str(&check(signed_in(alice.path(), &url, &["--json", "remote", "show"]), "show")).unwrap();
     assert_eq!(shown["server"]["actor"], "alice");
+    let token = &shown["server"]["token"];
+    assert_eq!((token["name"].as_str(), token["github"]["login"].as_str()), (Some(name.as_str()), Some("alice")));
+    assert!(token["expires_at"].as_str().is_some_and(|at| at > "2026"), "{token}");
 
     // By team, then by organization: the first matching rule's permissions.
     github.next("bob", 0);
@@ -4932,4 +4935,35 @@ fn github_accounts_keep_their_actor_until_an_admin_releases_it() {
 
     let out = bd(&root).args(["serve", "token", "revoke", "x", "--forget", "--root"]).arg(&root).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "--forget goes with --github");
+}
+
+#[test]
+fn info_and_remote_show_tell_clients_what_their_token_may_do() {
+    let server = Server::start();
+    let alice = server.client(&server.token(
+        "alice-desk",
+        "alice",
+        &["--role", "admin", "--kind", "human", "--workspace", "proj"],
+    ));
+    let dash = server.client(&server.token("dash", "dash", &["--role", "read"]));
+
+    let token = alice.json(&["info"])["token"].clone();
+    assert_eq!(
+        token,
+        json!({ "name": "alice-desk", "actor": "alice", "role": "admin", "kind": "human", "workspaces": ["proj"],
+                "expires_at": null, "github": null }),
+        "never the token's id or hash"
+    );
+    let shown = alice.ok(&["remote", "show"]);
+    assert!(shown.contains("access      role admin, kind human, workspaces proj; token alice-desk"), "{shown}");
+    let shown: Value = serde_json::from_str(&alice.ok(&["--json", "remote", "show"])).unwrap();
+    assert_eq!(shown["server"]["token"]["kind"], "human");
+
+    let info = dash.ok(&["info"]);
+    assert!(info.contains("access      role read, kind agent, workspaces all; token dash"), "{info}");
+
+    // Locally no token is involved.
+    let local: Value = serde_json::from_str(&check(server.local("alice", &["--json", "info"]), "local info")).unwrap();
+    assert!(local["token"].is_null(), "{local}");
+    assert!(!check(server.local("alice", &["info"]), "local info").contains("access"));
 }

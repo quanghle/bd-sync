@@ -1182,6 +1182,7 @@ impl Server {
             admin: policy.admin,
             human: policy.human,
             token_actor: policy.actor,
+            token: Some(token.clone()),
             ..Capture::new(Box::new(out.clone()))
         };
         let (exit_code, captured) = io::capture(capture, || crate::execute(&mut app, &cli.command));

@@ -381,15 +381,26 @@ fn playbook_files_are_parsed_strictly() {
 fn timer_and_github_gates_via_gate_check() {
     let ws = Ws::new();
     let work = ws.id(&["create", "Bake"]);
-    // The timer counts from `gate create`; a 2s timer leaves slow CI runners
-    // room to spawn two processes before the first check.
-    let armed = std::time::Instant::now();
-    ws.ok(&["gate", "create", "-t", "timer", "--timeout", "2s", "--blocks", &work]);
+    // The timer counts from the gate's `armed_at`, recorded inside `gate create`'s
+    // transaction; read the deadline the gate stores rather than timing the process.
+    let gate = ws.id(&["gate", "create", "-t", "timer", "--timeout", "2s", "--blocks", &work]);
+    let deadline =
+        bd_core::Timestamp::parse_rfc3339(ws.json(&["gate", "show", &gate])["deadline"].as_str().unwrap()).unwrap();
     let checked = ws.json(&["gate", "check"]);
-    assert_eq!(checked["checked"][0]["verdict"], "pending");
-    std::thread::sleep(std::time::Duration::from_millis(2100).saturating_sub(armed.elapsed()));
-    let checked = ws.json(&["gate", "check"]);
-    assert_eq!(checked["checked"][0]["action"], "opened");
+    if bd_core::Timestamp::now() < deadline {
+        assert_eq!(checked["checked"][0]["verdict"], "pending", "{checked}");
+    }
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let wait = deadline.since(bd_core::Timestamp::now()).max(0) as u64 + 50;
+        std::thread::sleep(std::time::Duration::from_millis(wait));
+        let checked = ws.json(&["gate", "check"]);
+        if checked["checked"][0]["action"] == "opened" {
+            break;
+        }
+        assert_eq!(checked["checked"][0]["verdict"], "pending", "{checked}");
+        assert!(std::time::Instant::now() < give_up, "the timer never opened: {checked}");
+    }
     assert_eq!(ws.json(&["ready"])[0]["id"], work.as_str());
 
     let gh = fake_gh(ws.dir.path());

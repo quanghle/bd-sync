@@ -69,9 +69,8 @@ pub struct EventPage {
     pub floor: i64,
 }
 
-pub fn query(conn: &Connection, q: &EventQuery) -> Result<EventPage> {
-    let head = head(conn)?;
-    let floor = floor(conn)?;
+/// Refuse a cursor that is negative, or behind retained history.
+fn check_cursor(q: &EventQuery, head: i64, floor: i64) -> Result<()> {
     if let Some(since) = q.since {
         if since < 0 {
             return Err(Error::invalid("event cursor must be >= 0"));
@@ -80,11 +79,16 @@ pub fn query(conn: &Connection, q: &EventQuery) -> Result<EventPage> {
             return Err(Error::EventsTruncated { since, floor });
         }
     }
+    Ok(())
+}
+
+/// The SQL conditions of `q`'s filters, and of events after `after`, with their parameters.
+fn filters(q: &EventQuery, after: Option<i64>) -> (String, Vec<SqlValue>) {
     let mut conds = String::new();
     let mut params: Vec<SqlValue> = Vec::new();
-    if let Some(since) = q.since {
+    if let Some(after) = after {
         conds.push_str(" AND seq > ?");
-        params.push(SqlValue::Integer(since));
+        params.push(SqlValue::Integer(after));
     }
     if let Some(id) = &q.issue_id {
         conds.push_str(" AND issue_id = ?");
@@ -98,21 +102,86 @@ pub fn query(conn: &Connection, q: &EventQuery) -> Result<EventPage> {
         conds.push_str(" AND actor = ?");
         params.push(SqlValue::Text(actor.clone()));
     }
-    let cols = "seq, tx, ts, actor, op, issue_id, data";
+    (conds, params)
+}
+
+const COLS: &str = "seq, tx, ts, actor, op, issue_id, data";
+
+pub fn query(conn: &Connection, q: &EventQuery) -> Result<EventPage> {
+    let head = head(conn)?;
+    let floor = floor(conn)?;
+    check_cursor(q, head, floor)?;
+    let (conds, mut params) = filters(q, q.since);
     let sql = match (q.since, q.limit) {
         (Some(_), Some(n)) => {
             params.push(SqlValue::Integer(n as i64));
-            format!("SELECT {cols} FROM events WHERE 1=1{conds} ORDER BY seq LIMIT ?")
+            format!("SELECT {COLS} FROM events WHERE 1=1{conds} ORDER BY seq LIMIT ?")
         }
-        (Some(_), None) => format!("SELECT {cols} FROM events WHERE 1=1{conds} ORDER BY seq"),
+        (Some(_), None) => format!("SELECT {COLS} FROM events WHERE 1=1{conds} ORDER BY seq"),
         (None, n) => {
             params.push(SqlValue::Integer(n.unwrap_or(50) as i64));
-            format!("SELECT * FROM (SELECT {cols} FROM events WHERE 1=1{conds} ORDER BY seq DESC LIMIT ?) ORDER BY seq")
+            format!("SELECT * FROM (SELECT {COLS} FROM events WHERE 1=1{conds} ORDER BY seq DESC LIMIT ?) ORDER BY seq")
         }
     };
     let mut stmt = conn.prepare_cached(&sql)?;
     let events = stmt.query_map(params_from_iter(params), event_from_row)?.collect::<rusqlite::Result<_>>()?;
     Ok(EventPage { events, head, floor })
+}
+
+/// The events [`query`] returns for `q`, handed to `f` oldest first in
+/// batches of at most `batch` instead of collected, so that a long page
+/// (`--since` without a limit) is never whole in memory. Returns the head and
+/// floor, as [`query`] gives them. In one read transaction, the batches make
+/// up the same page [`query`] would.
+pub fn query_each(
+    conn: &Connection,
+    q: &EventQuery,
+    batch: usize,
+    f: &mut dyn FnMut(&[Event]) -> Result<()>,
+) -> Result<(i64, i64)> {
+    let head = head(conn)?;
+    let floor = floor(conn)?;
+    check_cursor(q, head, floor)?;
+    let (mut after, mut left) = match q.since {
+        Some(since) => (since, q.limit),
+        None => {
+            // The most recent `limit` events (50 by default): from the oldest of them on.
+            let n = q.limit.unwrap_or(50);
+            if n == 0 {
+                return Ok((head, floor));
+            }
+            let (conds, mut params) = filters(q, None);
+            params.push(SqlValue::Integer(i64::try_from(n - 1).unwrap_or(i64::MAX)));
+            let sql = format!("SELECT seq FROM events WHERE 1=1{conds} ORDER BY seq DESC LIMIT 1 OFFSET ?");
+            let oldest: Option<i64> =
+                conn.prepare_cached(&sql)?.query_row(params_from_iter(params), |r| r.get(0)).optional()?;
+            (oldest.map_or(0, |seq| seq - 1), Some(n))
+        }
+    };
+    let batch = batch.max(1);
+    loop {
+        let take = left.map_or(batch, |l| l.min(batch));
+        if take == 0 {
+            break;
+        }
+        let (conds, mut params) = filters(q, Some(after));
+        params.push(SqlValue::Integer(i64::try_from(take).unwrap_or(i64::MAX)));
+        let sql = format!("SELECT {COLS} FROM events WHERE 1=1{conds} ORDER BY seq LIMIT ?");
+        let events: Vec<Event> = conn
+            .prepare_cached(&sql)?
+            .query_map(params_from_iter(params), event_from_row)?
+            .collect::<rusqlite::Result<_>>()?;
+        let Some(last) = events.last().map(|e| e.seq) else { break };
+        f(&events)?;
+        after = last;
+        if let Some(l) = &mut left {
+            *l -= events.len();
+        }
+        if events.len() < take {
+            break;
+        }
+    }
+    Ok((head, floor))
 }
 
 /// Full retained history of one issue, oldest first.

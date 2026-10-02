@@ -627,7 +627,9 @@ pub fn cmd_show(app: &mut App, a: &ShowArgs) -> Result<()> {
         let all = a.ids.iter().map(|raw| r.details(&r.resolve_id(raw)?)).collect::<Result<Vec<_>>>()?;
         Ok((all, r.now()))
     })?;
-    if app.g.json {
+    if app.g.json && all.len() > 1 {
+        app.print(Out::default().items(all));
+    } else if app.g.json {
         app.print_json(&one_or_many(&all));
     } else if app.g.quiet {
         all.iter().for_each(|d| io::outln(&d.issue.id));
@@ -660,13 +662,15 @@ pub fn cmd_list(app: &mut App, a: &ListArgs) -> Result<()> {
         Ok((issues, parents, r.now()))
     })?;
     let n = issues.len();
-    let lines = fmt::nest(&issues, &parents)
-        .into_iter()
-        .map(|(depth, i)| format!("{}{}", bd_core::graph::indent(depth), fmt::issue_line(i, now)));
-    let out =
-        Out::new(&issues).lines(lines).line(if n == 0 { "No issues".to_string() } else { format!("-- {n} issue(s)") });
-    let ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
-    app.print(Out { ids, ..out });
+    let mut out = Out::default();
+    if !json {
+        let lines = fmt::nest(&issues, &parents)
+            .into_iter()
+            .map(|(depth, i)| format!("{}{}", bd_core::graph::indent(depth), fmt::issue_line(i, now)));
+        out = out.lines(lines).line(if n == 0 { "No issues".to_string() } else { format!("-- {n} issue(s)") });
+    }
+    out.ids = issues.iter().map(|i| i.id.clone()).collect();
+    app.print(out.items(issues));
     Ok(())
 }
 
@@ -683,7 +687,7 @@ pub fn cmd_ready(app: &mut App, a: &ReadyArgs) -> Result<()> {
         };
         Ok((r.ready(&q)?, r.stats()?, r.now()))
     })?;
-    let mut out = Out::new(&issues);
+    let mut out = Out::default();
     if issues.is_empty() {
         out = out.line(format!(
             "No ready work ({} blocked, {} in progress, {} deferred)",
@@ -698,7 +702,7 @@ pub fn cmd_ready(app: &mut App, a: &ReadyArgs) -> Result<()> {
         }
     }
     out.ids = issues.iter().map(|i| i.id.clone()).collect();
-    app.print(out);
+    app.print(out.items(issues));
     Ok(())
 }
 
@@ -707,7 +711,7 @@ pub fn cmd_blocked(app: &mut App, a: &BlockedArgs) -> Result<()> {
         let f = filter_from(r, &a.filter)?;
         Ok((r.blocked(&f, (a.limit > 0).then_some(a.limit))?, r.now()))
     })?;
-    let mut out = Out::new(&blocked);
+    let mut out = Out::default();
     if blocked.is_empty() {
         out = out.line("Nothing is blocked");
     }
@@ -718,7 +722,7 @@ pub fn cmd_blocked(app: &mut App, a: &BlockedArgs) -> Result<()> {
         }
         out = out.id(b.issue.id.clone());
     }
-    app.print(out);
+    app.print(out.items(blocked));
     Ok(())
 }
 
@@ -727,7 +731,7 @@ pub fn cmd_leases(app: &mut App, a: &LeasesArgs) -> Result<()> {
     if a.expired {
         leases.retain(|l| l.expired);
     }
-    let mut out = Out::new(&leases);
+    let mut out = Out::default();
     if leases.is_empty() {
         out = out.line("No leases");
     }
@@ -736,7 +740,7 @@ pub fn cmd_leases(app: &mut App, a: &LeasesArgs) -> Result<()> {
             .line(format!("◐ {} {} — {}", l.lease.issue_id, l.title, fmt::lease_text(&l.lease, now)))
             .id(l.lease.issue_id.clone());
     }
-    app.print(out);
+    app.print(out.items(leases));
     Ok(())
 }
 
@@ -890,7 +894,7 @@ pub fn cmd_comments(app: &mut App, id: &str) -> Result<()> {
         let c = r.comments(&id)?;
         Ok((id, c))
     })?;
-    let mut out = Out::new(&comments);
+    let mut out = Out::default();
     if comments.is_empty() {
         out = out.line(format!("No comments on {id}"));
     }
@@ -900,7 +904,7 @@ pub fn cmd_comments(app: &mut App, id: &str) -> Result<()> {
             out = out.line(format!("  {line}"));
         }
     }
-    app.print(out);
+    app.print(out.items(comments));
     Ok(())
 }
 
@@ -916,7 +920,7 @@ pub fn cmd_memory_get(app: &mut App, key: &str) -> Result<()> {
 
 pub fn cmd_memory_list(app: &mut App, query: Option<&str>) -> Result<()> {
     let list = app.read(|r| r.memories(query))?;
-    let mut out = Out::new(&list);
+    let mut out = Out::default();
     out = out.line(match query {
         Some(q) => format!("Memories matching {q:?} ({}):", list.len()),
         None => format!("Memories ({}):", list.len()),
@@ -925,9 +929,12 @@ pub fn cmd_memory_list(app: &mut App, query: Option<&str>) -> Result<()> {
         let preview: String = m.content.replace('\n', " ").chars().take(120).collect();
         out = out.line(format!("  {}", m.key)).line(format!("    {preview}")).id(m.key.clone());
     }
-    app.print(out);
+    app.print(out.items(list));
     Ok(())
 }
+
+/// Events `bd events` reads and prints at a time.
+const EVENT_BATCH: usize = 1000;
 
 pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
     if let Some(EventsAction::Prune(p)) = &a.action {
@@ -952,17 +959,38 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
     if let Some(wait) = a.wait.filter(|_| !io::serving()) {
         q.since = Some(wait_for_events(app, &q, wait, a.interval_ms)?);
     }
-    let print = |app: &App, events: &[bd_core::Event]| {
-        io::with_stdout(|w| {
-            for e in events {
-                let line = if app.g.json { serde_json::to_string(e).unwrap_or_default() } else { fmt::event_line(e) };
-                let _ = writeln!(w, "{line}");
+    let json = app.g.json;
+    let print = |w: &mut dyn Write, events: &[bd_core::Event]| -> std::io::Result<()> {
+        for e in events {
+            match json {
+                true => writeln!(w, "{}", serde_json::to_string(e).unwrap_or_default())?,
+                false => writeln!(w, "{}", fmt::event_line(e))?,
             }
-        });
+        }
+        Ok(())
     };
-    let page = app.read(|r| r.events(&q))?;
-    print(app, &page.events);
-    let mut cursor = page.events.last().map(|e| e.seq).unwrap_or(page.head.max(q.since.unwrap_or(0)));
+    // A batch at a time, so that a long page (`--since` without `--limit`) is never whole in memory; in one read
+    // transaction, so that it is the same page. Output that can no longer be written (a closed pipe, a client
+    // gone) ends the command quietly, as no one reads the rest.
+    let mut last = None;
+    let mut closed = false;
+    let read = io::with_stdout(|w| {
+        let mut w = std::io::BufWriter::new(w);
+        let read = app.read(|r| {
+            r.events_each(&q, EVENT_BATCH, &mut |events| {
+                print(&mut w, events).inspect_err(|_| closed = true)?;
+                last = events.last().map(|e| e.seq);
+                Ok(())
+            })
+        });
+        closed |= w.flush().is_err();
+        read
+    });
+    let head = match read {
+        _ if closed => return Ok(()),
+        read => read?.0,
+    };
+    let mut cursor = last.unwrap_or(head.max(q.since.unwrap_or(0)));
     if !a.follow {
         io::cursor(cursor);
         return Ok(());
@@ -977,7 +1005,9 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
         } else {
             cursor = cursor.max(page.head);
         }
-        print(app, &page.events);
+        if io::with_stdout(|w| print(w, &page.events)).is_err() {
+            return Ok(());
+        }
     }
 }
 
@@ -1040,7 +1070,7 @@ pub fn cmd_history(app: &mut App, a: &HistoryArgs) -> Result<()> {
     if events.is_empty() && !exists {
         return Err(Error::not_found("issue", id));
     }
-    let mut out = Out::new(&events);
+    let mut out = Out::default();
     out = if events.is_empty() {
         out.line(format!("No retained history for {id} (events were pruned)"))
     } else {
@@ -1049,7 +1079,7 @@ pub fn cmd_history(app: &mut App, a: &HistoryArgs) -> Result<()> {
     for e in &events {
         out = out.line(fmt::event_line(e)).id(e.seq.to_string());
     }
-    app.print(out);
+    app.print(out.items(events));
     Ok(())
 }
 

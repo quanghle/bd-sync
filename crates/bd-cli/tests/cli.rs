@@ -150,6 +150,41 @@ fn list_nests_children_under_listed_parents() {
 }
 
 #[test]
+fn long_outputs_print_whole_across_batches() {
+    let ws = Ws::new();
+    let script = ws.dir.path().join("ops.txt");
+    let ops: String = (0..1100).map(|n| format!("create \"Issue {n}\"\n")).collect();
+    std::fs::write(&script, ops).unwrap();
+    ws.json(&["batch", "-f", script.to_str().unwrap()]);
+
+    // Events print a batch at a time: every one, in order, across the batches.
+    let events = ws.ok(&["--json", "events", "--since", "0"]);
+    let seqs: Vec<i64> =
+        events.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()["seq"].as_i64().unwrap()).collect();
+    assert!(seqs.len() > 1100, "{}", seqs.len());
+    assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "each event once, in order");
+    let tail = ws.ok(&["--json", "events", "-n", "1050"]);
+    assert_eq!(tail.lines().count(), 1050, "the most recent 1050");
+    assert!(tail.lines().last().unwrap().contains(&format!("\"seq\":{}", seqs.last().unwrap())));
+
+    // A reader that stops early ends the command quietly, without it reading the rest.
+    let mut child = Ws::cmd_in(ws.dir.path(), "tester", &["--json", "events", "--since", "0"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut first = String::new();
+    std::io::BufRead::read_line(&mut std::io::BufReader::new(child.stdout.take().unwrap()), &mut first).unwrap();
+    assert!(first.contains("\"seq\":1,"), "{first}");
+    assert!(child.wait().unwrap().success(), "a closed pipe is no failure");
+
+    // A list streams element by element into the same JSON its whole tree printed.
+    let list = ws.ok(&["--json", "list", "--limit", "0"]);
+    let parsed: Value = serde_json::from_str(&list).unwrap();
+    assert_eq!(parsed.as_array().unwrap().len(), 1100);
+    assert_eq!(list, format!("{}\n", serde_json::to_string_pretty(&parsed).unwrap()));
+}
+
+#[test]
 fn batch_is_atomic_with_back_references() {
     let ws = Ws::new();
     let script = ws.dir.path().join("ops.txt");

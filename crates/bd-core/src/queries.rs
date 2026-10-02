@@ -121,6 +121,17 @@ pub trait Queries {
         events::query(self.conn(), q)
     }
 
+    /// The events [`Queries::events`] returns, handed to `f` oldest first in
+    /// batches of at most `batch` instead of collected: the head and floor.
+    fn events_each(
+        &self,
+        q: &EventQuery,
+        batch: usize,
+        f: &mut dyn FnMut(&[Event]) -> Result<()>,
+    ) -> Result<(i64, i64)> {
+        events::query_each(self.conn(), q, batch, f)
+    }
+
     fn history(&self, id: &str) -> Result<Vec<Event>> {
         events::history(self.conn(), id)
     }

@@ -1027,3 +1027,52 @@ fn cycles_in_a_damaged_database_are_each_listed_once() {
     // Each cycle cost a scan of the whole path: minutes in a debug build.
     assert!(took < Duration::from_secs(60), "dep cycles took {took:?}");
 }
+
+#[test]
+fn batched_event_pages_are_the_whole_pages() {
+    let mut env = Env::new();
+    let a = env.create("A", 1);
+    let b = env.create("B", 2);
+    env.close(&a);
+    env.store
+        .write("create", "bob", |tx| tx.create_issue(NewIssue { title: "C".into(), ..Default::default() }))
+        .unwrap();
+    env.dep(&b, &a, DepType::Blocks);
+    let head = env.events().last().unwrap().seq;
+    let mut queries = Vec::new();
+    for since in [None, Some(0), Some(2), Some(head), Some(head + 5)] {
+        for limit in [None, Some(0), Some(1), Some(3), Some(100)] {
+            queries.push(EventQuery { since, limit, ..Default::default() });
+        }
+        queries.push(EventQuery { since, issue_id: Some(a.clone()), ..Default::default() });
+        queries.push(EventQuery { since, ops: vec!["created".into()], limit: Some(2), ..Default::default() });
+        queries.push(EventQuery { since, actor: Some("bob".into()), ..Default::default() });
+    }
+    let each = |store: &Store, q: &EventQuery, batch: usize| {
+        store.read(|r| {
+            let mut got: Vec<Event> = Vec::new();
+            let (head, floor) = r.events_each(q, batch, &mut |events| {
+                assert!(!events.is_empty() && events.len() <= batch.max(1), "{} in a batch of {batch}", events.len());
+                got.extend_from_slice(events);
+                Ok(())
+            })?;
+            Ok((got, head, floor))
+        })
+    };
+    for q in &queries {
+        let page = env.store.read(|r| r.events(q)).unwrap();
+        for batch in [0, 1, 2, 3, 1000] {
+            let (got, head, floor) = each(&env.store, q, batch).unwrap();
+            let seqs = |events: &[Event]| events.iter().map(|e| e.seq).collect::<Vec<_>>();
+            assert_eq!(seqs(&got), seqs(&page.events), "{q:?} in batches of {batch}");
+            assert_eq!((head, floor), (page.head, page.floor), "{q:?}");
+        }
+    }
+
+    // A cursor behind retained history fails the same way.
+    let opts = PruneOptions { before: Some(4), ..Default::default() };
+    env.store.write("prune", "alice", |tx| tx.prune_events(&opts)).unwrap();
+    let behind = EventQuery { since: Some(1), ..Default::default() };
+    assert!(matches!(env.store.read(|r| r.events(&behind)), Err(Error::EventsTruncated { .. })));
+    assert!(matches!(each(&env.store, &behind, 2), Err(Error::EventsTruncated { .. })));
+}

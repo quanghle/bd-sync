@@ -505,7 +505,11 @@ in progress share a 256 MiB memory budget (more if one maximum-size request
 needs it), and the server answers 503 when it is used up, which clients
 retry. Answers stream: past 64 KiB, a command's output goes to the client
 as the command writes it, through less than 1 MiB of buffers per request, so
-a large `bd export` costs the server no more memory than a claim. At most 8
+a large `bd export` costs the server no more memory than a claim. `bd events`
+reads and sends a long page a thousand events at a time, and lists (`list`,
+`ready`, `blocked`, `show` of several issues, `history`, `comments`) write
+their JSON element by element, so they hold their results but no copy of them
+as JSON. At most 8
 reads stream their answers at once (another is answered 503, which clients
 retry), so slow readers cannot take the slots of short commands like claims.
 A client that takes nothing for 60 s, or takes a streamed answer slower than

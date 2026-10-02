@@ -42,6 +42,10 @@ impl Ws {
             .env_remove("BD_GH")
             .env_remove("BD_TEST_CHMOD_IGNORED")
             .env("XDG_CONFIG_HOME", dir.join(".xdg"));
+        // Where the harnesses keep user-level hooks, which `bd agents pull` looks at.
+        for var in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME"] {
+            c.env(var, dir.join(".home").join(var));
+        }
         for var in SESSION_ENV {
             c.env_remove(var);
         }
@@ -1577,6 +1581,45 @@ fn age(dir: &Path, rel: &str) {
 }
 
 #[test]
+fn agents_pull_adds_the_session_start_hook_once() {
+    let ws = Ws::new();
+    let root = ws.dir.path();
+    let text = ws.ok(&["agents", "status", "--harness", "copilot"]);
+    assert_eq!(text, "copilot: nothing served\ncopilot: session-start hook to add to .github/hooks/bd.json\n");
+    assert!(!root.join(".github").exists(), "status writes nothing");
+
+    let pulled = ws.json(&["agents", "pull", "--harness", "copilot"]);
+    assert_eq!(
+        pulled["harnesses"]["copilot"]["hook"],
+        serde_json::json!({"file": ".github/hooks/bd.json", "state": "added"})
+    );
+    let hooks: Value = serde_json::from_str(&read(root, ".github/hooks/bd.json").unwrap()).unwrap();
+    assert_eq!(hooks["version"], 1);
+    let commands: Vec<&str> =
+        hooks["hooks"]["sessionStart"].as_array().unwrap().iter().map(|h| h["command"].as_str().unwrap()).collect();
+    assert_eq!(commands, ["bd hook session-start --harness copilot", "bd prime --hook copilot"]);
+    assert_eq!(ws.ok(&["agents", "pull", "--harness", "copilot"]), "copilot: nothing served\n");
+    let again = ws.json(&["agents", "status", "--harness", "copilot"]);
+    assert_eq!(again["harnesses"]["copilot"]["hook"]["state"], "present");
+
+    // Merged into the personal settings, keeping what they hold.
+    write_file(root, ".claude/settings.local.json", r#"{"permissions": {"allow": ["Bash(ls)"]}}"#);
+    let pulled = ws.json(&["agents", "pull", "--harness", "claude"]);
+    assert_eq!(pulled["harnesses"]["claude"]["hook"]["file"], ".claude/settings.local.json");
+    let settings: Value = serde_json::from_str(&read(root, ".claude/settings.local.json").unwrap()).unwrap();
+    assert_eq!(settings["permissions"]["allow"][0], "Bash(ls)");
+    assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][1]["command"], "bd prime");
+
+    // A file bd cannot merge into is left as it is.
+    write_file(root, ".codex/hooks.json", "[]");
+    let text = ws.ok(&["agents", "pull", "--harness", "codex"]);
+    assert!(text.contains("codex: session-start hook not added: .codex/hooks.json: not a JSON object"), "{text}");
+    assert_eq!(read(root, ".codex/hooks.json").as_deref(), Some("[]"));
+    let skipped = ws.json(&["agents", "pull", "--harness", "codex", "--no-hook"]);
+    assert!(skipped["harnesses"]["codex"].get("hook").is_none());
+}
+
+#[test]
 fn agents_pull_places_each_harness_set_in_its_own_places() {
     let (ws, agents) = agents_ws();
     let root = ws.dir.path();
@@ -1609,7 +1652,15 @@ fn agents_pull_places_each_harness_set_in_its_own_places() {
     assert!(gitignore.starts_with("bd.db\n") && gitignore.lines().any(|l| l == "agents.lock*"), "{gitignore}");
 
     let text = ws.ok(&["agents", "pull", "--harness", "claude,codex"]);
-    assert_eq!(text, "claude: skills added: deploy, review\ncodex: skills added: triage\n");
+    let hook = "session-start hook added to";
+    let runs = "new sessions run `bd hook session-start` and `bd prime`";
+    assert_eq!(
+        text,
+        format!(
+            "claude: skills added: deploy, review\nclaude: {hook} .claude/settings.local.json: {runs}\ncodex: skills \
+             added: triage\ncodex: {hook} .codex/hooks.json: {runs} (once trusted in Codex's /hooks)\n"
+        )
+    );
     assert_eq!(read(root, ".claude/skills/deploy/scripts/run.sh").as_deref(), Some("#!/bin/sh\necho deploy\n"));
     assert_eq!(read(root, ".agents/skills/triage/SKILL.md").as_deref(), Some("---\nname: triage\n---\n"));
     #[cfg(unix)]
@@ -1997,7 +2048,7 @@ fn agents_pull_makes_an_adopted_script_executable() {
     // Committed without its executable bit.
     write_file(root, ".claude/skills/deploy/run.sh", "#!/bin/sh\n");
     mode(root.join(".claude/skills/deploy/run.sh"), 0o644);
-    let text = ws.ok(&["agents", "status", "--harness", "claude"]);
+    let text = ws.ok(&["agents", "status", "--harness", "claude", "--no-hook"]);
     assert_eq!(text, "claude: skills to add: deploy\n", "the skill is new here");
     let pulled = ws.json(&["agents", "pull", "--harness", "claude"]);
     let updated = &pulled["harnesses"]["claude"]["skills"]["updated"];
@@ -2039,7 +2090,8 @@ fn agents_pull_says_once_that_the_file_system_keeps_no_executable_bit() {
     assert_eq!(
         ok(&["agents", "pull", "--harness", "claude"]),
         "claude: skills added: deploy\nclaude: not executable here, as the file system did not keep the executable \
-         bit: .claude/skills/deploy/run.sh\n"
+         bit: .claude/skills/deploy/run.sh\nclaude: session-start hook added to .claude/settings.local.json: new \
+         sessions run `bd hook session-start` and `bd prime`\n"
     );
     let script = std::fs::metadata(root.join(".claude/skills/deploy/run.sh")).unwrap();
     assert_eq!(script.permissions().mode() & 0o111, 0, "the file system kept no bit");

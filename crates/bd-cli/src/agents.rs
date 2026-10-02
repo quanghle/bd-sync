@@ -77,6 +77,10 @@
 //! a set is fetched whole only when files are to be written or MCP changes
 //! shown.
 //!
+//! `pull` also adds the harness's session-start hook where none is
+//! configured, and `status` reports that it would ([`session_hook`]); both
+//! leave it out with `--no-hook`. The hook is bd's own, never the server's.
+//!
 //! `bd hook session-start` pulls for the harness starting a session, within
 //! a few seconds, and tells the session what changed and what waits for
 //! approval ([`hook`]). `bd agents watch` pulls each time the workspace's
@@ -114,7 +118,8 @@
 //!         "removed": ["old"], "restored": [], "replaced": [], "adopted": [], "edited": [],
 //!         "conflicts": [{"name": null, "reason": ".mcp.json: not valid JSON (...); ..."}]
 //!       },
-//!       "unset_env": ["GITHUB_TOKEN"]
+//!       "unset_env": ["GITHUB_TOKEN"],
+//!       "hook": {"file": ".claude/settings.local.json", "state": "added"}
 //!     }
 //!   }
 //! }
@@ -143,6 +148,9 @@
 //!   `conflicts` name an entry, or `null` for the whole file.
 //! - `unset_env`: the variables the MCP definitions read that are unset or
 //!   empty here.
+//! - `hook` (without `--no-hook`): the session-start hook's `file` (where
+//!   it is configured, or goes) and `state`: `present`, `added`, or
+//!   `conflict` with a `reason`.
 //!
 //! `approve` shows each entry and its prompt on stderr; then its text
 //! output has a line per outcome and harness (`claude: approved github:
@@ -190,6 +198,7 @@ pub mod checkout;
 pub mod hook;
 pub mod lock;
 pub mod mcp_file;
+pub mod session_hook;
 pub mod show;
 pub mod sync;
 pub mod watch;
@@ -208,6 +217,7 @@ use crate::io;
 use crate::playbooks;
 use crate::remote::{self, Remote};
 use checkout::Checkout;
+use session_hook::HookState;
 use sync::{HarnessReport, Options, PendingChange, Report, SkillChange, Source};
 
 /// The workspace's agents directory, next to its database.
@@ -220,8 +230,8 @@ pub fn cmd_agents(app: &mut App, cmd: &AgentsCommand) -> Result<()> {
     match cmd {
         AgentsCommand::Manifest(a) => cmd_manifest(app, a),
         AgentsCommand::Fetch(a) => cmd_fetch(app, a),
-        AgentsCommand::Status(a) => cmd_sync(app, None, &a.harnesses, false, false),
-        AgentsCommand::Pull(a) => cmd_sync(app, None, &a.harnesses, true, a.force),
+        AgentsCommand::Status(a) => cmd_sync(app, None, &a.harnesses, false, false, !a.no_hook),
+        AgentsCommand::Pull(a) => cmd_sync(app, None, &a.harnesses, true, a.force, !a.no_hook),
         AgentsCommand::Approve(a) => approve::cmd_approve(app, None, a),
         AgentsCommand::Watch(a) => watch::cmd_watch(app, None, a),
     }
@@ -231,8 +241,12 @@ pub fn cmd_agents(app: &mut App, cmd: &AgentsCommand) -> Result<()> {
 /// the server's sets itself. `None`: the server runs the command.
 pub fn client_command(app: &App, remote: &Remote, cmd: &AgentsCommand) -> Result<Option<i32>> {
     match cmd {
-        AgentsCommand::Status(a) => cmd_sync(app, Some(remote), &a.harnesses, false, false).map(|()| Some(0)),
-        AgentsCommand::Pull(a) => cmd_sync(app, Some(remote), &a.harnesses, true, a.force).map(|()| Some(0)),
+        AgentsCommand::Status(a) => {
+            cmd_sync(app, Some(remote), &a.harnesses, false, false, !a.no_hook).map(|()| Some(0))
+        }
+        AgentsCommand::Pull(a) => {
+            cmd_sync(app, Some(remote), &a.harnesses, true, a.force, !a.no_hook).map(|()| Some(0))
+        }
         AgentsCommand::Approve(a) => approve::cmd_approve(app, Some(remote), a).map(|()| Some(0)),
         AgentsCommand::Watch(a) => watch::cmd_watch(app, Some(remote), a).map(|()| Some(0)),
         AgentsCommand::Manifest(_) | AgentsCommand::Fetch(_) => Ok(None),
@@ -280,12 +294,29 @@ fn cmd_fetch(app: &mut App, a: &AgentsFetchArgs) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sync(app: &App, remote: Option<&Remote>, requested: &[Harness], apply: bool, force: bool) -> Result<()> {
+fn cmd_sync(
+    app: &App,
+    remote: Option<&Remote>,
+    requested: &[Harness],
+    apply: bool,
+    force: bool,
+    hook: bool,
+) -> Result<()> {
     io::require_local(if apply { "bd agents pull" } else { "bd agents status" })?;
     let checkout = find_checkout(app, remote.is_some())?;
     let harnesses = harnesses(requested, &checkout)?;
     let opts = Options { apply, force, lock_wait: Duration::from_millis(app.g.busy_timeout_ms) };
-    let report = sync_checkout(app, remote, &checkout, &harnesses, opts)?;
+    let mut report = sync_checkout(app, remote, &checkout, &harnesses, opts)?;
+    if hook {
+        let _mutex = match apply {
+            true => Some(checkout.exclusive(opts.lock_wait)?),
+            false => checkout.shared(opts.lock_wait)?,
+        };
+        let homes = session_hook::Homes::from_env();
+        for (h, r) in report.harnesses.iter_mut() {
+            r.hook = Some(session_hook::ensure(&checkout, *h, apply, &homes)?);
+        }
+    }
     app.print(render(&report));
     Ok(())
 }
@@ -551,6 +582,25 @@ fn harness_lines(h: Harness, r: &HarnessReport, applied: bool) -> Vec<String> {
     }
     if !r.unset_env.is_empty() {
         lines.push(format!("{h}: unset environment variables the MCP servers read: {}", r.unset_env.join(", ")));
+    }
+    if let Some(hook) = &r.hook {
+        match hook.state {
+            HookState::Present => {}
+            HookState::Added if applied => lines.push(format!(
+                "{h}: session-start hook added to {}: new sessions run `bd hook session-start` and `bd prime`{}",
+                hook.file,
+                match h {
+                    Harness::Codex => " (once trusted in Codex's /hooks)",
+                    _ => "",
+                }
+            )),
+            HookState::Added => lines.push(format!("{h}: session-start hook to add to {}", hook.file)),
+            HookState::Conflict => lines.push(format!(
+                "{h}: session-start hook not added: {}: {}; add it by hand (see `bd hook session-start --help`)",
+                hook.file,
+                hook.reason.as_deref().unwrap_or_default()
+            )),
+        }
     }
     // Names and paths are checked, and reasons are bd's own, but they may quote what a file or server holds.
     lines.iter().map(|l| show::printable(l)).collect()

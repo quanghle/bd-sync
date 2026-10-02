@@ -61,6 +61,9 @@ pub struct HarnessReport {
     /// Environment variables the MCP definitions (in effect, or waiting for
     /// approval) take values from, and that are unset or empty here.
     pub unset_env: Vec<String>,
+    /// The harness's session-start hook (`status` and `pull` only, without `--no-hook`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hook: Option<super::session_hook::HookReport>,
 }
 
 #[derive(Debug, Default, Serialize)]

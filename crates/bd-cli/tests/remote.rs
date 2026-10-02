@@ -19,6 +19,10 @@ mod pty;
 fn bd(dir: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_bd"));
     c.current_dir(dir).env("BD_LOG", "error").env("XDG_CONFIG_HOME", dir.join(".xdg"));
+    // Where the harnesses keep user-level hooks, which `bd agents pull` looks at.
+    for var in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME"] {
+        c.env(var, dir.join(".home").join(var));
+    }
     for var in [
         "BD_DB",
         "BD_REMOTE",

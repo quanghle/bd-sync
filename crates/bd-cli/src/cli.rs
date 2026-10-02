@@ -1074,7 +1074,8 @@ pub enum AgentsCommand {
     /// Bring this checkout's agent skills up to date with the workspace's (.claude/skills, .agents/skills,
     /// .github/skills), recorded in .bd/agents.lock; MCP entries the server removed are removed, new or changed
     /// MCP definitions wait for `bd agents approve`. Never overwrites or deletes what bd did not write, or local
-    /// edits (without --force)
+    /// edits (without --force). Also adds the harness's session-start hook (bd hook session-start, then bd prime)
+    /// where none is configured: .claude/settings.local.json, .codex/hooks.json, .github/hooks/bd.json
     #[command(after_help = AGENTS_SYNC_HELP)]
     Pull(AgentsPullArgs),
     /// Review new and changed MCP server definitions waiting for approval and approve them one by one: shows each
@@ -1144,6 +1145,9 @@ pub struct AgentsStatusArgs {
     /// .bd/agents.lock)
     #[arg(long = "harness", value_delimiter = ',', value_parser = harness_parser())]
     pub harnesses: Vec<Harness>,
+    /// Leave the harness's session-start hook out of the check
+    #[arg(long)]
+    pub no_hook: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1157,6 +1161,9 @@ pub struct AgentsPullArgs {
     /// wait for approval
     #[arg(long)]
     pub force: bool,
+    /// Do not add the harness's session-start hook (bd hook session-start, then bd prime) where none is configured
+    #[arg(long)]
+    pub no_hook: bool,
 }
 
 #[derive(Args, Debug, Clone)]

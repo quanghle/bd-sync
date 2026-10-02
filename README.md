@@ -1220,6 +1220,24 @@ with exit 5. The rules a pull follows:
 - **MCP definitions.** New and changed definitions are never written by a
   pull, a hook or a watch: they wait for `bd agents approve`. Removals of
   unedited entries bd wrote apply at once, as they add nothing that runs.
+- **Session-start hook.** `pull` also gives the harness the session-start
+  hook ([Session-start hooks](#session-start-hooks)) when none is
+  configured, so that the first agent session in a fresh checkout runs
+  `bd prime` and keeps the checkout's assets up to date: Claude Code's in
+  `.claude/settings.local.json`, Codex's in `.codex/hooks.json`, Copilot
+  CLI's in `.github/hooks/bd.json`. The hook is bd's own, never the
+  server's (a server's sets hold no hooks). One already configured for the
+  harness, in the checkout or for the user (`~/.claude/settings.json`,
+  `$CODEX_HOME/hooks.json`, `$COPILOT_HOME/hooks/*.json` or
+  `settings.json`, an installed Copilot CLI plugin's), is left as it is,
+  and nothing is written. bd's entries are appended to what the file
+  holds, which is rewritten pretty-printed with sorted keys; a file that is
+  not a JSON object, keeps its hooks elsewhere than `hooks.<event>`, or is
+  a symlink is left alone and reported (`session-start hook not added`).
+  `status` reports `session-start hook to add`; `--no-hook` leaves the hook
+  out of either command. The files are local: keep them out of commits
+  where teammates or Copilot cloud agent run sessions without bd
+  (Copilot cloud agent runs `.github/hooks/*.json` too).
 
 MCP files keep everything bd did not write. `.mcp.json` and
 `.github/mcp.json` keep every other key and server, and are written
@@ -1241,10 +1259,12 @@ Claude Code and Copilot CLI (not `${VAR:-default}`); `env_vars` (but not
 
 With `--json`, `status` and `pull` print `{"applied", "checkout",
 "harnesses": {"<harness>": {"server_revision", "applied_revision", "skills",
-"mcp", "unset_env"}}}`, where `skills` and `mcp` list what changed, was
+"mcp", "unset_env", "hook"}}}`, where `skills` and `mcp` list what changed, was
 adopted, edited, left or is in conflict, and `mcp.pending` the definitions
 waiting (`name`, `change`: `new` or `changed`, the top-level `fields` that
-changed, and whether the entry was `edited` here); `approve` prints, per
+changed, and whether the entry was `edited` here), and `hook` the
+session-start hook's `file` and `state` (`present`, `added`, or `conflict`
+with a `reason`; left out with `--no-hook`); `approve` prints, per
 harness, the entries `approved`, `declined`, `skipped` (with a reason) and
 in `conflicts`. The module docs of `crates/bd-cli/src/agents.rs` have the
 full shapes. Exit codes: 0 when the command did its work (pending MCP
@@ -1391,6 +1411,10 @@ said when nothing is served or no answer came within 3 s):
 ```
   agent assets are served for claude, codex, copilot: `bd agents pull --harness <claude|codex|copilot>` (for each harness used here) places them in this checkout before the first agent session
 ```
+
+`bd agents pull --harness <h>` writes the harness's entries below where
+none is configured ([Pulling into a checkout](#pulling-into-a-checkout)),
+so a fresh checkout needs only `bd remote set` (or login) and one pull.
 
 **Claude Code** (`.claude/settings.json`; the `SessionStart` entry of this
 repository's): `bd hook session-start` also gives the session its own actor

@@ -18,7 +18,8 @@
 //! A server is its URL up to `/w/<workspace>`: scheme, host, port and any
 //! path prefix (lowercase scheme and host, no default port), since one token
 //! may cover every workspace of its server. A workspace entry takes precedence
-//! over its server's, and `$BD_TOKEN` over both.
+//! over its server's, and `$BD_TOKEN` over both where `--remote` or
+//! `$BD_REMOTE` names the server (never a checkout's `remote.toml`).
 //!
 //! `ca` is what the server's certificate was trusted against at login: the
 //! system's certificate authorities, or the SHA-256 of a CA file's

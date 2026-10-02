@@ -25,7 +25,7 @@ pub struct Global {
     /// Database file (default: nearest .bd/bd.db walking up from the current directory)
     #[arg(long, global = true, env = "BD_DB", value_name = "PATH")]
     pub db: Option<PathBuf>,
-    /// Workspace on a bd server, e.g. https://bd.example.com/w/proj (default: .bd/remote.toml); token: $BD_TOKEN or `bd remote login`
+    /// Workspace on a bd server, e.g. https://bd.example.com/w/proj (default: .bd/remote.toml); token: $BD_TOKEN (with this or $BD_REMOTE only) or `bd remote login`
     #[arg(long, global = true, env = "BD_REMOTE", value_name = "URL")]
     pub remote: Option<String>,
     /// Run as if started in this directory

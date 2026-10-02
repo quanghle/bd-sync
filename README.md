@@ -764,8 +764,13 @@ directory (`bd remote set` refuses to hide one unless given `--force`), `--db`
 always means a local database, and `bd remote unset` removes the file.
 
 The access token comes from `$BD_TOKEN`, else from the tokens saved by
-`bd remote login`, never from the repository. CI and agents usually take
-`BD_TOKEN` from a secret; people log in once per machine:
+`bd remote login`, never from the repository. `$BD_TOKEN` is bound to no
+server, so it is sent only to the workspace URL that `--remote` or
+`$BD_REMOTE` names, never to one from a `.bd/remote.toml`: a cloned
+repository, a pull request or a submodule could name its own server there and
+collect the token. CI and agents set `BD_REMOTE` (with `BD_CA_CERT` for a
+private CA: a checkout's `ca_cert` is not read then) and take `BD_TOKEN` from a
+secret; people log in once per machine:
 
 ```bash
 bd remote login --github               # sign in with GitHub; or: bd remote login --github https://bd.example.com/w/proj
@@ -795,7 +800,8 @@ or `%APPDATA%\bd\credentials.toml` on Windows), one per server: the URL up to
 `https://bd.example.com/w/other` share the token saved for
 `https://bd.example.com`, and a path prefix (`https://example.com/bd`) is part
 of the server. A `--workspace-only` token takes precedence over its server's,
-and `$BD_TOKEN` over both; `bd remote show` says which one is used. A saved
+and `$BD_TOKEN` over both where `$BD_REMOTE` names the server; `bd remote
+show` says which one is used. A saved
 token is bound to the certificate authorities it was checked against: the
 system's, or the CA file in use at login (`ca_cert` in `.bd/remote.toml`, or
 `BD_CA_CERT`). It is not sent where another CA would be trusted, so a cloned
@@ -817,7 +823,7 @@ revoked on the server (`bd serve token revoke`).
 
 | variable | meaning |
 |---|---|
-| `BD_TOKEN` | access token; takes precedence over tokens saved by `bd remote login` |
+| `BD_TOKEN` | access token for the workspace `BD_REMOTE` (or `--remote`) names, never sent to a `.bd/remote.toml` URL; takes precedence over tokens saved by `bd remote login` |
 | `BD_REMOTE` / `--remote URL` | use this workspace URL instead of `.bd/remote.toml` |
 | `BD_CA_CERT` | PEM file of the CA that signed the server certificate |
 | `BD_ACTOR` | act as `<token actor>/<name>`; anything else is refused |
@@ -941,6 +947,14 @@ with no events (and the cursor) when the wait ends. Failures before the
 command runs return a non-200 status with the `--json` error shape. Every
 answer carries a `bd-protocol: 2` header, which tells bd serve's own answers
 (a 503 before the command ran, say) apart from a proxy's.
+
+Printed output never drives a terminal: control characters (except line
+ends and tabs) and bidirectional formatting characters in titles,
+descriptions, comments or a server's answer are printed as `\uXXXX`, both by
+the command and again by the client, so neither stored text nor a server can
+move the cursor, clear the screen or set the clipboard. Inside `--json`
+strings that escape is the same character. Output files (`-o`) are written
+as stored.
 
 ### Followers
 

@@ -601,13 +601,16 @@ fn remote_command_configures_a_checkout() {
     let checkout = checkout_dir();
     let sub = checkout.path().join("src");
     std::fs::create_dir_all(&sub).unwrap();
-    let run = |dir: &Path, token: Option<&str>, args: &[&str]| {
+    let config = tempfile::tempdir().unwrap();
+    let cmd = |dir: &Path, token: Option<&str>, args: &[&str]| {
         let mut cmd = bd(dir);
+        cmd.env("XDG_CONFIG_HOME", config.path()).args(args);
         if let Some(t) = token {
             cmd.env("BD_TOKEN", t);
         }
-        cmd.args(args).output().unwrap()
+        cmd
     };
+    let run = |dir: &Path, token: Option<&str>, args: &[&str]| cmd(dir, token, args).output().unwrap();
 
     check(run(checkout.path(), None, &["remote", "set", &server.url()]), "remote set");
     let toml = std::fs::read_to_string(checkout.path().join(".bd/remote.toml")).unwrap();
@@ -619,25 +622,35 @@ fn remote_command_configures_a_checkout() {
     let show: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!((show["connected"].as_bool(), show["token_set"].as_bool()), (Some(false), Some(false)));
 
+    // $BD_TOKEN never goes to a URL that remote.toml names: a checkout may name any server.
     let out = run(&sub, Some(&secret), &["--json", "remote", "show"]);
+    assert_eq!(out.status.code(), Some(7));
+    let show: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((show["connected"].as_bool(), show["token_set"].as_bool()), (Some(false), Some(false)));
+    let message = show["error"]["message"].as_str().unwrap();
+    assert!(message.contains(&format!("BD_REMOTE={}", server.url())), "{message}");
+
+    check(with_input(cmd(&sub, None, &["remote", "login"]), &secret), "remote login");
+    let out = run(&sub, None, &["--json", "remote", "show"]);
     let show: Value = serde_json::from_str(&check(out, "remote show")).unwrap();
     assert_eq!(show["connected"], true);
     assert_eq!(show["server"]["actor"], "alice");
     assert_eq!(show["url"], server.url());
-    let out = run(&sub, Some("bdt_wrong"), &["remote", "show"]);
-    assert_eq!(out.status.code(), Some(7), "a bad token fails the check");
+    let mut wrong = cmd(&sub, Some("bdt_wrong"), &["remote", "show"]);
+    wrong.env("BD_REMOTE", server.url());
+    assert_eq!(wrong.output().unwrap().status.code(), Some(7), "a bad token fails the check");
 
-    assert_eq!(check(run(&sub, Some(&secret), &["-q", "create", "From the checkout"]), "create").trim(), "t-1");
+    assert_eq!(check(run(&sub, None, &["-q", "create", "From the checkout"]), "create").trim(), "t-1");
 
     check(run(&sub, None, &["remote", "unset"]), "remote unset");
     assert!(!checkout.path().join(".bd/remote.toml").exists());
-    assert_eq!(run(&sub, Some(&secret), &["list"]).status.code(), Some(3), "no workspace any more");
+    assert_eq!(run(&sub, None, &["list"]).status.code(), Some(3), "no workspace any more");
 
     // A local workspace in the same .bd/ is not hidden by accident.
     check(run(checkout.path(), None, &["init", "--prefix", "loc"]), "init");
     assert_eq!(run(checkout.path(), None, &["remote", "set", &server.url()]).status.code(), Some(2));
     check(run(checkout.path(), None, &["remote", "set", &server.url(), "--force"]), "remote set --force");
-    assert_eq!(check(run(&sub, Some(&secret), &["-q", "list"]), "list").trim(), "t-1", "remote.toml wins");
+    assert_eq!(check(run(&sub, None, &["-q", "list"]), "list").trim(), "t-1", "remote.toml wins");
     assert_eq!(run(&sub, None, &["remote", "set", "http://bd.example.com/w/proj"]).status.code(), Some(2));
 }
 
@@ -654,6 +667,14 @@ fn with_input(mut cmd: Command, input: &str) -> Output {
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
     child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
     child.wait_with_output().unwrap()
+}
+
+/// `bd remote login --no-verify` in `dir`, for its checkout's server and CA, saving `token` under `config`
+/// (`XDG_CONFIG_HOME`): a checkout's remote.toml gets its token from there, never from $BD_TOKEN.
+fn login_in(dir: &Path, config: &Path, token: &str) {
+    let mut c = bd(dir);
+    c.env("XDG_CONFIG_HOME", config).args(["remote", "login", "--no-verify"]);
+    check(with_input(c, token), "remote login --no-verify");
 }
 
 #[test]
@@ -719,10 +740,21 @@ fn remote_login_saves_tokens_per_server() {
     assert_eq!(v["credentials"]["key"].as_str(), Some(&*server.base));
     assert_eq!(v["credentials"]["path"].as_str().map(Path::new), Some(creds.as_path()));
 
-    // $BD_TOKEN takes precedence.
-    assert_eq!(run(Some("bdt_wrong"), &["list"]).status.code(), Some(7));
-    let v = json(run(Some(&bob), &["--json", "remote", "show"]), "remote show with BD_TOKEN");
+    // $BD_TOKEN takes precedence where $BD_REMOTE names the server...
+    let named = |token: &str, args: &[&str]| {
+        let mut c = cmd(Some(token), args);
+        c.env("BD_REMOTE", server.url());
+        with_input(c, "")
+    };
+    assert_eq!(named("bdt_wrong", &["list"]).status.code(), Some(7));
+    let v = json(named(&bob, &["--json", "remote", "show"]), "remote show with BD_TOKEN");
     assert_eq!((v["token_from"].as_str(), v["server"]["actor"].as_str()), (Some("env"), Some("bob")));
+    // ...and is never sent to the one remote.toml names.
+    check(run(Some("bdt_wrong"), &["list"]), "list with BD_TOKEN and remote.toml");
+    let v = json(run(Some(&bob), &["--json", "remote", "show"]), "remote show with BD_TOKEN and remote.toml");
+    assert_eq!((v["token_from"].as_str(), v["server"]["actor"].as_str()), (Some("credentials"), Some("alice")));
+    let text = check(run(Some(&bob), &["remote", "show"]), "remote show");
+    assert!(text.contains("$BD_TOKEN is set, and goes only to a server named by --remote or $BD_REMOTE"), "{text}");
 
     // A token saved for one workspace takes precedence over its server's.
     let v = json(login(&bob, &[&server.url(), "--workspace-only"]), "login --workspace-only");
@@ -738,7 +770,7 @@ fn remote_login_saves_tokens_per_server() {
     let out = run(None, &["list"]);
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains(&*creds.to_string_lossy()));
-    check(run(Some(&alice), &["list"]), "list with BD_TOKEN");
+    check(named(&alice, &["list"]), "list with BD_TOKEN");
     std::fs::write(&creds, saved).unwrap();
 
     let v = json(run(None, &["--json", "remote", "logout"]), "logout");
@@ -826,9 +858,12 @@ fn saved_tokens_stay_bound_to_the_ca_they_were_checked_with() {
     assert_eq!(code, Some(7), "{text}");
     assert!(text.contains("not usable") && text.contains("is not sent"), "{text}");
 
-    // The user's own settings still apply: $BD_TOKEN, and $BD_CA_CERT.
+    // $BD_TOKEN is not sent there either; the user's own settings still apply: $BD_REMOTE, and $BD_CA_CERT.
     let mut c = cmd(repo.path(), &["-q", "create", "With BD_TOKEN"]);
     c.env("BD_TOKEN", &secret);
+    assert_eq!(run(c).0, Some(7));
+    let mut c = cmd(elsewhere.path(), &["--remote", &server.url(), "-q", "create", "With BD_TOKEN"]);
+    c.env("BD_TOKEN", &secret).env("BD_CA_CERT", &ca_pem);
     assert_eq!(run(c), (Some(0), "t-1\n".to_string()));
     let mut c = cmd(elsewhere.path(), &["--remote", &server.url(), "-q", "list"]);
     c.env("BD_CA_CERT", &ca_pem);
@@ -936,18 +971,15 @@ fn prime_in_session_hooks_never_fails() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("unavailable") && text.contains("BD_TOKEN"), "{text}");
 
+    let config = checkout.path().join(".xdg");
+    login_in(checkout.path(), &config, "bdt_x");
     let started = Instant::now();
-    let out = bd(checkout.path()).env("BD_TOKEN", "bdt_x").arg("prime").output().unwrap();
+    let out = bd(checkout.path()).arg("prime").output().unwrap();
     assert_eq!(out.status.code(), Some(0), "server down");
     assert!(String::from_utf8_lossy(&out.stdout).contains("unavailable"));
     assert!(started.elapsed() < Duration::from_secs(10), "hooks are not held up: {:?}", started.elapsed());
 
-    let out = bd(checkout.path())
-        .env("BD_TOKEN", "bdt_x")
-        .env("BD_REMOTE_RETRY_SECS", "0")
-        .args(["--json", "prime"])
-        .output()
-        .unwrap();
+    let out = bd(checkout.path()).env("BD_REMOTE_RETRY_SECS", "0").args(["--json", "prime"]).output().unwrap();
     assert_eq!(out.status.code(), Some(8), "--json keeps strict errors");
 
     // Accepts connections and never answers: the hook's 5s budget, not a request's own 15s.
@@ -963,9 +995,10 @@ fn prime_in_session_hooks_never_fails() {
             held.push(conn);
         }
     });
+    login_in(checkout.path(), &config, "bdt_x");
     for args in [&["prime"][..], &["prime", "--hook", "copilot"]] {
         let started = Instant::now();
-        let out = bd(checkout.path()).env("BD_TOKEN", "bdt_x").args(args).stdin(Stdio::null()).output().unwrap();
+        let out = bd(checkout.path()).args(args).stdin(Stdio::null()).output().unwrap();
         // About 5s by design; generous for a loaded machine, and well short of a request's own 15s.
         assert!(started.elapsed() < Duration::from_secs(10), "{args:?}: {:?}", started.elapsed());
         assert_eq!(out.status.code(), Some(0), "{args:?}: stalling server");
@@ -974,6 +1007,34 @@ fn prime_in_session_hooks_never_fails() {
         assert!(text.starts_with("# bd workflow context\nThe remote bd workspace is unavailable: "), "{text}");
         assert!(text.contains("s allowed)"), "{text}");
     }
+}
+
+#[test]
+fn env_token_is_never_sent_to_a_url_from_remote_toml() {
+    // A server named by a checkout (a pull request, a submodule): it must never see a connection.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/w/proj", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let checkout = checkout_dir();
+    std::fs::write(checkout.path().join(".bd/remote.toml"), format!("url = \"{url}\"\n")).unwrap();
+    for args in [&["list"][..], &["--json", "prime"], &["prime"], &["remote", "show"], &["agents", "pull"]] {
+        let out = bd(checkout.path()).env("BD_TOKEN", "bdt_secret").args(args).stdin(Stdio::null()).output().unwrap();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains("$BD_TOKEN is not sent to") && !text.contains("bdt_secret"), "{args:?}: {text}");
+        let want = if args == ["prime"] { 0 } else { 7 };
+        assert_eq!(out.status.code(), Some(want), "{args:?}: {text}");
+    }
+    // Under $BD_REMOTE the checkout's ca_cert is not read: the advice names it.
+    let ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    let ca = ca.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+    std::fs::write(checkout.path().join(".bd/ca.pem"), ca.pem()).unwrap();
+    std::fs::write(checkout.path().join(".bd/remote.toml"), format!("url = \"{url}\"\nca_cert = \"ca.pem\"\n"))
+        .unwrap();
+    let out = bd(checkout.path()).env("BD_TOKEN", "bdt_secret").arg("list").output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    assert!(stderr.contains(&format!("BD_REMOTE={url} and BD_CA_CERT=")) && stderr.contains("ca.pem"), "{stderr}");
+    assert!(listener.accept().is_err(), "nothing connected");
 }
 
 #[test]
@@ -1035,7 +1096,9 @@ fn remote_configuration_and_refusals() {
     std::fs::create_dir_all(repo.path().join(".bd")).unwrap();
     std::fs::write(repo.path().join(".bd/remote.toml"), format!("url = \"{}\"\n", server.url())).unwrap();
     std::fs::create_dir_all(repo.path().join("src/deep")).unwrap();
-    let run = |dir: &Path, args: &[&str]| bd(dir).env("BD_TOKEN", &secret).args(args).output().unwrap();
+    let config = tempfile::tempdir().unwrap();
+    login_in(repo.path(), config.path(), &secret);
+    let run = |dir: &Path, args: &[&str]| bd(dir).env("XDG_CONFIG_HOME", config.path()).args(args).output().unwrap();
     let out = check(run(&repo.path().join("src/deep"), &["--json", "list"]), "list via remote.toml");
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap()[0]["title"], "Via remote.toml");
     assert_eq!(run(repo.path(), &["init"]).status.code(), Some(2), "init refused in a remote workspace");
@@ -1753,7 +1816,8 @@ fn https_with_a_private_ca() {
     std::fs::copy(&ca_pem, repo.path().join(".bd/ca.pem")).unwrap();
     std::fs::write(repo.path().join(".bd/remote.toml"), format!("url = \"{}\"\nca_cert = \"ca.pem\"\n", server.url()))
         .unwrap();
-    let out = bd(repo.path()).env("BD_TOKEN", &alice.token).args(["-q", "list"]).output().unwrap();
+    login_in(repo.path(), &repo.path().join(".xdg"), &alice.token);
+    let out = bd(repo.path()).args(["-q", "list"]).output().unwrap();
     assert_eq!(check(out, "list via remote.toml with ca_cert").trim(), "t-1");
 
     // `bd remote set --ca-cert` copies the CA next to remote.toml.
@@ -1761,7 +1825,8 @@ fn https_with_a_private_ca() {
     let out = bd(fresh.path()).args(["remote", "set", &server.url(), "--ca-cert"]).arg(&ca_pem).output().unwrap();
     check(out, "remote set --ca-cert");
     assert_eq!(std::fs::read(fresh.path().join(".bd/ca.pem")).unwrap(), std::fs::read(&ca_pem).unwrap());
-    let out = bd(fresh.path()).env("BD_TOKEN", &alice.token).args(["remote", "show"]).output().unwrap();
+    login_in(fresh.path(), &fresh.path().join(".xdg"), &alice.token);
+    let out = bd(fresh.path()).args(["remote", "show"]).output().unwrap();
     assert!(check(out, "remote show over TLS").contains("✓ connected"));
     let out = bd(fresh.path()).args(["remote", "set", &server.url(), "--ca-cert"]).arg(&key_pem).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "a key is not a CA certificate");
@@ -2768,6 +2833,26 @@ fn answers_cut_off_before_any_output_are_retried() {
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hello\n", "printed once");
     assert_eq!(server.requests.load(Ordering::SeqCst), 4, "three cut-off answers, then a complete one");
+}
+
+#[test]
+fn a_servers_output_cannot_drive_the_clients_terminal() {
+    // A CRLF split across frames stays a line end; a lone carriage return does not.
+    let frames = vec![
+        stdout_frame("a\u{1b}]52;c;eA==\u{7}b\r"),
+        stdout_frame("\nc\u{9b}2J\u{202e}\r"),
+        stdout_frame("d\n"),
+        exit_frame(0, "warning: \u{1b}[2K\u{1b}[1A\n"),
+    ];
+    for chunked in [false, true] {
+        let frames = frames.clone();
+        let server = FakeServer::start(move |_| answer(&frames, chunked, 0));
+        let out = server.client().run(&["list"]);
+        assert_eq!(out.status.code(), Some(0), "chunked: {chunked}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout, "a\\u001b]52;c;eA==\\u0007b\r\nc\\u009b2J\\u202e\\u000dd\n", "chunked: {chunked}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "warning: \\u001b[2K\\u001b[1A\n", "chunked: {chunked}");
+    }
 }
 
 #[test]
@@ -3801,7 +3886,10 @@ fn agents_pull_and_status_place_the_servers_sets_in_client_checkouts() {
     std::fs::write(repo.path().join(".bd/remote.toml"), format!("url = \"{}\"\n", server.url())).unwrap();
     let deep = repo.path().join("src/deep");
     std::fs::create_dir_all(&deep).unwrap();
-    let out = bd(&deep).env("BD_TOKEN", &token).args(["agents", "pull", "--harness", "codex"]).output().unwrap();
+    let config = repo.path().join(".xdg");
+    login_in(repo.path(), &config, &token);
+    let out =
+        bd(&deep).env("XDG_CONFIG_HOME", &config).args(["agents", "pull", "--harness", "codex"]).output().unwrap();
     check(out, "pull from below the checkout's root");
     assert!(repo.path().join(".agents/skills/triage/SKILL.md").is_file());
     assert!(!deep.join(".agents").exists());
@@ -3973,13 +4061,15 @@ fn session_start_hook_pulls_the_servers_skills_and_reports_its_mcp_changes() {
     let repo = checkout_dir();
     std::fs::write(repo.path().join(".bd/remote.toml"), format!("url = \"{}\"\n", server.url())).unwrap();
     let plugin = tempfile::tempdir().unwrap();
+    let config = plugin.path().join(".xdg");
+    login_in(repo.path(), &config, &token);
     let input = json!({ "sessionId": "s1", "timestamp": 1, "cwd": repo.path(), "source": "new" }).to_string();
     for (args, want) in [
         (&["hook", "session-start", "--harness", "copilot"][..], "bd: agent skills updated from the bd server: triage"),
         (&["prime", "--hook", "copilot"], "# bd workflow context\nWorkspace "),
     ] {
         let mut cmd = bd(plugin.path());
-        cmd.env("BD_TOKEN", &token).args(args);
+        cmd.args(args);
         let out = with_input(cmd, &input);
         let context = copilot_context(&check(out, &format!("{args:?}"))).unwrap();
         assert!(context.starts_with(want), "{args:?}: {context}");

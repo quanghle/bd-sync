@@ -8,9 +8,11 @@
 //! ca_cert = "ca.pem"   # optional, relative to this file: trust a private CA
 //! ```
 //!
-//! The access token comes from `$BD_TOKEN`, else from the user's
-//! credentials file (`bd remote login`, see [`crate::credentials`]), never
-//! from a file in the repository. The command line travels unchanged; the
+//! The access token comes from `$BD_TOKEN` when `--remote` or `$BD_REMOTE`
+//! names the workspace, else from the user's credentials file (`bd remote
+//! login`, see [`crate::credentials`]), never from a file in the repository.
+//! `$BD_TOKEN` is bound to no URL, so it never goes to one a checkout's
+//! `remote.toml` names: a cloned repository could name its own server. The command line travels unchanged; the
 //! server runs it and streams back its output and exit code. Each invocation
 //! gets a request id that its retries reuse, so a write whose answer was lost
 //! is applied once: a write's answer is held until it has arrived whole, and
@@ -143,11 +145,31 @@ pub fn identity() -> (Option<String>, Option<String>) {
     }
 }
 
-fn missing_token(url: &str) -> Error {
+fn missing_token(url: &str, ca: Option<&Path>) -> Error {
     Error::Unauthorized(format!(
         "no access token for {url}: sign in with `bd remote login --github` (where the server has GitHub sign-in), \
-         save a token from the server's admin with `bd remote login`, or set BD_TOKEN"
+         save a token from the server's admin with `bd remote login`, or set BD_TOKEN with {}",
+        env_setup(url, ca)
     ))
+}
+
+fn env_token_refused(url: &str, file: &Path, ca: Option<&Path>) -> Error {
+    Error::Unauthorized(format!(
+        "$BD_TOKEN is not sent to {url}, named by {}: it goes only to the server named by --remote or $BD_REMOTE, \
+         since a checkout's remote.toml may name any server. If the token is for {url}, set {}; or save a token \
+         for it with `bd remote login`",
+        file.display(),
+        env_setup(url, ca)
+    ))
+}
+
+/// The variables that send `$BD_TOKEN` to `url`: under `$BD_REMOTE` a
+/// checkout's `ca_cert` is not read, so a private CA must be named again.
+fn env_setup(url: &str, ca: Option<&Path>) -> String {
+    match ca {
+        Some(ca) => format!("BD_REMOTE={url} and BD_CA_CERT={}", ca.display()),
+        None => format!("BD_REMOTE={url}"),
+    }
 }
 
 /// The remote workspace configured for this invocation, if any.
@@ -217,13 +239,22 @@ impl Trust {
     }
 }
 
-/// The access token for a workspace URL reached under `trust`: `$BD_TOKEN`,
-/// else one saved by `bd remote login`.
-fn token_for(url: &str, trust: &Trust) -> Result<Option<Token>> {
-    if let Some(t) = env("BD_TOKEN") {
-        return Ok(Some(Token::Env(t)));
+/// The access token for a workspace URL reached under `trust`: `$BD_TOKEN`
+/// when the user's own `--remote` or `$BD_REMOTE` names the URL, else one
+/// saved by `bd remote login` for it.
+fn token_for(url: &str, trust: &Trust, source: &Source) -> Result<Option<Token>> {
+    let env_token = env("BD_TOKEN");
+    if let (Some(t), Source::Flag) = (&env_token, source) {
+        return Ok(Some(Token::Env(t.clone())));
     }
-    let Some(saved) = credentials::lookup(url)? else { return Ok(None) };
+    // A checkout's remote.toml may name any server and CA: $BD_TOKEN, bound to
+    // no URL, never goes there, or a cloned repository could collect it.
+    let Some(saved) = credentials::lookup(url)? else {
+        return match (env_token, source) {
+            (Some(_), Source::File(path)) => Err(env_token_refused(url, path, trust.path.as_deref())),
+            _ => Ok(None),
+        };
+    };
     // A CA named by a checkout's remote.toml must be the one the token was
     // saved under, or a cloned repository could send it to a man in the
     // middle. $BD_CA_CERT is the user's own setting.
@@ -240,8 +271,10 @@ fn token_for(url: &str, trust: &Trust) -> Result<Option<Token>> {
         );
         return Err(Error::Unauthorized(format!(
             "the access token saved for {} is not sent to {url}: it was saved trusting {then}, and {url} is now \
-             set up to trust {now}. If you trust that, log in again here (`bd remote login`); or set BD_TOKEN",
-            saved.key
+             set up to trust {now}. If that CA is trusted, log in again here (`bd remote login`); or set BD_TOKEN with \
+             {}",
+            saved.key,
+            env_setup(url, ca_cert)
         )));
     }
     Ok(Some(Token::Saved(saved)))
@@ -266,7 +299,7 @@ fn read_ca(path: &Path) -> Result<Vec<ureq::tls::Certificate<'static>>> {
 pub fn detect(app: &App) -> Result<Option<Remote>> {
     let Some(c) = configured(app)? else { return Ok(None) };
     let trust = Trust::load(c.ca_cert.as_deref())?;
-    let token = token_for(&c.url, &trust)?.ok_or_else(|| missing_token(&c.url))?;
+    let token = token_for(&c.url, &trust, &c.source)?.ok_or_else(|| missing_token(&c.url, trust.path.as_deref()))?;
     Ok(Some(Remote::new(c, trust, token.secret())))
 }
 
@@ -361,7 +394,7 @@ pub fn run(app: &mut App, remote: Remote, cli: &Cli) -> i32 {
         Ok(response) if hook && response.exit_code != 0 => unavailable(cli, &response_error(&response, &remote.url)),
         Ok(response) => {
             io::out(&response.stdout);
-            let _ = std::io::stderr().write_all(response.stderr.as_bytes());
+            let _ = std::io::stderr().write_all(io::printable(&response.stderr).as_bytes());
             response.exit_code
         }
         Err(e) if hook => unavailable(cli, &e),
@@ -513,6 +546,8 @@ struct Delivery {
     /// The server may hold the request a long time before answering (a long
     /// poll): its retry time starts at its first failure.
     long_poll: bool,
+    /// Escapes stdout printed as it arrives, across frames.
+    screen: io::Escaper,
 }
 
 /// An output file, written to `<target>.tmp` and renamed into place once the command succeeds.
@@ -539,6 +574,7 @@ impl Delivery {
             files,
             cursor: None,
             long_poll: false,
+            screen: io::Escaper::default(),
         }
     }
 
@@ -552,6 +588,7 @@ impl Delivery {
         self.discard();
         self.held.clear();
         self.cursor = None;
+        self.screen = io::Escaper::default();
         self.printing = !self.hold && !whole;
     }
 
@@ -561,7 +598,9 @@ impl Delivery {
             return Ok(());
         }
         self.printed = true;
-        Ok(io::with_stdout(|w| w.write_all(text.as_bytes()))?)
+        let mut screened = Vec::new();
+        self.screen.feed(text.as_bytes(), &mut screened);
+        Ok(io::with_stdout(|w| w.write_all(&screened))?)
     }
 
     fn file(&mut self, path: &str, data: &str) -> Result<()> {
@@ -573,6 +612,11 @@ impl Delivery {
 
     /// The command finished: its files go into place if it succeeded.
     fn exit(&mut self, exit: Exit) -> Result<ExecResponse> {
+        if self.printing {
+            let mut rest = Vec::new();
+            self.screen.finish(&mut rest);
+            io::with_stdout(|w| w.write_all(&rest))?;
+        }
         if exit.exit_code == 0 {
             for f in &mut self.files {
                 f.commit()?;
@@ -698,7 +742,7 @@ fn events_request(
 /// continue from), or the exit code of a failure, whose error is printed.
 fn print_events(remote: &Remote, r: ExecResponse) -> Result<std::result::Result<i64, i32>> {
     if r.exit_code != 0 {
-        let _ = std::io::stderr().write_all(r.stderr.as_bytes());
+        let _ = std::io::stderr().write_all(io::printable(&r.stderr).as_bytes());
         return Ok(Err(r.exit_code));
     }
     let cursor = r.cursor.ok_or_else(|| Error::Remote(format!("{}: the server sent no event cursor", remote.url)))?;
@@ -1312,7 +1356,7 @@ fn set(app: &mut App, a: &RemoteSetArgs) -> Result<()> {
         &path,
         format!(
             "# Commands in this checkout run on a bd server; `bd remote show` checks the connection.\n\
-             # The access token comes from $BD_TOKEN or `bd remote login`: never commit it.\n{body}"
+             # The access token comes from `bd remote login` ($BD_TOKEN goes only to $BD_REMOTE): never commit it.\n{body}"
         ),
     )?;
     let checkout = dir.parent().unwrap_or(&dir).display().to_string();
@@ -1324,12 +1368,12 @@ fn set(app: &mut App, a: &RemoteSetArgs) -> Result<()> {
     }
     let ca_path = ca_cert.as_ref().map(|c| dir.join(c));
     let trust = Trust::load(ca_path.as_deref()).ok();
-    let token = trust.as_ref().and_then(|t| token_for(&url, t).ok().flatten());
+    let token = trust.as_ref().and_then(|t| token_for(&url, t, &Source::File(path.clone())).ok().flatten());
     out = out.line(if token.is_some() {
         "  check the connection: bd remote show"
     } else {
         "  next: `bd remote login --github` to sign in with GitHub, or `bd remote login` with a token (or set \
-         BD_TOKEN); then `bd remote show` checks the connection"
+         BD_TOKEN with BD_REMOTE); then `bd remote show` checks the connection"
     });
     if let (Some(trust), Some(token), None) = (trust, token, &app.g.remote) {
         let c = Configured { url: url.clone(), source: Source::File(path.clone()), ca_cert: ca_path };
@@ -1382,7 +1426,7 @@ fn show(app: &mut App) -> Result<i32> {
         app.print(Out::new(json!({ "remote": null, "local": local })).line(line));
         return Ok(0);
     };
-    let token = Trust::load(c.ca_cert.as_deref()).and_then(|trust| Ok((token_for(&c.url, &trust)?, trust)));
+    let token = Trust::load(c.ca_cert.as_deref()).and_then(|trust| Ok((token_for(&c.url, &trust, &c.source)?, trust)));
     let source = match &c.source {
         Source::Flag => "--remote or $BD_REMOTE".to_string(),
         Source::File(p) => p.display().to_string(),
@@ -1409,12 +1453,15 @@ fn show(app: &mut App) -> Result<i32> {
             view["credentials"] = json!({ "path": s.path, "key": s.key, "scope": s.scope.as_str() });
             format!("token       saved for {} in {}", s.key, s.path.display())
         }
-        Ok((None, _)) => "token       none: run `bd remote login`, or set BD_TOKEN".to_string(),
+        Ok((None, _)) => "token       none: run `bd remote login`, or set BD_TOKEN with BD_REMOTE".to_string(),
         Err(_) => "token       not usable".to_string(),
     });
+    if let (Some(_), Source::File(_), Ok((Some(Token::Saved(_)), _))) = (env("BD_TOKEN"), &c.source, &token) {
+        lines.push("note        $BD_TOKEN is set, and goes only to a server named by --remote or $BD_REMOTE".into());
+    }
     let checked = match token {
         Ok((Some(t), trust)) => check(Remote::new(c.clone(), trust, t.secret()).quick(), identity()),
-        Ok((None, _)) => Err(missing_token(&c.url)),
+        Ok((None, trust)) => Err(missing_token(&c.url, trust.path.as_deref())),
         Err(e) => Err(e),
     };
     let code = match checked {
@@ -1667,7 +1714,7 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
         ));
     }
     if env("BD_TOKEN").is_some() {
-        out = out.line("  note: $BD_TOKEN is set, and takes precedence over saved tokens");
+        out = out.line("  note: $BD_TOKEN is set, and takes precedence over saved tokens for the server named by --remote or $BD_REMOTE");
     }
     let here = configured(app).ok().flatten().is_some_and(|here| here.url == c.url);
     if !a.no_verify && here {
@@ -1716,7 +1763,7 @@ fn logout(app: &mut App, a: &RemoteLogoutArgs) -> Result<()> {
         );
     }
     if env("BD_TOKEN").is_some() {
-        out = out.line("  note: $BD_TOKEN is still set, and keeps providing a token");
+        out = out.line("  note: $BD_TOKEN is still set, and keeps providing a token for the server named by --remote or $BD_REMOTE");
     }
     app.print(out);
     Ok(())
@@ -1775,7 +1822,8 @@ fn prompt_hidden(prompt: &str) -> Result<String> {
         return Err(Error::invalid(format!("cannot turn off echo on this terminal; {}", how_to_pipe())));
     }
     let mut stderr = std::io::stderr();
-    let _ = write!(stderr, "{prompt}");
+    // The label comes from a checkout's remote.toml, so it must not redraw the prompt.
+    let _ = write!(stderr, "{}", io::printable(prompt));
     let _ = stderr.flush();
     let mut line = String::new();
     let read = std::io::stdin().lock().read_line(&mut line);

@@ -114,6 +114,27 @@ fn lifecycle_with_exit_codes() {
 }
 
 #[test]
+fn stored_text_cannot_drive_the_terminal() {
+    let ws = Ws::new();
+    // OSC 52 (set the clipboard), a C1 CSI, a carriage return and a bidi override.
+    let title = "Fix\u{1b}]52;c;Y3VybA==\u{7} it\u{9b}2J\rnow\u{202e}txt";
+    let id = ws.id(&["create", title, "-d", "line\r\nnext\u{1b}[2K"]);
+    for args in [&["list"][..], &["show", &id], &["ready"]] {
+        let text = ws.ok(args);
+        assert!(!text.contains(['\u{1b}', '\u{7}', '\u{9b}', '\u{202e}']), "{args:?}: {text:?}");
+        assert!(text.contains(r"Fix\u001b]52;c;Y3VybA==\u0007 it\u009b2J\u000dnow\u202etxt"), "{args:?}: {text}");
+    }
+    let shown = ws.ok(&["show", &id]);
+    assert!(shown.contains("  line\n  next\\u001b[2K\n"), "CRLF line ends are line ends: {shown}");
+    // --json and exports keep the text as stored.
+    assert_eq!(ws.json(&["show", &id])["title"], title);
+    let export = ws.ok(&["export"]);
+    assert!(!export.contains(['\u{1b}', '\u{9b}', '\u{202e}']), "{export:?}");
+    let issue = export.lines().map(|l| serde_json::from_str::<Value>(l).unwrap()).find(|v| v["id"] == id.as_str());
+    assert_eq!(issue.unwrap()["title"], title);
+}
+
+#[test]
 fn show_list_and_short_ids() {
     let ws = Ws::new();
     let epic = ws.id(&["create", "Epic", "-t", "epic"]);

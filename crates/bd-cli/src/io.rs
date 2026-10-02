@@ -195,13 +195,141 @@ fn with_capture<T>(f: impl FnOnce(&mut Capture) -> T) -> Option<T> {
 /// the request's sink, which streams it to the client.
 pub fn with_stdout<T>(f: impl FnOnce(&mut dyn Write) -> T) -> T {
     if serving() {
-        return f(&mut Captured(None));
+        return screened(&mut Captured(None), f);
     }
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let out = f(&mut lock);
+    let out = screened(&mut lock, f);
     let _ = lock.flush();
     out
+}
+
+/// Run `f` writing to `w` through an [`Escaper`].
+fn screened<T>(w: &mut dyn Write, f: impl FnOnce(&mut dyn Write) -> T) -> T {
+    let mut screen = Screened { inner: w, escaper: Escaper::default(), buf: Vec::new() };
+    let out = f(&mut screen);
+    screen.buf.clear();
+    screen.escaper.finish(&mut screen.buf);
+    let _ = screen.inner.write_all(&screen.buf);
+    out
+}
+
+struct Screened<'a> {
+    inner: &'a mut dyn Write,
+    escaper: Escaper,
+    buf: Vec<u8>,
+}
+
+impl Write for Screened<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.buf.clear();
+        self.escaper.feed(data, &mut self.buf);
+        self.inner.write_all(&self.buf)?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Whether printing `c` could do more than show a character: controls other
+/// than newline and tab (terminal escape sequences, a carriage return that
+/// overwrites the line) and bidirectional embeddings, overrides and isolates
+/// (text that reads other than it is stored).
+fn unsafe_char(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t') || matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Escapes printed output as it streams, so that text stored by anyone who
+/// may write to a workspace, or sent by a server, cannot drive the terminal
+/// that shows it. Characters are escaped as `\uXXXX`, which inside a JSON
+/// string means the same character, so `--json` output and exports keep
+/// their data. A carriage return stays when a newline follows it (CRLF line
+/// ends). Bytes that are not UTF-8 (bd prints none) are escaped as `\xNN`.
+#[derive(Default)]
+pub struct Escaper {
+    /// The end of the last write: an incomplete character, or a carriage return.
+    held: Vec<u8>,
+}
+
+impl Escaper {
+    /// Escape the next bytes of the stream into `out`.
+    pub fn feed(&mut self, data: &[u8], out: &mut Vec<u8>) {
+        let data = if self.held.is_empty() {
+            std::borrow::Cow::Borrowed(data)
+        } else {
+            let mut joined = std::mem::take(&mut self.held);
+            joined.extend_from_slice(data);
+            std::borrow::Cow::Owned(joined)
+        };
+        let keep = escape(&data, out, false);
+        self.held.extend_from_slice(&data[data.len() - keep..]);
+    }
+
+    /// The stream ended: escape what was held back into `out`.
+    pub fn finish(&mut self, out: &mut Vec<u8>) {
+        escape(&std::mem::take(&mut self.held), out, true);
+    }
+}
+
+/// `text` as an [`Escaper`] prints it.
+pub fn printable(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(unsafe_char) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = Vec::with_capacity(text.len() + 16);
+    escape(text.as_bytes(), &mut out, true);
+    std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Escape `data` into `out`. Returns how many bytes at its end are held back
+/// for the next write (none at the `end` of the stream).
+fn escape(data: &[u8], out: &mut Vec<u8>, end: bool) -> usize {
+    let mut i = 0;
+    while i < data.len() {
+        let (text, bad) = match std::str::from_utf8(&data[i..]) {
+            Ok(s) => (s, None),
+            Err(e) => (std::str::from_utf8(&data[i..i + e.valid_up_to()]).unwrap_or_default(), Some(e.error_len())),
+        };
+        let bytes = text.as_bytes();
+        let mut from = 0;
+        let mut chars = text.char_indices().peekable();
+        while let Some((at, c)) = chars.next() {
+            if !unsafe_char(c) {
+                continue;
+            }
+            if c == '\r' {
+                match chars.peek() {
+                    Some((_, '\n')) => continue,
+                    // The newline may come with the next write.
+                    None if bad.is_none() && !end => {
+                        out.extend_from_slice(&bytes[from..at]);
+                        return data.len() - (i + at);
+                    }
+                    _ => {}
+                }
+            }
+            out.extend_from_slice(&bytes[from..at]);
+            let _ = write!(out, "\\u{:04x}", c as u32);
+            from = at + c.len_utf8();
+        }
+        out.extend_from_slice(&bytes[from..]);
+        i += text.len();
+        match bad {
+            None => {}
+            // A character the next write completes.
+            Some(None) if !end => return data.len() - i,
+            Some(len) => {
+                let n = len.unwrap_or(data.len() - i);
+                for b in &data[i..i + n] {
+                    let _ = write!(out, "\\x{b:02x}");
+                }
+                i += n;
+            }
+        }
+    }
+    0
 }
 
 /// A served command's stdout (`None`) or output file: each write goes to the request's sink.
@@ -238,6 +366,7 @@ pub fn outln(line: impl AsRef<str>) {
 
 /// Print a line on stderr.
 pub fn errln(line: impl AsRef<str>) {
+    let line = printable(line.as_ref());
     let line = line.as_ref();
     if with_capture(|c| keep_stderr(&mut c.stderr, line)).is_none() {
         let _ = writeln!(std::io::stderr(), "{line}");
@@ -393,6 +522,63 @@ mod tests {
     fn recording() -> (Rc<RefCell<Recorded>>, Capture) {
         let sink = Rc::new(RefCell::new(Recorded::default()));
         (sink.clone(), Capture::new(Box::new(sink)))
+    }
+
+    /// `chunks` through one [`Escaper`], as written one after another.
+    fn escaped(chunks: &[&[u8]]) -> String {
+        let (mut e, mut out) = (Escaper::default(), Vec::new());
+        for c in chunks {
+            e.feed(c, &mut out);
+        }
+        e.finish(&mut out);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn printed_output_cannot_drive_the_terminal() {
+        let hostile = "a\u{1b}]52;c;Y3VybA==\u{7}b\u{9b}2J\u{7f}\u{0}c\u{202e}d\u{2066}e\rf";
+        let shown = printable(hostile);
+        assert_eq!(shown, r"a\u001b]52;c;Y3VybA==\u0007b\u009b2J\u007f\u0000c\u202ed\u2066e\u000df");
+        assert!(!shown.contains(unsafe_char));
+        assert_eq!(printable(&shown), shown, "escaping twice changes nothing");
+        // Newlines, tabs, CRLF line ends and other text are printed as they are.
+        for plain in ["line\n\tindented\r\nnext ünïcode ✓ 👨‍👩‍👧 שלום\u{200f}", ""] {
+            assert_eq!(printable(plain), plain);
+        }
+        // Inside a JSON string the escapes mean the same characters: --json and exports keep their data.
+        let json = serde_json::to_string(&serde_json::json!({ "title": hostile })).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&printable(&json)).unwrap();
+        assert_eq!(back["title"], hostile);
+    }
+
+    #[test]
+    fn the_escaper_holds_characters_and_crlf_split_across_writes() {
+        let text = "é\r\n\u{1b}x\u{202e}";
+        let bytes = text.as_bytes();
+        let whole = escaped(&[bytes]);
+        assert_eq!(whole, "é\r\n\\u001bx\\u202e");
+        for at in 0..=bytes.len() {
+            assert_eq!(escaped(&[&bytes[..at], &bytes[at..]]), whole, "split at {at}");
+        }
+        assert_eq!(escaped(&[b"a\r", b"b"]), r"a\u000db");
+        assert_eq!(escaped(&[b"a\r"]), r"a\u000d", "a carriage return at the end");
+        assert_eq!(escaped(&[b"a\xc3"]), r"a\xc3", "a character the stream never completes");
+        assert_eq!(escaped(&[b"a\xff\x9bb"]), r"a\xff\x9bb", "bytes that are not UTF-8");
+    }
+
+    #[test]
+    fn stdout_and_stderr_are_escaped_when_serving() {
+        let (sink, c) = recording();
+        let ((), c) = capture(c, || {
+            with_stdout(|w| {
+                w.write_all(b"t\xc3").unwrap();
+                w.write_all(b"\xa9\x1b[2J\r").unwrap();
+                w.write_all(b"\n").unwrap();
+            });
+            errln("bad \u{1b}]0;x\u{7}");
+        });
+        assert_eq!(String::from_utf8(sink.borrow().stdout.clone()).unwrap(), "té\\u001b[2J\r\n");
+        assert_eq!(String::from_utf8(c.stderr).unwrap(), "bad \\u001b]0;x\\u0007\n");
     }
 
     #[test]

@@ -51,6 +51,9 @@ pub const HARNESSES: &[(&str, &[&str])] = &[
     ("codex", &["CODEX_THREAD_ID", "CODEX_SESSION_ID"]),
 ];
 
+/// Longest session id `bd hook session-start` writes to `$CLAUDE_ENV_FILE`, in bytes.
+pub const MAX_SESSION_ID: usize = 256;
+
 /// Longest `$BD_SESSION` part of a label.
 pub const MAX_NAME: usize = 64;
 /// Longest session label (harness ids and a `$BD_SESSION` name).
@@ -245,8 +248,9 @@ pub fn cmd_session_start(_app: &mut App) -> Result<i32> {
     io::require_local("bd hook session-start")?;
     let Some(file) = env("CLAUDE_ENV_FILE") else { return Ok(0) };
     let input = if std::io::stdin().is_terminal() { String::new() } else { io::read_stdin().unwrap_or_default() };
-    let Some(id) = hook_session_id(&input).filter(|id| !id.chars().any(char::is_control)) else {
-        io::errln("bd hook session-start: no session_id in the hook input; nothing written to $CLAUDE_ENV_FILE");
+    let usable = |id: &String| id.len() <= MAX_SESSION_ID && !id.chars().any(char::is_control);
+    let Some(id) = hook_session_id(&input).filter(usable) else {
+        io::errln("bd hook session-start: no usable session_id in the hook input; nothing written to $CLAUDE_ENV_FILE");
         return Ok(0);
     };
     if let Err(e) = append_export(std::path::Path::new(&file), CLAUDE_SESSION_VAR, &id) {

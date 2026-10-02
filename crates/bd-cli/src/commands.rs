@@ -209,7 +209,23 @@ pub fn exec_update(tx: &mut WriteCtx<'_>, a: &UpdateArgs) -> Result<Out> {
     } else {
         format!("✓ Updated {id}: {} (revision {})", out.changed.join(", "), out.issue.revision)
     };
-    Ok(Out::new(&out).line(text).id(id))
+    // A claim moved to the caller (a takeover) comes with a new lease token,
+    // which the old one no longer renews; a retry shows it again.
+    let moved_to_me = a.assignee.is_some()
+        && out.issue.status == Status::InProgress
+        && out.issue.assignee.as_deref() == Some(tx.actor());
+    let lease = if moved_to_me { tx.lease(&id)? } else { None };
+    let mut o = Out::new(&out).line(text).id(id.clone());
+    if let Some(l) = lease {
+        o = o.line(format!(
+            "  lease token {}, expires {} (renew: bd heartbeat {id} --token {})",
+            l.token,
+            rel(l.expires_at, now),
+            l.token
+        ));
+        o.json["lease"] = serde_json::to_value(&l)?;
+    }
+    Ok(o)
 }
 
 pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
@@ -1142,7 +1158,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
         o.push(
             "Claims of your user's other actors: an earlier session (before /clear or a resume), a parent or \
              subagent with its own session, or a concurrent one. Take one over only if this session is continuing \
-             that work; otherwise leave it to its session."
+             that work, then use the new lease token it prints; otherwise leave it to its session."
                 .into(),
         );
         for (i, l) in &others {

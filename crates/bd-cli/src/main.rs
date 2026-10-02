@@ -122,8 +122,15 @@ fn report_as(e: &Error, json: bool, actor: Option<&str>) -> i32 {
 
 /// The hint for a claim conflict with another session of the caller's own
 /// user (after /clear or a resume, or in a subagent with its own session),
-/// which the caller may be continuing.
+/// which the caller may be continuing, or with a newer lease of the caller.
 fn other_session_hint(e: &Error, me: &str) -> Option<String> {
+    if let Error::LeaseLost { id, holder: Some(h), .. } = e {
+        if h == me {
+            return Some(format!(
+                "you still hold {id}, under a newer lease token (named above; `bd show {id}` shows it): use that one"
+            ));
+        }
+    }
     let (id, holder) = match e {
         Error::NotOwner { id, holder: Some(h), .. } | Error::LeaseLost { id, holder: Some(h), .. } => (id, h),
         Error::AlreadyClaimed { id, holder } => (id, holder),
@@ -135,7 +142,7 @@ fn other_session_hint(e: &Error, me: &str) -> Option<String> {
     Some(format!(
         "{id} is held by another session of yours ({holder}; you are {me}). If this session is continuing that work \
          (after /clear or a resume, or as the subagent it was handed to), take the claim over: `{}` (recorded in the \
-         event history). Otherwise another session is working on it: leave it to that session and pick other work.",
+         event history), then use the new lease token it prints. Otherwise another session is working on it: leave it to that session and pick other work.",
         actor::take_over_command(id, me)
     ))
 }

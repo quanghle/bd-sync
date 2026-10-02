@@ -1039,6 +1039,10 @@ fn session_start_hook_gives_claude_sessions_their_own_actor() {
         assert!(hook(&[], input).status.success(), "{input}");
     }
     assert_eq!(std::fs::read_to_string(&env_file).unwrap(), written);
+    // Overlong ids are not written either.
+    let long = format!(r#"{{"session_id":"{}"}}"#, "a".repeat(300));
+    assert!(hook(&[], &long).status.success());
+    assert_eq!(std::fs::read_to_string(&env_file).unwrap(), written);
     // Ids are quoted for the shell that sources the file.
     assert!(hook(&[], r#"{"session_id":"a'b c"}"#).status.success());
     assert!(std::fs::read_to_string(&env_file).unwrap().ends_with("export CLAUDE_CODE_SESSION_ID='a'\\''b c'\n"));
@@ -1108,10 +1112,38 @@ fn claims_of_other_sessions_of_yours_are_listed_with_their_takeover() {
     let err = String::from_utf8(as_user(&ws, Some(SESSION_B), &["close", "t-2"]).stderr).unwrap();
     assert!(err.contains("pick other work") && !err.contains("session of yours"), "{err}");
 
-    // The takeover it names works, and moves the lease.
-    let mut cmd: Vec<&str> = take_over.split(' ').skip(1).collect();
-    cmd.retain(|a| !a.is_empty());
-    assert!(as_user(&ws, Some(SESSION_B), &cmd).status.success());
-    assert!(as_user(&ws, Some(SESSION_B), &["heartbeat", "t-1"]).status.success());
-    assert_eq!(as_user(&ws, Some(SESSION_A), &["heartbeat", "t-1"]).status.code(), Some(4));
+    assert!(prime_text_says_new_token(&ws));
+
+    // The full recovery: the takeover prime names prints the new lease token,
+    // which the session then renews and closes with; the old token is stale.
+    let old_token = json_of(as_user(&ws, None, &["--json", "show", "t-1"]))["lease"]["token"].as_i64();
+    let cmd: Vec<&str> = take_over.split(' ').skip(1).collect();
+    let out = as_user(&ws, Some(SESSION_B), &cmd);
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success() && text.contains("lease token "), "{text}");
+    let moved = json_of(as_user(&ws, Some(SESSION_B), &[&["--json"][..], &cmd[..]].concat()));
+    assert_eq!(moved["issue"]["assignee"], "tester/copilot-15a04348");
+    let token = moved["lease"]["token"].as_i64().expect("a takeover reports its lease");
+    assert!(text.contains(&format!("(renew: bd heartbeat t-1 --token {token})")), "a retry shows the same: {text}");
+    assert_eq!(json_of(as_user(&ws, None, &["--json", "show", "t-1"]))["lease"]["token"].as_i64(), Some(token));
+    let old = old_token.unwrap().to_string();
+    let out = as_user(&ws, Some(SESSION_B), &["heartbeat", "t-1", "--token", &old]);
+    let err = String::from_utf8(out.stderr).unwrap();
+    assert_eq!(out.status.code(), Some(4), "{err}");
+    assert!(err.contains("you still hold t-1, under a newer lease token"), "{err}");
+    let token = token.to_string();
+    assert!(as_user(&ws, Some(SESSION_B), &["heartbeat", "t-1", "--token", &token]).status.success());
+    assert_eq!(as_user(&ws, Some(SESSION_A), &["heartbeat", "t-1"]).status.code(), Some(4), "the old session lost it");
+    assert!(as_user(&ws, Some(SESSION_B), &["close", "t-1", "--token", &token]).status.success());
+    assert_eq!(json_of(as_user(&ws, None, &["--json", "show", "t-1"]))["status"], "closed");
+}
+
+fn json_of(out: Output) -> Value {
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn prime_text_says_new_token(ws: &Ws) -> bool {
+    let prime = String::from_utf8(as_user(ws, Some(SESSION_B), &["prime"]).stdout).unwrap();
+    prime.contains("then use the new lease token it prints")
 }

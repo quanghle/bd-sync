@@ -913,7 +913,8 @@ that has its own id (Codex threads, Copilot CLI; Claude Code subagents share
 their session's). `bd prime` lists the in-progress claims of your user's
 other actors (`<user>` and `<user>/*`) under "Held by other sessions of
 yours", each with the command that takes it over, `bd update <id>
---assignee <you> --take-over`, and a claim conflict (exit 4) with one of
+--assignee <you> --take-over` (it prints the new lease token to renew and
+close with), and a claim conflict (exit 4) with one of
 them names that command in its hint. Take a claim over only if this session
 is continuing that work; otherwise another session is on it. To delegate a
 claimed issue to a subagent with its own session id, either have the

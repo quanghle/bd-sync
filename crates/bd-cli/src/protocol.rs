@@ -35,7 +35,9 @@
 //! token: `POST <server>/v2/auth/github/device` ([`SignInStart`] ->
 //! [`SignInCode`]) and `POST <server>/v2/auth/github/token`, polled
 //! ([`SignInPoll`] -> [`SignInAnswer`]). Their answers are JSON, and their
-//! failures [`ErrorBody`]s.
+//! failures [`ErrorBody`]s. `POST <server>/v2/auth/revoke`, sent with a
+//! token as its bearer token, revokes that token if it came from GitHub
+//! sign-in ([`RevokeAnswer`]; `bd remote logout`).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -184,6 +186,18 @@ pub enum SignInAnswer {
     SlowDown { interval: u64 },
     /// Entered, and the account may sign in: its new access token.
     Issued(Box<Issued>),
+}
+
+/// Answer of `POST <server>/v2/auth/revoke`, sent with the token to revoke as
+/// its bearer token. A token unknown to the server (revoked before, say) is
+/// answered 401, like any request with it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeAnswer {
+    /// The token's name.
+    pub name: String,
+    /// Revoked now: it came from GitHub sign-in. A token the server's admin
+    /// created is kept (it may serve elsewhere too): only the admin revokes it.
+    pub revoked: bool,
 }
 
 /// An access token issued by GitHub sign-in.

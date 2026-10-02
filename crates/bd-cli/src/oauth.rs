@@ -582,7 +582,7 @@ fn plain_url(s: &str) -> bool {
 /// and waits until it was entered, or expired; the token issued.
 pub fn sign_in(remote: &Remote, workspace: &str, server: &str) -> Result<Issued> {
     let start = SignInStart { workspace: workspace.to_string() };
-    let code: SignInCode = remote.sign_in_request("github/device", &start, Duration::ZERO)?;
+    let code: SignInCode = remote.auth_request("github/device", &start, Duration::ZERO)?;
     if !plain_code(&code.user_code) || !plain_url(&code.verification_uri) || code.device_code.is_empty() {
         return Err(Error::Remote(format!("{server}: unexpected sign-in answer: not a GitHub code and address")));
     }
@@ -606,7 +606,7 @@ pub fn sign_in(remote: &Remote, workspace: &str, server: &str) -> Result<Issued>
             ));
         }
         std::thread::sleep(interval);
-        match remote.sign_in_request("github/token", &poll, interval)? {
+        match remote.auth_request("github/token", &poll, interval)? {
             SignInAnswer::Pending => {}
             SignInAnswer::SlowDown { interval: asked } => {
                 let asked = Duration::from_secs(asked.min(MAX_CODE_LIFE));

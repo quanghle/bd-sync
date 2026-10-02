@@ -37,7 +37,7 @@ use crate::credentials::{self, Scope};
 use crate::io;
 use crate::playbooks;
 use crate::protocol::{
-    ErrorBody, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, Frame, PROTOCOL, PROTOCOL_HEADER,
+    ErrorBody, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, Frame, PROTOCOL, PROTOCOL_HEADER, RevokeAnswer,
     valid_workspace_name,
 };
 use crate::stream::{Cut, FrameReader};
@@ -1084,12 +1084,12 @@ impl Remote {
         info["events_head"].as_i64().ok_or_else(|| Error::Remote(format!("{}: bd info has no events_head", self.url)))
     }
 
-    /// POST `body` to the server's GitHub sign-in endpoint
-    /// `<server>/v2/auth/<path>`, which needs no access token: its JSON
-    /// answer. Failures in transit, busy answers and a proxy's server errors
-    /// are retried for the retry time, at least `pace` apart; the server's
-    /// own refusals end it.
-    pub fn sign_in_request<T: serde::de::DeserializeOwned>(
+    /// POST `body` to the server's endpoint `<server>/v2/auth/<path>` (GitHub
+    /// sign-in, which needs no token, or revocation, sent with this remote's
+    /// token): its JSON answer. Failures in transit, busy answers and a
+    /// proxy's server errors are retried for the retry time, at least `pace`
+    /// apart; the server's own refusals end it.
+    pub fn auth_request<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: &impl Serialize,
@@ -1103,11 +1103,14 @@ impl Remote {
         let deadline = Instant::now() + self.retry;
         let mut delay = pace.max(Duration::from_millis(200));
         loop {
-            let sent = agent
-                .post(&endpoint)
-                .header("accept", "application/json")
-                .content_type("application/json")
-                .send(&body[..]);
+            let mut post = agent.post(&endpoint);
+            if let Some(left) = self.time_left() {
+                post = post.config().timeout_global(Some(left)).build();
+            }
+            if !self.token.is_empty() {
+                post = post.header("authorization", &format!("Bearer {}", self.token));
+            }
+            let sent = post.header("accept", "application/json").content_type("application/json").send(&body[..]);
             let failure = match sent {
                 Ok(mut response) => {
                     let status = response.status().as_u16();
@@ -1135,7 +1138,8 @@ impl Remote {
                 Err(e) if retryable(&e) => e.to_string(),
                 Err(e) => return Err(Error::Remote(format!("{server}: {e}{}", certificate_advice(&e.to_string())))),
             };
-            if Instant::now() + delay > deadline {
+            let past_deadline = self.deadline.is_some_and(|(at, _)| Instant::now() + delay > at);
+            if Instant::now() + delay > deadline || past_deadline {
                 return Err(Error::Remote(format!(
                     "{server}: {failure} (gave up after retrying for {}s)",
                     self.retry.as_secs()
@@ -1146,6 +1150,94 @@ impl Remote {
             delay = (delay * 2).min(Duration::from_secs(4).max(pace));
         }
     }
+
+    /// Revoke this remote's token on its server, if it came from GitHub
+    /// sign-in. An `Error::Unauthorized` means the server no longer knew it.
+    pub fn revoke_own_token(&self) -> Result<RevokeAnswer> {
+        self.auth_request("revoke", &json!({}), Duration::ZERO)
+    }
+}
+
+/// How long `bd remote logout` and `login` give a server to revoke a token.
+const REVOKE_BUDGET: Duration = Duration::from_secs(5);
+
+/// What became of a sign-in token, taken out of the credentials file, on its server.
+enum Revocation {
+    /// Revoked now: the token's name.
+    Revoked(String),
+    /// The server no longer knew it: revoked or expired long before.
+    Gone,
+    /// The server's admin created it, so it stays valid.
+    Kept,
+    /// Not revoked, and why: it still works until it expires.
+    NotRevoked(String),
+}
+
+impl Revocation {
+    fn line(&self) -> String {
+        match self {
+            Revocation::Revoked(name) => {
+                format!("  revoked it on the server too ({})", crate::agents::show::printable(name))
+            }
+            Revocation::Gone => "  the server had already revoked it, or it had expired".into(),
+            Revocation::Kept => {
+                "  the server's admin created it: the server accepts it until revoked there (`bd serve token revoke`)"
+                    .into()
+            }
+            Revocation::NotRevoked(why) => {
+                format!("  not revoked on the server ({why}): it works there until it expires")
+            }
+        }
+    }
+
+    fn view(&self, key: &str) -> Value {
+        match self {
+            Revocation::Revoked(name) => json!({ "key": key, "outcome": "revoked", "name": name }),
+            Revocation::Gone => json!({ "key": key, "outcome": "gone" }),
+            Revocation::Kept => json!({ "key": key, "outcome": "kept" }),
+            Revocation::NotRevoked(why) => json!({ "key": key, "outcome": "not_revoked", "reason": why }),
+        }
+    }
+}
+
+/// Revoke `gone`, a token from GitHub sign-in taken out of the credentials
+/// file, on its server: within [`REVOKE_BUDGET`], and only trusting the
+/// server as when the token was saved. That is `trust`, what this command
+/// trusts the server through, if it matches; else the system's certificate
+/// authorities, if those were trusted then; else the token is not sent.
+fn revoke_saved(gone: &credentials::Gone, trust: Option<&Trust>) -> Revocation {
+    let trust = match trust.filter(|t| t.anchor == gone.ca) {
+        Some(t) => t.clone(),
+        None if gone.ca == credentials::SYSTEM_CA => match Trust::load(None) {
+            Ok(t) => t,
+            Err(e) => return Revocation::NotRevoked(e.to_string()),
+        },
+        None => {
+            return Revocation::NotRevoked(
+                "it was saved trusting a CA certificate that is not in use here, so it was not sent".into(),
+            );
+        }
+    };
+    let c = Configured { url: gone.key.clone(), source: Source::Flag, ca_cert: trust.path.clone() };
+    let remote = Remote::new(c, trust, gone.token.clone()).quick().within(REVOKE_BUDGET);
+    match remote.revoke_own_token() {
+        Ok(answer) if answer.revoked => Revocation::Revoked(answer.name),
+        Ok(_) => Revocation::Kept,
+        Err(Error::Unauthorized(_)) => Revocation::Gone,
+        Err(e) => Revocation::NotRevoked(crate::agents::show::printable(&e.to_string())),
+    }
+}
+
+/// What a command naming `url` trusts its server through: the checkout's
+/// remote workspace's CA certificate when it is on the same server, else
+/// `$BD_CA_CERT`, else the system's certificate authorities.
+fn trust_for(app: &App, url: &str) -> Option<Trust> {
+    let server = |u: &str| credentials::keys(u).ok().map(|k| k.server);
+    let ca_cert = match configured(app).ok().flatten() {
+        Some(c) if server(&c.url) == server(url) => c.ca_cert,
+        _ => env("BD_CA_CERT").map(PathBuf::from),
+    };
+    Trust::load(ca_cert.as_deref()).ok()
 }
 
 /// bd serve's refusal of a GitHub sign-in step, as an error.
@@ -1491,7 +1583,21 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
             info["actor"].as_str().map(String::from)
         }
     };
-    let saved = credentials::save(&path, &c.url, &token, &trust.anchor, scope)?;
+    let saved = credentials::save(&path, &c.url, &token, &trust.anchor, scope, signed_in.is_some())?;
+    // A sign-in token this one takes the place of ends on its server too (unless no server is to be asked).
+    let revoke = |gone: &credentials::Gone| {
+        (gone.github && gone.token != token).then(|| match a.no_verify {
+            true => Revocation::NotRevoked("--no-verify asks no server".into()),
+            false => revoke_saved(gone, Some(&trust)),
+        })
+    };
+    let replaced = saved.replaced.as_ref().map(|gone| (gone, revoke(gone)));
+    let dropped = saved.dropped.as_ref().map(|gone| (gone, revoke(gone)));
+    let revocations: Vec<Value> = replaced
+        .iter()
+        .chain(dropped.iter())
+        .filter_map(|(gone, revocation)| revocation.as_ref().map(|r| r.view(&gone.key)))
+        .collect();
     let reach = match scope {
         Scope::Server => format!("{} (every workspace it allows there)", saved.key),
         Scope::Workspace => saved.key.clone(),
@@ -1503,8 +1609,9 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
         "scope": scope.as_str(),
         "verified": !a.no_verify,
         "actor": actor,
-        "replaced": saved.replaced,
-        "dropped": saved.dropped,
+        "replaced": replaced.is_some(),
+        "dropped": dropped.as_ref().map(|(gone, _)| &gone.key),
+        "revocations": revocations,
         "ca_cert": c.ca_cert,
     });
     if let Some(issued) = &signed_in {
@@ -1541,11 +1648,13 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
     if let Some(ca) = &c.ca_cert {
         out = out.line(format!("  bound to the CA certificate {}: it is not sent trusting any other", ca.display()));
     }
-    if saved.replaced {
+    if let Some((_, revocation)) = &replaced {
         out = out.line("  it replaces the token saved there before");
+        out = out.lines(revocation.iter().map(Revocation::line));
     }
-    if let Some(k) = &saved.dropped {
-        out = out.line(format!("  removed the token saved for {k} only, which would have taken precedence"));
+    if let Some((gone, revocation)) = &dropped {
+        out = out.line(format!("  removed the token saved for {} only, which would have taken precedence", gone.key));
+        out = out.lines(revocation.iter().map(Revocation::line));
     }
     if let Some(mode) = saved.loose_mode {
         out = out.line(format!(
@@ -1574,20 +1683,32 @@ fn logout(app: &mut App, a: &RemoteLogoutArgs) -> Result<()> {
     };
     let path = credentials::default_path()?;
     let r = credentials::remove(&path, &url, a.workspace_only)?;
-    let mut out = Out::new(json!({ "path": path, "removed": r.removed, "file_removed": r.file_removed }));
+    // A token from GitHub sign-in ends on its server too; one an admin created may serve elsewhere, and stays.
+    let trust = if r.removed.iter().any(|gone| gone.github) { trust_for(app, &url) } else { None };
+    let revocations: Vec<Option<Revocation>> =
+        r.removed.iter().map(|gone| gone.github.then(|| revoke_saved(gone, trust.as_ref()))).collect();
+    let keys: Vec<&str> = r.removed.iter().map(|gone| gone.key.as_str()).collect();
+    let views: Vec<Value> = r
+        .removed
+        .iter()
+        .zip(&revocations)
+        .filter_map(|(gone, revocation)| revocation.as_ref().map(|r| r.view(&gone.key)))
+        .collect();
+    let mut out =
+        Out::new(json!({ "path": path, "removed": keys, "file_removed": r.file_removed, "revocations": views }));
     if r.removed.is_empty() {
         out = out.line(format!("= No access token saved for {}", url.trim()));
     }
-    for k in &r.removed {
-        out = out.line(format!("✓ Removed the access token saved for {k}"));
-        out = out.id(k.clone());
+    for (gone, revocation) in r.removed.iter().zip(&revocations) {
+        out = out.line(format!("✓ Removed the access token saved for {}", gone.key)).id(gone.key.clone());
+        out = out.lines(revocation.iter().map(Revocation::line));
     }
     if r.file_removed {
         out = out.line(format!("  removed {}, which is empty now", path.display()));
     }
-    if !r.removed.is_empty() {
+    if r.removed.iter().any(|gone| !gone.github) {
         out = out.line(
-            "  the server still accepts the token until it is revoked there (`bd serve token revoke`), or expires",
+            "  the server still accepts a token its admin created until it is revoked there (`bd serve token revoke`)",
         );
     }
     if env("BD_TOKEN").is_some() {

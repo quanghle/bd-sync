@@ -1394,7 +1394,7 @@ pub enum RemoteCommand {
     /// Otherwise the token is read from stdin when it is piped (`printf %s "$TOKEN" | bd remote login`), else
     /// from a prompt that does not echo it; never from the command line. It is checked against the server first.
     Login(RemoteLoginArgs),
-    /// Forget access tokens saved by `bd remote login`
+    /// Forget access tokens saved by `bd remote login`, revoking those from GitHub sign-in on their server
     Logout(RemoteLogoutArgs),
 }
 

@@ -4967,3 +4967,66 @@ fn info_and_remote_show_tell_clients_what_their_token_may_do() {
     assert!(local["token"].is_null(), "{local}");
     assert!(!check(server.local("alice", &["info"]), "local info").contains("access"));
 }
+
+#[test]
+fn sign_in_tokens_end_on_the_server_when_logged_out_or_replaced() {
+    let github = FakeGithub::start();
+    let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"alice\"]\n");
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+    let machine = tempfile::tempdir().unwrap();
+    let sign_in = |what: &str| -> Value {
+        github.next("alice", 0);
+        serde_json::from_str(&check(github_login(machine.path(), &url), what)).unwrap()
+    };
+    let logout = |extra: &[(&str, &str)]| -> Value {
+        let mut cmd = bd(machine.path());
+        cmd.args(["--json", "remote", "logout", &url]).envs(extra.iter().copied());
+        serde_json::from_str(&check(cmd.output().unwrap(), "logout")).unwrap()
+    };
+    let live = |name: &Value| {
+        let out = bd(&root).args(["--json", "serve", "token", "list", "--root"]).arg(&root).output().unwrap();
+        let tokens: Value = serde_json::from_str(&check(out, "token list")).unwrap();
+        tokens.as_array().unwrap().iter().any(|t| &t["name"] == name && t["revoked_at"].is_null())
+    };
+    let works = |secret: &str| {
+        let out = bd(machine.path()).env("BD_REMOTE", &url).env("BD_TOKEN", secret).arg("list").output().unwrap();
+        out.status.success()
+    };
+
+    // Signing in again on the same machine revokes the token it replaces.
+    let first = sign_in("first sign-in");
+    let first_secret = saved_token(machine.path()).unwrap();
+    let second = sign_in("second sign-in");
+    let (first_name, second_name) = (&first["token"]["name"], &second["token"]["name"]);
+    assert_eq!(second["revocations"], json!([{ "key": server.base, "outcome": "revoked", "name": first_name }]));
+    assert!(!live(first_name) && !works(&first_secret), "the replaced token is revoked");
+    assert!(live(second_name));
+
+    // Logging out revokes it on the server, then forgets it.
+    let v = logout(&[]);
+    assert_eq!(v["revocations"], json!([{ "key": server.base, "outcome": "revoked", "name": second_name }]));
+    assert!(!live(second_name));
+    assert_eq!(saved_token(machine.path()), None);
+
+    // One the server's admin revoked first is gone there already.
+    sign_in("third sign-in");
+    let out = bd(&root).args(["serve", "token", "revoke", "--github", "alice", "--root"]).arg(&root).output().unwrap();
+    check(out, "revoke --github");
+    assert_eq!(logout(&[])["revocations"][0]["outcome"], "gone");
+
+    // A token an admin created is forgotten here, but stays valid on the server.
+    let admin = server.token("alice-ci", "ci", &[]);
+    let mut login = bd(machine.path());
+    login.args(["remote", "login", &url]);
+    check(with_input(login, &admin), "login with a token");
+    let v = logout(&[]);
+    assert_eq!(v["revocations"], json!([]));
+    assert!(works(&admin));
+
+    // With the server gone, logging out still forgets the token here.
+    sign_in("fourth sign-in");
+    drop(server);
+    let v = logout(&[("BD_REMOTE_RETRY_SECS", "0")]);
+    assert_eq!(v["revocations"][0]["outcome"], "not_revoked", "{v}");
+    assert_eq!(saved_token(machine.path()), None);
+}

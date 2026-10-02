@@ -612,7 +612,10 @@ logged. A few things to keep in mind:
 - Whoever started a sign-in gets its token: enter only codes shown by one's
   own `bd remote login --github`.
 - The sign-in endpoints, `POST /v2/auth/github/device` and
-  `POST /v2/auth/github/token`, need no token. At most 8 sign-in requests run
+  `POST /v2/auth/github/token`, need no token. `POST /v2/auth/revoke`, sent
+  with a token, revokes it if it came from sign-in: `bd remote logout` and a
+  new sign-in on the same machine use it, so a token people no longer use
+  stops working at once rather than when it expires. At most 8 sign-in requests run
   at once (others are answered 503, which clients retry), and GitHub limits
   how many codes an app may have entered per hour. GitHub gives a code's token
   only once, so the server keeps the answer that issued a bd token for 5
@@ -718,7 +721,7 @@ bd remote login --github               # sign in with GitHub; or: bd remote logi
 bd remote login                        # the checkout's server; or: bd remote login https://bd.example.com/w/proj
 printf %s "$TOKEN" | bd remote login   # a piped token is read from stdin, not from a prompt
 bd remote login --workspace-only       # this workspace only, e.g. for a token limited to it
-bd remote logout                       # forget it (a server URL also forgets its workspaces' tokens)
+bd remote logout                       # forget it, and revoke it on the server if it came from GitHub sign-in
 ```
 
 With `--github`, `login` gets the token from the server instead of reading
@@ -751,10 +754,15 @@ redirect it; log in again from that checkout if you trust its CA. Setting
 
 On Unix, the file is replaced atomically by one with mode 0600, in a
 directory created 0700, and bd refuses to use it if other users can read it. On Windows it is
-protected by the per-user permissions of `%APPDATA%`. `bd remote logout` only
-forgets the token on this machine: revoke it on the server with
-`bd serve token revoke` (a token from GitHub sign-in also stops working when
-it expires).
+protected by the per-user permissions of `%APPDATA%`. `bd remote logout`
+forgets the token saved for a workspace URL and for its server (`--workspace-only`
+keeps the server's), or for a server URL and all its workspaces. A token from
+GitHub sign-in is revoked on its server too, and so is one that signing in
+again replaces: within a few seconds, and only trusting the server as when
+the token was saved. If that fails (the server cannot be reached, say), the
+token is forgotten all the same and works on the server until it expires. A
+token an admin created may serve elsewhere too, so it stays valid until it is
+revoked on the server (`bd serve token revoke`).
 
 | variable | meaning |
 |---|---|

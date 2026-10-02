@@ -11,8 +11,9 @@
 //! `POST /w/<name>/v2/exec` (the wire format is in `protocol.rs`);
 //! `<root>/tokens.json` holds the access tokens, and `<root>/auth.toml`
 //! turns on GitHub sign-in, served at `POST /v2/auth/github/{device,token}`
-//! without a token (`oauth.rs`). `GET /healthz` answers `ok` without a
-//! token.
+//! without a token (`oauth.rs`); `POST /v2/auth/revoke` revokes the token it
+//! is sent with, if it came from sign-in. `GET /healthz` answers `ok`
+//! without a token.
 //!
 //! Memory and slots: up to `MAX_RUNNING` commands run at once. Requests in
 //! progress share a budget (`MIN_BODY_BUDGET`, or more for one maximum-size
@@ -73,7 +74,7 @@ use crate::jobs;
 use crate::oauth;
 use crate::protocol::{
     ErrorBody, ErrorDetail, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, PROTOCOL, PROTOCOL_HEADER,
-    SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
+    RevokeAnswer, SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
 };
 use crate::stream::{FrameWriter, Limits, ResponseBody, Stalls};
 
@@ -445,6 +446,12 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
         } else {
             Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
         }
+    } else if path.ends_with(&format!("/v{PROTOCOL}/auth/revoke")) {
+        if req.method() == Method::POST {
+            revoke_own(&server, req).await
+        } else {
+            Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
+        }
     } else {
         let msg = format!("no such endpoint; workspaces are at /w/<name>/v{PROTOCOL}/exec");
         Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response()
@@ -579,6 +586,38 @@ impl Drop for Completing {
     }
 }
 
+/// `POST /v2/auth/revoke`: revoke the request's own token, if it came from
+/// GitHub sign-in (`bd remote logout`). One an admin created is kept: it may
+/// serve elsewhere too, and only the admin revokes it. An expired token may
+/// still be revoked; an unknown one is refused like any request.
+async fn revoke_own(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
+    let Some(secret) = bearer(req.headers()).map(str::to_string) else { return denied().response() };
+    let token = match server.tokens.verify(&secret) {
+        Ok(Verified::Valid(t) | Verified::Expired(t)) => t,
+        Ok(Verified::Unknown) => return denied().response(),
+        Err(e) => return Reject::internal(e).response(),
+    };
+    // The body says nothing; read it all the same, small, so that the connection stays usable.
+    let _ = tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await;
+    if token.github.is_none() {
+        return json_response(StatusCode::OK, &RevokeAnswer { name: token.name, revoked: false });
+    }
+    let (root, srv, id) = (server.root.clone(), server.clone(), token.id.clone());
+    let revoked = blocking(move || {
+        let revoked = auth::revoke_by_id(&root, &id)?;
+        srv.tokens.invalidate();
+        Ok(revoked)
+    })
+    .await;
+    match revoked {
+        Ok(_) => {
+            tracing::info!(target: "bd::serve", token = %token.name, actor = %token.actor, "access token revoked by its holder");
+            json_response(StatusCode::OK, &RevokeAnswer { name: token.name, revoked: true })
+        }
+        Err(e) => Reject::internal(e).response(),
+    }
+}
+
 /// Run `f` on a blocking thread.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     match tokio::task::spawn_blocking(f).await {
@@ -587,21 +626,25 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
     }
 }
 
+fn denied() -> Reject {
+    Reject::new(
+        StatusCode::UNAUTHORIZED,
+        "unauthorized",
+        "missing or invalid access token (sent as a bearer token in the Authorization header)",
+        7,
+    )
+}
+
+/// The bearer token of the Authorization header, if it has one.
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let (scheme, secret) = value.trim().split_once(' ')?;
+    Some(secret.trim()).filter(|s| scheme.eq_ignore_ascii_case("bearer") && !s.is_empty())
+}
+
 fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Token, Reject> {
-    let denied = || {
-        Reject::new(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "missing or invalid access token (sent as a bearer token in the Authorization header)",
-            7,
-        )
-    };
-    let value = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or_else(denied)?;
-    let (scheme, secret) = value.trim().split_once(' ').ok_or_else(denied)?;
-    if !scheme.eq_ignore_ascii_case("bearer") || secret.trim().is_empty() {
-        return Err(denied());
-    }
-    match server.tokens.verify(secret.trim()) {
+    let secret = bearer(headers).ok_or_else(denied)?;
+    match server.tokens.verify(secret) {
         Ok(Verified::Valid(token)) => Ok(token),
         Ok(Verified::Expired(token)) => {
             let at = token.expires_at.map(|t| t.to_rfc3339()).unwrap_or_default();

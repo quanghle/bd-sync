@@ -747,6 +747,13 @@ fn revoke(app: &mut App, a: &TokenRevokeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Revoke the token with this id (not its name, which a later token may
+/// reuse): whether it was revoked now.
+pub fn revoke_by_id(root: &Path, id: &str) -> Result<bool> {
+    let (_, revoked) = revoke_where(root, |tokens| (0..tokens.len()).filter(|&i| tokens[i].id == id).collect())?;
+    Ok(!revoked.is_empty())
+}
+
 /// Revoke the tokens `pick` selects (indexes): how many it selects, and the
 /// names of those revoked now (the others already were).
 fn revoke_where(root: &Path, pick: impl FnOnce(&[Token]) -> Vec<usize>) -> Result<(usize, Vec<String>)> {
@@ -1096,6 +1103,20 @@ mod tests {
             "role write, kind human, workspaces all; token n, expires 2026-11-01T00:00:00.000Z, GitHub user alice"
         );
         assert_eq!(access_line(&json!({})), "role ?, kind ?, workspaces ; token ?", "whatever a server sends");
+    }
+
+    #[test]
+    fn tokens_are_revoked_by_id_not_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, _) = issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
+        revoke_where(dir.path(), |tokens| (0..tokens.len()).collect()).unwrap();
+        let (second, _) = issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
+        assert!(!revoke_by_id(dir.path(), &first.id).unwrap(), "already revoked");
+        let live =
+            || load_file(&tokens_path(dir.path())).unwrap().tokens.iter().filter(|t| t.revoked_at.is_none()).count();
+        assert_eq!(live(), 1, "the later token of the same name is untouched");
+        assert!(revoke_by_id(dir.path(), &second.id).unwrap());
+        assert_eq!(live(), 0);
     }
 
     #[test]

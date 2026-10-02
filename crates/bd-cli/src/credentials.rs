@@ -12,6 +12,7 @@
 //! [workspaces."https://bd.example.com/w/other"]
 //! token = "bdt_..."
 //! ca = "sha256:..."
+//! github = true    # from GitHub sign-in: revoked on its server at logout
 //! ```
 //!
 //! A server is its URL up to `/w/<workspace>`: scheme, host, port and any
@@ -56,6 +57,14 @@ struct File {
 struct Entry {
     token: String,
     ca: String,
+    /// From GitHub sign-in (`bd remote login --github`): logging out, or
+    /// saving another token in its place, revokes it on its server.
+    #[serde(default, skip_serializing_if = "is_false")]
+    github: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// The trust of a token checked against the system's certificate authorities.
@@ -99,14 +108,39 @@ pub struct Saved {
     pub scope: Scope,
 }
 
+/// A saved token taken out of the file, by [`save`] or [`remove`].
+#[derive(Clone)]
+pub struct Gone {
+    /// The entry it was saved under.
+    pub key: String,
+    pub token: String,
+    /// What the server's certificate was trusted against when it was saved.
+    pub ca: String,
+    /// It came from GitHub sign-in.
+    pub github: bool,
+}
+
+impl std::fmt::Debug for Gone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the secret.
+        f.debug_struct("Gone").field("key", &self.key).field("ca", &self.ca).field("github", &self.github).finish()
+    }
+}
+
+impl Gone {
+    fn new(key: String, entry: Entry) -> Gone {
+        Gone { key, token: entry.token, ca: entry.ca, github: entry.github }
+    }
+}
+
 /// What [`save`] did.
 #[derive(Debug)]
 pub struct SaveReport {
     pub key: String,
-    /// An earlier token for the same entry was replaced.
-    pub replaced: bool,
+    /// The token saved for the same entry before, replaced now.
+    pub replaced: Option<Gone>,
     /// A workspace entry removed because it would have hidden the new server token.
-    pub dropped: Option<String>,
+    pub dropped: Option<Gone>,
     /// The file's earlier mode, when other users could read it.
     pub loose_mode: Option<u32>,
 }
@@ -114,7 +148,7 @@ pub struct SaveReport {
 /// What [`remove`] did.
 #[derive(Debug, Default)]
 pub struct RemoveReport {
-    pub removed: Vec<String>,
+    pub removed: Vec<Gone>,
     /// Nothing was left, so the file was deleted.
     pub file_removed: bool,
 }
@@ -200,21 +234,22 @@ pub fn check_token(token: &str) -> Result<()> {
 }
 
 /// Save `token` for `url`'s server, or for the workspace only, with the
-/// trust it was checked under (`ca`: [`SYSTEM_CA`] or `sha256:<hex>`).
-pub fn save(path: &Path, url: &str, token: &str, ca: &str, scope: Scope) -> Result<SaveReport> {
+/// trust it was checked under (`ca`: [`SYSTEM_CA`] or `sha256:<hex>`), and
+/// whether it came from GitHub sign-in.
+pub fn save(path: &Path, url: &str, token: &str, ca: &str, scope: Scope, github: bool) -> Result<SaveReport> {
     check_token(token)?;
     let keys = keys(url)?;
     let (mut file, loose_mode) = load(path)?.unwrap_or_default();
-    let entry = Entry { token: token.to_string(), ca: ca.to_string() };
+    let entry = Entry { token: token.to_string(), ca: ca.to_string(), github };
     let report = match scope {
         Scope::Server => {
-            let dropped = keys.workspace.filter(|k| file.workspaces.remove(k).is_some());
-            let replaced = file.servers.insert(keys.server.clone(), entry).is_some();
+            let dropped = keys.workspace.and_then(|k| file.workspaces.remove(&k).map(|e| Gone::new(k, e)));
+            let replaced = file.servers.insert(keys.server.clone(), entry).map(|e| Gone::new(keys.server.clone(), e));
             SaveReport { key: keys.server, replaced, dropped, loose_mode }
         }
         Scope::Workspace => {
             let key = keys.workspace.ok_or_else(|| Error::invalid(format!("{url}: not a workspace URL")))?;
-            let replaced = file.workspaces.insert(key.clone(), entry).is_some();
+            let replaced = file.workspaces.insert(key.clone(), entry).map(|e| Gone::new(key.clone(), e));
             SaveReport { key, replaced, dropped: None, loose_mode }
         }
     };
@@ -232,11 +267,11 @@ pub fn remove(path: &Path, url: &str, workspace_only: bool) -> Result<RemoveRepo
     }
     let Some((mut file, _)) = load(path)? else { return Ok(RemoveReport::default()) };
     let mut removed = Vec::new();
-    if !workspace_only && file.servers.remove(&keys.server).is_some() {
-        removed.push(keys.server.clone());
+    if !workspace_only {
+        removed.extend(file.servers.remove(&keys.server).map(|e| Gone::new(keys.server.clone(), e)));
     }
     match &keys.workspace {
-        Some(k) => removed.extend(file.workspaces.remove(k).map(|_| k.clone())),
+        Some(k) => removed.extend(file.workspaces.remove(k).map(|e| Gone::new(k.clone(), e))),
         None => {
             let prefix = format!("{}/w/", keys.server);
             let under: Vec<String> = file
@@ -246,8 +281,7 @@ pub fn remove(path: &Path, url: &str, workspace_only: bool) -> Result<RemoveRepo
                 .cloned()
                 .collect();
             for k in under {
-                file.workspaces.remove(&k);
-                removed.push(k);
+                removed.extend(file.workspaces.remove(&k).map(|e| Gone::new(k, e)));
             }
         }
     }
@@ -335,6 +369,24 @@ fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn keys_of(gone: &[Gone]) -> Vec<&str> {
+        gone.iter().map(|g| g.key.as_str()).collect()
+    }
+
+    #[test]
+    fn sign_in_tokens_are_marked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        save(&path, "https://h/w/a", "bdt_gh", SYSTEM_CA, Scope::Server, true).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("github = true"));
+        let r = save(&path, "https://h/w/a", "bdt_admin", SYSTEM_CA, Scope::Server, false).unwrap();
+        let replaced = r.replaced.unwrap();
+        assert!(replaced.github && replaced.token == "bdt_gh");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("github"), "only sign-in tokens say so");
+        let r = remove(&path, "https://h", false).unwrap();
+        assert!(!r.removed[0].github && r.removed[0].token == "bdt_admin");
+    }
+
     fn k(server: &str, workspace: Option<&str>) -> Keys {
         Keys { server: server.into(), workspace: workspace.map(String::from) }
     }
@@ -370,34 +422,38 @@ mod tests {
         assert!(lookup_in(&path, "https://h/w/a").unwrap().is_none(), "a missing file is no token");
         assert!(remove(&path, "https://h/w/a", false).unwrap().removed.is_empty());
 
-        let r = save(&path, "https://H:443/w/a", "bdt_server", SYSTEM_CA, Scope::Server).unwrap();
-        assert_eq!((r.key.as_str(), r.replaced, r.dropped.is_none()), ("https://h", false, true));
-        save(&path, "https://other/w/a", "bdt_other", SYSTEM_CA, Scope::Server).unwrap();
-        save(&path, "https://h/w/b", "bdt_b", SYSTEM_CA, Scope::Workspace).unwrap();
+        let r = save(&path, "https://H:443/w/a", "bdt_server", SYSTEM_CA, Scope::Server, false).unwrap();
+        assert_eq!((r.key.as_str(), r.replaced.is_none(), r.dropped.is_none()), ("https://h", true, true));
+        save(&path, "https://other/w/a", "bdt_other", SYSTEM_CA, Scope::Server, false).unwrap();
+        save(&path, "https://h/w/b", "bdt_b", SYSTEM_CA, Scope::Workspace, false).unwrap();
         let found = |url: &str| lookup_in(&path, url).unwrap().map(|s| (s.token, s.key, s.scope));
         assert_eq!(found("https://h/w/a"), Some(("bdt_server".into(), "https://h".into(), Scope::Server)));
         assert_eq!(found("https://h/w/b"), Some(("bdt_b".into(), "https://h/w/b".into(), Scope::Workspace)));
         assert_eq!(found("https://h/prefix/w/a"), None, "another server behind the same host");
 
         // Logging in to b's server again replaces the server token and drops b's own, which would hide it.
-        let r = save(&path, "https://h/w/b", "bdt_new", SYSTEM_CA, Scope::Server).unwrap();
-        assert!(r.replaced);
-        assert_eq!(r.dropped.as_deref(), Some("https://h/w/b"));
+        let r = save(&path, "https://h/w/b", "bdt_new", SYSTEM_CA, Scope::Server, false).unwrap();
+        let replaced = r.replaced.unwrap();
+        assert_eq!((replaced.key.as_str(), replaced.token.as_str()), ("https://h", "bdt_server"), "what it replaced");
+        let dropped = r.dropped.unwrap();
+        assert_eq!((dropped.key.as_str(), dropped.token.as_str()), ("https://h/w/b", "bdt_b"));
+        assert!(!format!("{dropped:?}").contains("bdt_b"), "never the secret");
         assert_eq!(found("https://h/w/b").unwrap().0, "bdt_new");
 
-        save(&path, "https://h/w/b", "bdt_b", SYSTEM_CA, Scope::Workspace).unwrap();
-        save(&path, "https://h/w/c", "bdt_c", SYSTEM_CA, Scope::Workspace).unwrap();
+        save(&path, "https://h/w/b", "bdt_b", SYSTEM_CA, Scope::Workspace, false).unwrap();
+        save(&path, "https://h/w/c", "bdt_c", SYSTEM_CA, Scope::Workspace, false).unwrap();
         let r = remove(&path, "https://h/w/b", true).unwrap();
-        assert_eq!(r.removed, vec!["https://h/w/b"]);
+        assert_eq!(keys_of(&r.removed), ["https://h/w/b"]);
         assert_eq!(found("https://h/w/b").unwrap().0, "bdt_new", "back to the server token");
         assert!(remove(&path, "https://h", true).is_err(), "--workspace-only needs a workspace");
 
         let r = remove(&path, "https://h/", false).unwrap();
-        assert_eq!(r.removed, vec!["https://h", "https://h/w/c"], "a server URL removes its workspaces too");
+        assert_eq!(keys_of(&r.removed), ["https://h", "https://h/w/c"], "a server URL removes its workspaces too");
+        assert_eq!(r.removed[1].token, "bdt_c");
         assert!(!r.file_removed);
         assert_eq!(found("https://other/w/z").unwrap().0, "bdt_other");
         let r = remove(&path, "https://other/w/a", false).unwrap();
-        assert_eq!((r.removed, r.file_removed), (vec!["https://other".to_string()], true));
+        assert_eq!((keys_of(&r.removed), r.file_removed), (vec!["https://other"], true));
         assert!(!path.exists(), "an empty file is deleted");
     }
 
@@ -405,7 +461,7 @@ mod tests {
     fn entries_keep_the_trust_they_were_checked_under() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.toml");
-        save(&path, "https://h/w/a", "bdt_x", "sha256:abc", Scope::Server).unwrap();
+        save(&path, "https://h/w/a", "bdt_x", "sha256:abc", Scope::Server, false).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("ca = \"sha256:abc\""));
         assert_eq!(lookup_in(&path, "https://h/w/a").unwrap().unwrap().ca, "sha256:abc");
         std::fs::write(&path, "[servers.\"https://h\"]\ntoken = \"bdt_secret_value\"\n").unwrap();
@@ -422,9 +478,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.toml");
-        assert!(save(&path, "https://h/w/a", "", SYSTEM_CA, Scope::Server).is_err());
+        assert!(save(&path, "https://h/w/a", "", SYSTEM_CA, Scope::Server, false).is_err());
         assert!(
-            save(&path, "https://h", "bdt_x", SYSTEM_CA, Scope::Workspace).is_err(),
+            save(&path, "https://h", "bdt_x", SYSTEM_CA, Scope::Workspace, false).is_err(),
             "a workspace entry needs a workspace URL"
         );
         assert!(!path.exists(), "nothing is written for a refused save");
@@ -444,7 +500,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cfg").join("bd").join("credentials.toml");
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        save(&path, "https://h/w/a", "bdt_x", SYSTEM_CA, Scope::Server).unwrap();
+        save(&path, "https://h/w/a", "bdt_x", SYSTEM_CA, Scope::Server, false).unwrap();
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert_eq!(mode(&dir.path().join("cfg")), 0o700);
@@ -454,7 +510,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let e = lookup_in(&path, "https://h/w/a").err().unwrap();
         assert!(e.to_string().contains("chmod 600") && e.exit_code() == 2, "{e}");
-        let r = save(&path, "https://h/w/a", "bdt_y", SYSTEM_CA, Scope::Server).unwrap();
+        let r = save(&path, "https://h/w/a", "bdt_y", SYSTEM_CA, Scope::Server, false).unwrap();
         assert_eq!(r.loose_mode, Some(0o644));
         assert_eq!(mode(&path), 0o600, "saving again makes it private");
         assert_eq!(lookup_in(&path, "https://h/w/a").unwrap().unwrap().token, "bdt_y");

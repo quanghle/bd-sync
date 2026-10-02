@@ -1211,7 +1211,6 @@ Code shell inherits `$CLAUDE_CODE_SESSION_ID` and is taken for Claude Code.
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -1242,10 +1241,10 @@ copilot`, on `SessionStart`. A repository can use a hook file instead,
 
 Copilot CLI also runs a repository's `.claude/settings.json` hooks, where
 `--harness claude` stays inert and plain `bd prime`'s output is dropped.
-Copilot CLI 1.0.91 refuses a `.claude/settings.json` with an empty
-`matcher` (as this repository's has), warning at each session start
-(`matcher cannot be empty`) and skipping the whole file; Claude Code
-accepts it.
+Leave out `matcher` to match every occurrence of an event, rather than
+writing `"matcher": ""`: Copilot CLI 1.0.91 refuses a `.claude/settings.json`
+with an empty `matcher`, warning at each session start (`matcher cannot be
+empty`) and skipping the whole file, while Claude Code treats both alike.
 
 **Codex** (`.codex/hooks.json` in the repository):
 

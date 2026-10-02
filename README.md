@@ -921,12 +921,21 @@ claimed issue to a subagent with its own session id, either have the
 subagent take it over that way, or run the subagent's bd commands with
 `BD_ACTOR=<your actor>` so that it acts as you.
 
+Only an actor bd derived has "sessions of yours": the plain user and its
+`<user>/<session>` sub-actors. An actor named outright (`--actor`,
+`$BD_ACTOR`, `$BEADS_ACTOR`) has none, since its first segment may be a
+pool rather than a user: with `BD_ACTOR=pool/w1`, a claim of `pool/w2` is
+another actor's, answered with the usual "pick other work" and not listed
+by `bd prime`.
+
 In a remote workspace, the access token decides: `--actor` and `$BD_ACTOR`
 may only name the token's actor or one of its sub-actors. Without them, a
 client in an agent session sends its session, not its user name, and acts
 as `<token actor>/<session>`; `bd serve` never derives an actor from its own
 environment. Servers older than this ignore the session and use the
-token's actor.
+token's actor. The token's actor is then the user: its sub-actors are the
+"other sessions" of a request that names no actor, while a request whose
+actor comes from `--actor` or the client's `$BD_ACTOR` has none.
 
 ## Exit codes
 

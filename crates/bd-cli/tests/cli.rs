@@ -1138,6 +1138,38 @@ fn claims_of_other_sessions_of_yours_are_listed_with_their_takeover() {
     assert_eq!(json_of(as_user(&ws, None, &["--json", "show", "t-1"]))["status"], "closed");
 }
 
+#[test]
+fn actors_named_outright_are_not_sessions_of_yours() {
+    // Workers of a pool named with $BD_ACTOR or --actor are other agents, not
+    // sessions of one user: no "of yours" wording and no takeover offered.
+    let ws = Ws::new();
+    ws.ok(&["create", "Pool work"]);
+    assert!(ws.run_as("pool/w1", &["claim", "t-1"]).status.success());
+    let w2 = |args: &[&str]| ws.run_as("pool/w2", args);
+    let flagged = |args: &[&str]| as_user(&ws, Some(SESSION_A), &[&["--actor", "pool/w2"][..], args].concat());
+    for run in [&w2 as &dyn Fn(&[&str]) -> Output, &flagged] {
+        for args in [&["close", "t-1"][..], &["release", "t-1"], &["claim", "t-1"], &["heartbeat", "t-1"]] {
+            let out = run(args);
+            let err = String::from_utf8(out.stderr).unwrap();
+            assert_eq!(out.status.code(), Some(4), "{args:?}: {err}");
+            assert!(!err.contains("session of yours") && !err.contains("--assignee pool/w2"), "{args:?}: {err}");
+            assert!(err.contains("hint: "), "{args:?}: {err}");
+        }
+        let prime = String::from_utf8(run(&["prime"]).stdout).unwrap();
+        assert!(!prime.contains("other sessions of yours") && !prime.contains("t-1 [P"), "{prime}");
+        let v: Value = serde_json::from_slice(&run(&["--json", "prime"]).stdout).unwrap();
+        assert_eq!(v["other_sessions_claims"].as_array().map(Vec::len), Some(0), "{v}");
+    }
+    // A pool's root named outright is not the user of its workers either.
+    let err = String::from_utf8(ws.run_as("pool", &["close", "t-1"]).stderr).unwrap();
+    assert!(!err.contains("session of yours"), "{err}");
+    // The derived actors of a user still are: a session sees the plain user's claim as its own user's.
+    ws.ok(&["create", "Terminal work"]);
+    assert!(as_user(&ws, None, &["claim", "t-2"]).status.success());
+    let err = String::from_utf8(as_user(&ws, Some(SESSION_A), &["close", "t-2"]).stderr).unwrap();
+    assert!(err.contains("held by another session of yours (tester;"), "{err}");
+}
+
 fn json_of(out: Output) -> Value {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).unwrap()

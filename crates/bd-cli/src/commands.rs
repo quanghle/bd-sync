@@ -1045,7 +1045,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
         let (mine, others): (Vec<_>, Vec<_>) = claimed
             .into_iter()
             .filter(|i| {
-                i.assignee.as_deref().is_some_and(|a| a == actor || crate::actor::other_session_of_user(&actor, a))
+                i.assignee.as_deref().is_some_and(|a| a == actor || crate::actor::other_session_of_user(&me, a))
             })
             .map(with_lease)
             .partition(|(i, _)| i.assignee.as_deref() == Some(actor.as_str()));

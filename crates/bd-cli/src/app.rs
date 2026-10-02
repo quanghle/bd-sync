@@ -95,8 +95,8 @@ impl App {
     }
 
     /// The actor, if a command resolved it already.
-    pub fn known_actor(&self) -> Option<String> {
-        self.actor.as_ref().map(|a| a.actor.clone())
+    pub fn known_actor(&self) -> Option<&actor::Resolved> {
+        self.actor.as_ref()
     }
 
     /// Run as `actor` (`bd serve` sets each request's).

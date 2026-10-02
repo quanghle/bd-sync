@@ -3497,4 +3497,28 @@ fn agent_sessions_act_as_sub_actors_of_the_token_actor() {
     let text = check(alice.cmd(&["prime"]).output().unwrap(), "prime");
     assert!(!text.contains('⚠'), "the plain actor holds nothing: {text}");
     check(session("5139d45d-1aec-41fb-a65b-5e2515a04348", &["close", "t-1", "--take-over"]), "own token's sub-actor");
+
+    // Actors the client names outright ($BD_ACTOR, --actor) are workers, not
+    // sessions of the token's user: the plain "another actor" answer.
+    alice.ok(&["create", "Pool work"]);
+    let named = |actor: &str, flag: bool, args: &[&str]| {
+        let mut cmd = if flag { alice.cmd(&[&["--actor", actor][..], args].concat()) } else { alice.cmd(args) };
+        if !flag {
+            cmd.env("BD_ACTOR", actor);
+        }
+        cmd.env("COPILOT_AGENT_SESSION_ID", "286f56fd-c22e-458a-93ac-dfcfb9bb2788").output().unwrap()
+    };
+    check(named("alice/w1", false, &["claim", "t-2"]), "w1 claims");
+    for flag in [false, true] {
+        let out = named("alice/w2", flag, &["close", "t-2"]);
+        let err = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(4), "{err}");
+        assert!(err.contains("held by alice/w1") && !err.contains("session of yours"), "{err}");
+        assert!(!err.contains("--assignee alice/w2"), "{err}");
+        let prime = check(named("alice/w2", flag, &["prime"]), "prime");
+        assert!(!prime.contains("other sessions of yours"), "{prime}");
+    }
+    // A session-derived actor still counts the token's other actors as its own user's.
+    let out = session("5139d45d-1aec-41fb-a65b-5e2515a04348", &["close", "t-2"]);
+    assert!(stderr_of(&out).contains("held by another session of yours (alice/w1"), "{}", stderr_of(&out));
 }

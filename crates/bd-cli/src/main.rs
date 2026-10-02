@@ -90,13 +90,13 @@ fn execute(app: &mut App, cmd: &Command) -> i32 {
     tracing::debug!(target: "bd::cli", command = name, total_us = elapsed.as_micros() as u64, ok = result.is_ok(), "done");
     match result {
         Ok(code) => code,
-        Err(e) => report_as(&e, app.g.json, app.known_actor().as_deref()),
+        Err(e) => report_as(&e, app.g.json, app.known_actor()),
     }
 }
 
 /// The lines `report` prints for an error; `actor` is who the command ran
 /// as, if it got that far.
-fn render_error(e: &Error, json: bool, actor: Option<&str>) -> String {
+fn render_error(e: &Error, json: bool, actor: Option<&actor::Resolved>) -> String {
     if json {
         return format!(
             "{}\n",
@@ -115,7 +115,7 @@ fn report(e: &Error, json: bool) -> i32 {
     report_as(e, json, None)
 }
 
-fn report_as(e: &Error, json: bool, actor: Option<&str>) -> i32 {
+fn report_as(e: &Error, json: bool, actor: Option<&actor::Resolved>) -> i32 {
     io::errln(render_error(e, json, actor).trim_end_matches('\n'));
     e.exit_code()
 }
@@ -123,7 +123,9 @@ fn report_as(e: &Error, json: bool, actor: Option<&str>) -> i32 {
 /// The hint for a claim conflict with another session of the caller's own
 /// user (after /clear or a resume, or in a subagent with its own session),
 /// which the caller may be continuing, or with a newer lease of the caller.
-fn other_session_hint(e: &Error, me: &str) -> Option<String> {
+/// Only an actor bd derived has other sessions ([`actor::user_root`]).
+fn other_session_hint(e: &Error, resolved: &actor::Resolved) -> Option<String> {
+    let me = resolved.actor.as_str();
     if let Error::LeaseLost { id, holder: Some(h), .. } = e {
         if h == me {
             return Some(format!(
@@ -136,7 +138,7 @@ fn other_session_hint(e: &Error, me: &str) -> Option<String> {
         Error::AlreadyClaimed { id, holder } => (id, holder),
         _ => return None,
     };
-    if !actor::other_session_of_user(me, holder) {
+    if !actor::other_session_of_user(resolved, holder) {
         return None;
     }
     Some(format!(

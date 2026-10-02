@@ -205,19 +205,25 @@ pub fn is_label(s: &str) -> bool {
     sanitize_label(s, MAX_LABEL).as_deref() == Some(s)
 }
 
-/// The user an actor belongs to, whose sub-actors are that user's other
-/// sessions: under `bd serve` the access token's actor, else the actor's
-/// first `/` segment.
-pub fn user_root(actor: &str) -> String {
-    match io::policy() {
-        Some(p) if bd_core::policy::is_actor_or_sub_actor(&p.actor, actor) => p.actor,
-        _ => actor.split('/').next().unwrap_or(actor).to_string(),
+/// The user whose sub-actors are the caller's other sessions, when bd
+/// derived the caller's actor: the plain user (locally `git user.name` or
+/// `$USER`, under `bd serve` the access token's actor), or the user part of
+/// an agent session's `<user>/<session>`. `None` for an actor named
+/// outright (`--actor`, `$BD_ACTOR`, `$BEADS_ACTOR`): its first segment may
+/// name a pool of workers (`pool/w1`) rather than a user, and its siblings
+/// are other agents, not sessions of the caller.
+pub fn user_root(me: &Resolved) -> Option<&str> {
+    match me.source {
+        Source::Flag | Source::Env => None,
+        Source::Default => Some(&me.actor),
+        // A session label has no `/`: what precedes the last one is the user.
+        Source::Session => Some(me.actor.rsplit_once('/').map_or(me.actor.as_str(), |(user, _)| user)),
     }
 }
 
-/// Whether `holder` is another session of the user `actor` belongs to.
-pub fn other_session_of_user(actor: &str, holder: &str) -> bool {
-    holder != actor && bd_core::policy::is_actor_or_sub_actor(&user_root(actor), holder)
+/// Whether `holder` is another session of the user the caller acts as (see [`user_root`]).
+pub fn other_session_of_user(me: &Resolved, holder: &str) -> bool {
+    holder != me.actor && user_root(me).is_some_and(|root| bd_core::policy::is_actor_or_sub_actor(root, holder))
 }
 
 /// `s` as one shell word.
@@ -411,11 +417,29 @@ mod tests {
 
     #[test]
     fn other_sessions_share_the_users_root() {
-        assert!(other_session_of_user("Quang Le/copilot-1", "Quang Le"));
-        assert!(other_session_of_user("Quang Le/copilot-1", "Quang Le/claude-2"));
-        assert!(other_session_of_user("Quang Le", "Quang Le/claude-2"));
-        assert!(!other_session_of_user("Quang Le/copilot-1", "Quang Le/copilot-1"), "itself");
-        assert!(!other_session_of_user("Quang Le/copilot-1", "Quang Lee/x"));
-        assert!(!other_session_of_user("alice", "bob/alice"));
+        let session = |a: &str| Resolved::new(a, Source::Session, "git user.name + $COPILOT_AGENT_SESSION_ID");
+        let user = |a: &str| Resolved::new(a, Source::Default, "git user.name");
+        assert!(other_session_of_user(&session("Quang Le/copilot-1"), "Quang Le"));
+        assert!(other_session_of_user(&session("Quang Le/copilot-1"), "Quang Le/claude-2"));
+        assert!(other_session_of_user(&user("Quang Le"), "Quang Le/claude-2"));
+        assert!(!other_session_of_user(&session("Quang Le/copilot-1"), "Quang Le/copilot-1"), "itself");
+        assert!(!other_session_of_user(&session("Quang Le/copilot-1"), "Quang Lee/x"));
+        assert!(!other_session_of_user(&user("alice"), "bob/alice"));
+        // A user name with a `/` keeps it: the session is only the last segment.
+        assert!(other_session_of_user(&session("org/alice/claude-1"), "org/alice/claude-2"));
+        assert!(!other_session_of_user(&session("org/alice/claude-1"), "org/bob"));
+        assert!(!other_session_of_user(&user("org/alice"), "org/bob"));
+    }
+
+    #[test]
+    fn actors_named_outright_have_no_other_sessions() {
+        // `pool/w2` is another worker of the pool, not a session of `pool/w1`.
+        for source in [Source::Flag, Source::Env] {
+            let me = Resolved::new("pool/w1", source, "$BD_ACTOR");
+            assert_eq!(user_root(&me), None);
+            for holder in ["pool/w2", "pool", "pool/w1/x"] {
+                assert!(!other_session_of_user(&me, holder), "{source:?} {holder}");
+            }
+        }
     }
 }

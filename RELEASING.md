@@ -76,7 +76,7 @@ on push), so the tag steps above and the tag deletions under
 |---|---|---|
 | Check tag and version | ubuntu-24.04 | Reads the version with `cargo metadata`, fails unless the tag is `v<version>` and `Cargo.lock` is current, and decides whether this is a pre-release. |
 | Build (one per target) | see below | Builds `cargo build --release --locked -p bd --target <target>` with symbols stripped, checks the binary (static on Linux, no dynamic C runtime on Windows, macOS 11 minimum and system libraries only on macOS), packages it, then unpacks the archive and smoke-tests it (`bd version`, `bd init`, `bd create`, `bd ready`). |
-| Write SHA256SUMS | ubuntu-24.04 | Writes `SHA256SUMS` for all archives. |
+| Write SHA256SUMS | ubuntu-24.04 | Writes `SHA256SUMS` for all archives. On tags, if the release is already published, fails unless its `SHA256SUMS` is byte-identical to this run's (`.github/scripts/release-state.sh`, the check publish runs too), so nothing is attested for archives that would not be published. |
 | Attest build provenance | ubuntu-24.04 | Tags only. Signs a SLSA build-provenance attestation for every archive. |
 | Publish GitHub Release | ubuntu-24.04 | Tags only. Creates the release with generated notes, the archives and `SHA256SUMS`. On a re-run it completes a draft left by an interrupted publish, but never replaces the assets of a published release (see [If something fails](#if-something-fails)). |
 
@@ -179,7 +179,8 @@ repository admin, because of the ruleset above), or a new patch version.
   - a published release only gets the assets it is missing, and only when the
     run's `SHA256SUMS` is byte-identical to the published one. Otherwise the job
     fails ("already published with different assets"). "Re-run all jobs"
-    rebuilds the archives with new hashes, so it hits this check;
+    rebuilds the archives with new hashes, so it hits this check, already in
+    the SHA256SUMS job: nothing is attested and the release is left as it is;
   - an immutable release cannot gain assets: if any are missing, the job fails.
 
   In the last two cases, release the next patch version.

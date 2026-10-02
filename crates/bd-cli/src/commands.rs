@@ -237,16 +237,14 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         guard: guard_from(&a.guard)?,
         token: a.token,
     };
-    let mut ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
+    let ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
     if ids.len() > 1 {
         // Every claim of another actor among them, before any close is refused for something else.
         tx.check_take_over(&ids, a.take_over, &format!("closing {}", ids.join(", ")))?;
     }
     // Deepest first, so children listed alongside their parent close before it.
-    let mut keyed = Vec::new();
-    for id in ids.drain(..) {
-        keyed.push((std::cmp::Reverse(tx.depth(&id)?), id));
-    }
+    let depths = tx.depths(&ids)?;
+    let mut keyed: Vec<_> = depths.into_iter().map(std::cmp::Reverse).zip(ids).collect();
     keyed.sort();
     keyed.dedup();
     let mut results = Vec::new();

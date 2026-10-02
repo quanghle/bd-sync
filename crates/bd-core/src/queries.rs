@@ -55,9 +55,9 @@ pub trait Queries {
         graph::parent_of(self.conn(), id)
     }
 
-    /// Number of ancestors above `id` in the hierarchy.
-    fn depth(&self, id: &str) -> Result<usize> {
-        Ok(graph::ancestors(self.conn(), id)?.len())
+    /// Number of ancestors above each of `ids` in the hierarchy, in one pass.
+    fn depths(&self, ids: &[String]) -> Result<Vec<usize>> {
+        graph::depths(self.conn(), ids)
     }
 
     fn ready(&self, q: &ReadyQuery) -> Result<Vec<Issue>> {

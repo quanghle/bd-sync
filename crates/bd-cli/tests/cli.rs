@@ -439,6 +439,36 @@ fn refusal(ws: &Ws, actor: &str, args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap(), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
+/// Several ids close deepest first, ties by id, duplicates once, whatever order they
+/// are listed in and however their ancestor chains overlap.
+#[test]
+fn close_several_orders_deepest_first() {
+    let ws = Ws::new();
+    let r = ws.id(&["create", "R"]);
+    let a = ws.id(&["create", "A", "--parent", &r]);
+    let a1 = ws.id(&["create", "A1", "--parent", &a]);
+    let a2 = ws.id(&["create", "A2", "--parent", &a1]);
+    let b = ws.id(&["create", "B", "--parent", &r]);
+    let b1 = ws.id(&["create", "B1", "--parent", &b]);
+    let c = ws.id(&["create", "C"]);
+    let depth = |id: &str| {
+        [(&r, 0), (&a, 1), (&a1, 2), (&a2, 3), (&b, 1), (&b1, 2), (&c, 0)].iter().find(|(i, _)| *i == id).unwrap().1
+    };
+    let listed = [&r, &b, &a2, &c, &a1, &b1, &a, &a2];
+    let mut expected: Vec<_> = listed.iter().map(|id| (std::cmp::Reverse(depth(id)), id.to_string())).collect();
+    expected.sort();
+    expected.dedup();
+    let expected: Vec<_> = expected.into_iter().map(|(_, id)| id).collect();
+    let mut args = vec!["close"];
+    args.extend(listed.iter().map(|s| s.as_str()));
+    let closed = ws.json(&args);
+    let order: Vec<_> =
+        closed.as_array().unwrap().iter().map(|o| o["issue"]["id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(order, expected);
+    assert_eq!(order.first(), Some(&a2));
+    assert_eq!(order[order.len() - 2..], [r, c]);
+}
+
 /// The incident: --force, passed to get past open children, blockers, dependents or an
 /// unfinished run, used to take over the claim too. Now the claim is named first, and
 /// only --take-over takes it over.

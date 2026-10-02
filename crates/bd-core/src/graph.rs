@@ -152,6 +152,50 @@ pub(crate) fn ancestors(conn: &Connection, id: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// `ancestors(id).len()` for each of `ids`, in one pass: walks up from each id
+/// only until an issue whose depth is already known, so ids sharing a chain
+/// cost one parent lookup per issue in the chain rather than one per id and
+/// ancestor.
+pub(crate) fn depths(conn: &Connection, ids: &[String]) -> Result<Vec<usize>> {
+    let mut known: HashMap<String, usize> = HashMap::new();
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(&d) = known.get(id) {
+            out.push(d);
+            continue;
+        }
+        let mut path = vec![id.clone()];
+        let mut on_path: HashSet<String> = HashSet::from([id.clone()]);
+        let mut cur = id.clone();
+        // Depth of the last issue on `path`: 0 for a root, else one below a known issue.
+        let mut base = Some(0);
+        while let Some(p) = parent_of(conn, &cur)? {
+            if let Some(&d) = known.get(&p) {
+                base = Some(d + 1);
+                break;
+            }
+            if !on_path.insert(p.clone()) {
+                // A cycle: no depth to share; count it the way `ancestors` does.
+                base = None;
+                break;
+            }
+            path.push(p.clone());
+            cur = p;
+        }
+        match base {
+            Some(base) => {
+                let n = path.len();
+                for (i, node) in path.into_iter().enumerate() {
+                    known.insert(node, base + (n - 1 - i));
+                }
+                out.push(known[id]);
+            }
+            None => out.push(ancestors(conn, id)?.len()),
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn waiters_on(conn: &Connection, id: &str) -> Result<Vec<String>> {
     let mut stmt =
         conn.prepare_cached("SELECT issue_id FROM dependencies WHERE depends_on_id = ?1 AND dep_type = 'waits-for'")?;
@@ -796,4 +840,45 @@ pub fn find_cycles(conn: &Connection) -> Result<Vec<Vec<String>>> {
         }
     }
     Ok(cycles.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn depths_match_walking_each_ids_ancestors() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, dep_type TEXT,
+                                        PRIMARY KEY (issue_id, depends_on_id)) WITHOUT ROWID;",
+        )
+        .unwrap();
+        // r <- a <- a1 <- a2, r <- b <- b1, c alone; x1 -> x2 -> x3 -> x1 a cycle with y below it;
+        // m has two parents (the first by id counts).
+        let edges = [
+            ("a", "r"),
+            ("a1", "a"),
+            ("a2", "a1"),
+            ("b", "r"),
+            ("b1", "b"),
+            ("x1", "x2"),
+            ("x2", "x3"),
+            ("x3", "x1"),
+            ("y", "x1"),
+            ("m", "a2"),
+            ("m", "b"),
+        ];
+        for (i, p) in edges {
+            conn.execute("INSERT INTO dependencies VALUES (?1, ?2, 'parent-child')", [i, p]).unwrap();
+        }
+        conn.execute("INSERT INTO dependencies VALUES ('b1', 'c', 'blocks')", []).unwrap();
+        let ids: Vec<String> = ["a2", "b1", "a", "r", "c", "a1", "y", "x2", "x1", "m", "a2", "zz", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let expected: Vec<usize> = ids.iter().map(|id| ancestors(&conn, id).unwrap().len()).collect();
+        assert_eq!(depths(&conn, &ids).unwrap(), expected);
+        assert_eq!(expected[..6], [3, 2, 1, 0, 0, 2]);
+    }
 }

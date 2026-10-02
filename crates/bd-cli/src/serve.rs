@@ -508,6 +508,10 @@ async fn sign_in(server: &Arc<Server>, step: SignIn, req: Request<Incoming>) -> 
                 Ok(p) => p,
                 Err(e) => return bad_body(e).response(),
             };
+            if server.workspace(&poll.workspace).is_none() {
+                let msg = format!("workspace not found: {}", poll.workspace);
+                return Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response();
+            }
             let key = auth::hash(&poll.device_code);
             {
                 let mut issued = lock(&server.issued);
@@ -1060,6 +1064,12 @@ impl Server {
         let dir = self.root.join(name);
         let db = dir.join(".bd").join("bd.db");
         if !db.is_file() {
+            return None;
+        }
+        // Only the directory's own name: on a case-insensitive filesystem, `PROJ` would open `proj` and get past
+        // tokens and sign-in rules that name `proj`.
+        let entries = std::fs::read_dir(&self.root).ok()?;
+        if !entries.flatten().any(|e| e.file_name() == std::ffi::OsStr::new(name)) {
             return None;
         }
         let ws = Arc::new(Workspace { name: name.to_string(), dir, db, pool: Mutex::default() });

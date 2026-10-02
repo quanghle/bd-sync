@@ -538,8 +538,9 @@ rule lets in gets nothing.
 client_id = "Ov23li0123456789abcd"
 token_ttl = "30d"                       # issued tokens expire (1h to 366d; default 30d)
 # url = "https://ghe.example.com"       # GitHub Enterprise Server; its API defaults to <url>/api/v3 (api_url)
+# deny = [12345]                        # GitHub user ids that may never sign in (`bd serve token accounts`)
 
-# Rules, in order: the first that matches an account decides its token.
+# Rules, in order: the first that lets an account into the workspace decides its token.
 [[github.allow]]
 users = ["alice"]                       # GitHub logins, whatever their case
 role = "admin"                          # read, write (default) or admin
@@ -553,11 +554,17 @@ kind = "human"
 orgs = ["acme"]
 role = "read"
 workspaces = ["proj"]                   # default: every workspace
+
+# [[github.allow]]
+# anyone = true                         # any GitHub account, e.g. for an open source project
+# workspaces = ["oss"]
+# role = "write"                        # read (default here) or write
 ```
 
 `bd serve` checks the file when it starts, and refuses to start with a
 mistake in it (an unknown field, a rule that names nobody, an `http` URL to
-another host). After that, each sign-in reads it again, so changes need no
+another host, an `anyone` rule that is not the last or gives more than a rule
+before it). After that, each sign-in reads it again, so changes need no
 restart; a mistake made meanwhile fails sign-ins, with the reason in the
 server log only.
 
@@ -569,7 +576,20 @@ server log only.
   (organization settings, Third-party access), and one with SAML single
   sign-on only for a GitHub token authorized for it (GitHub offers that on its
   authorization page); until then its members count as no members, and the
-  server log says why.
+  server log says why (also when a later rule lets the account in).
+- A rule that lets an account in, but not into the workspace the sign-in is
+  for, leaves it to the rules after it; the token a later rule then issues
+  covers that workspace only, never one where an earlier rule decides. An
+  account no rule lets into that workspace is refused, and so is a workspace the server does not have:
+  nothing is issued.
+- A rule with `anyone = true` lets in every GitHub account the rules before
+  it do not, so it names no users, orgs or teams and must be the last rule.
+  Since anyone can create GitHub accounts, its tokens read by default, may
+  write at most (never `admin`), and are always `agent` tokens, which cannot
+  open human gates. A rule before it may not give a lower role in a workspace
+  it shares with it, so members never get less than strangers. Each account
+  still gets its own actor; to keep one out, add its user id to `deny` and
+  revoke its tokens (below), since revoking alone lets it sign in again.
 - The token acts as the account's actor, or its sub-actors `<actor>/<agent>`:
   the account's login when it first signed in, which it keeps when its login
   changes. The token is named `github-<actor>-<random>` and expires after
@@ -581,20 +601,24 @@ server log only.
   sign-in, in `tokens.json`, and keeps the binding when the account's tokens
   expire or are revoked. A sign-in is refused while its login's actor belongs
   to another account (one that had the login before), or while a live token
-  an admin created acts as it or one of its sub-actors; `bd serve token
-  create` refuses an account's actor in the same way. `bd serve token
-  accounts` lists the bindings, and `bd serve token revoke --github <login>
-  --forget` releases one: it revokes the account's tokens, and the next
-  account to sign in as that login binds the actor again.
-- A change to `auth.toml` applies to the next sign-ins: tokens already issued
-  keep their permissions until they expire. To cut an account off at once,
+  an admin created acts as it or one of its sub-actors. An account that
+  `users` lets in by a login it took after another account gave it up is
+  refused too, even if bound before under another login, while the login
+  names another account's actor, that account's login at its latest
+  sign-in, or a live admin-created token's actor: so it does not pass for
+  the previous holder. Under another rule (`orgs`, `teams`, `anyone`), such
+  an account signs in as its own actor. `bd serve token create` refuses
+  an account's actor in the same way. `bd serve token accounts` lists the
+  bindings, and `bd serve token revoke --github <login> --forget` releases
+  one: it revokes the account's tokens, and the next account to sign in as
+  that login binds the actor again.
+- A change to `auth.toml` (`deny` included) applies to the next sign-ins:
+  tokens already issued keep their permissions until they expire. To cut an
+  account off at once,
   `bd serve token revoke --github alice --root /srv/bd` revokes every token it
   got by signing in, including those from before a rename (`alice` may be its
   latest login or its actor). `bd serve token list` shows each token's
   GitHub account and expiry; expired ones leave the list a week later.
-- An account that a rule lets in, but not into the workspace the sign-in is
-  for, is refused, and so is a workspace the server does not have: nothing is
-  issued.
 
 The server runs GitHub's device flow itself, so the client needs to reach only
 the bd server, and the GitHub token never leaves the server: it reads the

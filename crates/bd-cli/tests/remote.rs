@@ -4760,6 +4760,8 @@ fn github_sign_in_refusals() {
     // An unknown workspace is refused before anyone goes to GitHub.
     let dir = machine();
     refused(github_login(dir.path(), &format!("{}/w/nope", server.base)), 3, "workspace not found: nope");
+    // Only the directory's own name: on a case-insensitive filesystem, PROJ would open proj.
+    refused(github_login(dir.path(), &format!("{}/w/PROJ", server.base)), 3, "workspace not found: PROJ");
     assert!(github.log().is_empty());
 
     // A sign-in cancelled at GitHub.
@@ -4814,6 +4816,73 @@ fn github_sign_in_refusals() {
     std::fs::write(root.path().join("auth.toml"), "[github]\nclient_id = \"x\"\n").unwrap();
     let out = bd(root.path()).args(["serve", "--listen", "127.0.0.1:0", "--root"]).arg(root.path()).output().unwrap();
     refused(out, 2, "auth.toml");
+}
+
+#[test]
+fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
+    let github = FakeGithub::start();
+    let server = sign_in_server(
+        &github,
+        "[[github.allow]]\nusers = [\"alice\", \"ci-agents\", \"new-name\"]\nkind = \"human\"\n\n[[github.allow]]\nanyone = true\n",
+    );
+    server.token("ci", "ci-agents", &[]);
+    let url = server.url();
+    let sign_in = |login: &str, id: u64| {
+        github.next(login, 0);
+        github.set_id(login, id);
+        let dir = tempfile::tempdir().unwrap();
+        let out = github_login(dir.path(), &url);
+        (dir, out)
+    };
+    let issued = |out: Output| -> Value {
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap()
+    };
+    let refused = |out: Output, says: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(out.status.code(), Some(7), "{stderr}");
+        assert!(stderr.contains(says), "{says}: {stderr}");
+    };
+
+    let v = issued(sign_in("alice", 1).1);
+    assert_eq!((v["github"]["via"].as_str(), v["token"]["kind"].as_str()), (Some("GitHub user alice"), Some("human")));
+
+    let (stranger, out) = sign_in("stranger", 2);
+    let v = issued(out);
+    assert_eq!(v["actor"], "stranger", "bound to its own login's actor");
+    assert_eq!(v["github"]["via"], "GitHub user stranger, as anyone");
+    assert_eq!((v["token"]["role"].as_str(), v["token"]["kind"].as_str()), (Some("read"), Some("agent")));
+    check(signed_in(stranger.path(), &url, &["list"]), "read as anyone");
+    assert_eq!(signed_in(stranger.path(), &url, &["create", "x"]).status.code(), Some(7), "a read token");
+    assert!(!github.log().iter().any(|l| l.contains("scope=")), "no rule reads memberships: {:?}", github.log());
+
+    // Renamed to a login a rule names, a bound account does not pass for the principal that had it.
+    refused(sign_in("alice", 2).1, "actor alice belongs to another GitHub account");
+    refused(sign_in("ci-agents", 2).1, "another access token acts as ci-agents");
+    issued(sign_in("stranger", 2).1);
+    // Nor for one whose login it was at its latest sign-in, though never its actor.
+    issued(sign_in("old-name", 5).1);
+    let v = issued(sign_in("new-name", 5).1);
+    assert_eq!((v["actor"].as_str(), v["token"]["kind"].as_str()), (Some("old-name"), Some("human")));
+    refused(sign_in("new-name", 2).1, "login new-name was that of another GitHub account (actor old-name)");
+    // A login no rule names is just anyone's: the account signs in as its own actor.
+    let v = issued(sign_in("old-name", 2).1);
+    assert_eq!(
+        (v["actor"].as_str(), v["github"]["via"].as_str()),
+        (Some("stranger"), Some("GitHub user old-name, as anyone"))
+    );
+
+    // The token step refuses a workspace the server does not have, as the device step does.
+    let (status, answer) = sign_in_post(&server, "token", json!({ "device_code": "abc", "workspace": "nope" }));
+    assert_eq!((status, answer["error"]["code"].as_str()), (404, Some("not_found")), "{answer}");
+
+    // A denied account gets nothing, whatever its login.
+    let config = server.root.path().join("auth.toml");
+    let text = std::fs::read_to_string(&config).unwrap().replace("[github]\n", "[github]\ndeny = [2]\n");
+    std::fs::write(&config, text).unwrap();
+    refused(sign_in("stranger", 2).1, "GitHub user stranger may not sign in");
+    refused(sign_in("someone-else", 2).1, "GitHub user someone-else may not sign in");
+    issued(sign_in("newcomer", 3).1);
 }
 
 /// POST `body` to the server's sign-in endpoint `step` (`device` or `token`): the status and JSON answer.

@@ -480,16 +480,23 @@ pub fn issue_token(
 /// sign-in, else its login, bound to it now. It is named
 /// `github-<actor>-<random>` (the actor cut to 40 characters). Returns it
 /// with its secret, which is not stored anywhere.
-pub fn issue_github_token(root: &Path, user: &GithubUser, grant: Grant, ttl: Duration) -> Result<(Token, String)> {
-    add_token(root, Holder::Github { user, expires_at: Timestamp::now().plus(ttl) }, grant)
+pub fn issue_github_token(
+    root: &Path,
+    user: &GithubUser,
+    grant: Grant,
+    ttl: Duration,
+    by_login: bool,
+) -> Result<(Token, String)> {
+    add_token(root, Holder::Github { user, expires_at: Timestamp::now().plus(ttl), by_login }, grant)
 }
 
 /// Whom a new token is for.
 enum Holder<'a> {
     /// An admin names it, and its actor.
     Admin { name: &'a str, actor: &'a str },
-    /// A GitHub account that signed in.
-    Github { user: &'a GithubUser, expires_at: Timestamp },
+    /// A GitHub account that signed in; `by_login` when a rule let it in by
+    /// its login.
+    Github { user: &'a GithubUser, expires_at: Timestamp, by_login: bool },
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -537,8 +544,14 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
             }
             (name.to_string(), actor.to_string(), None, None)
         }
-        Holder::Github { user, expires_at } => {
-            let actor = bind(&mut file.accounts, user, now)?;
+        Holder::Github { user, expires_at, by_login } => {
+            let actor = bind(&mut file.accounts, user, now, by_login)?;
+            // A renamed account let in by a login that names another principal's actor must not pass for it.
+            if by_login && !related(&actor, &user.login) {
+                if let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now) {
+                    return Err(conflict_error(&user.login, Some(user), other));
+                }
+            }
             let label: String = actor.chars().take(40).collect();
             let name = format!("github-{label}-{}", random_hex(4)?);
             check_name(&name)?;
@@ -572,14 +585,19 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
 }
 
 /// The actor of `user`'s tokens: the one bound to its account, else its
-/// login, bound to it now, unless another account's actor is related to it.
-fn bind(accounts: &mut Vec<Account>, user: &GithubUser, now: Timestamp) -> Result<String> {
-    if let Some(account) = accounts.iter_mut().find(|a| a.is(user)) {
-        account.login = user.login.clone();
-        account.last_seen = now;
-        return Ok(account.actor.clone());
-    }
-    if let Some(other) = accounts.iter().find(|a| related(&a.actor, &user.login)) {
+/// login, bound to it now. Refused while the login would bind another
+/// account's actor; and, when a rule let the account in `by_login`, while
+/// another account's actor or latest login is related to it, even for an
+/// account bound before: one that took a login given up must not pass for
+/// its previous holder, whom rules name by it.
+fn bind(accounts: &mut Vec<Account>, user: &GithubUser, now: Timestamp, by_login: bool) -> Result<String> {
+    let bound = accounts.iter().any(|a| a.is(user));
+    let taken = |a: &Account| {
+        let actor = related(&a.actor, &user.login) && (!bound || by_login);
+        let login = by_login && related(&a.login, &user.login);
+        !a.is(user) && (actor || login)
+    };
+    if let Some(other) = accounts.iter().find(|a| taken(a)) {
         tracing::info!(
             target: "bd::serve",
             login = %user.login,
@@ -588,11 +606,20 @@ fn bind(accounts: &mut Vec<Account>, user: &GithubUser, now: Timestamp) -> Resul
             bound_to = other.id,
             "GitHub sign-in refused: the login's actor belongs to another account"
         );
+        let whose = match related(&other.actor, &user.login) {
+            true => format!("actor {} belongs to another GitHub account, which had that login before", other.actor),
+            false => format!("login {} was that of another GitHub account (actor {}) before", other.login, other.actor),
+        };
         return Err(Error::Unauthorized(format!(
-            "GitHub user {} may not sign in to this bd server: actor {} belongs to another GitHub account, which had \
-             that login before; the server's admin resolves that (`bd serve token accounts`)",
-            user.login, other.actor
+            "GitHub user {} may not sign in to this bd server: {whose}; the server's admin resolves that (`bd serve \
+             token accounts`)",
+            user.login
         )));
+    }
+    if let Some(account) = accounts.iter_mut().find(|a| a.is(user)) {
+        account.login = user.login.clone();
+        account.last_seen = now;
+        return Ok(account.actor.clone());
     }
     accounts.push(Account {
         url: user.url.clone(),
@@ -915,7 +942,7 @@ mod tests {
         let grant = Grant { role: Role::Read, kind: Kind::Human, workspaces: vec!["proj".into(), " ".into()] };
         let ttl = Duration::from_secs(30 * 24 * 3600);
         let before = Timestamp::now();
-        let (t, secret) = issue_github_token(dir.path(), &alice, grant.clone(), ttl).unwrap();
+        let (t, secret) = issue_github_token(dir.path(), &alice, grant.clone(), ttl, true).unwrap();
         assert!(secret.starts_with("bdt_") && t.sha256 == hash(&secret));
         assert!(t.name.starts_with("github-Alice-GH-") && t.name.len() == "github-Alice-GH-".len() + 8, "{}", t.name);
         assert_eq!((t.actor.as_str(), t.role, t.kind), ("Alice-GH", Role::Read, Kind::Human));
@@ -926,10 +953,10 @@ mod tests {
         assert!(t.describe().contains("signed in as GitHub user Alice-GH"), "{}", t.describe());
         assert!(t.state(Timestamp::now()).contains("expires"), "{}", t.state(Timestamp::now()));
         assert!(t.state(expires).starts_with("expired"));
-        let (again, _) = issue_github_token(dir.path(), &alice, grant.clone(), ttl).unwrap();
+        let (again, _) = issue_github_token(dir.path(), &alice, grant.clone(), ttl, true).unwrap();
         assert_ne!(again.name, t.name, "each sign-in gets a token of its own");
         let long = gh(&"a".repeat(60), 7);
-        let (t, _) = issue_github_token(dir.path(), &long, grant, ttl).unwrap();
+        let (t, _) = issue_github_token(dir.path(), &long, grant, ttl, true).unwrap();
         assert_eq!((t.actor.len(), t.name.len()), (60, "github-".len() + 40 + 9), "the actor keeps the whole login");
 
         let v = Verifier::new(dir.path());
@@ -967,7 +994,7 @@ mod tests {
         let path = tokens_path(dir.path());
         let hour = Duration::from_secs(3600);
         let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![] };
-        let sign_in = |user: &GithubUser| issue_github_token(dir.path(), user, grant.clone(), hour);
+        let sign_in = |user: &GithubUser| issue_github_token(dir.path(), user, grant.clone(), hour, true);
         let accounts = || load_file(&path).unwrap().accounts;
 
         let (first, _) = sign_in(&gh("alice", 1)).unwrap();
@@ -1017,9 +1044,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ttl = Duration::from_secs(3600);
         let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![] };
-        let (a1, _) = issue_github_token(dir.path(), &gh("Alice", 1), grant.clone(), ttl).unwrap();
-        let (a2, _) = issue_github_token(dir.path(), &gh("alice-new", 1), grant.clone(), ttl).unwrap();
-        let (b, _) = issue_github_token(dir.path(), &gh("bob", 2), grant, ttl).unwrap();
+        let (a1, _) = issue_github_token(dir.path(), &gh("Alice", 1), grant.clone(), ttl, true).unwrap();
+        let (a2, _) = issue_github_token(dir.path(), &gh("alice-new", 1), grant.clone(), ttl, true).unwrap();
+        let (b, _) = issue_github_token(dir.path(), &gh("bob", 2), grant, ttl, true).unwrap();
         issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
         let mut done = revoke_github(dir.path(), "ALICE-NEW", false).unwrap();
         done.revoked.sort();
@@ -1049,14 +1076,14 @@ mod tests {
         manual("ci", "ci-agents").unwrap();
         manual("carol-ci", "carol/ci").unwrap();
         for (login, id) in [("ci-agents", 1), ("CI-Agents", 1), ("carol", 2)] {
-            let e = issue_github_token(dir.path(), &gh(login, id), grant.clone(), ttl).unwrap_err();
+            let e = issue_github_token(dir.path(), &gh(login, id), grant.clone(), ttl, true).unwrap_err();
             assert_eq!(e.exit_code(), 7, "{login}: {e}");
             assert!(e.to_string().contains("another access token acts as"), "{e}");
         }
         assert!(load_file(&tokens_path(dir.path())).unwrap().accounts.is_empty(), "a refused sign-in binds nothing");
-        issue_github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl).unwrap();
-        issue_github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl).unwrap();
-        assert!(issue_github_token(dir.path(), &gh("Alice", 4), grant.clone(), ttl).is_err(), "another account");
+        issue_github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl, true).unwrap();
+        issue_github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl, true).unwrap();
+        assert!(issue_github_token(dir.path(), &gh("Alice", 4), grant.clone(), ttl, true).is_err(), "another account");
         for actor in ["alice", "ALICE/ci"] {
             let e = manual("x", actor).unwrap_err();
             assert!(e.to_string().contains("bd serve token revoke --github alice --forget"), "{e}");
@@ -1065,10 +1092,10 @@ mod tests {
 
         // Revoked, an account keeps its actor; released, the actor is free again. Admins' tokens may share theirs.
         revoke_github(dir.path(), "alice", false).unwrap();
-        assert!(issue_github_token(dir.path(), &gh("alice", 4), grant.clone(), ttl).is_err());
+        assert!(issue_github_token(dir.path(), &gh("alice", 4), grant.clone(), ttl, true).is_err());
         assert!(manual("x", "alice").is_err());
         revoke_github(dir.path(), "alice", true).unwrap();
-        issue_github_token(dir.path(), &gh("alice", 4), grant, ttl).unwrap();
+        issue_github_token(dir.path(), &gh("alice", 4), grant, ttl, true).unwrap();
         manual("ci-2", "ci-agents").unwrap();
     }
 

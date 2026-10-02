@@ -83,7 +83,7 @@ pub fn export(conn: &Connection, now: Timestamp, out: &mut dyn Write, opts: &Exp
         let deps: Vec<Value> = {
             let mut stmt = conn.prepare_cached(
                 "SELECT d.depends_on_id, d.dep_type, d.metadata, d.created_at, d.created_by
-                 FROM dependencies d JOIN issues t ON t.id = d.depends_on_id
+                 FROM dependencies d CROSS JOIN issues t INDEXED BY sqlite_autoindex_issues_1 ON t.id = d.depends_on_id
                  WHERE d.issue_id = ?1 AND (?2 OR t.ephemeral = 0) ORDER BY d.depends_on_id",
             )?;
             let rows = stmt.query_map(params![issue.id, opts.include_ephemeral], |r| {

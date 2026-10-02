@@ -187,11 +187,12 @@ pub struct CompactOutcome {
 }
 
 fn children_in_order(conn: &Connection, id: &str) -> Result<Vec<Issue>> {
-    // CROSS JOIN keeps this an index lookup of the children whatever the
-    // planner's statistics say: stale ones (a `bd serve` pool rarely runs
-    // `PRAGMA optimize`) can make it scan every issue instead, per node.
+    // A fixed plan (see `graph`'s module docs): index lookups of the children
+    // whatever the planner's statistics say; stale ones (a young workspace's,
+    // or a `bd serve` pool's) can make it scan every issue instead, per node.
     let sql = format!(
-        "SELECT {ISSUE_COLUMNS} FROM dependencies d CROSS JOIN issues i ON i.id = d.issue_id
+        "SELECT {ISSUE_COLUMNS} FROM dependencies d
+         CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = d.issue_id
          WHERE d.depends_on_id = ?1 AND d.dep_type = 'parent-child' ORDER BY i.created_at, i.rowid"
     );
     let mut stmt = conn.prepare_cached(&sql)?;

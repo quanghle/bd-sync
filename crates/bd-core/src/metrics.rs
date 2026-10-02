@@ -54,7 +54,8 @@ pub fn stats(conn: &Connection, now: Timestamp) -> Result<Stats> {
             "SELECT e.id FROM issues e
              WHERE e.issue_type = 'epic' AND e.status <> 'closed'
                AND EXISTS (SELECT 1 FROM dependencies d WHERE d.depends_on_id = e.id AND d.dep_type = 'parent-child')
-               AND NOT EXISTS (SELECT 1 FROM dependencies d JOIN issues c ON c.id = d.issue_id
+               AND NOT EXISTS (SELECT 1 FROM dependencies d
+                               CROSS JOIN issues c INDEXED BY sqlite_autoindex_issues_1 ON c.id = d.issue_id
                                WHERE d.depends_on_id = e.id AND d.dep_type = 'parent-child' AND c.status <> 'closed')
              ORDER BY e.id",
         )?;

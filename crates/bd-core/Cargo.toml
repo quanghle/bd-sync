@@ -18,6 +18,8 @@ toml = "1.1.6"
 tracing = "0.1.44"
 
 [dev-dependencies]
+# Records the statements a test runs, to check their query plans.
+rusqlite = { version = "0.40.2", features = ["trace"] }
 tempfile = "3.27.0"
 
 [target."cfg(unix)".dependencies]

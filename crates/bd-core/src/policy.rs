@@ -116,7 +116,8 @@ enum Hold {
 /// Open human gates `id` depends on through its own `blocks` edges.
 fn human_gates_on(conn: &rusqlite::Connection, id: &str) -> Result<Option<String>> {
     let sql = format!(
-        "SELECT {ISSUE_COLUMNS} FROM dependencies d JOIN issues i ON i.id = d.depends_on_id
+        "SELECT {ISSUE_COLUMNS} FROM dependencies d
+         CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = d.depends_on_id
          WHERE d.issue_id = ?1 AND d.dep_type = 'blocks' AND i.issue_type = 'gate'
            AND i.status NOT IN ('closed','pinned')
          ORDER BY i.id"
@@ -523,7 +524,8 @@ impl WriteCtx<'_> {
         for g in gates.into_iter().filter(is_open_human_gate) {
             let direct: Vec<String> = {
                 let mut stmt = self.conn().prepare_cached(
-                    "SELECT d.issue_id FROM dependencies d JOIN issues w ON w.id = d.issue_id
+                    "SELECT d.issue_id FROM dependencies d
+                     CROSS JOIN issues w INDEXED BY sqlite_autoindex_issues_1 ON w.id = d.issue_id
                      WHERE d.depends_on_id = ?1 AND d.dep_type = 'blocks' AND w.status NOT IN ('closed','pinned')
                      ORDER BY d.issue_id",
                 )?;

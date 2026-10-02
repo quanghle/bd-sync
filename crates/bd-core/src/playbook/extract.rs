@@ -50,8 +50,10 @@ fn without_nulls(map: Map<String, Value>) -> Map<String, Value> {
 }
 
 fn children_in_order(conn: &Connection, id: &str) -> Result<Vec<Issue>> {
+    // A fixed plan, as in `graph`: index lookups of the children per node.
     let sql = format!(
-        "SELECT {ISSUE_COLUMNS} FROM issues i JOIN dependencies d ON d.issue_id = i.id
+        "SELECT {ISSUE_COLUMNS} FROM dependencies d
+         CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = d.issue_id
          WHERE d.depends_on_id = ?1 AND d.dep_type = 'parent-child' ORDER BY i.created_at, i.rowid"
     );
     let mut stmt = conn.prepare_cached(&sql)?;

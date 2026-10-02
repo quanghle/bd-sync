@@ -481,7 +481,7 @@ pub fn view_of(conn: &Connection, issue: &Issue) -> Result<GateView> {
     let blocks = {
         let mut stmt = conn.prepare_cached(
             "SELECT o.id, o.title, o.status, o.priority, o.issue_type, o.assignee
-             FROM dependencies d CROSS JOIN issues o ON o.id = d.issue_id
+             FROM dependencies d CROSS JOIN issues o INDEXED BY sqlite_autoindex_issues_1 ON o.id = d.issue_id
              WHERE d.depends_on_id = ?1 AND d.dep_type = 'blocks' ORDER BY o.id",
         )?;
         let rows = stmt.query_map([&issue.id], |r| {

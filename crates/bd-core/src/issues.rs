@@ -160,7 +160,7 @@ pub(crate) fn refs(conn: &Connection, ids: &[String]) -> Result<Vec<IssueRef>> {
 pub fn children(conn: &Connection, id: &str) -> Result<Vec<IssueRef>> {
     let mut stmt = conn.prepare_cached(
         "SELECT c.id, c.title, c.status, c.priority, c.issue_type, c.assignee
-         FROM dependencies d JOIN issues c ON c.id = d.issue_id
+         FROM dependencies d CROSS JOIN issues c INDEXED BY sqlite_autoindex_issues_1 ON c.id = d.issue_id
          WHERE d.depends_on_id = ?1 AND d.dep_type = 'parent-child'
          ORDER BY c.created_at, c.rowid",
     )?;
@@ -179,7 +179,7 @@ pub fn children(conn: &Connection, id: &str) -> Result<Vec<IssueRef>> {
 
 fn open_children(conn: &Connection, id: &str) -> Result<Vec<String>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT c.id FROM dependencies d JOIN issues c ON c.id = d.issue_id
+        "SELECT c.id FROM dependencies d CROSS JOIN issues c INDEXED BY sqlite_autoindex_issues_1 ON c.id = d.issue_id
          WHERE d.depends_on_id = ?1 AND d.dep_type = 'parent-child' AND c.status <> 'closed'
          ORDER BY c.id",
     )?;
@@ -194,30 +194,36 @@ pub(crate) fn is_playbook_container(issue: &Issue) -> bool {
         && matches!(issue.metadata.pointer("/playbook/role").and_then(Value::as_str), Some("run" | "group"))
 }
 
+// The subtree drives every join, one edge or issue lookup per issue in it
+// (see `graph`'s module docs on query plans): planned from statistics, each
+// recursive step could scan every edge, and the final join every issue.
 const SUBTREE_CTE: &str = "WITH RECURSIVE sub(id) AS (
     SELECT issue_id FROM dependencies WHERE depends_on_id = ?1 AND dep_type = 'parent-child'
     UNION
-    SELECT d.issue_id FROM dependencies d JOIN sub s ON d.depends_on_id = s.id WHERE d.dep_type = 'parent-child')";
+    SELECT d.issue_id FROM sub s CROSS JOIN dependencies d ON d.depends_on_id = s.id
+    WHERE d.dep_type = 'parent-child')";
 
 /// Whether anything below `id` is live (not closed or pinned), leaving out
 /// `settled` and its subtree: a terminal issue below `id` with nothing live
-/// below it. `CROSS JOIN` keeps the subtree the outer loop: with table
-/// statistics the planner would otherwise scan every issue.
+/// below it. Planned as [`descendants`].
 fn has_live_descendants(conn: &Connection, id: &str, settled: Option<&str>) -> Result<bool> {
     let sql = "WITH RECURSIVE sub(id) AS (
             SELECT issue_id FROM dependencies
             WHERE depends_on_id = ?1 AND dep_type = 'parent-child' AND issue_id IS NOT ?2
             UNION
-            SELECT d.issue_id FROM dependencies d JOIN sub s ON d.depends_on_id = s.id
+            SELECT d.issue_id FROM sub s CROSS JOIN dependencies d ON d.depends_on_id = s.id
             WHERE d.dep_type = 'parent-child' AND d.issue_id IS NOT ?2)
-        SELECT EXISTS (SELECT 1 FROM sub CROSS JOIN issues i ON i.id = sub.id
+        SELECT EXISTS (SELECT 1 FROM sub CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = sub.id
                        WHERE i.status NOT IN ('closed','pinned'))";
     Ok(conn.prepare_cached(sql)?.query_row(params![id, settled], |r| r.get(0))?)
 }
 
 /// Every issue below `id` in the hierarchy, in creation order.
 pub fn descendants(conn: &Connection, id: &str) -> Result<Vec<Issue>> {
-    let sql = format!("{SUBTREE_CTE} SELECT {ISSUE_COLUMNS} FROM issues i JOIN sub ON sub.id = i.id ORDER BY i.rowid");
+    let sql = format!(
+        "{SUBTREE_CTE} SELECT {ISSUE_COLUMNS}
+         FROM sub CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = sub.id ORDER BY i.rowid"
+    );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([id], issue_from_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -877,7 +883,8 @@ impl WriteCtx<'_> {
             let failed: bool = self
                 .conn()
                 .prepare_cached(
-                    "SELECT EXISTS (SELECT 1 FROM dependencies d JOIN issues c ON c.id = d.issue_id
+                    "SELECT EXISTS (SELECT 1 FROM dependencies d
+                     CROSS JOIN issues c INDEXED BY sqlite_autoindex_issues_1 ON c.id = d.issue_id
                      WHERE d.depends_on_id = ?1 AND d.dep_type = 'parent-child' AND c.close_outcome = 'failed')",
                 )?
                 .query_row([&parent], |r| r.get(0))?;
@@ -1035,7 +1042,10 @@ impl WriteCtx<'_> {
             self.emit("deleted", Some(s), data)?;
         }
         for chunk in deleted.chunks(500) {
-            let sql = format!("DELETE FROM issues WHERE id IN {}", placeholders(chunk.len()));
+            let sql = format!(
+                "DELETE FROM issues INDEXED BY sqlite_autoindex_issues_1 WHERE id IN {}",
+                placeholders(chunk.len())
+            );
             self.conn().execute(&sql, params_from_iter(chunk.iter()))?;
         }
         seeds.retain(|x| !set.contains(x));
@@ -1096,7 +1106,10 @@ impl WriteCtx<'_> {
         self.emit(op, issue_id, data)?;
         let ids: Vec<&String> = set.iter().collect();
         for chunk in ids.chunks(500) {
-            let sql = format!("DELETE FROM issues WHERE id IN {}", placeholders(chunk.len()));
+            let sql = format!(
+                "DELETE FROM issues INDEXED BY sqlite_autoindex_issues_1 WHERE id IN {}",
+                placeholders(chunk.len())
+            );
             self.conn().execute(&sql, params_from_iter(chunk.iter()))?;
         }
         seeds.retain(|x| !set.contains(x));

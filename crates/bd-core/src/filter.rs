@@ -63,11 +63,12 @@ pub(crate) fn text_values(items: &[String]) -> Vec<SqlValue> {
     items.iter().map(|s| SqlValue::Text(s.clone())).collect()
 }
 
-/// Every issue below `parent` in the hierarchy (any depth).
+/// Every issue below `parent` in the hierarchy (any depth). Each step looks
+/// up the edges below one issue (`CROSS JOIN`: see `graph`'s module docs).
 pub(crate) const UNDER_CTE: &str = "under(id) AS (
     SELECT issue_id FROM dependencies WHERE depends_on_id = ? AND dep_type = 'parent-child'
     UNION
-    SELECT d.issue_id FROM dependencies d JOIN under u ON d.depends_on_id = u.id
+    SELECT d.issue_id FROM under u CROSS JOIN dependencies d ON d.depends_on_id = u.id
     WHERE d.dep_type = 'parent-child')";
 
 /// Apply a [`WorkFilter`] to issues aliased as `i`.

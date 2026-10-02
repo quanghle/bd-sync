@@ -23,13 +23,15 @@ use crate::time::{Timestamp, format_duration_ms};
 const HYBRID_WINDOW: Duration = Duration::from_secs(48 * 3600);
 
 // The two seed selects are separate so each uses an index (status prefix of
-// idx_issues_ready, partial idx_issues_deferral) instead of a table scan.
+// idx_issues_ready, partial idx_issues_deferral) instead of a table scan, and
+// each step looks up the edges below one issue: plans fixed whatever the
+// statistics say (see `graph`'s module docs).
 const DEFERRED_CTE: &str = "deferred(id) AS (
-    SELECT id FROM issues WHERE status = 'deferred'
+    SELECT id FROM issues INDEXED BY idx_issues_ready WHERE status = 'deferred'
     UNION
-    SELECT id FROM issues WHERE defer_until > ?
+    SELECT id FROM issues INDEXED BY idx_issues_deferral WHERE defer_until > ?
     UNION
-    SELECT d.issue_id FROM dependencies d JOIN deferred x ON d.depends_on_id = x.id
+    SELECT d.issue_id FROM deferred x CROSS JOIN dependencies d ON d.depends_on_id = x.id
     WHERE d.dep_type = 'parent-child')";
 
 /// Cheap probe (two index lookups) so the deferred-subtree CTE is only built

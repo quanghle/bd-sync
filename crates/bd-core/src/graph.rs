@@ -13,6 +13,18 @@
 //!
 //! The flag is recomputed inside the same transaction as every mutation that
 //! can change it, for the affected issues and their whole subtrees.
+//!
+//! Query plans: queries run once per issue of a walk (recomputing a subtree,
+//! a tree's edges, blockers, descendants, ...) fix their plan instead of
+//! trusting the planner's statistics, which can be badly stale: `PRAGMA
+//! optimize` first records them while a young workspace holds an issue or
+//! two, and a long-lived connection (`bd serve`'s, or one large import) keeps
+//! what it opened with. Believing a table holds a row, SQLite scans all of it
+//! per lookup, and the walk turns quadratic. Such a query starts from the
+//! edges, its `CROSS JOIN`s keeping the tables in the order written, and
+//! reaches every issue by its id through `issues INDEXED BY
+//! sqlite_autoindex_issues_1` (the primary key's index). `tests/plans.rs`
+//! checks the plans of what the walks prepare under stale statistics.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -26,11 +38,13 @@ use crate::store::WriteCtx;
 use crate::time::Timestamp;
 
 const WAITS_GATE_SHUT: &str = "(
-    (EXISTS (SELECT 1 FROM dependencies c JOIN issues ci ON ci.id = c.issue_id
+    (EXISTS (SELECT 1 FROM dependencies c
+             CROSS JOIN issues ci INDEXED BY sqlite_autoindex_issues_1 ON ci.id = c.issue_id
              WHERE c.depends_on_id = s.id AND c.dep_type = 'parent-child'
                AND ci.status NOT IN ('closed','pinned'))
      AND NOT (COALESCE(json_extract(w.metadata, '$.gate'), 'all-children') = 'any-children'
-              AND EXISTS (SELECT 1 FROM dependencies c JOIN issues ci ON ci.id = c.issue_id
+              AND EXISTS (SELECT 1 FROM dependencies c
+                          CROSS JOIN issues ci INDEXED BY sqlite_autoindex_issues_1 ON ci.id = c.issue_id
                           WHERE c.depends_on_id = s.id AND c.dep_type = 'parent-child'
                             AND ci.status = 'closed')))
     OR (json_extract(w.metadata, '$.also_blocks') IN (1, 'true') AND s.status NOT IN ('closed','pinned'))
@@ -38,13 +52,16 @@ const WAITS_GATE_SHUT: &str = "(
 
 fn direct_block_predicate(alias: &str) -> String {
     format!(
-        "(EXISTS (SELECT 1 FROM dependencies d JOIN issues t ON t.id = d.depends_on_id
+        "(EXISTS (SELECT 1 FROM dependencies d
+                  CROSS JOIN issues t INDEXED BY sqlite_autoindex_issues_1 ON t.id = d.depends_on_id
                   WHERE d.issue_id = {a}.id AND d.dep_type = 'blocks'
                     AND t.status NOT IN ('closed','pinned'))
-          OR EXISTS (SELECT 1 FROM dependencies d JOIN issues t ON t.id = d.depends_on_id
+          OR EXISTS (SELECT 1 FROM dependencies d
+                  CROSS JOIN issues t INDEXED BY sqlite_autoindex_issues_1 ON t.id = d.depends_on_id
                   WHERE d.issue_id = {a}.id AND d.dep_type = 'conditional-blocks'
                     AND NOT (t.status = 'closed' AND t.close_outcome = 'failed'))
-          OR EXISTS (SELECT 1 FROM dependencies w JOIN issues s ON s.id = w.depends_on_id
+          OR EXISTS (SELECT 1 FROM dependencies w
+                  CROSS JOIN issues s INDEXED BY sqlite_autoindex_issues_1 ON s.id = w.depends_on_id
                   WHERE w.issue_id = {a}.id AND w.dep_type = 'waits-for' AND {gate}))",
         a = alias,
         gate = WAITS_GATE_SHUT
@@ -55,7 +72,8 @@ fn should_block_sql() -> String {
     format!(
         "SELECT CASE WHEN i.status IN ('closed','pinned') THEN 0 ELSE (
             {direct}
-            OR EXISTS (SELECT 1 FROM dependencies d JOIN issues p ON p.id = d.depends_on_id
+            OR EXISTS (SELECT 1 FROM dependencies d
+                       CROSS JOIN issues p INDEXED BY sqlite_autoindex_issues_1 ON p.id = d.depends_on_id
                        WHERE d.issue_id = i.id AND d.dep_type = 'parent-child' AND p.is_blocked = 1)
          ) END
          FROM issues i WHERE i.id = ?1",
@@ -75,9 +93,9 @@ fn full_blocked_sql() -> String {
          blocked(id) AS (
              SELECT id FROM direct
              UNION
-             SELECT d.issue_id FROM dependencies d
-             JOIN blocked b ON d.depends_on_id = b.id
-             JOIN issues c ON c.id = d.issue_id
+             SELECT d.issue_id FROM blocked b
+             CROSS JOIN dependencies d ON d.depends_on_id = b.id
+             CROSS JOIN issues c INDEXED BY sqlite_autoindex_issues_1 ON c.id = d.issue_id
              WHERE d.dep_type = 'parent-child' AND c.status NOT IN ('closed','pinned')
          )
          SELECT id FROM blocked",
@@ -327,11 +345,9 @@ pub(crate) fn recompute_all(ctx: &mut WriteCtx<'_>) -> Result<Vec<BlockChange>> 
     Ok(drift)
 }
 
-/// Explain why `id` is blocked (empty when it is not). Its queries, like the
-/// tree walks', start from the edges with CROSS JOIN: SQLite then never plans
-/// a scan of every issue per call, whatever its statistics (stale in a
-/// long-lived `bd serve` connection) say, so callers can ask once per issue
-/// of a large hierarchy.
+/// Explain why `id` is blocked (empty when it is not). Its queries fix their
+/// plan (see the module docs), so callers can ask once per issue of a large
+/// hierarchy.
 pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     let status: Option<Status> =
         conn.prepare_cached("SELECT status FROM issues WHERE id = ?1")?.query_row([id], |r| r.get(0)).optional()?;
@@ -343,7 +359,8 @@ pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     let mut out = Vec::new();
     {
         let mut stmt = conn.prepare_cached(
-            "SELECT t.id, t.title, t.status FROM dependencies d CROSS JOIN issues t ON t.id = d.depends_on_id
+            "SELECT t.id, t.title, t.status FROM dependencies d
+             CROSS JOIN issues t INDEXED BY sqlite_autoindex_issues_1 ON t.id = d.depends_on_id
              WHERE d.issue_id = ?1 AND d.dep_type = 'blocks' AND t.status NOT IN ('closed','pinned')
              ORDER BY t.id",
         )?;
@@ -362,7 +379,8 @@ pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     }
     {
         let mut stmt = conn.prepare_cached(
-            "SELECT t.id, t.title, t.status FROM dependencies d CROSS JOIN issues t ON t.id = d.depends_on_id
+            "SELECT t.id, t.title, t.status FROM dependencies d
+             CROSS JOIN issues t INDEXED BY sqlite_autoindex_issues_1 ON t.id = d.depends_on_id
              WHERE d.issue_id = ?1 AND d.dep_type = 'conditional-blocks'
                AND NOT (t.status = 'closed' AND t.close_outcome = 'failed')
              ORDER BY t.id",
@@ -382,10 +400,11 @@ pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     {
         let sql = format!(
             "SELECT s.id, s.title, s.status, COALESCE(json_extract(w.metadata, '$.gate'), 'all-children'),
-                    (SELECT COUNT(*) FROM dependencies c CROSS JOIN issues ci ON ci.id = c.issue_id
+                    (SELECT COUNT(*) FROM dependencies c
+                     CROSS JOIN issues ci INDEXED BY sqlite_autoindex_issues_1 ON ci.id = c.issue_id
                      WHERE c.depends_on_id = s.id AND c.dep_type = 'parent-child'
                        AND ci.status NOT IN ('closed','pinned'))
-             FROM dependencies w CROSS JOIN issues s ON s.id = w.depends_on_id
+             FROM dependencies w CROSS JOIN issues s INDEXED BY sqlite_autoindex_issues_1 ON s.id = w.depends_on_id
              WHERE w.issue_id = ?1 AND w.dep_type = 'waits-for' AND {WAITS_GATE_SHUT}
              ORDER BY s.id"
         );
@@ -410,7 +429,8 @@ pub fn blockers(conn: &Connection, id: &str) -> Result<Vec<Blocker>> {
     }
     {
         let mut stmt = conn.prepare_cached(
-            "SELECT p.id, p.title, p.status FROM dependencies d CROSS JOIN issues p ON p.id = d.depends_on_id
+            "SELECT p.id, p.title, p.status FROM dependencies d
+             CROSS JOIN issues p INDEXED BY sqlite_autoindex_issues_1 ON p.id = d.depends_on_id
              WHERE d.issue_id = ?1 AND d.dep_type = 'parent-child' AND p.is_blocked = 1
              ORDER BY p.id",
         )?;
@@ -666,11 +686,11 @@ pub fn dependents_of(conn: &Connection, id: &str) -> Result<Vec<Edge>> {
 fn edges(conn: &Connection, id: &str, outgoing: bool) -> Result<Vec<Edge>> {
     let sql = if outgoing {
         "SELECT o.id, o.title, o.status, o.priority, d.dep_type, d.metadata
-         FROM dependencies d JOIN issues o ON o.id = d.depends_on_id
+         FROM dependencies d CROSS JOIN issues o INDEXED BY sqlite_autoindex_issues_1 ON o.id = d.depends_on_id
          WHERE d.issue_id = ?1 ORDER BY d.dep_type, o.id"
     } else {
         "SELECT o.id, o.title, o.status, o.priority, d.dep_type, d.metadata
-         FROM dependencies d JOIN issues o ON o.id = d.issue_id
+         FROM dependencies d CROSS JOIN issues o INDEXED BY sqlite_autoindex_issues_1 ON o.id = d.issue_id
          WHERE d.depends_on_id = ?1 ORDER BY d.dep_type, o.id"
     };
     let mut stmt = conn.prepare_cached(sql)?;
@@ -725,12 +745,14 @@ pub fn indent(depth: usize) -> String {
 /// Depth-first dependency tree from `root`, cycle-safe (each node expands once).
 /// Symmetric `related` links are skipped.
 pub fn dep_tree(conn: &Connection, root: &str, direction: Direction, max_depth: usize) -> Result<Vec<TreeNode>> {
-    // CROSS JOIN, as in `blockers`: one index lookup per node, whatever the statistics.
+    // A fixed plan (see the module docs): index lookups per node, whatever the statistics.
     let sql_out = "SELECT o.id, o.title, o.status, o.priority, o.is_blocked, d.dep_type
-                   FROM dependencies d CROSS JOIN issues o ON o.id = d.depends_on_id
+                   FROM dependencies d
+                   CROSS JOIN issues o INDEXED BY sqlite_autoindex_issues_1 ON o.id = d.depends_on_id
                    WHERE d.issue_id = ?1 AND d.dep_type <> 'related' ORDER BY d.dep_type, o.id";
     let sql_in = "SELECT o.id, o.title, o.status, o.priority, o.is_blocked, d.dep_type
-                  FROM dependencies d CROSS JOIN issues o ON o.id = d.issue_id
+                  FROM dependencies d
+                  CROSS JOIN issues o INDEXED BY sqlite_autoindex_issues_1 ON o.id = d.issue_id
                   WHERE d.depends_on_id = ?1 AND d.dep_type <> 'related' ORDER BY d.dep_type, o.id";
     let root_issue = crate::issues::require(conn, root)?;
     let mut out = vec![TreeNode {

@@ -567,3 +567,68 @@ fn deep_hierarchies_fit_a_server_threads_stack() {
         .join()
         .unwrap();
 }
+
+/// A run `{prefix}0` with `levels` open groups `{prefix}1..` below it, each
+/// the only child of the one before, and an open step below the last one.
+/// Plain SQL, as in [`chain_below`], then table statistics as a real
+/// workspace has them (`PRAGMA optimize`), which change query plans. Returns
+/// the step.
+fn group_chain(env: &mut Env, prefix: &str, levels: usize) -> String {
+    let issues = "WITH RECURSIVE n(k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO issues (id, title, issue_type, metadata, created_at, updated_at)
+        SELECT ?3 || k, 'Level ' || k, 'epic',
+               json_object('playbook', json_object('role', CASE k WHEN 0 THEN 'run' ELSE 'group' END)),
+               ?2 + k, ?2 + k
+        FROM n";
+    let edges = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+        SELECT ?3 || k, ?3 || (k - 1), 'parent-child', ?2 FROM n";
+    env.store
+        .write("chain", "alice", |tx| {
+            tx.conn().execute(issues, (levels as i64, T0, prefix))?;
+            tx.conn().execute(edges, (levels as i64, T0, prefix))?;
+            tx.conn().execute_batch("ANALYZE")?;
+            tx.create_issue(NewIssue { parent: Some(format!("{prefix}{levels}")), ..NewIssue::titled("Last step") })
+        })
+        .unwrap()
+        .id
+}
+
+#[test]
+fn closing_the_last_step_under_deep_groups_closes_them_in_linear_time() {
+    const LEVELS: usize = 50_000;
+    let mut env = Env::new();
+    let (local, served) = (group_chain(&mut env, "a", LEVELS), group_chain(&mut env, "b", LEVELS));
+    // On bd serve's 2 MiB blocking threads, once without a policy and once
+    // under an agent's, which checks every group for human gates.
+    let env = std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            for (step, prefix, policy) in
+                [(local, "a", None), (served, "b", Some(Policy { actor: "alice".into(), admin: false, human: false }))]
+            {
+                let started = std::time::Instant::now();
+                let out = env
+                    .store
+                    .write("close", "alice", |tx| {
+                        tx.set_policy(policy.clone());
+                        tx.close_issue(&step, &CloseOptions::default())
+                    })
+                    .unwrap();
+                let took = started.elapsed();
+                // Quadratic, this took hours; linear, about a second unoptimized.
+                assert!(took < Duration::from_secs(60), "closing {step} took {took:?}");
+                assert_eq!(out.completed.len(), LEVELS + 1);
+                assert_eq!(out.completed[0].id, format!("{prefix}{LEVELS}"));
+                assert_eq!(out.completed[LEVELS].id, format!("{prefix}0"));
+                let run = env.issue(&format!("{prefix}0"));
+                assert_eq!((run.status, run.close_reason.as_deref()), (Status::Closed, Some("every step closed")));
+            }
+            env
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    let mut env = env;
+    env.assert_healthy();
+}

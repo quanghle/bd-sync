@@ -51,7 +51,7 @@
 //! Which repositories GitHub gates may watch is a workspace setting rather
 //! than a token's: see [`crate::gates::GateRepos`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use rusqlite::params;
 use serde_json::{Value, json};
@@ -129,17 +129,32 @@ fn human_gates_on(conn: &rusqlite::Connection, id: &str) -> Result<Option<String
 /// The open human gate holding `id` back: through `id`'s own `blocks` edges,
 /// or an ancestor's (up to a closed one, below which nothing is blocked).
 fn holding_gate(conn: &rusqlite::Connection, id: &str) -> Result<Option<String>> {
-    if let Some(g) = human_gates_on(conn, id)? {
-        return Ok(Some(g));
-    }
-    for a in graph::ancestors(conn, id)? {
-        if issues::get(conn, &a)?.is_none_or(|i| i.status.is_terminal()) {
+    holding_gate_in(conn, id, &mut HashSet::new())
+}
+
+/// [`holding_gate`], skipping what an earlier walk found: `clear` holds
+/// issues from which the walk up to the first terminal ancestor met no open
+/// human gate, and gets this walk's issues when it meets none either.
+fn holding_gate_in(conn: &rusqlite::Connection, id: &str, clear: &mut HashSet<String>) -> Result<Option<String>> {
+    let mut walked = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cur = id.to_string();
+    loop {
+        if clear.contains(&cur) {
             break;
         }
-        if let Some(g) = human_gates_on(conn, &a)? {
+        if let Some(g) = human_gates_on(conn, &cur)? {
             return Ok(Some(g));
         }
+        let parent = graph::parent_of(conn, &cur)?;
+        walked.push(cur);
+        let Some(p) = parent else { break };
+        if !seen.insert(p.clone()) || issues::get(conn, &p)?.is_none_or(|i| i.status.is_terminal()) {
+            break;
+        }
+        cur = p;
     }
+    clear.extend(walked);
     Ok(None)
 }
 
@@ -420,13 +435,20 @@ impl WriteCtx<'_> {
     /// claim of another actor stays (the container stays open, as if it had
     /// work left), and a container a human gate holds is refused as if
     /// closed by hand. Returns whether it may close.
-    pub(crate) fn check_auto_close(&self, c: &Issue) -> Result<bool> {
+    ///
+    /// `c` is live and nothing below it is, so no gate below it can hold it
+    /// ([`human_hold`] would find none there): only one on its own `blocks`
+    /// edges or its live ancestors' can. `clear` carries the issues found
+    /// free of those up a cascade of closing containers, so each is looked
+    /// at once however deep the cascade.
+    pub(crate) fn check_auto_close(&self, c: &Issue, clear: &mut HashSet<String>) -> Result<bool> {
         if self.others_live_claim(c)?.is_some() {
             return Ok(false);
         }
         if self.gates_limited() {
-            if let Some(hold) = human_hold(self.conn(), c)? {
-                return Err(human_only(&c.id, &hold, "close it (its last open step just closed)"));
+            debug_assert!(!c.status.is_terminal() && !is_open_human_gate(c));
+            if let Some(g) = holding_gate_in(self.conn(), &c.id, clear)? {
+                return Err(human_only(&c.id, &Hold::HeldBy(g), "close it (its last open step just closed)"));
             }
         }
         Ok(true)

@@ -191,6 +191,18 @@ pub(crate) fn seeds_for_edge(conn: &Connection, issue: &str, target: &str, dep_t
 /// caller's transaction. Emits `blocked` / `unblocked` events for net changes
 /// on live issues and returns them.
 pub(crate) fn recompute(ctx: &mut WriteCtx<'_>, seeds: Vec<String>) -> Result<Vec<BlockChange>> {
+    recompute_above(ctx, seeds, None)
+}
+
+/// [`recompute`], without descending below `settled`: an issue that just
+/// turned terminal with nothing live below it, so every issue there is
+/// terminal, unblocked, and stays so. Keeps a run closing up a deep chain of
+/// groups linear.
+pub(crate) fn recompute_above(
+    ctx: &mut WriteCtx<'_>,
+    seeds: Vec<String>,
+    settled: Option<&str>,
+) -> Result<Vec<BlockChange>> {
     if seeds.is_empty() {
         return Ok(Vec::new());
     }
@@ -212,7 +224,9 @@ pub(crate) fn recompute(ctx: &mut WriteCtx<'_>, seeds: Vec<String>) -> Result<Ve
             continue;
         };
         state.insert(id.clone(), (blocked, status));
-        queue.extend(children(conn, &id)?);
+        if settled != Some(id.as_str()) {
+            queue.extend(children(conn, &id)?);
+        }
         order.push(id);
     }
     drop(load);

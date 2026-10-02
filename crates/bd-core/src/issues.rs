@@ -1,6 +1,6 @@
 //! Issue lifecycle: create, read, list, update, close, reopen, defer, delete.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
@@ -199,12 +199,20 @@ const SUBTREE_CTE: &str = "WITH RECURSIVE sub(id) AS (
     UNION
     SELECT d.issue_id FROM dependencies d JOIN sub s ON d.depends_on_id = s.id WHERE d.dep_type = 'parent-child')";
 
-fn has_live_descendants(conn: &Connection, id: &str) -> Result<bool> {
-    let sql = format!(
-        "{SUBTREE_CTE} SELECT EXISTS (SELECT 1 FROM issues i JOIN sub ON sub.id = i.id
-                                     WHERE i.status NOT IN ('closed','pinned'))"
-    );
-    Ok(conn.prepare_cached(&sql)?.query_row([id], |r| r.get(0))?)
+/// Whether anything below `id` is live (not closed or pinned), leaving out
+/// `settled` and its subtree: a terminal issue below `id` with nothing live
+/// below it. `CROSS JOIN` keeps the subtree the outer loop: with table
+/// statistics the planner would otherwise scan every issue.
+fn has_live_descendants(conn: &Connection, id: &str, settled: Option<&str>) -> Result<bool> {
+    let sql = "WITH RECURSIVE sub(id) AS (
+            SELECT issue_id FROM dependencies
+            WHERE depends_on_id = ?1 AND dep_type = 'parent-child' AND issue_id IS NOT ?2
+            UNION
+            SELECT d.issue_id FROM dependencies d JOIN sub s ON d.depends_on_id = s.id
+            WHERE d.dep_type = 'parent-child' AND d.issue_id IS NOT ?2)
+        SELECT EXISTS (SELECT 1 FROM sub CROSS JOIN issues i ON i.id = sub.id
+                       WHERE i.status NOT IN ('closed','pinned'))";
+    Ok(conn.prepare_cached(sql)?.query_row(params![id, settled], |r| r.get(0))?)
 }
 
 /// Every issue below `id` in the hierarchy, in creation order.
@@ -794,7 +802,8 @@ impl WriteCtx<'_> {
         let mut freed = self.mark_closed(&old, reason, outcome, false, claim_override)?;
         let (completed, also_freed) = self.close_finished_containers(id)?;
         freed.extend(also_freed);
-        freed.retain(|f| !completed.contains(f));
+        let done: HashSet<&String> = completed.iter().collect();
+        freed.retain(|f| !done.contains(f));
         Ok(CloseOutcome {
             issue: require(self.conn(), id)?,
             already_closed: false,
@@ -833,16 +842,25 @@ impl WriteCtx<'_> {
         }
         self.emit("closed", Some(id), data)?;
         let seeds = graph::seeds_for_terminal_flip(self.conn(), id)?;
-        let changes = graph::recompute(self, seeds)?;
+        // A run or group closes itself only with nothing live below it: every
+        // issue there is terminal, hence unblocked, and stays so.
+        let settled = auto.then_some(id);
+        let changes = graph::recompute_above(self, seeds, settled)?;
         Ok(changes.into_iter().filter(|c| !c.blocked && c.id != id).map(|c| c.id).collect())
     }
 
     /// Close the playbook runs and groups above `id` whose whole subtree is
     /// now closed (outcome failed when a child failed). Returns the closed
     /// containers and the issues their closing freed.
+    ///
+    /// Linear in the subtree of the last container it closes, however deep:
+    /// each container closed leaves nothing live below it, so the check of
+    /// the next one up skips its subtree, and the walk is a loop.
     fn close_finished_containers(&mut self, id: &str) -> Result<(Vec<String>, Vec<String>)> {
         let mut closed = Vec::new();
         let mut freed = Vec::new();
+        let mut settled: Option<String> = None;
+        let mut clear = HashSet::new();
         let mut cur = id.to_string();
         while let Some(parent) = graph::parent_of(self.conn(), &cur)? {
             let p = require(self.conn(), &parent)?;
@@ -850,10 +868,10 @@ impl WriteCtx<'_> {
             if p.status.is_terminal() {
                 continue;
             }
-            if !is_playbook_container(&p) || has_live_descendants(self.conn(), &parent)? {
+            if !is_playbook_container(&p) || has_live_descendants(self.conn(), &parent, settled.as_deref())? {
                 break;
             }
-            if !self.check_auto_close(&p)? {
+            if !self.check_auto_close(&p, &mut clear)? {
                 break;
             }
             let failed: bool = self
@@ -869,7 +887,8 @@ impl WriteCtx<'_> {
                 (Outcome::Done, "every step closed")
             };
             freed.extend(self.mark_closed(&p, Some(reason.into()), outcome, true, None)?);
-            closed.push(parent);
+            closed.push(parent.clone());
+            settled = Some(parent);
         }
         Ok((closed, freed))
     }

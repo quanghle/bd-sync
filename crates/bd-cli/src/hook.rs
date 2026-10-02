@@ -204,4 +204,19 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn the_repositorys_hook_configs_have_no_empty_matcher() {
+        // Copilot CLI refuses a whole file with an empty `matcher`; an omitted one matches all for both harnesses.
+        for file in
+            [include_str!("../../../.claude/settings.json"), include_str!("../../../.copilot-plugin/plugin.json")]
+        {
+            let v: Value = serde_json::from_str(file).unwrap();
+            for (event, groups) in v["hooks"].as_object().unwrap() {
+                for group in groups.as_array().unwrap() {
+                    assert_ne!(group.get("matcher").and_then(Value::as_str), Some(""), "{event}");
+                }
+            }
+        }
+    }
 }

@@ -2,7 +2,6 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",
@@ -17,7 +16,6 @@
     ],
     "SubagentStart": [
       {
-        "matcher": "",
         "hooks": [
           {
             "type": "command",

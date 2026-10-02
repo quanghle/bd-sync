@@ -1,6 +1,7 @@
 //! Command-line grammar.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
@@ -682,10 +683,13 @@ pub struct EventsArgs {
     /// Maximum events (default 50 without --since, unlimited with it)
     #[arg(short = 'n', long)]
     pub limit: Option<usize>,
-    /// Keep polling for new events
+    /// Keep printing new events as they are committed
     #[arg(short, long)]
     pub follow: bool,
-    /// Poll interval for --follow
+    /// With --since: if no event matches yet, wait up to this long for one (e.g. 30s, 5m)
+    #[arg(long, value_name = "DURATION", requires = "since", conflicts_with = "follow", value_parser = parse_wait)]
+    pub wait: Option<Duration>,
+    /// Poll interval for --follow and --wait; a remote follower asks at most this often
     #[arg(long, default_value_t = 500, value_name = "MS")]
     pub interval_ms: u64,
     #[arg(long)]
@@ -1105,6 +1109,12 @@ pub struct ServeArgs {
     /// Backups kept per workspace; older ones are deleted (0 = keep all)
     #[arg(long, default_value_t = 24, value_name = "N", requires = "backup_dir")]
     pub backup_keep: usize,
+    /// Clients waiting for new events at once (`events --follow`, `--wait`); others poll (0 to 256)
+    #[arg(long, default_value_t = 256, value_name = "N")]
+    pub max_followers: usize,
+    /// The longest a request waits for new events: keep it below the idle timeout of proxies in front
+    #[arg(long, default_value = "25s", value_name = "DURATION")]
+    pub max_wait: String,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1217,6 +1227,10 @@ pub struct RemoteSetArgs {
     /// Refused without being echoed: a token pasted after the URL
     #[arg(hide = true)]
     pub extra: Vec<String>,
+}
+
+pub fn parse_wait(s: &str) -> Result<Duration, String> {
+    bd_core::time::parse_duration(s).map_err(|e| e.to_string())
 }
 
 pub fn parse_priority(s: &str) -> Result<u8, String> {

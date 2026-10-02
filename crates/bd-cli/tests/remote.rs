@@ -125,8 +125,14 @@ impl Server {
 
     /// `bd` on the server's host, opening workspace `proj`'s database directly as `actor`.
     fn local(&self, actor: &str, args: &[&str]) -> Output {
+        self.local_cmd(actor, args).output().unwrap()
+    }
+
+    fn local_cmd(&self, actor: &str, args: &[&str]) -> Command {
         let db = self.root.path().join("proj").join(".bd").join("bd.db");
-        bd(self.root.path()).arg("--db").arg(db).env("BD_ACTOR", actor).args(args).output().unwrap()
+        let mut c = bd(self.root.path());
+        c.arg("--db").arg(db).env("BD_ACTOR", actor).args(args);
+        c
     }
 }
 
@@ -237,7 +243,7 @@ fn post_once(url: &str, token: &str, body: &Value) -> (u16, Value) {
 
 /// The frames of an answer, gathered into one object.
 fn gather(frames: &str) -> Value {
-    let (mut stdout, mut files, mut exit) = (String::new(), serde_json::Map::new(), None);
+    let (mut stdout, mut files, mut exit, mut cursor) = (String::new(), serde_json::Map::new(), None, None);
     for line in frames.lines().filter(|l| !l.trim().is_empty()) {
         assert!(exit.is_none(), "the exit frame comes last: {line}");
         let frame: Value = serde_json::from_str(line).unwrap();
@@ -246,6 +252,9 @@ fn gather(frames: &str) -> Value {
         } else if let Some(file) = frame.get("file") {
             let data = files.entry(file["path"].as_str().unwrap()).or_insert_with(|| json!(""));
             *data = json!(format!("{}{}", data.as_str().unwrap(), file["data"].as_str().unwrap()));
+        } else if let Some(seq) = frame.get("cursor") {
+            assert!(cursor.is_none(), "one cursor frame: {frames}");
+            cursor = Some(seq.as_i64().unwrap());
         } else {
             exit = Some(frame.get("exit").unwrap_or_else(|| panic!("unknown frame {line}")).clone());
         }
@@ -257,6 +266,7 @@ fn gather(frames: &str) -> Value {
         "stderr": exit["stderr"],
         "replayed": exit["replayed"],
         "files": files,
+        "cursor": cursor,
     })
 }
 
@@ -1032,37 +1042,403 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// A client printing events (`events --follow`, or `--wait`), whose output lines are read as they come.
+struct Follower {
+    child: KillOnDrop,
+    lines: std::sync::mpsc::Receiver<String>,
+    /// The lines read so far.
+    seen: Vec<String>,
+}
+
+impl Follower {
+    fn start(cmd: &mut Command) -> Follower {
+        let mut child = KillOnDrop::new(cmd.stdout(Stdio::piped()).spawn().unwrap());
+        let stdout = child.child().stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        Follower { child, lines, seen: Vec::new() }
+    }
+
+    /// Read lines until one contains all of `parts`.
+    fn wait_for(&mut self, parts: &[&str]) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.lines.recv_timeout(left) {
+                Ok(line) => {
+                    let found = parts.iter().all(|p| line.contains(p));
+                    self.seen.push(line);
+                    if found {
+                        return;
+                    }
+                }
+                Err(_) => panic!("no line with {parts:?} within 30s; read {:#?}", self.seen),
+            }
+        }
+    }
+
+    /// The exit code, once the client has finished.
+    fn exit_code(&mut self) -> Option<i32> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = self.child.child().try_wait().unwrap() {
+                return status.code();
+            }
+            assert!(Instant::now() < deadline, "the client did not finish");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn running(&mut self) -> bool {
+        self.child.child().try_wait().unwrap().is_none()
+    }
+}
+
+/// `events` requests a server logged as done.
+fn events_requests(log: &Path) -> usize {
+    let text = std::fs::read_to_string(log).unwrap();
+    text.lines().filter(|l| l.contains(" exec ") && l.contains("command=\"events\"")).count()
+}
+
+/// Lines of a server log containing `what`.
+fn logged(log: &Path, what: &str) -> usize {
+    std::fs::read_to_string(log).unwrap().lines().filter(|l| l.contains(what)).count()
+}
+
+/// A server logging at debug level to `<root>/server.log`, with `extra` flags.
+fn logged_server(root: TempDir, extra: &[&str]) -> (Server, std::path::PathBuf) {
+    let log = root.path().join("server.log");
+    let file = std::fs::File::create(&log).unwrap();
+    let server = Server::launch_with(root, "127.0.0.1:0", extra, |c| {
+        c.env("BD_LOG", "bd::serve=debug").stderr(file);
+    });
+    (server, log)
+}
+
+fn events_head(client: &Client) -> String {
+    client.json(&["info"])["events_head"].as_i64().unwrap().to_string()
+}
+
+/// Send `argv` to workspace `proj` on a connection that closes after the answer, without reading it.
+fn send_exec(addr: &str, secret: &str, argv: Value) -> std::net::TcpStream {
+    let mut conn = std::net::TcpStream::connect(addr).unwrap();
+    let body = json!({ "argv": argv }).to_string();
+    let auth = format!("Authorization: Bearer {secret}\r\n");
+    write!(
+        conn,
+        "POST /w/proj/v2/exec HTTP/1.1\r\nHost: {addr}\r\n{auth}Connection: close\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    conn
+}
+
+/// The whole answer on a connection from [`send_exec`].
+fn read_answer(mut conn: std::net::TcpStream) -> String {
+    conn.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    let mut answer = String::new();
+    conn.read_to_string(&mut answer).unwrap();
+    answer
+}
+
 #[test]
-fn events_follow_polls_the_server() {
+fn followers_get_events_as_they_are_committed() {
+    let root = Server::prepare();
+    short_leases(&root.path().join("proj"));
+    let (server, log) = logged_server(root, &["--reclaim-every", "100ms"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let reader = server.client(&server.token("dashboard", "dash", &["--role", "read"]));
+    alice.ok(&["create", "Before"]);
+
+    // Each follower sees only its own events (filters apply on the server), so
+    // none waits out its interval because of another's events. A read token may follow.
+    let follow = |client: &Client, filter: &[&str]| {
+        let mut cmd = client.cmd(&["--json", "events", "--follow", "--interval-ms", "10000"]);
+        cmd.args(filter);
+        Follower::start(&mut cmd)
+    };
+    let mut by_alice = follow(&reader, &["--by", "alice"]);
+    let mut by_carol = follow(&alice, &["--by", "carol"]);
+    let mut reclaims = follow(&alice, &["--op", "reclaimed"]);
+    by_alice.wait_for(&["\"op\":\"created\"", "\"issue_id\":\"t-1\""]);
+    eventually("the first page of each follower", || events_requests(&log) >= 3);
+    eventually("the three followers waiting", || logged(&log, "waiting for events") >= 3);
+
+    // Waiting followers send no requests, however often the reclaim job runs.
+    let before = events_requests(&log);
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(events_requests(&log), before, "no polling");
+
+    // A client's write reaches its followers at once, well within their 10 s interval.
+    let started = Instant::now();
+    alice.ok(&["create", "From a client"]);
+    by_alice.wait_for(&["\"op\":\"created\"", "\"issue_id\":\"t-2\""]);
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+
+    // So does a write by a process on the server's host, opening bd.db directly.
+    let started = Instant::now();
+    check(server.local("carol", &["create", "From the server's host"]), "local create");
+    by_carol.wait_for(&["\"op\":\"created\"", "\"issue_id\":\"t-3\""]);
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+
+    // And the server's own background jobs: a lease of 1 s reclaimed.
+    let started = Instant::now();
+    alice.ok(&["claim", "t-1"]);
+    reclaims.wait_for(&["\"op\":\"reclaimed\"", "\"issue_id\":\"t-1\""]);
+    assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
+    assert_eq!(by_carol.seen.len(), 1, "{:?}", by_carol.seen);
+    assert_eq!(reclaims.seen.len(), 1, "{:?}", reclaims.seen);
+}
+
+#[test]
+fn remote_followers_print_what_local_followers_print() {
     let server = Server::start();
     let alice = server.client(&server.token("alice-laptop", "alice", &[]));
-    alice.ok(&["create", "Before"]);
-    let mut follower = KillOnDrop::new(
-        alice.cmd(&["--json", "events", "--follow", "--interval-ms", "200"]).stdout(Stdio::piped()).spawn().unwrap(),
-    );
-    let (tx, rx) = std::sync::mpsc::channel::<Value>();
-    let stdout = follower.child().stdout.take().unwrap();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
-            if tx.send(serde_json::from_str(&line).unwrap()).is_err() {
-                return;
-            }
-        }
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    alice.ok(&["create", "First"]);
+    alice.ok(&["create", "Second"]);
+    // Each case, and a line its last event prints.
+    let cases: [(&[&str], &[&str]); 3] = [
+        (&["--json", "events", "--follow", "--op", "created,closed"], &["\"op\":\"created\"", "\"issue_id\":\"t-3\""]),
+        (&["events", "--follow", "--issue", "t-1"], &[" deleted t-1"]),
+        (&["--json", "events", "--follow", "--since", "0", "--limit", "2", "--by", "alice"], &["\"op\":\"deleted\""]),
+    ];
+    let mut followers: Vec<(Follower, Follower)> = cases
+        .iter()
+        .map(|(args, _)| {
+            let mut remote = alice.cmd(args);
+            remote.args(["--interval-ms", "200"]);
+            let mut local = server.local_cmd("someone", args);
+            local.args(["--interval-ms", "100"]);
+            (Follower::start(&mut remote), Follower::start(&mut local))
+        })
+        .collect();
+    alice.ok(&["comment", "add", "t-1", "Looks good"]);
+    alice.ok(&["update", "t-2", "--title", "Second, renamed"]);
+    alice.ok(&["close", "t-1"]);
+    alice.ok(&["delete", "t-1"]);
+    bob.ok(&["create", "From Bob"]);
+    for ((remote, local), (args, last)) in followers.iter_mut().zip(cases) {
+        remote.wait_for(last);
+        local.wait_for(last);
+        assert!(remote.seen.len() > 1, "{args:?}: {:?}", remote.seen);
+        assert_eq!(remote.seen, local.seen, "{args:?}");
+    }
+    // A deleted issue's follower keeps following it.
+    std::thread::sleep(Duration::from_millis(700));
+    assert!(followers[1].0.running(), "the remote follower of t-1 is still running");
+}
+
+#[test]
+fn followers_resume_after_dropped_connections_without_gaps_or_duplicates() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    // Every other connection is cut within its answer: once the events arrived, before the follower has them.
+    let proxy = Proxy::start(server.base.trim_start_matches("http://"), usize::MAX, Answers::CutOdd(250));
+    let client = proxy.client(&secret);
+    let mut cmd = client.cmd(&["--json", "events", "--follow", "--since", "0", "--interval-ms", "200"]);
+    let mut follower = Follower::start(cmd.stderr(Stdio::null()));
+    for i in 1..=8 {
+        alice.ok(&["create", &format!("Task {i}")]);
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    follower.wait_for(&["\"issue_id\":\"t-8\""]);
+    let head: i64 = events_head(&alice).parse().unwrap();
+    let seqs: Vec<i64> =
+        follower.seen.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()["seq"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, (1..=head).collect::<Vec<_>>(), "each event once, in order");
+    assert!(proxy.connections.load(Ordering::SeqCst) > 8, "answers were cut and asked for again");
+}
+
+#[cfg(unix)]
+#[test]
+fn followers_that_fall_behind_retention_resume_at_the_head() {
+    let (server, log) = logged_server(Server::prepare(), &[]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let admin = server.client(&server.token("admin", "root", &["--role", "admin"]));
+    alice.ok(&["create", "One"]);
+    let errors = alice.dir.path().join("follower.err");
+    let mut cmd = alice.cmd(&["--json", "events", "--follow", "--interval-ms", "200"]);
+    let mut follower = Follower::start(cmd.stderr(std::fs::File::create(&errors).unwrap()));
+    follower.wait_for(&["\"issue_id\":\"t-1\""]);
+    eventually("the follower waiting", || logged(&log, "waiting for events") >= 1);
+
+    // The follower stops reading: the answer with t-2 waits for it (on Linux,
+    // resuming interrupts the read, and it asks again). Then retention deletes
+    // events it has not read.
+    let pid = follower.child.child().id().to_string();
+    check(Command::new("kill").args(["-STOP", &pid]).output().unwrap(), "kill -STOP");
+    let answered = events_requests(&log);
+    alice.ok(&["create", "Two"]);
+    eventually("the follower's answer", || events_requests(&log) > answered);
+    for title in ["Three", "Four"] {
+        alice.ok(&["create", title]);
+    }
+    admin.ok(&["events", "prune", "--keep", "1"]);
+    check(Command::new("kill").args(["-CONT", &pid]).output().unwrap(), "kill -CONT");
+    eventually("the follower's warning", || std::fs::read_to_string(&errors).unwrap().contains("were pruned"));
+    alice.ok(&["create", "Five"]);
+    follower.wait_for(&["\"op\":\"created\"", "\"issue_id\":\"t-5\""]);
+    assert!(!follower.seen.iter().any(|l| l.contains("\"issue_id\":\"t-3\"")), "{:?}", follower.seen);
+    assert!(follower.running());
+}
+
+#[test]
+fn waiting_followers_hold_no_command_slots() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    alice.ok(&["create", "Work"]);
+    let head = events_head(&alice);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    // More waiting followers than commands run at once (32).
+    let argv = json!(["--json", "events", "--since", head, "--wait", "60s", "--op", "closed"]);
+    let waiting: Vec<std::net::TcpStream> = (0..40).map(|_| send_exec(&addr, &secret, argv.clone())).collect();
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Claims run at once, and the events they write wake the followers, whose filters skip them.
+    let quick = |args: &[&str]| check(alice.cmd(args).env("BD_REMOTE_RETRY_SECS", "0").output().unwrap(), "quick");
+    let started = Instant::now();
+    quick(&["create", "More"]);
+    quick(&["claim", "t-1"]);
+    quick(&["update", "t-1", "--title", "Work, in progress"]);
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    for conn in &waiting {
+        conn.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        let e = conn.peek(&mut [0u8; 1]).expect_err("still waiting");
+        assert!(matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut), "{e}");
+    }
+
+    quick(&["close", "t-1"]);
+    for conn in waiting {
+        let answer = read_answer(conn);
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        let frames: Vec<&str> = answer.split("\r\n\r\n").nth(1).unwrap().lines().collect();
+        assert_eq!(frames.len(), 3, "the event, the cursor and the exit: {answer}");
+        assert!(frames[0].contains("\\\"op\\\":\\\"closed\\\""), "{answer}");
+        assert!(frames[1].starts_with("{\"cursor\":"), "{answer}");
+    }
+}
+
+#[test]
+fn followers_past_the_cap_poll() {
+    let (server, log) = logged_server(Server::prepare(), &["--max-followers", "1"]);
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    alice.ok(&["create", "First"]);
+    let head = events_head(&alice);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let _held = send_exec(&addr, &secret, json!(["events", "--since", head, "--wait", "60s", "--op", "closed"]));
+    eventually("the only follower's place taken", || logged(&log, "waiting for events") == 1);
+
+    let mut follower = Follower::start(&mut alice.cmd(&["--json", "events", "--follow", "--interval-ms", "200"]));
+    follower.wait_for(&["\"issue_id\":\"t-1\""]);
+    let before = events_requests(&log);
+    std::thread::sleep(Duration::from_secs(2));
+    let polls = events_requests(&log) - before;
+    assert!((3..=20).contains(&polls), "it polls every 200 ms instead: {polls} requests in 2 s");
+    assert!(logged(&log, "too many followers; not waiting") >= polls);
+    alice.ok(&["create", "Second"]);
+    follower.wait_for(&["\"issue_id\":\"t-2\""]);
+
+    // With --max-followers 0, nobody waits.
+    let (server, log) = logged_server(Server::prepare(), &["--max-followers", "0"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let head = events_head(&alice);
+    let started = Instant::now();
+    assert_eq!(alice.ok(&["events", "--since", &head, "--wait", "1s", "--interval-ms", "200"]), "");
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(events_requests(&log) >= 3, "the client polled");
+    assert_eq!(logged(&log, "waiting for events"), 0);
+}
+
+#[test]
+fn filtered_waits_outlive_retention_of_the_events_they_skipped() {
+    let (server, log) = logged_server(Server::prepare(), &[]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let admin = server.client(&server.token("admin", "root", &["--role", "admin"]));
+    alice.ok(&["create", "Watched"]);
+    let since = events_head(&alice);
+    alice.ok(&["create", "Skipped"]);
+    alice.ok(&["create", "Skipped too"]);
+    let skipped = events_head(&alice);
+    let mut waiter =
+        Follower::start(&mut alice.cmd(&["--json", "events", "--since", &since, "--wait", "60s", "--op", "closed"]));
+    eventually("the wait past the skipped events", || {
+        logged(&log, &format!("waiting for events workspace=proj cursor={skipped}")) == 1
     });
-    let wait_for = |issue: &str| {
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
-            match rx.recv_timeout(left) {
-                Ok(e) if e["op"] == "created" && e["issue_id"] == issue => return true,
-                Ok(_) => {}
-                Err(_) => return false,
-            }
+
+    // Retention deletes the skipped events: listing from `since` fails now, but
+    // the waiting request lists from where its filters got to.
+    admin.ok(&["events", "prune", "--before", &skipped]);
+    assert_eq!(alice.code(&["events", "--since", &since, "--op", "closed"]), 6);
+    alice.ok(&["close", "t-1"]);
+    waiter.wait_for(&["\"op\":\"closed\"", "\"issue_id\":\"t-1\""]);
+    assert_eq!(waiter.exit_code(), Some(0));
+}
+
+#[test]
+fn remote_waits_last_as_long_as_asked() {
+    let (server, log) = logged_server(Server::prepare(), &["--max-wait", "1s"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "Watched"]);
+    let head = events_head(&alice);
+
+    let started = Instant::now();
+    assert_eq!(alice.ok(&["events", "--since", &head, "--wait", "1500ms"]), "", "nothing came");
+    assert!(started.elapsed() >= Duration::from_millis(1500), "{:?}", started.elapsed());
+
+    // Longer than the server's --max-wait: the client asks again, from where the server got to.
+    let mut waiter =
+        Follower::start(&mut alice.cmd(&["--json", "events", "--since", &head, "--wait", "60s", "--op", "closed"]));
+    std::thread::sleep(Duration::from_millis(2500));
+    alice.ok(&["create", "Not this one"]);
+    alice.ok(&["close", "t-1"]);
+    waiter.wait_for(&["\"op\":\"closed\"", "\"issue_id\":\"t-1\""]);
+    assert_eq!(waiter.exit_code(), Some(0));
+    assert_eq!(waiter.seen.len(), 1, "{:?}", waiter.seen);
+    assert!(logged(&log, "waited_ms=") >= 4, "the server's waits are 1 s at most");
+    let local = check(server.local("x", &["--json", "events", "--since", &head, "--op", "closed"]), "local events");
+    assert_eq!(waiter.seen, local.lines().collect::<Vec<_>>());
+}
+
+#[cfg(unix)]
+#[test]
+fn shutdown_answers_waiting_followers_at_once() {
+    let (mut server, log) = logged_server(Server::prepare(), &[]);
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    let head = events_head(&alice);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let waiting: Vec<std::net::TcpStream> =
+        (0..3).map(|_| send_exec(&addr, &secret, json!(["events", "--since", head, "--wait", "60s"]))).collect();
+    eventually("three followers waiting", || logged(&log, "waiting for events") == 3);
+
+    let pid = server.child.id().to_string();
+    check(Command::new("kill").args(["-TERM", &pid]).output().unwrap(), "kill -TERM");
+    let stopping = Instant::now();
+    for conn in waiting {
+        let answer = read_answer(conn);
+        assert!(answer.starts_with("HTTP/1.1 503"), "{answer}");
+        assert!(answer.contains("shutting down"), "{answer}");
+    }
+    let status = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break status;
         }
-        false
+        assert!(stopping.elapsed() < Duration::from_secs(30), "bd serve did not exit");
+        std::thread::sleep(Duration::from_millis(20));
     };
-    assert!(wait_for("t-1"), "the first page includes recent history");
-    alice.ok(&["create", "After"]);
-    assert!(wait_for("t-2"), "the follower printed the new event");
+    assert!(status.success(), "{status:?}");
+    assert!(stopping.elapsed() < Duration::from_secs(5), "{:?}", stopping.elapsed());
 }
 
 /// An HTTPS server whose certificate a private CA signed; returns the server and the CA and key PEM files in `dir`.
@@ -1322,6 +1698,10 @@ fn serve_validates_background_job_flags() {
         &["--backup-every", "1h"],
         &["--backup-keep", "3"],
         &["--backup-dir", inside_a_file.to_str().unwrap()],
+        &["--max-followers", "257"],
+        &["--max-wait", "0s"],
+        &["--max-wait", "6m"],
+        &["--max-wait", "soon"],
     ] {
         let child = bd(root.path())
             .args(["serve", "--listen", "127.0.0.1:0", "--root"])
@@ -2179,6 +2559,8 @@ fn slow_readers_cannot_take_every_command_slot() {
 enum Answers {
     /// Cut off after this many bytes.
     Cut(u64),
+    /// Every other answer (the second, fourth...) cut off after this many bytes.
+    CutOdd(u64),
     /// Replaced, `after` the server has the whole request, by `answer` (a gateway error).
     Replace { after: Duration, answer: Vec<u8> },
 }
@@ -2229,6 +2611,7 @@ impl Proxy {
                 std::thread::spawn(move || std::io::copy(&mut requests, &mut upstream));
                 let limit = match &first {
                     Answers::Cut(after) if i < n => *after,
+                    Answers::CutOdd(after) if i < n && i % 2 == 1 => *after,
                     _ => u64::MAX,
                 };
                 std::thread::spawn(move || {

@@ -15,7 +15,15 @@
 //! Blank lines are keep-alives. A stream that ends without an exit frame was
 //! cut off: the command's outcome is unknown. Small answers arrive whole
 //! (with a `Content-Length`) once the command finishes; larger ones are sent
-//! while it runs, so neither side holds a whole export in memory.
+//! while it runs, so neither side holds a whole export in memory. An event
+//! listing (`events`) also carries a cursor frame, `{"cursor":1234}`, before
+//! its exit frame: the `--since` value that continues after it, past events
+//! its filters skipped.
+//!
+//! `events --since N --wait DURATION` is a long poll: the server waits,
+//! without holding a command slot, until an event matching the filters
+//! follows `N` (or up to its `--max-wait`, 25 s by default), then answers like
+//! `events --since N`. Remote `events --follow` asks this way in a loop.
 //!
 //! Failures before the command runs (transport, access) answer with a
 //! non-200 status and an [`ErrorBody`], shaped like the CLI's `--json`
@@ -71,6 +79,9 @@ pub enum Frame<'a> {
     /// The next part of an output file named on the command line (`export
     /// -o`), keyed by the path as given; the client writes it locally.
     File { path: Cow<'a, str>, data: Cow<'a, str> },
+    /// Where an event listing (`bd events`) ends: the `--since` value that
+    /// continues after it. Sent before the exit frame of such answers only.
+    Cursor(i64),
     /// The command finished: always the last frame.
     Exit(Exit),
 }
@@ -100,6 +111,9 @@ pub struct ExecResponse {
     /// Output files, keyed by the path as given.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, String>,
+    /// The cursor frame of an event listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<i64>,
     /// This is the stored response of an earlier attempt with the same request id.
     #[serde(default)]
     pub replayed: bool,

@@ -6,6 +6,7 @@ mod cli;
 mod commands;
 mod credentials;
 mod fmt;
+mod follow;
 mod gates;
 mod io;
 mod jobs;

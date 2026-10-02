@@ -210,9 +210,18 @@ transaction.
 ```bash
 bd events -n 20                    # recent events
 bd events --since 1200 --follow    # tail from a cursor (JSON lines with --json)
+bd events --since 1200 --wait 5m --op closed   # wait for the next match, print it, exit
 bd history demo-xyz                # one issue (survives deletion)
 bd events prune --older-than 30d   # retention; a cursor behind it fails (exit 6)
 ```
+
+`--follow` keeps printing new events; `--wait` prints the events after
+`--since` like a plain `bd events --since`, but first waits up to the given
+time for one matching the filters (`--issue`, `--op`, `--by`), so a script can
+block until something happens. Locally both check the database every
+`--interval-ms` (default 500). Through a [bd server](#followers), they are told
+of new events as they are committed instead. A deleted issue keeps its events
+(`--issue` still finds them, as `bd history` does).
 
 To mirror the state elsewhere, `bd export` writes a snapshot whose header
 carries `head_seq`. Load it, then tail `--since head_seq`.
@@ -705,8 +714,9 @@ What runs where:
   playbook is too large to send. GitHub gates are checked by the server's
   `gh`, for the repositories `gate.repos` allows, also on the server's own
   schedule ([Background jobs](#background-jobs-and-backups)).
-- `events --follow` polls the server. `init`, `bench` and `serve` only run
-  on the machine that holds the database.
+- `events --follow` and `events --wait` wait on the server for new events
+  ([Followers](#followers)). `init`, `bench` and `serve` only run on the
+  machine that holds the database.
 - `bd prime`, which session hooks run, gives up within seconds when the
   server is unreachable or there is no access token, and prints a notice instead
   of failing the hook. With `--json` it fails like any other command.
@@ -723,17 +733,56 @@ directly: `POST /w/<name>/v2/exec` with `Authorization: Bearer <token>` and
 wrote them: `{"stdout": "..."}` for output, `{"file": {"path", "data"}}` for
 part of an output file, and last `{"exit": {"exit_code", "stderr", "replayed"}}`.
 Blank lines are keep-alives, and an answer without the exit frame was cut
-off. Failures before the command runs return a non-200 status with the
-`--json` error shape. Every answer carries a `bd-protocol: 2` header, and a
-client and server of different protocol versions refuse each other with an
-explanation.
+off. An event listing (`events`) also sends `{"cursor": N}` before its exit
+frame: the `--since` value that continues after it, past the events its
+filters skipped. `["events", "--since", "N", "--wait", "25s", "--json"]` is a
+long poll: answered as soon as an event matching its filters follows `N`, or
+with no events (and the cursor) when the wait ends. Failures before the
+command runs return a non-200 status with the `--json` error shape. Every
+answer carries a `bd-protocol: 2` header, and a client and server of
+different protocol versions refuse each other with an explanation.
+
+### Followers
+
+`bd events --follow` and `bd events --wait` on a remote workspace are long
+polls. Each request asks for the events after the client's cursor, and when
+none matches yet, the server holds the request until one is committed, then
+answers at once: a follower sees an event within milliseconds of its commit,
+and an idle follower costs one request per `--max-wait` (25 s by default)
+instead of one per poll interval. Each answer says where the next request
+continues, so a follower prints every event once and in order, even when an
+answer is lost and asked for again. A follower that falls so far behind that
+retention deleted events it had not read says so on stderr and continues
+from the newest event. Under load, a follower asks at most once per
+`--interval-ms` (default 500), so events arrive in batches; a `--wait` longer
+than the server's `--max-wait` takes several requests.
+
+A waiting request holds no command slot, database connection, transaction or
+memory budget on the server, only its connection. The server learns of new
+events from the commands it runs (clients' writes and its own background
+jobs), and, while anyone waits on a workspace, by reading its events head
+every 500 ms, for writes by other processes on its host (`bd` opening
+`bd.db` directly). One reader per workspace checks for all the requests
+waiting on it, and after waking them it waits 100 ms before it checks again,
+so a burst of commits wakes them once.
+
+| flag | default | meaning |
+|---|---|---|
+| `--max-followers N` | 256 | requests waiting at once (0 to 256, half the server's 512 connections); others are answered at once, and their clients poll every `--interval-ms` |
+| `--max-wait DURATION` | 25s | the longest a request waits before answering that nothing came (1s to 5m) |
+
+Keep `--max-wait` below the idle timeout of every proxy between clients and
+the server: Cloudflare ends requests idle for 100 s, many load balancers
+after 60 s, and Google Cloud's after 30 s by default. On shutdown, waiting
+requests are answered at once (503, which clients retry), so the server does
+not wait for them.
 
 ## Observability
 
 Everything is local; nothing is sent anywhere (a remote workspace talks only to its own `bd serve`).
 
 - **Logs**: `BD_LOG=bd=debug bd …` shows per-transaction lock-wait, exec, and commit timings on stderr. `--log-format json` emits structured logs. Colors appear only on a terminal (`NO_COLOR` turns them off), so redirected logs stay plain text.
-- **Server logs**: `bd serve` logs (target `bd::serve`) one line per request, its background job settings at startup, and one line per background job that changed something (`reclaimed expired leases`, `checked gates`, `backed up`, `pruned request records`, with the workspace, counts, issue ids, and `ms`). Failures are warnings (`background job failed`, `gate check failed` with the gate and the `gh` error). `BD_LOG=bd::serve=debug` also logs the jobs that found nothing to do.
+- **Server logs**: `bd serve` logs (target `bd::serve`) one line per request (with `waited_ms` for a request that waited for events), its background job settings at startup, and one line per background job that changed something (`reclaimed expired leases`, `checked gates`, `backed up`, `pruned request records`, with the workspace, counts, issue ids, and `ms`). Failures are warnings (`background job failed`, `gate check failed` with the gate and the `gh` error). `BD_LOG=bd::serve=debug` also logs the jobs that found nothing to do, and each request that starts `waiting for events` or finds `too many followers`.
 - **Timing**: `--timing` (or `BD_TIMING=1`) prints a per-command breakdown. Commands and transactions slower than `--slow-ms` (default 250) log `bd::slow` warnings and increment the `slow_writes` counter.
 - **Metrics**: `bd metrics` prints Prometheus text, `--format json` prints JSON:
   - issues by status, ready count by priority, blocked/deferred counts

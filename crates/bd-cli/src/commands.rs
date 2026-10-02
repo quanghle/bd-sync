@@ -870,16 +870,16 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
         app.print(out);
         return Ok(());
     }
-    let issue = match &a.issue {
-        Some(raw) => Some(app.read(|r| r.resolve_id(raw))?),
-        None => None,
-    };
+    let mut q = app.read(|r| event_query(r, a))?;
     if a.follow {
-        // Remote clients follow by polling; a request must finish.
+        // Remote clients follow with `--wait` requests instead, which bd
+        // serve answers without holding a command slot while they wait.
         io::require_local("events --follow")?;
     }
-    let mut q =
-        EventQuery { since: a.since, limit: a.limit, issue_id: issue, ops: a.ops.clone(), actor: a.by_actor.clone() };
+    // Under bd serve, the server waited before running the command.
+    if let Some(wait) = a.wait.filter(|_| !io::serving()) {
+        q.since = Some(wait_for_events(app, &q, wait, a.interval_ms)?);
+    }
     let print = |app: &App, events: &[bd_core::Event]| {
         io::with_stdout(|w| {
             for e in events {
@@ -890,10 +890,11 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
     };
     let page = app.read(|r| r.events(&q))?;
     print(app, &page.events);
+    let mut cursor = page.events.last().map(|e| e.seq).unwrap_or(page.head.max(q.since.unwrap_or(0)));
     if !a.follow {
+        io::cursor(cursor);
         return Ok(());
     }
-    let mut cursor = page.events.last().map(|e| e.seq).unwrap_or(page.head.max(a.since.unwrap_or(0)));
     q.limit = Some(1000);
     loop {
         std::thread::sleep(Duration::from_millis(a.interval_ms.max(10)));
@@ -905,6 +906,51 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
             cursor = cursor.max(page.head);
         }
         print(app, &page.events);
+    }
+}
+
+/// The query `bd events` runs for `a`: its cursor, limit and filters, with
+/// `--issue` resolved. A deleted issue keeps its events, as for `bd history`,
+/// so a follower of it sees its deletion and is not cut off by it.
+pub fn event_query(r: &bd_core::ReadCtx<'_>, a: &EventsArgs) -> Result<EventQuery> {
+    let issue_id = match &a.issue {
+        Some(raw) => Some(match r.resolve_id(raw) {
+            Ok(id) => id,
+            Err(Error::NotFound { .. }) if has_events(r, raw.trim())? => raw.trim().to_string(),
+            Err(e) => return Err(e),
+        }),
+        None => None,
+    };
+    Ok(EventQuery { since: a.since, limit: a.limit, issue_id, ops: a.ops.clone(), actor: a.by_actor.clone() })
+}
+
+fn has_events(r: &bd_core::ReadCtx<'_>, issue: &str) -> Result<bool> {
+    let q = EventQuery { limit: Some(1), issue_id: Some(issue.to_string()), ..Default::default() };
+    Ok(!r.events(&q)?.events.is_empty())
+}
+
+/// Whether an event matching `q`'s filters follows `cursor`; and the events head.
+pub fn events_after(r: &bd_core::ReadCtx<'_>, q: &EventQuery, cursor: i64) -> Result<(bool, i64)> {
+    let page = r.events(&EventQuery { since: Some(cursor), limit: Some(1), ..q.clone() })?;
+    Ok((!page.events.is_empty(), page.head))
+}
+
+/// `events --wait` here: poll every `interval_ms` until an event matching
+/// `q` follows its cursor, or `wait` has passed. Returns the cursor to list
+/// from: past the events the filters skipped meanwhile, which retention may
+/// delete without failing the listing.
+fn wait_for_events(app: &mut App, q: &EventQuery, wait: Duration, interval_ms: u64) -> Result<i64> {
+    let started = std::time::Instant::now();
+    let mut cursor = q.since.unwrap_or(0);
+    loop {
+        let (found, head) = app.read(|r| events_after(r, q, cursor))?;
+        let left = wait.saturating_sub(started.elapsed());
+        if found || left.is_zero() {
+            return Ok(cursor);
+        }
+        // Nothing up to the head matched: later checks start there.
+        cursor = cursor.max(head);
+        std::thread::sleep(Duration::from_millis(interval_ms.max(10)).min(left));
     }
 }
 

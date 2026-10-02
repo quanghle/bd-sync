@@ -337,6 +337,8 @@ pub struct FrameWriter {
     finished: bool,
     bytes: u64,
     held: Option<Held>,
+    /// The cursor frame of an event listing, sent before the exit frame.
+    cursor: Option<i64>,
 }
 
 /// Output held back while the command runs, in the order written, until it
@@ -418,6 +420,7 @@ impl FrameWriter {
             finished: false,
             bytes: 0,
             held: None,
+            cursor: None,
         }
     }
 
@@ -442,6 +445,7 @@ impl FrameWriter {
     /// a held answer, all of a bounded size.
     pub fn respond(&mut self, r: &ExecResponse) -> Sent {
         self.whole = true;
+        self.cursor = r.cursor;
         let _ = self.write(None, r.stdout.as_bytes());
         for (path, data) in &r.files {
             let _ = self.write(Some(path), data.as_bytes());
@@ -457,6 +461,7 @@ impl FrameWriter {
                 exit_code: exit.exit_code,
                 stderr: exit.stderr,
                 replayed: exit.replayed,
+                cursor: self.cursor,
                 ..Default::default()
             };
             for (target, data) in held.parts {
@@ -472,8 +477,11 @@ impl FrameWriter {
         if !self.finished {
             self.finished = true;
             let sent = self.frame(true).and_then(|()| {
-                serde_json::to_writer(&mut self.frames, &Frame::Exit(exit)).map_err(io::Error::other)?;
-                self.frames.push(b'\n');
+                let cursor = self.cursor.map(Frame::Cursor);
+                for frame in cursor.iter().chain([&Frame::Exit(exit)]) {
+                    serde_json::to_writer(&mut self.frames, frame).map_err(io::Error::other)?;
+                    self.frames.push(b'\n');
+                }
                 if self.pipe.is_some() {
                     return self.send();
                 }
@@ -627,6 +635,10 @@ impl Sink for FrameWriter {
     fn file(&mut self, path: &str, data: &[u8]) -> io::Result<()> {
         self.write(Some(path), data)
     }
+
+    fn cursor(&mut self, seq: i64) {
+        self.cursor = Some(seq);
+    }
 }
 
 impl Drop for FrameWriter {
@@ -742,6 +754,7 @@ mod tests {
             match serde_json::from_slice::<Frame<'static>>(line).unwrap() {
                 Frame::Stdout(text) => r.stdout.push_str(&text),
                 Frame::File { path, data } => r.files.entry(path.into_owned()).or_default().push_str(&data),
+                Frame::Cursor(seq) => r.cursor = Some(seq),
                 Frame::Exit(exit) => {
                     (r.exit_code, r.stderr, r.replayed) = (exit.exit_code, exit.stderr, exit.replayed);
                     exited = true;
@@ -782,6 +795,29 @@ mod tests {
         assert_eq!(r.files.get("snap.jsonl").map(String::as_str), Some("{\"_type\":\"header\"}\n"));
         assert_eq!(r.files.get("empty.jsonl").map(String::as_str), Some(""), "an empty file still has a frame");
         assert_eq!((r.exit_code, r.stderr.as_str()), (3, "error: x\n"));
+    }
+
+    #[test]
+    fn event_listings_end_with_their_cursor() {
+        let (mut w, answered) = writer(Limits::SERVE);
+        w.stdout(b"#5 created t-1\n").unwrap();
+        w.cursor(5);
+        w.cursor(9);
+        w.finish(Exit::default());
+        let bytes = runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(text.lines().nth(1), Some("{\"cursor\":9}"), "the last one, before the exit frame: {text}");
+        assert_eq!(gather(text.as_bytes()).cursor, Some(9));
+
+        // Known answers carry theirs; other answers have none.
+        let (mut w, answered) = writer(Limits::SERVE);
+        w.respond(&ExecResponse { cursor: Some(3), ..Default::default() });
+        assert_eq!(gather(&runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap()).cursor, Some(3));
+        let (mut w, answered) = writer(Limits::SERVE);
+        w.stdout(b"t-1\n").unwrap();
+        w.finish(Exit::default());
+        let bytes = runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("cursor"));
     }
 
     #[test]
@@ -928,6 +964,7 @@ mod tests {
             .map(|l| match serde_json::from_slice::<Frame<'static>>(l).unwrap() {
                 Frame::Stdout(_) => "stdout",
                 Frame::File { .. } => "file",
+                Frame::Cursor(_) => "cursor",
                 Frame::Exit(_) => "exit",
             })
             .collect();

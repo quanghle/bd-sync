@@ -29,6 +29,8 @@ pub trait Sink {
     /// The next bytes of the output file `path` (as named on the command
     /// line); the first call for a file may be empty.
     fn file(&mut self, path: &str, data: &[u8]) -> std::io::Result<()>;
+    /// Where an event listing ends (see [`cursor`]); the last one counts.
+    fn cursor(&mut self, _seq: i64) {}
 }
 
 /// A sink shared with the code that installed it, which reads it afterwards.
@@ -39,6 +41,10 @@ impl<S: Sink + ?Sized> Sink for Rc<RefCell<S>> {
 
     fn file(&mut self, path: &str, data: &[u8]) -> std::io::Result<()> {
         self.borrow_mut().file(path, data)
+    }
+
+    fn cursor(&mut self, seq: i64) {
+        self.borrow_mut().cursor(seq)
     }
 }
 
@@ -219,6 +225,12 @@ pub fn errln(line: impl AsRef<str>) {
     if with_capture(|c| keep_stderr(&mut c.stderr, line)).is_none() {
         let _ = writeln!(std::io::stderr(), "{line}");
     }
+}
+
+/// Tell a remote client where the event listing just printed ends: the
+/// `--since` value that continues after it. Locally it is not printed.
+pub fn cursor(seq: i64) {
+    with_capture(|c| c.sink.cursor(seq));
 }
 
 fn keep_stderr(stderr: &mut Vec<u8>, line: &str) {

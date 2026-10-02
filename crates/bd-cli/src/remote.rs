@@ -17,12 +17,14 @@
 //! asked for again when it does not; one that cannot be recovered fails as
 //! [`Error::AnswerLost`] (exit 9), never as safe to run again. A read prints
 //! a large output as it arrives, so it is not retried once it has.
+//! `events --follow` and `events --wait` are long polls whose answers say
+//! where the next one continues (`follow_events`).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use bd_core::{Error, Event, Result};
+use bd_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -31,7 +33,6 @@ use crate::app::{App, Out};
 use crate::auth::random_hex;
 use crate::cli::*;
 use crate::credentials::{self, Scope};
-use crate::fmt;
 use crate::io;
 use crate::playbooks;
 use crate::protocol::{
@@ -335,6 +336,10 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
             let code = follow_events(app, remote, a)?;
             return Ok(ExecResponse { exit_code: code, ..Default::default() });
         }
+        Command::Events(a @ EventsArgs { action: None, since: Some(since), wait: Some(wait), .. }) => {
+            let code = wait_for_events(app, remote, a, *since, *wait)?;
+            return Ok(ExecResponse { exit_code: code, ..Default::default() });
+        }
         Command::Playbook(cmd) => {
             if let Some(code) = playbooks::client_command(app, remote, cmd)? {
                 return Ok(ExecResponse { exit_code: code, ..Default::default() });
@@ -447,6 +452,8 @@ struct Delivery {
     /// Output reached the user, so the request cannot be tried again.
     printed: bool,
     files: Vec<OutputFile>,
+    /// The cursor frame of this attempt.
+    cursor: Option<i64>,
 }
 
 /// An output file, written to `<target>.tmp` and renamed into place once the command succeeds.
@@ -464,7 +471,7 @@ impl Delivery {
     fn new(files: Vec<OutputFile>, hold: bool, write: bool) -> Delivery {
         // A command writing files prints a summary: it waits until the files are in place.
         let hold = hold || write || !files.is_empty();
-        Delivery { write, hold, printing: false, held: String::new(), printed: false, files }
+        Delivery { write, hold, printing: false, held: String::new(), printed: false, files, cursor: None }
     }
 
     /// Everything kept in memory, for the client's own requests (reads).
@@ -476,6 +483,7 @@ impl Delivery {
     fn start(&mut self, whole: bool) {
         self.discard();
         self.held.clear();
+        self.cursor = None;
         self.printing = !self.hold && !whole;
     }
 
@@ -508,6 +516,7 @@ impl Delivery {
             stdout: std::mem::take(&mut self.held),
             stderr: exit.stderr,
             replayed: exit.replayed,
+            cursor: self.cursor.take(),
             ..Default::default()
         })
     }
@@ -570,62 +579,131 @@ impl OutputFile {
     }
 }
 
-/// `events --follow`: poll the server with a cursor, as the local command polls the database.
+/// How long a remote follower asks the server to wait for a new event; the
+/// server's `--max-wait` (25 s by default) caps it. The client waits up to
+/// two minutes for an answer to start.
+const FOLLOW_WAIT: Duration = Duration::from_secs(90);
+/// Events per answer while following, as the local `events --follow` reads them.
+const FOLLOW_BATCH: usize = 1000;
+
+/// `events` on the server from `since`, at most `limit` events, waiting up
+/// to `wait` for the first; with the command's filters and output format.
+fn events_request(
+    app: &App,
+    remote: &Remote,
+    a: &EventsArgs,
+    since: Option<i64>,
+    limit: Option<usize>,
+    wait: Option<Duration>,
+) -> ExecRequest {
+    let mut argv: Vec<String> = Vec::new();
+    if app.g.json {
+        argv.push("--json".into());
+    }
+    if let Some(actor) = &app.g.actor {
+        argv.extend(["--actor".into(), actor.clone()]);
+    }
+    argv.push("events".into());
+    if let Some(c) = since {
+        argv.extend(["--since".into(), c.to_string()]);
+    }
+    if let Some(n) = limit {
+        argv.extend(["--limit".into(), n.to_string()]);
+    }
+    if let Some(w) = wait {
+        argv.extend(["--wait".into(), format!("{}ms", w.as_millis())]);
+    }
+    if let Some(issue) = &a.issue {
+        argv.extend(["--issue".into(), issue.clone()]);
+    }
+    for op in &a.ops {
+        argv.extend(["--op".into(), op.clone()]);
+    }
+    if let Some(by) = &a.by_actor {
+        argv.extend(["--by".into(), by.clone()]);
+    }
+    ExecRequest { argv, actor: env_actor(), location: Some(remote.url.clone()), ..Default::default() }
+}
+
+/// Print the events of an answer; returns where they end (the cursor to
+/// continue from), or the exit code of a failure, whose error is printed.
+fn print_events(remote: &Remote, r: ExecResponse) -> Result<std::result::Result<i64, i32>> {
+    if r.exit_code != 0 {
+        let _ = std::io::stderr().write_all(r.stderr.as_bytes());
+        return Ok(Err(r.exit_code));
+    }
+    let cursor = r.cursor.ok_or_else(|| {
+        Error::Remote(format!("{}: the server sent no event cursor (is it another bd version?)", remote.url))
+    })?;
+    io::out(&r.stdout);
+    Ok(Ok(cursor))
+}
+
+/// `events --follow`: long polls. Each request waits on the server until an
+/// event matching the filters follows the cursor (or the server's wait
+/// ends), and its answer says where to continue, so every event is printed
+/// once, in order, however requests fail and are retried. Under load,
+/// events arrive in batches: a request starts at most once per interval.
 fn follow_events(app: &App, remote: &Remote, a: &EventsArgs) -> Result<i32> {
     let interval = Duration::from_millis(a.interval_ms.max(200));
-    let mut cursor = a.since;
-    let mut first = true;
+    let mut cursor = match a.since {
+        Some(since) => since,
+        // First the most recent events, as the local command prints them.
+        None => match print_events(remote, remote.exec(&events_request(app, remote, a, None, a.limit, None))?)? {
+            Ok(cursor) => cursor,
+            Err(code) => return Ok(code),
+        },
+    };
+    let mut first = a.since.is_some();
     loop {
-        let mut argv = vec!["events".to_string(), "--json".to_string()];
-        if let Some(c) = cursor {
-            argv.extend(["--since".to_string(), c.to_string()]);
-        }
-        match (first, a.limit) {
-            (true, Some(n)) => argv.extend(["--limit".to_string(), n.to_string()]),
-            (false, _) => argv.extend(["--limit".to_string(), "1000".to_string()]),
-            (true, None) => {}
-        }
-        if let Some(issue) = &a.issue {
-            argv.extend(["--issue".to_string(), issue.clone()]);
-        }
-        for op in &a.ops {
-            argv.extend(["--op".to_string(), op.clone()]);
-        }
-        if let Some(by) = &a.by_actor {
-            argv.extend(["--by".to_string(), by.clone()]);
-        }
-        let request =
-            ExecRequest { argv, actor: env_actor(), location: Some(remote.url.clone()), ..Default::default() };
-        let response = remote.exec(&request)?;
+        let started = Instant::now();
+        let limit = match a.limit {
+            Some(n) if first => n.min(FOLLOW_BATCH),
+            _ => FOLLOW_BATCH,
+        };
+        let response = remote.exec(&events_request(app, remote, a, Some(cursor), Some(limit), Some(FOLLOW_WAIT)))?;
         if response.exit_code == 6 && !first {
-            // Retention pruned past the cursor while nothing matched: resume at the head.
-            cursor = Some(remote.event_head()?);
+            // Retention pruned past the cursor (the follower fell far behind): resume at the head.
+            let head = remote.event_head()?;
+            io::errln(format!(
+                "warning: events after #{cursor} were pruned before they were read; following from #{head}"
+            ));
+            cursor = head;
             continue;
         }
-        if response.exit_code != 0 {
-            let _ = std::io::stderr().write_all(response.stderr.as_bytes());
-            return Ok(response.exit_code);
-        }
-        let events = response
-            .stdout
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .map(serde_json::from_str::<Event>)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| Error::Remote(format!("{}: unexpected events output: {e}", remote.url)))?;
-        io::with_stdout(|w| {
-            for e in &events {
-                let line = if app.g.json { serde_json::to_string(e).unwrap_or_default() } else { fmt::event_line(e) };
-                let _ = writeln!(w, "{line}");
-            }
-        });
-        match events.last() {
-            Some(e) => cursor = Some(e.seq),
-            None if cursor.is_none() => cursor = Some(remote.event_head()?),
-            None => {}
-        }
+        cursor = match print_events(remote, response)? {
+            Ok(next) => next,
+            Err(code) => return Ok(code),
+        };
         first = false;
-        std::thread::sleep(interval);
+        if let Some(rest) = interval.checked_sub(started.elapsed()) {
+            std::thread::sleep(rest);
+        }
+    }
+}
+
+/// `events --since N --wait D`: long polls of at most [`FOLLOW_WAIT`] until
+/// an event matching the filters follows `N`, or `D` has passed.
+fn wait_for_events(app: &App, remote: &Remote, a: &EventsArgs, since: i64, wait: Duration) -> Result<i32> {
+    let interval = Duration::from_millis(a.interval_ms.max(200));
+    let started = Instant::now();
+    let mut cursor = since;
+    loop {
+        let round = Instant::now();
+        let left = wait.saturating_sub(started.elapsed());
+        let request = events_request(app, remote, a, Some(cursor), a.limit, Some(left.min(FOLLOW_WAIT)));
+        let response = remote.exec(&request)?;
+        let found = !response.stdout.is_empty();
+        cursor = match print_events(remote, response)? {
+            Ok(next) => next,
+            Err(code) => return Ok(code),
+        };
+        let left = wait.saturating_sub(started.elapsed());
+        if found || left.is_zero() {
+            return Ok(0);
+        }
+        // An answer before its wait ended (the server's followers are full): ask again after the interval.
+        std::thread::sleep(interval.saturating_sub(round.elapsed()).min(left));
     }
 }
 
@@ -808,6 +886,7 @@ impl Remote {
             match frames.next() {
                 Ok(Some(Frame::Stdout(text))) => out.stdout(&text)?,
                 Ok(Some(Frame::File { path, data })) => out.file(&path, &data)?,
+                Ok(Some(Frame::Cursor(seq))) => out.cursor = Some(seq),
                 Ok(Some(Frame::Exit(exit))) => return out.exit(exit).map(Ok),
                 Ok(None) => return Ok(Err(Cut::Broken("the answer ended before the command did".into()))),
                 Err(cut) => return Ok(Err(cut)),

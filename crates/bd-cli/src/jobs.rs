@@ -192,6 +192,9 @@ fn discover(root: &Path) -> std::io::Result<Vec<Workspace>> {
 /// Runs one job in one workspace (on a blocking thread); false when it failed.
 type Runner = Arc<dyn Fn(&Workspace, Job) -> bool + Send + Sync>;
 
+/// Told the name of a workspace whose job may have appended events.
+pub type Committed = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// The running scheduler.
 pub struct Jobs {
     stop: watch::Sender<bool>,
@@ -199,8 +202,9 @@ pub struct Jobs {
     lanes: Vec<Arc<Semaphore>>,
 }
 
-/// Start the background jobs (inside the server's runtime).
-pub fn start(config: Config, root: PathBuf, open: OpenOptions) -> Jobs {
+/// Start the background jobs (inside the server's runtime); `committed`
+/// hears of each job that may have written.
+pub fn start(config: Config, root: PathBuf, open: OpenOptions, committed: Committed) -> Jobs {
     match &config.backups {
         Some(b) => tracing::info!(
             target: "bd::serve",
@@ -222,7 +226,14 @@ pub fn start(config: Config, root: PathBuf, open: OpenOptions) -> Jobs {
         ),
     }
     let backups = config.backups.clone();
-    let runner: Runner = Arc::new(move |ws: &Workspace, job| run(ws, job, &open, backups.as_ref()));
+    let runner: Runner = Arc::new(move |ws: &Workspace, job| {
+        let ok = run(ws, job, &open, backups.as_ref());
+        if job != Job::Backup {
+            // Reclaims and gate checks append events: followers check again.
+            committed(&ws.name);
+        }
+        ok
+    });
     spawn(config, root, runner)
 }
 

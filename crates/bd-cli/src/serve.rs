@@ -29,6 +29,12 @@
 //!
 //! Background jobs keep every workspace up without a client asking: lease
 //! reclaim, gate checks, backups and pruning of request records (`jobs.rs`).
+//!
+//! Followers: `events --since N --wait D` (what remote `events --follow`
+//! sends) waits for a matching event before its command runs, without a
+//! command slot, a database connection or memory budget (`follow.rs`). Up to
+//! `--max-followers` requests wait at once, for at most `--max-wait`; others
+//! run at once, and their clients poll.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -40,7 +46,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use bd_core::{Error, OpenOptions, Result, Store};
+use bd_core::{Error, OpenOptions, Queries, Result, Store};
 use clap::Parser;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
@@ -50,13 +56,14 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Semaphore, TryAcquireError};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError, watch};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls;
 
 use crate::app::{App, RequestKey};
 use crate::auth::{self, Role, Token, Verifier};
 use crate::cli::*;
+use crate::follow::{self, Feeds, HeadReader, Subscription};
 use crate::io::{self, Capture};
 use crate::jobs;
 use crate::protocol::{
@@ -111,6 +118,13 @@ const ANSWER_BUDGET: usize = max(Limits::SERVE.memory(READ_BUFFER), REPLAY_LIMIT
 const MAX_STREAMING: usize = 8;
 /// A connection whose client takes nothing for this long is closed.
 const WRITE_STALL: Duration = Duration::from_secs(60);
+/// The most requests `--max-followers` lets wait for events: half the
+/// connections, so that followers cannot take all of them.
+const MAX_FOLLOWERS: usize = MAX_CONNECTIONS / 2;
+/// The range of `--max-wait`.
+const MAX_WAIT_RANGE: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(5 * 60));
+/// On shutdown, how long waiting followers may take to get their answers.
+const FOLLOWERS_GRACE: Duration = Duration::from_secs(5);
 
 type Body = ResponseBody;
 
@@ -152,10 +166,11 @@ fn run(a: &ServeArgs) -> Result<()> {
         return Err(Error::invalid(format!("--max-body-mib {}: use 1 to 4096", a.max_body_mib)));
     }
     let max_body = usize::try_from(a.max_body_mib << 20).unwrap_or(usize::MAX);
+    let waits = Waits::from_args(a)?;
     let jobs = jobs::Config::from_args(a)?;
     // Before any request or background job: gate checks in this process use the server's defaults.
     io::mark_server_process();
-    let server = Arc::new(Server::new(root, max_body));
+    let server = Arc::new(Server::new(root, max_body, waits));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("bd-serve")
@@ -199,7 +214,9 @@ async fn serve(server: Arc<Server>, addr: SocketAddr, tls: Option<TlsAcceptor>, 
     // Tests and scripts read the bound address (with --listen ...:0) from this line.
     io::outln(format!("bd serve: listening on {scheme}://{local} (workspaces in {})", server.root.display()));
     tracing::info!(target: "bd::serve", %local, scheme, root = %server.root.display(), "listening");
-    let jobs = jobs::start(jobs, server.root.clone(), server.open.clone());
+    let feeds = server.feeds.clone();
+    let committed = Arc::new(move |workspace: &str| feeds.committed(workspace));
+    let jobs = jobs::start(jobs, server.root.clone(), server.open.clone(), committed);
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -229,11 +246,17 @@ async fn serve(server: Arc<Server>, addr: SocketAddr, tls: Option<TlsAcceptor>, 
         });
     }
     tracing::info!(target: "bd::serve", "shutting down after running commands finish");
+    // Clients trying to connect are refused at once, and retry.
+    drop(listener);
+    // Requests waiting for events are answered at once, instead of at the end of their wait.
+    server.stopping.send_replace(true);
     // GitHub gates are checked again after a restart; no need to wait for gh.
     crate::gates::cancel_gh_calls();
     let all = u32::try_from(MAX_RUNNING).unwrap_or(u32::MAX);
     let commands = tokio::time::timeout(COMMANDS_GRACE, server.running.acquire_many(all));
-    let _ = tokio::join!(commands, jobs.stop(JOBS_GRACE));
+    let followers = u32::try_from(server.waits.followers).unwrap_or(u32::MAX);
+    let followers = tokio::time::timeout(FOLLOWERS_GRACE, server.followers.acquire_many(followers));
+    let _ = tokio::join!(commands, followers, jobs.stop(JOBS_GRACE));
     Ok(())
 }
 
@@ -298,6 +321,15 @@ struct Reject {
 impl Reject {
     fn new(status: StatusCode, code: &'static str, message: impl Into<String>, exit_code: i32) -> Reject {
         Reject { status, code, message: message.into(), exit_code }
+    }
+
+    fn busy(doing: &str) -> Reject {
+        let msg = format!("the server is busy {doing}; retry shortly");
+        Reject::new(StatusCode::SERVICE_UNAVAILABLE, "busy", msg, 5)
+    }
+
+    fn shutting_down() -> Reject {
+        Reject::new(StatusCode::SERVICE_UNAVAILABLE, "remote", "the server is shutting down", 8)
     }
 
     fn failed() -> Reject {
@@ -428,7 +460,8 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
             Ok(Err(_)) => return shutting_down(),
             Err(_) => return busy("receiving other requests"),
         };
-    let answer_budget = budget.split(answer_permits as usize);
+    let mut answer_budget = budget.split(answer_permits as usize);
+    let mut budget = Some(budget);
     let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(req.into_body(), server.max_body).collect()).await
     {
         Ok(Ok(b)) => b.to_bytes(),
@@ -457,6 +490,24 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
             Err(TryAcquireError::Closed) => return shutting_down(),
         },
     };
+    let mut waited = None;
+    if let Some((cli, wait)) = follow::requested(&request.argv) {
+        // A waiting request holds no memory: its body is parsed, and its answer comes later.
+        drop((budget.take(), answer_budget.take()));
+        // A request its token may not make is refused at once, by `run`.
+        if resolve_actor(cli.global.actor.as_deref(), request.actor.as_deref(), &token).is_ok() {
+            match server.wait_for_events(&ws, wait).await {
+                Ok(w) => waited = Some(w),
+                Err(reject) => return reject.response(),
+            }
+        }
+        let permits = server.body_budget.clone().acquire_many_owned(answer_permits);
+        answer_budget = match tokio::time::timeout(QUEUE_WAIT, permits).await {
+            Ok(Ok(permit)) => Some(permit),
+            Ok(Err(_)) => return shutting_down(),
+            Err(_) => return busy("receiving other requests"),
+        };
+    }
     let slot = match tokio::time::timeout(QUEUE_WAIT, server.running.clone().acquire_owned()).await {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => return shutting_down(),
@@ -470,7 +521,7 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
     let job = tokio::task::spawn_blocking(move || {
         // Held until the command finishes, even if the client goes away meanwhile.
         let _held = (slot, budget, planning);
-        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| srv.run(&ws, &token, request, started, out)));
+        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| srv.run(&ws, &token, request, started, waited, out)));
         ran.unwrap_or_else(|_| {
             tracing::error!(target: "bd::serve", workspace = %ws.name, "command panicked");
             Err(Reject::failed())
@@ -501,12 +552,11 @@ fn too_large(max_body: usize) -> Response<Body> {
 }
 
 fn busy(doing: &str) -> Response<Body> {
-    let msg = format!("the server is busy {doing}; retry shortly");
-    Reject::new(StatusCode::SERVICE_UNAVAILABLE, "busy", msg, 5).response()
+    Reject::busy(doing).response()
 }
 
 fn shutting_down() -> Response<Body> {
-    Reject::new(StatusCode::SERVICE_UNAVAILABLE, "remote", "the server is shutting down", 8).response()
+    Reject::shutting_down().response()
 }
 
 struct Server {
@@ -524,6 +574,55 @@ struct Server {
     body_budget: Arc<Semaphore>,
     max_body: usize,
     open: OpenOptions,
+    /// Requests waiting for events: one permit each.
+    followers: Arc<Semaphore>,
+    waits: Waits,
+    feeds: Arc<Feeds>,
+    /// Set when the server shuts down.
+    stopping: watch::Sender<bool>,
+}
+
+/// How a request waiting for events ended its wait.
+#[derive(Clone, Copy, Debug)]
+struct Waited {
+    took: Duration,
+    /// No event matching the request's filters follows its `--since` up to
+    /// here: its command runs from here, which prints the same events.
+    since: i64,
+}
+
+/// Limits of requests waiting for events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Waits {
+    /// Requests waiting at once (`--max-followers`).
+    followers: usize,
+    /// The longest one waits (`--max-wait`).
+    longest: Duration,
+}
+
+impl Default for Waits {
+    fn default() -> Waits {
+        Waits { followers: MAX_FOLLOWERS, longest: Duration::from_secs(25) }
+    }
+}
+
+impl Waits {
+    fn from_args(a: &ServeArgs) -> Result<Waits> {
+        if a.max_followers > MAX_FOLLOWERS {
+            return Err(Error::invalid(format!(
+                "--max-followers {}: use 0 to {MAX_FOLLOWERS} (half of the {MAX_CONNECTIONS} connections the server \
+                 accepts)",
+                a.max_followers
+            )));
+        }
+        let longest = bd_core::time::parse_duration(&a.max_wait)
+            .map_err(|e| Error::invalid(format!("--max-wait {}: {e}", a.max_wait)))?;
+        let (low, high) = MAX_WAIT_RANGE;
+        if longest < low || longest > high {
+            return Err(Error::invalid(format!("--max-wait {}: use 1s to 5m", a.max_wait)));
+        }
+        Ok(Waits { followers: a.max_followers, longest })
+    }
 }
 
 struct Workspace {
@@ -551,6 +650,16 @@ impl Workspace {
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Reads the events head of `ws` with a pooled connection.
+fn head_reader(ws: Arc<Workspace>, open: OpenOptions) -> HeadReader {
+    Arc::new(move || {
+        let store = ws.take(&open)?;
+        let head = store.read(|r| r.event_head());
+        ws.give(store);
+        head
+    })
 }
 
 /// Marks a request id as running until dropped.
@@ -654,7 +763,7 @@ fn lossy(bytes: Vec<u8>) -> String {
 }
 
 impl Server {
-    fn new(root: PathBuf, max_body: usize) -> Server {
+    fn new(root: PathBuf, max_body: usize, waits: Waits) -> Server {
         let budget =
             kib(max_body.saturating_mul(BODY_COPIES)).saturating_add(kib(ANSWER_BUDGET)).max(kib(MIN_BODY_BUDGET));
         Server {
@@ -668,6 +777,10 @@ impl Server {
             body_budget: Arc::new(Semaphore::new(budget as usize)),
             max_body,
             open: OpenOptions::default(),
+            followers: Arc::new(Semaphore::new(waits.followers)),
+            waits,
+            feeds: Arc::new(Feeds::new(follow::HEAD_CHECK_EVERY, follow::HEAD_CHECK_GAP)),
+            stopping: watch::Sender::new(false),
         }
     }
 
@@ -690,6 +803,79 @@ impl Server {
         Some(ws)
     }
 
+    /// Hold a request `events --since N --wait D` until an event matching its
+    /// filters follows `N`, its wait ends (at most `--max-wait`), or the
+    /// server stops. Meanwhile it holds no command slot, connection or
+    /// budget: only a place among the followers, and it checks again each
+    /// time the workspace's events head moves past what it has seen. Then
+    /// the command runs; or the request is refused (busy, shutting down).
+    async fn wait_for_events(
+        self: &Arc<Self>,
+        ws: &Arc<Workspace>,
+        wait: follow::Wait,
+    ) -> std::result::Result<Waited, Reject> {
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + wait.wait.min(self.waits.longest);
+        let mut stopping = self.stopping.subscribe();
+        let args = Arc::new(wait.args);
+        let mut cursor = wait.since;
+        let mut follower: Option<(OwnedSemaphorePermit, Subscription)> = None;
+        loop {
+            if *stopping.borrow() {
+                return Err(Reject::shutting_down());
+            }
+            let slot = match tokio::time::timeout(QUEUE_WAIT, self.running.clone().acquire_owned()).await {
+                Ok(Ok(permit)) => permit,
+                Ok(Err(_)) => return Err(Reject::shutting_down()),
+                Err(_) => return Err(Reject::busy("running other commands")),
+            };
+            let (srv, ws2, args2) = (self.clone(), ws.clone(), args.clone());
+            let probed = tokio::task::spawn_blocking(move || {
+                let _slot = slot;
+                srv.probe(&ws2, &args2, cursor)
+            })
+            .await;
+            match probed {
+                // Nothing up to the head matched: the next check starts there.
+                Ok(Ok((false, head))) => cursor = cursor.max(head),
+                // Found, or failed: the command prints the events, or reports the failure.
+                _ => return Ok(Waited { took: started.elapsed(), since: cursor }),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(Waited { took: started.elapsed(), since: cursor });
+            }
+            let feed = match &mut follower {
+                Some((_, feed)) => feed,
+                None => {
+                    // Past the cap, the request runs at once, and its client polls.
+                    let Ok(permit) = self.followers.clone().try_acquire_owned() else {
+                        tracing::debug!(target: "bd::serve", workspace = %ws.name, "too many followers; not waiting");
+                        return Ok(Waited { took: started.elapsed(), since: cursor });
+                    };
+                    tracing::debug!(target: "bd::serve", workspace = %ws.name, cursor, "waiting for events");
+                    let feed = self.feeds.subscribe(&ws.name, || head_reader(ws.clone(), self.open.clone()));
+                    &mut follower.insert((permit, feed)).1
+                }
+            };
+            tokio::select! {
+                _ = feed.past(cursor) => {}
+                _ = tokio::time::sleep_until(deadline) => return Ok(Waited { took: started.elapsed(), since: cursor }),
+                _ = stopping.wait_for(|stop| *stop) => return Err(Reject::shutting_down()),
+            }
+        }
+    }
+
+    /// Whether an event matching `args`' filters follows `cursor` in `ws`; and its events head.
+    fn probe(&self, ws: &Workspace, args: &EventsArgs, cursor: i64) -> Result<(bool, i64)> {
+        let store = ws.take(&self.open)?;
+        let found = store.read(|r| {
+            let q = crate::commands::event_query(r, args)?;
+            crate::commands::events_after(r, &q, cursor)
+        });
+        ws.give(store);
+        found
+    }
+
     /// Run one command line for `token` in `ws` (on a blocking thread),
     /// answering through `out`. A request refused before the command runs
     /// returns its [`Reject`] instead.
@@ -699,12 +885,16 @@ impl Server {
         token: &Token,
         request: ExecRequest,
         started: Instant,
+        waited: Option<Waited>,
         mut out: FrameWriter,
     ) -> std::result::Result<(), Reject> {
-        let cli = match Cli::try_parse_from(std::iter::once("bd".to_string()).chain(request.argv.iter().cloned())) {
+        let mut cli = match Cli::try_parse_from(std::iter::once("bd".to_string()).chain(request.argv.iter().cloned())) {
             Ok(cli) => cli,
             Err(e) => return respond(&mut out, &parse_failure(&e)),
         };
+        if let (Some(w), Command::Events(a)) = (waited, &mut cli.command) {
+            a.since = Some(w.since);
+        }
         let json = cli.global.json;
         let name = crate::command_name(&cli.command);
         let access = access(&cli.command);
@@ -768,6 +958,10 @@ impl Server {
             ..Capture::new(Box::new(out.clone()))
         };
         let (exit_code, captured) = io::capture(capture, || crate::execute(&mut app, &cli.command));
+        if access == Access::Write {
+            // Requests waiting for events check again.
+            self.feeds.committed(&ws.name);
+        }
         let recorded = app.request.as_ref().filter(|k| k.recorded).map(|k| k.id.clone());
         if let Some(store) = app.take_store() {
             if !read_only || store.connection().pragma_update(None, "query_only", false).is_ok() {
@@ -810,6 +1004,7 @@ impl Server {
             exit_code,
             bytes = sent.bytes,
             ms = started.elapsed().as_millis() as u64,
+            waited_ms = waited.map(|w| w.took.as_millis() as u64),
             "exec"
         );
         if sent.streamed {
@@ -894,7 +1089,7 @@ mod tests {
         assert_eq!(kib((4096 << 20) * BODY_COPIES), 8 << 20, "the largest --max-body-mib fits");
         // A maximum-size request, with its answer's share, fits in the budget.
         for max_body in [1 << 20, 64 << 20, 4096 << 20] {
-            let server = Server::new(PathBuf::from("."), max_body);
+            let server = Server::new(PathBuf::from("."), max_body, Waits::default());
             let request = kib(max_body * BODY_COPIES) + kib(ANSWER_BUDGET);
             assert!(server.body_budget.available_permits() >= request as usize, "--max-body-mib {}", max_body >> 20);
         }
@@ -916,6 +1111,7 @@ mod tests {
             (&["show", "t-1"][..], Access::Read),
             (&["ready"][..], Access::Read),
             (&["events"][..], Access::Read),
+            (&["events", "--since", "5", "--wait", "30s"][..], Access::Read),
             (&["dep", "tree", "t-1"][..], Access::Read),
             (&["config", "get", "lease.ttl"][..], Access::Read),
             (&["playbook", "extract", "x"][..], Access::Read),

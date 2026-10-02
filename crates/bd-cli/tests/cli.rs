@@ -156,6 +156,61 @@ fn events_cursor_and_truncation() {
     assert_eq!(ws.code_as("tester", &["history", "t-404"]), 3);
 }
 
+fn seqs(lines: &str) -> Vec<(i64, String)> {
+    lines
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .map(|e| (e["seq"].as_i64().unwrap(), e["op"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+#[test]
+fn events_wait_for_a_matching_event() {
+    use std::time::{Duration, Instant};
+    let ws = Ws::new();
+    ws.ok(&["create", "One"]);
+    let head = ws.json(&["info"])["events_head"].as_i64().unwrap().to_string();
+
+    let started = Instant::now();
+    assert_eq!(ws.ok(&["events", "--since", &head, "--wait", "400ms", "--interval-ms", "50"]), "", "nothing came");
+    assert!(started.elapsed() >= Duration::from_millis(400), "{:?}", started.elapsed());
+
+    // Events its filters skip do not end the wait; the first matching one does.
+    let waiter = Ws::cmd_in(ws.dir.path(), "tester", &["--json", "events", "--since", &head])
+        .args(["--wait", "60s", "--op", "closed", "--interval-ms", "50"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    ws.ok(&["create", "Two"]);
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    ws.ok(&["close", "t-1"]);
+    let out = waiter.wait_with_output().unwrap();
+    assert!(out.status.success());
+    assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
+    let printed = seqs(&String::from_utf8(out.stdout).unwrap());
+    assert_eq!(printed.iter().map(|(_, op)| op.as_str()).collect::<Vec<_>>(), ["closed"]);
+
+    // Events already there are printed at once, like without --wait.
+    let started = Instant::now();
+    let now = seqs(&ws.ok(&["--json", "events", "--since", &head, "--wait", "1h"]));
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(now, seqs(&ws.ok(&["--json", "events", "--since", &head])));
+
+    assert_eq!(ws.code_as("tester", &["events", "--wait", "1s"]), 2, "--wait needs a cursor");
+    assert_eq!(ws.code_as("tester", &["events", "--since", "1", "--wait", "1s", "--follow"]), 2);
+    assert_eq!(ws.code_as("tester", &["events", "--since", "1", "--wait", "soon"]), 2);
+
+    // A deleted issue keeps its events, as for `bd history`.
+    ws.ok(&["delete", "t-2"]);
+    let ops: Vec<String> =
+        seqs(&ws.ok(&["--json", "events", "--issue", "t-2"])).into_iter().map(|(_, op)| op).collect();
+    assert_eq!(ops.first().map(String::as_str), Some("created"));
+    assert_eq!(ops.last().map(String::as_str), Some("deleted"));
+    assert_eq!(ws.code_as("tester", &["events", "--issue", "t-404"]), 3, "unknown issues are still errors");
+}
+
 #[test]
 fn crash_recovery_via_reclaim() {
     let ws = Ws::new();

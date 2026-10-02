@@ -540,7 +540,7 @@ fn bench_remote_mode_verifies_invariants() {
 fn remote_command_configures_a_checkout() {
     let server = Server::start();
     let secret = server.token("alice-laptop", "alice", &[]);
-    let checkout = tempfile::tempdir().unwrap();
+    let checkout = checkout_dir();
     let sub = checkout.path().join("src");
     std::fs::create_dir_all(&sub).unwrap();
     let run = |dir: &Path, token: Option<&str>, args: &[&str]| {
@@ -583,6 +583,14 @@ fn remote_command_configures_a_checkout() {
     assert_eq!(run(&sub, None, &["remote", "set", "http://bd.example.com/w/proj"]).status.code(), Some(2));
 }
 
+/// A temp dir with an empty `.bd/`, so `bd remote set` writes there and never into a `.bd/` of an ancestor
+/// (as when $TMPDIR is inside a checkout).
+fn checkout_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".bd")).unwrap();
+    dir
+}
+
 /// Run `cmd` with `input` on its stdin; returns its output.
 fn with_input(mut cmd: Command, input: &str) -> Output {
     let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
@@ -595,7 +603,7 @@ fn remote_login_saves_tokens_per_server() {
     let server = Server::start();
     let alice = server.token("alice-laptop", "alice", &[]);
     let bob = server.token("bob-proj", "bob", &["--workspace", "proj"]);
-    let checkout = tempfile::tempdir().unwrap();
+    let checkout = checkout_dir();
     let config = tempfile::tempdir().unwrap();
     let creds = config.path().join("bd").join("credentials.toml");
     let cmd = |token: Option<&str>, args: &[&str]| {
@@ -825,7 +833,7 @@ fn saved_tokens_stay_bound_to_the_ca_they_were_checked_with() {
 
 #[test]
 fn tokens_passed_as_arguments_are_never_echoed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = checkout_dir();
     let url = "https://bd.example.com/w/proj";
     for (args, why) in [
         (vec!["remote", "login", "bdt_fakesecret123"], "looks like an access token"),
@@ -1098,7 +1106,7 @@ fn https_with_a_private_ca() {
     assert_eq!(check(out, "list via remote.toml with ca_cert").trim(), "t-1");
 
     // `bd remote set --ca-cert` copies the CA next to remote.toml.
-    let fresh = tempfile::tempdir().unwrap();
+    let fresh = checkout_dir();
     let out = bd(fresh.path()).args(["remote", "set", &server.url(), "--ca-cert"]).arg(&ca_pem).output().unwrap();
     check(out, "remote set --ca-cert");
     assert_eq!(std::fs::read(fresh.path().join(".bd/ca.pem")).unwrap(), std::fs::read(&ca_pem).unwrap());

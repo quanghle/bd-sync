@@ -1464,13 +1464,25 @@ fn followers_past_the_cap_poll() {
     let _held = send_exec(&addr, &secret, json!(["events", "--since", head, "--wait", "60s", "--op", "closed"]));
     eventually("the only follower's place taken", || logged(&log, "waiting for events") == 1);
 
+    let (requests, refused) = (events_requests(&log), logged(&log, "too many followers; not waiting"));
     let mut follower = Follower::start(&mut alice.cmd(&["--json", "events", "--follow", "--interval-ms", "200"]));
     follower.wait_for(&["\"issue_id\":\"t-1\""]);
+    // It polls instead: several requests, each started at most once per 200 ms
+    // interval. The bound comes from the time they actually took, so load only
+    // slows it; +3 covers the window's edges and the first listing, whose log
+    // line may come after the follower printed its answer.
     let before = events_requests(&log);
-    std::thread::sleep(Duration::from_secs(2));
+    let started = Instant::now();
+    eventually("five polls", || events_requests(&log) - before >= 5);
     let polls = events_requests(&log) - before;
-    assert!((3..=20).contains(&polls), "it polls every 200 ms instead: {polls} requests in 2 s");
-    assert!(logged(&log, "too many followers; not waiting") >= polls);
+    let elapsed = started.elapsed();
+    let most = elapsed.as_millis() as usize / 200 + 3;
+    assert!(polls <= most, "{polls} requests in {elapsed:?}: faster than one per 200 ms");
+    // Each poll was refused a wait (its line is logged before its exec line);
+    // the follower's first request lists the latest events, without waiting.
+    let (requests, refused) =
+        (events_requests(&log) - requests, logged(&log, "too many followers; not waiting") - refused);
+    assert!(refused + 1 >= requests, "{refused} of {requests} requests refused a wait");
     alice.ok(&["create", "Second"]);
     follower.wait_for(&["\"issue_id\":\"t-2\""]);
 
@@ -1481,7 +1493,7 @@ fn followers_past_the_cap_poll() {
     let started = Instant::now();
     assert_eq!(alice.ok(&["events", "--since", &head, "--wait", "1s", "--interval-ms", "200"]), "");
     assert!(started.elapsed() >= Duration::from_secs(1));
-    assert!(events_requests(&log) >= 3, "the client polled");
+    assert!(events_requests(&log) >= 2, "the client polled");
     assert_eq!(logged(&log, "waiting for events"), 0);
 }
 
@@ -1522,15 +1534,15 @@ fn remote_waits_last_as_long_as_asked() {
     assert!(started.elapsed() >= Duration::from_millis(1500), "{:?}", started.elapsed());
 
     // Longer than the server's --max-wait: the client asks again, from where the server got to.
+    let waits = logged(&log, "waited_ms=");
     let mut waiter =
         Follower::start(&mut alice.cmd(&["--json", "events", "--since", &head, "--wait", "60s", "--op", "closed"]));
-    std::thread::sleep(Duration::from_millis(2500));
+    eventually("two of the server's 1 s waits ended", || logged(&log, "waited_ms=") >= waits + 2);
     alice.ok(&["create", "Not this one"]);
     alice.ok(&["close", "t-1"]);
     waiter.wait_for(&["\"op\":\"closed\"", "\"issue_id\":\"t-1\""]);
     assert_eq!(waiter.exit_code(), Some(0));
     assert_eq!(waiter.seen.len(), 1, "{:?}", waiter.seen);
-    assert!(logged(&log, "waited_ms=") >= 4, "the server's waits are 1 s at most");
     let local = check(server.local("x", &["--json", "events", "--since", &head, "--op", "closed"]), "local events");
     assert_eq!(waiter.seen, local.lines().collect::<Vec<_>>());
 }

@@ -1360,10 +1360,10 @@ copilot`, on `SessionStart`. A repository can use a hook file instead,
 
 Copilot CLI also runs a repository's `.claude/settings.json` hooks, where
 `--harness claude` stays inert and plain `bd prime`'s output is dropped.
-Leave `matcher` out of an entry meant to match everything rather than
-setting it to `""`: Claude Code reads both as match-all, but Copilot CLI
-refuses an empty `matcher` (`matcher cannot be empty`) and skips the whole
-file.
+Leave out `matcher` to match every occurrence of an event, rather than
+writing `"matcher": ""`: Copilot CLI 1.0.91 refuses a `.claude/settings.json`
+with an empty `matcher`, warning at each session start (`matcher cannot be
+empty`) and skipping the whole file, while Claude Code treats both alike.
 
 **Codex** (`.codex/hooks.json` in the repository):
 

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bd_core::gates::{GateKind, GateRepos, GateSpec, NewGate};
-use bd_core::playbook::{self, CompactOptions, Loader, RunRequest, StartOptions};
+use bd_core::playbook::{self, CompactOptions, DiscardOptions, Loader, RunRequest, StartOptions};
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::*;
 use serde_json::{Value, json};
@@ -92,7 +92,11 @@ fn denied<T: std::fmt::Debug>(r: Result<T>, needle: &str) {
 }
 
 fn force_release() -> ReleaseOptions {
-    ReleaseOptions { force: true, ..Default::default() }
+    ReleaseOptions { take_over: true, ..Default::default() }
+}
+
+fn discard(force: bool, take_over: bool, dry_run: bool) -> DiscardOptions {
+    DiscardOptions { force, take_over, dry_run }
 }
 
 fn patch(f: impl FnOnce(&mut IssuePatch)) -> IssuePatch {
@@ -116,7 +120,7 @@ fn other_actors_claims_need_an_admin() {
     denied(env.as_("alice", agent("alice"), |tx| tx.release(&held, &force_release())), "needs an admin");
     let cas = ReleaseOptions {
         guard: Guard { if_assignee: Some(Some("bob/w1".into())), ..Default::default() },
-        force: true,
+        take_over: true,
         ..Default::default()
     };
     denied(env.as_("alice", agent("alice"), |tx| tx.release(&held, &cas)), "claimed by bob/w1");
@@ -138,13 +142,15 @@ fn other_actors_claims_need_an_admin() {
     env.as_("alice", agent("alice"), |tx| tx.update_issue(&held, &label, &Guard::default(), false)).unwrap();
 
     // The token's own actor and its sub-actors may take over each other's claims without an
-    // admin, but with force like everyone: each sub-actor holds its own lease.
+    // admin, but with take_over like everyone: each sub-actor holds its own lease.
     env.as_("bob/w2", agent("bob"), |tx| tx.release(&ids[1], &force_release())).unwrap();
-    let e = env.as_("bob", agent("bob"), |tx| tx.close_issue(&ids[2], &CloseOptions::default())).unwrap_err();
-    assert!(matches!(e, Error::NotOwner { .. }), "{e}");
-    let force_close = CloseOptions { force: true, ..Default::default() };
-    env.as_("bob", agent("bob"), |tx| tx.close_issue(&ids[2], &force_close)).unwrap();
-    // An admin may take over anyone's claim; without a policy (the CLI) anyone may: with force.
+    for opts in [CloseOptions::default(), CloseOptions { force: true, ..Default::default() }] {
+        let e = env.as_("bob", agent("bob"), |tx| tx.close_issue(&ids[2], &opts)).unwrap_err();
+        assert!(matches!(e, Error::NotOwner { .. }), "{e}");
+    }
+    let take_close = CloseOptions { take_over: true, ..Default::default() };
+    env.as_("bob", agent("bob"), |tx| tx.close_issue(&ids[2], &take_close)).unwrap();
+    // An admin may take over anyone's claim; without a policy (the CLI) anyone may: with take_over.
     let e = env.as_("ops", admin_agent("ops"), |tx| tx.update_issue(&held, &take, &Guard::default(), false));
     assert!(matches!(e, Err(Error::AlreadyClaimed { .. })), "{e:?}");
     env.as_("ops", admin_agent("ops"), |tx| tx.update_issue(&held, &take, &Guard::default(), true)).unwrap();
@@ -196,14 +202,18 @@ fn live_claims_are_their_holders_alone() {
     let none = Guard::default();
     let close = CloseOptions::default();
     let force_close = CloseOptions { force: true, ..Default::default() };
+    let take_close = CloseOptions { take_over: true, ..Default::default() };
     let reopen = patch(|p| p.status = Some(Status::Open));
     let take = |who: &str| patch(|p| p.assignee = Some(Some(who.to_string())));
 
     // Without a policy (the CLI), every other actor name is refused: another actor, the
-    // holder's root actor, and a sibling sub-actor alike.
+    // holder's root actor, and a sibling sub-actor alike. `force` changes nothing.
     for actor in ["bob", "ann", "ann/s2"] {
         let held = &ids[0];
         not_owner(env.as_(actor, None, |tx| tx.close_issue(held, &close)), "ann/s1");
+        not_owner(env.as_(actor, None, |tx| tx.close_issue(held, &force_close)), "ann/s1");
+        let del = DeleteOptions { force: true, cascade: true, ..Default::default() };
+        not_owner(env.as_(actor, None, |tx| tx.delete_issues(std::slice::from_ref(held), &del)), "ann/s1");
         not_owner(env.as_(actor, None, |tx| tx.update_issue(held, &reopen, &none, false)), "ann/s1");
         let e = env.as_(actor, None, |tx| tx.update_issue(held, &take(actor), &none, false)).unwrap_err();
         assert!(matches!(e, Error::AlreadyClaimed { .. }) && e.exit_code() == 4, "{e}");
@@ -222,12 +232,12 @@ fn live_claims_are_their_holders_alone() {
     let label = patch(|p| p.add_labels = vec!["seen".into()]);
     env.as_("bob", None, |tx| tx.update_issue(&ids[0], &label, &none, false)).expect("leaves the claim alone");
 
-    // With force each goes through, and its event names the claim it ended.
+    // With take_over each goes through, and its event names the claim it ended.
     let overridden = |env: &Env, op: &str, n: usize| {
         let e = last_event(env, op, &ids[n]);
         assert_eq!(e.data["claim_override"], json!({ "holder": "ann/s1", "token": tokens[n] }), "{op}: {}", e.data);
     };
-    env.as_("bob", None, |tx| tx.close_issue(&ids[0], &force_close)).unwrap();
+    env.as_("bob", None, |tx| tx.close_issue(&ids[0], &take_close)).unwrap();
     overridden(&env, "closed", 0);
     env.as_("ann", None, |tx| tx.update_issue(&ids[1], &reopen, &none, true)).unwrap();
     overridden(&env, "updated", 1);
@@ -236,7 +246,7 @@ fn live_claims_are_their_holders_alone() {
     assert_eq!(env.store.read(|r| r.lease(&ids[2])).unwrap().unwrap().holder, "ann/s2", "the lease follows");
     env.as_("bob", None, |tx| tx.release(&ids[3], &force_release())).unwrap();
     overridden(&env, "released", 3);
-    let del = DeleteOptions { force: true, ..Default::default() };
+    let del = DeleteOptions { take_over: true, ..Default::default() };
     env.as_("bob", None, |tx| tx.delete_issues(std::slice::from_ref(&ids[4]), &del)).unwrap();
     overridden(&env, "deleted", 4);
 
@@ -281,17 +291,17 @@ fn a_dead_claim_is_released_by_anyone_a_live_one_by_its_holder() {
 }
 
 #[test]
-fn imports_and_runs_need_force_to_end_live_claims() {
+fn imports_need_take_over_to_end_live_claims() {
     let mut env = Env::new();
     let id = env.create("Claimed");
     let mut before = Vec::new();
     env.store.read(|r| r.export_jsonl(&mut before, &ExportOptions::default())).unwrap();
     let token = env.as_("ann", None, |tx| tx.claim(&id, &ClaimOptions::default())).unwrap().lease.token;
     // An export from before the claim would put the issue back to open.
-    let import = |force: bool| {
+    let import = |take_over: bool| {
         let before = before.clone();
         move |tx: &mut WriteCtx<'_>| {
-            tx.import_jsonl(&mut before.as_slice(), &ImportOptions { force, ..Default::default() })
+            tx.import_jsonl(&mut before.as_slice(), &ImportOptions { take_over, ..Default::default() })
         }
     };
     not_owner(env.as_("bob", None, import(false)), "ann");
@@ -301,21 +311,166 @@ fn imports_and_runs_need_force_to_end_live_claims() {
         tx.set_rollback_only();
         Ok(())
     })
-    .expect("an admin token, with force");
+    .expect("an admin token, with take_over");
     env.as_("bob", None, import(true)).unwrap();
     assert_eq!(env.issue(&id).status, Status::Open);
     assert_eq!(last_event(&env, "imported", &id).data["claim_override"], json!({ "holder": "ann", "token": token }));
+    env.assert_healthy();
+}
 
-    // Discarding or compacting a run deletes its claimed steps only with force (already
-    // required for unfinished runs), and records each claim it ended.
-    let run = env.start("[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\n", &[]).unwrap();
-    let step = format!("{run}.a");
-    let token = env.as_("ann", None, |tx| tx.claim(&step, &ClaimOptions::default())).unwrap().lease.token;
-    assert!(matches!(env.as_("bob", None, |tx| tx.discard_run(&run, false, false)), Err(Error::Refused(_))));
-    let compact = CompactOptions { force: true, ..Default::default() };
-    env.as_("bob", None, |tx| tx.compact_run(&run, &compact)).unwrap();
+/// The incident: a coordinator closing a worker's claim because `--force` got it past
+/// something else. `force` never takes over a claim, and the claim is named first.
+#[test]
+fn force_gets_past_structure_never_past_a_claim() {
+    let mut env = Env::new();
+    let none = Guard::default();
+    let epic = env.create("Epic");
+    let open_child = child(&mut env, "alice", None, &epic, NewIssue::titled("Open child"));
+    let token = env
+        .as_("bob", None, |tx| tx.claim(&epic, &ClaimOptions { allow_blocked: true, ..Default::default() }))
+        .unwrap()
+        .lease
+        .token;
+    let close = |force: bool, take_over: bool| CloseOptions { force, take_over, ..Default::default() };
+    // Open children would refuse it (exit 2, "pass --force"), but the claim is named first.
+    for opts in [close(false, false), close(true, false)] {
+        not_owner(env.as_("alice", None, |tx| tx.close_issue(&epic, &opts)), "bob");
+    }
+    let e = env.as_("alice", None, |tx| tx.close_issue(&epic, &close(false, true))).unwrap_err();
+    assert!(matches!(e, Error::Refused(ref m) if m.contains("open child")), "take_over is not force: {e}");
+    env.as_("alice", None, |tx| tx.close_issue(&epic, &close(true, true))).unwrap();
+    assert_eq!(last_event(&env, "closed", &epic).data["claim_override"], json!({ "holder": "bob", "token": token }));
+    assert_eq!(env.issue(&open_child).status, Status::Open);
+
+    // Deleting: dependents would refuse it, but the claim is named first, with --cascade too.
+    let held = env.create("Held");
+    let dependent = env
+        .as_("alice", None, |tx| {
+            tx.create_issue(NewIssue { deps: vec![(DepType::Blocks, held.clone())], ..NewIssue::titled("After") })
+        })
+        .unwrap()
+        .id;
+    env.as_("bob", None, |tx| tx.claim(&held, &ClaimOptions::default())).unwrap();
+    let del = |force: bool, cascade: bool, take_over: bool| DeleteOptions { force, cascade, take_over, dry_run: false };
+    for opts in [del(false, false, false), del(true, false, false), del(false, true, false)] {
+        not_owner(env.as_("alice", None, |tx| tx.delete_issues(std::slice::from_ref(&held), &opts)), "bob");
+    }
+    let e = env.as_("alice", None, |tx| tx.delete_issues(std::slice::from_ref(&held), &del(false, false, true)));
+    assert!(matches!(e, Err(Error::Refused(_))), "{e:?}");
+    env.as_("alice", None, |tx| tx.delete_issues(std::slice::from_ref(&held), &del(true, false, true))).unwrap();
+    assert_eq!(last_event(&env, "deleted", &held).data["claim_override"]["holder"], "bob");
+    assert!(!env.issue(&dependent).is_blocked);
+
+    // Several at once are named together, each with its holder.
+    let (x, y) = (env.create("X"), env.create("Y"));
+    env.as_("bob", None, |tx| tx.claim(&x, &ClaimOptions::default())).unwrap();
+    env.as_("carol", None, |tx| tx.claim(&y, &ClaimOptions::default())).unwrap();
+    let e = env.as_("alice", None, |tx| tx.delete_issues(&[x.clone(), y.clone()], &del(true, false, false)));
+    match e {
+        Err(e @ Error::ClaimsHeld { .. }) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains(&format!("{x} (held by bob)")) && msg.contains(&format!("{y} (held by carol)")),
+                "{msg}"
+            );
+            assert_eq!((e.exit_code(), e.code()), (4, "not_owner"));
+        }
+        other => panic!("expected both claims named, got {other:?}"),
+    }
+    let e = env.as_("alice", None, |tx| tx.check_take_over(&[x.clone(), y.clone()], false, "closing them"));
+    assert!(matches!(e, Err(Error::ClaimsHeld { .. })), "{e:?}");
+    env.as_("alice", None, |tx| tx.check_take_over(&[x.clone(), y.clone()], true, "closing them")).unwrap();
+    // update has no structural refusals: its only override is take_over.
+    let reopen = patch(|p| p.status = Some(Status::Open));
+    not_owner(env.as_("alice", None, |tx| tx.update_issue(&x, &reopen, &none, false)), "bob");
+    env.assert_healthy();
+}
+
+#[test]
+fn runs_with_others_claims_need_take_over_to_discard_or_compact() {
+    let mut env = Env::new();
+    let two = "[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\n";
+    let opts = |force: bool, take_over: bool| DiscardOptions { force, take_over, dry_run: false };
+
+    // A claimed run issue (not just a step) is someone else's work too.
+    let run = env.start(two, &[]).unwrap();
+    let token = env
+        .as_("bob", None, |tx| tx.claim(&run, &ClaimOptions { allow_blocked: true, ..Default::default() }))
+        .unwrap()
+        .lease
+        .token;
+    for o in [opts(false, false), opts(true, false)] {
+        not_owner(env.as_("alice", None, |tx| tx.discard_run(&run, &o)), "bob");
+    }
+    env.as_("alice", None, |tx| tx.discard_run(&run, &opts(false, true))).unwrap();
+    assert_eq!(last_event(&env, "deleted", &run).data["claim_override"], json!({ "holder": "bob", "token": token }));
+
+    // Every held step is listed with its holder, before the run's other refusals.
+    let run = env.start(two, &[]).unwrap();
+    let (a, b) = (format!("{run}.a"), format!("{run}.b"));
+    let ta = env.as_("ann", None, |tx| tx.claim(&a, &ClaimOptions::default())).unwrap().lease.token;
+    env.as_("carol", None, |tx| tx.claim(&b, &ClaimOptions::default())).unwrap();
+    for o in [opts(false, false), opts(true, false)] {
+        let e = env.as_("alice", None, |tx| tx.discard_run(&run, &o)).unwrap_err();
+        let msg = e.to_string();
+        assert!(matches!(e, Error::ClaimsHeld { .. }), "{e}");
+        assert!(msg.contains(&format!("{a} (held by ann)")) && msg.contains(&format!("{b} (held by carol)")), "{msg}");
+    }
+    let compact = |force: bool, take_over: bool| CompactOptions { force, take_over, ..Default::default() };
+    for c in [compact(false, false), compact(true, false)] {
+        let e = env.as_("alice", None, |tx| tx.compact_run(&run, &c)).unwrap_err();
+        assert!(matches!(e, Error::ClaimsHeld { .. }) && e.to_string().contains("compacting"), "{e}");
+    }
+    let e = env.as_("alice", None, |tx| tx.compact_run(&run, &compact(false, true))).unwrap_err();
+    assert!(matches!(e, Error::Refused(ref m) if m.contains("not finished")), "take_over is not force: {e}");
+    env.as_("alice", None, |tx| tx.compact_run(&run, &compact(true, true))).unwrap();
     let e = last_event(&env, "run_compacted", &run);
-    assert_eq!(e.data["claim_overrides"], json!({ step.clone(): { "holder": "ann", "token": token } }), "{}", e.data);
+    assert_eq!(e.data["claim_overrides"][&a], json!({ "holder": "ann", "token": ta }), "{}", e.data);
+    assert_eq!(e.data["claim_overrides"][&b]["holder"], "carol");
+
+    // The caller's own claims are its own work in progress: force, as before.
+    let run = env.start(two, &[]).unwrap();
+    env.as_("alice", None, |tx| tx.claim(&format!("{run}.a"), &ClaimOptions::default())).unwrap();
+    let e = env.as_("alice", None, |tx| tx.discard_run(&run, &opts(false, true))).unwrap_err();
+    assert!(matches!(e, Error::Refused(ref m) if m.contains("in progress")), "{e}");
+    env.as_("alice", None, |tx| tx.discard_run(&run, &opts(true, false))).unwrap();
+    env.assert_healthy();
+}
+
+#[test]
+fn reclaiming_inside_the_grace_window_is_a_takeover() {
+    let mut env = Env::new();
+    let ids: Vec<String> = (1..=3).map(|n| env.create(&format!("Task {n}"))).collect();
+    let short = ClaimOptions { ttl: Some(Duration::from_secs(1)), ..Default::default() };
+    let tokens: Vec<i64> =
+        ids.iter().map(|id| env.as_("bob/w1", None, |tx| tx.claim(id, &short)).unwrap().lease.token).collect();
+    env.clock.advance(Duration::from_secs(2));
+    // Expired but inside lease.grace (10m): still live. The default grace leaves them be,
+    // as bd serve's background reclaim (actor bd-serve, no rights) does.
+    let quick = |take_over: bool| ReclaimOptions { grace: Some(Duration::ZERO), take_over, ..Default::default() };
+    let none = env.as_("bd-serve", Some(Policy::default()), |tx| tx.reclaim_expired(&ReclaimOptions::default()));
+    assert!(none.unwrap().is_empty());
+    let e = env.as_("alice", None, |tx| tx.reclaim_expired(&quick(false))).unwrap_err();
+    assert!(matches!(e, Error::ClaimsHeld { .. }) && e.to_string().contains("lease.grace (10m)"), "{e}");
+    let one = |n: usize, take_over: bool| ReclaimOptions {
+        filter: WorkFilter { ids: vec![ids[n].clone()], ..Default::default() },
+        ..quick(take_over)
+    };
+    not_owner(
+        env.as_("alice", None, |tx| tx.reclaim_expired(&ReclaimOptions { dry_run: true, ..one(0, false) })),
+        "bob/w1",
+    );
+    // Under a policy, as for any takeover: an admin or the claim's own family, with take_over.
+    denied(env.as_("alice", agent("alice"), |tx| tx.reclaim_expired(&one(0, true))), "needs an admin");
+    let r = env.as_("alice", None, |tx| tx.reclaim_expired(&one(0, true))).unwrap();
+    assert_eq!(r.len(), 1);
+    let e = last_event(&env, "reclaimed", &ids[0]);
+    assert_eq!(e.data["claim_override"], json!({ "holder": "bob/w1", "token": tokens[0] }), "{}", e.data);
+    env.as_("bob/w2", agent("bob"), |tx| tx.reclaim_expired(&one(1, true))).unwrap();
+    assert_eq!(last_event(&env, "reclaimed", &ids[1]).data["claim_override"]["holder"], "bob/w1");
+    // The holder may reclaim its own early; no takeover.
+    env.as_("bob/w1", None, |tx| tx.reclaim_expired(&one(2, false))).unwrap();
+    assert!(last_event(&env, "reclaimed", &ids[2]).data.get("claim_override").is_none());
     env.assert_healthy();
 }
 
@@ -324,10 +479,15 @@ fn runs_with_claimed_steps_need_an_admin_to_discard() {
     let mut env = Env::new();
     let run = env.start("[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\n", &[]).unwrap();
     env.as_("bob", agent("bob"), |tx| tx.claim("t-1.a", &ClaimOptions::default())).unwrap();
-    denied(env.as_("alice", agent("alice"), |tx| tx.discard_run(&run, true, true)), "claimed by bob");
-    let compact = CompactOptions { force: true, ..Default::default() };
-    denied(env.as_("alice", agent("alice"), |tx| tx.compact_run(&run, &compact)), "claimed by bob");
-    env.as_("ops", admin_agent("ops"), |tx| tx.discard_run(&run, true, false)).unwrap();
+    for take_over in [false, true] {
+        let opts = discard(true, take_over, true);
+        denied(env.as_("alice", agent("alice"), |tx| tx.discard_run(&run, &opts)), "claimed by bob");
+        let compact = CompactOptions { force: true, take_over, ..Default::default() };
+        denied(env.as_("alice", agent("alice"), |tx| tx.compact_run(&run, &compact)), "claimed by bob");
+    }
+    let e = env.as_("ops", admin_agent("ops"), |tx| tx.discard_run(&run, &discard(true, false, false))).unwrap_err();
+    assert!(matches!(e, Error::NotOwner { .. }), "an admin too needs take_over, not just force: {e}");
+    env.as_("ops", admin_agent("ops"), |tx| tx.discard_run(&run, &discard(false, true, false))).unwrap();
     assert!(env.store.read(|r| r.issue(&run)).is_err(), "discarded");
 }
 
@@ -399,7 +559,7 @@ fn human_gates_open_only_for_a_person() {
     let detach = patch(|p| p.parent = Some(None));
     denied(env.as_("bot", bot(), |tx| tx.update_issue("t-1.deploy.upload", &detach, &none, false)), "move it");
     denied(env.as_("bot", bot(), |tx| tx.remove_dependency("t-1.deploy.upload", "t-1.deploy")), "move it out");
-    denied(env.as_("bot", bot(), |tx| tx.discard_run(&run, true, true)), "delete it");
+    denied(env.as_("bot", bot(), |tx| tx.discard_run(&run, &discard(true, false, true))), "delete it");
     let compact = CompactOptions { force: true, ..Default::default() };
     denied(env.as_("bot", bot(), |tx| tx.compact_run(&run, &compact)), "delete it");
     // Without force, held work is refused as before (blocked), not as an access problem.
@@ -481,7 +641,7 @@ fn people_and_the_cli_are_not_limited_by_human_gates() {
         })
         .unwrap();
     env.as_("bot", agent("bot"), |tx| tx.resolve_gate(&timer.id, None, false)).unwrap();
-    env.as_("bot", agent("bot"), |tx| tx.discard_run(&run, true, false)).unwrap();
+    env.as_("bot", agent("bot"), |tx| tx.discard_run(&run, &discard(true, false, false))).unwrap();
     env.assert_healthy();
 }
 

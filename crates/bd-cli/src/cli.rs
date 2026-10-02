@@ -389,9 +389,9 @@ pub struct UpdateArgs {
     #[command(flatten)]
     pub guard: GuardArgs,
     /// Take over or end another actor's live claim: reassign it, or move it out of in_progress (recorded in the
-    /// event; through bd serve, an admin token unless the token's actor owns the claim)
-    #[arg(long)]
-    pub force: bool,
+    /// event; through bd serve, an admin token unless the token's actor owns the claim). --force is an older alias
+    #[arg(long, visible_alias = "force")]
+    pub take_over: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -403,10 +403,13 @@ pub struct CloseArgs {
     /// Record the outcome as failed (releases conditional-blocks dependents)
     #[arg(long)]
     pub failed: bool,
-    /// Close despite open children, live blockers, or another actor's live claim (recorded in the event; through
-    /// bd serve, an admin token unless the token's actor owns the claim)
+    /// Close despite open children or live blockers (never past another actor's claim: see --take-over)
     #[arg(long)]
     pub force: bool,
+    /// Close another actor's live claim (recorded in the event; through bd serve, an admin token unless the token's
+    /// actor owns the claim)
+    #[arg(long)]
+    pub take_over: bool,
     /// Fencing token from `claim`: close only while that lease is held
     #[arg(long)]
     pub token: Option<i64>,
@@ -437,10 +440,14 @@ pub struct DeleteArgs {
     /// Also delete everything that depends on them
     #[arg(long)]
     pub cascade: bool,
-    /// Delete even if other issues depend on them (drops those edges) or another actor holds a live claim on one
-    /// (recorded in the event; through bd serve, an admin token unless the token's actor owns the claim)
+    /// Delete even if other issues depend on them (drops those edges; never past another actor's claim: see
+    /// --take-over)
     #[arg(long)]
     pub force: bool,
+    /// Delete issues other actors hold live claims on (recorded in the events; through bd serve, an admin token unless
+    /// the token's actor owns the claims)
+    #[arg(long)]
+    pub take_over: bool,
     #[arg(long)]
     pub dry_run: bool,
 }
@@ -515,10 +522,10 @@ pub struct ReleaseArgs {
     #[arg(short, long)]
     pub reason: Option<String>,
     /// Release another actor's live claim or assignment (recorded in the event; through bd serve, an admin token
-    /// unless the token's actor owns the claim)
-    #[arg(long)]
-    pub force: bool,
-    /// Release only if still held by this actor (compare-and-swap); implies --force
+    /// unless the token's actor owns the claim). --force is an older alias
+    #[arg(long, visible_alias = "force")]
+    pub take_over: bool,
+    /// Release only if still held by this actor (compare-and-swap); another actor's live claim also needs --take-over
     #[arg(long, value_name = "ACTOR")]
     pub if_assignee: Option<String>,
     /// Fencing token from `claim`: release only while that lease is held
@@ -528,7 +535,8 @@ pub struct ReleaseArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct ReclaimArgs {
-    /// Only leases expired at least this long ago (default: lease.grace)
+    /// Only leases expired at least this long ago (default: lease.grace). Shorter than lease.grace, other actors'
+    /// claims are still live: reclaiming them needs --take-over
     #[arg(long)]
     pub grace: Option<String>,
     /// Only these holders
@@ -540,6 +548,10 @@ pub struct ReclaimArgs {
     pub ids: Vec<String>,
     #[arg(long)]
     pub dry_run: bool,
+    /// Reclaim other actors' leases inside lease.grace, with a shorter --grace (recorded in the events; through bd
+    /// serve, an admin token unless the token's actor owns the claims)
+    #[arg(long)]
+    pub take_over: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -806,7 +818,7 @@ pub struct ImportArgs {
     /// Import over other actors' live claims too (moving them out of in_progress or to another assignee; recorded in
     /// the events)
     #[arg(long)]
-    pub force: bool,
+    pub take_over: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -897,9 +909,14 @@ pub struct CompactArgs {
     /// Your summary, written above the generated digest
     #[arg(short, long)]
     pub summary: Option<String>,
-    /// Compact even though the run is not finished, deleting its open steps (other actors' live claims too)
+    /// Compact even though the run is not finished, deleting its open steps (never past another actor's claim: see
+    /// --take-over)
     #[arg(long)]
     pub force: bool,
+    /// Delete steps other actors hold live claims on (recorded in the event; through bd serve, an admin token unless
+    /// the token's actor owns the claims)
+    #[arg(long)]
+    pub take_over: bool,
     /// Print the digest without changing anything
     #[arg(long)]
     pub dry_run: bool,
@@ -908,9 +925,14 @@ pub struct CompactArgs {
 #[derive(Args, Debug, Clone)]
 pub struct DiscardArgs {
     pub id: String,
-    /// Discard even with steps in progress (other actors' live claims too)
+    /// Discard even with work in progress: your own claims, or dead ones (never past another actor's claim: see
+    /// --take-over)
     #[arg(long)]
     pub force: bool,
+    /// Discard although other actors hold live claims on the run or its steps (recorded in the events; through bd
+    /// serve, an admin token unless the token's actor owns the claims)
+    #[arg(long)]
+    pub take_over: bool,
     #[arg(long)]
     pub dry_run: bool,
 }

@@ -36,6 +36,6 @@ pub use model::{
     parse_toml, to_toml,
 };
 pub use run::{
-    CompactOptions, CompactOutcome, Progress, RunStarted, RunStatus, RunSummary, RunsQuery, StartOptions, StatusNode,
-    StepState, role_of, run_of, run_status, runs,
+    CompactOptions, CompactOutcome, DiscardOptions, Progress, RunStarted, RunStatus, RunSummary, RunsQuery,
+    StartOptions, StatusNode, StepState, role_of, run_of, run_status, runs,
 };

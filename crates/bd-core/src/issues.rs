@@ -322,9 +322,12 @@ fn validate_metadata(v: &Value) -> Result<()> {
 pub struct CloseOptions {
     pub reason: Option<String>,
     pub outcome: Option<Outcome>,
-    /// Close despite open children, live blockers, or another actor's live
-    /// claim (a takeover, recorded in the `closed` event; see [`crate::policy`]).
+    /// Close despite open children or live blockers. Never past another
+    /// actor's live claim: that is `take_over`.
     pub force: bool,
+    /// Close another actor's live claim: a takeover, recorded in the
+    /// `closed` event (see [`crate::policy`]).
+    pub take_over: bool,
     pub guard: Guard,
     /// Fencing token from `claim`: close only while that lease is still held.
     pub token: Option<i64>,
@@ -365,9 +368,11 @@ pub struct DeleteOptions {
     /// through readiness edges (blocks, conditional-blocks, parent-child, waits-for).
     pub cascade: bool,
     /// Delete even though other issues depend on the targets (drops those
-    /// edges), or another actor holds a live claim on one (recorded in its
-    /// `deleted` event; see [`crate::policy`]).
+    /// edges). Never past another actor's live claim: that is `take_over`.
     pub force: bool,
+    /// Delete issues other actors hold live claims on: a takeover, recorded
+    /// in each one's `deleted` event (see [`crate::policy`]).
+    pub take_over: bool,
     pub dry_run: bool,
 }
 
@@ -493,11 +498,17 @@ impl WriteCtx<'_> {
         require(self.conn(), &id)
     }
 
-    /// Apply `patch`. `force`: even when that ends or takes over another
+    /// Apply `patch`. `take_over`: even when that ends or takes over another
     /// actor's live claim (reassigning it, or moving it out of `in_progress`;
     /// recorded in the `updated` event, see [`crate::policy`]).
-    pub fn update_issue(&mut self, id: &str, patch: &IssuePatch, guard: &Guard, force: bool) -> Result<UpdateOutcome> {
-        self.update_issue_as(id, patch, guard, force, false)
+    pub fn update_issue(
+        &mut self,
+        id: &str,
+        patch: &IssuePatch,
+        guard: &Guard,
+        take_over: bool,
+    ) -> Result<UpdateOutcome> {
+        self.update_issue_as(id, patch, guard, take_over, false)
     }
 
     /// [`WriteCtx::update_issue`]; `playbook` when playbook runs update their
@@ -507,7 +518,7 @@ impl WriteCtx<'_> {
         id: &str,
         patch: &IssuePatch,
         guard: &Guard,
-        force: bool,
+        take_over: bool,
         playbook: bool,
     ) -> Result<UpdateOutcome> {
         let old = require(self.conn(), id)?;
@@ -603,7 +614,7 @@ impl WriteCtx<'_> {
         if was_claimed
             && is_claimed
             && old.assignee != new.assignee
-            && !force
+            && !take_over
             && self.others_live_claim(&old)?.is_some()
         {
             return Err(Error::AlreadyClaimed { id: id.to_string(), holder: old.assignee.clone().unwrap_or_default() });
@@ -677,7 +688,7 @@ impl WriteCtx<'_> {
             return Ok(UpdateOutcome { issue: old, changed: Vec::new() });
         }
         let moved_from = parent_change.as_ref().and_then(|(from, _)| from.as_deref());
-        let claim_override = self.check_update(&old, &new, moved_from, playbook, force)?;
+        let claim_override = self.check_update(&old, &new, moved_from, playbook, take_over)?;
         self.check_gate_repo(&new.issue_type, &new.metadata, Some(&old))?;
 
         self.conn()
@@ -756,6 +767,8 @@ impl WriteCtx<'_> {
         if let Some(token) = opts.token {
             claims::check_token(self.conn(), id, self.actor(), token)?;
         }
+        // Someone else's work is named before anything `force` gets past.
+        let claim_override = self.check_claim_override(&old, opts.take_over)?;
         if !opts.force {
             let open = open_children(self.conn(), id)?;
             // A spawner (others wait on its children via waits-for) may finish
@@ -775,7 +788,7 @@ impl WriteCtx<'_> {
                 )));
             }
         }
-        let claim_override = self.check_close(&old, opts.force)?;
+        self.check_close(&old, opts.force)?;
         let reason = opts.reason.clone().filter(|r| !r.trim().is_empty());
         let outcome = opts.outcome.unwrap_or(Outcome::Done);
         let mut freed = self.mark_closed(&old, reason, outcome, false, claim_override)?;
@@ -959,6 +972,9 @@ impl WriteCtx<'_> {
                 }
             }
         }
+        // Someone else's work is named before anything `force` gets past.
+        let mut overrides =
+            self.check_removal_claims(&set, opts.take_over, &format!("deleting {}", ids_in.join(", ")))?;
         let mut detached: BTreeSet<String> = BTreeSet::new();
         {
             let mut stmt = self.conn().prepare_cached("SELECT issue_id FROM dependencies WHERE depends_on_id = ?1")?;
@@ -978,7 +994,7 @@ impl WriteCtx<'_> {
                 detached.iter().cloned().collect::<Vec<_>>().join(", ")
             )));
         }
-        let mut overrides = self.check_removal(&set, opts.force)?;
+        self.check_removal_gates(&set)?;
         let deleted: Vec<String> = set.iter().cloned().collect();
         let detached: Vec<String> = detached.into_iter().collect();
         if opts.dry_run {
@@ -1010,7 +1026,7 @@ impl WriteCtx<'_> {
 
     /// Delete `set` recording one summary event instead of a snapshot per
     /// issue (scratch work: purges and compactions). Edges from surviving
-    /// issues into the set are dropped; returns those survivors. `force`:
+    /// issues into the set are dropped; returns those survivors. `take_over`:
     /// despite other actors' live claims (listed in the event).
     pub(crate) fn delete_quietly(
         &mut self,
@@ -1018,12 +1034,17 @@ impl WriteCtx<'_> {
         op: &str,
         issue_id: Option<&str>,
         mut data: Value,
-        force: bool,
+        take_over: bool,
     ) -> Result<Vec<String>> {
         if set.is_empty() {
             return Ok(Vec::new());
         }
-        let overrides = self.check_removal(set, force)?;
+        let what = match issue_id {
+            Some(id) => format!("{op} {id}"),
+            None => op.to_string(),
+        };
+        let overrides = self.check_removal_claims(set, take_over, &what)?;
+        self.check_removal_gates(set)?;
         if !overrides.is_empty() {
             data["claim_overrides"] = json!(overrides);
         }

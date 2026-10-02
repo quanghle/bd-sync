@@ -6,9 +6,14 @@
 //! `lease.grace`, see [`crate::claims`]) is its holder's alone: ending or
 //! taking over one held by an actor other than the transaction's (releasing
 //! it, closing it, reassigning it or moving it out of `in_progress`, deleting
-//! it, also by discarding or compacting its run, or importing over it) needs
-//! that operation's `force`, and the override is recorded in its event
-//! (`claim_override`: the holder and the lease token). Any other actor name
+//! it, also by discarding or compacting its run, importing over it, or
+//! reclaiming it with a grace shorter than `lease.grace`) needs that
+//! operation's `take_over` (`--take-over`), and the override is recorded in
+//! its event (`claim_override`: the holder and the lease token). `force`
+//! never does: it only gets past structural refusals (open children,
+//! blockers, dependents, an unfinished run), and the claim is checked before
+//! those, so the first refusal names the holder (exit 4; one listing every
+//! holder when an operation would end several claims). Any other actor name
 //! counts, the holder's root actor (`alice` for `alice/agent-1`) and its
 //! siblings too: each sub-actor is its own lease holder. A claim past its
 //! grace is anyone's to reclaim, claim, close or release; reserving or
@@ -27,8 +32,8 @@
 //! * **Claims**: taking over another actor's live claim also needs
 //!   [`Policy::admin`], unless the policy's actor owns it (holds it itself,
 //!   or a sub-actor `<actor>/<agent>` does). A caller that may not take it
-//!   over is refused that way whether or not it passed `force` (except a
-//!   release or reassignment without `force`, which fails as before: not the
+//!   over is refused that way whether or not it passed `take_over` (except a
+//!   release or reassignment without it, which fails as before: not the
 //!   holder's).
 //! * **Human gates** need [`Policy::human`] to be opened (closed or pinned),
 //!   retyped, given another condition, or deleted while open, and for the
@@ -63,9 +68,9 @@ use crate::store::WriteCtx;
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Policy {
     /// The caller's own actor: claims held by it or its sub-actors
-    /// (`<actor>/<agent>`) are the caller's to take over (with `force`).
+    /// (`<actor>/<agent>`) are the caller's to take over (with `take_over`).
     pub actor: String,
-    /// May take over anyone's live claims (with `force`, like everyone).
+    /// May take over anyone's live claims (with `take_over`, like everyone).
     pub admin: bool,
     /// A person: may open human gates and move work past them.
     pub human: bool,
@@ -246,9 +251,11 @@ impl WriteCtx<'_> {
     }
 
     /// Ending or taking over `issue`'s claim. Another actor's live claim
-    /// needs `force` (and the policy's leave); returns the override to record
-    /// in the write's event, if it is one.
-    pub(crate) fn check_claim_override(&self, issue: &Issue, force: bool) -> Result<Option<Value>> {
+    /// needs `take_over` (and the policy's leave); returns the override to
+    /// record in the write's event, if it is one. Callers check this before
+    /// any refusal that `force` gets past, so that the first answer about
+    /// someone else's work names its holder.
+    pub(crate) fn check_claim_override(&self, issue: &Issue, take_over: bool) -> Result<Option<Value>> {
         let Some(LiveClaim { holder, lease }) = self.others_live_claim(issue)? else { return Ok(None) };
         if self.claim_limits().is_some_and(|p| !p.owns(&holder)) {
             return Err(Error::Unauthorized(format!(
@@ -256,18 +263,74 @@ impl WriteCtx<'_> {
                 issue.id
             )));
         }
-        if !force {
+        if !take_over {
             return Err(Error::NotOwner { id: issue.id.clone(), holder: Some(holder), actor: self.actor().into() });
         }
         Ok(Some(json!({ "holder": holder, "token": lease.map(|l| l.token) })))
     }
 
-    /// Closing `issue` (with `force`: despite blockers, open children, or
-    /// another actor's live claim). Returns the claim override, if any.
-    pub(crate) fn check_close(&self, issue: &Issue, force: bool) -> Result<Option<Value>> {
-        let claim_override = self.check_claim_override(issue, force)?;
+    /// [`Self::check_claim_override`] for every issue `what` (an operation,
+    /// e.g. "discarding t-1") would end at once: without `take_over`, one
+    /// refusal lists every live claim of another actor among them. Returns
+    /// the overrides by issue id.
+    pub(crate) fn check_claim_overrides(
+        &self,
+        issues: impl IntoIterator<Item = Issue>,
+        take_over: bool,
+        what: &str,
+    ) -> Result<BTreeMap<String, Value>> {
+        let mut overrides = BTreeMap::new();
+        let mut held = Vec::new();
+        for issue in issues {
+            match self.check_claim_override(&issue, take_over) {
+                Ok(Some(o)) => {
+                    overrides.insert(issue.id, o);
+                }
+                Ok(None) => {}
+                Err(Error::NotOwner { id, holder, .. }) => held.push((id, holder.unwrap_or_default())),
+                Err(e) => return Err(e),
+            }
+        }
+        match held.len() {
+            0 => Ok(overrides),
+            1 => {
+                let (id, holder) = held.remove(0);
+                Err(Error::NotOwner { id, holder: Some(holder), actor: self.actor().into() })
+            }
+            _ => Err(Error::ClaimsHeld { what: what.to_string(), held }),
+        }
+    }
+
+    /// Refuse, up front, ending the claims of `ids` when other actors hold
+    /// live claims on any of them and `take_over` is not set, listing them
+    /// all (e.g. `bd close A B`, before the first close is refused alone).
+    pub fn check_take_over(&self, ids: &[String], take_over: bool, what: &str) -> Result<()> {
+        self.check_claim_overrides(self.held_by_others(ids)?, take_over, what).map(|_| ())
+    }
+
+    /// Of `ids`, the `in_progress` issues assigned to an actor other than
+    /// this transaction's: the only ones whose claims may need a takeover.
+    fn held_by_others<'a>(&self, ids: impl IntoIterator<Item = &'a String>) -> Result<Vec<Issue>> {
+        let mut out = Vec::new();
+        for id in ids {
+            let held: bool = self
+                .conn()
+                .prepare_cached(
+                    "SELECT EXISTS (SELECT 1 FROM issues WHERE id = ?1 AND status = 'in_progress' AND assignee IS NOT ?2)",
+                )?
+                .query_row(params![id, self.actor()], |r| r.get(0))?;
+            if held {
+                out.extend(issues::get(self.conn(), id)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Closing `issue` past human gates (with `force`: despite blockers or
+    /// open children). Claims are checked first, by the caller.
+    pub(crate) fn check_close(&self, issue: &Issue, force: bool) -> Result<()> {
         if !self.gates_limited() {
-            return Ok(claim_override);
+            return Ok(());
         }
         if is_open_human_gate(issue) {
             return Err(human_only(&issue.id, &Hold::Is, "open it"));
@@ -278,7 +341,7 @@ impl WriteCtx<'_> {
                 return Err(human_only(&issue.id, &hold, "close it"));
             }
         }
-        Ok(claim_override)
+        Ok(())
     }
 
     /// Updating `old` to `new`, moving it out from under `moved_from` (its
@@ -290,12 +353,12 @@ impl WriteCtx<'_> {
         new: &Issue,
         moved_from: Option<&str>,
         playbook: bool,
-        force: bool,
+        take_over: bool,
     ) -> Result<Option<Value>> {
         let claimed = old.status == Status::InProgress;
         let mut claim_override = None;
         if claimed && (new.status != Status::InProgress || new.assignee != old.assignee) {
-            claim_override = self.check_claim_override(old, force)?;
+            claim_override = self.check_claim_override(old, take_over)?;
         }
         if self.gates_limited() && !old.status.is_terminal() {
             if is_open_human_gate(old) && !is_open_human_gate(new) {
@@ -363,39 +426,30 @@ impl WriteCtx<'_> {
         self.check_move_out(&issues::require(self.conn(), issue)?, target)
     }
 
-    /// Deleting every issue in `ids` at once (with `force`: despite other
-    /// actors' live claims). Returns the claim overrides by issue id.
-    pub(crate) fn check_removal<'a>(
+    /// Ending the claims of every issue in `ids`, deleted at once (with
+    /// `take_over`: despite other actors' live claims). Returns the claim
+    /// overrides by issue id.
+    pub(crate) fn check_removal_claims<'a>(
         &self,
         ids: impl IntoIterator<Item = &'a String>,
-        force: bool,
+        take_over: bool,
+        what: &str,
     ) -> Result<BTreeMap<String, Value>> {
-        let gates = self.gates_limited();
-        let mut overrides = BTreeMap::new();
+        self.check_claim_overrides(self.held_by_others(ids)?, take_over, what)
+    }
+
+    /// Deleting every issue in `ids` at once past human gates.
+    pub(crate) fn check_removal_gates<'a>(&self, ids: impl IntoIterator<Item = &'a String>) -> Result<()> {
+        if !self.gates_limited() {
+            return Ok(());
+        }
         for id in ids {
-            // Only another actor's claim can stand in the way, unless gates are protected.
-            if !gates {
-                let held: bool = self
-                    .conn()
-                    .prepare_cached(
-                        "SELECT EXISTS (SELECT 1 FROM issues WHERE id = ?1 AND status = 'in_progress' AND assignee IS NOT ?2)",
-                    )?
-                    .query_row(params![id, self.actor()], |r| r.get(0))?;
-                if !held {
-                    continue;
-                }
-            }
             let Some(issue) = issues::get(self.conn(), id)? else { continue };
-            if let Some(o) = self.check_claim_override(&issue, force)? {
-                overrides.insert(id.clone(), o);
-            }
-            if gates {
-                if let Some(hold) = human_hold(self.conn(), &issue)? {
-                    return Err(human_only(id, &hold, "delete it"));
-                }
+            if let Some(hold) = human_hold(self.conn(), &issue)? {
+                return Err(human_only(id, &hold, "delete it"));
             }
         }
-        Ok(overrides)
+        Ok(())
     }
 
     /// Refuse an import changing `old`'s `metadata.playbook` (see [`check_playbook_metadata`]).

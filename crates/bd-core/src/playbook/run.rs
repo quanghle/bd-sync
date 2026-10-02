@@ -157,8 +157,24 @@ pub struct RunsQuery {
 pub struct CompactOptions {
     /// Your own summary, written above the generated digest.
     pub summary: Option<String>,
-    /// Compact even though the run is not finished.
+    /// Compact even though the run is not finished. Never past another
+    /// actor's live claim on a step: that is `take_over`.
     pub force: bool,
+    /// Delete steps other actors hold live claims on (recorded in the
+    /// `run_compacted` event; see [`crate::policy`]).
+    pub take_over: bool,
+    pub dry_run: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DiscardOptions {
+    /// Discard even though the run has work in progress (the caller's own
+    /// claims, or dead ones). Never past another actor's live claim on the
+    /// run or a step: that is `take_over`.
+    pub force: bool,
+    /// Delete the run although other actors hold live claims on it or its
+    /// steps (recorded in each `deleted` event; see [`crate::policy`]).
+    pub take_over: bool,
     pub dry_run: bool,
 }
 
@@ -522,6 +538,10 @@ impl WriteCtx<'_> {
         if tree.is_empty() {
             return Err(Error::invalid(format!("{run} has nothing to compact")));
         }
+        // The steps are deleted (the run issue is kept): someone else's claims
+        // among them are named before anything `force` gets past.
+        let steps = tree.iter().map(|(_, i)| i.clone());
+        self.check_claim_overrides(steps, opts.take_over, &format!("compacting {run}"))?;
         let live: Vec<&str> =
             tree.iter().filter(|(_, i)| !i.status.is_terminal()).map(|(_, i)| i.id.as_str()).collect();
         if (!live.is_empty() || !root.status.is_terminal()) && !opts.force {
@@ -547,29 +567,33 @@ impl WriteCtx<'_> {
             set_metadata: vec![("playbook".into(), pb)],
             ..Default::default()
         };
-        self.update_issue_as(run, &patch, &Guard::default(), true, true)?;
+        self.update_issue_as(run, &patch, &Guard::default(), false, true)?;
         let set: BTreeSet<String> = removed.iter().cloned().collect();
-        self.delete_quietly(&set, "run_compacted", Some(run), json!({}), opts.force)?;
+        self.delete_quietly(&set, "run_compacted", Some(run), json!({}), opts.take_over)?;
         Ok(CompactOutcome { run: issues::require(self.conn(), run)?, removed, digest, dry_run: false })
     }
 
     /// Delete a run and every issue in it.
-    pub fn discard_run(&mut self, run: &str, force: bool, dry_run: bool) -> Result<DeleteOutcome> {
-        require_run(self.conn(), run)?;
-        let mut ids = vec![run.to_string()];
-        let mut active = Vec::new();
-        for (_, i) in walk(self.conn(), run)? {
-            if i.status == Status::InProgress {
-                active.push(format!("{} (@{})", i.id, i.assignee.clone().unwrap_or_default()));
-            }
-            ids.push(i.id);
-        }
-        if !active.is_empty() && !force {
+    pub fn discard_run(&mut self, run: &str, opts: &DiscardOptions) -> Result<DeleteOutcome> {
+        let root = require_run(self.conn(), run)?;
+        let all: Vec<Issue> =
+            std::iter::once(root).chain(walk(self.conn(), run)?.into_iter().map(|(_, i)| i)).collect();
+        // Other actors' live claims, on the run itself or a step, come first.
+        let taken = self.check_claim_overrides(all.iter().cloned(), opts.take_over, &format!("discarding {run}"))?;
+        let active: Vec<String> = all
+            .iter()
+            .filter(|i| i.status == Status::InProgress && !taken.contains_key(&i.id))
+            .map(|i| format!("{} (@{})", i.id, i.assignee.clone().unwrap_or_default()))
+            .collect();
+        if !active.is_empty() && !opts.force {
             return Err(Error::Refused(format!(
                 "{run} has work in progress: {}; release it or pass --force",
                 active.join(", ")
             )));
         }
-        self.delete_issues(&ids, &DeleteOptions { cascade: false, force: true, dry_run })
+        let ids: Vec<String> = all.into_iter().map(|i| i.id).collect();
+        // `force` here only drops edges from outside the run; claims keep the caller's answer.
+        let delete = DeleteOptions { cascade: false, force: true, take_over: opts.take_over, dry_run: opts.dry_run };
+        self.delete_issues(&ids, &delete)
     }
 }

@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use bd_core::doctor;
 use bd_core::gates::{self, GateKind, GatePhase, GateSpec, NewGate, Verdict};
-use bd_core::playbook::{self, CompactOptions, Loader, Plan, Role, RunRequest, StartOptions, StepState};
+use bd_core::playbook::{
+    self, CompactOptions, DiscardOptions, Loader, Plan, Role, RunRequest, StartOptions, StepState,
+};
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::*;
 use serde_json::json;
@@ -389,13 +391,16 @@ fn compact_folds_a_finished_run_and_discard_removes_one() {
 
     let other = env.start(RELEASE, &[("version", "2.0.0")]);
     env.store.write("claim", "bob", |tx| tx.claim(&format!("{other}.bump"), &ClaimOptions::default())).unwrap();
-    let err = env.store.write("discard", "a", |tx| tx.discard_run(&other, false, false)).unwrap_err();
-    assert!(err.to_string().contains("in progress"), "{err}");
-    let gone = env.store.write("discard", "a", |tx| tx.discard_run(&other, true, false)).unwrap();
+    let opts = |force: bool, take_over: bool| DiscardOptions { force, take_over, dry_run: false };
+    for o in [opts(false, false), opts(true, false)] {
+        let err = env.store.write("discard", "a", |tx| tx.discard_run(&other, &o)).unwrap_err();
+        assert!(err.to_string().contains("held by bob"), "{err}");
+    }
+    let gone = env.store.write("discard", "a", |tx| tx.discard_run(&other, &opts(false, true))).unwrap();
     assert_eq!(gone.deleted.len(), 4);
-    let err = env.store.write("discard", "a", |tx| tx.discard_run("t-1.cleanup", false, false));
+    let err = env.store.write("discard", "a", |tx| tx.discard_run("t-1.cleanup", &opts(false, false)));
     assert!(err.is_err(), "only runs can be discarded");
-    let compacted = env.store.write("discard", "a", |tx| tx.discard_run(&run, false, false)).unwrap();
+    let compacted = env.store.write("discard", "a", |tx| tx.discard_run(&run, &opts(false, false))).unwrap();
     assert_eq!(compacted.deleted, vec![run.clone()]);
     env.assert_healthy();
 }

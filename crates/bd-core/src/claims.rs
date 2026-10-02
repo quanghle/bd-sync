@@ -14,17 +14,19 @@
 //! not been expired for `lease.grace`. A live claim is its holder's alone: a
 //! second claim of it fails even for the same actor, unless it passes the
 //! lease's token (an idempotent renew), and ending or taking it over needs
-//! `force` (see [`crate::policy`]). A claim past that point is anyone's to
+//! `take_over` (see [`crate::policy`]); so does reclaiming it early, with a
+//! grace shorter than `lease.grace`. A claim past that point is anyone's to
 //! reclaim, claim, close or release.
 //!
 //! Invariant (checked by `doctor`): a lease row exists iff its issue is
 //! `in_progress`, and the lease holder equals the issue's assignee.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::config;
 use crate::error::{Error, Result};
@@ -33,7 +35,7 @@ use crate::issues;
 use crate::model::{GATE_TYPE, Guard, Issue, Lease, ReadyQuery, Status, WorkFilter};
 use crate::ready;
 use crate::store::WriteCtx;
-use crate::time::{Timestamp, duration_ms};
+use crate::time::{Timestamp, duration_ms, format_duration_ms};
 
 const LEASE_COLUMNS: &str = "issue_id, holder, token, granted_at, expires_at, heartbeat_at, renewals";
 
@@ -144,10 +146,10 @@ pub struct Claim {
 #[derive(Clone, Debug, Default)]
 pub struct ReleaseOptions {
     pub reason: Option<String>,
-    /// Release another actor's claim or assignment (a live claim's takeover
-    /// is recorded in the `released` event; through `bd serve` it also needs
-    /// an admin token unless the caller's token owns it).
-    pub force: bool,
+    /// Release another actor's live claim or assignment (a live claim's
+    /// takeover is recorded in the `released` event; through `bd serve` it
+    /// also needs an admin token unless the caller's token owns it).
+    pub take_over: bool,
     pub guard: Guard,
     pub token: Option<i64>,
 }
@@ -155,9 +157,14 @@ pub struct ReleaseOptions {
 #[derive(Clone, Debug, Default)]
 pub struct ReclaimOptions {
     /// How long past expiry a lease must be; defaults to `lease.grace`.
+    /// Shorter, it may end claims that are still live: other actors' need
+    /// `take_over`.
     pub grace: Option<Duration>,
     pub filter: WorkFilter,
     pub dry_run: bool,
+    /// Reclaim other actors' leases inside `lease.grace` (a takeover,
+    /// recorded in each `reclaimed` event; see [`crate::policy`]).
+    pub take_over: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -377,13 +384,13 @@ impl WriteCtx<'_> {
         let claimed = issue.status == Status::InProgress;
         // Assignments and live claims are their holder's to give up; a dead
         // claim is anyone's, as for `reclaim`.
-        if holder != actor && !opts.force && (!claimed || self.others_live_claim(&issue)?.is_some()) {
+        if holder != actor && !opts.take_over && (!claimed || self.others_live_claim(&issue)?.is_some()) {
             return Err(Error::NotOwner { id: id.to_string(), holder: Some(holder), actor });
         }
         if let Some(t) = opts.token {
             check_token(self.conn(), id, &actor, t)?;
         }
-        let claim_override = if claimed { self.check_claim_override(&issue, opts.force)? } else { None };
+        let claim_override = if claimed { self.check_claim_override(&issue, opts.take_over)? } else { None };
         let (status, started_at) =
             if issue.status == Status::InProgress { (Status::Open, None) } else { (issue.status, issue.started_at) };
         self.conn()
@@ -411,12 +418,12 @@ impl WriteCtx<'_> {
     }
 
     /// Crash recovery: revert in-progress issues whose lease expired at least
-    /// `grace` ago back to `open`, clearing the assignee.
+    /// `grace` ago back to `open`, clearing the assignee. A grace shorter than
+    /// `lease.grace` reaches claims that are still live: other actors' are
+    /// taken over only with `opts.take_over` (and the policy's leave).
     pub fn reclaim_expired(&mut self, opts: &ReclaimOptions) -> Result<Vec<Reclaimed>> {
-        let grace = match opts.grace {
-            Some(g) => g,
-            None => config::lease_grace(self.conn())?,
-        };
+        let lease_grace = config::lease_grace(self.conn())?;
+        let grace = opts.grace.unwrap_or(lease_grace);
         let now = self.now();
         let cutoff = now.minus(grace);
         let mut parts = QueryParts::default();
@@ -441,11 +448,23 @@ impl WriteCtx<'_> {
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
+        let mut overrides = BTreeMap::new();
+        if grace < lease_grace {
+            let mut held = Vec::new();
+            for r in &stale {
+                held.extend(issues::get(self.conn(), &r.issue_id)?);
+            }
+            let what = format!(
+                "reclaiming leases expired less than lease.grace ({}) ago",
+                format_duration_ms(duration_ms(lease_grace))
+            );
+            overrides = self.check_claim_overrides(held, opts.take_over, &what)?;
+        }
         if opts.dry_run {
             return Ok(stale);
         }
         for r in &stale {
-            self.revert_reclaimed(r, grace)?;
+            self.revert_reclaimed(r, grace, overrides.remove(&r.issue_id))?;
         }
         Ok(stale)
     }
@@ -459,11 +478,12 @@ impl WriteCtx<'_> {
             expired_at: lease.expires_at,
             heartbeat_at: lease.heartbeat_at,
         };
-        self.revert_reclaimed(&r, grace)?;
+        self.revert_reclaimed(&r, grace, None)?;
         Ok(r)
     }
 
-    fn revert_reclaimed(&mut self, r: &Reclaimed, grace: Duration) -> Result<()> {
+    /// `claim_override`: the live claim this ended (a reclaim inside `lease.grace`).
+    fn revert_reclaimed(&mut self, r: &Reclaimed, grace: Duration, claim_override: Option<Value>) -> Result<()> {
         delete_lease(self.conn(), &r.issue_id)?;
         self.conn()
             .prepare_cached(
@@ -472,17 +492,17 @@ impl WriteCtx<'_> {
                  WHERE id = ?2 AND status = 'in_progress'",
             )?
             .execute(params![self.now(), r.issue_id])?;
-        self.emit(
-            "reclaimed",
-            Some(&r.issue_id),
-            json!({
-                "previous_holder": r.previous_holder,
-                "token": r.token,
-                "expired_at": r.expired_at,
-                "last_heartbeat_at": r.heartbeat_at,
-                "grace_ms": duration_ms(grace),
-            }),
-        )?;
+        let mut data = json!({
+            "previous_holder": r.previous_holder,
+            "token": r.token,
+            "expired_at": r.expired_at,
+            "last_heartbeat_at": r.heartbeat_at,
+            "grace_ms": duration_ms(grace),
+        });
+        if let Some(o) = claim_override {
+            data["claim_override"] = o;
+        }
+        self.emit("reclaimed", Some(&r.issue_id), data)?;
         self.bump_counter("reclaims", 1)
     }
 }

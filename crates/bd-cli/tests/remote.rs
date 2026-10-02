@@ -2118,26 +2118,34 @@ fn force_takeovers_need_an_admin_token() {
 
     alice.ok(&["create", "Contended"]);
     check(bob_as("bob/w1", &["claim", "t-1"]), "bob/w1 claims");
-    assert_eq!(alice.code(&["release", "t-1"]), 4, "without --force: not the owner, as before");
+    assert_eq!(alice.code(&["release", "t-1"]), 4, "without --take-over: not the owner, as before");
+    assert_eq!(alice.code(&["release", "t-1", "--if-assignee", "bob/w1"]), 4, "a guard is not a takeover");
     assert_eq!(alice.code(&["update", "t-1", "--assignee", "alice"]), 4, "already claimed, as before");
+    // A token that may not take it over is told so (7), with or without --take-over (--force on
+    // release and update is its older alias).
     for args in [
         &["release", "t-1", "--force"][..],
-        &["release", "t-1", "--if-assignee", "bob/w1"],
+        &["release", "t-1", "--take-over"],
+        &["release", "t-1", "--if-assignee", "bob/w1", "--take-over"],
         &["update", "t-1", "--assignee", "alice", "--force"],
+        &["update", "t-1", "--assignee", "alice", "--take-over"],
         &["update", "t-1", "--status", "open"],
         &["close", "t-1"],
+        &["close", "t-1", "--force"],
+        &["close", "t-1", "--take-over"],
         &["delete", "t-1"],
+        &["delete", "t-1", "--take-over"],
     ] {
         let out = alice.run(args);
         assert_eq!(out.status.code(), Some(7), "bd {args:?}: {}", stderr_of(&out));
         assert!(stderr_of(&out).contains("claimed by bob/w1"), "{}", stderr_of(&out));
     }
-    assert_eq!(alice.with_stdin(&["batch"], "release t-1 --force\n").status.code(), Some(7));
+    assert_eq!(alice.with_stdin(&["batch"], "release t-1 --take-over\n").status.code(), Some(7));
     assert_eq!(alice.json(&["show", "t-1"])["assignee"], "bob/w1", "still bob's");
     alice.ok(&["comment", "add", "t-1", "how is it going?"]);
 
     // The token's other agents may take over its own claims.
-    check(bob_as("bob/w2", &["update", "t-1", "--assignee", "bob/w2", "--force"]), "sub-actor takeover");
+    check(bob_as("bob/w2", &["update", "t-1", "--assignee", "bob/w2", "--take-over"]), "sub-actor takeover");
     // An admin token may take over anyone's.
     ops.ok(&["update", "t-1", "--assignee", "ops", "--force"]);
     assert_eq!(alice.json(&["show", "t-1"])["assignee"], "ops");
@@ -2147,21 +2155,28 @@ fn force_takeovers_need_an_admin_token() {
 }
 
 #[test]
-fn takeovers_need_force_whatever_the_token() {
+fn takeovers_need_take_over_whatever_the_token() {
     let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
     let bob = server.client(&server.token("bob-laptop", "bob", &[]));
     let ops = server.client(&server.token("ops", "ops", &["--role", "admin"]));
     let bob_as = |agent: &str, args: &[&str]| bob.cmd(args).env("BD_ACTOR", agent).output().unwrap();
 
-    for _ in 0..4 {
+    for _ in 0..5 {
         bob.ok(&["create", "Task"]);
     }
     for n in 1..=4 {
         check(bob_as("bob/w1", &["claim", &format!("t-{n}")]), "bob/w1 claims");
     }
     // An admin token, the token's root actor and a sibling agent may take it over, but only
-    // with --force: without it, exit 4 as locally, alone or in a batch.
-    for args in [&["close", "t-1"][..], &["update", "t-1", "--status", "open"], &["delete", "t-1"]] {
+    // with --take-over: without it (--force or not), exit 4 as locally, alone or in a batch.
+    for args in [
+        &["close", "t-1"][..],
+        &["close", "t-1", "--force"],
+        &["update", "t-1", "--status", "open"],
+        &["delete", "t-1"],
+        &["delete", "t-1", "--force"],
+    ] {
         assert_eq!(ops.code(args), 4, "admin: bd {args:?}");
         assert_eq!(bob.code(args), 4, "root actor: bd {args:?}");
         let out = bob_as("bob/w2", args);
@@ -2170,9 +2185,9 @@ fn takeovers_need_force_whatever_the_token() {
     }
     assert_eq!(ops.with_stdin(&["batch"], "close t-1\n").status.code(), Some(4));
     assert_eq!(bob.json(&["show", "t-1"])["assignee"], "bob/w1");
-    ops.ok(&["close", "t-1", "--force"]);
-    check(bob_as("bob", &["update", "t-2", "--status", "open", "--force"]), "root actor --force");
-    check(bob_as("bob/w2", &["delete", "t-3", "--force"]), "sibling --force");
+    ops.ok(&["close", "t-1", "--take-over"]);
+    check(bob_as("bob", &["update", "t-2", "--status", "open", "--take-over"]), "root actor --take-over");
+    check(bob_as("bob/w2", &["delete", "t-3", "--take-over"]), "sibling --take-over");
     let history = bob.json(&["history", "t-1"]);
     let closed = history.as_array().unwrap().iter().rev().find(|e| e["op"] == "closed").unwrap();
     assert_eq!(
@@ -2186,6 +2201,20 @@ fn takeovers_need_force_whatever_the_token() {
     let token = bob.json(&["show", "t-4"])["lease"]["token"].as_i64().unwrap().to_string();
     check(bob_as("bob/w1", &["claim", "t-4", "--token", &token]), "renew with the token");
     check(bob_as("bob/w1", &["close", "t-4"]), "the holder closes its own claim");
+
+    // Reclaiming a lease inside lease.grace (a shorter --grace) is a takeover too.
+    check(bob_as("bob/w1", &["claim", "t-5", "--ttl", "1s"]), "a short lease");
+    std::thread::sleep(Duration::from_millis(1100));
+    for args in [&["reclaim", "--grace", "0s"][..], &["reclaim", "--grace", "0s", "--take-over"]] {
+        assert_eq!(alice.code(args), 7, "another token: bd {args:?}");
+    }
+    let out = bob_as("bob/w2", &["reclaim", "--grace", "0s"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr_of(&out));
+    assert!(alice.json(&["reclaim"]).as_array().unwrap().is_empty(), "the configured grace takes nothing");
+    check(bob_as("bob/w2", &["reclaim", "--grace", "0s", "--take-over"]), "the token's own agent, --take-over");
+    let history = bob.json(&["history", "t-5"]);
+    let reclaimed = history.as_array().unwrap().iter().rev().find(|e| e["op"] == "reclaimed").unwrap();
+    assert_eq!(reclaimed["data"]["claim_override"]["holder"], "bob/w1");
 }
 
 /// A stand-in for `gh pr view` that reports PR 42 merged and appends its

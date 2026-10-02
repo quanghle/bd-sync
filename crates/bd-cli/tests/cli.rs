@@ -218,7 +218,8 @@ fn crash_recovery_via_reclaim() {
     let out = ws.run_as("crashy", &["--json", "claim", "t-1", "--ttl", "1s"]);
     assert!(out.status.success());
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    let reclaimed = ws.json(&["reclaim", "--grace", "0s"]);
+    // Sooner than lease.grace, the claim is still live: reclaiming it is a takeover.
+    let reclaimed = ws.json(&["reclaim", "--grace", "0s", "--take-over"]);
     assert_eq!(reclaimed[0]["issue_id"], "t-1");
     assert_eq!(reclaimed[0]["previous_holder"], "crashy");
     assert_eq!(ws.code_as("crashy", &["heartbeat", "t-1"]), 4, "zombie learns it lost the lease");
@@ -289,14 +290,18 @@ fn live_claims_are_protected_from_other_actors() {
     }
     // Another actor, the holder's root actor, and a sibling sub-actor are all refused (exit 4)
     // anything that ends or takes over the claim, alone or in a batch (which rolls back whole).
+    // --force (open children, blockers, dependents) changes nothing.
     for actor in ["bob", "ann", "ann/s2"] {
         for args in [
             &["close", "t-1"][..],
+            &["close", "t-1", "--force"],
             &["close", "t-1", "--token", &tokens[1]],
             &["update", "t-1", "--status", "open"],
             &["update", "t-1", "--assignee", actor],
             &["delete", "t-1"],
+            &["delete", "t-1", "--force", "--cascade"],
             &["release", "t-1"],
+            &["release", "t-1", "--if-assignee", "ann/s1"],
             &["claim", "t-1"],
         ] {
             assert_eq!(ws.code_as(actor, args), 4, "bd {args:?} as {actor}");
@@ -307,19 +312,21 @@ fn live_claims_are_protected_from_other_actors() {
     }
     let out = ws.run_as("bob", &["close", "t-1"]);
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("t-1 is held by ann/s1, not bob") && err.contains("--force"), "{err}");
+    assert!(err.contains("t-1 is held by ann/s1, not bob") && err.contains("--take-over"), "{err}");
+    assert!(!err.contains("bd reclaim"), "no workaround is suggested: {err}");
     assert!(ws.json(&["comments", "t-1"]).as_array().unwrap().is_empty(), "every batch rolled back");
     let shown = ws.json(&["show", "t-1"]);
     assert_eq!((shown["status"].as_str(), shown["assignee"].as_str()), (Some("in_progress"), Some("ann/s1")));
     assert_eq!(shown["lease"]["token"].as_i64().unwrap().to_string(), tokens[1]);
     ws.json_as("bob", &["update", "t-1", "--add-label", "seen", "--notes", "looked at it"]);
 
-    // With --force each goes through, and the event history records the claim it ended.
-    ws.json_as("bob", &["close", "t-1", "--force", "--reason", "superseded"]);
-    ws.json_as("ann", &["update", "t-2", "--status", "open", "--force"]);
+    // With --take-over each goes through, and the event history records the claim it ended.
+    // (On update and release, where it never meant anything else, --force is an alias.)
+    ws.json_as("bob", &["close", "t-1", "--take-over", "--reason", "superseded"]);
+    ws.json_as("ann", &["update", "t-2", "--status", "open", "--take-over"]);
     ws.json_as("ann/s2", &["update", "t-3", "--assignee", "ann/s2", "--force"]);
-    ws.json_as("bob", &["release", "t-4", "--force"]);
-    let out = ws.batch_as("bob", "delete t-5 --force\n");
+    ws.json_as("bob", &["release", "t-4", "--if-assignee", "ann/s1", "--take-over"]);
+    let out = ws.batch_as("bob", "delete t-5 --take-over\n");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     for (n, op) in [(1, "closed"), (2, "updated"), (3, "updated"), (4, "released"), (5, "deleted")] {
         let data = ws.last_event(op, &format!("t-{n}"));
@@ -327,7 +334,7 @@ fn live_claims_are_protected_from_other_actors() {
         assert_eq!(data["claim_override"], expected, "t-{n} {op}: {data}");
     }
     assert_eq!(ws.json(&["show", "t-3"])["lease"]["holder"], "ann/s2", "the lease follows the takeover");
-    // The holder itself needs neither --force nor its token.
+    // The holder itself needs neither --take-over nor its token.
     ws.json_as("ann/s1", &["close", "t-6"]);
     assert!(ws.last_event("closed", "t-6").get("claim_override").is_none());
     assert_eq!(ws.code_as("tester", &["doctor"]), 0);
@@ -344,7 +351,7 @@ fn dead_claims_are_anyones() {
         ws.json_as("crashy", &["claim", &format!("t-{n}"), "--ttl", "1s"]);
     }
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    // A claim `bd reclaim` would take back is reclaimed by a claim, and closed or released without --force.
+    // A claim `bd reclaim` would take back is reclaimed by a claim, and closed or released without --take-over.
     let c = ws.json_as("tester", &["claim", "t-1"]);
     assert_eq!(
         (c["issue"]["assignee"].as_str(), c["reclaimed"]["previous_holder"].as_str()),
@@ -358,7 +365,7 @@ fn dead_claims_are_anyones() {
 }
 
 #[test]
-fn imports_take_over_live_claims_only_with_force() {
+fn imports_take_over_live_claims_only_with_take_over() {
     let ws = Ws::new();
     ws.ok(&["create", "Task"]);
     let before = ws.dir.path().join("before.jsonl");
@@ -367,12 +374,103 @@ fn imports_take_over_live_claims_only_with_force() {
     // The export from before the claim would put the issue back to open.
     assert_eq!(ws.code_as("bob", &["import", before.to_str().unwrap()]), 4);
     assert_eq!(ws.json(&["show", "t-1"])["assignee"], "ann");
-    ws.json_as("bob", &["import", before.to_str().unwrap(), "--force"]);
+    ws.json_as("bob", &["import", before.to_str().unwrap(), "--take-over"]);
     assert_eq!(ws.json(&["show", "t-1"])["status"], "open");
     assert_eq!(
         ws.last_event("imported", "t-1")["claim_override"],
         serde_json::json!({ "holder": "ann", "token": token })
     );
+}
+
+/// Exit code and stderr of `bd args` as `actor`.
+fn refusal(ws: &Ws, actor: &str, args: &[&str]) -> (i32, String) {
+    let out = ws.run_as(actor, args);
+    (out.status.code().unwrap(), String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// The incident: --force, passed to get past open children, blockers, dependents or an
+/// unfinished run, used to take over the claim too. Now the claim is named first, and
+/// only --take-over takes it over.
+#[test]
+fn force_never_takes_over_a_claim() {
+    let ws = Ws::new();
+    let epic = ws.id(&["create", "Epic", "-t", "epic"]);
+    let child = ws.id(&["create", "Child", "--parent", &epic]);
+    ws.json_as("worker", &["claim", &epic, "--allow-blocked"]);
+    for args in [&["close", epic.as_str()][..], &["close", epic.as_str(), "--force"]] {
+        let (code, err) = refusal(&ws, "coord", args);
+        assert_eq!(code, 4, "bd {args:?}: {err}");
+        assert!(err.contains(&format!("{epic} is held by worker, not coord")), "{err}");
+    }
+    let (code, err) = refusal(&ws, "coord", &["close", &epic, "--take-over"]);
+    assert!(code == 2 && err.contains("open child"), "--take-over is not --force: {err}");
+    ws.json_as("coord", &["close", &epic, "--force", "--take-over"]);
+    assert_eq!(ws.last_event("closed", &epic)["claim_override"]["holder"], "worker");
+    assert_eq!(ws.json(&["show", &child])["status"], "open");
+
+    // Several ids: every claim of another actor is named before anything else happens.
+    let free = ws.id(&["create", "Free"]);
+    let mine = ws.id(&["create", "Worker's"]);
+    let theirs = ws.id(&["create", "Other's"]);
+    ws.json_as("worker", &["claim", &mine]);
+    ws.json_as("other", &["claim", &theirs]);
+    let (code, err) = refusal(&ws, "coord", &["close", &free, &mine, "--force"]);
+    assert!(code == 4 && err.contains(&format!("{mine} is held by worker")), "{err}");
+    let (code, err) = refusal(&ws, "coord", &["close", &free, &mine, &theirs]);
+    assert_eq!(code, 4, "{err}");
+    assert!(
+        err.contains(&format!("{mine} (held by worker)")) && err.contains(&format!("{theirs} (held by other)")),
+        "{err}"
+    );
+    assert_eq!(ws.json(&["show", &free])["status"], "open", "nothing closed");
+
+    // Deleting past dependents (--force, --cascade) is not deleting past a claim.
+    let after = ws.id(&["create", "After", "--dep", &mine]);
+    for args in [&["delete", mine.as_str(), "--force"][..], &["delete", mine.as_str(), "--cascade"]] {
+        let (code, err) = refusal(&ws, "coord", args);
+        assert!(code == 4 && err.contains("held by worker"), "bd {args:?}: {err}");
+    }
+    ws.json_as("coord", &["delete", &mine, "--force", "--take-over"]);
+    assert_eq!(ws.last_event("deleted", &mine)["claim_override"]["holder"], "worker");
+    assert_eq!(ws.json(&["show", &after])["is_blocked"], false);
+
+    // An unfinished run (--force) with claimed steps (--take-over), listed with their holders.
+    ws.playbook("two", "[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\n");
+    let run = ws.json(&["playbook", "run", "two"])["run"]["id"].as_str().unwrap().to_string();
+    let (a, b) = (format!("{run}.a"), format!("{run}.b"));
+    ws.json_as("worker", &["claim", &a]);
+    ws.json_as("other", &["claim", &b]);
+    for args in
+        [&["playbook", "compact", run.as_str(), "--force"][..], &["playbook", "discard", run.as_str(), "--force"]]
+    {
+        let (code, err) = refusal(&ws, "coord", args);
+        assert_eq!(code, 4, "bd {args:?}: {err}");
+        assert!(
+            err.contains(&format!("{a} (held by worker)")) && err.contains(&format!("{b} (held by other)")),
+            "{err}"
+        );
+    }
+    ws.json_as("coord", &["playbook", "discard", &run, "--take-over"]);
+    assert_eq!(ws.last_event("deleted", &a)["claim_override"]["holder"], "worker");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn reclaiming_a_live_claim_early_is_a_takeover() {
+    let ws = Ws::new();
+    let id = ws.id(&["create", "Slow"]);
+    ws.json_as("worker", &["claim", &id, "--ttl", "1s"]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // Expired, but inside lease.grace (10m): the worker may still heartbeat.
+    assert_eq!(refusal(&ws, "coord", &["close", &id]).0, 4);
+    assert!(ws.json_as("coord", &["reclaim"]).as_array().unwrap().is_empty(), "the configured grace");
+    let (code, err) = refusal(&ws, "coord", &["reclaim", "--grace", "0s"]);
+    assert!(code == 4 && err.contains(&format!("{id} is held by worker")), "{err}");
+    assert_eq!(ws.json(&["show", &id])["assignee"], "worker");
+    let r = ws.json_as("coord", &["reclaim", "--grace", "0s", "--take-over"]);
+    assert_eq!(r[0]["issue_id"], id.as_str());
+    assert_eq!(ws.last_event("reclaimed", &id)["claim_override"]["holder"], "worker");
+    assert_eq!(ws.code_as("worker", &["heartbeat", &id]), 4, "the worker learns it lost the lease");
 }
 
 #[test]
@@ -383,8 +481,12 @@ fn a_run_claimed_by_another_actor_stays_open_when_its_last_step_closes() {
     let (a, b) = (format!("{run}.a"), format!("{run}.b"));
     ws.json_as("coordinator", &["claim", &run]);
     ws.json_as("worker", &["claim", &a]);
-    // Discarding the run would end the worker's claim: --force (as before for work in progress).
-    assert_eq!(ws.code_as("coordinator", &["playbook", "discard", &run]), 2);
+    // Discarding the run would end the worker's claim: named first, --force or not.
+    for args in [&["playbook", "discard", &run][..], &["playbook", "discard", &run, "--force"]] {
+        let out = ws.run_as("coordinator", args);
+        assert_eq!(out.status.code(), Some(4), "bd {args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("{a} is held by worker")));
+    }
     ws.json_as("worker", &["close", &a]);
     let closed = ws.json_as("worker", &["close", &b]);
     assert!(closed.get("completed").is_none(), "{closed}");

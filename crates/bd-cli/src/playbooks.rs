@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bd_core::playbook::{
-    self, Bundle, CompactOptions, Listed, Loader, MAX_BUNDLE_FILE_BYTES, Playbook, RunRequest, RunStatus, RunsQuery,
-    StartOptions, Step, StepState,
+    self, Bundle, CompactOptions, DiscardOptions, Listed, Loader, MAX_BUNDLE_FILE_BYTES, Playbook, RunRequest,
+    RunStatus, RunsQuery, StartOptions, Step, StepState,
 };
 use bd_core::time::parse_duration;
 use bd_core::{Error, Queries, Result};
@@ -430,7 +430,8 @@ fn cmd_runs(app: &mut App, a: &RunsArgs) -> Result<()> {
 }
 
 fn cmd_compact(app: &mut App, a: &CompactArgs) -> Result<()> {
-    let opts = CompactOptions { summary: a.summary.clone(), force: a.force, dry_run: a.dry_run };
+    let opts =
+        CompactOptions { summary: a.summary.clone(), force: a.force, take_over: a.take_over, dry_run: a.dry_run };
     let r = app.write("playbook.compact", |tx| {
         let id = tx.resolve_id(&a.id)?;
         tx.compact_run(&id, &opts)
@@ -459,7 +460,7 @@ fn cmd_compact(app: &mut App, a: &CompactArgs) -> Result<()> {
 fn cmd_discard(app: &mut App, a: &DiscardArgs) -> Result<()> {
     let r = app.write("playbook.discard", |tx| {
         let id = tx.resolve_id(&a.id)?;
-        tx.discard_run(&id, a.force, a.dry_run)
+        tx.discard_run(&id, &DiscardOptions { force: a.force, take_over: a.take_over, dry_run: a.dry_run })
     })?;
     let verb = if r.dry_run { "Would discard" } else { "✓ Discarded" };
     let mut out = Out::new(&r).line(format!("{verb} {} issue(s): {}", r.deleted.len(), r.deleted.join(", ")));

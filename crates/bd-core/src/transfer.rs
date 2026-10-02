@@ -131,7 +131,7 @@ pub struct ImportOptions {
     /// Import over other actors' live claims too: an issue the import moves
     /// out of `in_progress` or gives another assignee (recorded in its
     /// `imported` event; see [`crate::policy`]).
-    pub force: bool,
+    pub take_over: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -333,7 +333,7 @@ impl WriteCtx<'_> {
                     let ends_claim = existing.status == Status::InProgress
                         && (issue.status != Status::InProgress || issue.assignee != existing.assignee);
                     let claim_override =
-                        if ends_claim { self.check_claim_override(&existing, opts.force)? } else { None };
+                        if ends_claim { self.check_claim_override(&existing, opts.take_over)? } else { None };
                     self.check_playbook_import(&existing, &issue.metadata)?;
                     self.check_gate_repo(&issue.issue_type, &issue.metadata, Some(&existing))?;
                     self.write_imported_issue(issue, true, claim_override)?;

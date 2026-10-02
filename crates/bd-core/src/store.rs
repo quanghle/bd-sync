@@ -441,7 +441,7 @@ fn contention_counter(e: &Error) -> Option<&'static str> {
         Error::AlreadyClaimed { .. } | Error::NotClaimable { .. } => Some("claim_conflicts"),
         Error::Conflict { .. } => Some("cas_conflicts"),
         Error::LeaseLost { .. } => Some("lease_lost"),
-        Error::NotOwner { .. } => Some("not_owner"),
+        Error::NotOwner { .. } | Error::ClaimsHeld { .. } => Some("not_owner"),
         _ => None,
     }
 }

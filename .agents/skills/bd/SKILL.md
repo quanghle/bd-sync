@@ -19,7 +19,7 @@ Run `bd prime`. It prints the workflow, your current claims, the top of the read
 4. During long work, renew the lease: `bd heartbeat <id> --token <t>`. If it fails, stop: the claim was lost.
 5. Record follow-up work: `bd create "Title" -d "why and what" --dep discovered-from:<id>`; order work with `bd dep add <issue> <depends-on>`.
 6. Finish: `bd close <id> --reason "..."` (add `--failed` if it failed), or give it back with `bd release <id>`.
-7. Never end or take over work another agent holds: closing, releasing, reassigning, moving out of `in_progress` or deleting its live claim fails with exit 4. `--force` takes it over and is recorded in the history; use it only when asked to.
+7. Never end or take over work another agent holds: closing, releasing, reassigning, moving out of `in_progress` or deleting its live claim fails with exit 4 naming the holder, and `--force` does not change that. `--take-over` takes it over and is recorded in the history; use it only when asked to.
 
 ## Playbooks and gates
 
@@ -30,7 +30,7 @@ Run `bd prime`. It prints the workflow, your current claims, the top of the read
 ## Rules
 
 - Prefer `--json` when parsing output.
-- Exit code 4 is a claim conflict (held by someone else, possibly another session of your own actor, or not ready); 13 is a stale `--if-revision` guard. Re-read instead of retrying blindly, and do not answer a 4 with `--force`.
+- Exit code 4 is a claim conflict (held by someone else, possibly another session of your own actor, or not ready); 13 is a stale `--if-revision` guard. Re-read instead of retrying blindly, and do not answer a 4 with `--take-over`.
 - In a remote workspace (`.bd/remote.toml`), commands run on a shared bd server and claims stay atomic across every client. Exit code 7 means the access token (`BD_TOKEN`, or one saved by `bd remote login`) is missing or not allowed; 8 means the server is unreachable, and retrying is safe; 9 means a write's answer was lost, so it may have taken effect: check (`bd show`) before running it again. `bd remote show` diagnoses the connection and the token.
 - Do not close or mutate tasks unless the work is actually done.
 - Store durable insights with `bd remember "..."`; search them with `bd memories <query>`.

@@ -112,15 +112,15 @@ fn report(e: &Error, json: bool) -> i32 {
 fn hint(e: &Error) -> Option<&'static str> {
     Some(match e {
         Error::AlreadyClaimed { .. } => {
-            "pick other work with `bd claim --next`; to renew a claim of yours, pass its lease token (`bd claim <id> --token <t>`); if the holder is gone, wait for `bd reclaim` or take over with `bd update <id> --assignee <you> --force`"
+            "pick other work with `bd claim --next`; to renew a claim of yours, pass its lease token (`bd claim <id> --token <t>`). A claim whose holder stops heartbeating frees itself once its lease has been expired for lease.grace. Only to take it over deliberately: `bd update <id> --assignee <you> --take-over` (recorded in the event history)"
         }
         Error::NotReady { .. } => "see `bd show <id>` for blockers; `bd claim <id> --allow-blocked` overrides",
         Error::Conflict { .. } => {
             "another actor changed it first; re-read (`bd show <id> --json`) and retry with the new revision"
         }
         Error::LeaseLost { .. } => "stop working on it: the claim was released, reclaimed, or taken over",
-        Error::NotOwner { .. } => {
-            "only its holder ends a live claim or gives up an assignment: pick other work, wait for `bd reclaim` if the holder is gone, or pass --force to take it over (recorded in the event history)"
+        Error::NotOwner { .. } | Error::ClaimsHeld { .. } => {
+            "only its holder ends a live claim or gives up an assignment: pick other work, or leave it to its holder (a claim whose holder stops heartbeating frees itself once its lease has been expired for lease.grace). --force does not change that; pass --take-over only to take it over deliberately (recorded in the event history)"
         }
         Error::Busy(_) => "another process holds the write lock; retry, or raise --busy-timeout-ms",
         Error::EventsTruncated { .. } => "re-baseline with `bd export` and tail from its head_seq",

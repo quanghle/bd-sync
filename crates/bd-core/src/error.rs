@@ -24,6 +24,15 @@ pub enum Error {
     #[error("{id} is held by {}, not {actor}", holder.as_deref().unwrap_or("nobody"))]
     NotOwner { id: String, holder: Option<String>, actor: String },
 
+    /// One operation would end several live claims of other actors (a run's
+    /// steps, a delete, a reclaim inside `lease.grace`): `held` lists each
+    /// issue with its holder.
+    #[error(
+        "{what} would end live claims of other actors: {}",
+        held.iter().map(|(id, holder)| format!("{id} (held by {holder})")).collect::<Vec<_>>().join(", ")
+    )]
+    ClaimsHeld { what: String, held: Vec<(String, String)> },
+
     #[error("lease lost on {id}: {detail}")]
     LeaseLost { id: String, detail: String },
 
@@ -108,7 +117,7 @@ impl Error {
             Error::AlreadyClaimed { .. } => "already_claimed",
             Error::NotClaimable { .. } => "not_claimable",
             Error::NotReady { .. } => "not_ready",
-            Error::NotOwner { .. } => "not_owner",
+            Error::NotOwner { .. } | Error::ClaimsHeld { .. } => "not_owner",
             Error::LeaseLost { .. } => "lease_lost",
             Error::Conflict { .. } => "conflict",
             Error::Cycle { .. } => "cycle",
@@ -136,6 +145,7 @@ impl Error {
             | Error::NotClaimable { .. }
             | Error::NotReady { .. }
             | Error::NotOwner { .. }
+            | Error::ClaimsHeld { .. }
             | Error::LeaseLost { .. } => 4,
             Error::Busy(_) => 5,
             Error::EventsTruncated { .. } => 6,
@@ -156,6 +166,7 @@ impl Error {
                 | Error::Conflict { .. }
                 | Error::LeaseLost { .. }
                 | Error::NotOwner { .. }
+                | Error::ClaimsHeld { .. }
         )
     }
 }

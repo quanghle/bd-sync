@@ -190,7 +190,7 @@ pub fn exec_update(tx: &mut WriteCtx<'_>, a: &UpdateArgs) -> Result<Out> {
     if patch.is_empty() {
         return Err(Error::invalid("nothing to update: pass at least one field flag"));
     }
-    let out = tx.update_issue(&id, &patch, &guard_from(&a.guard)?, a.force)?;
+    let out = tx.update_issue(&id, &patch, &guard_from(&a.guard)?, a.take_over)?;
     let text = if out.changed.is_empty() {
         format!("= {id} unchanged (revision {})", out.issue.revision)
     } else {
@@ -204,10 +204,15 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         reason: a.reason.clone(),
         outcome: Some(if a.failed { Outcome::Failed } else { Outcome::Done }),
         force: a.force,
+        take_over: a.take_over,
         guard: guard_from(&a.guard)?,
         token: a.token,
     };
     let mut ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
+    if ids.len() > 1 {
+        // Every claim of another actor among them, before any close is refused for something else.
+        tx.check_take_over(&ids, a.take_over, &format!("closing {}", ids.join(", ")))?;
+    }
     // Deepest first, so children listed alongside their parent close before it.
     let mut keyed = Vec::new();
     for id in ids.drain(..) {
@@ -283,7 +288,7 @@ pub fn exec_undefer(tx: &mut WriteCtx<'_>, a: &IdArg) -> Result<Out> {
 
 pub fn exec_delete(tx: &mut WriteCtx<'_>, a: &DeleteArgs) -> Result<Out> {
     let ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
-    let opts = DeleteOptions { cascade: a.cascade, force: a.force, dry_run: a.dry_run };
+    let opts = DeleteOptions { cascade: a.cascade, force: a.force, take_over: a.take_over, dry_run: a.dry_run };
     let r = tx.delete_issues(&ids, &opts)?;
     let verb = if r.dry_run { "Would delete" } else { "✓ Deleted" };
     let mut out = Out::new(&r).line(format!("{verb} {} issue(s): {}", r.deleted.len(), r.deleted.join(", ")));
@@ -444,14 +449,17 @@ pub fn exec_heartbeat(tx: &mut WriteCtx<'_>, a: &HeartbeatArgs) -> Result<Out> {
 pub fn exec_release(tx: &mut WriteCtx<'_>, a: &ReleaseArgs) -> Result<Out> {
     let opts = ReleaseOptions {
         reason: a.reason.clone(),
-        force: a.force || a.if_assignee.is_some(),
+        take_over: a.take_over,
         guard: Guard { if_assignee: a.if_assignee.as_ref().map(|x| Some(x.trim().to_string())), ..Default::default() },
         token: a.token,
     };
+    let ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
+    if ids.len() > 1 {
+        tx.check_take_over(&ids, a.take_over, &format!("releasing {}", ids.join(", ")))?;
+    }
     let mut issues = Vec::new();
     let mut out = Out::new(Value::Null);
-    for raw in &a.ids {
-        let id = tx.resolve_id(raw)?;
+    for id in ids {
         let issue = tx.release(&id, &opts)?;
         out = out.line(format!("✓ Released {id} (now {})", issue.status)).id(id);
         issues.push(issue);
@@ -690,6 +698,7 @@ pub fn cmd_reclaim(app: &mut App, a: &ReclaimArgs) -> Result<()> {
                 ..Default::default()
             },
             dry_run: a.dry_run,
+            take_over: a.take_over,
         };
         Ok((tx.reclaim_expired(&opts)?, tx.now()))
     })?;
@@ -1059,8 +1068,8 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     );
     o.push(
         "- A live claim is its holder's: claiming it again (even as your own actor, from another session) or \
-         closing, releasing or reassigning another actor's fails with exit 4. `--force` takes it over and is \
-         recorded; use it only on purpose."
+         closing, releasing or reassigning another actor's fails with exit 4, `--force` or not. `--take-over` \
+         takes it over and is recorded; use it only on purpose."
             .into(),
     );
     o.push(
@@ -1334,7 +1343,7 @@ pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
 pub fn cmd_import(app: &mut App, a: &ImportArgs) -> Result<()> {
     io::require_admin("bd import")?;
     let data = read_input(&a.file)?;
-    let opts = ImportOptions { lenient: a.lenient, force: a.force };
+    let opts = ImportOptions { lenient: a.lenient, take_over: a.take_over };
     let dry = a.dry_run;
     let summary = app.write("import", |tx| {
         let s = tx.import_jsonl(&mut BufReader::new(data.as_bytes()), &opts)?;

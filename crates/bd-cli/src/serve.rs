@@ -383,28 +383,20 @@ fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response<B
     response(status, "application/json", Body::whole(serde_json::to_vec(body).unwrap_or_default()))
 }
 
-/// `[/<prefix>]/w/<name>/v<N>/exec` -> (`<name>`, N): a proxy may serve bd
-/// under a path prefix without stripping it.
-fn exec_path(path: &str) -> Option<(&str, u32)> {
+/// `[/<prefix>]/w/<name>/v2/exec` -> `<name>`: a proxy may serve bd under a
+/// path prefix without stripping it.
+fn exec_path(path: &str) -> Option<&str> {
     let (rest, version) = path.strip_suffix("/exec")?.rsplit_once("/v")?;
-    let version = version.parse().ok()?;
     let (_, name) = rest.rsplit_once("/w/")?;
-    Some((name, version)).filter(|(w, _)| !w.is_empty() && !w.contains('/'))
+    Some(name).filter(|w| version == PROTOCOL.to_string() && !w.is_empty() && !w.contains('/'))
 }
 
 async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
     let response = if path == "/healthz" && req.method() == Method::GET {
         response(StatusCode::OK, "text/plain", Body::whole(Bytes::from_static(b"ok\n")))
-    } else if let Some((workspace, version)) = exec_path(&path) {
-        if version != PROTOCOL {
-            let msg = format!(
-                "this bd server (bd {}) speaks protocol {PROTOCOL}, and this client protocol {version}: use the same \
-                 bd version on both",
-                env!("CARGO_PKG_VERSION")
-            );
-            Reject::new(StatusCode::GONE, "remote", msg, 8).response()
-        } else if req.method() == Method::POST {
+    } else if let Some(workspace) = exec_path(&path) {
+        if req.method() == Method::POST {
             exec(&server, workspace.to_string(), req).await
         } else {
             Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
@@ -900,9 +892,6 @@ impl Server {
         waited: Option<Waited>,
         mut out: FrameWriter,
     ) -> std::result::Result<(), Reject> {
-        if request.cursor {
-            out.send_cursor();
-        }
         let mut cli = match Cli::try_parse_from(std::iter::once("bd".to_string()).chain(request.argv.iter().cloned())) {
             Ok(cli) => cli,
             Err(e) => return respond(&mut out, &parse_failure(&e)),
@@ -1090,10 +1079,12 @@ mod tests {
 
     #[test]
     fn exec_paths() {
-        assert_eq!(exec_path("/w/bd-sync/v2/exec"), Some(("bd-sync", 2)));
-        assert_eq!(exec_path("/bd/w/proj/v2/exec"), Some(("proj", 2)), "under an unstripped proxy prefix");
-        assert_eq!(exec_path("/w/v2/v1/exec"), Some(("v2", 1)), "older clients learn the protocol changed");
-        for bad in ["/w//v2/exec", "/w/a/b/v2/exec", "/v2/exec", "/w/x/v2/exec/", "/w/x/vx/exec", "/w/x"] {
+        assert_eq!(exec_path("/w/bd-sync/v2/exec"), Some("bd-sync"));
+        assert_eq!(exec_path("/bd/w/proj/v2/exec"), Some("proj"), "under an unstripped proxy prefix");
+        assert_eq!(exec_path("/w/v2/v2/exec"), Some("v2"));
+        for bad in
+            ["/w//v2/exec", "/w/a/b/v2/exec", "/v2/exec", "/w/x/v2/exec/", "/w/x/vx/exec", "/w/x", "/w/x/v1/exec"]
+        {
             assert_eq!(exec_path(bad), None, "{bad}");
         }
     }

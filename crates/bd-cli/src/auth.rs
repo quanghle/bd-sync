@@ -45,16 +45,13 @@ impl Role {
     }
 }
 
-/// Who holds a token, independent of its role. Entries written before kinds
-/// existed are agent tokens, so approving human gates always takes a
-/// deliberately created human token.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+/// Who holds a token, independent of its role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
     /// A person: may also resolve human gates and move work past them.
     Human,
-    /// A program (the default).
-    #[default]
+    /// A program (the default of `bd serve token create`).
     Agent,
 }
 
@@ -75,7 +72,6 @@ pub struct Token {
     pub name: String,
     pub actor: String,
     pub role: Role,
-    #[serde(default)]
     pub kind: Kind,
     /// Workspace names, or `*` for every workspace.
     pub workspaces: Vec<String>,
@@ -395,25 +391,22 @@ mod tests {
     }
 
     #[test]
-    fn entries_without_a_kind_are_agent_tokens() {
+    fn every_entry_names_its_kind() {
         let dir = tempfile::tempdir().unwrap();
-        let legacy = json!({ "version": 1, "tokens": [{
-            "id": "0123456789abcdef", "name": "old", "actor": "alice", "role": "admin", "workspaces": ["*"],
-            "sha256": hash("bdt_old"), "created_at": "2026-01-01T00:00:00Z",
-        }]});
-        std::fs::write(tokens_path(dir.path()), legacy.to_string()).unwrap();
-        let t = Verifier::new(dir.path()).verify("bdt_old").unwrap().expect("loads");
-        assert_eq!((t.role, t.kind), (Role::Admin, Kind::Agent));
-        assert_eq!(t.policy(), bd_core::Policy { actor: "alice".into(), admin: true, human: false });
-        assert!(t.describe().contains("kind agent"), "{}", t.describe());
-
-        // Saving the file again (another token created) writes the kind out and keeps the old entry.
         let (human, _) = issue_token(dir.path(), "alice-desk", "alice", Role::Write, Kind::Human, &[]).unwrap();
         assert!(human.policy().human && !human.policy().admin);
-        let file = load_file(&tokens_path(dir.path())).unwrap();
-        let kinds: Vec<(&str, Kind)> = file.tokens.iter().map(|t| (t.name.as_str(), t.kind)).collect();
-        assert_eq!(kinds, vec![("old", Kind::Agent), ("alice-desk", Kind::Human)]);
+        let (agent, _) = issue_token(dir.path(), "ci", "alice", Role::Admin, Kind::Agent, &[]).unwrap();
+        assert_eq!(agent.policy(), bd_core::Policy { actor: "alice".into(), admin: true, human: false });
+        assert!(agent.describe().contains("kind agent"), "{}", agent.describe());
         let text = std::fs::read_to_string(tokens_path(dir.path())).unwrap();
         assert!(text.contains("\"kind\": \"agent\"") && text.contains("\"kind\": \"human\""), "{text}");
+
+        let without = json!({ "version": 1, "tokens": [{
+            "id": "0123456789abcdef", "name": "n", "actor": "alice", "role": "admin", "workspaces": ["*"],
+            "sha256": hash("bdt_x"), "created_at": "2026-01-01T00:00:00Z",
+        }]});
+        std::fs::write(tokens_path(dir.path()), without.to_string()).unwrap();
+        let err = Verifier::new(dir.path()).verify("bdt_x").unwrap_err().to_string();
+        assert!(err.contains("tokens.json") && err.contains("kind"), "{err}");
     }
 }

@@ -566,8 +566,7 @@ pub fn cmd_purge(app: &mut App, a: &PurgeArgs) -> Result<()> {
 
 /// Where a client puts the bundle among a request's files.
 const BUNDLE_FILE: &str = "playbooks.bundle.json";
-/// Names the bundle on the command line. A server too old for bundles
-/// rejects it as an unknown argument instead of running another playbook.
+/// Names the bundle on the command line.
 const BUNDLE_FLAG: &str = "--playbook-bundle";
 
 /// A remote workspace's checkout playbooks: `.bd/playbooks` next to
@@ -633,17 +632,6 @@ pub fn attach_bundle(app: &App, cmd: &Command, request: &mut ExecRequest) -> Res
     let bundle = bundle.to_json()?;
     request.files.insert(BUNDLE_FILE.to_string(), bundle);
     request.argv.splice(0..0, [BUNDLE_FLAG.to_string(), BUNDLE_FILE.to_string()]);
-    Ok(())
-}
-
-/// Explains the answer of a server too old to read bundles.
-pub fn check_server(request: &ExecRequest, response: &ExecResponse, url: &str) -> Result<()> {
-    let sent = request.argv.first().is_some_and(|a| a == BUNDLE_FLAG);
-    if sent && response.exit_code == 2 && response.stderr.contains(&format!("'{BUNDLE_FLAG}'")) {
-        return Err(Error::Refused(format!(
-            "{url}: this bd server cannot run playbooks from a client's checkout (it runs an older bd); upgrade it"
-        )));
-    }
     Ok(())
 }
 
@@ -742,26 +730,7 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn a_server_too_old_for_bundles_is_named_as_the_problem() {
-        // What such a server answers: clap's error for an argument it does not know.
-        let unknown = Cli::try_parse_from(["bd", "--no-such-flag", "x", "playbook", "list"]).unwrap_err();
-        let rendered = unknown.render().to_string();
-        assert!(rendered.contains("'--no-such-flag'"), "{rendered}");
-        let old = ExecResponse {
-            exit_code: 2,
-            stderr: rendered.replace("--no-such-flag", BUNDLE_FLAG),
-            ..Default::default()
-        };
-        let argv = [BUNDLE_FLAG, BUNDLE_FILE, "playbook", "run", "x"].map(String::from).to_vec();
-        let request = ExecRequest { argv, ..Default::default() };
-        let err = check_server(&request, &old, "http://h/w/p").unwrap_err();
-        assert!(err.to_string().contains("older bd") && err.exit_code() == 2, "{err}");
-
-        let failed =
-            ExecResponse { exit_code: 2, stderr: "error: playbook x: has no steps\n".into(), ..Default::default() };
-        assert!(check_server(&request, &failed, "u").is_ok(), "other failures pass through");
-        let plain = ExecRequest { argv: vec!["playbook".into(), "run".into(), "x".into()], ..Default::default() };
-        assert!(check_server(&plain, &old, "u").is_ok(), "only requests that carried a bundle");
+    fn the_bundle_flag_parses() {
         assert!(Cli::try_parse_from(["bd", BUNDLE_FLAG, BUNDLE_FILE, "playbook", "list"]).is_ok());
     }
 }

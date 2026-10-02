@@ -1317,11 +1317,8 @@ fn waiting_followers_hold_no_command_slots() {
     let head = events_head(&alice);
     let addr = server.base.trim_start_matches("http://").to_string();
     // More waiting followers than commands run at once (32).
-    let request = json!({
-        "argv": ["--json", "events", "--since", head, "--wait", "60s", "--op", "closed"],
-        "cursor": true,
-    });
-    let waiting: Vec<std::net::TcpStream> = (0..40).map(|_| send_request(&addr, &secret, request.clone())).collect();
+    let argv = json!(["--json", "events", "--since", head, "--wait", "60s", "--op", "closed"]);
+    let waiting: Vec<std::net::TcpStream> = (0..40).map(|_| send_exec(&addr, &secret, argv.clone())).collect();
     std::thread::sleep(Duration::from_millis(500));
 
     // Claims run at once, and the events they write wake the followers, whose filters skip them.
@@ -1349,29 +1346,26 @@ fn waiting_followers_hold_no_command_slots() {
 }
 
 #[test]
-fn only_clients_that_ask_get_cursor_frames() {
+fn event_listings_end_with_their_cursor() {
     let server = Server::start();
     let secret = server.token("alice-laptop", "alice", &[]);
     let alice = server.client(&secret);
     alice.ok(&["create", "First"]);
     alice.ok(&["create", "Second"]);
     let head = events_head(&alice);
-    // Clients from before cursor frames (protocol 2 all the same) fail on
-    // frames they do not know: they get stdout and exit frames only, as before.
     for argv in [
         json!(["events", "-n", "20"]),
         json!(["--json", "events", "--since", "0"]),
         json!(["events", "--since", &head, "--wait", "1s"]),
     ] {
-        let (status, plain) = post(&server.url(), &secret, &json!({ "argv": argv }));
-        assert_eq!((status, &plain["exit_code"]), (200, &json!(0)), "{plain}");
-        assert!(plain["cursor"].is_null(), "{argv}: {plain}");
-        let (_, asked) = post(&server.url(), &secret, &json!({ "argv": argv, "cursor": true }));
-        assert_eq!(asked["cursor"], json!(head.parse::<i64>().unwrap()), "{argv}: {asked}");
-        assert_eq!(asked["stdout"], plain["stdout"], "{argv}");
+        let (status, answer) = post(&server.url(), &secret, &json!({ "argv": argv }));
+        assert_eq!((status, &answer["exit_code"]), (200, &json!(0)), "{answer}");
+        assert_eq!(answer["cursor"], json!(head.parse::<i64>().unwrap()), "{argv}: {answer}");
     }
+    let (_, other) = post(&server.url(), &secret, &json!({ "argv": ["list"] }));
+    assert!(other["cursor"].is_null(), "only event listings: {other}");
 
-    // A follower asks for them, and prints every event once, in order.
+    // A follower continues from each, and prints every event once, in order.
     let mut follower = Follower::start(&mut alice.cmd(&["--json", "events", "--follow", "--interval-ms", "200"]));
     for i in 3..=6 {
         alice.ok(&["create", &format!("Task {i}")]);
@@ -1395,7 +1389,6 @@ fn requests_too_large_to_hold_do_not_wait() {
     let large = json!({
         "argv": ["events", "--since", &head, "--wait", "60s"],
         "stdin": "x".repeat(1 << 20),
-        "cursor": true,
     });
     let started = Instant::now();
     let answer = read_answer(send_request(&addr, &secret, large));
@@ -2092,24 +2085,18 @@ fn only_human_tokens_resolve_human_gates() {
 }
 
 #[test]
-fn tokens_without_a_kind_load_as_agent_tokens() {
+fn tokens_without_a_kind_are_refused() {
     let root = Server::prepare();
-    let secret = create_token(root.path(), "old-human", "dana", &["--kind", "human"]);
-    // tokens.json as written before kinds existed.
+    create_token(root.path(), "dana-desk", "dana", &["--kind", "human"]);
     let path = root.path().join("tokens.json");
     let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
     file["tokens"][0].as_object_mut().unwrap().remove("kind").expect("kind is stored");
     std::fs::write(&path, file.to_string()).unwrap();
 
-    let server = Server::launch(root, "127.0.0.1:0", &[]);
-    let dana = server.client(&secret);
-    dana.ok(&["create", "Ship"]);
-    dana.ok(&["gate", "create", "-t", "human", "--blocks", "t-1"]);
-    assert_eq!(dana.code(&["gate", "resolve", "t-2"]), 7, "a token without a kind is an agent's");
-    let out =
-        bd(server.root.path()).args(["--json", "serve", "token", "list", "--root"]).arg(server.root.path()).output();
-    let list: Value = serde_json::from_str(&check(out.unwrap(), "token list")).unwrap();
-    assert_eq!(list[0]["kind"], "agent");
+    let out = bd(root.path()).args(["serve", "token", "list", "--root"]).arg(root.path()).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("tokens.json") && stderr.contains("kind"), "{stderr}");
 }
 
 #[test]
@@ -2682,8 +2669,8 @@ fn output_files_appear_only_when_the_command_succeeds() {
 }
 
 #[test]
-fn mismatched_protocols_fail_with_an_explanation() {
-    // An older client, which posts to /v1/exec, against this server.
+fn servers_other_than_bd_serve_are_named() {
+    // Another endpoint of bd serve is not found.
     let server = Server::start();
     let secret = server.token("alice-laptop", "alice", &[]);
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
@@ -2692,27 +2679,23 @@ fn mismatched_protocols_fail_with_an_explanation() {
         .header("authorization", format!("Bearer {secret}"))
         .send(r#"{"argv":["list"]}"#)
         .unwrap();
-    assert_eq!(r.status().as_u16(), 410);
+    assert_eq!(r.status().as_u16(), 404);
     let body: Value = serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap();
-    let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.contains("protocol 2") && message.contains("same bd version"), "{message}");
+    assert_eq!(body["error"]["code"], "not_found", "{body}");
 
-    // This client against an older server, and against something that is not a protocol 2 stream.
-    let old = FakeServer::start(|n| {
-        let body = r#"{"error":{"code":"not_found","message":"no such endpoint; workspaces are at /w/<name>/v1/exec","exit_code":3}}"#;
+    // A URL where something else answers: a 404 without bd's header, then a 200 that is not a frame stream.
+    let other = FakeServer::start(|n| {
+        let body = r#"{"error":{"code":"not_found","message":"no such page","exit_code":3}}"#;
         let json = r#"{"exit_code":0,"stdout":"t-1\n","stderr":"","replayed":false}"#;
         let (status, body) = if n == 0 { ("404 Not Found", body) } else { ("200 OK", json) };
         format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len())
             .into_bytes()
     });
-    let out = old.client().run(&["list"]);
+    let out = other.client().run(&["list"]);
     assert_eq!(out.status.code(), Some(8));
-    assert!(
-        String::from_utf8_lossy(&out.stderr).contains("same bd version"),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let out = old.client().run(&["list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not a bd server") && stderr.contains("check the URL"), "{stderr}");
+    let out = other.client().run(&["list"]);
     assert_eq!(out.status.code(), Some(8));
     assert!(String::from_utf8_lossy(&out.stderr).contains("content type"), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(out.stdout.is_empty());
@@ -3361,49 +3344,20 @@ fn checkout_playbook_runs_are_writes_asked_for_again_when_cut_off() {
 }
 
 #[test]
-fn a_server_too_old_for_checkout_playbooks_says_so() {
-    // A protocol 2 server from before bundles: its command line parser refuses the flag.
-    let refusal = "error: unexpected argument '--playbook-bundle' found\n\nUsage: bd [OPTIONS] <COMMAND>\n";
-    let old = FakeServer::start(move |_| answer(&[exit_frame(2, refusal)], false, 0));
-    let client = old.client();
-    write(&client.dir.path().join(".bd").join("playbooks"), "ship.toml", "[[steps]]\nid = \"build\"\n");
-    for args in [&["playbook", "show", "ship"][..], &["playbook", "run", "ship"][..]] {
-        let out = client.run(args);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(2), "{stderr}");
-        assert!(
-            stderr.contains("cannot run playbooks from a client's checkout") && stderr.contains("upgrade"),
-            "{stderr}"
-        );
-    }
-    // Commands that send no playbooks are its own business.
-    let out = client.run(&["playbook", "show", "elsewhere"]);
-    assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument"), "{out:?}");
-}
-
-#[test]
-fn a_server_too_old_for_followers_says_so() {
-    // A protocol 2 server from before cursor frames: listings without them, and no `events --wait`.
-    // Frames of types added later are skipped.
-    let later = json!({ "later": { "x": 1 } }).to_string();
-    let listing =
-        move || answer(&[later.clone(), stdout_frame("#1 created t-1 by alice\n"), exit_frame(0, "")], false, 0);
-    let old = FakeServer::start(move |_| listing());
-    let client = old.client();
-    assert_eq!(client.ok(&["events", "-n", "20"]), "#1 created t-1 by alice\n", "plain listings work");
-    let out = client.run(&["events", "--follow"]);
+fn answers_outside_the_protocol_are_errors() {
+    // An event listing without its cursor, and a frame of an unknown type.
+    let listing = || answer(&[stdout_frame("#1 created t-1 by alice\n"), exit_frame(0, "")], false, 0);
+    let client = FakeServer::start(move |_| listing()).client();
+    let out = client.run(&["events", "--since", "0", "--wait", "5s"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("older bd") && stderr.contains("upgrade"), "{stderr}");
+    assert_eq!(out.status.code(), Some(8), "{stderr}");
+    assert!(stderr.contains("no event cursor"), "{stderr}");
 
-    let refusal = "error: unexpected argument '--wait' found\n\nUsage: bd events [OPTIONS]\n";
-    let old = FakeServer::start(move |_| answer(&[exit_frame(2, refusal)], false, 0));
-    let client = old.client();
-    for args in [&["events", "--follow", "--since", "0"][..], &["events", "--since", "0", "--wait", "5s"][..]] {
-        let out = client.run(args);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
-        assert!(stderr.contains("older bd") && stderr.contains("upgrade"), "{args:?}: {stderr}");
-    }
-    assert_eq!(old.requests.load(Ordering::SeqCst), 2, "refused at once, not retried");
+    let unknown = json!({ "progress": { "done": 1 } }).to_string();
+    let listing = move || answer(&[unknown.clone(), stdout_frame("t-1\n"), exit_frame(0, "")], false, 0);
+    let client = FakeServer::start(move |_| listing()).client();
+    let out = client.run(&["list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(8), "{stderr}");
+    assert!(stderr.contains("unexpected answer") && stderr.contains("not a bd frame"), "{stderr}");
 }

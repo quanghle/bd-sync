@@ -22,7 +22,7 @@
 //! deadline on the whole answer, which a large export could not meet.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{self, BufRead, BufReader, Read};
 use std::pin::Pin;
@@ -339,8 +339,6 @@ pub struct FrameWriter {
     held: Option<Held>,
     /// The cursor frame of an event listing, sent before the exit frame.
     cursor: Option<i64>,
-    /// The client reads cursor frames (it asked for them).
-    send_cursor: bool,
 }
 
 /// Output held back while the command runs, in the order written, until it
@@ -423,14 +421,7 @@ impl FrameWriter {
             bytes: 0,
             held: None,
             cursor: None,
-            send_cursor: false,
         }
-    }
-
-    /// Send the cursor frame of an event listing: the client asked for it
-    /// ([`crate::protocol::ExecRequest::cursor`]); others may not know it.
-    pub fn send_cursor(&mut self) {
-        self.send_cursor = true;
     }
 
     /// Hold the output back while the command runs, up to `limit` bytes, so
@@ -486,7 +477,7 @@ impl FrameWriter {
         if !self.finished {
             self.finished = true;
             let sent = self.frame(true).and_then(|()| {
-                let cursor = self.cursor.filter(|_| self.send_cursor).map(Frame::Cursor);
+                let cursor = self.cursor.map(Frame::Cursor);
                 for frame in cursor.iter().chain([&Frame::Exit(exit)]) {
                     serde_json::to_writer(&mut self.frames, frame).map_err(io::Error::other)?;
                     self.frames.push(b'\n');
@@ -710,12 +701,8 @@ impl FrameReader {
                     }
                     Ok(_) if line.last() != Some(&b'\n') => Err(Cut::Broken("the answer ended within a frame".into())),
                     Ok(_) if line.iter().all(u8::is_ascii_whitespace) => continue,
-                    Ok(_) => match serde_json::from_slice::<Frame<'static>>(&line) {
-                        Ok(frame) => Ok(frame),
-                        // A frame added since: optional, so skipped.
-                        Err(_) if unknown_frame_type(&line) => continue,
-                        Err(e) => Err(Cut::Malformed(format!("not a bd frame ({e})"))),
-                    },
+                    Ok(_) => serde_json::from_slice::<Frame<'static>>(&line)
+                        .map_err(|e| Cut::Malformed(format!("not a bd frame ({e})"))),
                     Err(e) => Err(Cut::Broken(format!("reading the answer: {e}"))),
                 };
                 let last = frame.is_err();
@@ -734,15 +721,6 @@ impl FrameReader {
             Err(RecvTimeoutError::Timeout) => Err(Cut::Stalled(self.idle)),
             Err(RecvTimeoutError::Disconnected) => Ok(None),
         }
-    }
-}
-
-/// Whether `line` is a frame of a type this version does not know: an
-/// object with one member, not named after a known type.
-fn unknown_frame_type(line: &[u8]) -> bool {
-    match serde_json::from_slice::<BTreeMap<String, serde::de::IgnoredAny>>(line) {
-        Ok(frame) => frame.len() == 1 && frame.keys().all(|tag| !Frame::TYPES.contains(&tag.as_str())),
-        Err(_) => false,
     }
 }
 
@@ -822,7 +800,6 @@ mod tests {
     #[test]
     fn event_listings_end_with_their_cursor() {
         let (mut w, answered) = writer(Limits::SERVE);
-        w.send_cursor();
         w.stdout(b"#5 created t-1\n").unwrap();
         w.cursor(5);
         w.cursor(9);
@@ -834,7 +811,6 @@ mod tests {
 
         // Known answers carry theirs; other answers have none.
         let (mut w, answered) = writer(Limits::SERVE);
-        w.send_cursor();
         w.respond(&ExecResponse { cursor: Some(3), ..Default::default() });
         assert_eq!(gather(&runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap()).cursor, Some(3));
         let (mut w, answered) = writer(Limits::SERVE);
@@ -842,31 +818,6 @@ mod tests {
         w.finish(Exit::default());
         let bytes = runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("cursor"));
-    }
-
-    #[test]
-    fn only_clients_that_ask_get_cursor_frames() {
-        // A client from before cursor frames: its frames are these (externally tagged, no catch-all).
-        #[allow(dead_code)]
-        #[derive(serde::Deserialize)]
-        #[serde(rename_all = "snake_case")]
-        enum OldFrame {
-            Stdout(String),
-            File { path: String, data: String },
-            Exit(Exit),
-        }
-        let (mut w, answered) = writer(Limits::SERVE);
-        w.stdout(b"#5 created t-1\n").unwrap();
-        w.cursor(5);
-        w.finish(Exit::default());
-        let bytes = runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap();
-        let frames: Vec<OldFrame> = bytes
-            .split(|b| *b == b'\n')
-            .filter(|l| !l.is_empty())
-            .map(|l| serde_json::from_slice(l).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(l))))
-            .collect();
-        assert!(matches!(frames[..], [OldFrame::Stdout(_), OldFrame::Exit(_)]));
-        assert!(serde_json::from_str::<OldFrame>("{\"cursor\":5}").is_err(), "old clients fail on cursor frames");
     }
 
     #[test]
@@ -1164,15 +1115,15 @@ mod tests {
         assert!(r.next().unwrap().is_some());
         assert!(matches!(r.next(), Err(Cut::Broken(_))), "cut within a frame");
 
-        let r = FrameReader::spawn(io::Cursor::new("{\"exit_code\":0,\"stdout\":\"\"}\n"), idle).unwrap();
-        assert!(matches!(r.next(), Err(Cut::Malformed(_))), "a protocol 1 answer is not a frame");
-
-        // Frames of types added later are skipped; known types must be well-formed.
-        let body = "{\"progress\":{\"done\":3}}\n{\"stdout\":\"a\"}\n{\"later\":[1]}\n{\"exit\":{\"exit_code\":0}}\n";
-        let r = FrameReader::spawn(io::Cursor::new(body), idle).unwrap();
-        assert_eq!(r.next().unwrap(), Some(Frame::Stdout("a".into())));
-        assert_eq!(r.next().unwrap(), Some(Frame::Exit(Exit::default())));
-        for bad in ["{\"cursor\":\"x\"}\n", "{\"stdout\":1}\n", "{\"a\":1,\"b\":2}\n", "[\"stdout\"]\n", "{}\n"] {
+        // Unknown frame types and ill-formed frames are not bd frames.
+        for bad in [
+            "{\"exit_code\":0,\"stdout\":\"\"}\n",
+            "{\"progress\":{\"done\":3}}\n",
+            "{\"cursor\":\"x\"}\n",
+            "{\"stdout\":1}\n",
+            "[\"stdout\"]\n",
+            "{}\n",
+        ] {
             let r = FrameReader::spawn(io::Cursor::new(bad), idle).unwrap();
             assert!(matches!(r.next(), Err(Cut::Malformed(_))), "{bad}");
         }

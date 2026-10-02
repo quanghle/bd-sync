@@ -368,9 +368,7 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
     check_outputs(app, &cli.command)?;
     // A session hook prints `bd prime` only once it knows the command worked.
     let write = crate::serve::access(&cli.command) == crate::serve::Access::Write;
-    let response = remote.exec_into(&request, &mut Delivery::new(output_files(app, &cli.command), hook, write))?;
-    playbooks::check_server(&request, &response, &remote.url)?;
-    Ok(response)
+    remote.exec_into(&request, &mut Delivery::new(output_files(app, &cli.command), hook, write))
 }
 
 /// The error a failed command reported (its `--json` error, or its first stderr line).
@@ -639,30 +637,17 @@ fn events_request(
     if let Some(by) = &a.by_actor {
         argv.extend(["--by".into(), by.clone()]);
     }
-    // Its answer ends with a cursor frame (servers before cursor frames send none).
-    ExecRequest { argv, actor: env_actor(), location: Some(remote.url.clone()), cursor: true, ..Default::default() }
-}
-
-/// What a server too old for remote followers says (it runs a bd from before cursor frames).
-fn server_too_old(remote: &Remote) -> Error {
-    Error::Refused(format!(
-        "{}: this bd server cannot send events as they are committed (it runs an older bd); upgrade it",
-        remote.url
-    ))
+    ExecRequest { argv, actor: env_actor(), location: Some(remote.url.clone()), ..Default::default() }
 }
 
 /// Print the events of an answer; returns where they end (the cursor to
 /// continue from), or the exit code of a failure, whose error is printed.
 fn print_events(remote: &Remote, r: ExecResponse) -> Result<std::result::Result<i64, i32>> {
-    if r.exit_code == 2 && r.stderr.contains("'--wait'") {
-        // Its command line parser does not know `events --wait`.
-        return Err(server_too_old(remote));
-    }
     if r.exit_code != 0 {
         let _ = std::io::stderr().write_all(r.stderr.as_bytes());
         return Ok(Err(r.exit_code));
     }
-    let cursor = r.cursor.ok_or_else(|| server_too_old(remote))?;
+    let cursor = r.cursor.ok_or_else(|| Error::Remote(format!("{}: the server sent no event cursor", remote.url)))?;
     io::out(&r.stdout);
     Ok(Ok(cursor))
 }
@@ -932,9 +917,7 @@ impl Remote {
         let headers = response.headers();
         let content_type = headers.get("content-type").and_then(|v| v.to_str().ok()).unwrap_or_default();
         if !content_type.starts_with(FRAMES_CONTENT_TYPE) {
-            return Ok(Err(Cut::Malformed(format!(
-                "content type {content_type:?}, not a protocol {PROTOCOL} stream (is the server another bd version?)"
-            ))));
+            return Ok(Err(Cut::Malformed(format!("content type {content_type:?}, not a bd answer (check the URL)"))));
         }
         out.start(headers.contains_key("content-length"));
         let frames = FrameReader::spawn(response.into_body().into_reader(), self.attempt_timeout)?;
@@ -1438,18 +1421,14 @@ fn error_code(body: &str) -> Option<String> {
     serde_json::from_str::<ErrorBody>(body).ok().map(|b| b.error.code)
 }
 
-/// The error of a non-200 answer; `bd` says whether a bd server of this protocol sent it.
+/// The error of a non-200 answer; `bd` says whether a bd server sent it.
 fn http_error(status: u16, body: &str, url: &str, bd: bool) -> Error {
     let detail = serde_json::from_str::<ErrorBody>(body).ok().map(|b| b.error);
     let message = detail.as_ref().map_or_else(|| format!("HTTP {status}"), |d| d.message.clone());
     match (status, detail.as_ref().map(|d| d.code.as_str())) {
         (401 | 403, _) | (_, Some("unauthorized")) => Error::Unauthorized(format!("{url}: {message}")),
         (404, _) if bd => Error::not_found("workspace", url),
-        // A server of another protocol (an older bd serve), or no bd server at all.
-        (404, _) => Error::Remote(format!(
-            "{url}: no bd server of protocol {PROTOCOL} answers there ({message}); check the URL, and that the \
-             server runs the same bd version"
-        )),
+        (404, _) => Error::Remote(format!("{url}: not a bd server ({message}); check the URL")),
         (400 | 413, _) => Error::invalid(format!("{url}: {message}")),
         _ => Error::Remote(format!("{url}: {message}")),
     }
@@ -1497,10 +1476,9 @@ mod tests {
         assert_eq!(http_error(404, &body("not_found"), "u", true).exit_code(), 3);
         assert_eq!(http_error(413, &body("invalid"), "u", true).exit_code(), 2);
         assert_eq!(http_error(500, "not json", "u", false).exit_code(), 8);
-        assert_eq!(http_error(410, &body("remote"), "u", true).exit_code(), 8, "another protocol");
-        let old = http_error(404, &body("not_found"), "u", false);
-        assert_eq!(old.exit_code(), 8, "a 404 without the protocol header is not a missing workspace");
-        assert!(old.to_string().contains("same bd version"), "{old}");
+        let other = http_error(404, &body("not_found"), "u", false);
+        assert_eq!(other.exit_code(), 8, "a 404 without the protocol header is not a missing workspace");
+        assert!(other.to_string().contains("not a bd server"), "{other}");
     }
 
     #[test]

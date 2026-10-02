@@ -16,13 +16,9 @@
 //! cut off: the command's outcome is unknown. Small answers arrive whole
 //! (with a `Content-Length`) once the command finishes; larger ones are sent
 //! while it runs, so neither side holds a whole export in memory. An event
-//! listing (`events`) asked for with `"cursor": true` in its request also
-//! carries a cursor frame, `{"cursor":1234}`, before its exit frame: the
-//! `--since` value that continues after it, past events its filters skipped.
-//!
-//! Frame types are added only as optional frames, sent to clients that ask
-//! for them (clients from before a frame type fail on it), and clients skip
-//! frames of types they do not know.
+//! listing (`events`) also carries a cursor frame, `{"cursor":1234}`, before
+//! its exit frame: the `--since` value that continues after it, past events
+//! its filters skipped.
 //!
 //! `events --since N --wait DURATION` is a long poll: the server waits,
 //! without holding a command slot, until an event matching the filters
@@ -31,10 +27,8 @@
 //!
 //! Failures before the command runs (transport, access) answer with a
 //! non-200 status and an [`ErrorBody`], shaped like the CLI's `--json`
-//! errors. Every answer carries the [`PROTOCOL_HEADER`]. The protocol 1
-//! endpoint (`/v1/exec`, one JSON object per answer) answers 410 Gone, so a
-//! client and a server of different protocols fail with an explanation
-//! instead of misreading each other.
+//! errors. Every answer carries the [`PROTOCOL_HEADER`], which tells bd
+//! serve's own answers apart from a proxy's.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -72,10 +66,6 @@ pub struct ExecRequest {
     /// How the client names the workspace (its URL), shown by `prime` and `info`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
-    /// The client reads [`Frame::Cursor`]: an event listing's answer carries
-    /// one. Servers from before cursor frames ignore it and send none.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub cursor: bool,
 }
 
 /// One line of a 200 answer.
@@ -88,16 +78,10 @@ pub enum Frame<'a> {
     /// -o`), keyed by the path as given; the client writes it locally.
     File { path: Cow<'a, str>, data: Cow<'a, str> },
     /// Where an event listing (`bd events`) ends: the `--since` value that
-    /// continues after it. Sent before the exit frame of such answers, and
-    /// only to clients that ask for it ([`ExecRequest::cursor`]).
+    /// continues after it. Sent before the exit frame of such answers only.
     Cursor(i64),
     /// The command finished: always the last frame.
     Exit(Exit),
-}
-
-impl Frame<'_> {
-    /// The frame types this version knows, as tagged on the wire.
-    pub const TYPES: [&'static str; 4] = ["stdout", "file", "cursor", "exit"];
 }
 
 /// How the command ended.
@@ -158,30 +142,6 @@ pub fn valid_workspace_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn every_frame_type_is_known() {
-        let frames = [
-            Frame::Stdout("a".into()),
-            Frame::File { path: "f".into(), data: "d".into() },
-            Frame::Cursor(1),
-            Frame::Exit(Exit::default()),
-        ];
-        let tags: Vec<String> = frames
-            .iter()
-            .map(|f| serde_json::to_value(f).unwrap().as_object().unwrap().keys().next().unwrap().clone())
-            .collect();
-        assert_eq!(tags, Frame::TYPES);
-    }
-
-    #[test]
-    fn requests_ask_for_cursor_frames_only_when_they_read_them() {
-        let plain = serde_json::to_string(&ExecRequest { argv: vec!["events".into()], ..Default::default() }).unwrap();
-        assert_eq!(plain, r#"{"argv":["events"]}"#, "unchanged for other requests");
-        let asked = serde_json::to_string(&ExecRequest { cursor: true, ..Default::default() }).unwrap();
-        assert!(serde_json::from_str::<ExecRequest>(&asked).unwrap().cursor);
-        assert!(!serde_json::from_str::<ExecRequest>(r#"{"argv":[]}"#).unwrap().cursor);
-    }
 
     #[test]
     fn workspace_names_cannot_escape_the_root() {

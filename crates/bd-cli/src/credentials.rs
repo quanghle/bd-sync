@@ -23,8 +23,7 @@
 //! system's certificate authorities, or the SHA-256 of a CA file's
 //! certificates. A token is only sent under the same trust (see
 //! `remote::token_for`), so a checkout whose `.bd/remote.toml` names another
-//! CA for the same URL cannot redirect a saved token. Entries without `ca`
-//! count as `system`.
+//! CA for the same URL cannot redirect a saved token.
 //!
 //! On Unix the file is replaced
 //! atomically by one created with mode 0600, in a directory created 0700, and
@@ -56,16 +55,11 @@ struct File {
 #[derive(Serialize, Deserialize)]
 struct Entry {
     token: String,
-    #[serde(default = "system_ca")]
     ca: String,
 }
 
 /// The trust of a token checked against the system's certificate authorities.
 pub const SYSTEM_CA: &str = "system";
-
-fn system_ca() -> String {
-    SYSTEM_CA.to_string()
-}
 
 /// Which entry a token is saved under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,8 +408,9 @@ mod tests {
         save(&path, "https://h/w/a", "bdt_x", "sha256:abc", Scope::Server).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("ca = \"sha256:abc\""));
         assert_eq!(lookup_in(&path, "https://h/w/a").unwrap().unwrap().ca, "sha256:abc");
-        std::fs::write(&path, "[servers.\"https://h\"]\ntoken = \"bdt_x\"\n").unwrap();
-        assert_eq!(lookup_in(&path, "https://h/w/a").unwrap().unwrap().ca, SYSTEM_CA, "entries without ca");
+        std::fs::write(&path, "[servers.\"https://h\"]\ntoken = \"bdt_secret_value\"\n").unwrap();
+        let msg = lookup_in(&path, "https://h/w/a").err().expect("an entry without ca is invalid").to_string();
+        assert!(msg.contains(&path.display().to_string()) && !msg.contains("bdt_secret"), "{msg}");
     }
 
     #[test]

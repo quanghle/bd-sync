@@ -648,8 +648,7 @@ A token acts as one actor (`--as`), or as that actor's sub-actors
 | `admin` | also `config set/unset`, `import`, `events prune`, `doctor`, and taking over other actors' claims |
 
 A token's kind, independent of its role, says who holds it: `agent` (the
-default, which tokens created before kinds existed are too) or `human`
-(`--kind human`). Keep human tokens out of agents' environments, since they
+default) or `human` (`--kind human`). Keep human tokens out of agents' environments, since they
 can approve. The server enforces roles and kinds in the engine, so a `bd batch`
 or a playbook gets the same answer as a single command:
 
@@ -733,16 +732,14 @@ directly: `POST /w/<name>/v2/exec` with `Authorization: Bearer <token>` and
 wrote them: `{"stdout": "..."}` for output, `{"file": {"path", "data"}}` for
 part of an output file, and last `{"exit": {"exit_code", "stderr", "replayed"}}`.
 Blank lines are keep-alives, and an answer without the exit frame was cut
-off. A request with `"cursor": true` asks for an event listing's
-(`events`) `{"cursor": N}` frame, sent before its exit frame: the `--since`
-value that continues after it, past the events its filters skipped. Clients
-skip frames of types they do not know; new types are sent only to clients
-that ask for them. `["events", "--since", "N", "--wait", "25s", "--json"]` is a
+off. An event listing (`events`) also sends `{"cursor": N}` before its exit
+frame: the `--since` value that continues after it, past the events its
+filters skipped. `["events", "--since", "N", "--wait", "25s", "--json"]` is a
 long poll: answered as soon as an event matching its filters follows `N`, or
 with no events (and the cursor) when the wait ends. Failures before the
 command runs return a non-200 status with the `--json` error shape. Every
-answer carries a `bd-protocol: 2` header, and a client and server of
-different protocol versions refuse each other with an explanation.
+answer carries a `bd-protocol: 2` header, which tells bd serve's own answers
+(a 503 before the command ran, say) apart from a proxy's.
 
 ### Followers
 

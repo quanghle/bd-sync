@@ -1,6 +1,6 @@
 //! Issue lifecycle: create, read, list, update, close, reopen, defer, delete.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rusqlite::types::Value as SqlValue;
 use rusqlite::{Connection, OptionalExtension, Row, params, params_from_iter};
@@ -1125,10 +1125,10 @@ impl WriteCtx<'_> {
         Ok(detached.into_iter().collect())
     }
 
-    /// Delete closed ephemeral issues (closed at least `older_than` ago).
-    /// Whole runs go together: an issue stays while any part of its
-    /// ephemeral tree is still open or too recent, or it has persistent
-    /// descendants.
+    /// Delete closed ephemeral issues closed at least `older_than` ago (the
+    /// candidates). Whole runs go together: a candidate stays while anything
+    /// below it is not a candidate (open, too recent, or persistent) or an
+    /// ephemeral issue above it is not one; persistent ancestors hold nothing.
     pub fn purge_ephemeral(&mut self, older_than: Option<std::time::Duration>, dry_run: bool) -> Result<PurgeOutcome> {
         let cutoff = older_than.map(|d| self.now().minus(d)).unwrap_or_else(|| self.now());
         let candidates: BTreeSet<String> = {
@@ -1138,24 +1138,7 @@ impl WriteCtx<'_> {
             let rows = stmt.query_map([cutoff], |r| r.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
-        let mut purge: BTreeSet<String> = BTreeSet::new();
-        for id in &candidates {
-            let subtree_ok = descendants(self.conn(), id)?.iter().all(|d| candidates.contains(&d.id));
-            let mut ancestors_ok = true;
-            for a in graph::ancestors(self.conn(), id)? {
-                let ephemeral: bool = self
-                    .conn()
-                    .prepare_cached("SELECT ephemeral FROM issues WHERE id = ?1")?
-                    .query_row([&a], |r| Ok(r.get::<_, i64>(0)? != 0))?;
-                if ephemeral && !candidates.contains(&a) {
-                    ancestors_ok = false;
-                    break;
-                }
-            }
-            if subtree_ok && ancestors_ok {
-                purge.insert(id.clone());
-            }
-        }
+        let purge = purgeable(self.conn(), &candidates)?;
         let deleted: Vec<String> = purge.iter().cloned().collect();
         if dry_run || purge.is_empty() {
             return Ok(PurgeOutcome { deleted, detached: Vec::new(), dry_run });
@@ -1163,6 +1146,102 @@ impl WriteCtx<'_> {
         let detached = self.delete_quietly(&purge, "purged", None, json!({ "cutoff": cutoff }), false)?;
         Ok(PurgeOutcome { deleted, detached, dry_run })
     }
+}
+
+/// The `candidates` a purge deletes: those with only candidates below them and
+/// no ephemeral issue above them that is not a candidate. Linear in the issues
+/// it reaches: one lookup of children per candidate, then the candidates with
+/// a non-candidate below them are spread up through their candidate parents,
+/// and each chain of ancestors is walked once, remembering every issue's
+/// verdict.
+fn purgeable(conn: &Connection, candidates: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+    let mut parents: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut stack: Vec<&str> = Vec::new();
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT issue_id FROM dependencies WHERE depends_on_id = ?1 AND dep_type = 'parent-child'",
+        )?;
+        for id in candidates {
+            for row in stmt.query_map([id], |r| r.get::<_, String>(0))? {
+                match candidates.get(&row?) {
+                    Some(child) => parents.entry(child.as_str()).or_default().push(id),
+                    None => stack.push(id),
+                }
+            }
+        }
+    }
+    let mut held: HashSet<&str> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if held.insert(id) {
+            stack.extend(parents.get(id).into_iter().flatten());
+        }
+    }
+    // Whether an issue and everything above it hold nothing: none of them is
+    // ephemeral but not a candidate.
+    let mut clear: HashMap<String, bool> = HashMap::new();
+    let mut purge = BTreeSet::new();
+    for id in candidates {
+        if held.contains(id.as_str()) {
+            continue;
+        }
+        if !clear.contains_key(id) {
+            clear_upwards(conn, candidates, id, &mut clear)?;
+        }
+        if clear[id] {
+            purge.insert(id.clone());
+        }
+    }
+    Ok(purge)
+}
+
+/// Fill `clear` for `id` and its ancestors up to the first one already known,
+/// with one parent lookup per issue. A hierarchy cycle (only reachable through
+/// a hand-made database) settles as a whole: every issue on it is above all
+/// the others.
+fn clear_upwards(
+    conn: &Connection,
+    candidates: &BTreeSet<String>,
+    id: &str,
+    clear: &mut HashMap<String, bool>,
+) -> Result<()> {
+    let mut path: Vec<String> = Vec::new();
+    let mut on_path: HashMap<String, usize> = HashMap::new();
+    let mut cur = id.to_string();
+    let mut above = true;
+    let mut cycle = None;
+    loop {
+        if let Some(&known) = clear.get(&cur) {
+            above = known;
+            break;
+        }
+        if let Some(&at) = on_path.get(&cur) {
+            cycle = Some(at);
+            break;
+        }
+        on_path.insert(cur.clone(), path.len());
+        path.push(cur.clone());
+        match graph::parent_of(conn, &cur)? {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    let mut stmt = conn.prepare_cached("SELECT ephemeral FROM issues WHERE id = ?1")?;
+    let mut holds_nothing = |x: &str| -> Result<bool> {
+        Ok(candidates.contains(x) || !stmt.query_row([x], |r| Ok(r.get::<_, i64>(0)? != 0))?)
+    };
+    if let Some(at) = cycle {
+        for x in &path[at..] {
+            above &= holds_nothing(x)?;
+        }
+        for x in path.drain(at..) {
+            clear.insert(x, above);
+        }
+    }
+    while let Some(x) = path.pop() {
+        above &= holds_nothing(&x)?;
+        clear.insert(x, above);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize)]

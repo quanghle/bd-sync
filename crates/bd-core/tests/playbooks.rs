@@ -1,5 +1,6 @@
 //! Playbooks, runs, and gates at the engine level (manual clock).
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -365,6 +366,212 @@ fn ephemeral_runs_stay_out_of_exports_and_purge_whole() {
         .collect();
     assert!(ops.contains(&"purged".to_string()) && !ops.contains(&"deleted".to_string()), "one summary event");
     env.assert_healthy();
+}
+
+/// Which closed ephemeral issues a purge deletes: a candidate (closed past
+/// the cutoff) goes when everything below it is a candidate too and every
+/// ephemeral issue above it is one (persistent ancestors, open or not, never
+/// hold it), even if a candidate ancestor itself has to stay.
+#[test]
+fn purge_deletes_candidates_whose_subtree_and_ephemeral_ancestors_are_candidates() {
+    let mut env = Env::new();
+    let mut make = |title: &str, parent: Option<&str>, ephemeral: bool| -> String {
+        let new = NewIssue { parent: parent.map(String::from), ephemeral, ..NewIssue::titled(title) };
+        env.store.write("c", "alice", |tx| tx.create_issue(new)).unwrap().id
+    };
+    // A whole closed ephemeral tree.
+    let a = make("a", None, true);
+    let a1 = make("a1", Some(&a), true);
+    let a2 = make("a2", Some(&a1), true);
+    let a1b = make("a1b", Some(&a), true);
+    // A closed ephemeral run whose last step closed too recently.
+    let b = make("b", None, true);
+    let b1 = make("b1", Some(&b), true);
+    let b2 = make("b2", Some(&b), true);
+    // A persistent child holds its ephemeral parent but neither its ephemeral
+    // child nor its ephemeral sibling.
+    let c = make("c", None, true);
+    let c1 = make("c1", Some(&c), false);
+    let c1x = make("c1x", Some(&c1), true);
+    let c2 = make("c2", Some(&c), true);
+    // Under an open persistent parent.
+    let d = make("d", None, false);
+    let d1 = make("d1", Some(&d), true);
+    let d1a = make("d1a", Some(&d1), true);
+    // Under an open ephemeral parent, even across a persistent one.
+    let e = make("e", None, true);
+    let e1 = make("e1", Some(&e), true);
+    let f1 = make("f1", Some(&e), false);
+    let f2 = make("f2", Some(&f1), true);
+    // Survivors with edges into the purge, and a spawner losing a closed child.
+    let keep = make("keep", None, false);
+    let cond = make("cond", None, false);
+    let spawner = make("spawner", None, false);
+    let spawned = make("spawned", Some(&spawner), true);
+    let live = make("live", Some(&spawner), false);
+    let waiter = make("waiter", None, false);
+    env.store
+        .write("dep", "alice", |tx| {
+            tx.add_dependency(&keep, &a2, DepType::Blocks, None)?;
+            tx.add_dependency(&a, &keep, DepType::Related, None)?;
+            tx.add_dependency(&waiter, &spawner, DepType::WaitsFor, Some(json!({ "gate": "any-children" })))
+        })
+        .unwrap();
+    for id in [&a2, &a1, &a1b, &a, &b1, &c1x, &c1, &c2, &c, &d1a, &d1, &e1, &f2, &f1, &spawned] {
+        env.close(id);
+    }
+    env.store.write("dep", "alice", |tx| tx.add_dependency(&cond, &a2, DepType::ConditionalBlocks, None)).unwrap();
+    assert!(env.issue(&cond).is_blocked && !env.issue(&waiter).is_blocked && env.issue(&live).status == Status::Open);
+    env.clock.advance(Duration::from_secs(3600));
+    env.close(&b2);
+    env.close(&b);
+
+    let mut expected = vec![a.clone(), a1.clone(), a2.clone(), a1b.clone(), c1x, c2, d1, d1a, spawned];
+    expected.sort();
+    let older = Some(Duration::from_secs(1800));
+    let head = env.store.read(|r| r.events(&EventQuery::default())).unwrap().events.last().unwrap().seq;
+    let dry = env.store.write("purge", "alice", |tx| tx.purge_ephemeral(older, true)).unwrap();
+    assert_eq!((dry.deleted.clone(), dry.dry_run), (expected.clone(), true));
+    assert!(dry.detached.is_empty() && env.store.read(|r| r.find_issue(&a)).unwrap().is_some());
+
+    let out = env.store.write("purge", "alice", |tx| tx.purge_ephemeral(older, false)).unwrap();
+    assert_eq!(out.deleted, expected);
+    assert_eq!(out.detached, {
+        let mut v = vec![keep.clone(), cond.clone()];
+        v.sort();
+        v
+    });
+    for id in &expected {
+        assert!(env.store.read(|r| r.find_issue(id)).unwrap().is_none(), "{id} purged");
+    }
+    for id in [&b, &b1, &b2, &c, &c1, &d, &e, &e1, &f1, &f2, &keep, &cond, &spawner, &live, &waiter] {
+        assert!(env.store.read(|r| r.find_issue(id)).unwrap().is_some(), "{id} kept");
+    }
+    assert!(!env.issue(&cond).is_blocked, "its conditional blocker is gone");
+    assert!(env.issue(&waiter).is_blocked, "the spawner's only closed child is gone");
+
+    let events = env.store.read(|r| r.events(&EventQuery { since: Some(head), ..Default::default() })).unwrap().events;
+    let ops: Vec<(&str, Option<&str>)> = events.iter().map(|e| (e.op.as_str(), e.issue_id.as_deref())).collect();
+    assert_eq!(ops, vec![("purged", None), ("unblocked", Some(cond.as_str())), ("blocked", Some(waiter.as_str()))]);
+    let cutoff = env.store.read(|r| Ok(r.now())).unwrap().minus(Duration::from_secs(1800));
+    assert_eq!(
+        events[0].data,
+        json!({ "cutoff": cutoff, "ids": expected, "count": expected.len(), "detached": out.detached })
+    );
+    env.assert_healthy();
+
+    let again = env.store.write("purge", "alice", |tx| tx.purge_ephemeral(None, false)).unwrap();
+    let mut rest = vec![b, b1, b2];
+    rest.sort();
+    assert_eq!(again.deleted, rest, "the run goes once its last step is old enough");
+    env.assert_healthy();
+}
+
+/// What a purge deletes, decided per candidate from its whole subtree and its
+/// chain of ancestors (the definition the engine computes in one pass).
+fn purge_by_definition(conn: &rusqlite::Connection, cutoff: Timestamp) -> Vec<String> {
+    let query = |sql: &str, arg: &dyn rusqlite::ToSql| -> Vec<String> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map([arg], |r| r.get(0)).unwrap().map(|r| r.unwrap()).collect()
+    };
+    let candidates: BTreeSet<String> =
+        query("SELECT id FROM issues WHERE ephemeral = 1 AND status = 'closed' AND closed_at <= ?1", &cutoff)
+            .into_iter()
+            .collect();
+    let mut out = Vec::new();
+    for id in &candidates {
+        let below = query(
+            "WITH RECURSIVE sub(id) AS (
+                 SELECT issue_id FROM dependencies WHERE depends_on_id = ?1 AND dep_type = 'parent-child'
+                 UNION SELECT d.issue_id FROM sub s JOIN dependencies d ON d.depends_on_id = s.id
+                 WHERE d.dep_type = 'parent-child')
+             SELECT id FROM sub",
+            id,
+        );
+        let mut above = Vec::new();
+        let mut cur = id.clone();
+        while let Some(p) = query(
+            "SELECT depends_on_id FROM dependencies WHERE issue_id = ?1 AND dep_type = 'parent-child'
+             ORDER BY depends_on_id LIMIT 1",
+            &cur,
+        )
+        .pop()
+        {
+            if above.contains(&p) {
+                break;
+            }
+            above.push(p.clone());
+            cur = p;
+        }
+        let ephemeral = |x: &String| query("SELECT id FROM issues WHERE id = ?1 AND ephemeral = 1", x).len() == 1;
+        if below.iter().all(|d| candidates.contains(d)) && above.iter().all(|a| candidates.contains(a) || !ephemeral(a))
+        {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+#[test]
+fn purge_matches_its_definition_on_random_forests() {
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut roll = |n: u64| -> u64 {
+        seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % n
+    };
+    for round in 0..12 {
+        let mut env = Env::new();
+        let n = 60;
+        let mut ids: Vec<String> = Vec::new();
+        let mut parent: Vec<Option<usize>> = Vec::new();
+        for i in 0..n {
+            let p = if i == 0 || roll(4) == 0 { None } else { Some(roll(i as u64) as usize) };
+            let new = NewIssue {
+                parent: p.map(|p| ids[p].clone()),
+                ephemeral: roll(5) != 0,
+                ..NewIssue::titled(format!("n{i}"))
+            };
+            ids.push(env.store.write("c", "alice", |tx| tx.create_issue(new)).unwrap().id);
+            parent.push(p);
+        }
+        // 0 open, 1 closed recently, 2 closed long ago; a parent closes after its children.
+        let mut state = vec![0u8; n];
+        for i in (0..n).rev() {
+            let floor = (0..n).filter(|&c| parent[c] == Some(i)).map(|c| state[c]).min().unwrap_or(2);
+            state[i] = roll(u64::from(floor) + 2).min(u64::from(floor)) as u8;
+        }
+        for phase in [2, 1] {
+            for i in (0..n).rev().filter(|&i| state[i] == phase) {
+                env.close(&ids[i]);
+            }
+            env.clock.advance(Duration::from_secs(3600));
+        }
+        if round % 3 == 2 {
+            // Hand-made hierarchies: extra parents and cycles.
+            env.store
+                .write("sql", "alice", |tx| {
+                    for _ in 0..6 {
+                        let (a, b) = (roll(n as u64) as usize, roll(n as u64) as usize);
+                        tx.conn().execute(
+                            "INSERT OR IGNORE INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+                             SELECT ?1, ?2, 'parent-child', 0 WHERE ?1 <> ?2",
+                            [&ids[a], &ids[b]],
+                        )?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let older = Duration::from_secs(5400);
+        let cutoff = env.store.read(|r| Ok(r.now())).unwrap().minus(older);
+        let expected = env.store.read(|r| Ok(purge_by_definition(r.conn(), cutoff))).unwrap();
+        let got = env.store.write("purge", "alice", |tx| tx.purge_ephemeral(Some(older), true)).unwrap().deleted;
+        assert_eq!(got, expected, "round {round}");
+        let all = env.store.read(|r| Ok(purge_by_definition(r.conn(), r.now()))).unwrap();
+        let got = env.store.write("purge", "alice", |tx| tx.purge_ephemeral(None, true)).unwrap().deleted;
+        assert_eq!(got, all, "round {round}");
+        assert!(!all.is_empty() && all.len() < n, "round {round}: a forest with something to keep and to purge");
+    }
 }
 
 #[test]

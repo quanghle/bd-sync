@@ -254,8 +254,8 @@ fn walk_the_graph(ws: &mut Ws) {
     ws.write("alice", None, |tx| tx.defer_issue(&group, Some(Timestamp(T0 + 86_400_000))));
     reads(ws);
 
-    // Scratch work purged, then the run deleted with everything under it.
-    let scratch = ws.create(NewIssue { ephemeral: true, ..NewIssue::titled("Scratch") });
+    // Scratch work under a persistent issue purged, then the run deleted with everything under it.
+    let scratch = ws.create(NewIssue { ephemeral: true, ..child("Scratch", &after) });
     let scratch_step = ws.create(NewIssue { ephemeral: true, ..child("Scratch step", &scratch) });
     ws.write("alice", None, |tx| tx.close_issue(&scratch_step, &CloseOptions::default()));
     ws.write("alice", None, |tx| tx.close_issue(&scratch, &CloseOptions::default()));

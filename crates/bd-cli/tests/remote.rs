@@ -1127,8 +1127,13 @@ fn events_head(client: &Client) -> String {
 
 /// Send `argv` to workspace `proj` on a connection that closes after the answer, without reading it.
 fn send_exec(addr: &str, secret: &str, argv: Value) -> std::net::TcpStream {
+    send_request(addr, secret, json!({ "argv": argv }))
+}
+
+/// Send the request `body` to workspace `proj`, like [`send_exec`].
+fn send_request(addr: &str, secret: &str, body: Value) -> std::net::TcpStream {
     let mut conn = std::net::TcpStream::connect(addr).unwrap();
-    let body = json!({ "argv": argv }).to_string();
+    let body = body.to_string();
     let auth = format!("Authorization: Bearer {secret}\r\n");
     write!(
         conn,
@@ -1300,8 +1305,11 @@ fn waiting_followers_hold_no_command_slots() {
     let head = events_head(&alice);
     let addr = server.base.trim_start_matches("http://").to_string();
     // More waiting followers than commands run at once (32).
-    let argv = json!(["--json", "events", "--since", head, "--wait", "60s", "--op", "closed"]);
-    let waiting: Vec<std::net::TcpStream> = (0..40).map(|_| send_exec(&addr, &secret, argv.clone())).collect();
+    let request = json!({
+        "argv": ["--json", "events", "--since", head, "--wait", "60s", "--op", "closed"],
+        "cursor": true,
+    });
+    let waiting: Vec<std::net::TcpStream> = (0..40).map(|_| send_request(&addr, &secret, request.clone())).collect();
     std::thread::sleep(Duration::from_millis(500));
 
     // Claims run at once, and the events they write wake the followers, whose filters skip them.
@@ -1326,6 +1334,75 @@ fn waiting_followers_hold_no_command_slots() {
         assert!(frames[0].contains("\\\"op\\\":\\\"closed\\\""), "{answer}");
         assert!(frames[1].starts_with("{\"cursor\":"), "{answer}");
     }
+}
+
+#[test]
+fn only_clients_that_ask_get_cursor_frames() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    alice.ok(&["create", "First"]);
+    alice.ok(&["create", "Second"]);
+    let head = events_head(&alice);
+    // Clients from before cursor frames (protocol 2 all the same) fail on
+    // frames they do not know: they get stdout and exit frames only, as before.
+    for argv in [
+        json!(["events", "-n", "20"]),
+        json!(["--json", "events", "--since", "0"]),
+        json!(["events", "--since", &head, "--wait", "1s"]),
+    ] {
+        let (status, plain) = post(&server.url(), &secret, &json!({ "argv": argv }));
+        assert_eq!((status, &plain["exit_code"]), (200, &json!(0)), "{plain}");
+        assert!(plain["cursor"].is_null(), "{argv}: {plain}");
+        let (_, asked) = post(&server.url(), &secret, &json!({ "argv": argv, "cursor": true }));
+        assert_eq!(asked["cursor"], json!(head.parse::<i64>().unwrap()), "{argv}: {asked}");
+        assert_eq!(asked["stdout"], plain["stdout"], "{argv}");
+    }
+
+    // A follower asks for them, and prints every event once, in order.
+    let mut follower = Follower::start(&mut alice.cmd(&["--json", "events", "--follow", "--interval-ms", "200"]));
+    for i in 3..=6 {
+        alice.ok(&["create", &format!("Task {i}")]);
+    }
+    follower.wait_for(&["\"issue_id\":\"t-6\""]);
+    let seqs: Vec<i64> =
+        follower.seen.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()["seq"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, (1..=events_head(&alice).parse().unwrap()).collect::<Vec<_>>(), "each event once, in order");
+}
+
+#[test]
+fn requests_too_large_to_hold_do_not_wait() {
+    let (server, log) = logged_server(Server::prepare(), &[]);
+    let secret = server.token("dashboard", "dash", &["--role", "read"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "First"]);
+    let head = events_head(&alice);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    // A waiting request holds its parsed body outside the memory budget: a
+    // large one (here with stdin `events` never reads) is answered at once.
+    let large = json!({
+        "argv": ["events", "--since", &head, "--wait", "60s"],
+        "stdin": "x".repeat(1 << 20),
+        "cursor": true,
+    });
+    let started = Instant::now();
+    let answer = read_answer(send_request(&addr, &secret, large));
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    let frames: Vec<Value> =
+        answer.split("\r\n\r\n").nth(1).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let cursor = json!({ "cursor": head.parse::<i64>().unwrap() });
+    assert_eq!(frames, [cursor, json!({ "exit": { "exit_code": 0, "stderr": "", "replayed": false } })], "nothing yet");
+    assert_eq!(logged(&log, "request too large to wait; not waiting"), 1);
+    assert_eq!(logged(&log, "waiting for events"), 0);
+
+    // The same request, small, waits.
+    let small = json!({ "argv": ["events", "--since", &head, "--wait", "60s"], "stdin": "x" });
+    let waiting = send_request(&addr, &secret, small);
+    eventually("the small request waiting", || logged(&log, "waiting for events") == 1);
+    alice.ok(&["create", "Second"]);
+    let answer = read_answer(waiting);
+    assert!(answer.contains("created t-2"), "{answer}");
 }
 
 #[test]
@@ -3170,4 +3247,31 @@ fn a_server_too_old_for_checkout_playbooks_says_so() {
     // Commands that send no playbooks are its own business.
     let out = client.run(&["playbook", "show", "elsewhere"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("unexpected argument"), "{out:?}");
+}
+
+#[test]
+fn a_server_too_old_for_followers_says_so() {
+    // A protocol 2 server from before cursor frames: listings without them, and no `events --wait`.
+    // Frames of types added later are skipped.
+    let later = json!({ "later": { "x": 1 } }).to_string();
+    let listing =
+        move || answer(&[later.clone(), stdout_frame("#1 created t-1 by alice\n"), exit_frame(0, "")], false, 0);
+    let old = FakeServer::start(move |_| listing());
+    let client = old.client();
+    assert_eq!(client.ok(&["events", "-n", "20"]), "#1 created t-1 by alice\n", "plain listings work");
+    let out = client.run(&["events", "--follow"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("older bd") && stderr.contains("upgrade"), "{stderr}");
+
+    let refusal = "error: unexpected argument '--wait' found\n\nUsage: bd events [OPTIONS]\n";
+    let old = FakeServer::start(move |_| answer(&[exit_frame(2, refusal)], false, 0));
+    let client = old.client();
+    for args in [&["events", "--follow", "--since", "0"][..], &["events", "--since", "0", "--wait", "5s"][..]] {
+        let out = client.run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(stderr.contains("older bd") && stderr.contains("upgrade"), "{args:?}: {stderr}");
+    }
+    assert_eq!(old.requests.load(Ordering::SeqCst), 2, "refused at once, not retried");
 }

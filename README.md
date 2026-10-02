@@ -733,9 +733,11 @@ directly: `POST /w/<name>/v2/exec` with `Authorization: Bearer <token>` and
 wrote them: `{"stdout": "..."}` for output, `{"file": {"path", "data"}}` for
 part of an output file, and last `{"exit": {"exit_code", "stderr", "replayed"}}`.
 Blank lines are keep-alives, and an answer without the exit frame was cut
-off. An event listing (`events`) also sends `{"cursor": N}` before its exit
-frame: the `--since` value that continues after it, past the events its
-filters skipped. `["events", "--since", "N", "--wait", "25s", "--json"]` is a
+off. A request with `"cursor": true` asks for an event listing's
+(`events`) `{"cursor": N}` frame, sent before its exit frame: the `--since`
+value that continues after it, past the events its filters skipped. Clients
+skip frames of types they do not know; new types are sent only to clients
+that ask for them. `["events", "--since", "N", "--wait", "25s", "--json"]` is a
 long poll: answered as soon as an event matching its filters follows `N`, or
 with no events (and the cursor) when the wait ends. Failures before the
 command runs return a non-200 status with the `--json` error shape. Every
@@ -758,7 +760,8 @@ from the newest event. Under load, a follower asks at most once per
 than the server's `--max-wait` takes several requests.
 
 A waiting request holds no command slot, database connection, transaction or
-memory budget on the server, only its connection. The server learns of new
+memory budget on the server, only its connection and its small request (one
+larger than 16 KiB, say with stdin, is answered at once). The server learns of new
 events from the commands it runs (clients' writes and its own background
 jobs), and, while anyone waits on a workspace, by reading its events head
 every 500 ms, for writes by other processes on its host (`bd` opening

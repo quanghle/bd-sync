@@ -5,7 +5,8 @@
 //! Such a request first checks whether an event matching its filters follows
 //! `N`. If none does, it waits on its workspace's [`Feeds`] entry before its
 //! command runs: it holds no command slot, database connection, transaction
-//! or memory budget meanwhile, only its connection and a place among the
+//! or memory budget meanwhile, only its connection, its small parsed request
+//! (a larger one, over 16 KiB, is answered at once) and a place among the
 //! server's followers (`--max-followers`; a request past that is answered at
 //! once, and its client polls). Each time the workspace's events head moves
 //! past what the request has seen, it checks again (its filters may skip the

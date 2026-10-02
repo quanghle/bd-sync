@@ -622,19 +622,30 @@ fn events_request(
     if let Some(by) = &a.by_actor {
         argv.extend(["--by".into(), by.clone()]);
     }
-    ExecRequest { argv, actor: env_actor(), location: Some(remote.url.clone()), ..Default::default() }
+    // Its answer ends with a cursor frame (servers before cursor frames send none).
+    ExecRequest { argv, actor: env_actor(), location: Some(remote.url.clone()), cursor: true, ..Default::default() }
+}
+
+/// What a server too old for remote followers says (it runs a bd from before cursor frames).
+fn server_too_old(remote: &Remote) -> Error {
+    Error::Refused(format!(
+        "{}: this bd server cannot send events as they are committed (it runs an older bd); upgrade it",
+        remote.url
+    ))
 }
 
 /// Print the events of an answer; returns where they end (the cursor to
 /// continue from), or the exit code of a failure, whose error is printed.
 fn print_events(remote: &Remote, r: ExecResponse) -> Result<std::result::Result<i64, i32>> {
+    if r.exit_code == 2 && r.stderr.contains("'--wait'") {
+        // Its command line parser does not know `events --wait`.
+        return Err(server_too_old(remote));
+    }
     if r.exit_code != 0 {
         let _ = std::io::stderr().write_all(r.stderr.as_bytes());
         return Ok(Err(r.exit_code));
     }
-    let cursor = r.cursor.ok_or_else(|| {
-        Error::Remote(format!("{}: the server sent no event cursor (is it another bd version?)", remote.url))
-    })?;
+    let cursor = r.cursor.ok_or_else(|| server_too_old(remote))?;
     io::out(&r.stdout);
     Ok(Ok(cursor))
 }

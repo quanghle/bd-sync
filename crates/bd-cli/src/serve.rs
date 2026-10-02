@@ -33,8 +33,9 @@
 //! Followers: `events --since N --wait D` (what remote `events --follow`
 //! sends) waits for a matching event before its command runs, without a
 //! command slot, a database connection or memory budget (`follow.rs`). Up to
-//! `--max-followers` requests wait at once, for at most `--max-wait`; others
-//! run at once, and their clients poll.
+//! `--max-followers` requests wait at once, for at most `--max-wait`; others,
+//! and requests too large to hold outside the budget, run at once, and their
+//! clients poll.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -121,6 +122,11 @@ const WRITE_STALL: Duration = Duration::from_secs(60);
 /// The most requests `--max-followers` lets wait for events: half the
 /// connections, so that followers cannot take all of them.
 const MAX_FOLLOWERS: usize = MAX_CONNECTIONS / 2;
+/// The largest request that waits for events. A waiting request holds no
+/// memory budget, only its parsed request, so all of them hold at most
+/// `--max-followers` times this (their command lines are shorter still:
+/// `follow::requested`). Larger ones (sent with stdin, say) run at once.
+const MAX_WAITING_BODY: usize = 16 << 10;
 /// The range of `--max-wait`.
 const MAX_WAIT_RANGE: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(5 * 60));
 /// On shutdown, how long waiting followers may take to get their answers.
@@ -474,12 +480,13 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
             return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
         }
     };
-    let request: ExecRequest = match serde_json::from_slice(&body) {
+    let mut request: ExecRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => {
             return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("bad request body: {e}"), 2).response();
         }
     };
+    let body_size = body.len();
     drop(body);
     let bundled = request.argv.iter().any(|a| a == "--playbook-bundle" || a.starts_with("--playbook-bundle="));
     let planning = match bundled {
@@ -491,9 +498,14 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
         },
     };
     let mut waited = None;
-    if let Some((cli, wait)) = follow::requested(&request.argv) {
-        // A waiting request holds no memory: its body is parsed, and its answer comes later.
+    let wait = follow::requested(&request.argv);
+    if wait.is_some() && body_size > MAX_WAITING_BODY {
+        tracing::debug!(target: "bd::serve", workspace = %ws.name, bytes = body_size, "request too large to wait; not waiting");
+    } else if let Some((cli, wait)) = wait {
+        // A waiting request holds no memory budget: its answer comes later,
+        // and its body is parsed, small, and without the inputs `events` never reads.
         drop((budget.take(), answer_budget.take()));
+        (request.stdin, request.files) = Default::default();
         // A request its token may not make is refused at once, by `run`.
         if resolve_actor(cli.global.actor.as_deref(), request.actor.as_deref(), &token).is_ok() {
             match server.wait_for_events(&ws, wait).await {
@@ -888,6 +900,9 @@ impl Server {
         waited: Option<Waited>,
         mut out: FrameWriter,
     ) -> std::result::Result<(), Reject> {
+        if request.cursor {
+            out.send_cursor();
+        }
         let mut cli = match Cli::try_parse_from(std::iter::once("bd".to_string()).chain(request.argv.iter().cloned())) {
             Ok(cli) => cli,
             Err(e) => return respond(&mut out, &parse_failure(&e)),

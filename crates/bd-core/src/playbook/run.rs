@@ -477,8 +477,14 @@ fn digest(root: &Issue, tree: &[(usize, Issue)], summary: Option<&str>, now: Tim
             (Status::Closed | Status::Pinned, _) => "✓",
             _ => "○",
         };
-        let mut line =
-            format!("{}- {icon} {}: {}", graph::indent(depth.saturating_sub(1)), short_key(root, i), i.title);
+        // Top-level steps are not indented; past the cap the label keeps the
+        // line a list item and names the same depth as `playbook status`.
+        let level = depth.saturating_sub(1);
+        let (pad, label) = match level <= graph::MAX_INDENT {
+            true => ("  ".repeat(level), String::new()),
+            false => ("  ".repeat(graph::MAX_INDENT), format!("[depth {depth}] ")),
+        };
+        let mut line = format!("{pad}- {label}{icon} {}: {}", short_key(root, i), i.title);
         let mut extra = Vec::new();
         if let Some(a) = &i.assignee {
             extra.push(format!("@{a}"));

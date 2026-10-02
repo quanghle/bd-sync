@@ -45,6 +45,12 @@ const MAX_LOCK_WAIT: Duration = Duration::from_secs(1);
 const MIN_SERVER: Duration = Duration::from_secs(1);
 const MIN_LOCK_WAIT: Duration = Duration::from_millis(200);
 
+/// What is left of [`HOOK_BUDGET`] for the server, never less than its
+/// floor: `bd prime` in a session hook bounds its request with it.
+pub fn server_budget(app: &App) -> Duration {
+    (app.started + HOOK_BUDGET).saturating_duration_since(Instant::now()).max(MIN_SERVER)
+}
+
 /// The server's time, and the wait for the checkout's mutex, out of `left`
 /// of [`HOOK_BUDGET`]: a fifth for the mutex (one second at most), the rest
 /// for the server; never less than the floors.

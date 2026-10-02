@@ -329,7 +329,8 @@ pub(crate) fn is_loopback(authority: &str) -> bool {
 }
 
 /// `bd prime` in text mode, or with `--hook`: session hooks run it, so it
-/// gives up quickly and reports an unavailable workspace as context instead
+/// gives up within the hook's budget (even against a server that accepts
+/// the connection and never answers) and reports an unavailable workspace as context instead
 /// of failing the hook.
 pub fn is_hook(cli: &Cli) -> bool {
     matches!(&cli.command, Command::Prime(a) if a.hook.is_some() || !cli.global.json)
@@ -355,7 +356,7 @@ pub fn unavailable(cli: &Cli, e: &Error) -> i32 {
 /// Run the command on the server; returns the process exit code.
 pub fn run(app: &mut App, remote: Remote, cli: &Cli) -> i32 {
     let hook = is_hook(cli);
-    let remote = if hook { remote.quick() } else { remote };
+    let remote = if hook { remote.quick().within(crate::agents::hook::server_budget(app)) } else { remote };
     match forward(app, &remote, cli, hook) {
         Ok(response) if hook && response.exit_code != 0 => unavailable(cli, &response_error(&response, &remote.url)),
         Ok(response) => {

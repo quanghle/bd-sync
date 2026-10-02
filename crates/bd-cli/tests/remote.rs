@@ -925,7 +925,7 @@ fn prime_in_session_hooks_never_fails() {
     let out = bd(checkout.path()).env("BD_TOKEN", "bdt_x").arg("prime").output().unwrap();
     assert_eq!(out.status.code(), Some(0), "server down");
     assert!(String::from_utf8_lossy(&out.stdout).contains("unavailable"));
-    assert!(started.elapsed() < Duration::from_secs(15), "hooks are not held up: {:?}", started.elapsed());
+    assert!(started.elapsed() < Duration::from_secs(10), "hooks are not held up: {:?}", started.elapsed());
 
     let out = bd(checkout.path())
         .env("BD_TOKEN", "bdt_x")
@@ -934,6 +934,31 @@ fn prime_in_session_hooks_never_fails() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(8), "--json keeps strict errors");
+
+    // Accepts connections and never answers: the hook's 5s budget, not a request's own 15s.
+    let stalling = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    std::fs::write(
+        checkout.path().join(".bd/remote.toml"),
+        format!("url = \"http://{}/w/proj\"\n", stalling.local_addr().unwrap()),
+    )
+    .unwrap();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for conn in stalling.incoming() {
+            held.push(conn);
+        }
+    });
+    for args in [&["prime"][..], &["prime", "--hook", "copilot"]] {
+        let started = Instant::now();
+        let out = bd(checkout.path()).env("BD_TOKEN", "bdt_x").args(args).stdin(Stdio::null()).output().unwrap();
+        // About 5s by design; generous for a loaded machine, and well short of a request's own 15s.
+        assert!(started.elapsed() < Duration::from_secs(10), "{args:?}: {:?}", started.elapsed());
+        assert_eq!(out.status.code(), Some(0), "{args:?}: stalling server");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let text = if args.len() > 1 { copilot_context(&stdout).unwrap() } else { stdout.into_owned() };
+        assert!(text.starts_with("# bd workflow context\nThe remote bd workspace is unavailable: "), "{text}");
+        assert!(text.contains("s allowed)"), "{text}");
+    }
 }
 
 #[test]

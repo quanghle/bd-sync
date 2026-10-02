@@ -23,6 +23,8 @@
 //! [[github.allow]]
 //! anyone = true                       # any GitHub account (an open project): last, read (default) or write
 //! workspaces = ["oss"]
+//! min_account_age = "30d"             # GitHub accounts younger than this are not let in by the rule
+//! max_claims = 3                      # its tokens' actors may hold at most 3 issues, claimed or reserved
 //! ```
 //!
 //! The server runs GitHub's device flow for the client, so the GitHub token
@@ -42,7 +44,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use bd_core::{Error, Result};
+use bd_core::{Error, Result, Timestamp};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -108,6 +110,10 @@ struct RuleDoc {
     kind: Kind,
     #[serde(default)]
     workspaces: Vec<String>,
+    #[serde(default)]
+    min_account_age: Option<String>,
+    #[serde(default)]
+    max_claims: Option<u32>,
 }
 
 fn agent_kind() -> Kind {
@@ -140,6 +146,8 @@ pub struct Rule {
     pub orgs: Vec<String>,
     /// `(organization, team slug)`.
     pub teams: Vec<(String, String)>,
+    /// Accounts GitHub created less than this long ago are not let in by the rule.
+    pub min_account_age: Option<Duration>,
     pub grant: Grant,
 }
 
@@ -214,6 +222,18 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
                 rules[n].grant.role.as_str(),
                 i + 1,
                 anyone.role.as_str()
+            ));
+        }
+        // Read tokens hold nothing, so only a writing `anyone` rule sets a floor.
+        let fewer = |r: &Rule| {
+            anyone.role != Role::Read && r.grant.max_claims.is_some_and(|n| anyone.max_claims.is_none_or(|a| n < a))
+        };
+        if let Some(n) = rules[..i].iter().position(|r| fewer(r) && overlap(&r.grant, anyone)) {
+            return Err(format!(
+                "[[github.allow]] rule {} lets its accounts hold fewer claims than rule {} lets anyone hold: raise its \
+                 max_claims, or keep their workspaces apart",
+                n + 1,
+                i + 1
             ));
         }
     }
@@ -297,7 +317,15 @@ fn rule(n: usize, r: RuleDoc) -> std::result::Result<Rule, String> {
     }
     let role = r.role.unwrap_or(if r.anyone { Role::Read } else { Role::Write });
     let workspaces = auth::workspace_list(&r.workspaces).map_err(|e| format!("{at}: {e}"))?;
-    Ok(Rule { anyone: r.anyone, users, orgs, teams, grant: Grant { role, kind: r.kind, workspaces } })
+    let min_account_age = match &r.min_account_age {
+        None => None,
+        Some(raw) => Some(bd_core::time::parse_duration(raw).map_err(|e| format!("{at}: min_account_age: {e}"))?),
+    };
+    if r.max_claims == Some(0) {
+        return Err(format!("{at}: max_claims must be at least 1 (role read lets its accounts claim nothing)"));
+    }
+    let grant = Grant { role, kind: r.kind, workspaces, max_claims: r.max_claims };
+    Ok(Rule { anyone: r.anyone, users, orgs, teams, min_account_age, grant })
 }
 
 /// Whether a GitHub account belongs to an organization or a team.
@@ -324,6 +352,9 @@ pub enum Decision {
     In { grant: Grant, via: String, by_login: bool },
     /// Rules let the account in, but only into these other workspaces.
     Elsewhere(Vec<String>),
+    /// A rule would let the account into the workspace, were its GitHub
+    /// account this old (the least such `min_account_age`).
+    TooNew(Duration),
     /// No rule lets the account in.
     Out,
 }
@@ -331,17 +362,27 @@ pub enum Decision {
 /// The first rule that lets `login` into `workspace`: a rule that lets the
 /// account in elsewhere only leaves it to the rules after it, and then the
 /// grant covers `workspace` alone, never one where an earlier rule decides.
-/// Memberships GitHub would not tell are noted in `unknown`.
+/// A rule whose `min_account_age` the account's `age` falls short of (or
+/// whose age GitHub did not tell) does not let it in. Memberships GitHub
+/// would not tell are noted in `unknown`.
 pub fn decide(
     github: &Github,
     login: &str,
+    age: Option<Duration>,
     workspace: &str,
     m: &mut dyn Memberships,
     unknown: &mut Vec<String>,
 ) -> Result<Decision> {
     let mut elsewhere: Vec<String> = Vec::new();
+    let mut too_new: Option<Duration> = None;
     for rule in &github.rules {
         let Some((via, by_login)) = lets_in(rule, login, m, unknown)? else { continue };
+        if let Some(min) = rule.min_account_age.filter(|min| age.is_none_or(|age| age < *min)) {
+            if rule.grant.allows_workspace(workspace) {
+                too_new = Some(too_new.map_or(min, |t| t.min(min)));
+            }
+            continue;
+        }
         if rule.grant.allows_workspace(workspace) {
             let mut grant = rule.grant.clone();
             if !elsewhere.is_empty() {
@@ -355,7 +396,11 @@ pub fn decide(
             }
         }
     }
-    Ok(if elsewhere.is_empty() { Decision::Out } else { Decision::Elsewhere(elsewhere) })
+    Ok(match too_new {
+        Some(min) => Decision::TooNew(min),
+        None if elsewhere.is_empty() => Decision::Out,
+        None => Decision::Elsewhere(elsewhere),
+    })
 }
 
 /// What lets `login` in by `rule`, if anything, and whether it is the login.
@@ -552,15 +597,24 @@ pub fn poll(root: &Path, poll: &SignInPoll) -> Result<SignInAnswer> {
     let Some(access) = body["access_token"].as_str().filter(|t| !t.is_empty()) else {
         return Err(refused(&github, "finish a sign-in", status, &body));
     };
-    let user = account(&api, access)?;
+    let (user, created) = account(&api, access)?;
+    let age = created.map(|at| Duration::from_millis(Timestamp::now().since(at).max(0) as u64));
     if github.deny.contains(&user.id) {
         tracing::info!(target: "bd::serve", login = %user.login, id = user.id, "GitHub sign-in refused: the account is denied");
         return Err(Error::Unauthorized(format!("GitHub user {} may not sign in to this bd server", user.login)));
     }
     let mut asked = Asked { api: &api, token: access, login: &user.login, seen: HashMap::new() };
     let mut unknown = Vec::new();
-    let (grant, via, by_login) = match decide(&github, &user.login, &poll.workspace, &mut asked, &mut unknown)? {
+    let (grant, via, by_login) = match decide(&github, &user.login, age, &poll.workspace, &mut asked, &mut unknown)? {
         Decision::In { grant, via, by_login } => (grant, via, by_login),
+        Decision::TooNew(min) => {
+            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, workspace = %poll.workspace, ?age, "GitHub sign-in refused: the account is too new");
+            return Err(Error::Unauthorized(format!(
+                "GitHub user {} may not sign in to this bd server yet: its GitHub account must be at least {} old",
+                user.login,
+                bd_core::time::format_duration_ms(i64::try_from(min.as_millis()).unwrap_or(i64::MAX))
+            )));
+        }
         Decision::Elsewhere(workspaces) => {
             tracing::info!(target: "bd::serve", login = %user.login, id = user.id, workspace = %poll.workspace, ?unknown, "GitHub sign-in refused: workspace not allowed");
             return Err(Error::Unauthorized(format!(
@@ -598,19 +652,22 @@ pub fn poll(root: &Path, poll: &SignInPoll) -> Result<SignInAnswer> {
         role: token.role.as_str().to_string(),
         kind: token.kind.as_str().to_string(),
         workspaces: token.workspaces,
+        max_claims: token.max_claims,
         expires_at: token.expires_at.map(|t| t.to_rfc3339()).unwrap_or_default(),
         login: user.login,
         via,
     })))
 }
 
-/// The account a GitHub token belongs to, at the GitHub `api` talks to.
-fn account(api: &Api, token: &str) -> Result<GithubUser> {
+/// The account a GitHub token belongs to, at the GitHub `api` talks to,
+/// and when GitHub created it (if it says).
+fn account(api: &Api, token: &str) -> Result<(GithubUser, Option<Timestamp>)> {
     let (status, body) = api.get(token, "/user")?;
     let login = body["login"].as_str().filter(|l| github_name(l));
     match (status, login, body["id"].as_u64()) {
         (200, Some(login), Some(id)) => {
-            Ok(GithubUser { url: api.url.to_ascii_lowercase(), login: login.to_string(), id })
+            let created = body["created_at"].as_str().and_then(|at| Timestamp::parse_rfc3339(at).ok());
+            Ok((GithubUser { url: api.url.to_ascii_lowercase(), login: login.to_string(), id }, created))
         }
         _ => Err(Error::Remote(format!("GitHub answered {status}{} for the account that signed in", message(&body)))),
     }
@@ -735,7 +792,10 @@ mod tests {
         assert_eq!((g.url.as_str(), g.api_url.as_str()), ("https://github.com", "https://api.github.com"));
         assert_eq!(g.token_ttl, DEFAULT_TTL);
         let rule = &g.rules[0];
-        assert_eq!(rule.grant, Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec!["*".into()] });
+        assert_eq!(
+            rule.grant,
+            Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec!["*".into()], max_claims: None }
+        );
         assert!(!g.reads_orgs(), "users alone need no scope");
 
         let g = github(
@@ -761,10 +821,14 @@ mod tests {
              [[github.allow]]\nanyone = true\nworkspaces = [\"oss\"]\n",
         );
         assert!(g.rules[1].anyone && !g.reads_orgs());
-        let read = Grant { role: Role::Read, kind: Kind::Agent, workspaces: vec!["oss".into()] };
+        let read = Grant { role: Role::Read, kind: Kind::Agent, workspaces: vec!["oss".into()], max_claims: None };
         assert_eq!(g.rules[1].grant, read, "anyone reads unless the rule says write");
         let g = github("[github]\nclient_id = \"x\"\n[[github.allow]]\nanyone = true\nrole = \"write\"\n");
         assert_eq!(g.rules[0].grant.role, Role::Write);
+        let g = github(
+            "[github]\nclient_id = \"x\"\n[[github.allow]]\norgs = [\"acme\"]\nmax_claims = 2\n[[github.allow]]\nanyone = true\n",
+        );
+        assert_eq!(g.rules[0].grant.max_claims, Some(2), "strangers who only read hold nothing to compare with");
     }
 
     #[test]
@@ -811,6 +875,23 @@ mod tests {
             (with("token_ttl = \"10m\"", "users = [\"a\"]"), "use 1h to 366d"),
             (with("token_ttl = \"400d\"", "users = [\"a\"]"), "use 1h to 366d"),
             (with("token_ttl = \"soon\"", "users = [\"a\"]"), "token_ttl"),
+            (with("", "anyone = true\nmin_account_age = \"a while\""), "rule 1: min_account_age"),
+            (with("", "anyone = true\nmax_claims = 0"), "max_claims must be at least 1"),
+            (with("", "anyone = true\nmax_claims = -1"), "line 6: invalid value"),
+            (
+                with(
+                    "",
+                    "orgs = [\"acme\"]\nmax_claims = 2\n[[github.allow]]\nanyone = true\nrole = \"write\"\nmax_claims = 5",
+                ),
+                "rule 1 lets its accounts hold fewer claims than rule 2",
+            ),
+            (
+                with(
+                    "",
+                    "orgs = [\"acme\"]\nmax_claims = 2\nworkspaces = [\"p\"]\n[[github.allow]]\nanyone = true\nrole = \"write\"",
+                ),
+                "raise its max_claims, or keep their workspaces apart",
+            ),
             ("[github]\nclient_id = \"has space\"\n[[github.allow]]\nusers = [\"a\"]\n".to_string(), "client_id"),
         ] {
             let e = error(&text);
@@ -859,7 +940,7 @@ mod tests {
         let decide_for = |login: &str, member_of: Vec<&'static str>, blocked: Vec<&'static str>| {
             let mut known = Known { member_of, blocked, asked: Vec::new() };
             let mut unknown = Vec::new();
-            let decided = role_via(decide(&g, login, "proj", &mut known, &mut unknown).unwrap());
+            let decided = role_via(decide(&g, login, None, "proj", &mut known, &mut unknown).unwrap());
             (decided, known.asked, unknown)
         };
         let (decided, asked, _) = decide_for("alice", vec!["acme"], vec![]);
@@ -896,7 +977,7 @@ mod tests {
         );
         let decide_for = |login: &str, workspace: &str| {
             let mut known = Known { member_of: vec!["acme"], blocked: vec![], asked: Vec::new() };
-            decide(&g, login, workspace, &mut known, &mut Vec::new()).unwrap()
+            decide(&g, login, None, workspace, &mut known, &mut Vec::new()).unwrap()
         };
         assert_eq!(role_via(decide_for("bob", "internal")), Some((Role::Admin, "member of acme".into())));
         assert_eq!(role_via(decide_for("bob", "docs")), Some((Role::Write, "GitHub user bob".into())));
@@ -908,7 +989,7 @@ mod tests {
             "[github]\nclient_id = \"x\"\n[[github.allow]]\nusers = [\"bob\"]\nworkspaces = [\"docs\", \"internal\"]\n",
         );
         let mut known = Known { member_of: vec![], blocked: vec![], asked: Vec::new() };
-        let Decision::In { grant, .. } = decide(&g, "bob", "docs", &mut known, &mut Vec::new()).unwrap() else {
+        let Decision::In { grant, .. } = decide(&g, "bob", None, "docs", &mut known, &mut Vec::new()).unwrap() else {
             panic!()
         };
         assert_eq!(grant.workspaces, ["docs", "internal"], "the first rule that lets bob in decides: all of it");
@@ -919,7 +1000,7 @@ mod tests {
 
         let g = github("[github]\nclient_id = \"x\"\n[[github.allow]]\nusers = [\"a\"]\nworkspaces = [\"p\"]\n");
         let mut known = Known { member_of: vec![], blocked: vec![], asked: Vec::new() };
-        assert!(matches!(decide(&g, "z", "p", &mut known, &mut Vec::new()).unwrap(), Decision::Out));
+        assert!(matches!(decide(&g, "z", None, "p", &mut known, &mut Vec::new()).unwrap(), Decision::Out));
     }
 
     #[test]
@@ -931,12 +1012,39 @@ mod tests {
         );
         assert_eq!(g.deny, [7]);
         let mut known = Known { member_of: vec!["acme"], blocked: vec![], asked: Vec::new() };
-        let decided = role_via(decide(&g, "bob", "proj", &mut known, &mut Vec::new()).unwrap());
+        let decided = role_via(decide(&g, "bob", None, "proj", &mut known, &mut Vec::new()).unwrap());
         assert_eq!(decided, Some((Role::Write, "member of acme".into())));
         let mut known = Known { member_of: vec![], blocked: vec![], asked: Vec::new() };
-        let decided = role_via(decide(&g, "Mallory", "proj", &mut known, &mut Vec::new()).unwrap());
+        let decided = role_via(decide(&g, "Mallory", None, "proj", &mut known, &mut Vec::new()).unwrap());
         assert_eq!(decided, Some((Role::Read, "GitHub user Mallory, as anyone".into())));
         assert_eq!(known.asked, ["acme"], "the anyone rule asks GitHub nothing");
+    }
+
+    #[test]
+    fn young_accounts_are_left_to_the_rules_without_a_min_account_age() {
+        let g = github(
+            "[github]\nclient_id = \"x\"\n\
+             [[github.allow]]\norgs = [\"acme\"]\nworkspaces = [\"proj\"]\nmin_account_age = \"7d\"\n\
+             [[github.allow]]\nanyone = true\nworkspaces = [\"proj\", \"oss\"]\nmin_account_age = \"30d\"\nmax_claims = 2\n",
+        );
+        assert_eq!(g.rules[1].min_account_age, Some(Duration::from_secs(30 * 86400)));
+        assert_eq!(g.rules[1].grant.max_claims, Some(2));
+        assert_eq!(g.rules[0].grant.max_claims, None);
+        let days = |n: u64| Some(Duration::from_secs(n * 86400));
+        let decide_for = |login: &str, age: Option<Duration>, workspace: &str| {
+            let mut known = Known { member_of: vec!["acme"], blocked: vec![], asked: Vec::new() };
+            decide(&g, login, age, workspace, &mut known, &mut Vec::new()).unwrap()
+        };
+        assert_eq!(role_via(decide_for("bob", days(8), "proj")), Some((Role::Write, "member of acme".into())));
+        let Decision::In { grant, .. } = decide_for("eve", days(31), "oss") else { panic!() };
+        assert_eq!((grant.role, grant.max_claims), (Role::Read, Some(2)));
+        // Too new for every rule that would let it in: the least age it needs.
+        assert!(matches!(decide_for("bob", days(6), "proj"), Decision::TooNew(d) if d == days(7).unwrap()));
+        assert!(matches!(decide_for("bob", days(6), "oss"), Decision::TooNew(d) if d == days(30).unwrap()));
+        assert!(matches!(decide_for("bob", None, "proj"), Decision::TooNew(_)), "no age from GitHub: too new");
+        // Too new for a rule elsewhere only: the rules for this workspace decide.
+        let mut known = Known { member_of: vec![], blocked: vec![], asked: Vec::new() };
+        assert!(matches!(decide(&g, "eve", days(1), "secret", &mut known, &mut Vec::new()).unwrap(), Decision::Out));
     }
 
     #[test]

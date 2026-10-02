@@ -1333,6 +1333,9 @@ pub struct TokenCreateArgs {
     /// Workspaces the token may use (repeatable or comma separated; default all)
     #[arg(long = "workspace", value_delimiter = ',', value_name = "NAME")]
     pub workspaces: Vec<String>,
+    /// The most issues its actor and its agents may hold, claimed or reserved (default no limit)
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    pub max_claims: Option<u32>,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }

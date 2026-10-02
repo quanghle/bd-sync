@@ -1621,6 +1621,7 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
             "role": issued.role,
             "kind": issued.kind,
             "workspaces": issued.workspaces,
+            "max_claims": issued.max_claims,
             "expires_at": issued.expires_at,
         });
     }
@@ -1628,10 +1629,13 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
     let mut out = match &signed_in {
         Some(issued) => {
             use crate::agents::show::printable;
-            let workspaces = match issued.workspaces.iter().any(|w| w == "*") {
+            let mut workspaces = match issued.workspaces.iter().any(|w| w == "*") {
                 true => "all".to_string(),
                 false => issued.workspaces.join(","),
             };
+            if let Some(n) = issued.max_claims {
+                workspaces.push_str(&format!(", at most {n} claims"));
+            }
             Out::new(view)
                 .line(format!("✓ Signed in with GitHub as {} ({})", printable(&issued.login), printable(&issued.via)))
                 .line(saved_line)

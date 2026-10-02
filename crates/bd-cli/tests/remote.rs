@@ -4470,6 +4470,8 @@ struct GithubState {
     minted: usize,
     /// User ids by login, where not derived from the login: a renamed account keeps its id.
     ids: std::collections::HashMap<String, u64>,
+    /// When GitHub created each account, where not long ago (`2015-01-01`).
+    created: std::collections::HashMap<String, String>,
     /// `METHOD /path` of each request, with its form body.
     log: Vec<String>,
 }
@@ -4499,6 +4501,10 @@ impl FakeGithub {
     /// `login` is the account with this id (a rename keeps it; another account taking a login has another).
     fn set_id(&self, login: &str, id: u64) {
         self.state.lock().unwrap().ids.insert(login.to_string(), id);
+    }
+
+    fn set_created(&self, login: &str, at: &str) {
+        self.state.lock().unwrap().created.insert(login.to_string(), at.to_string());
     }
 
     fn member(&self, login: &str, of: &str) {
@@ -4583,7 +4589,8 @@ fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubS
             Some(l) => {
                 // A distinct id per login, as GitHub's are, unless set.
                 let id = s.ids.get(l).copied().unwrap_or_else(|| l.bytes().fold(7u64, |h, b| h * 31 + u64::from(b)));
-                (200, json!({ "login": l, "id": id, "type": "User" }))
+                let created = s.created.get(l).map_or("2015-01-01T00:00:00Z", String::as_str);
+                (200, json!({ "login": l, "id": id, "type": "User", "created_at": created }))
             }
             None => (401, json!({ "message": "Bad credentials" })),
         },
@@ -4908,6 +4915,66 @@ fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
     issued(sign_in("newcomer", 3).1);
 }
 
+#[test]
+fn github_sign_in_rules_keep_out_new_accounts_and_cap_claims() {
+    let github = FakeGithub::start();
+    let server = sign_in_server(
+        &github,
+        "[[github.allow]]\nanyone = true\nrole = \"write\"\nmin_account_age = \"30d\"\nmax_claims = 1\n",
+    );
+    let url = server.url();
+    let sign_in = |login: &str| {
+        github.next(login, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let out = github_login(dir.path(), &url);
+        (dir, out)
+    };
+
+    // A day-old account, or one GitHub gives no age for, is not let in.
+    let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+    github.set_created("fresh", &yesterday);
+    github.set_created("ageless", "");
+    for login in ["fresh", "ageless"] {
+        let out = sign_in(login).1;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(7), "{stderr}");
+        assert!(stderr.contains("its GitHub account must be at least 30d old"), "{stderr}");
+    }
+
+    let (dir, out) = sign_in("veteran");
+    let v: Value = serde_json::from_str(&check(out, "an old account signs in")).unwrap();
+    assert_eq!(v["token"]["max_claims"], 1, "{v}");
+    let info: Value = serde_json::from_str(&check(signed_in(dir.path(), &url, &["--json", "info"]), "info")).unwrap();
+    assert!(info.to_string().contains("\"max_claims\":1"), "bd info tells the limit: {info}");
+
+    // Its token holds one issue at a time, whichever of its agents claims it.
+    let ids: Vec<String> = (1..=2)
+        .map(|n| check(signed_in(dir.path(), &url, &["-q", "create", &format!("Task {n}")]), "create").trim().into())
+        .collect();
+    check(signed_in(dir.path(), &url, &["--actor", "veteran/a1", "claim", &ids[0]]), "first claim");
+    let out = signed_in(dir.path(), &url, &["--actor", "veteran/a2", "claim", &ids[1]]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    assert!(stderr.contains("its access token allows at most 1"), "{stderr}");
+    let out = signed_in(dir.path(), &url, &["update", &ids[1], "--assignee", "veteran"]);
+    assert_eq!(out.status.code(), Some(7), "reserving counts too: {}", String::from_utf8_lossy(&out.stderr));
+    check(signed_in(dir.path(), &url, &["--actor", "veteran/a1", "close", &ids[0], "--reason", "done"]), "close");
+    check(signed_in(dir.path(), &url, &["--actor", "veteran/a2", "claim", &ids[1]]), "a claim after closing one");
+
+    // An admin gives a token the same limit.
+    let root = server.root.path();
+    create_token(root, "capped", "capped", &["--max-claims", "2"]);
+    let list = check(bd(root).args(["--json", "serve", "token", "list", "--root"]).arg(root).output().unwrap(), "list");
+    let list: Value = serde_json::from_str(&list).unwrap();
+    let capped = list.as_array().unwrap().iter().find(|t| t["name"] == "capped").unwrap();
+    assert_eq!(capped["max_claims"], 2, "{capped}");
+    let out = bd(root)
+        .args(["serve", "token", "create", "none", "--as", "x", "--max-claims", "0", "--root"])
+        .arg(root)
+        .output();
+    assert_eq!(out.unwrap().status.code(), Some(2), "a limit of 0 claims is refused");
+}
+
 /// POST `body` to the server's sign-in endpoint `step` (`device` or `token`): the status and JSON answer.
 fn sign_in_post(server: &Server, step: &str, body: Value) -> (u16, Value) {
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
@@ -5043,7 +5110,7 @@ fn info_and_remote_show_tell_clients_what_their_token_may_do() {
     assert_eq!(
         token,
         json!({ "name": "alice-desk", "actor": "alice", "role": "admin", "kind": "human", "workspaces": ["proj"],
-                "expires_at": null, "github": null }),
+                "expires_at": null, "github": null, "max_claims": null }),
         "never the token's id or hash"
     );
     let shown = alice.ok(&["remote", "show"]);

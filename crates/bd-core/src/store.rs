@@ -419,9 +419,11 @@ fn run_write<T>(
         events: 0,
         rollback_only: false,
         policy: None,
+        held_before: None,
     };
     let exec_start = Instant::now();
     let out = f(&mut ctx)?;
+    ctx.check_work_held()?;
     if ctx.events > 0 && !ctx.rollback_only {
         ctx.auto_prune_events()?;
     }
@@ -510,6 +512,8 @@ pub struct WriteCtx<'c> {
     events: u32,
     rollback_only: bool,
     policy: Option<Policy>,
+    /// Issues the policy's actor held when the policy was set, under [`Policy::max_claims`].
+    pub(crate) held_before: Option<u32>,
 }
 
 impl WriteCtx<'_> {
@@ -525,8 +529,15 @@ impl WriteCtx<'_> {
     }
 
     /// Limit what this transaction may override ([`crate::policy`]). `bd
-    /// serve` sets one per request; without one, nothing is limited.
+    /// serve` sets one per request, before writing anything; without one,
+    /// nothing is limited.
     pub fn set_policy(&mut self, policy: Option<Policy>) {
+        // What the actor holds before this transaction writes: should the count fail, nothing, so the
+        // limit holds all the same.
+        self.held_before = match &policy {
+            Some(Policy { max_claims: Some(_), actor, .. }) => crate::policy::held_by(&self.tx, actor).ok(),
+            _ => None,
+        };
         self.policy = policy;
     }
 

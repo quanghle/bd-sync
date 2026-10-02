@@ -477,6 +477,7 @@ bd serve token create alice-laptop --as alice --root /srv/bd
 bd serve token create alice-desk --as alice --kind human --root /srv/bd   # a person's: approves human gates
 bd serve token create ci --as ci --workspace proj --root /srv/bd
 bd serve token create dashboard --as dash --role read --root /srv/bd
+bd serve token create intern --as intern --max-claims 2 --root /srv/bd   # holds at most 2 issues at once
 bd serve token list --root /srv/bd
 bd serve token revoke ci --root /srv/bd          # takes effect at once, no restart
 # Or let people get their own by signing in with GitHub: <root>/auth.toml (below)
@@ -563,6 +564,8 @@ workspaces = ["proj"]                   # default: every workspace
 # anyone = true                         # any GitHub account, e.g. for an open source project
 # workspaces = ["oss"]
 # role = "write"                        # read (default here) or write
+# min_account_age = "30d"               # GitHub accounts younger than this are not let in by the rule
+# max_claims = 3                        # its tokens' actors hold at most 3 issues at once
 ```
 
 `bd serve` checks the file when it starts, and refuses to start with a
@@ -594,6 +597,24 @@ server log only.
   it shares with it, so members never get less than strangers. Each account
   still gets its own actor; to keep one out, add its user id to `deny` and
   revoke its tokens (below), since revoking alone lets it sign in again.
+- Any rule may set `min_account_age` (like `token_ttl`, e.g. `"30d"`): an
+  account GitHub created more recently, or whose creation date GitHub does
+  not give, is not let in by that rule, and is left to the rules after it.
+  If none lets it in, the sign-in is refused with the age it needs. This
+  keeps out accounts made on the spot, not determined ones.
+- Any rule may set `max_claims`, and `bd serve token create` takes
+  `--max-claims N`: the token's actor and its sub-actors may then hold at
+  most that many open issues, claimed (`in_progress`) or reserved (assigned),
+  so that no one takes the whole ready queue. A command that would make them
+  hold more (`claim`, `update --status in_progress` or `--assignee`,
+  `create --assignee`, an import, a batch or a playbook run) fails with exit
+  7 and changes nothing. Issues others assign to them count, but never stop
+  them from working on those, and closing or releasing in the same command
+  makes room. An abandoned claim counts until its lease runs out and is
+  reclaimed. A rule before an `anyone` rule with `role = "write"` may not
+  set fewer `max_claims` than it in a workspace they share. With `role = "write"`, tokens can still
+  change issues in other ways, so the limit is a guard against greed, not
+  malice.
 - The token acts as the account's actor, or its sub-actors `<actor>/<agent>`:
   the account's login when it first signed in, which it keeps when its login
   changes. The token is named `github-<actor>-<random>` and expires after

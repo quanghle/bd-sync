@@ -65,6 +65,8 @@ pub struct Capture {
     /// The request's access token's actor: claims held by it or its
     /// sub-actors are the caller's own.
     pub token_actor: String,
+    /// The most issues the token's actor and sub-actors may hold.
+    pub max_claims: Option<u32>,
     /// The request's access token itself, which `bd info` describes to its
     /// client; the fields above are what it may override.
     pub token: Option<crate::auth::Token>,
@@ -83,6 +85,7 @@ impl Capture {
             admin: false,
             human: false,
             token_actor: String::new(),
+            max_claims: None,
             token: None,
         }
     }
@@ -171,7 +174,12 @@ pub fn in_server_process() -> bool {
 /// What the request's access token may override (see [`bd_core::policy`]);
 /// `None` outside `bd serve`, where nothing is limited.
 pub fn policy() -> Option<bd_core::Policy> {
-    with_capture(|c| bd_core::Policy { actor: c.token_actor.clone(), admin: c.admin, human: c.human })
+    with_capture(|c| bd_core::Policy {
+        actor: c.token_actor.clone(),
+        admin: c.admin,
+        human: c.human,
+        max_claims: c.max_claims,
+    })
 }
 
 /// The access token of the request being served, if any.
@@ -555,6 +563,6 @@ mod tests {
         assert_eq!(p, Some(bd_core::Policy::default()), "nor do the server's own commands");
         let c = Capture { human: true, token_actor: "alice".into(), ..recording().1 };
         let (p, _) = capture(c, policy);
-        assert_eq!(p, Some(bd_core::Policy { actor: "alice".into(), admin: false, human: true }));
+        assert_eq!(p, Some(bd_core::Policy { actor: "alice".into(), admin: false, human: true, max_claims: None }));
     }
 }

@@ -1251,6 +1251,7 @@ impl Server {
             admin: policy.admin,
             human: policy.human,
             token_actor: policy.actor,
+            max_claims: policy.max_claims,
             token: Some(token.clone()),
             ..Capture::new(Box::new(out.clone()))
         };
@@ -1463,6 +1464,7 @@ mod tests {
             revoked_at: None,
             expires_at: None,
             github: None,
+            max_claims: None,
         };
         let actor = |flag, env, session| resolve_actor(flag, env, session, &t).map(|r| (r.actor, r.source));
         let code = |flag, env, session| resolve_actor(flag, env, session, &t).unwrap_err().exit_code();

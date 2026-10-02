@@ -101,6 +101,9 @@ pub struct Token {
     /// The GitHub account that signed in for the token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub github: Option<GithubUser>,
+    /// The most issues its actor and sub-actors may hold, claimed or reserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_claims: Option<u32>,
 }
 
 /// A GitHub account, as GitHub names it.
@@ -152,13 +155,16 @@ fn related(a: &str, b: &str) -> bool {
     covers(&a, &b) || covers(&b, &a)
 }
 
-/// What a token may do: its role, kind and workspaces.
+/// What a token may do: its role, kind and workspaces, and how much work
+/// its actor may hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Grant {
     pub role: Role,
     pub kind: Kind,
     /// Workspace names, or `*` for every workspace.
     pub workspaces: Vec<String>,
+    /// The most issues its actor and sub-actors may hold, claimed or reserved.
+    pub max_claims: Option<u32>,
 }
 
 impl Grant {
@@ -201,6 +207,9 @@ pub fn access_line(summary: &serde_json::Value) -> String {
         workspaces_text(&workspaces),
         text("name")
     );
+    if let Some(n) = summary["max_claims"].as_u64() {
+        line.push_str(&format!(", at most {n} claims"));
+    }
     if let Some(at) = summary["expires_at"].as_str() {
         line.push_str(&format!(", expires {at}"));
     }
@@ -222,7 +231,12 @@ impl Token {
 
     /// What the token's requests may override.
     pub fn policy(&self) -> bd_core::Policy {
-        bd_core::Policy { actor: self.actor.clone(), admin: self.role == Role::Admin, human: self.kind == Kind::Human }
+        bd_core::Policy {
+            actor: self.actor.clone(),
+            admin: self.role == Role::Admin,
+            human: self.kind == Kind::Human,
+            max_claims: self.max_claims,
+        }
     }
 
     /// Whether the token no longer works at `now` because it expired.
@@ -241,6 +255,7 @@ impl Token {
             "workspaces": self.workspaces,
             "expires_at": self.expires_at,
             "github": self.github,
+            "max_claims": self.max_claims,
         })
     }
 
@@ -256,6 +271,7 @@ impl Token {
             "revoked_at": self.revoked_at,
             "expires_at": self.expires_at,
             "github": self.github,
+            "max_claims": self.max_claims,
         })
     }
 
@@ -267,6 +283,9 @@ impl Token {
             self.kind.as_str(),
             workspaces_text(&self.workspaces)
         );
+        if let Some(n) = self.max_claims {
+            text.push_str(&format!(", at most {n} claims"));
+        }
         if let Some(user) = &self.github {
             text.push_str(&format!(", signed in as GitHub user {}", user.login));
         }
@@ -456,7 +475,8 @@ pub fn cmd_token(app: &mut App, cmd: &TokenCommand) -> Result<()> {
 
 fn create(app: &mut App, a: &TokenCreateArgs) -> Result<()> {
     let root = root_dir(&a.root)?;
-    let (token, secret) = issue_token(&root, &a.name, &a.act_as, a.role, a.kind, &a.workspaces)?;
+    let grant = Grant { role: a.role, kind: a.kind, workspaces: a.workspaces.clone(), max_claims: a.max_claims };
+    let (token, secret) = add_token(&root, Holder::Admin { name: a.name.trim(), actor: a.act_as.trim() }, grant)?;
     let mut view = token.view();
     view["token"] = json!(secret);
     let out = Out::new(view)
@@ -478,7 +498,7 @@ pub fn issue_token(
     kind: Kind,
     workspaces: &[String],
 ) -> Result<(Token, String)> {
-    let grant = Grant { role, kind, workspaces: workspaces.to_vec() };
+    let grant = Grant { role, kind, workspaces: workspaces.to_vec(), max_claims: None };
     add_token(root, Holder::Admin { name: name.trim(), actor: actor.trim() }, grant)
 }
 
@@ -596,6 +616,7 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
         revoked_at: None,
         expires_at,
         github,
+        max_claims: grant.max_claims,
     };
     file.tokens.push(token.clone());
     save_file(&path, &file)?;
@@ -881,6 +902,7 @@ mod tests {
             revoked_at: None,
             expires_at: None,
             github: None,
+            max_claims: None,
         }
     }
 
@@ -957,7 +979,12 @@ mod tests {
     fn github_sign_ins_get_expiring_tokens_named_after_the_account() {
         let dir = tempfile::tempdir().unwrap();
         let alice = gh("Alice-GH", 42);
-        let grant = Grant { role: Role::Read, kind: Kind::Human, workspaces: vec!["proj".into(), " ".into()] };
+        let grant = Grant {
+            role: Role::Read,
+            kind: Kind::Human,
+            workspaces: vec!["proj".into(), " ".into()],
+            max_claims: None,
+        };
         let ttl = Duration::from_secs(30 * 24 * 3600);
         let before = Timestamp::now();
         let (t, secret) = issue_github_token(dir.path(), &alice, grant.clone(), ttl, true).unwrap();
@@ -1011,7 +1038,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = tokens_path(dir.path());
         let hour = Duration::from_secs(3600);
-        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![] };
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
         let sign_in = |user: &GithubUser| issue_github_token(dir.path(), user, grant.clone(), hour, true);
         let accounts = || load_file(&path).unwrap().accounts;
 
@@ -1061,7 +1088,7 @@ mod tests {
     fn revoking_by_github_user_takes_all_of_their_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let ttl = Duration::from_secs(3600);
-        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![] };
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
         let (a1, _) = issue_github_token(dir.path(), &gh("Alice", 1), grant.clone(), ttl, true).unwrap();
         let (a2, _) = issue_github_token(dir.path(), &gh("alice-new", 1), grant.clone(), ttl, true).unwrap();
         let (b, _) = issue_github_token(dir.path(), &gh("bob", 2), grant, ttl, true).unwrap();
@@ -1089,7 +1116,7 @@ mod tests {
     fn github_accounts_never_share_actors_with_other_principals() {
         let dir = tempfile::tempdir().unwrap();
         let ttl = Duration::from_secs(3600);
-        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![] };
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
         let manual = |name: &str, actor: &str| issue_token(dir.path(), name, actor, Role::Write, Kind::Agent, &[]);
         manual("ci", "ci-agents").unwrap();
         manual("carol-ci", "carol/ci").unwrap();
@@ -1121,7 +1148,7 @@ mod tests {
     fn the_servers_own_actor_is_never_a_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let ttl = Duration::from_secs(3600);
-        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![] };
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
         for actor in ["bd-serve", "BD-Serve", "bd-serve/jobs"] {
             let e = issue_token(dir.path(), "x", actor, Role::Admin, Kind::Agent, &[]).unwrap_err();
             assert!(e.exit_code() == 2 && e.to_string().contains("reserved"), "{actor}: {e}");
@@ -1188,7 +1215,10 @@ mod tests {
         let (human, _) = issue_token(dir.path(), "alice-desk", "alice", Role::Write, Kind::Human, &[]).unwrap();
         assert!(human.policy().human && !human.policy().admin);
         let (agent, _) = issue_token(dir.path(), "ci", "alice", Role::Admin, Kind::Agent, &[]).unwrap();
-        assert_eq!(agent.policy(), bd_core::Policy { actor: "alice".into(), admin: true, human: false });
+        assert_eq!(
+            agent.policy(),
+            bd_core::Policy { actor: "alice".into(), admin: true, human: false, max_claims: None }
+        );
         assert!(agent.describe().contains("kind agent"), "{}", agent.describe());
         let text = std::fs::read_to_string(tokens_path(dir.path())).unwrap();
         assert!(text.contains("\"kind\": \"agent\"") && text.contains("\"kind\": \"human\""), "{text}");

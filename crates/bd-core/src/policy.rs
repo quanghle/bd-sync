@@ -45,6 +45,13 @@
 //! * **`metadata.playbook`**, which makes runs and groups close themselves,
 //!   is written by playbook runs; other callers need [`Policy::admin`] to
 //!   change it on an existing issue (by update or import).
+//! * **Work held**: with [`Policy::max_claims`], the policy's actor and its
+//!   sub-actors may hold at most that many issues, claimed or reserved
+//!   (assigned to one of them, not closed or pinned), at the end of the
+//!   transaction: a transaction that leaves them more than that, and more
+//!   than they held before it, is refused, however it gave them the work
+//!   (claiming, updating, creating, importing, in a batch or a playbook).
+//!   A claim whose lease died counts until it is reclaimed.
 //!
 //! Gates are never claims: an issue cannot be a gate and `in_progress`.
 //!
@@ -74,6 +81,23 @@ pub struct Policy {
     pub admin: bool,
     /// A person: may open human gates and move work past them.
     pub human: bool,
+    /// The most issues the actor and its sub-actors may hold, claimed or
+    /// reserved; `None` for no limit.
+    pub max_claims: Option<u32>,
+}
+
+/// Issues `actor` and its sub-actors hold: assigned to one of them, and not
+/// closed or pinned.
+pub(crate) fn held_by(conn: &rusqlite::Connection, actor: &str) -> Result<u32> {
+    // Sub-actors `<actor>/<name>` sort between `<actor>/` and `<actor>0` ('0' follows '/').
+    let n: i64 = conn
+        .prepare_cached(
+            "SELECT (SELECT COUNT(*) FROM issues WHERE assignee = ?1 AND status NOT IN ('closed','pinned'))
+                  + (SELECT COUNT(*) FROM issues
+                     WHERE assignee > ?1 || '/' AND assignee < ?1 || '0' AND status NOT IN ('closed','pinned'))",
+        )?
+        .query_row([actor], |r| r.get(0))?;
+    Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
 
 impl Policy {
@@ -238,6 +262,22 @@ pub(crate) struct LiveClaim {
 }
 
 impl WriteCtx<'_> {
+    /// Under [`Policy::max_claims`], refuse a transaction that leaves the
+    /// policy's actor holding more work than that, and more than before it.
+    pub(crate) fn check_work_held(&self) -> Result<()> {
+        let Some((actor, max)) = self.policy().and_then(|p| Some((p.actor.as_str(), p.max_claims?))) else {
+            return Ok(());
+        };
+        let held = held_by(self.conn(), actor)?;
+        if held <= max || held <= self.held_before.unwrap_or(0) {
+            return Ok(());
+        }
+        Err(Error::Unauthorized(format!(
+            "{actor} and its agents would hold {held} issues (claimed or reserved), and its access token allows at \
+             most {max}: close or release some first"
+        )))
+    }
+
     /// Limits on claim overrides, unless the caller is an admin (or unlimited).
     fn claim_limits(&self) -> Option<&Policy> {
         self.policy().filter(|p| !p.admin)

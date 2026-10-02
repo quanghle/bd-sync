@@ -811,9 +811,10 @@ fn closing_the_last_step_under_deep_groups_closes_them_in_linear_time() {
     let env = std::thread::Builder::new()
         .stack_size(2 << 20)
         .spawn(move || {
-            for (step, prefix, policy) in
-                [(local, "a", None), (served, "b", Some(Policy { actor: "alice".into(), admin: false, human: false }))]
-            {
+            for (step, prefix, policy) in [
+                (local, "a", None),
+                (served, "b", Some(Policy { actor: "alice".into(), admin: false, human: false, max_claims: None })),
+            ] {
                 let started = std::time::Instant::now();
                 let out = env
                     .store

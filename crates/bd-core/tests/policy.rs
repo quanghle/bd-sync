@@ -15,15 +15,15 @@ use tempfile::TempDir;
 const T0: i64 = 1_700_000_000_000;
 
 fn agent(actor: &str) -> Option<Policy> {
-    Some(Policy { actor: actor.into(), admin: false, human: false })
+    Some(Policy { actor: actor.into(), admin: false, human: false, max_claims: None })
 }
 
 fn admin_agent(actor: &str) -> Option<Policy> {
-    Some(Policy { actor: actor.into(), admin: true, human: false })
+    Some(Policy { actor: actor.into(), admin: true, human: false, max_claims: None })
 }
 
 fn person(actor: &str) -> Option<Policy> {
-    Some(Policy { actor: actor.into(), admin: false, human: true })
+    Some(Policy { actor: actor.into(), admin: false, human: true, max_claims: None })
 }
 
 struct Env {
@@ -1081,5 +1081,66 @@ fn a_failed_savepoint_undoes_only_its_own_writes() {
     assert_eq!(seqs, vec![head + 1], "only the kept step's event, numbered without a gap: {seqs:?}");
     assert_eq!(events.events[0].tx, head + 1, "and it starts its transaction");
     assert_eq!(events.events[0].issue_id.as_deref(), Some(kept.id.as_str()));
+    env.assert_healthy();
+}
+
+fn capped(actor: &str, max: u32) -> Option<Policy> {
+    Some(Policy { actor: actor.into(), max_claims: Some(max), ..Default::default() })
+}
+
+#[test]
+fn a_claim_limit_caps_the_work_an_actor_and_its_agents_hold() {
+    let mut env = Env::new();
+    let ids: Vec<String> = (1..=8).map(|n| env.create(&format!("Task {n}"))).collect();
+    let claim = ClaimOptions::default();
+    let a = env.as_("bob/w1", capped("bob", 2), |tx| tx.claim(&ids[0], &claim)).unwrap();
+    env.as_("bob/w2", capped("bob", 2), |tx| tx.claim(&ids[1], &claim)).unwrap();
+
+    // Every way of taking more work is refused, by any of bob's agents.
+    denied(env.as_("bob", capped("bob", 2), |tx| tx.claim(&ids[2], &claim)), "allows at most 2");
+    denied(env.as_("bob/w3", capped("bob", 2), |tx| tx.claim_next(&ReadyQuery::default(), &claim)), "would hold 3");
+    let reserve = patch(|p| p.assignee = Some(Some("bob/w3".into())));
+    denied(
+        env.as_("bob", capped("bob", 2), |tx| tx.update_issue(&ids[2], &reserve, &Guard::default(), false)),
+        "at most 2",
+    );
+    let start = patch(|p| {
+        p.status = Some(Status::InProgress);
+        p.assignee = Some(Some("bob".into()));
+    });
+    denied(
+        env.as_("bob", capped("bob", 2), |tx| tx.update_issue(&ids[2], &start, &Guard::default(), false)),
+        "at most 2",
+    );
+    let new = NewIssue { assignee: Some("bob/w9".into()), ..NewIssue::titled("Mine") };
+    denied(env.as_("bob", capped("bob", 2), |tx| tx.create_issue(new)), "at most 2");
+    assert_eq!(env.issue(&ids[2]).assignee, None, "nothing changed");
+
+    // What it already holds is its own: renewing a claim, or work for actors that are not bob's.
+    let renew = ClaimOptions { token: Some(a.lease.token), ..Default::default() };
+    assert!(env.as_("bob/w1", capped("bob", 2), |tx| tx.claim(&ids[0], &renew)).unwrap().already_held);
+    let to_bobby = patch(|p| p.assignee = Some(Some("bobby".into())));
+    env.as_("bob", capped("bob", 2), |tx| tx.update_issue(&ids[3], &to_bobby, &Guard::default(), false)).unwrap();
+
+    // Giving work back makes room, in the same transaction too.
+    env.as_("bob/w2", capped("bob", 2), |tx| {
+        tx.close_issue(&ids[1], &CloseOptions::default())?;
+        tx.claim(&ids[2], &claim)
+    })
+    .unwrap();
+    denied(env.as_("bob/w2", capped("bob", 2), |tx| tx.claim(&ids[4], &claim)), "at most 2");
+
+    // Work others give bob counts, but does not stop bob working on it: only taking more.
+    for id in &ids[4..7] {
+        let p = patch(|p| p.assignee = Some(Some("bob".into())));
+        env.as_("alice", None, |tx| tx.update_issue(id, &p, &Guard::default(), false)).unwrap();
+    }
+    env.as_("bob", capped("bob", 2), |tx| tx.claim(&ids[4], &claim)).unwrap();
+    denied(env.as_("bob", capped("bob", 2), |tx| tx.claim(&ids[7], &claim)), "would hold 6");
+    env.as_("bob", capped("bob", 2), |tx| tx.release(&ids[4], &ReleaseOptions::default())).unwrap();
+    denied(env.as_("bob", capped("bob", 2), |tx| tx.claim(&ids[7], &claim)), "would hold 5");
+
+    // Without a limit, nothing is counted.
+    env.as_("bob", agent("bob"), |tx| tx.claim(&ids[7], &claim)).unwrap();
     env.assert_healthy();
 }

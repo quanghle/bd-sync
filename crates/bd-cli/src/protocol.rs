@@ -210,6 +210,9 @@ pub struct Issued {
     pub role: String,
     pub kind: String,
     pub workspaces: Vec<String>,
+    /// The most issues its actor and sub-actors may hold, claimed or reserved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_claims: Option<u32>,
     pub expires_at: String,
     /// The GitHub login that signed in.
     pub login: String,

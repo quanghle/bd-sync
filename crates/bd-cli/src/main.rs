@@ -14,6 +14,7 @@ mod hook;
 mod io;
 mod jobs;
 mod logging;
+mod oauth;
 mod paths;
 mod playbooks;
 mod protocol;

@@ -29,6 +29,13 @@
 //! non-200 status and an [`ErrorBody`], shaped like the CLI's `--json`
 //! errors. Every answer carries the [`PROTOCOL_HEADER`], which tells bd
 //! serve's own answers apart from a proxy's.
+//!
+//! GitHub sign-in (`bd remote login --github`, see `oauth.rs`) has two
+//! endpoints of its own on the server, outside any workspace and without a
+//! token: `POST <server>/v2/auth/github/device` ([`SignInStart`] ->
+//! [`SignInCode`]) and `POST <server>/v2/auth/github/token`, polled
+//! ([`SignInPoll`] -> [`SignInAnswer`]). Their answers are JSON, and their
+//! failures [`ErrorBody`]s.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -134,6 +141,66 @@ pub struct ErrorDetail {
     pub code: String,
     pub message: String,
     pub exit_code: i32,
+}
+
+/// Body of `POST <server>/v2/auth/github/device`: start a GitHub sign-in.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SignInStart {
+    /// The workspace the client signs in for: it must exist on the server.
+    pub workspace: String,
+}
+
+/// Answer of `POST <server>/v2/auth/github/device`: the code a person
+/// enters at GitHub, and how often to ask whether they did.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignInCode {
+    /// Sent back with each poll: whoever holds it gets the sign-in's token.
+    pub device_code: String,
+    /// The one-time code to enter at `verification_uri`.
+    pub user_code: String,
+    pub verification_uri: String,
+    /// Seconds until the codes expire.
+    pub expires_in: u64,
+    /// Seconds to wait between polls.
+    pub interval: u64,
+}
+
+/// Body of `POST <server>/v2/auth/github/token`: was the code entered yet?
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SignInPoll {
+    pub device_code: String,
+    /// The workspace the client signs in for: the token must allow it.
+    pub workspace: String,
+}
+
+/// Answer of `POST <server>/v2/auth/github/token`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SignInAnswer {
+    /// Not entered yet: ask again after the same interval.
+    Pending,
+    /// Not entered yet, and asked too often: ask again after a longer
+    /// interval, at least `interval` seconds (0 when GitHub gave none).
+    SlowDown { interval: u64 },
+    /// Entered, and the account may sign in: its new access token.
+    Issued(Box<Issued>),
+}
+
+/// An access token issued by GitHub sign-in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Issued {
+    /// The secret: saved by the client, never shown.
+    pub token: String,
+    pub name: String,
+    pub actor: String,
+    pub role: String,
+    pub kind: String,
+    pub workspaces: Vec<String>,
+    pub expires_at: String,
+    /// The GitHub login that signed in.
+    pub login: String,
+    /// What let the account in: `GitHub user alice`, `member of acme`, `member of team acme/bd`.
+    pub via: String,
 }
 
 /// Workspace names: a letter or digit, then letters, digits, `.`, `_`, `-`

@@ -4392,3 +4392,453 @@ fn agents_watch_catches_up_on_changes_no_event_announced() {
     assert!(agents_changes(&alice).is_empty(), "no event announced it");
     assert!(watch.err.try_recv().is_err());
 }
+
+// ------------------------------------------------------------ GitHub sign-in
+
+/// A stand-in for GitHub: the device flow and the API endpoints GitHub
+/// sign-in uses. A device code is entered by the account `next` names when
+/// the code is given out, after `pending` polls, or cancelled with `deny`.
+/// `members` pairs logins with `org` or `org/team`; organizations in
+/// `blocked` answer 403, as one restricting OAuth apps does.
+struct FakeGithub {
+    url: String,
+    state: Arc<std::sync::Mutex<GithubState>>,
+}
+
+#[derive(Default)]
+struct GithubState {
+    next: String,
+    pending: usize,
+    deny: bool,
+    /// Answer device code requests as an app without device flow does.
+    disabled: bool,
+    /// How long device code requests wait before their answer.
+    hold: Duration,
+    members: Vec<(String, String)>,
+    blocked: Vec<String>,
+    /// Device code -> the login entering it, polls before it does, and whether it is cancelled.
+    codes: std::collections::HashMap<String, (String, usize, bool)>,
+    /// Device codes given out, each unique, as GitHub's are.
+    minted: usize,
+    /// `METHOD /path` of each request, with its form body.
+    log: Vec<String>,
+}
+
+impl FakeGithub {
+    fn start() -> FakeGithub {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(std::sync::Mutex::new(GithubState::default()));
+        let shared = state.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                let state = shared.clone();
+                std::thread::spawn(move || github_answer(conn, &state));
+            }
+        });
+        FakeGithub { url, state }
+    }
+
+    /// The next device code is entered by `login`, after `pending` polls.
+    fn next(&self, login: &str, pending: usize) {
+        let mut s = self.state.lock().unwrap();
+        (s.next, s.pending, s.deny) = (login.to_string(), pending, false);
+    }
+
+    fn member(&self, login: &str, of: &str) {
+        self.state.lock().unwrap().members.push((login.to_string(), of.to_string()));
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.state.lock().unwrap().log.clone()
+    }
+}
+
+fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubState>) {
+    let mut reader = BufReader::new(conn.try_clone().unwrap());
+    let mut request = String::new();
+    if reader.read_line(&mut request).unwrap_or(0) == 0 {
+        return;
+    }
+    let (mut length, mut login) = (0, None);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        let (name, value) = line.split_once(':').unwrap();
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => length = value.trim().parse().unwrap(),
+            "authorization" => login = value.trim().strip_prefix("Bearer gho_").map(String::from),
+            _ => {}
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    let body = String::from_utf8(body).unwrap();
+    let form = |key: &str| body.split('&').find_map(|kv| kv.strip_prefix(&format!("{key}="))).map(String::from);
+    let mut words = request.split_whitespace();
+    let (method, path) = (words.next().unwrap(), words.next().unwrap());
+    let hold = {
+        let mut s = state.lock().unwrap();
+        s.log.push(format!("{method} {path} {body}"));
+        if path == "/login/device/code" { s.hold } else { Duration::ZERO }
+    };
+    std::thread::sleep(hold);
+    let mut s = state.lock().unwrap();
+    let member = |s: &GithubState, login: &str, of: &str| s.members.iter().any(|(l, o)| l == login && o == of);
+    let active = json!({ "state": "active", "role": "member" });
+    let not_found = (404, json!({ "message": "Not Found" }));
+    let (status, answer) = match (method, path) {
+        ("POST", "/login/device/code") if s.disabled => (
+            200,
+            json!({ "error": "device_flow_disabled", "error_description": "Device Flow must be explicitly enabled for this App" }),
+        ),
+        ("POST", "/login/device/code") => {
+            s.minted += 1;
+            let code = format!("dc{}", s.minted);
+            let entry = (s.next.clone(), s.pending, s.deny);
+            s.codes.insert(code.clone(), entry);
+            let uri = "https://github.com/login/device";
+            (
+                200,
+                json!({ "device_code": code, "user_code": "WDJB-MJHT", "verification_uri": uri, "expires_in": 900, "interval": 1 }),
+            )
+        }
+        ("POST", "/login/oauth/access_token") => {
+            let code = form("device_code").unwrap_or_default();
+            match s.codes.get(&code).cloned() {
+                None => (200, json!({ "error": "incorrect_device_code" })),
+                Some((_, left, _)) if left > 0 => {
+                    s.codes.get_mut(&code).unwrap().1 -= 1;
+                    (200, json!({ "error": "authorization_pending" }))
+                }
+                Some((_, _, true)) => (200, json!({ "error": "access_denied" })),
+                Some((login, _, false)) => {
+                    s.codes.remove(&code);
+                    (
+                        200,
+                        json!({ "access_token": format!("gho_{login}"), "token_type": "bearer", "scope": "read:org" }),
+                    )
+                }
+            }
+        }
+        ("GET", "/user") => match &login {
+            // A distinct id per login, as GitHub's are.
+            Some(l) => {
+                (200, json!({ "login": l, "id": l.bytes().fold(7u64, |h, b| h * 31 + u64::from(b)), "type": "User" }))
+            }
+            None => (401, json!({ "message": "Bad credentials" })),
+        },
+        ("GET", p) if p.starts_with("/user/memberships/orgs/") => {
+            let org = &p["/user/memberships/orgs/".len()..];
+            match &login {
+                _ if s.blocked.iter().any(|b| b == org) => {
+                    (403, json!({ "message": "the organization has enabled OAuth App access restrictions" }))
+                }
+                Some(l) if member(&s, l, org) => (200, active),
+                _ => not_found,
+            }
+        }
+        ("GET", p) if p.starts_with("/orgs/") => {
+            // /orgs/<org>/teams/<team>/memberships/<login>
+            let parts: Vec<&str> = p["/orgs/".len()..].split('/').collect();
+            match parts[..] {
+                [org, "teams", team, "memberships", user]
+                    if login.is_some() && member(&s, user, &format!("{org}/{team}")) =>
+                {
+                    (200, active)
+                }
+                _ => not_found,
+            }
+        }
+        _ => not_found,
+    };
+    drop(s);
+    let text = answer.to_string();
+    let head = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n", text.len());
+    let _ = conn.write_all(format!("{head}connection: close\r\n\r\n{text}").as_bytes());
+}
+
+/// A server whose GitHub sign-in goes to `github`, with these `[[github.allow]]` rules.
+fn sign_in_server(github: &FakeGithub, rules: &str) -> Server {
+    let root = Server::prepare();
+    let config = format!("[github]\nclient_id = \"Iv1.test\"\nurl = \"{0}\"\napi_url = \"{0}\"\n\n{rules}", github.url);
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    Server::launch(root, "127.0.0.1:0", &[])
+}
+
+/// `bd remote login --github` on the client machine `dir` (its own user config directory).
+fn github_login(dir: &Path, url: &str) -> Output {
+    bd(dir).args(["--json", "remote", "login", "--github", url]).stdin(Stdio::null()).output().unwrap()
+}
+
+/// The token saved on the client machine `dir`, if any.
+fn saved_token(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join(".xdg").join("bd").join("credentials.toml")).ok()?;
+    Some(text.split("token = \"").nth(1)?.split('"').next()?.to_string())
+}
+
+/// `bd` on the client machine `dir`, using the workspace `url` with its saved token.
+fn signed_in(dir: &Path, url: &str, args: &[&str]) -> Output {
+    bd(dir).env("BD_REMOTE", url).args(args).output().unwrap()
+}
+
+#[test]
+fn github_sign_in_issues_tokens_by_the_rules() {
+    let github = FakeGithub::start();
+    github.member("bob", "acme/bd");
+    github.member("bob", "acme");
+    github.member("carol", "acme");
+    let server = sign_in_server(
+        &github,
+        "[[github.allow]]\nusers = [\"Alice\"]\nrole = \"admin\"\nkind = \"human\"\n\n\
+         [[github.allow]]\nteams = [\"acme/bd\"]\nworkspaces = [\"proj\"]\n\n\
+         [[github.allow]]\norgs = [\"acme\"]\nrole = \"read\"\n",
+    );
+    let url = server.url();
+    let machine = || tempfile::tempdir().unwrap();
+    let login = |dir: &Path| {
+        let out = github_login(dir, &url);
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        if let Some(secret) = saved_token(dir) {
+            assert!(!stdout.contains(&secret) && !stderr.contains(&secret), "never printed: {stdout}{stderr}");
+        }
+        (out.status.code(), stdout.to_string(), stderr.to_string())
+    };
+
+    // By login, after a poll that finds the code not entered yet.
+    github.next("alice", 1);
+    let alice = machine();
+    let (code, stdout, stderr) = login(alice.path());
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(stderr.contains("WDJB-MJHT") && stderr.contains("https://github.com/login/device"), "{stderr}");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        (v["actor"].as_str(), v["scope"].as_str(), v["verified"].as_bool()),
+        (Some("alice"), Some("server"), Some(true))
+    );
+    assert_eq!(v["github"], json!({ "login": "alice", "via": "GitHub user alice" }));
+    assert_eq!((v["token"]["role"].as_str(), v["token"]["kind"].as_str()), (Some("admin"), Some("human")));
+    assert_eq!(v["token"]["workspaces"], json!(["*"]));
+    let name = v["token"]["name"].as_str().unwrap().to_string();
+    assert!(name.starts_with("github-alice-"), "{name}");
+    let polls = github.log().iter().filter(|l| l.starts_with("POST /login/oauth/access_token")).count();
+    assert_eq!(polls, 2, "pending, then entered");
+    assert!(
+        github.log()[0].contains("client_id=Iv1.test") && github.log()[0].contains("scope=read%3Aorg"),
+        "{:?}",
+        github.log()
+    );
+    assert_eq!(check(signed_in(alice.path(), &url, &["-q", "create", "Signed in"]), "create").trim(), "t-1");
+    let shown: Value =
+        serde_json::from_str(&check(signed_in(alice.path(), &url, &["--json", "remote", "show"]), "show")).unwrap();
+    assert_eq!(shown["server"]["actor"], "alice");
+
+    // By team, then by organization: the first matching rule's permissions.
+    github.next("bob", 0);
+    let bob = machine();
+    let (code, stdout, stderr) = login(bob.path());
+    assert_eq!(code, Some(0), "{stderr}");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(v["github"]["via"], "member of team acme/bd");
+    assert_eq!((v["token"]["role"].as_str(), v["token"]["kind"].as_str()), (Some("write"), Some("agent")));
+    assert_eq!(v["token"]["workspaces"], json!(["proj"]));
+    check(signed_in(bob.path(), &url, &["create", "By bob"]), "create as bob");
+
+    github.next("carol", 0);
+    let carol = machine();
+    let (code, stdout, stderr) = login(carol.path());
+    assert_eq!(code, Some(0), "{stderr}");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!((v["github"]["via"].as_str(), v["token"]["role"].as_str()), (Some("member of acme"), Some("read")));
+    check(signed_in(carol.path(), &url, &["list"]), "read as carol");
+    assert_eq!(signed_in(carol.path(), &url, &["create", "x"]).status.code(), Some(7), "a read token");
+
+    // No rule lets mallory in: nothing is issued or saved.
+    github.next("mallory", 0);
+    let mallory = machine();
+    let (code, _, stderr) = login(mallory.path());
+    assert_eq!(code, Some(7), "{stderr}");
+    assert!(stderr.contains("mallory may not sign in"), "{stderr}");
+    assert_eq!(saved_token(mallory.path()), None);
+
+    // The server lists what it issued; revoking by GitHub user takes all of alice's tokens.
+    let root = server.root.path().to_path_buf();
+    let list = |args: &[&str]| -> Value {
+        let out =
+            bd(&root).args(["--json", "serve", "token", "list", "--root"]).arg(&root).args(args).output().unwrap();
+        serde_json::from_str(&check(out, "token list")).unwrap()
+    };
+    let tokens = list(&[]);
+    let tokens = tokens.as_array().unwrap();
+    assert_eq!(tokens.len(), 3, "{tokens:?}");
+    let alices = tokens.iter().find(|t| t["name"] == name.as_str()).unwrap();
+    assert_eq!((alices["actor"].as_str(), alices["github"]["login"].as_str()), (Some("alice"), Some("alice")));
+    assert!(alices["expires_at"].as_str().is_some_and(|at| at > "2026"), "{alices}");
+    let out = bd(&root)
+        .args(["--json", "serve", "token", "revoke", "--github", "ALICE", "--root"])
+        .arg(&root)
+        .output()
+        .unwrap();
+    let v: Value = serde_json::from_str(&check(out, "revoke --github")).unwrap();
+    assert_eq!(v["revoked"], json!([name]));
+    assert_eq!(signed_in(alice.path(), &url, &["list"]).status.code(), Some(7), "revoked at once");
+    let out =
+        bd(&root).args(["serve", "token", "revoke", "--github", "mallory", "--root"]).arg(&root).output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "mallory never got one");
+
+    // An expired token is refused with what to do about it.
+    let path = root.join("tokens.json");
+    let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for t in file["tokens"].as_array_mut().unwrap().iter_mut().filter(|t| t["github"]["login"] == "bob") {
+        t["expires_at"] = json!("2026-01-01T00:00:00.000Z");
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+    let out = signed_in(bob.path(), &url, &["list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    assert!(stderr.contains("expired at 2026-01-01") && stderr.contains("bd remote login --github"), "{stderr}");
+    check(signed_in(carol.path(), &url, &["list"]), "other tokens still work");
+}
+
+#[test]
+fn github_sign_in_refusals() {
+    let github = FakeGithub::start();
+    let machine = || tempfile::tempdir().unwrap();
+    let refused = |out: Output, code: i32, says: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert_eq!(out.status.code(), Some(code), "{says}: {stderr}");
+        assert!(stderr.contains(says), "{says}: {stderr}");
+    };
+
+    // Without auth.toml, nobody signs in.
+    let plain = Server::start();
+    let dir = machine();
+    refused(github_login(dir.path(), &plain.url()), 7, "GitHub sign-in is not enabled");
+    assert_eq!(saved_token(dir.path()), None);
+    assert!(github.log().is_empty(), "GitHub is not asked");
+
+    let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"alice\"]\nworkspaces = [\"other\"]\n");
+    // An unknown workspace is refused before anyone goes to GitHub.
+    let dir = machine();
+    refused(github_login(dir.path(), &format!("{}/w/nope", server.base)), 3, "workspace not found: nope");
+    assert!(github.log().is_empty());
+
+    // A sign-in cancelled at GitHub.
+    github.next("alice", 0);
+    github.state.lock().unwrap().deny = true;
+    refused(github_login(dir.path(), &server.url()), 7, "cancelled at GitHub");
+
+    // Allowed in, but not into this workspace: no token is issued.
+    github.next("alice", 0);
+    refused(github_login(dir.path(), &server.url()), 7, "not use workspace proj (only other)");
+    assert_eq!(saved_token(dir.path()), None);
+    assert!(!server.root.path().join("tokens.json").exists(), "nothing issued");
+    assert!(!github.log().iter().any(|l| l.contains("scope=")), "users alone need no scope: {:?}", github.log());
+
+    // An app without device flow: GitHub's answer reaches the person signing in.
+    github.state.lock().unwrap().disabled = true;
+    refused(github_login(dir.path(), &server.url()), 8, "device_flow_disabled");
+    github.state.lock().unwrap().disabled = false;
+
+    // A mistake made in auth.toml while the server runs: the client learns nothing of the file.
+    let config = server.root.path().join("auth.toml");
+    let good = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, good.replace("[github]\n", "[github]\nclient_secret = \"s3cret-value\"\n")).unwrap();
+    let out = github_login(dir.path(), &server.url());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("s3cret"), "{}", String::from_utf8_lossy(&out.stderr));
+    refused(out, 8, "GitHub sign-in is not working on this bd server");
+    std::fs::write(&config, good).unwrap();
+
+    // A login whose actor an admin's token has: refused, so that neither acts as the other.
+    let github = FakeGithub::start();
+    let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"ci-agents\"]\n");
+    server.token("ci", "ci-agents", &[]);
+    github.next("ci-agents", 0);
+    refused(github_login(dir.path(), &server.url()), 7, "another access token acts as ci-agents");
+    let out = bd(server.root.path())
+        .args(["serve", "token", "create", "ci-2", "--as", "ci-agents/x", "--root"])
+        .arg(server.root.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "admins' tokens may share actors among themselves");
+
+    // An organization that will not tell counts as no membership.
+    let github = FakeGithub::start();
+    github.member("dana", "acme");
+    github.state.lock().unwrap().blocked.push("acme".into());
+    let server = sign_in_server(&github, "[[github.allow]]\norgs = [\"acme\"]\n");
+    github.next("dana", 0);
+    refused(github_login(dir.path(), &server.url()), 7, "dana may not sign in");
+
+    // A broken auth.toml keeps the server from starting.
+    let root = Server::prepare();
+    std::fs::write(root.path().join("auth.toml"), "[github]\nclient_id = \"x\"\n").unwrap();
+    let out = bd(root.path()).args(["serve", "--listen", "127.0.0.1:0", "--root"]).arg(root.path()).output().unwrap();
+    refused(out, 2, "auth.toml");
+}
+
+/// POST `body` to the server's sign-in endpoint `step` (`device` or `token`): the status and JSON answer.
+fn sign_in_post(server: &Server, step: &str, body: Value) -> (u16, Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let mut r = agent
+        .post(format!("{}/v2/auth/github/{step}", server.base))
+        .content_type("application/json")
+        .send(body.to_string().as_bytes())
+        .unwrap();
+    let status = r.status().as_u16();
+    (status, serde_json::from_str(&r.body_mut().read_to_string().unwrap()).unwrap())
+}
+
+#[test]
+fn github_sign_in_answers_a_retry_with_the_token_it_issued() {
+    let github = FakeGithub::start();
+    let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"alice\"]\n");
+    github.next("alice", 0);
+    let (status, code) = sign_in_post(&server, "device", json!({ "workspace": "proj" }));
+    assert_eq!(status, 200, "{code}");
+    let poll = json!({ "device_code": code["device_code"], "workspace": "proj" });
+    let (status, first) = sign_in_post(&server, "token", poll.clone());
+    assert_eq!((status, first["status"].as_str()), (200, Some("issued")), "{first}");
+
+    // Its answer lost, the client asks again: GitHub gives a code's token once, so the server kept the answer.
+    let (status, again) = sign_in_post(&server, "token", poll);
+    assert_eq!((status, &again), (200, &first));
+    let exchanges = github.log().iter().filter(|l| l.starts_with("POST /login/oauth/access_token")).count();
+    assert_eq!(exchanges, 1, "GitHub was asked once");
+    let tokens: Value =
+        serde_json::from_str(&std::fs::read_to_string(server.root.path().join("tokens.json")).unwrap()).unwrap();
+    assert_eq!(tokens["tokens"].as_array().unwrap().len(), 1, "one token issued");
+
+    let (status, other) = sign_in_post(&server, "token", json!({ "device_code": "dc-other", "workspace": "proj" }));
+    assert_eq!(status, 400, "another code gets nothing of it: {other}");
+}
+
+#[test]
+fn sign_ins_waiting_on_github_keep_their_places_when_their_clients_leave() {
+    let github = FakeGithub::start();
+    github.state.lock().unwrap().hold = Duration::from_secs(4);
+    let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"alice\"]\n");
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let body = json!({ "workspace": "proj" }).to_string();
+    let conns: Vec<std::net::TcpStream> = (0..8)
+        .map(|_| {
+            let mut conn = std::net::TcpStream::connect(&addr).unwrap();
+            let head =
+                format!("POST /v2/auth/github/device HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n");
+            write!(conn, "{head}Content-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            conn
+        })
+        .collect();
+    eventually("eight sign-ins waiting on GitHub", || github.log().len() == 8);
+    drop(conns);
+    std::thread::sleep(Duration::from_millis(300));
+    let (status, answer) = sign_in_post(&server, "device", json!({ "workspace": "proj" }));
+    assert_eq!(status, 503, "their work still holds the places: {answer}");
+    assert_eq!(answer["error"]["code"], "busy");
+
+    github.state.lock().unwrap().hold = Duration::ZERO;
+    eventually("the places back", || sign_in_post(&server, "device", json!({ "workspace": "proj" })).0 == 200);
+}

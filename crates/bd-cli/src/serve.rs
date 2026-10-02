@@ -9,8 +9,10 @@
 //!
 //! Layout: `<root>/<name>/.bd/bd.db` is workspace `<name>`, served at
 //! `POST /w/<name>/v2/exec` (the wire format is in `protocol.rs`);
-//! `<root>/tokens.json` holds the access tokens. `GET /healthz` answers `ok`
-//! without a token.
+//! `<root>/tokens.json` holds the access tokens, and `<root>/auth.toml`
+//! turns on GitHub sign-in, served at `POST /v2/auth/github/{device,token}`
+//! without a token (`oauth.rs`). `GET /healthz` answers `ok` without a
+//! token.
 //!
 //! Memory and slots: up to `MAX_RUNNING` commands run at once. Requests in
 //! progress share a budget (`MIN_BODY_BUDGET`, or more for one maximum-size
@@ -63,14 +65,15 @@ use tokio_rustls::rustls;
 
 use crate::actor::{self, Resolved, Source};
 use crate::app::{App, RequestKey};
-use crate::auth::{self, Role, Token, Verifier};
+use crate::auth::{self, Role, Token, Verified, Verifier};
 use crate::cli::*;
 use crate::follow::{self, Feeds, HeadReader, Subscription};
 use crate::io::{self, Capture};
 use crate::jobs;
+use crate::oauth;
 use crate::protocol::{
     ErrorBody, ErrorDetail, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, PROTOCOL, PROTOCOL_HEADER,
-    valid_workspace_name,
+    SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
 };
 use crate::stream::{FrameWriter, Limits, ResponseBody, Stalls};
 
@@ -132,6 +135,11 @@ const MAX_WAITING_BODY: usize = 16 << 10;
 const MAX_WAIT_RANGE: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(5 * 60));
 /// On shutdown, how long waiting followers may take to get their answers.
 const FOLLOWERS_GRACE: Duration = Duration::from_secs(5);
+/// GitHub sign-in requests handled at once, each waiting on GitHub; more
+/// are answered 503 at once, which clients retry.
+const MAX_SIGN_INS: usize = 8;
+/// The largest body of a sign-in request.
+const MAX_SIGN_IN_BODY: usize = 16 << 10;
 
 type Body = ResponseBody;
 
@@ -175,6 +183,16 @@ fn run(a: &ServeArgs) -> Result<()> {
     let max_body = usize::try_from(a.max_body_mib << 20).unwrap_or(usize::MAX);
     let waits = Waits::from_args(a)?;
     let jobs = jobs::Config::from_args(a)?;
+    // Checked now so that a mistake shows at once; each sign-in reads the file again.
+    if let Some(github) = oauth::load(&root)? {
+        tracing::info!(
+            target: "bd::serve",
+            github = %github.url,
+            rules = github.rules.len(),
+            token_ttl = %bd_core::time::format_duration_ms(i64::try_from(github.token_ttl.as_millis()).unwrap_or(i64::MAX)),
+            "GitHub sign-in is on"
+        );
+    }
     // Before any request or background job: gate checks in this process use the server's defaults.
     io::mark_server_process();
     let server = Arc::new(Server::new(root, max_body, waits));
@@ -392,6 +410,25 @@ fn exec_path(path: &str) -> Option<&str> {
     Some(name).filter(|w| version == PROTOCOL.to_string() && !w.is_empty() && !w.contains('/'))
 }
 
+/// A step of GitHub sign-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignIn {
+    /// Get a one-time code.
+    Device,
+    /// Ask whether it was entered, and get the token once it was.
+    Token,
+}
+
+/// `[/<prefix>]/v2/auth/github/<device|token>` -> the step.
+fn sign_in_path(path: &str) -> Option<SignIn> {
+    let (_, step) = path.rsplit_once(&format!("/v{PROTOCOL}/auth/github/"))?;
+    match step {
+        "device" => Some(SignIn::Device),
+        "token" => Some(SignIn::Token),
+        _ => None,
+    }
+}
+
 async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
     let response = if path == "/healthz" && req.method() == Method::GET {
@@ -402,11 +439,152 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
         } else {
             Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
         }
+    } else if let Some(step) = sign_in_path(&path) {
+        if req.method() == Method::POST {
+            sign_in(&server, step, req).await
+        } else {
+            Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
+        }
     } else {
         let msg = format!("no such endpoint; workspaces are at /w/<name>/v{PROTOCOL}/exec");
         Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response()
     };
     Ok(response)
+}
+
+/// A step of GitHub sign-in, for a client without a token yet. Each runs on
+/// a blocking thread, as it waits on GitHub (`oauth.rs`).
+async fn sign_in(server: &Arc<Server>, step: SignIn, req: Request<Incoming>) -> Response<Body> {
+    // The body first, small and time-limited: a slow client holds no slot meanwhile.
+    let body = match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect())
+        .await
+    {
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(e)) if e.is::<LengthLimitError>() => {
+            let msg = format!("sign-in request larger than {} KiB", MAX_SIGN_IN_BODY >> 10);
+            return Reject::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid", msg, 2).response();
+        }
+        Ok(Err(e)) => {
+            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
+        }
+        Err(_) => {
+            let msg = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
+            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
+        }
+    };
+    let bad_body =
+        |e: serde_json::Error| Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("bad request body: {e}"), 2);
+    let answer = match step {
+        SignIn::Device => {
+            let start: SignInStart = match serde_json::from_slice(&body) {
+                Ok(s) => s,
+                Err(e) => return bad_body(e).response(),
+            };
+            // Before anyone goes to GitHub for it.
+            if server.workspace(&start.workspace).is_none() {
+                let msg = format!("workspace not found: {}", start.workspace);
+                return Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response();
+            }
+            let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
+                return busy("signing in other accounts");
+            };
+            let root = server.root.clone();
+            // The permit goes with the work: a client that leaves does not end it.
+            blocking(move || {
+                let _permit = permit;
+                Ok(serde_json::to_value(oauth::start(&root)?)?)
+            })
+            .await
+        }
+        SignIn::Token => {
+            let poll: SignInPoll = match serde_json::from_slice(&body) {
+                Ok(p) => p,
+                Err(e) => return bad_body(e).response(),
+            };
+            let key = auth::hash(&poll.device_code);
+            {
+                let mut issued = lock(&server.issued);
+                let now = Instant::now();
+                issued.answers.retain(|_, (at, _)| now.duration_since(*at) < ISSUED_REPLAY);
+                if let Some((_, answer)) = issued.answers.get(&key) {
+                    return json_response(StatusCode::OK, answer);
+                }
+                // A retry while the first attempt still runs waits for its answer.
+                if !issued.running.insert(key.clone()) {
+                    return busy("completing this sign-in");
+                }
+            }
+            let completing = Completing { server: server.clone(), key: key.clone() };
+            let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
+                return busy("signing in other accounts");
+            };
+            let srv = server.clone();
+            blocking(move || {
+                let _held = (permit, completing);
+                let answer = oauth::poll(&srv.root, &poll)?;
+                let value = serde_json::to_value(&answer)?;
+                // Kept even if this client is gone: its retry gets the token GitHub will not give again.
+                if let SignInAnswer::Issued(_) = answer {
+                    srv.tokens.invalidate();
+                    let mut issued = lock(&srv.issued);
+                    if issued.answers.len() >= MAX_ISSUED {
+                        let oldest = issued.answers.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone());
+                        issued.answers.remove(&oldest.unwrap_or_default());
+                    }
+                    issued.answers.insert(key, (Instant::now(), value.clone()));
+                }
+                Ok(value)
+            })
+            .await
+        }
+    };
+    match answer {
+        Ok(value) => json_response(StatusCode::OK, &value),
+        Err(e) => {
+            let status = match &e {
+                Error::Unauthorized(_) => StatusCode::FORBIDDEN,
+                Error::Invalid(_) => StatusCode::BAD_REQUEST,
+                Error::Remote(_) => StatusCode::BAD_GATEWAY,
+                Error::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => return Reject::internal(e).response(),
+            };
+            Reject::new(status, e.code(), e.to_string(), e.exit_code()).response()
+        }
+    }
+}
+
+/// How long the answer of a sign-in that issued a token is kept, for a
+/// retry whose first answer was lost: GitHub gives a sign-in's token once.
+const ISSUED_REPLAY: Duration = Duration::from_secs(5 * 60);
+/// Answers of sign-ins kept at once; the oldest goes first.
+const MAX_ISSUED: usize = 256;
+
+/// Sign-ins completing, and the answers of those that issued a token, by
+/// the SHA-256 of their device code.
+#[derive(Default)]
+struct Issuances {
+    answers: HashMap<String, (Instant, serde_json::Value)>,
+    running: HashSet<String>,
+}
+
+/// A sign-in completing: no other attempt of it runs until this is dropped.
+struct Completing {
+    server: Arc<Server>,
+    key: String,
+}
+
+impl Drop for Completing {
+    fn drop(&mut self) {
+        lock(&self.server.issued).running.remove(&self.key);
+    }
+}
+
+/// Run `f` on a blocking thread.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => Err(Error::Io(std::io::Error::other(format!("a sign-in step failed: {e}")))),
+    }
 }
 
 fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Token, Reject> {
@@ -424,8 +602,17 @@ fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Tok
         return Err(denied());
     }
     match server.tokens.verify(secret.trim()) {
-        Ok(Some(token)) => Ok(token),
-        Ok(None) => Err(denied()),
+        Ok(Verified::Valid(token)) => Ok(token),
+        Ok(Verified::Expired(token)) => {
+            let at = token.expires_at.map(|t| t.to_rfc3339()).unwrap_or_default();
+            let renew = match token.github {
+                Some(_) => "sign in again: `bd remote login --github`",
+                None => "the server's admin issues new ones",
+            };
+            let msg = format!("access token {} expired at {at}; {renew}", token.name);
+            Err(Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7))
+        }
+        Ok(Verified::Unknown) => Err(denied()),
         Err(e) => Err(Reject::internal(e)),
     }
 }
@@ -585,6 +772,10 @@ struct Server {
     followers: Arc<Semaphore>,
     waits: Waits,
     feeds: Arc<Feeds>,
+    /// GitHub sign-in requests running.
+    sign_ins: Arc<Semaphore>,
+    /// Sign-ins completing, and the answers of those that issued tokens.
+    issued: Mutex<Issuances>,
     /// Set when the server shuts down.
     stopping: watch::Sender<bool>,
 }
@@ -808,6 +999,8 @@ impl Server {
             followers: Arc::new(Semaphore::new(waits.followers)),
             waits,
             feeds: Arc::new(Feeds::new(follow::HEAD_CHECK_EVERY, follow::HEAD_CHECK_GAP)),
+            sign_ins: Arc::new(Semaphore::new(MAX_SIGN_INS)),
+            issued: Mutex::default(),
             stopping: watch::Sender::new(false),
         }
     }
@@ -1120,6 +1313,16 @@ mod tests {
     }
 
     #[test]
+    fn sign_in_paths() {
+        assert_eq!(sign_in_path("/v2/auth/github/device"), Some(SignIn::Device));
+        assert_eq!(sign_in_path("/bd/v2/auth/github/token"), Some(SignIn::Token), "under a proxy prefix");
+        for bad in ["/v2/auth/github/", "/v2/auth/github/device/", "/v1/auth/github/token", "/v2/auth/gitlab/token"] {
+            assert_eq!(sign_in_path(bad), None, "{bad}");
+        }
+        assert_eq!(exec_path("/v2/auth/github/token"), None);
+    }
+
+    #[test]
     fn body_budget_permits_are_kib() {
         assert_eq!((kib(0), kib(1), kib(1024), kib(1025)), (1, 1, 1, 2));
         assert_eq!(kib((4096 << 20) * BODY_COPIES), 8 << 20, "the largest --max-body-mib fits");
@@ -1188,6 +1391,8 @@ mod tests {
             sha256: String::new(),
             created_at: String::new(),
             revoked_at: None,
+            expires_at: None,
+            github: None,
         };
         let actor = |flag, env, session| resolve_actor(flag, env, session, &t).map(|r| (r.actor, r.source));
         let code = |flag, env, session| resolve_actor(flag, env, session, &t).unwrap_err().exit_code();

@@ -145,8 +145,8 @@ pub fn identity() -> (Option<String>, Option<String>) {
 
 fn missing_token(url: &str) -> Error {
     Error::Unauthorized(format!(
-        "no access token for {url}: run `bd remote login`, or set BD_TOKEN (create one on the server with `bd serve \
-         token create`)"
+        "no access token for {url}: sign in with `bd remote login --github` (where the server has GitHub sign-in), \
+         save a token from the server's admin with `bd remote login`, or set BD_TOKEN"
     ))
 }
 
@@ -320,7 +320,7 @@ fn check_url(raw: &str) -> Result<String> {
     }
 }
 
-fn is_loopback(authority: &str) -> bool {
+pub(crate) fn is_loopback(authority: &str) -> bool {
     let host = match authority.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or_default(),
         None => authority.rsplit_once(':').map_or(authority, |(h, _)| h),
@@ -1082,6 +1082,82 @@ impl Remote {
         let info: serde_json::Value = serde_json::from_str(&response.stdout)?;
         info["events_head"].as_i64().ok_or_else(|| Error::Remote(format!("{}: bd info has no events_head", self.url)))
     }
+
+    /// POST `body` to the server's GitHub sign-in endpoint
+    /// `<server>/v2/auth/<path>`, which needs no access token: its JSON
+    /// answer. Failures in transit, busy answers and a proxy's server errors
+    /// are retried for the retry time, at least `pace` apart; the server's
+    /// own refusals end it.
+    pub fn sign_in_request<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &impl Serialize,
+        pace: Duration,
+    ) -> Result<T> {
+        use crate::agents::show::printable;
+        let server = credentials::keys(&self.url)?.server;
+        let endpoint = format!("{server}/v{PROTOCOL}/auth/{path}");
+        let agent = self.agent()?;
+        let body = serde_json::to_vec(body)?;
+        let deadline = Instant::now() + self.retry;
+        let mut delay = pace.max(Duration::from_millis(200));
+        loop {
+            let sent = agent
+                .post(&endpoint)
+                .header("accept", "application/json")
+                .content_type("application/json")
+                .send(&body[..]);
+            let failure = match sent {
+                Ok(mut response) => {
+                    let status = response.status().as_u16();
+                    let bd = response.headers().contains_key(PROTOCOL_HEADER);
+                    match (status, bd, response.body_mut().with_config().limit(1 << 20).read_to_string()) {
+                        (200, true, Ok(text)) => {
+                            return serde_json::from_str(&text).map_err(|e| {
+                                Error::Remote(format!(
+                                    "{server}: unexpected sign-in answer: {}",
+                                    printable(&e.to_string())
+                                ))
+                            });
+                        }
+                        (503, true, Ok(text)) => format!("HTTP 503{}", printable(&error_message(&text))),
+                        (_, true, Ok(text)) => return Err(sign_in_error(status, &text, &server)),
+                        (_, true, Err(e)) => format!("HTTP {status}, reading the answer: {e}"),
+                        (500.., false, _) => format!("HTTP {status}"),
+                        (_, false, _) => {
+                            return Err(Error::Remote(format!(
+                                "{server}: HTTP {status} to a GitHub sign-in: not a bd server; check the URL"
+                            )));
+                        }
+                    }
+                }
+                Err(e) if retryable(&e) => e.to_string(),
+                Err(e) => return Err(Error::Remote(format!("{server}: {e}{}", certificate_advice(&e.to_string())))),
+            };
+            if Instant::now() + delay > deadline {
+                return Err(Error::Remote(format!(
+                    "{server}: {failure} (gave up after retrying for {}s)",
+                    self.retry.as_secs()
+                )));
+            }
+            tracing::debug!(target: "bd::remote", %server, %failure, "retrying");
+            std::thread::sleep(delay);
+            delay = (delay * 2).min(Duration::from_secs(4).max(pace));
+        }
+    }
+}
+
+/// bd serve's refusal of a GitHub sign-in step, as an error.
+fn sign_in_error(status: u16, body: &str, server: &str) -> Error {
+    let detail = serde_json::from_str::<ErrorBody>(body).ok().map(|b| b.error);
+    let message =
+        detail.as_ref().map_or_else(|| format!("HTTP {status}"), |d| crate::agents::show::printable(&d.message));
+    match detail.map_or(0, |d| d.exit_code) {
+        7 => Error::Unauthorized(format!("{server}: {message}")),
+        2 => Error::invalid(format!("{server}: {message}")),
+        3 => Error::NoWorkspace(format!("{server}: {message}")),
+        _ => Error::Remote(format!("{server}: {message}")),
+    }
 }
 
 // ------------------------------------------------------------ bd remote
@@ -1159,7 +1235,8 @@ fn set(app: &mut App, a: &RemoteSetArgs) -> Result<()> {
     out = out.line(if token.is_some() {
         "  check the connection: bd remote show"
     } else {
-        "  next: `bd remote login` (or set BD_TOKEN), then check the connection with `bd remote show`"
+        "  next: `bd remote login --github` to sign in with GitHub, or `bd remote login` with a token (or set \
+         BD_TOKEN); then `bd remote show` checks the connection"
     });
     if let (Some(trust), Some(token), None) = (trust, token, &app.g.remote) {
         let c = Configured { url: url.clone(), source: Source::File(path.clone()), ca_cert: ca_path };
@@ -1370,37 +1447,50 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
     let scope = if a.workspace_only { Scope::Workspace } else { Scope::Server };
     let keys = credentials::keys(&c.url)?;
     let path = credentials::default_path()?;
-    let label = match scope {
-        Scope::Server => keys.server.clone(),
-        Scope::Workspace => c.url.clone(),
-    };
     let trust = Trust::load(c.ca_cert.as_deref())?;
-    let label = match &trust.path {
-        Some(ca) => format!("{label}, trusting the CA certificate {}", ca.display()),
-        None => label,
-    };
-    let token = read_token(&label)?;
-    credentials::check_token(&token)?;
-    let actor = if a.no_verify {
-        None
+    let (token, signed_in) = if a.github {
+        let workspace = c.url.rsplit_once("/w/").map_or("", |(_, w)| w);
+        let remote = Remote::new(c.clone(), trust.clone(), String::new());
+        let issued = crate::oauth::sign_in(&remote, workspace, &keys.server)?;
+        credentials::check_token(&issued.token)
+            .map_err(|_| Error::Remote(format!("{}: unexpected sign-in answer: not an access token", keys.server)))?;
+        (issued.token.clone(), Some(issued))
     } else {
-        // The token alone: $BD_ACTOR is checked per command, not saved.
-        let info =
-            check(Remote::new(c.clone(), trust.clone(), token.clone()).quick(), (None, None)).map_err(|e| match e {
-                Error::Unauthorized(m) => Error::Unauthorized(format!("{m}; nothing was saved")),
-                Error::Remote(m) => {
-                    Error::Remote(format!("{m}; nothing was saved (--no-verify saves the token without checking it)"))
-                }
-                e => e,
-            })?;
-        info["actor"].as_str().map(String::from)
+        let label = match scope {
+            Scope::Server => keys.server.clone(),
+            Scope::Workspace => c.url.clone(),
+        };
+        let label = match &trust.path {
+            Some(ca) => format!("{label}, trusting the CA certificate {}", ca.display()),
+            None => label,
+        };
+        let token = read_token(&label)?;
+        credentials::check_token(&token)?;
+        (token, None)
+    };
+    let actor = match &signed_in {
+        Some(issued) => Some(issued.actor.clone()),
+        None if a.no_verify => None,
+        None => {
+            // The token alone: $BD_ACTOR is checked per command, not saved.
+            let info = check(Remote::new(c.clone(), trust.clone(), token.clone()).quick(), (None, None)).map_err(
+                |e| match e {
+                    Error::Unauthorized(m) => Error::Unauthorized(format!("{m}; nothing was saved")),
+                    Error::Remote(m) => Error::Remote(format!(
+                        "{m}; nothing was saved (--no-verify saves the token without checking it)"
+                    )),
+                    e => e,
+                },
+            )?;
+            info["actor"].as_str().map(String::from)
+        }
     };
     let saved = credentials::save(&path, &c.url, &token, &trust.anchor, scope)?;
     let reach = match scope {
         Scope::Server => format!("{} (every workspace it allows there)", saved.key),
         Scope::Workspace => saved.key.clone(),
     };
-    let mut out = Out::new(json!({
+    let mut view = json!({
         "url": c.url,
         "path": path,
         "key": saved.key,
@@ -1410,12 +1500,38 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
         "replaced": saved.replaced,
         "dropped": saved.dropped,
         "ca_cert": c.ca_cert,
-    }))
-    .line(format!("✓ Saved the access token for {reach} in {}", path.display()))
-    .line(match &actor {
-        Some(actor) => format!("  {} accepts it, as actor {actor}", c.url),
-        None => "  not checked (--no-verify): `bd remote show` checks it".to_string(),
     });
+    if let Some(issued) = &signed_in {
+        view["github"] = json!({ "login": issued.login, "via": issued.via });
+        view["token"] = json!({
+            "name": issued.name,
+            "role": issued.role,
+            "kind": issued.kind,
+            "workspaces": issued.workspaces,
+            "expires_at": issued.expires_at,
+        });
+    }
+    let saved_line = format!("✓ Saved the access token for {reach} in {}", path.display());
+    let mut out = match &signed_in {
+        Some(issued) => {
+            use crate::agents::show::printable;
+            let workspaces = match issued.workspaces.iter().any(|w| w == "*") {
+                true => "all".to_string(),
+                false => issued.workspaces.join(","),
+            };
+            Out::new(view)
+                .line(format!("✓ Signed in with GitHub as {} ({})", printable(&issued.login), printable(&issued.via)))
+                .line(saved_line)
+                .line(printable(&format!(
+                    "  acts as {0} or {0}/<agent>, role {1}, kind {2}, workspaces {workspaces}; expires {3}",
+                    issued.actor, issued.role, issued.kind, issued.expires_at
+                )))
+        }
+        None => Out::new(view).line(saved_line).line(match &actor {
+            Some(actor) => format!("  {} accepts it, as actor {actor}", c.url),
+            None => "  not checked (--no-verify): `bd remote show` checks it".to_string(),
+        }),
+    };
     if let Some(ca) = &c.ca_cert {
         out = out.line(format!("  bound to the CA certificate {}: it is not sent trusting any other", ca.display()));
     }
@@ -1464,7 +1580,9 @@ fn logout(app: &mut App, a: &RemoteLogoutArgs) -> Result<()> {
         out = out.line(format!("  removed {}, which is empty now", path.display()));
     }
     if !r.removed.is_empty() {
-        out = out.line("  the server still accepts the token until it is revoked there (`bd serve token revoke`)");
+        out = out.line(
+            "  the server still accepts the token until it is revoked there (`bd serve token revoke`), or expires",
+        );
     }
     if env("BD_TOKEN").is_some() {
         out = out.line("  note: $BD_TOKEN is still set, and keeps providing a token");

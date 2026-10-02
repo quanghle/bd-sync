@@ -1241,7 +1241,8 @@ pub struct BenchWorkerArgs {
 pub struct ServeArgs {
     #[command(subcommand)]
     pub action: Option<ServeAction>,
-    /// Directory of workspaces: <root>/<name>/.bd/bd.db is served at /w/<name>; tokens in <root>/tokens.json
+    /// Directory of workspaces: <root>/<name>/.bd/bd.db is served at /w/<name>; tokens in <root>/tokens.json,
+    /// GitHub sign-in set up in <root>/auth.toml
     #[arg(long, env = "BD_SERVE_ROOT", value_name = "DIR")]
     pub root: Option<PathBuf>,
     /// Address and port to listen on
@@ -1300,10 +1301,10 @@ pub enum ServeAction {
 pub enum TokenCommand {
     /// Create an access token and print its secret once
     Create(TokenCreateArgs),
-    /// List access tokens (never their secrets)
+    /// List access tokens (never their secrets), including those GitHub sign-in issued
     #[command(alias = "ls")]
     List(TokenRootArgs),
-    /// Revoke an access token; it stops working at once
+    /// Revoke an access token, or every token a GitHub user got by signing in; it stops working at once
     Revoke(TokenRevokeArgs),
 }
 
@@ -1335,7 +1336,12 @@ pub struct TokenCreateArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct TokenRevokeArgs {
-    pub name: String,
+    /// The token's name
+    #[arg(required_unless_present = "github")]
+    pub name: Option<String>,
+    /// Revoke every token this GitHub user (a login) got by signing in, instead of a named one
+    #[arg(long, value_name = "LOGIN", conflicts_with = "name")]
+    pub github: Option<String>,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }
@@ -1374,10 +1380,12 @@ pub enum RemoteCommand {
     /// Stop using the remote workspace (removes .bd/remote.toml)
     #[command(alias = "rm")]
     Unset,
-    /// Save an access token for a bd server in your user config directory, so BD_TOKEN is not needed
+    /// Save an access token for a bd server in the user config directory, so BD_TOKEN is not needed
     ///
-    /// The token is read from stdin when it is piped (`printf %s "$TOKEN" | bd remote login`), else from a
-    /// prompt that does not echo it; never from the command line. It is checked against the server first.
+    /// With --github, sign in with GitHub instead: the one-time code shown is entered at GitHub
+    /// (github.com/login/device), and the server issues a token if its auth.toml lets the GitHub account in.
+    /// Otherwise the token is read from stdin when it is piped (`printf %s "$TOKEN" | bd remote login`), else
+    /// from a prompt that does not echo it; never from the command line. It is checked against the server first.
     Login(RemoteLoginArgs),
     /// Forget access tokens saved by `bd remote login`
     Logout(RemoteLogoutArgs),
@@ -1387,6 +1395,9 @@ pub enum RemoteCommand {
 pub struct RemoteLoginArgs {
     /// Workspace URL, e.g. https://bd.example.com/w/proj (default: this checkout's remote workspace)
     pub url: Option<String>,
+    /// Sign in with GitHub to get a token from the server, instead of entering one
+    #[arg(long, conflicts_with = "no_verify")]
+    pub github: bool,
     /// Save the token for this workspace only, instead of for every workspace on its server
     #[arg(long)]
     pub workspace_only: bool,

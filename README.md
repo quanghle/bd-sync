@@ -12,7 +12,7 @@ coordination engine:
 - **Optimistic concurrency**: per-issue revisions and `--if-revision/--if-status/--if-assignee` guards (exit code 13 on conflict)
 - **Comments, durable memory, and transactional event history** with gapless, commit-ordered sequence numbers
 - **Playbooks and gates**: repeatable multi-step work declared once in TOML and run atomically as `<run>.<step>` issues; human, timer, issue, and GitHub gates that arm when their step could start ([Playbooks](#playbooks-repeatable-multi-step-work))
-- **Remote server**: `bd serve` shares workspaces over HTTPS with laptops, CI runners and cloud agents; the same `bd` binary is the client, with access tokens (roles, and human or agent kinds), and retries that apply a write once. The server also reclaims dead workers' leases, checks gates and takes backups on its own ([Remote server](#remote-server-one-workspace-many-machines))
+- **Remote server**: `bd serve` shares workspaces over HTTPS with laptops, CI runners and cloud agents; the same `bd` binary is the client, with access tokens (roles, and human or agent kinds) that an admin creates or people get by signing in with GitHub, and retries that apply a write once. The server also reclaims dead workers' leases, checks gates and takes backups on its own ([Remote server](#remote-server-one-workspace-many-machines))
 - **Agent assets**: a workspace serves skills and MCP server definitions per harness (Claude Code, Codex, Copilot CLI); checkouts pull them into each harness's own places, skills at session start, MCP definitions only once a person approves them ([Agent skills and MCP definitions](#agent-skills-and-mcp-definitions))
 - Extras: JSONL export/import (reads beads exports), `bd batch` (many writes, one transaction), `bd bench`, and local observability (structured logs, timing, Prometheus metrics, `bd doctor`)
 
@@ -479,6 +479,7 @@ bd serve token create ci --as ci --workspace proj --root /srv/bd
 bd serve token create dashboard --as dash --role read --root /srv/bd
 bd serve token list --root /srv/bd
 bd serve token revoke ci --root /srv/bd          # takes effect at once, no restart
+# Or let people get their own by signing in with GitHub: <root>/auth.toml (below)
 
 bd serve --root /srv/bd --listen 0.0.0.0:7420 --tls-cert cert.pem --tls-key key.pem
 ```
@@ -516,6 +517,99 @@ line per request on stderr; set `BD_LOG` to change that. Ctrl-C or SIGTERM
 lets running commands finish first (up to 30 seconds). The server keeps
 connections to each database open, so restart it after replacing or moving a
 workspace's `bd.db`.
+
+### Signing in with GitHub
+
+Instead of creating each person's token, an admin can let people get their
+own: `bd remote login --github` shows a one-time code to enter at GitHub, and
+the server issues an access token if a rule of `<root>/auth.toml` lets the
+GitHub account in, with that rule's role, kind and workspaces. An account no
+rule lets in gets nothing.
+
+1. Register a [GitHub OAuth app](https://github.com/settings/developers) (any
+   homepage and callback URL will do) or a GitHub App, and tick **Enable
+   Device Flow** in its settings. Only its client ID is needed, no secret. A
+   GitHub App that checks memberships needs the **Members** organization
+   permission (read), and must be installed in those organizations.
+2. Write `<root>/auth.toml` on the server:
+
+```toml
+[github]
+client_id = "Ov23li0123456789abcd"
+token_ttl = "30d"                       # issued tokens expire (1h to 366d; default 30d)
+# url = "https://ghe.example.com"       # GitHub Enterprise Server; its API defaults to <url>/api/v3 (api_url)
+
+# Rules, in order: the first that matches an account decides its token.
+[[github.allow]]
+users = ["alice"]                       # GitHub logins, whatever their case
+role = "admin"                          # read, write (default) or admin
+kind = "human"                          # agent (default) or human
+
+[[github.allow]]
+teams = ["acme/bd-maintainers"]         # <organization>/<team slug>
+kind = "human"
+
+[[github.allow]]
+orgs = ["acme"]
+role = "read"
+workspaces = ["proj"]                   # default: every workspace
+```
+
+`bd serve` checks the file when it starts, and refuses to start with a
+mistake in it (an unknown field, a rule that names nobody, an `http` URL to
+another host). After that, each sign-in reads it again, so changes need no
+restart; a mistake made meanwhile fails sign-ins, with the reason in the
+server log only.
+
+- A rule lets an account in if `users` lists its login, or if it is an active
+  member (not just invited) of one of its `orgs` or `teams`. Memberships are
+  read with the account's own GitHub token, so the sign-in asks for the
+  `read:org` scope when a rule names organizations or teams. An organization
+  that restricts OAuth apps only answers once an owner approves the app
+  (organization settings, Third-party access), and one with SAML single
+  sign-on only for a GitHub token authorized for it (GitHub offers that on its
+  authorization page); until then its members count as no members, and the
+  server log says why.
+- The token acts as the GitHub login, or its sub-actors `<login>/<agent>`. It
+  is named `github-<login>-<random>` and expires after `token_ttl`; each
+  sign-in gets a token of its own, so one account may sign in on several
+  machines. Once it expires, commands fail with exit 7 naming the time, and
+  `bd remote login --github` gets a new one.
+- An actor belongs to one account: a sign-in is refused while a live token of
+  another principal acts as the login, or as one of its sub-actors (a token
+  an admin created, or one of another GitHub account that had the login
+  before), and `bd serve token create` refuses an actor of a signed-in
+  account in the same way. Revoke the other tokens to let the sign-in through.
+- A change to `auth.toml` applies to the next sign-ins: tokens already issued
+  keep their permissions until they expire. To cut an account off at once,
+  `bd serve token revoke --github alice --root /srv/bd` revokes every token it
+  got by signing in, including those from before a rename (accounts are told
+  apart by their GitHub user id). `bd serve token list` shows each token's
+  GitHub account and expiry; expired ones leave the list a week later.
+- An account that a rule lets in, but not into the workspace the sign-in is
+  for, is refused, and so is a workspace the server does not have: nothing is
+  issued.
+
+The server runs GitHub's device flow itself, so the client needs to reach only
+the bd server, and the GitHub token never leaves the server: it reads the
+account and its memberships during the sign-in, and is never stored or
+logged. A few things to keep in mind:
+
+- `users` matches logins, and a login given up by renaming an account can be
+  registered by someone else; memberships of organizations and teams follow
+  the account itself. The login is also the actor's name in the history.
+- Tokens saved by `bd remote login` serve every process of that user on that
+  machine, agents included, so a rule's `kind = "human"` lets those agents
+  resolve human gates too. `agent` is the default.
+- Whoever started a sign-in gets its token: enter only codes shown by one's
+  own `bd remote login --github`.
+- The sign-in endpoints, `POST /v2/auth/github/device` and
+  `POST /v2/auth/github/token`, need no token. At most 8 sign-in requests run
+  at once (others are answered 503, which clients retry), and GitHub limits
+  how many codes an app may have entered per hour. GitHub gives a code's token
+  only once, so the server keeps the answer that issued a bd token for 5
+  minutes: a client whose answer was lost in transit gets it again by asking
+  again.
 
 ### Background jobs and backups
 
@@ -589,7 +683,8 @@ commit the result, so every checkout and agent uses the shared workspace:
 
 ```bash
 bd remote set https://bd.example.com/w/proj   # writes .bd/remote.toml (--ca-cert ca.pem for a private CA)
-bd remote login                               # prompts for the access token, checks it, saves it for you
+bd remote login --github                      # signs in with GitHub, where the server allows it; the server issues the token
+bd remote login                               # or: prompts for a token from the server's admin, checks it, saves it
 bd remote show                                # checks the URL, certificate, token and actor
 bd ready                                      # every command now runs on the server
 BD_ACTOR=alice/agent-2 bd claim --next        # sub-actors: one lease holder per agent
@@ -611,13 +706,22 @@ The access token comes from `$BD_TOKEN`, else from the tokens saved by
 `BD_TOKEN` from a secret; people log in once per machine:
 
 ```bash
+bd remote login --github               # sign in with GitHub; or: bd remote login --github https://bd.example.com/w/proj
 bd remote login                        # the checkout's server; or: bd remote login https://bd.example.com/w/proj
 printf %s "$TOKEN" | bd remote login   # a piped token is read from stdin, not from a prompt
 bd remote login --workspace-only       # this workspace only, e.g. for a token limited to it
 bd remote logout                       # forget it (a server URL also forgets its workspaces' tokens)
 ```
 
-The token is never taken from the command line, so it stays out of shell
+With `--github`, `login` gets the token from the server instead of reading
+one: it shows a one-time code to enter at GitHub
+(`https://github.com/login/device`), waits until it is entered (Ctrl-C
+cancels; the code lasts 15 minutes), and saves the token the server issues,
+reporting its actor, role, kind, workspaces and expiry. The server must have
+GitHub sign-in on, and must let the account in
+([Signing in with GitHub](#signing-in-with-github)).
+
+Otherwise the token is never taken from the command line, so it stays out of shell
 history and process lists, and it is never printed. `login` reads it from
 stdin when stdin is piped, and otherwise prompts without echoing it (on
 Windows, pipe it: `Read-Host -MaskInput Token | bd remote login` in
@@ -641,7 +745,8 @@ On Unix, the file is replaced atomically by one with mode 0600, in a
 directory created 0700, and bd refuses to use it if other users can read it. On Windows it is
 protected by the per-user permissions of `%APPDATA%`. `bd remote logout` only
 forgets the token on this machine: revoke it on the server with
-`bd serve token revoke`.
+`bd serve token revoke` (a token from GitHub sign-in also stops working when
+it expires).
 
 | variable | meaning |
 |---|---|
@@ -653,8 +758,9 @@ forgets the token on this machine: revoke it on the server with
 | `BD_REMOTE_RETRY_SECS` | how long to retry an unreachable server (default 30; 0 = once) |
 | `BD_INSECURE_HTTP=1` | allow plain `http://` to a non-loopback host |
 
-A token acts as one actor (`--as`), or as that actor's sub-actors
-`<actor>/<name>`, so leases keep naming who holds them. Roles:
+A token acts as one actor (`--as`, or the GitHub login of a token from GitHub
+sign-in), or as that actor's sub-actors `<actor>/<name>`, so leases keep
+naming who holds them. Roles:
 
 | role | may run |
 |---|---|
@@ -663,7 +769,8 @@ A token acts as one actor (`--as`), or as that actor's sub-actors
 | `admin` | also `config set/unset`, `import`, `events prune`, `doctor`, and taking over other actors' claims (with `--take-over`) |
 
 A token's kind, independent of its role, says who holds it: `agent` (the
-default) or `human` (`--kind human`). Keep human tokens out of agents' environments, since they
+default) or `human` (`--kind human`, or `kind = "human"` in an `auth.toml`
+rule). Keep human tokens out of agents' environments, since they
 can approve. The server enforces roles and kinds in the engine, so a `bd batch`
 or a playbook gets the same answer as a single command:
 
@@ -1486,7 +1593,7 @@ actor comes from `--actor` or the client's `$BD_ACTOR` has none.
 | 4 | claim conflict: already claimed (a live claim, even your own actor's, without its `--token`), not ready, not the holder of a live claim (`--take-over` takes it over; `--force` does not), or lease lost |
 | 5 | database busy, or another bd process kept a checkout's agent assets mutex (`.bd/agents.lock.mutex`) past `--busy-timeout-ms` |
 | 6 | event cursor truncated |
-| 7 | access denied: missing or invalid token, or its role, kind, workspaces or actor do not allow it |
+| 7 | access denied: missing, invalid or expired token, or its role, kind, workspaces or actor do not allow it; or a GitHub sign-in that was refused |
 | 8 | bd server unreachable, its certificate not trusted, or a server failure: the command did not take effect (retrying is safe) |
 | 9 | a write reached the bd server, but its answer was lost: it may have taken effect, so check before running it again |
 | 13 | stale optimistic-concurrency guard |
@@ -1527,9 +1634,10 @@ crates/bd-core/tests/ engine integration tests (graph semantics, leases with a m
 crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) · batch · bench · fmt · logging
                       io (stdio and files, or a captured request) · serve (bd serve) · jobs (its background
                       jobs: reclaim, gate checks, agent sets, backups) · auth (access tokens)
-                      · remote (client) · credentials (bd remote login) · protocol (wire format)
-                      · stream (streamed answers) · agents (bd agents) + agents/ (checkout, lock, mcp_file,
-                      sync, approve, show, hook, watch) · hook (session hook output per harness)
+                      · oauth (GitHub sign-in) · remote (client) · credentials (bd remote login)
+                      · protocol (wire format) · stream (streamed answers) · agents (bd agents) + agents/
+                      (checkout, lock, mcp_file, sync, approve, show, hook, watch) · hook (session hook
+                      output per harness)
 crates/bd-cli/tests/  end-to-end CLI tests; remote.rs runs real bd serve and client processes
 ```
 

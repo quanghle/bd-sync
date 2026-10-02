@@ -720,6 +720,66 @@ fn comments_and_memories() {
     assert!(env.store.read(|r| r.memories(None)).unwrap().is_empty());
 }
 
+/// A recompute stops at the closed, unblocked issues below what changed:
+/// closing a hierarchy bottom-up in one transaction, then blocking its root,
+/// gives the flags and events of a walk through every descendant.
+#[test]
+fn recompute_stops_at_closed_descendants() {
+    let mut env = Env::new();
+    let child = |env: &mut Env, title: &str, parent: &str| {
+        env.create_with(NewIssue { title: title.into(), parent: Some(parent.into()), ..Default::default() })
+    };
+    let x = env.create("blocker", 1);
+    let r = env.create("root", 1);
+    let a = child(&mut env, "a", &r);
+    let b = child(&mut env, "b", &a);
+    let c = child(&mut env, "c", &b);
+    let d = child(&mut env, "d", &c);
+    let s = child(&mut env, "closed with a live child", &r);
+    let s1 = child(&mut env, "live below a closed parent", &s);
+    let w = env.create("waiter", 1);
+    env.dep(&w, &b, DepType::WaitsFor);
+    env.dep(&a, &x, DepType::Blocks);
+    let force = CloseOptions { force: true, ..Default::default() };
+    env.store.write("close", "alice", |tx| tx.close_issue(&s, &force)).unwrap();
+    let y = env.create("late blocker", 1);
+    let since = env.events().last().unwrap().seq;
+
+    env.store
+        .write("close", "alice", |tx| {
+            for id in [&x, &d, &c, &b] {
+                tx.close_issue(id, &CloseOptions::default())?;
+            }
+            tx.add_dependency(&r, &y, DepType::Blocks, None)
+        })
+        .unwrap();
+
+    let got: Vec<(String, String)> =
+        env.events().into_iter().filter(|e| e.seq > since).map(|e| (e.op, e.issue_id.unwrap_or_default())).collect();
+    let want: Vec<(String, String)> = [
+        ("closed", &x),
+        ("unblocked", &a),
+        ("unblocked", &b),
+        ("unblocked", &c),
+        ("unblocked", &d),
+        ("closed", &d),
+        ("closed", &c),
+        ("unblocked", &w),
+        ("closed", &b),
+        ("dep_added", &r),
+        ("blocked", &r),
+        ("blocked", &a),
+    ]
+    .into_iter()
+    .map(|(op, id)| (op.to_string(), id.clone()))
+    .collect();
+    assert_eq!(got, want);
+    assert!(env.issue(&a).is_blocked);
+    assert!(!env.issue(&s1).is_blocked);
+    assert!(!env.issue(&d).is_blocked);
+    env.assert_healthy();
+}
+
 #[test]
 fn events_are_gapless_transactional_and_prunable() {
     let mut env = Env::new();

@@ -12,7 +12,9 @@
 //!   hierarchy, never up.
 //!
 //! The flag is recomputed inside the same transaction as every mutation that
-//! can change it, for the affected issues and their whole subtrees.
+//! can change it, for the affected issues and their subtrees, down to the
+//! terminal, unblocked issues there (whose flag, all their children see of
+//! them, cannot change).
 //!
 //! Query plans: queries run once per issue of a walk (recomputing a subtree,
 //! a tree's edges, blockers, descendants, ...) fix their plan instead of
@@ -249,7 +251,7 @@ pub(crate) fn seeds_for_edge(conn: &Connection, issue: &str, target: &str, dep_t
     Ok(seeds)
 }
 
-/// Recompute `is_blocked` for `seeds` and all their descendants, inside the
+/// Recompute `is_blocked` for `seeds` and their descendants, inside the
 /// caller's transaction. Emits `blocked` / `unblocked` events for net changes
 /// on live issues and returns them.
 pub(crate) fn recompute(ctx: &mut WriteCtx<'_>, seeds: Vec<String>) -> Result<Vec<BlockChange>> {
@@ -271,6 +273,12 @@ pub(crate) fn recompute_above(
     let conn = ctx.conn();
     // BFS from the seeds down the hierarchy: parents precede children, so
     // one pass usually converges; the loop below guarantees a fixpoint.
+    //
+    // A terminal issue below the seeds that is unblocked stays so (terminal
+    // issues never block), and its children see only that flag: the walk
+    // stops there. Closing a chain bottom-up then costs one step per close,
+    // not one per issue already closed below it.
+    let seed_set: HashSet<String> = seeds.iter().cloned().collect();
     let mut order: Vec<String> = Vec::new();
     let mut state: HashMap<String, (bool, Status)> = HashMap::new();
     let mut queue: VecDeque<String> = seeds.into_iter().collect();
@@ -285,6 +293,9 @@ pub(crate) fn recompute_above(
         else {
             continue;
         };
+        if !blocked && status.is_terminal() && !seed_set.contains(&id) {
+            continue;
+        }
         state.insert(id.clone(), (blocked, status));
         if settled != Some(id.as_str()) {
             queue.extend(children(conn, &id)?);

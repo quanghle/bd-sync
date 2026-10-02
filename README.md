@@ -1145,11 +1145,12 @@ copilot: conflict: .github/skills/triage/SKILL.md: differs from the server's and
 ```
 
 `.bd/agents.lock` records, per harness, the server revision last pulled,
-each skill file bd wrote or adopted (`sha256`, `executable`), and each MCP
-entry bd wrote or adopted, with the definition approved. It is local state:
-the first lock written adds `agents.lock*` to `.bd/.gitignore` (covering
-`agents.lock.mutex`, the checkout's OS-locked mutex, and temp files), and
-`bd init` writes that line too. Changes to a checkout are serialized by the
+each skill file bd wrote or adopted (`sha256`, `executable`, and
+`executable_not_kept` where the file system did not keep that bit), and
+each MCP entry bd wrote or adopted, with the definition approved. It is
+local state: the first lock written adds `agents.lock*` to `.bd/.gitignore`
+(covering `agents.lock.mutex`, the checkout's OS-locked mutex, and temp
+files), and `bd init` writes that line too. Changes to a checkout are serialized by the
 mutex, which the system releases when its process ends: a session hook and
 a watch can run at once, and one that waits past `--busy-timeout-ms` fails
 with exit 5. The rules a pull follows:
@@ -1177,7 +1178,14 @@ with exit 5. The rules a pull follows:
   executable bits, also when adopted or kept with the server's text; a
   server change of the bit alone applies even to an edited file. An
   executable bit the server never set is left alone (some file systems show
-  every file executable).
+  every file executable). Where the file system does not keep the bit
+  (`chmod` has no effect or is refused, and files read back without it:
+  vfat, exfat, or SMB mounts with an `fmask` that clears it), the pull says
+  so once (`not executable here`; `skills.not_executable` in JSON), records
+  it in the lock (`executable_not_kept`), and later pulls and `status` count
+  the file as up to date. bd sets the bit again when the server's set
+  changes (reporting it only if it is kept then), or with `pull --force`,
+  and drops the mark once the file has it (set by hand, say).
 - **MCP definitions.** New and changed definitions are never written by a
   pull, a hook or a watch: they wait for `bd agents approve`. Removals of
   unedited entries bd wrote apply at once, as they add nothing that runs.
@@ -1448,11 +1456,11 @@ The hook's lines and `approve`'s output name the step to take.
   .github/skills/** -text
   ```
 
-- On mounts where `chmod` has no effect and files read back without
-  executable bits (vfat, exfat, or SMB mounts with an `fmask` that clears
-  them), a file the server marks executable is reported as updated on every
-  pull and session start. Mounts that show every file as executable (WSL's
-  `/mnt/c` without `metadata`) are fine.
+- On mounts that keep no executable bits (vfat, exfat, or SMB mounts with
+  an `fmask` that clears them), scripts the server marks executable stay
+  without them: run them through their interpreter (`sh run.sh`). Mounts
+  that show every file as executable (WSL's `/mnt/c` without `metadata`)
+  are fine.
 
 ## Observability
 

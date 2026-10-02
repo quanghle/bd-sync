@@ -9,7 +9,8 @@
 //!       "revision": "<the server revision last pulled>",
 //!       "skills": {
 //!         ".claude/skills/deploy/SKILL.md": {"sha256": "<sha256>"},
-//!         ".claude/skills/deploy/scripts/run.sh": {"sha256": "<sha256>", "executable": true}
+//!         ".claude/skills/deploy/scripts/run.sh": {"sha256": "<sha256>", "executable": true},
+//!         ".claude/skills/deploy/check.sh": {"sha256": "<sha256>", "executable": true, "executable_not_kept": true}
 //!       },
 //!       "mcp_servers": {
 //!         "github": {"sha256": "<sha256>", "definition": {"command": "npx", "args": ["-y", "server-github"]}}
@@ -25,10 +26,17 @@
 //! (canonical JSON; codex: its table as JSON), to show what a newer version
 //! changes. Only applied and approved state is recorded: MCP changes that
 //! wait for approval are worked out from the server each time.
+//!
+//! `executable_not_kept` marks an executable file whose executable bit the
+//! file system did not keep when bd set it (vfat, an SMB mount whose fmask
+//! clears it): with the text recorded, it counts as up to date without the
+//! bit, rather than as a mode to fix on every pull. bd sets the bit again
+//! when the server's set changes, or with `bd agents pull --force`, and
+//! drops the mark once the file has it.
 
 use std::collections::BTreeMap;
 
-use bd_core::agents::{Harness, check_server_name, check_skill_name, check_skill_path, mcp_digest};
+use bd_core::agents::{FileDigest, Harness, check_server_name, check_skill_name, check_skill_path, mcp_digest};
 use bd_core::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,6 +81,21 @@ pub struct OwnedFile {
     pub sha256: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub executable: bool,
+    /// The file system did not keep the executable bit bd set on it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub executable_not_kept: bool,
+}
+
+impl OwnedFile {
+    /// The server's file, as bd placed it: `not_kept` if the file system
+    /// did not keep its executable bit (only an executable file's counts).
+    pub fn of(digest: &FileDigest, not_kept: bool) -> OwnedFile {
+        OwnedFile {
+            sha256: digest.sha256.clone(),
+            executable: digest.executable,
+            executable_not_kept: digest.executable && not_kept,
+        }
+    }
 }
 
 /// An MCP server entry as bd wrote or adopted it.
@@ -101,6 +124,9 @@ impl LockFile {
                     )));
                 }
                 check_sha256(&file.sha256).map_err(|e| Error::invalid(format!("{h}: {path}: {e}")))?;
+                if file.executable_not_kept && !file.executable {
+                    return Err(Error::invalid(format!("{h}: {path}: executable_not_kept, and not executable")));
+                }
             }
             for (name, entry) in &applied.mcp_servers {
                 check_server_name(name).map_err(|e| Error::invalid(format!("{h}: {e}")))?;
@@ -166,7 +192,10 @@ mod tests {
             "version": 1,
             "harnesses": {"claude": {
                 "revision": "r",
-                "skills": {".claude/skills/deploy/SKILL.md": {"sha256": SHA}},
+                "skills": {
+                    ".claude/skills/deploy/SKILL.md": {"sha256": SHA},
+                    ".claude/skills/deploy/run.sh": {"sha256": SHA, "executable": true, "executable_not_kept": true}
+                },
                 "mcp_servers": {"github": {"sha256": mcp_digest(&definition), "definition": definition}}
             }}
         });
@@ -181,6 +210,10 @@ mod tests {
         let mut bad = good.clone();
         bad["harnesses"]["claude"]["skills"] = json!({".claude/skills/deploy/SKILL.md": {"sha256": "x"}});
         assert!(serde_json::from_value::<LockFile>(bad).unwrap().check().is_err());
+        let mut bad = good.clone();
+        bad["harnesses"]["claude"]["skills"][".claude/skills/deploy/run.sh"]["executable"] = json!(false);
+        let e = serde_json::from_value::<LockFile>(bad).unwrap().check().unwrap_err().to_string();
+        assert!(e.contains("not executable"), "{e}");
         let mut bad = good.clone();
         bad["harnesses"]["claude"]["mcp_servers"]["github"]["definition"] = json!({"command": "uvx"});
         let e = serde_json::from_value::<LockFile>(bad).unwrap().check().unwrap_err().to_string();

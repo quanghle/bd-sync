@@ -34,8 +34,9 @@ pub trait Source {
 pub struct Options {
     /// Make the changes (pull); without, only report them (status).
     pub apply: bool,
-    /// Also replace or remove local edits of what bd wrote. Never anything
-    /// bd did not write, and MCP definitions still wait for approval.
+    /// Also replace or remove local edits of what bd wrote, and try again to
+    /// set executable bits the file system did not keep. Never anything bd
+    /// did not write, and MCP definitions still wait for approval.
     pub force: bool,
     /// How long to wait for another bd process changing the same checkout.
     pub lock_wait: Duration,
@@ -77,6 +78,10 @@ pub struct SkillsReport {
     pub adopted: Vec<SkillFileRef>,
     /// Files bd wrote that were edited here, with no newer version on the server: kept.
     pub edited: Vec<SkillFileRef>,
+    /// Executable files whose executable bit the file system here did not
+    /// keep when bd set it (vfat, an SMB mount whose fmask clears it): they
+    /// stay without it, and later pulls leave them be.
+    pub not_executable: Vec<SkillFileRef>,
     pub conflicts: Vec<Conflict>,
     /// What stays where the server removed something: files bd did not write, symlinks.
     pub left: Vec<Conflict>,
@@ -177,8 +182,9 @@ enum SkillOp {
     /// Delete the file if it still has this hash.
     Remove { skill: String, rel: String, sha256: String },
     /// Set the file's executable bits as the server's file has them, if it
-    /// still has this hash, and record it as the server's.
-    Mode { skill: String, rel: String, sha256: String, digest: FileDigest },
+    /// still has this hash, and record it as the server's. `quiet`: a retry
+    /// of a bit the file system did not keep, reported only if it now does.
+    Mode { skill: String, rel: String, sha256: String, digest: FileDigest, quiet: bool },
     /// Record a file as bd's.
     Record { path: String, digest: FileDigest },
     /// Drop a file from the record.
@@ -377,6 +383,9 @@ enum FileDecision {
     Remove(String),
     /// Give it the server's executable bits; it has the server's text, with this hash.
     Mode(String),
+    /// Give it the server's executable bit again, which the file system did
+    /// not keep last time: reported only if it keeps it now.
+    RetryMode(String),
     Forget,
     /// Kept: edited here, and the server has nothing newer.
     Edited,
@@ -472,7 +481,16 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
                     // The server changed the executable bit: applied either way.
                     (true, _) if cfg!(unix) => D::Mode(sha),
                     (true, _) => D::Rerecord,
+                    // It has the bit the file system did not keep before (set by hand, or kept now).
+                    (false, true) if o.executable_not_kept => D::Rerecord,
                     (false, true) => D::Nothing,
+                    // The file system did not keep the bit: up to date without it. Tried
+                    // again with --force, or quietly when the server's set changes.
+                    (false, false) if o.executable_not_kept && force => D::Mode(sha),
+                    (false, false) if o.executable_not_kept && applied.revision != manifest.revision => {
+                        D::RetryMode(sha)
+                    }
+                    (false, false) if o.executable_not_kept => D::Nothing,
                     (false, false) => D::Mode(sha),
                 }
             }
@@ -537,15 +555,22 @@ fn plan_skills(checkout: &Checkout, p: &mut Plan, manifest: &Manifest, applied: 
             }
             D::Mode(sha256) => {
                 let digest = digest.expect("the server's mode").clone();
-                p.skills.push(SkillOp::Mode { skill: skill.to_string(), rel: rel.to_string(), sha256, digest });
+                let op = SkillOp::Mode { skill: skill.to_string(), rel: rel.to_string(), sha256, digest, quiet: false };
+                p.skills.push(op);
                 r.updated.push(file_ref);
                 changes.entry(skill.to_string()).or_default().insert(SkillChange::Updated);
+            }
+            D::RetryMode(sha256) => {
+                let digest = digest.expect("the server's mode").clone();
+                let op = SkillOp::Mode { skill: skill.to_string(), rel: rel.to_string(), sha256, digest, quiet: true };
+                p.skills.push(op);
             }
             D::Forget => p.skills.push(SkillOp::Forget { path: path.clone() }),
             D::Edited => r.edited.push(file_ref),
             D::EditedMode(sha256) => {
                 let digest = digest.expect("the server's mode").clone();
-                p.skills.push(SkillOp::Mode { skill: skill.to_string(), rel: rel.to_string(), sha256, digest });
+                let op = SkillOp::Mode { skill: skill.to_string(), rel: rel.to_string(), sha256, digest, quiet: false };
+                p.skills.push(op);
                 r.edited.push(SkillFileRef { skill: skill.to_string(), path: path.clone() });
                 r.updated.push(file_ref);
                 changes.entry(skill.to_string()).or_default().insert(SkillChange::Updated);
@@ -743,13 +768,18 @@ fn apply(checkout: &Checkout, p: &mut Plan, set: Option<&AgentSet>, applied: &mu
     // Removals first: a file the server removed may stand where one of its new files goes.
     let (removals, others): (Vec<&SkillOp>, Vec<&SkillOp>) =
         p.skills.iter().partition(|op| matches!(op, SkillOp::Remove { .. }));
+    let r = &mut p.report.skills;
     for op in removals.into_iter().chain(others) {
+        let file_ref =
+            |skill: &str, rel: &str| SkillFileRef { skill: skill.to_string(), path: skill_path(h, skill, rel) };
         match op {
             SkillOp::Write { skill, rel, digest } => {
                 let file =
                     set.and_then(|s| s.skills.get(skill)?.get(rel)).ok_or_else(|| missing(format!("{skill}/{rel}")))?;
-                checkout.write_skill_file(h, skill, rel, file)?;
-                let owned = OwnedFile { sha256: digest.sha256.clone(), executable: digest.executable };
+                let owned = OwnedFile::of(digest, !checkout.write_skill_file(h, skill, rel, file)?);
+                if owned.executable_not_kept {
+                    r.not_executable.push(file_ref(skill, rel));
+                }
                 applied.skills.insert(skill_path(h, skill, rel), owned);
             }
             SkillOp::Remove { skill, rel, sha256 } => {
@@ -758,15 +788,22 @@ fn apply(checkout: &Checkout, p: &mut Plan, set: Option<&AgentSet>, applied: &mu
                     applied.skills.remove(&skill_path(h, skill, rel));
                 }
             }
-            SkillOp::Mode { skill, rel, sha256, digest } => {
-                if checkout.set_skill_mode(h, skill, rel, sha256, digest.executable)? {
-                    let owned = OwnedFile { sha256: digest.sha256.clone(), executable: digest.executable };
+            SkillOp::Mode { skill, rel, sha256, digest, quiet } => {
+                if let Some(kept) = checkout.set_skill_mode(h, skill, rel, sha256, digest.executable)? {
+                    let owned = OwnedFile::of(digest, !kept);
+                    match (owned.executable_not_kept, quiet) {
+                        (true, false) => r.not_executable.push(file_ref(skill, rel)),
+                        (false, true) => {
+                            r.updated.push(file_ref(skill, rel));
+                            r.changed.entry(skill.clone()).or_insert(SkillChange::Updated);
+                        }
+                        _ => {}
+                    }
                     applied.skills.insert(skill_path(h, skill, rel), owned);
                 }
             }
             SkillOp::Record { path, digest } => {
-                let owned = OwnedFile { sha256: digest.sha256.clone(), executable: digest.executable };
-                applied.skills.insert(path.clone(), owned);
+                applied.skills.insert(path.clone(), OwnedFile::of(digest, false));
             }
             SkillOp::Forget { path } => {
                 applied.skills.remove(path);
@@ -1355,6 +1392,86 @@ mod tests {
         assert_eq!(conflicts(&r)[0].0, up);
         assert!(conflicts(&r)[0].1.starts_with("edited here and changed on the server"));
         assert_eq!(f.get(up).as_deref(), Some("echo up, edited here\n"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_bits_the_file_system_does_not_keep_are_reported_once() {
+        use super::super::checkout::CHMOD_IGNORED;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = Fixture::new();
+        if !super::super::checkout::modes_stick(&f.checkout.root) {
+            return; // Every file shows as executable here, whatever its mode is set to.
+        }
+        let chmod = |root: &Path, rel: &str, mode: u32| {
+            std::fs::set_permissions(under(root, rel), std::fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let executable = |f: &Fixture, rel: &str| {
+            std::fs::metadata(under(&f.checkout.root, rel)).unwrap().permissions().mode() & 0o111 != 0
+        };
+        let not_kept = |f: &Fixture, rel: &str| f.recorded(H).skills[rel].executable_not_kept;
+        let quiet = |r: &HarnessReport| {
+            r.skills.changed.is_empty() && r.skills.updated.is_empty() && r.skills.not_executable.is_empty()
+        };
+        let (server, root) = (f.source.dir.clone(), f.checkout.root.clone());
+        let (run, adopted) = (".claude/skills/deploy/run.sh", ".claude/skills/deploy/adopted.sh");
+        f.serve("claude/skills/deploy/SKILL.md", "deploy");
+        f.serve("claude/skills/deploy/run.sh", "#!/bin/sh\necho run\n");
+        f.serve("claude/skills/deploy/adopted.sh", "#!/bin/sh\necho adopted\n");
+        chmod(&server, "claude/skills/deploy/run.sh", 0o755);
+        chmod(&server, "claude/skills/deploy/adopted.sh", 0o755);
+        f.put(adopted, "#!/bin/sh\necho adopted\n");
+        chmod(&root, adopted, 0o644);
+
+        // A file system where chmod succeeds and changes nothing: said once, recorded.
+        CHMOD_IGNORED.set(true);
+        let r = f.pull(H);
+        assert_eq!(paths(&r.skills.updated), [adopted]);
+        assert_eq!(paths(&r.skills.not_executable), [adopted, run]);
+        assert!(!executable(&f, run) && !executable(&f, adopted));
+        assert!(not_kept(&f, run) && not_kept(&f, adopted) && !not_kept(&f, ".claude/skills/deploy/SKILL.md"));
+        f.calls();
+        let (status, pulled) = (f.status(H), f.pull(H));
+        assert!(quiet(&status) && quiet(&pulled), "{status:?} {pulled:?}");
+        assert_eq!(f.calls(), (2, 0), "nothing to fetch");
+
+        // A change of the set tries again, and says nothing of a bit still not kept.
+        f.serve("claude/skills/deploy/a.md", "a");
+        let r = f.pull(H);
+        assert_eq!(paths(&r.skills.added), [".claude/skills/deploy/a.md"]);
+        assert!(r.skills.updated.is_empty() && r.skills.not_executable.is_empty(), "{r:?}");
+        assert!(not_kept(&f, run) && not_kept(&f, adopted));
+        // --force tries again, and says so.
+        let r = f.force(H);
+        assert_eq!(paths(&r.skills.updated), [adopted, run]);
+        assert_eq!(paths(&r.skills.not_executable), [adopted, run]);
+        assert!(quiet(&f.pull(H)));
+
+        // A bit set by hand is recorded as kept, without a word.
+        CHMOD_IGNORED.set(false);
+        chmod(&root, run, 0o755);
+        assert!(quiet(&f.status(H)) && quiet(&f.pull(H)));
+        assert!(!not_kept(&f, run) && not_kept(&f, adopted));
+        // Where the file system keeps bits again, the next change of the set gives them.
+        assert!(quiet(&f.pull(H)) && !executable(&f, adopted));
+        f.serve("claude/skills/deploy/b.md", "b");
+        let r = f.pull(H);
+        assert_eq!(paths(&r.skills.updated), [adopted]);
+        assert_eq!(r.skills.changed["deploy"], SkillChange::Updated);
+        assert!(r.skills.not_executable.is_empty());
+        assert!(executable(&f, adopted) && !not_kept(&f, adopted));
+        assert!(quiet(&f.status(H)) && quiet(&f.pull(H)));
+
+        // A new text is written and checked again.
+        CHMOD_IGNORED.set(true);
+        f.serve("claude/skills/deploy/run.sh", "#!/bin/sh\necho run v2\n");
+        chmod(&server, "claude/skills/deploy/run.sh", 0o755);
+        let r = f.pull(H);
+        assert_eq!(paths(&r.skills.updated), [run]);
+        assert_eq!(paths(&r.skills.not_executable), [run]);
+        assert!(not_kept(&f, run) && !executable(&f, run));
+        assert!(quiet(&f.status(H)) && quiet(&f.pull(H)));
+        CHMOD_IGNORED.set(false);
     }
 
     #[test]

@@ -30,7 +30,8 @@
 //!
 //! - It writes the server's skill files (each at once, through a temp file;
 //!   executable ones get their executable bits on Unix, and so does a file
-//!   adopted or kept with the server's text but without them), restores
+//!   adopted or kept with the server's text but without them, except where
+//!   the file system did not keep the bit before: see [`lock`]), restores
 //!   the ones bd wrote that were deleted, and deletes those the server
 //!   removed, with the directories that leaves empty below the skills
 //!   directory, before it writes anything: a file the server renamed only
@@ -95,6 +96,7 @@
 //!         "added": [{"skill": "triage", "path": ".claude/skills/triage/SKILL.md"}],
 //!         "updated": [{"skill": "deploy", "path": ".claude/skills/deploy/SKILL.md"}],
 //!         "restored": [], "replaced": [], "removed": [], "adopted": [], "edited": [],
+//!         "not_executable": [],
 //!         "conflicts": [{"skill": "lint", "path": ".claude/skills/lint/SKILL.md", "reason": "..."}],
 //!         "left": []
 //!       },
@@ -124,6 +126,8 @@
 //!   the other lists name each file (`skill`, checkout-relative `path`):
 //!   `updated` also lists files whose executable bit alone was set or
 //!   cleared, `adopted` were already the server's, `edited` are local edits kept,
+//!   `not_executable` (pull only) are executable files whose executable bit
+//!   the file system did not keep when bd set it, listed once,
 //!   `conflicts` are in the way (`path` is what is in the way: the file, or
 //!   a directory or symlink above it), `left` stay where the server removed
 //!   something.
@@ -474,6 +478,13 @@ fn harness_lines(h: Harness, r: &HarnessReport, applied: bool) -> Vec<String> {
     if !s.edited.is_empty() {
         let paths: Vec<&str> = s.edited.iter().map(|f| f.path.as_str()).collect();
         lines.push(format!("{h}: local edits kept: {}", paths.join(", ")));
+    }
+    if !s.not_executable.is_empty() {
+        let paths: Vec<&str> = s.not_executable.iter().map(|f| f.path.as_str()).collect();
+        lines.push(format!(
+            "{h}: not executable here, as the file system did not keep the executable bit: {}",
+            paths.join(", ")
+        ));
     }
     for c in &s.conflicts {
         lines.push(format!("{h}: conflict: {}: {}", c.path, c.reason));

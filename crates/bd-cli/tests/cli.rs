@@ -40,6 +40,7 @@ impl Ws {
             .env_remove("BD_REMOTE")
             .env_remove("BD_PLAYBOOK_PATH")
             .env_remove("BD_GH")
+            .env_remove("BD_TEST_CHMOD_IGNORED")
             .env("XDG_CONFIG_HOME", dir.join(".xdg"));
         for var in SESSION_ENV {
             c.env_remove(var);
@@ -2010,6 +2011,64 @@ fn agents_pull_makes_an_adopted_script_executable() {
             &ws.json(&["agents", "manifest", "--harness", "claude"])["claude"]["revision"].as_str().unwrap()[..12]
         )
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn agents_pull_says_once_that_the_file_system_keeps_no_executable_bit() {
+    use std::os::unix::fs::PermissionsExt;
+    let (ws, agents) = agents_ws();
+    let root = ws.dir.path();
+    if !modes_stick(root) {
+        return; // Every file shows as executable here, whatever its mode is set to.
+    }
+    write_file(&agents, "claude/skills/deploy/SKILL.md", "deploy\n");
+    write_file(&agents, "claude/skills/deploy/run.sh", "#!/bin/sh\n");
+    std::fs::set_permissions(agents.join("claude/skills/deploy/run.sh"), std::fs::Permissions::from_mode(0o755))
+        .unwrap();
+    // As on vfat, or an SMB mount whose fmask clears executable bits: chmod succeeds and changes nothing.
+    let ignored = [("BD_TEST_CHMOD_IGNORED", "1")];
+    let ok = |args: &[&str]| {
+        let out = ws.with_env(&ignored, args);
+        assert!(out.status.success(), "bd {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let revision = ws.json(&["agents", "manifest", "--harness", "claude"])["claude"]["revision"].as_str().unwrap()
+        [..12]
+        .to_string();
+    assert_eq!(
+        ok(&["agents", "pull", "--harness", "claude"]),
+        "claude: skills added: deploy\nclaude: not executable here, as the file system did not keep the executable \
+         bit: .claude/skills/deploy/run.sh\n"
+    );
+    let script = std::fs::metadata(root.join(".claude/skills/deploy/run.sh")).unwrap();
+    assert_eq!(script.permissions().mode() & 0o111, 0, "the file system kept no bit");
+    let lock: Value = serde_json::from_str(&read(root, ".bd/agents.lock").unwrap()).unwrap();
+    let recorded = &lock["harnesses"]["claude"]["skills"][".claude/skills/deploy/run.sh"];
+    assert_eq!((&recorded["executable"], &recorded["executable_not_kept"]), (&Value::Bool(true), &Value::Bool(true)));
+
+    // The second pull, the status and the session hook find nothing to do.
+    age(root, ".bd/agents.lock");
+    let before = mtime(root, ".bd/agents.lock");
+    assert_eq!(ok(&["agents", "pull", "--harness", "claude"]), "claude: up to date\n");
+    assert_eq!(ok(&["agents", "status", "--harness", "claude"]), format!("claude: up to date (revision {revision})\n"));
+    let pulled: Value = serde_json::from_str(&ok(&["--json", "agents", "pull", "--harness", "claude"])).unwrap();
+    let skills = &pulled["harnesses"]["claude"]["skills"];
+    assert_eq!(skills["changed"], serde_json::json!({}));
+    assert_eq!((&skills["updated"], &skills["not_executable"]), (&serde_json::json!([]), &serde_json::json!([])));
+    let hook = session_start(root, &["--harness", "claude"], &[CLAUDE, ignored[0]]);
+    assert_eq!(hook, "", "the session hook says nothing");
+    assert_eq!(mtime(root, ".bd/agents.lock"), before, "nothing written");
+
+    // Where chmod works again, --force sets the bit.
+    let pulled = ws.json(&["agents", "pull", "--harness", "claude", "--force"]);
+    let updated = &pulled["harnesses"]["claude"]["skills"]["updated"];
+    assert_eq!(updated, &serde_json::json!([{"skill": "deploy", "path": ".claude/skills/deploy/run.sh"}]));
+    let script = std::fs::metadata(root.join(".claude/skills/deploy/run.sh")).unwrap();
+    assert_ne!(script.permissions().mode() & 0o111, 0);
+    let lock: Value = serde_json::from_str(&read(root, ".bd/agents.lock").unwrap()).unwrap();
+    assert!(lock["harnesses"]["claude"]["skills"][".claude/skills/deploy/run.sh"].get("executable_not_kept").is_none());
+    assert_eq!(ws.ok(&["agents", "pull", "--harness", "claude"]), "claude: up to date\n");
 }
 
 /// `bd agents approve` in `root` with `env` set and `stdin` piped in: not a terminal.

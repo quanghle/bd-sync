@@ -179,8 +179,10 @@ impl Checkout {
 
     /// Write `file` as file `rel` of skill `name` of `harness`, at once (a
     /// temp file renamed into place), creating the directories it needs and
-    /// never writing through a symlink below the skills directory.
-    pub fn write_skill_file(&self, harness: Harness, name: &str, rel: &str, file: &SkillFile) -> Result<()> {
+    /// never writing through a symlink below the skills directory. Returns
+    /// whether the file system kept the executable bit it was given, as
+    /// `set_executable` tells.
+    pub fn write_skill_file(&self, harness: Harness, name: &str, rel: &str, file: &SkillFile) -> Result<bool> {
         if sha256_hex(file.text.as_bytes()) != file.sha256 {
             return Err(Error::invalid(format!(
                 "{}: its text does not match its sha256",
@@ -203,8 +205,12 @@ impl Checkout {
                 target.display()
             )));
         }
-        let executable = file.executable;
-        write_atomically(&target, file.text.as_bytes(), true, |f| set_executable(f, executable))
+        let (executable, mut kept) = (file.executable, true);
+        write_atomically(&target, file.text.as_bytes(), true, |f| {
+            kept = set_executable(f, executable)?;
+            Ok(())
+        })?;
+        Ok(kept)
     }
 
     /// Delete file `rel` of skill `name` of `harness` if it is still the
@@ -229,7 +235,9 @@ impl Checkout {
 
     /// Give file `rel` of skill `name` of `harness` its executable bits on
     /// Unix (where it has read bits), or take them away, if it is still the
-    /// regular file whose SHA-256 is `sha256`. Returns whether it did.
+    /// regular file whose SHA-256 is `sha256`. Returns `None` if it is not,
+    /// else whether the file system kept the executable bit, as
+    /// `set_executable` tells.
     pub fn set_skill_mode(
         &self,
         harness: Harness,
@@ -237,14 +245,13 @@ impl Checkout {
         rel: &str,
         sha256: &str,
         executable: bool,
-    ) -> Result<bool> {
+    ) -> Result<Option<bool>> {
         if !matches!(self.find_skill_file(harness, name, rel)?, Found::File { sha256: s, .. } if s == sha256) {
-            return Ok(false);
+            return Ok(None);
         }
         let path = under(&self.root, &format!("{}/{name}/{rel}", harness.skills_dest()));
         let file = File::open(&path).map_err(|e| path_error(&path, e))?;
-        set_executable(&file, executable).map_err(|e| path_error(&path, e))?;
-        Ok(true)
+        set_executable(&file, executable).map(Some).map_err(|e| path_error(&path, e))
     }
 
     /// Whether the checkout-relative paths `a` and `b` reach the same file:
@@ -406,20 +413,48 @@ pub fn write_atomically(
 
 /// Give `file` the executable bits where it has read bits (as git checks
 /// scripts out), or take them away. Windows has no such bits.
+///
+/// Returns whether the file system kept an executable bit asked for: some
+/// ignore chmod and show files without them (vfat or exfat, an SMB mount
+/// whose fmask clears them), or refuse it (vfat without `quiet`), so the
+/// mode is read back. An executable bit that stays where none was asked
+/// for is kept (`true`), as file systems that show every file executable
+/// (WSL's /mnt/c without metadata) are fine as they are.
 #[cfg(unix)]
-fn set_executable(file: &File, executable: bool) -> std::io::Result<()> {
+fn set_executable(file: &File, executable: bool) -> std::io::Result<bool> {
     use std::os::unix::fs::PermissionsExt;
     let mode = file.metadata()?.permissions().mode();
     let want = if executable { mode | ((mode & 0o444) >> 2) } else { mode & !0o111 };
-    if want != mode {
-        file.set_permissions(std::fs::Permissions::from_mode(want))?;
+    if want != mode && !chmod_ignored() {
+        match file.set_permissions(std::fs::Permissions::from_mode(want)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return Ok(!executable),
+            Err(e) => return Err(e),
+        }
     }
-    Ok(())
+    Ok(!executable || file.metadata()?.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(not(unix))]
-fn set_executable(_: &File, _: bool) -> std::io::Result<()> {
-    Ok(())
+fn set_executable(_: &File, _: bool) -> std::io::Result<bool> {
+    Ok(true)
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Unit tests' [`chmod_ignored`], per thread as tests run side by side.
+    pub(crate) static CHMOD_IGNORED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A test seam: whether to act as a file system where chmod succeeds and
+/// changes nothing (`BD_TEST_CHMOD_IGNORED=1`, for the integration tests).
+#[cfg(unix)]
+fn chmod_ignored() -> bool {
+    #[cfg(test)]
+    if CHMOD_IGNORED.with(|c| c.get()) {
+        return true;
+    }
+    std::env::var_os("BD_TEST_CHMOD_IGNORED").is_some_and(|v| v == "1")
 }
 
 /// Whether a mode set on a file in `dir` sticks: not where every file shows

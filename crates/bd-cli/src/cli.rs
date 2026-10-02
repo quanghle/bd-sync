@@ -1152,8 +1152,9 @@ pub struct AgentsPullArgs {
     /// .bd/agents.lock)
     #[arg(long = "harness", value_delimiter = ',', value_parser = harness_parser())]
     pub harnesses: Vec<Harness>,
-    /// Also replace or remove local edits of skill files and MCP entries bd wrote. Never touches what bd did not
-    /// write, and new or changed MCP definitions still wait for approval
+    /// Also replace or remove local edits of skill files and MCP entries bd wrote, and try again to set executable bits
+    /// the file system did not keep. Never touches what bd did not write, and new or changed MCP definitions still
+    /// wait for approval
     #[arg(long)]
     pub force: bool,
 }

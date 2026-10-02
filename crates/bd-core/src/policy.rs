@@ -291,8 +291,15 @@ impl WriteCtx<'_> {
                 Err(e) => return Err(e),
             }
         }
+        self.not_holders(held, what)?;
+        Ok(overrides)
+    }
+
+    /// The refusal for ending the live claims `held` (issue, holder) of other
+    /// actors without `take_over`: one names its holder, several are listed.
+    fn not_holders(&self, mut held: Vec<(String, String)>, what: &str) -> Result<()> {
         match held.len() {
-            0 => Ok(overrides),
+            0 => Ok(()),
             1 => {
                 let (id, holder) = held.remove(0);
                 Err(Error::NotOwner { id, holder: Some(holder), actor: self.actor().into() })
@@ -306,6 +313,22 @@ impl WriteCtx<'_> {
     /// all (e.g. `bd close A B`, before the first close is refused alone).
     pub fn check_take_over(&self, ids: &[String], take_over: bool, what: &str) -> Result<()> {
         self.check_claim_overrides(self.held_by_others(ids)?, take_over, what).map(|_| ())
+    }
+
+    /// [`Self::check_take_over`] for releases, answering as a single
+    /// [`WriteCtx::release`] does: without `take_over`, someone else's claim
+    /// is refused as not the caller's (exit 4) before any policy answer.
+    pub fn check_release_take_over(&self, ids: &[String], take_over: bool, what: &str) -> Result<()> {
+        if take_over {
+            return self.check_take_over(ids, true, what);
+        }
+        let mut held = Vec::new();
+        for issue in self.held_by_others(ids)? {
+            if let Some(LiveClaim { holder, .. }) = self.others_live_claim(&issue)? {
+                held.push((issue.id, holder));
+            }
+        }
+        self.not_holders(held, what)
     }
 
     /// Of `ids`, the `in_progress` issues assigned to an actor other than

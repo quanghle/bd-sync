@@ -389,9 +389,12 @@ pub struct UpdateArgs {
     #[command(flatten)]
     pub guard: GuardArgs,
     /// Take over or end another actor's live claim: reassign it, or move it out of in_progress (recorded in the
-    /// event; through bd serve, an admin token unless the token's actor owns the claim). --force is an older alias
-    #[arg(long, visible_alias = "force")]
+    /// event; through bd serve, an admin token unless the token's actor owns the claim)
+    #[arg(long)]
     pub take_over: bool,
+    /// No longer accepted: --force never takes over a claim (use --take-over)
+    #[arg(long, hide = true)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -522,9 +525,12 @@ pub struct ReleaseArgs {
     #[arg(short, long)]
     pub reason: Option<String>,
     /// Release another actor's live claim or assignment (recorded in the event; through bd serve, an admin token
-    /// unless the token's actor owns the claim). --force is an older alias
-    #[arg(long, visible_alias = "force")]
+    /// unless the token's actor owns the claim)
+    #[arg(long)]
     pub take_over: bool,
+    /// No longer accepted: --force never takes over a claim (use --take-over)
+    #[arg(long, hide = true)]
+    pub force: bool,
     /// Release only if still held by this actor (compare-and-swap); another actor's live claim also needs --take-over
     #[arg(long, value_name = "ACTOR")]
     pub if_assignee: Option<String>,

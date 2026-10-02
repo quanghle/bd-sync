@@ -2117,17 +2117,26 @@ fn force_takeovers_need_an_admin_token() {
     let bob_as = |agent: &str, args: &[&str]| bob.cmd(args).env("BD_ACTOR", agent).output().unwrap();
 
     alice.ok(&["create", "Contended"]);
+    alice.ok(&["create", "Also contended"]);
     check(bob_as("bob/w1", &["claim", "t-1"]), "bob/w1 claims");
+    check(bob_as("bob/w1", &["claim", "t-2"]), "bob/w1 claims");
     assert_eq!(alice.code(&["release", "t-1"]), 4, "without --take-over: not the owner, as before");
+    let out = alice.run(&["release", "t-1", "t-2"]);
+    assert_eq!(out.status.code(), Some(4), "several at once, the same answer: {}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("t-1 (held by bob/w1), t-2 (held by bob/w1)"), "{}", stderr_of(&out));
+    assert_eq!(alice.code(&["release", "t-1", "t-2", "--take-over"]), 7, "and with --take-over, access denied");
+    // --force no longer means a takeover anywhere: on update and release it is a usage error.
+    for args in [&["release", "t-1", "--force"][..], &["update", "t-1", "--assignee", "alice", "--force"]] {
+        let out = alice.run(args);
+        assert_eq!(out.status.code(), Some(2), "bd {args:?}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains("--take-over"), "{}", stderr_of(&out));
+    }
     assert_eq!(alice.code(&["release", "t-1", "--if-assignee", "bob/w1"]), 4, "a guard is not a takeover");
     assert_eq!(alice.code(&["update", "t-1", "--assignee", "alice"]), 4, "already claimed, as before");
-    // A token that may not take it over is told so (7), with or without --take-over (--force on
-    // release and update is its older alias).
+    // A token that may not take it over is told so (7), with or without --take-over.
     for args in [
-        &["release", "t-1", "--force"][..],
-        &["release", "t-1", "--take-over"],
+        &["release", "t-1", "--take-over"][..],
         &["release", "t-1", "--if-assignee", "bob/w1", "--take-over"],
-        &["update", "t-1", "--assignee", "alice", "--force"],
         &["update", "t-1", "--assignee", "alice", "--take-over"],
         &["update", "t-1", "--status", "open"],
         &["close", "t-1"],
@@ -2147,10 +2156,10 @@ fn force_takeovers_need_an_admin_token() {
     // The token's other agents may take over its own claims.
     check(bob_as("bob/w2", &["update", "t-1", "--assignee", "bob/w2", "--take-over"]), "sub-actor takeover");
     // An admin token may take over anyone's.
-    ops.ok(&["update", "t-1", "--assignee", "ops", "--force"]);
+    ops.ok(&["update", "t-1", "--assignee", "ops", "--take-over"]);
     assert_eq!(alice.json(&["show", "t-1"])["assignee"], "ops");
-    // Locally, on the server's host, --force works as it always has.
-    check(server.local("local-ops", &["release", "t-1", "--force"]), "local release --force");
+    // Locally, on the server's host, no token limits it: --take-over is enough.
+    check(server.local("local-ops", &["release", "t-1", "--take-over"]), "local release --take-over");
     assert_eq!(alice.json(&["show", "t-1"])["status"], "open");
 }
 
@@ -2435,7 +2444,7 @@ fn claims_cannot_hide_as_gates() {
     let out = alice.run(&["update", "t-1", "--type", "gate"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
     assert!(stderr_of(&out).contains("release it before making it a gate"), "{}", stderr_of(&out));
-    let takeover = "update t-1 --type gate\nupdate t-1 --assignee alice --force\nupdate t-1 --type task\n";
+    let takeover = "update t-1 --type gate\nupdate t-1 --assignee alice --take-over\nupdate t-1 --type task\n";
     let out = alice.with_stdin(&["batch"], takeover);
     assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
     let issue = alice.json(&["show", "t-1"]);

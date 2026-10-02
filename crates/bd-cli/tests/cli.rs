@@ -320,11 +320,24 @@ fn live_claims_are_protected_from_other_actors() {
     assert_eq!(shown["lease"]["token"].as_i64().unwrap().to_string(), tokens[1]);
     ws.json_as("bob", &["update", "t-1", "--add-label", "seen", "--notes", "looked at it"]);
 
+    // --force never takes over: on update and release, where it once did, it is a usage error,
+    // alone or in a batch.
+    for args in [
+        &["update", "t-3", "--assignee", "ann/s2", "--force"][..],
+        &["update", "t-3", "--status", "open", "--force"],
+        &["release", "t-3", "--force"],
+    ] {
+        let (code, err) = refusal(&ws, "ann/s2", args);
+        assert!(code == 2 && err.contains("--take-over"), "bd {args:?}: {err}");
+        let line = shlex::try_join(args.iter().copied()).unwrap();
+        assert_eq!(ws.batch_as("ann/s2", &format!("{line}\n")).status.code(), Some(2), "batch {line:?}");
+    }
+    assert_eq!(ws.json(&["show", "t-3"])["assignee"], "ann/s1", "still ann/s1's");
+
     // With --take-over each goes through, and the event history records the claim it ended.
-    // (On update and release, where it never meant anything else, --force is an alias.)
     ws.json_as("bob", &["close", "t-1", "--take-over", "--reason", "superseded"]);
     ws.json_as("ann", &["update", "t-2", "--status", "open", "--take-over"]);
-    ws.json_as("ann/s2", &["update", "t-3", "--assignee", "ann/s2", "--force"]);
+    ws.json_as("ann/s2", &["update", "t-3", "--assignee", "ann/s2", "--take-over"]);
     ws.json_as("bob", &["release", "t-4", "--if-assignee", "ann/s1", "--take-over"]);
     let out = ws.batch_as("bob", "delete t-5 --take-over\n");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

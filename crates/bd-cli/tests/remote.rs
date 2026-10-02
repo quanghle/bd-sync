@@ -1175,7 +1175,8 @@ fn server_log_is_plain_text_with_one_line_per_request() {
 
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(!text.contains('\u{1b}'), "no terminal colors in a log file: {text:?}");
-    let exec: Vec<&str> = text.lines().filter(|l| l.contains("exec")).collect();
+    // Under load the same request may also log `bd::slow` warnings (with `exec_ms=`); count only exec lines.
+    let exec: Vec<&str> = text.lines().filter(|l| l.contains("bd::serve") && l.contains(" exec ")).collect();
     assert_eq!(exec.len(), 1, "{text}");
     assert!(exec[0].contains("token=alice-laptop") && exec[0].contains("exit_code=0"), "{}", exec[0]);
 }

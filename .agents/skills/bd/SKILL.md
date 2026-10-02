@@ -15,10 +15,11 @@ Run `bd prime`. It prints the workflow, your current claims, the top of the read
 
 1. Find work: `bd ready` (queue order), `bd list --status in_progress`, `bd blocked`.
 2. Inspect before editing: `bd show <id>` (blockers, dependencies, comments, lease).
-3. Claim atomically: `bd claim <id>`, or `bd claim --next` for the head of the queue. Note the lease token it prints.
+3. Claim atomically: `bd claim <id>`, or `bd claim --next` for the head of the queue. Note the lease token it prints. A claim someone already holds is refused (exit 4), even when it was taken under your own actor name by another session; `bd claim <id> --token <t>` renews only a claim you hold.
 4. During long work, renew the lease: `bd heartbeat <id> --token <t>`. If it fails, stop: the claim was lost.
 5. Record follow-up work: `bd create "Title" -d "why and what" --dep discovered-from:<id>`; order work with `bd dep add <issue> <depends-on>`.
 6. Finish: `bd close <id> --reason "..."` (add `--failed` if it failed), or give it back with `bd release <id>`.
+7. Never end or take over work another agent holds: closing, releasing, reassigning, moving out of `in_progress` or deleting its live claim fails with exit 4. `--force` takes it over and is recorded in the history; use it only when asked to.
 
 ## Playbooks and gates
 
@@ -29,7 +30,7 @@ Run `bd prime`. It prints the workflow, your current claims, the top of the read
 ## Rules
 
 - Prefer `--json` when parsing output.
-- Exit code 4 is a claim conflict (held by someone else, or not ready); 13 is a stale `--if-revision` guard. Re-read instead of retrying blindly.
+- Exit code 4 is a claim conflict (held by someone else, possibly another session of your own actor, or not ready); 13 is a stale `--if-revision` guard. Re-read instead of retrying blindly, and do not answer a 4 with `--force`.
 - In a remote workspace (`.bd/remote.toml`), commands run on a shared bd server and claims stay atomic across every client. Exit code 7 means the access token (`BD_TOKEN`, or one saved by `bd remote login`) is missing or not allowed; 8 means the server is unreachable, and retrying is safe; 9 means a write's answer was lost, so it may have taken effect: check (`bd show`) before running it again. `bd remote show` diagnoses the connection and the token.
 - Do not close or mutate tasks unless the work is actually done.
 - Store durable insights with `bd remember "..."`; search them with `bd memories <query>`.

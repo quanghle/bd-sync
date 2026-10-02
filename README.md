@@ -7,7 +7,7 @@ coordination engine:
 - **Task lifecycle**: `open → in_progress → closed`, plus `blocked`, `deferred`, `pinned`
 - **Typed dependency graph**: `blocks`, `conditional-blocks`, `parent-child`, `waits-for` gate readiness; informational edges (`related`, `discovered-from`, …) never do. Cycles and hierarchy deadlocks are rejected at write time.
 - **Deterministic ready work**: a materialized blocked flag maintained in the same transaction as every change, and a total queue order (policy, then id)
-- **Leased atomic claiming**: claims run under SQLite's write lock and return a lease with a fencing token
+- **Leased atomic claiming**: claims run under SQLite's write lock and return a lease with a fencing token; a live claim is its holder's alone, and taking one over takes `--force`
 - **Crash recovery**: expired leases are reclaimed after a grace window (automatically by `claim --next`, and every minute by `bd serve`); WAL makes every transaction atomic
 - **Optimistic concurrency**: per-issue revisions and `--if-revision/--if-status/--if-assignee` guards (exit code 13 on conflict)
 - **Comments, durable memory, and transactional event history** with gapless, commit-ordered sequence numbers
@@ -131,7 +131,9 @@ bd prime                                    # agent context: claims, ready work,
 
 Agent loop: `bd claim --next --json` → work, heartbeating every few minutes
 → `bd close <id> --token <t>` (or `--failed`). If `heartbeat` exits 4, the
-lease was lost (reclaimed or taken over): stop working on that issue.
+lease was lost (reclaimed or taken over): stop working on that issue. Give
+each agent its own actor (`BD_ACTOR=<you>/<agent>`): a claim is protected
+from every other actor name, not from other sessions sharing its own.
 
 ## Concepts
 
@@ -173,12 +175,13 @@ ready work (`-t gate` lists them).
 
 ### Claims, leases, and recovery
 
-- `bd claim <id>` succeeds only if the issue is `open`, ready, and unassigned, reserved for you, or held by a `claim.pools` alias. Re-claiming your own claim is idempotent and refreshes the lease.
-- `bd claim --next` claims the head of the ready queue inside one write transaction, so two agents can never take the same issue. It first reclaims leases that expired more than `lease.grace` ago.
-- The lease `token` is the sequence number of the `claimed` event: unique and increasing. Pass it to `heartbeat`, `close`, or `release` so a stale worker cannot act on a claim it no longer holds.
+- `bd claim <id>` succeeds only if the issue is `open`, ready, and unassigned, reserved for you, or held by a `claim.pools` alias. A claim is *live* until `bd reclaim` could take it back (its lease expired more than `lease.grace` ago), and a live claim is never claimed twice: not even by its own actor, since two sessions may share an actor name. Its holder renews it with `bd claim <id> --token <t>` (an idempotent retry that returns the same lease); without the token, or with a stale one, the claim fails with exit 4. A dead claim (past `lease.grace`) is reclaimed by the claim first, with a `reclaimed` event.
+- `bd claim --next` claims the head of the ready queue inside one write transaction, so two agents can never take the same issue, and never returns work someone holds. It first reclaims leases that expired more than `lease.grace` ago.
+- The lease `token` is the sequence number of the `claimed` event: unique and increasing. Pass it to `claim`, `heartbeat`, `close`, or `release` so a stale worker cannot act on a claim it no longer holds.
+- A live claim is its holder's. Ending or taking over one held by another actor name fails with exit 4 (`not_owner`, or `already_claimed` for a reassignment), alone or in a `bd batch`: `close`, `release`, `update --status` out of `in_progress`, `update --assignee`, `delete`, and `import` (`playbook discard` and `compact` refuse unfinished runs without `--force` anyway). Another actor name is any other: the holder's root actor (`alice` for `alice/agent-1`) and its sibling sub-actors too. `--force` takes it over deliberately (`release --if-assignee <holder>` counts as forced), and the event (`closed`, `released`, `updated`, `deleted`, `imported`, or `run_compacted`'s `claim_overrides`) records the takeover as `claim_override` with the holder and lease token. The holder needs neither `--force` nor its token (a token it passes must match), so sessions sharing one actor name can still end each other's claims: give each agent its own actor. A dead claim is anyone's to claim, close or release without `--force`. A playbook run or group claimed by another actor stays open, still claimed, when its last step closes; its holder closes it.
 - `bd reclaim [--grace 10m]` reverts dead workers' issues to `open` and records `reclaimed` events. `bd leases` shows lease health. `bd serve` runs it in every workspace each minute ([Background jobs](#background-jobs-and-backups)).
 - Invariant (checked by `bd doctor`): a lease exists if and only if the issue is `in_progress`, and the lease holder is the assignee.
-- Through `bd serve`, only an admin token may end or take over another actor's claim ([Remote server](#remote-server-one-workspace-many-machines)).
+- Through `bd serve`, a takeover also needs an admin token, unless the token's own actor or one of its sub-actors holds the claim ([Remote server](#remote-server-one-workspace-many-machines)).
 
 ### Optimistic concurrency
 
@@ -645,21 +648,25 @@ A token acts as one actor (`--as`), or as that actor's sub-actors
 |---|---|
 | `read` | read-only commands; its database connection is query-only |
 | `write` (default) | every command except the admin ones |
-| `admin` | also `config set/unset`, `import`, `events prune`, `doctor`, and taking over other actors' claims |
+| `admin` | also `config set/unset`, `import`, `events prune`, `doctor`, and taking over other actors' claims (with `--force`) |
 
 A token's kind, independent of its role, says who holds it: `agent` (the
 default) or `human` (`--kind human`). Keep human tokens out of agents' environments, since they
 can approve. The server enforces roles and kinds in the engine, so a `bd batch`
 or a playbook gets the same answer as a single command:
 
-- Ending or taking over a live claim of another actor needs an admin token:
-  `release --force` (or `--if-assignee`), `update --assignee ... --force` or
-  moving the issue out of `in_progress`, `close`, `delete`, and discarding
-  or force-compacting a run with such a step. The token's own actor and its
-  sub-actors are not another actor. Expired leases stay reclaimable by any
-  write token (`bd reclaim`), and unclaimed work may be reassigned as before.
-  A run or group claimed by another actor stays open, still claimed, when
-  its last step closes.
+- Taking over a live claim of another actor needs `--force`, as locally
+  ([Claims](#claims-leases-and-recovery)), and an admin token: `release
+  --force` (or `--if-assignee`), `update --assignee ... --force` or moving
+  the issue out of `in_progress`, `close --force`, `delete --force`, and
+  discarding or force-compacting a run with such a step. A claim held by the
+  token's own actor or one of its sub-actors needs only `--force`. A token
+  that may not take the claim over is refused (exit 7) with or without
+  `--force`, except a release or reassignment without it (exit 4, as
+  before). Dead claims stay reclaimable by any write token (`bd reclaim`,
+  `bd claim`), and unclaimed work may be reassigned as before. A run or group
+  claimed by another actor stays open, still claimed, when its last step
+  closes.
 - Opening a human gate needs a human token, whatever the role: `gate
   resolve`, `close`, pinning it, changing its type or condition, or deleting
   it. So does getting the work it holds back past it early: removing that
@@ -844,7 +851,7 @@ connections open, while each `cli` process opens the database again.
 | `issue_prefix` | from the directory name | id prefix |
 | `id.mode` | `hash` | `hash` or `counter` |
 | `lease.ttl` | `5m` | claim lease duration |
-| `lease.grace` | `10m` | how long past expiry before reclaim reverts a claim |
+| `lease.grace` | `10m` | how long past expiry before reclaim reverts a claim; until then it stays live, its holder's |
 | `lease.auto_reclaim` | `true` | `claim --next` reclaims stale leases first, and `bd serve` reclaims them every minute |
 | `claim.pools` | | comma-separated assignees anyone may claim from |
 | `types.custom` | | extra issue types |
@@ -862,7 +869,7 @@ The actor comes from `--actor`, then `$BD_ACTOR`, `$BEADS_ACTOR`, `git config us
 | 1 | internal or doctor problems |
 | 2 | invalid input, cycle, or policy refusal |
 | 3 | not found or no workspace |
-| 4 | claim conflict: already claimed, not ready, not owner, or lease lost |
+| 4 | claim conflict: already claimed (a live claim, even your own actor's, without its `--token`), not ready, not the holder of a live claim (`--force` takes it over), or lease lost |
 | 5 | database busy |
 | 6 | event cursor truncated |
 | 7 | access denied: missing or invalid token, or its role, kind, workspaces or actor do not allow it |

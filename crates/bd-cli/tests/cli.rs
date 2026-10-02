@@ -226,6 +226,175 @@ fn crash_recovery_via_reclaim() {
     assert_eq!(claim["issue"]["assignee"], "tester");
 }
 
+impl Ws {
+    fn json_as(&self, actor: &str, args: &[&str]) -> Value {
+        let mut a = vec!["--json"];
+        a.extend_from_slice(args);
+        let out = self.run_as(actor, &a);
+        assert!(out.status.success(), "bd {args:?} as {actor}: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
+    /// `bd batch` as `actor`, from a file holding `ops`.
+    fn batch_as(&self, actor: &str, ops: &str) -> Output {
+        let script = self.dir.path().join("batch.txt");
+        std::fs::write(&script, ops).unwrap();
+        self.run_as(actor, &["batch", "-f", script.to_str().unwrap()])
+    }
+
+    /// The `data` of the last `op` event on `id`.
+    fn last_event(&self, op: &str, id: &str) -> Value {
+        let history = self.json(&["history", id]);
+        let e = history.as_array().unwrap().iter().rev().find(|e| e["op"] == op);
+        e.unwrap_or_else(|| panic!("no {op} event on {id}: {history}"))["data"].clone()
+    }
+}
+
+#[test]
+fn a_live_claim_is_claimed_once_even_by_the_same_actor() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Contended"]);
+    let first = ws.json_as("ann", &["claim", "t-1"]);
+    let token = first["lease"]["token"].as_i64().unwrap().to_string();
+    // A second session running as the same actor is told, not handed the same lease.
+    let out = ws.run_as("ann", &["claim", "t-1"]);
+    assert_eq!(out.status.code(), Some(4));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("already claimed by ann") && err.contains("--token"), "{err}");
+    assert_eq!(ws.code_as("ann", &["claim", "t-1", "--token", "99999"]), 4, "a stale token");
+    // Its holder renews it with its token: the same lease.
+    let again = ws.json_as("ann", &["claim", "t-1", "--token", &token]);
+    assert_eq!((again["already_held"].as_bool(), &again["lease"]["token"]), (Some(true), &first["lease"]["token"]));
+    assert_eq!(ws.code_as("ann", &["claim", "--next", "--token", &token]), 2, "--token names one claim");
+    assert!(ws.json_as("ann", &["claim", "--next"]).is_null(), "claim --next never returns held work");
+    assert_eq!(ws.batch_as("ann", "claim t-1\n").status.code(), Some(4), "nor does a batch");
+    ws.ok(&["create", "Next"]);
+    // The common path is unchanged: claim, work, close by the same actor.
+    let next = ws.json_as("ann", &["claim", "--next"]);
+    assert_eq!(next["issue"]["id"], "t-2");
+    ws.json_as("ann", &["close", "t-2", "--reason", "done"]);
+    ws.json_as("ann", &["close", "t-1", "--token", &token]);
+}
+
+#[test]
+fn live_claims_are_protected_from_other_actors() {
+    let ws = Ws::new();
+    for n in 1..=6 {
+        ws.ok(&["create", &format!("Task {n}")]);
+    }
+    let mut tokens = vec![String::new()];
+    for n in 1..=6 {
+        let c = ws.json_as("ann/s1", &["claim", &format!("t-{n}")]);
+        tokens.push(c["lease"]["token"].as_i64().unwrap().to_string());
+    }
+    // Another actor, the holder's root actor, and a sibling sub-actor are all refused (exit 4)
+    // anything that ends or takes over the claim, alone or in a batch (which rolls back whole).
+    for actor in ["bob", "ann", "ann/s2"] {
+        for args in [
+            &["close", "t-1"][..],
+            &["close", "t-1", "--token", &tokens[1]],
+            &["update", "t-1", "--status", "open"],
+            &["update", "t-1", "--assignee", actor],
+            &["delete", "t-1"],
+            &["release", "t-1"],
+            &["claim", "t-1"],
+        ] {
+            assert_eq!(ws.code_as(actor, args), 4, "bd {args:?} as {actor}");
+            let line = shlex::try_join(args.iter().copied()).unwrap();
+            let out = ws.batch_as(actor, &format!("comment add t-1 \"checking in\"\n{line}\n"));
+            assert_eq!(out.status.code(), Some(4), "batch {line:?} as {actor}");
+        }
+    }
+    let out = ws.run_as("bob", &["close", "t-1"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("t-1 is held by ann/s1, not bob") && err.contains("--force"), "{err}");
+    assert!(ws.json(&["comments", "t-1"]).as_array().unwrap().is_empty(), "every batch rolled back");
+    let shown = ws.json(&["show", "t-1"]);
+    assert_eq!((shown["status"].as_str(), shown["assignee"].as_str()), (Some("in_progress"), Some("ann/s1")));
+    assert_eq!(shown["lease"]["token"].as_i64().unwrap().to_string(), tokens[1]);
+    ws.json_as("bob", &["update", "t-1", "--add-label", "seen", "--notes", "looked at it"]);
+
+    // With --force each goes through, and the event history records the claim it ended.
+    ws.json_as("bob", &["close", "t-1", "--force", "--reason", "superseded"]);
+    ws.json_as("ann", &["update", "t-2", "--status", "open", "--force"]);
+    ws.json_as("ann/s2", &["update", "t-3", "--assignee", "ann/s2", "--force"]);
+    ws.json_as("bob", &["release", "t-4", "--force"]);
+    let out = ws.batch_as("bob", "delete t-5 --force\n");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for (n, op) in [(1, "closed"), (2, "updated"), (3, "updated"), (4, "released"), (5, "deleted")] {
+        let data = ws.last_event(op, &format!("t-{n}"));
+        let expected = serde_json::json!({ "holder": "ann/s1", "token": tokens[n].parse::<i64>().unwrap() });
+        assert_eq!(data["claim_override"], expected, "t-{n} {op}: {data}");
+    }
+    assert_eq!(ws.json(&["show", "t-3"])["lease"]["holder"], "ann/s2", "the lease follows the takeover");
+    // The holder itself needs neither --force nor its token.
+    ws.json_as("ann/s1", &["close", "t-6"]);
+    assert!(ws.last_event("closed", "t-6").get("claim_override").is_none());
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn dead_claims_are_anyones() {
+    let ws = Ws::new();
+    for n in 1..=3 {
+        ws.ok(&["create", &format!("Task {n}")]);
+    }
+    ws.ok(&["config", "set", "lease.grace", "0s"]);
+    for n in 1..=3 {
+        ws.json_as("crashy", &["claim", &format!("t-{n}"), "--ttl", "1s"]);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    // A claim `bd reclaim` would take back is reclaimed by a claim, and closed or released without --force.
+    let c = ws.json_as("tester", &["claim", "t-1"]);
+    assert_eq!(
+        (c["issue"]["assignee"].as_str(), c["reclaimed"]["previous_holder"].as_str()),
+        (Some("tester"), Some("crashy"))
+    );
+    assert!(ws.ok(&["claim", "t-2"]).contains("reclaimed from crashy"));
+    ws.json_as("other", &["release", "t-3"]);
+    assert_eq!(ws.json(&["show", "t-3"])["status"], "open");
+    assert_eq!(ws.code_as("crashy", &["heartbeat", "t-1"]), 4, "the zombie learns it lost the lease");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn imports_take_over_live_claims_only_with_force() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Task"]);
+    let before = ws.dir.path().join("before.jsonl");
+    ws.ok(&["export", "-o", before.to_str().unwrap()]);
+    let token = ws.json_as("ann", &["claim", "t-1"])["lease"]["token"].clone();
+    // The export from before the claim would put the issue back to open.
+    assert_eq!(ws.code_as("bob", &["import", before.to_str().unwrap()]), 4);
+    assert_eq!(ws.json(&["show", "t-1"])["assignee"], "ann");
+    ws.json_as("bob", &["import", before.to_str().unwrap(), "--force"]);
+    assert_eq!(ws.json(&["show", "t-1"])["status"], "open");
+    assert_eq!(
+        ws.last_event("imported", "t-1")["claim_override"],
+        serde_json::json!({ "holder": "ann", "token": token })
+    );
+}
+
+#[test]
+fn a_run_claimed_by_another_actor_stays_open_when_its_last_step_closes() {
+    let ws = Ws::new();
+    ws.playbook("two", "[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\n");
+    let run = ws.json(&["playbook", "run", "two"])["run"]["id"].as_str().unwrap().to_string();
+    let (a, b) = (format!("{run}.a"), format!("{run}.b"));
+    ws.json_as("coordinator", &["claim", &run]);
+    ws.json_as("worker", &["claim", &a]);
+    // Discarding the run would end the worker's claim: --force (as before for work in progress).
+    assert_eq!(ws.code_as("coordinator", &["playbook", "discard", &run]), 2);
+    ws.json_as("worker", &["close", &a]);
+    let closed = ws.json_as("worker", &["close", &b]);
+    assert!(closed.get("completed").is_none(), "{closed}");
+    let shown = ws.json(&["show", &run]);
+    assert_eq!((shown["status"].as_str(), shown["assignee"].as_str()), (Some("in_progress"), Some("coordinator")));
+    // Its holder closes it.
+    ws.json_as("coordinator", &["close", &run]);
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
 #[test]
 fn memory_comments_prime_and_health() {
     let ws = Ws::new();

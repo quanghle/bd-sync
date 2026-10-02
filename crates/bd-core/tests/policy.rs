@@ -137,12 +137,20 @@ fn other_actors_claims_need_an_admin() {
     let label = patch(|p| p.add_labels = vec!["looked-at".into()]);
     env.as_("alice", agent("alice"), |tx| tx.update_issue(&held, &label, &Guard::default(), false)).unwrap();
 
-    // The token's own actor and its sub-actors are the caller's own.
+    // The token's own actor and its sub-actors may take over each other's claims without an
+    // admin, but with force like everyone: each sub-actor holds its own lease.
     env.as_("bob/w2", agent("bob"), |tx| tx.release(&ids[1], &force_release())).unwrap();
-    env.as_("bob", agent("bob"), |tx| tx.close_issue(&ids[2], &CloseOptions::default())).unwrap();
-    // An admin may take over anyone's claim; without a policy (the CLI) anyone may.
+    let e = env.as_("bob", agent("bob"), |tx| tx.close_issue(&ids[2], &CloseOptions::default())).unwrap_err();
+    assert!(matches!(e, Error::NotOwner { .. }), "{e}");
+    let force_close = CloseOptions { force: true, ..Default::default() };
+    env.as_("bob", agent("bob"), |tx| tx.close_issue(&ids[2], &force_close)).unwrap();
+    // An admin may take over anyone's claim; without a policy (the CLI) anyone may: with force.
+    let e = env.as_("ops", admin_agent("ops"), |tx| tx.update_issue(&held, &take, &Guard::default(), false));
+    assert!(matches!(e, Err(Error::AlreadyClaimed { .. })), "{e:?}");
     env.as_("ops", admin_agent("ops"), |tx| tx.update_issue(&held, &take, &Guard::default(), true)).unwrap();
     assert_eq!(env.issue(&held).assignee.as_deref(), Some("alice"));
+    let e = env.as_("carol", None, |tx| tx.release(&ids[3], &ReleaseOptions::default())).unwrap_err();
+    assert!(matches!(e, Error::NotOwner { .. }), "{e}");
     env.as_("carol", None, |tx| tx.release(&ids[3], &force_release())).unwrap();
 
     // Reserved work nobody has claimed can be reassigned and released.
@@ -158,6 +166,156 @@ fn other_actors_claims_need_an_admin() {
     let mut reclaimed: Vec<&str> = reclaimed.iter().map(|r| r.issue_id.as_str()).collect();
     reclaimed.sort();
     assert_eq!(reclaimed, vec![ids[0].as_str(), ids[4].as_str()], "bob's and the one taken over");
+    env.assert_healthy();
+}
+
+fn last_event(env: &Env, op: &str, id: &str) -> Event {
+    let history = env.store.read(|r| r.history(id)).unwrap();
+    history.into_iter().rev().find(|e| e.op == op).unwrap_or_else(|| panic!("no {op} event on {id}"))
+}
+
+/// A claim conflict (exit 4): `id` is held by `holder`.
+fn not_owner<T: std::fmt::Debug>(r: Result<T>, holder: &str) {
+    match r {
+        Err(e @ Error::NotOwner { .. }) => {
+            assert!(e.to_string().contains(&format!("held by {holder},")), "{e}");
+            assert_eq!(e.exit_code(), 4);
+        }
+        other => panic!("expected a refusal naming holder {holder}, got {other:?}"),
+    }
+}
+
+#[test]
+fn live_claims_are_their_holders_alone() {
+    let mut env = Env::new();
+    let ids: Vec<String> = (1..=8).map(|n| env.create(&format!("Task {n}"))).collect();
+    let tokens: Vec<i64> = ids
+        .iter()
+        .map(|id| env.as_("ann/s1", None, |tx| tx.claim(id, &ClaimOptions::default())).unwrap().lease.token)
+        .collect();
+    let none = Guard::default();
+    let close = CloseOptions::default();
+    let force_close = CloseOptions { force: true, ..Default::default() };
+    let reopen = patch(|p| p.status = Some(Status::Open));
+    let take = |who: &str| patch(|p| p.assignee = Some(Some(who.to_string())));
+
+    // Without a policy (the CLI), every other actor name is refused: another actor, the
+    // holder's root actor, and a sibling sub-actor alike.
+    for actor in ["bob", "ann", "ann/s2"] {
+        let held = &ids[0];
+        not_owner(env.as_(actor, None, |tx| tx.close_issue(held, &close)), "ann/s1");
+        not_owner(env.as_(actor, None, |tx| tx.update_issue(held, &reopen, &none, false)), "ann/s1");
+        let e = env.as_(actor, None, |tx| tx.update_issue(held, &take(actor), &none, false)).unwrap_err();
+        assert!(matches!(e, Error::AlreadyClaimed { .. }) && e.exit_code() == 4, "{e}");
+        let del = DeleteOptions::default();
+        not_owner(env.as_(actor, None, |tx| tx.delete_issues(std::slice::from_ref(held), &del)), "ann/s1");
+        not_owner(env.as_(actor, None, |tx| tx.release(held, &ReleaseOptions::default())), "ann/s1");
+        let e = env.as_(actor, None, |tx| tx.claim(held, &ClaimOptions::default())).unwrap_err();
+        assert!(matches!(e, Error::AlreadyClaimed { .. }), "{e}");
+        // Even with the holder's token: it proves a grant to its holder only.
+        let with_token = ClaimOptions { token: Some(tokens[0]), ..Default::default() };
+        let e = env.as_(actor, None, |tx| tx.claim(held, &with_token)).unwrap_err();
+        assert!(matches!(e, Error::AlreadyClaimed { .. }), "{e}");
+    }
+    assert_eq!(env.issue(&ids[0]).assignee.as_deref(), Some("ann/s1"), "nothing changed");
+    assert_eq!(env.store.read(|r| r.lease(&ids[0])).unwrap().unwrap().token, tokens[0]);
+    let label = patch(|p| p.add_labels = vec!["seen".into()]);
+    env.as_("bob", None, |tx| tx.update_issue(&ids[0], &label, &none, false)).expect("leaves the claim alone");
+
+    // With force each goes through, and its event names the claim it ended.
+    let overridden = |env: &Env, op: &str, n: usize| {
+        let e = last_event(env, op, &ids[n]);
+        assert_eq!(e.data["claim_override"], json!({ "holder": "ann/s1", "token": tokens[n] }), "{op}: {}", e.data);
+    };
+    env.as_("bob", None, |tx| tx.close_issue(&ids[0], &force_close)).unwrap();
+    overridden(&env, "closed", 0);
+    env.as_("ann", None, |tx| tx.update_issue(&ids[1], &reopen, &none, true)).unwrap();
+    overridden(&env, "updated", 1);
+    env.as_("ann/s2", None, |tx| tx.update_issue(&ids[2], &take("ann/s2"), &none, true)).unwrap();
+    overridden(&env, "updated", 2);
+    assert_eq!(env.store.read(|r| r.lease(&ids[2])).unwrap().unwrap().holder, "ann/s2", "the lease follows");
+    env.as_("bob", None, |tx| tx.release(&ids[3], &force_release())).unwrap();
+    overridden(&env, "released", 3);
+    let del = DeleteOptions { force: true, ..Default::default() };
+    env.as_("bob", None, |tx| tx.delete_issues(std::slice::from_ref(&ids[4]), &del)).unwrap();
+    overridden(&env, "deleted", 4);
+
+    // The holder ends its own claim without force or token; a token it passes must match.
+    let stale = CloseOptions { token: Some(tokens[5] + 1000), ..Default::default() };
+    let e = env.as_("ann/s1", None, |tx| tx.close_issue(&ids[5], &stale)).unwrap_err();
+    assert!(matches!(e, Error::LeaseLost { .. }), "{e}");
+    env.as_("ann/s1", None, |tx| tx.close_issue(&ids[5], &close)).unwrap();
+    assert!(last_event(&env, "closed", &ids[5]).data.get("claim_override").is_none());
+
+    // An expired lease stays protected until `reclaim` could take it (lease.grace, 10m, past
+    // its expiry); then the claim is anyone's to claim or end.
+    env.clock.advance(Duration::from_secs(6 * 60));
+    not_owner(env.as_("bob", None, |tx| tx.close_issue(&ids[6], &close)), "ann/s1");
+    let e = env.as_("bob", None, |tx| tx.claim(&ids[6], &ClaimOptions::default())).unwrap_err();
+    assert!(matches!(e, Error::AlreadyClaimed { .. }), "{e}");
+    env.clock.advance(Duration::from_secs(10 * 60));
+    let c = env.as_("bob", None, |tx| tx.claim(&ids[6], &ClaimOptions::default())).unwrap();
+    assert_eq!((c.issue.status, c.issue.assignee.as_deref()), (Status::InProgress, Some("bob")));
+    assert_eq!(c.reclaimed.as_ref().map(|r| (r.previous_holder.as_str(), r.token)), Some(("ann/s1", tokens[6])));
+    assert!(c.lease.token > tokens[6] && !c.already_held);
+    assert_eq!(last_event(&env, "reclaimed", &ids[6]).data["previous_holder"], "ann/s1");
+    env.as_("bob", None, |tx| tx.close_issue(&ids[7], &close)).expect("a dead claim needs no force");
+    assert!(last_event(&env, "closed", &ids[7]).data.get("claim_override").is_none());
+    let reclaimed = env.as_("bob", None, |tx| tx.reclaim_expired(&ReclaimOptions::default())).unwrap();
+    assert_eq!(reclaimed.len(), 1, "only ann/s2's claim taken over above is left: {reclaimed:?}");
+    env.assert_healthy();
+}
+
+#[test]
+fn a_dead_claim_is_released_by_anyone_a_live_one_by_its_holder() {
+    let mut env = Env::new();
+    let id = env.create("Task");
+    env.as_("ann", None, |tx| tx.claim(&id, &ClaimOptions::default())).unwrap();
+    not_owner(env.as_("bob", None, |tx| tx.release(&id, &ReleaseOptions::default())), "ann");
+    env.clock.advance(Duration::from_secs(16 * 60));
+    let released = env.as_("bob", None, |tx| tx.release(&id, &ReleaseOptions::default())).unwrap();
+    assert_eq!((released.status, released.assignee), (Status::Open, None));
+    let e = last_event(&env, "released", &id);
+    assert_eq!((e.data["previous_holder"].as_str(), e.data.get("claim_override")), (Some("ann"), None));
+    env.assert_healthy();
+}
+
+#[test]
+fn imports_and_runs_need_force_to_end_live_claims() {
+    let mut env = Env::new();
+    let id = env.create("Claimed");
+    let mut before = Vec::new();
+    env.store.read(|r| r.export_jsonl(&mut before, &ExportOptions::default())).unwrap();
+    let token = env.as_("ann", None, |tx| tx.claim(&id, &ClaimOptions::default())).unwrap().lease.token;
+    // An export from before the claim would put the issue back to open.
+    let import = |force: bool| {
+        let before = before.clone();
+        move |tx: &mut WriteCtx<'_>| {
+            tx.import_jsonl(&mut before.as_slice(), &ImportOptions { force, ..Default::default() })
+        }
+    };
+    not_owner(env.as_("bob", None, import(false)), "ann");
+    denied(env.as_("bob", agent("bob"), import(true)), "needs an admin");
+    env.as_("ops", admin_agent("ops"), |tx| {
+        import(true)(tx)?;
+        tx.set_rollback_only();
+        Ok(())
+    })
+    .expect("an admin token, with force");
+    env.as_("bob", None, import(true)).unwrap();
+    assert_eq!(env.issue(&id).status, Status::Open);
+    assert_eq!(last_event(&env, "imported", &id).data["claim_override"], json!({ "holder": "ann", "token": token }));
+
+    // Discarding or compacting a run deletes its claimed steps only with force (already
+    // required for unfinished runs), and records each claim it ended.
+    let run = env.start("[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\n", &[]).unwrap();
+    let step = format!("{run}.a");
+    let token = env.as_("ann", None, |tx| tx.claim(&step, &ClaimOptions::default())).unwrap().lease.token;
+    assert!(matches!(env.as_("bob", None, |tx| tx.discard_run(&run, false, false)), Err(Error::Refused(_))));
+    let compact = CompactOptions { force: true, ..Default::default() };
+    env.as_("bob", None, |tx| tx.compact_run(&run, &compact)).unwrap();
+    let e = last_event(&env, "run_compacted", &run);
+    assert_eq!(e.data["claim_overrides"], json!({ step.clone(): { "holder": "ann", "token": token } }), "{}", e.data);
     env.assert_healthy();
 }
 
@@ -505,9 +663,15 @@ fn self_closing_containers_respect_the_policy() {
     let group = env.issue(&claimed);
     assert_eq!((group.status, group.assignee.as_deref()), (Status::InProgress, Some("bob")));
     env.as_("bob", agent("bob"), |tx| tx.heartbeat(&claimed, None, None)).expect("bob still holds it");
-    // Its holder's family, an admin, or the CLI close it as before.
+    // So it does for its holder's sub-actors, an admin, and the CLI: no step close takes over a claim.
+    for (actor, policy) in [("bob/w1", agent("bob")), ("ops", admin_agent("ops")), ("carol", None)] {
+        env.as_("alice", None, |tx| tx.reopen_issue(&steps[1], None)).unwrap();
+        env.as_(actor, policy, |tx| tx.close_issue(&steps[1], &CloseOptions::default())).unwrap();
+        assert_eq!(env.issue(&claimed).status, Status::InProgress, "{actor}");
+    }
+    // Its holder closes it as before.
     env.as_("alice", None, |tx| tx.reopen_issue(&steps[1], None)).unwrap();
-    env.as_("bob/w1", agent("bob"), |tx| tx.close_issue(&steps[1], &CloseOptions::default())).unwrap();
+    env.as_("bob", agent("bob"), |tx| tx.close_issue(&steps[1], &CloseOptions::default())).unwrap();
     assert_eq!(env.issue(&claimed).status, Status::Closed);
 
     // Real runs still close themselves, and compaction still writes its bookkeeping.

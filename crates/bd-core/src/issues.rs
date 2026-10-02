@@ -322,7 +322,8 @@ fn validate_metadata(v: &Value) -> Result<()> {
 pub struct CloseOptions {
     pub reason: Option<String>,
     pub outcome: Option<Outcome>,
-    /// Close despite open children or live blockers.
+    /// Close despite open children, live blockers, or another actor's live
+    /// claim (a takeover, recorded in the `closed` event; see [`crate::policy`]).
     pub force: bool,
     pub guard: Guard,
     /// Fencing token from `claim`: close only while that lease is still held.
@@ -363,7 +364,9 @@ pub struct DeleteOptions {
     /// Also delete everything that transitively depends on the targets
     /// through readiness edges (blocks, conditional-blocks, parent-child, waits-for).
     pub cascade: bool,
-    /// Delete even though other issues depend on the targets (drops those edges).
+    /// Delete even though other issues depend on the targets (drops those
+    /// edges), or another actor holds a live claim on one (recorded in its
+    /// `deleted` event; see [`crate::policy`]).
     pub force: bool,
     pub dry_run: bool,
 }
@@ -490,6 +493,9 @@ impl WriteCtx<'_> {
         require(self.conn(), &id)
     }
 
+    /// Apply `patch`. `force`: even when that ends or takes over another
+    /// actor's live claim (reassigning it, or moving it out of `in_progress`;
+    /// recorded in the `updated` event, see [`crate::policy`]).
     pub fn update_issue(&mut self, id: &str, patch: &IssuePatch, guard: &Guard, force: bool) -> Result<UpdateOutcome> {
         self.update_issue_as(id, patch, guard, force, false)
     }
@@ -598,7 +604,7 @@ impl WriteCtx<'_> {
             && is_claimed
             && old.assignee != new.assignee
             && !force
-            && old.assignee.as_deref() != Some(self.actor())
+            && self.others_live_claim(&old)?.is_some()
         {
             return Err(Error::AlreadyClaimed { id: id.to_string(), holder: old.assignee.clone().unwrap_or_default() });
         }
@@ -671,7 +677,7 @@ impl WriteCtx<'_> {
             return Ok(UpdateOutcome { issue: old, changed: Vec::new() });
         }
         let moved_from = parent_change.as_ref().and_then(|(from, _)| from.as_deref());
-        self.check_update(&old, &new, moved_from, playbook)?;
+        let claim_override = self.check_update(&old, &new, moved_from, playbook, force)?;
         self.check_gate_repo(&new.issue_type, &new.metadata, Some(&old))?;
 
         self.conn()
@@ -709,7 +715,11 @@ impl WriteCtx<'_> {
             self.conn().prepare_cached("INSERT INTO labels (issue_id, label) VALUES (?1, ?2)")?.execute([id, l])?;
         }
         let changed: Vec<String> = changes.keys().cloned().collect();
-        let seq = self.emit("updated", Some(id), json!({ "changes": changes }))?;
+        let mut data = json!({ "changes": changes });
+        if let Some(o) = claim_override {
+            data["claim_override"] = o;
+        }
+        let seq = self.emit("updated", Some(id), data)?;
 
         let mut seeds = Vec::new();
         if let Some((old_parent, new_parent)) = parent_change {
@@ -765,10 +775,10 @@ impl WriteCtx<'_> {
                 )));
             }
         }
-        self.check_close(&old, opts.force)?;
+        let claim_override = self.check_close(&old, opts.force)?;
         let reason = opts.reason.clone().filter(|r| !r.trim().is_empty());
         let outcome = opts.outcome.unwrap_or(Outcome::Done);
-        let mut freed = self.mark_closed(&old, reason, outcome, false)?;
+        let mut freed = self.mark_closed(&old, reason, outcome, false, claim_override)?;
         let (completed, also_freed) = self.close_finished_containers(id)?;
         freed.extend(also_freed);
         freed.retain(|f| !completed.contains(f));
@@ -780,13 +790,16 @@ impl WriteCtx<'_> {
         })
     }
 
-    /// Close one issue and recompute what it held back; returns the issues it freed.
+    /// Close one issue and recompute what it held back; returns the issues it
+    /// freed. `auto`: a run or group closing after its last step; `claim_override`:
+    /// the live claim of another actor this close ended.
     fn mark_closed(
         &mut self,
         old: &Issue,
         reason: Option<String>,
         outcome: Outcome,
         auto: bool,
+        claim_override: Option<Value>,
     ) -> Result<Vec<String>> {
         let id = old.id.as_str();
         self.conn()
@@ -801,6 +814,9 @@ impl WriteCtx<'_> {
             json!({ "reason": reason, "outcome": outcome, "previous_status": old.status, "assignee": old.assignee });
         if auto {
             data["auto"] = json!(true);
+        }
+        if let Some(o) = claim_override {
+            data["claim_override"] = o;
         }
         self.emit("closed", Some(id), data)?;
         let seeds = graph::seeds_for_terminal_flip(self.conn(), id)?;
@@ -839,7 +855,7 @@ impl WriteCtx<'_> {
             } else {
                 (Outcome::Done, "every step closed")
             };
-            freed.extend(self.mark_closed(&p, Some(reason.into()), outcome, true)?);
+            freed.extend(self.mark_closed(&p, Some(reason.into()), outcome, true, None)?);
             closed.push(parent);
         }
         Ok((closed, freed))
@@ -962,7 +978,7 @@ impl WriteCtx<'_> {
                 detached.iter().cloned().collect::<Vec<_>>().join(", ")
             )));
         }
-        self.check_removal(&set)?;
+        let mut overrides = self.check_removal(&set, opts.force)?;
         let deleted: Vec<String> = set.iter().cloned().collect();
         let detached: Vec<String> = detached.into_iter().collect();
         if opts.dry_run {
@@ -977,8 +993,11 @@ impl WriteCtx<'_> {
             }
         }
         for s in &deleted {
-            let snap = snapshot(self.conn(), s)?;
-            self.emit("deleted", Some(s), json!({ "issue": snap }))?;
+            let mut data = json!({ "issue": snapshot(self.conn(), s)? });
+            if let Some(o) = overrides.remove(s) {
+                data["claim_override"] = o;
+            }
+            self.emit("deleted", Some(s), data)?;
         }
         for chunk in deleted.chunks(500) {
             let sql = format!("DELETE FROM issues WHERE id IN {}", placeholders(chunk.len()));
@@ -991,18 +1010,23 @@ impl WriteCtx<'_> {
 
     /// Delete `set` recording one summary event instead of a snapshot per
     /// issue (scratch work: purges and compactions). Edges from surviving
-    /// issues into the set are dropped; returns those survivors.
+    /// issues into the set are dropped; returns those survivors. `force`:
+    /// despite other actors' live claims (listed in the event).
     pub(crate) fn delete_quietly(
         &mut self,
         set: &BTreeSet<String>,
         op: &str,
         issue_id: Option<&str>,
         mut data: Value,
+        force: bool,
     ) -> Result<Vec<String>> {
         if set.is_empty() {
             return Ok(Vec::new());
         }
-        self.check_removal(set)?;
+        let overrides = self.check_removal(set, force)?;
+        if !overrides.is_empty() {
+            data["claim_overrides"] = json!(overrides);
+        }
         let mut detached: BTreeSet<String> = BTreeSet::new();
         let mut seeds: Vec<String> = Vec::new();
         {
@@ -1075,7 +1099,7 @@ impl WriteCtx<'_> {
         if dry_run || purge.is_empty() {
             return Ok(PurgeOutcome { deleted, detached: Vec::new(), dry_run });
         }
-        let detached = self.delete_quietly(&purge, "purged", None, json!({ "cutoff": cutoff }))?;
+        let detached = self.delete_quietly(&purge, "purged", None, json!({ "cutoff": cutoff }), false)?;
         Ok(PurgeOutcome { deleted, detached, dry_run })
     }
 }

@@ -441,11 +441,20 @@ fn retried_writes_are_applied_once() {
     assert_eq!((&c1["issue"]["id"], &c1["lease"]["token"]), (&c2["issue"]["id"], &c2["lease"]["token"]));
     let leases = alice.json(&["leases"]);
     assert_eq!(leases.as_array().unwrap().len(), 1, "one lease, not two: {leases}");
+    // So does a claim by id, which a new request (another session of the same actor) cannot repeat.
+    assert_eq!(alice.ok(&["-q", "create", "By id"]).trim(), "t-2");
+    let claim = json!({ "argv": ["--json", "claim", "t-2"], "request_id": "claim-2" });
+    let (_, first) = post(&url, &secret, &claim);
+    let (_, again) = post(&url, &secret, &claim);
+    assert_eq!((first["exit_code"].as_i64(), again["replayed"].as_bool()), (Some(0), Some(true)), "{again}");
+    assert_eq!(parse(&first)["lease"]["token"], parse(&again)["lease"]["token"]);
+    let fresh = json!({ "argv": ["--json", "claim", "t-2"], "request_id": "claim-3" });
+    assert_eq!(post(&url, &secret, &fresh).1["exit_code"], 4);
 
     // Each CLI invocation is its own request.
     alice.ok(&["create", "Twice"]);
     alice.ok(&["create", "Twice"]);
-    assert_eq!(alice.json(&["list"]).as_array().unwrap().len(), 3);
+    assert_eq!(alice.json(&["list"]).as_array().unwrap().len(), 4);
 }
 
 #[test]
@@ -2135,6 +2144,48 @@ fn force_takeovers_need_an_admin_token() {
     // Locally, on the server's host, --force works as it always has.
     check(server.local("local-ops", &["release", "t-1", "--force"]), "local release --force");
     assert_eq!(alice.json(&["show", "t-1"])["status"], "open");
+}
+
+#[test]
+fn takeovers_need_force_whatever_the_token() {
+    let server = Server::start();
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    let ops = server.client(&server.token("ops", "ops", &["--role", "admin"]));
+    let bob_as = |agent: &str, args: &[&str]| bob.cmd(args).env("BD_ACTOR", agent).output().unwrap();
+
+    for _ in 0..4 {
+        bob.ok(&["create", "Task"]);
+    }
+    for n in 1..=4 {
+        check(bob_as("bob/w1", &["claim", &format!("t-{n}")]), "bob/w1 claims");
+    }
+    // An admin token, the token's root actor and a sibling agent may take it over, but only
+    // with --force: without it, exit 4 as locally, alone or in a batch.
+    for args in [&["close", "t-1"][..], &["update", "t-1", "--status", "open"], &["delete", "t-1"]] {
+        assert_eq!(ops.code(args), 4, "admin: bd {args:?}");
+        assert_eq!(bob.code(args), 4, "root actor: bd {args:?}");
+        let out = bob_as("bob/w2", args);
+        assert_eq!(out.status.code(), Some(4), "sibling: bd {args:?}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains("held by bob/w1, not bob/w2"), "{}", stderr_of(&out));
+    }
+    assert_eq!(ops.with_stdin(&["batch"], "close t-1\n").status.code(), Some(4));
+    assert_eq!(bob.json(&["show", "t-1"])["assignee"], "bob/w1");
+    ops.ok(&["close", "t-1", "--force"]);
+    check(bob_as("bob", &["update", "t-2", "--status", "open", "--force"]), "root actor --force");
+    check(bob_as("bob/w2", &["delete", "t-3", "--force"]), "sibling --force");
+    let history = bob.json(&["history", "t-1"]);
+    let closed = history.as_array().unwrap().iter().rev().find(|e| e["op"] == "closed").unwrap();
+    assert_eq!(
+        (closed["actor"].as_str(), closed["data"]["claim_override"]["holder"].as_str()),
+        (Some("ops"), Some("bob/w1"))
+    );
+
+    // Same actor: a second claim needs the lease's token.
+    let out = bob_as("bob/w1", &["claim", "t-4"]);
+    assert_eq!(out.status.code(), Some(4), "{}", stderr_of(&out));
+    let token = bob.json(&["show", "t-4"])["lease"]["token"].as_i64().unwrap().to_string();
+    check(bob_as("bob/w1", &["claim", "t-4", "--token", &token]), "renew with the token");
+    check(bob_as("bob/w1", &["close", "t-4"]), "the holder closes its own claim");
 }
 
 /// A stand-in for `gh pr view` that reports PR 42 merged and appends its

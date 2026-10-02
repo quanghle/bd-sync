@@ -41,7 +41,11 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("issue_prefix", "bd", "Prefix for new issue ids"),
     ("id.mode", "hash", "Id scheme: hash | counter"),
     ("lease.ttl", "5m", "Claim lease duration; heartbeat faster than this"),
-    ("lease.grace", "10m", "How long past expiry a lease must be before reclaim reverts it"),
+    (
+        "lease.grace",
+        "10m",
+        "How long past expiry a lease must be before reclaim reverts it (until then the claim stays live)",
+    ),
     ("lease.auto_reclaim", "true", "claim --next and bd serve reclaim stale leases (past grace) automatically"),
     ("claim.pools", "", "Comma-separated pool assignees anyone may claim from"),
     ("types.custom", "", "Comma-separated extra issue types"),

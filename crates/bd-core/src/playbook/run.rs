@@ -549,7 +549,7 @@ impl WriteCtx<'_> {
         };
         self.update_issue_as(run, &patch, &Guard::default(), true, true)?;
         let set: BTreeSet<String> = removed.iter().cloned().collect();
-        self.delete_quietly(&set, "run_compacted", Some(run), json!({}))?;
+        self.delete_quietly(&set, "run_compacted", Some(run), json!({}), opts.force)?;
         Ok(CompactOutcome { run: issues::require(self.conn(), run)?, removed, digest, dry_run: false })
     }
 

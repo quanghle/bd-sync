@@ -7,8 +7,15 @@
 //! issue to `open` so another worker can take it.
 //!
 //! Every lease carries a fencing token (the sequence number of the event that
-//! granted it). Passing the token to heartbeat/close/release proves the caller
-//! still holds *that* grant, not merely the same actor name.
+//! granted it). Passing the token to claim/heartbeat/close/release proves the
+//! caller still holds *that* grant, not merely the same actor name.
+//!
+//! A claim is *live* until `reclaim` could take it back: while its lease has
+//! not been expired for `lease.grace`. A live claim is its holder's alone: a
+//! second claim of it fails even for the same actor, unless it passes the
+//! lease's token (an idempotent renew), and ending or taking it over needs
+//! `force` (see [`crate::policy`]). A claim past that point is anyone's to
+//! reclaim, claim, close or release.
 //!
 //! Invariant (checked by `doctor`): a lease row exists iff its issue is
 //! `in_progress`, and the lease holder equals the issue's assignee.
@@ -93,6 +100,15 @@ pub(crate) fn check_token(conn: &Connection, id: &str, _actor: &str, token: i64)
     }
 }
 
+/// Whether `lease` has been expired for at least `lease.grace`, so that
+/// `reclaim` would take it back: its claim is no longer live.
+pub(crate) fn is_reclaimable(conn: &Connection, lease: &Lease, now: Timestamp) -> Result<bool> {
+    if !lease.is_expired(now) {
+        return Ok(false);
+    }
+    Ok(lease.expires_at <= now.minus(config::lease_grace(conn)?))
+}
+
 fn validate_ttl(ttl: Duration) -> Result<Duration> {
     if ttl < Duration::from_secs(1) {
         return Err(Error::invalid("lease ttl must be at least 1s"));
@@ -107,20 +123,30 @@ pub struct ClaimOptions {
     /// Claim even if the issue is blocked or deferred (by explicit id only).
     pub allow_blocked: bool,
     pub guard: Guard,
+    /// Fencing token of a claim the caller already holds: claiming it again
+    /// with this token renews the lease (an idempotent retry). Without it, a
+    /// live claim cannot be claimed again, even by the same actor.
+    pub token: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Claim {
     pub issue: Issue,
     pub lease: Lease,
-    /// The actor already held this claim; the lease was refreshed.
+    /// The caller already held this claim (it passed the lease's token, or
+    /// the lease was missing); the lease was refreshed.
     pub already_held: bool,
+    /// A dead claim (lease expired for `lease.grace`) this claim took back first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reclaimed: Option<Reclaimed>,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ReleaseOptions {
     pub reason: Option<String>,
-    /// Release another actor's claim (admin/reaper use).
+    /// Release another actor's claim or assignment (a live claim's takeover
+    /// is recorded in the `released` event; through `bd serve` it also needs
+    /// an admin token unless the caller's token owns it).
     pub force: bool,
     pub guard: Guard,
     pub token: Option<i64>,
@@ -182,9 +208,11 @@ impl WriteCtx<'_> {
     /// Atomically claim one issue for the transaction's actor.
     ///
     /// Claimable means: status `open`, unassigned / reserved for the actor /
-    /// held by a `claim.pools` alias, and (unless `allow_blocked`) ready.
-    /// Re-claiming an issue the actor already holds is idempotent and
-    /// refreshes the lease.
+    /// held by a `claim.pools` alias, and (unless `allow_blocked`) ready. A
+    /// dead claim (lease expired for `lease.grace`) is reclaimed first, as
+    /// `reclaim` would. A live claim is refused, even to its own actor (two
+    /// sessions sharing an actor name must not both hold it), unless
+    /// `opts.token` names its lease: then the claim is renewed.
     pub fn claim(&mut self, id: &str, opts: &ClaimOptions) -> Result<Claim> {
         self.claim_checked(id, opts, false)
     }
@@ -192,7 +220,7 @@ impl WriteCtx<'_> {
     /// `ready_verified`: the caller just selected `id` from the ready queue
     /// inside this transaction, so the readiness re-check can be skipped.
     fn claim_checked(&mut self, id: &str, opts: &ClaimOptions, ready_verified: bool) -> Result<Claim> {
-        let issue = issues::require(self.conn(), id)?;
+        let mut issue = issues::require(self.conn(), id)?;
         opts.guard.check(&issue)?;
         if issue.issue_type == GATE_TYPE {
             return Err(Error::Refused(format!(
@@ -203,25 +231,36 @@ impl WriteCtx<'_> {
         let ttl = self.lease_ttl(opts.ttl)?;
         let now = self.now();
 
+        let mut reclaimed = None;
         if issue.status == Status::InProgress {
-            if issue.assignee.as_deref() != Some(actor.as_str()) {
-                return Err(Error::AlreadyClaimed {
-                    id: id.to_string(),
-                    holder: issue.assignee.clone().unwrap_or_default(),
-                });
+            let holder = issue.assignee.clone().unwrap_or_default();
+            let lease = get_lease(self.conn(), id)?;
+            if let Some(t) = opts.token {
+                if lease.as_ref().is_some_and(|l| l.token == t) && holder == actor {
+                    let lease = renew_lease(self.conn(), id, now, ttl)?;
+                    return Ok(Claim { issue, lease, already_held: true, reclaimed: None });
+                }
+                check_token(self.conn(), id, &actor, t)?;
             }
-            let lease = match get_lease(self.conn(), id)? {
-                Some(_) => renew_lease(self.conn(), id, now, ttl)?,
-                None => {
+            match lease {
+                Some(l) if is_reclaimable(self.conn(), &l, now)? => {
+                    reclaimed = Some(self.reclaim_one(&l, config::lease_grace(self.conn())?)?);
+                    issue = issues::require(self.conn(), id)?;
+                }
+                // A claim whose lease is missing: its holder gets one back.
+                None if holder == actor => {
                     let seq = self.emit(
                         "lease_granted",
                         Some(id),
                         json!({ "reason": "regrant", "ttl_ms": duration_ms(ttl) }),
                     )?;
-                    upsert_lease(self.conn(), id, &actor, seq, now, ttl)?
+                    let lease = upsert_lease(self.conn(), id, &actor, seq, now, ttl)?;
+                    return Ok(Claim { issue, lease, already_held: true, reclaimed: None });
                 }
-            };
-            return Ok(Claim { issue, lease, already_held: true });
+                _ => return Err(Error::AlreadyClaimed { id: id.to_string(), holder }),
+            }
+        } else if let Some(t) = opts.token {
+            check_token(self.conn(), id, &actor, t)?;
         }
         if issue.status != Status::Open {
             return Err(Error::NotClaimable { id: id.to_string(), status: issue.status });
@@ -254,7 +293,7 @@ impl WriteCtx<'_> {
             }),
         )?;
         let lease = upsert_lease(self.conn(), id, &actor, seq, now, ttl)?;
-        Ok(Claim { issue: issues::require(self.conn(), id)?, lease, already_held: false })
+        Ok(Claim { issue: issues::require(self.conn(), id)?, lease, already_held: false, reclaimed })
     }
 
     /// Atomically claim the first ready issue (in queue order) the actor may
@@ -274,7 +313,7 @@ impl WriteCtx<'_> {
         match head.into_iter().next() {
             None => Ok(None),
             Some(issue) => {
-                let claim_opts = ClaimOptions { ttl: opts.ttl, allow_blocked: false, guard: Guard::default() };
+                let claim_opts = ClaimOptions { ttl: opts.ttl, ..Default::default() };
                 self.claim_checked(&issue.id, &claim_opts, true).map(Some)
             }
         }
@@ -335,13 +374,16 @@ impl WriteCtx<'_> {
             return Err(Error::invalid(format!("{id} is not claimed or assigned")));
         };
         let actor = self.actor().to_string();
-        if holder != actor && !opts.force {
+        let claimed = issue.status == Status::InProgress;
+        // Assignments and live claims are their holder's to give up; a dead
+        // claim is anyone's, as for `reclaim`.
+        if holder != actor && !opts.force && (!claimed || self.others_live_claim(&issue)?.is_some()) {
             return Err(Error::NotOwner { id: id.to_string(), holder: Some(holder), actor });
         }
         if let Some(t) = opts.token {
             check_token(self.conn(), id, &actor, t)?;
         }
-        self.check_claim_override(&issue)?;
+        let claim_override = if claimed { self.check_claim_override(&issue, opts.force)? } else { None };
         let (status, started_at) =
             if issue.status == Status::InProgress { (Status::Open, None) } else { (issue.status, issue.started_at) };
         self.conn()
@@ -354,17 +396,17 @@ impl WriteCtx<'_> {
         let lease = get_lease(self.conn(), id)?;
         delete_lease(self.conn(), id)?;
         let reason = opts.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
-        self.emit(
-            "released",
-            Some(id),
-            json!({
-                "previous_holder": holder,
-                "previous_status": issue.status,
-                "reason": reason,
-                "forced": holder != actor,
-                "token": lease.map(|l| l.token),
-            }),
-        )?;
+        let mut data = json!({
+            "previous_holder": holder,
+            "previous_status": issue.status,
+            "reason": reason,
+            "forced": holder != actor,
+            "token": lease.map(|l| l.token),
+        });
+        if let Some(o) = claim_override {
+            data["claim_override"] = o;
+        }
+        self.emit("released", Some(id), data)?;
         issues::require(self.conn(), id)
     }
 
@@ -403,27 +445,44 @@ impl WriteCtx<'_> {
             return Ok(stale);
         }
         for r in &stale {
-            delete_lease(self.conn(), &r.issue_id)?;
-            self.conn()
-                .prepare_cached(
-                    "UPDATE issues SET status = 'open', assignee = NULL, started_at = NULL, updated_at = ?1,
-                        revision = revision + 1
-                     WHERE id = ?2 AND status = 'in_progress'",
-                )?
-                .execute(params![now, r.issue_id])?;
-            self.emit(
-                "reclaimed",
-                Some(&r.issue_id),
-                json!({
-                    "previous_holder": r.previous_holder,
-                    "token": r.token,
-                    "expired_at": r.expired_at,
-                    "last_heartbeat_at": r.heartbeat_at,
-                    "grace_ms": duration_ms(grace),
-                }),
-            )?;
-            self.bump_counter("reclaims", 1)?;
+            self.revert_reclaimed(r, grace)?;
         }
         Ok(stale)
+    }
+
+    /// Reclaim the dead claim holding `lease` (see [`is_reclaimable`]).
+    fn reclaim_one(&mut self, lease: &Lease, grace: Duration) -> Result<Reclaimed> {
+        let r = Reclaimed {
+            issue_id: lease.issue_id.clone(),
+            previous_holder: lease.holder.clone(),
+            token: lease.token,
+            expired_at: lease.expires_at,
+            heartbeat_at: lease.heartbeat_at,
+        };
+        self.revert_reclaimed(&r, grace)?;
+        Ok(r)
+    }
+
+    fn revert_reclaimed(&mut self, r: &Reclaimed, grace: Duration) -> Result<()> {
+        delete_lease(self.conn(), &r.issue_id)?;
+        self.conn()
+            .prepare_cached(
+                "UPDATE issues SET status = 'open', assignee = NULL, started_at = NULL, updated_at = ?1,
+                    revision = revision + 1
+                 WHERE id = ?2 AND status = 'in_progress'",
+            )?
+            .execute(params![self.now(), r.issue_id])?;
+        self.emit(
+            "reclaimed",
+            Some(&r.issue_id),
+            json!({
+                "previous_holder": r.previous_holder,
+                "token": r.token,
+                "expired_at": r.expired_at,
+                "last_heartbeat_at": r.heartbeat_at,
+                "grace_ms": duration_ms(grace),
+            }),
+        )?;
+        self.bump_counter("reclaims", 1)
     }
 }

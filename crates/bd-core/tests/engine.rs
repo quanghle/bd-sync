@@ -370,9 +370,19 @@ fn claims_are_atomic_idempotent_and_leased() {
     let claimed_event = env.events().into_iter().find(|e| e.op == "claimed").unwrap();
     assert_eq!(claimed_event.seq, token, "the fencing token is the claim event's seq");
 
-    let again = env.store.write("claim", "bob", |tx| tx.claim(&a, &ClaimOptions::default())).unwrap();
+    // A live claim is its lease's: claimed again by the same actor name, it is
+    // refused (another session may hold it), unless the caller shows the token.
+    let err = env.store.write("claim", "bob", |tx| tx.claim(&a, &ClaimOptions::default())).unwrap_err();
+    assert!(matches!(err, Error::AlreadyClaimed { ref holder, .. } if holder == "bob"), "{err}");
+    let renew = ClaimOptions { token: Some(token), ..Default::default() };
+    env.clock.advance(Duration::from_secs(60));
+    let again = env.store.write("claim", "bob", |tx| tx.claim(&a, &renew)).unwrap();
     assert!(again.already_held);
     assert_eq!(again.lease.token, token);
+    assert_eq!(again.lease.expires_at, env.clock.now().plus(Duration::from_secs(300)), "renewed");
+    let stale = ClaimOptions { token: Some(token + 100), ..Default::default() };
+    let err = env.store.write("claim", "bob", |tx| tx.claim(&a, &stale)).unwrap_err();
+    assert!(matches!(err, Error::LeaseLost { .. }), "{err}");
 
     let err = env.store.write("claim", "carol", |tx| tx.claim(&a, &ClaimOptions::default())).unwrap_err();
     assert!(matches!(err, Error::AlreadyClaimed { ref holder, .. } if holder == "bob"));
@@ -393,7 +403,8 @@ fn claims_are_atomic_idempotent_and_leased() {
     assert!(env.store.read(|r| r.lease(&a)).unwrap().is_none());
 
     let counters = env.store.read(|r| Ok(metrics::metrics(r.conn(), r.now(), None)?.counters)).unwrap();
-    assert_eq!(counters.get("claim_conflicts"), Some(&1));
+    assert_eq!(counters.get("claim_conflicts"), Some(&2));
+    assert_eq!(counters.get("lease_lost"), Some(&1));
     assert_eq!(counters.get("not_owner"), Some(&1));
     env.assert_healthy();
 }

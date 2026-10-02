@@ -388,7 +388,8 @@ pub struct UpdateArgs {
     pub ephemeral: Option<bool>,
     #[command(flatten)]
     pub guard: GuardArgs,
-    /// Allow taking over another actor's live claim (through bd serve: an admin token)
+    /// Take over or end another actor's live claim: reassign it, or move it out of in_progress (recorded in the
+    /// event; through bd serve, an admin token unless the token's actor owns the claim)
     #[arg(long)]
     pub force: bool,
 }
@@ -402,7 +403,8 @@ pub struct CloseArgs {
     /// Record the outcome as failed (releases conditional-blocks dependents)
     #[arg(long)]
     pub failed: bool,
-    /// Close despite open children or live blockers
+    /// Close despite open children, live blockers, or another actor's live claim (recorded in the event; through
+    /// bd serve, an admin token unless the token's actor owns the claim)
     #[arg(long)]
     pub force: bool,
     /// Fencing token from `claim`: close only while that lease is held
@@ -435,7 +437,8 @@ pub struct DeleteArgs {
     /// Also delete everything that depends on them
     #[arg(long)]
     pub cascade: bool,
-    /// Delete even if other issues depend on them (drops those edges)
+    /// Delete even if other issues depend on them (drops those edges) or another actor holds a live claim on one
+    /// (recorded in the event; through bd serve, an admin token unless the token's actor owns the claim)
     #[arg(long)]
     pub force: bool,
     #[arg(long)]
@@ -489,6 +492,9 @@ pub struct ClaimArgs {
     pub allow_blocked: bool,
     #[arg(long, value_name = "N")]
     pub if_revision: Option<i64>,
+    /// Fencing token of your claim: renew it (by id only). A live claim is refused without it, even to its own actor
+    #[arg(long, conflicts_with = "next")]
+    pub token: Option<i64>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -508,12 +514,14 @@ pub struct ReleaseArgs {
     pub ids: Vec<String>,
     #[arg(short, long)]
     pub reason: Option<String>,
-    /// Release another actor's claim (through bd serve: an admin token)
+    /// Release another actor's live claim or assignment (recorded in the event; through bd serve, an admin token
+    /// unless the token's actor owns the claim)
     #[arg(long)]
     pub force: bool,
-    /// Release only if still held by this actor (compare-and-swap)
+    /// Release only if still held by this actor (compare-and-swap); implies --force
     #[arg(long, value_name = "ACTOR")]
     pub if_assignee: Option<String>,
+    /// Fencing token from `claim`: release only while that lease is held
     #[arg(long)]
     pub token: Option<i64>,
 }
@@ -795,6 +803,10 @@ pub struct ImportArgs {
     /// Keep unknown issue types and map unknown statuses to open
     #[arg(long)]
     pub lenient: bool,
+    /// Import over other actors' live claims too (moving them out of in_progress or to another assignee; recorded in
+    /// the events)
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -885,7 +897,7 @@ pub struct CompactArgs {
     /// Your summary, written above the generated digest
     #[arg(short, long)]
     pub summary: Option<String>,
-    /// Compact even though the run is not finished
+    /// Compact even though the run is not finished, deleting its open steps (other actors' live claims too)
     #[arg(long)]
     pub force: bool,
     /// Print the digest without changing anything
@@ -896,7 +908,7 @@ pub struct CompactArgs {
 #[derive(Args, Debug, Clone)]
 pub struct DiscardArgs {
     pub id: String,
-    /// Discard even with steps in progress
+    /// Discard even with steps in progress (other actors' live claims too)
     #[arg(long)]
     pub force: bool,
     #[arg(long)]

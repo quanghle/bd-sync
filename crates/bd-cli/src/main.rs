@@ -112,14 +112,16 @@ fn report(e: &Error, json: bool) -> i32 {
 fn hint(e: &Error) -> Option<&'static str> {
     Some(match e {
         Error::AlreadyClaimed { .. } => {
-            "pick other work with `bd claim --next`; if the holder is gone, wait for `bd reclaim` or take over with `bd update <id> --assignee <you> --force`"
+            "pick other work with `bd claim --next`; to renew a claim of yours, pass its lease token (`bd claim <id> --token <t>`); if the holder is gone, wait for `bd reclaim` or take over with `bd update <id> --assignee <you> --force`"
         }
         Error::NotReady { .. } => "see `bd show <id>` for blockers; `bd claim <id> --allow-blocked` overrides",
         Error::Conflict { .. } => {
             "another actor changed it first; re-read (`bd show <id> --json`) and retry with the new revision"
         }
         Error::LeaseLost { .. } => "stop working on it: the claim was released, reclaimed, or taken over",
-        Error::NotOwner { .. } => "only the holder releases a claim; use --force for abandoned work",
+        Error::NotOwner { .. } => {
+            "only its holder ends a live claim or gives up an assignment: pick other work, wait for `bd reclaim` if the holder is gone, or pass --force to take it over (recorded in the event history)"
+        }
         Error::Busy(_) => "another process holds the write lock; retry, or raise --busy-timeout-ms",
         Error::EventsTruncated { .. } => "re-baseline with `bd export` and tail from its head_seq",
         Error::NoWorkspace(_) => "create one with `bd init`",

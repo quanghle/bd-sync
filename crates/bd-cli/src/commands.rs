@@ -376,16 +376,23 @@ pub fn exec_comment_add(tx: &mut WriteCtx<'_>, a: &CommentAddArgs) -> Result<Out
 
 fn claim_out(c: &Claim, now: Timestamp) -> Out {
     let verb = if c.already_held { "Already holding" } else { "Claimed" };
-    Out::new(c)
-        .line(format!("✓ {verb} {}: {}", c.issue.id, c.issue.title))
-        .line(format!(
-            "  lease token {}, expires {} (renew: bd heartbeat {} --token {})",
-            c.lease.token,
-            rel(c.lease.expires_at, now),
-            c.issue.id,
-            c.lease.token
-        ))
-        .id(c.issue.id.clone())
+    let mut out = Out::new(c).line(format!("✓ {verb} {}: {}", c.issue.id, c.issue.title));
+    if let Some(r) = &c.reclaimed {
+        out = out.line(format!(
+            "  reclaimed from {} (lease token {} expired {})",
+            r.previous_holder,
+            r.token,
+            rel(r.expired_at, now)
+        ));
+    }
+    out.line(format!(
+        "  lease token {}, expires {} (renew: bd heartbeat {} --token {})",
+        c.lease.token,
+        rel(c.lease.expires_at, now),
+        c.issue.id,
+        c.lease.token
+    ))
+    .id(c.issue.id.clone())
 }
 
 pub fn exec_claim(tx: &mut WriteCtx<'_>, a: &ClaimArgs) -> Result<Out> {
@@ -411,6 +418,7 @@ pub fn exec_claim(tx: &mut WriteCtx<'_>, a: &ClaimArgs) -> Result<Out> {
             ttl,
             allow_blocked: a.allow_blocked,
             guard: Guard { if_revision: a.if_revision, ..Default::default() },
+            token: a.token,
         };
         Ok(claim_out(&tx.claim(&id, &opts)?, now))
     }
@@ -1050,6 +1058,12 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             .into(),
     );
     o.push(
+        "- A live claim is its holder's: claiming it again (even as your own actor, from another session) or \
+         closing, releasing or reassigning another actor's fails with exit 4. `--force` takes it over and is \
+         recorded; use it only on purpose."
+            .into(),
+    );
+    o.push(
         "- `bd create \"title\" --dep <id>` records discovered work; `bd dep add <issue> <depends-on>` orders it."
             .into(),
     );
@@ -1320,7 +1334,7 @@ pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
 pub fn cmd_import(app: &mut App, a: &ImportArgs) -> Result<()> {
     io::require_admin("bd import")?;
     let data = read_input(&a.file)?;
-    let opts = ImportOptions { lenient: a.lenient };
+    let opts = ImportOptions { lenient: a.lenient, force: a.force };
     let dry = a.dry_run;
     let summary = app.write("import", |tx| {
         let s = tx.import_jsonl(&mut BufReader::new(data.as_bytes()), &opts)?;

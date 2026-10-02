@@ -1,25 +1,42 @@
-//! Limits on what the caller of a write transaction may override.
+//! Who may end or take over a claim, and what else the caller of a write
+//! transaction may override.
 //!
-//! The CLI and the library run without a policy: whoever holds the database
-//! may do anything. `bd serve` sets one for each request from its access
-//! token ([`WriteCtx::set_policy`]), and the engine enforces it where the
-//! override happens, so a command gets the same answer however it reaches
-//! the engine (on its own, in a `bd batch`, or through a playbook):
+//! **Claims** are protected from every caller, with or without a policy. A
+//! live claim (an `in_progress` issue whose lease has not been expired for
+//! `lease.grace`, see [`crate::claims`]) is its holder's alone: ending or
+//! taking over one held by an actor other than the transaction's (releasing
+//! it, closing it, reassigning it or moving it out of `in_progress`, deleting
+//! it, also by discarding or compacting its run, or importing over it) needs
+//! that operation's `force`, and the override is recorded in its event
+//! (`claim_override`: the holder and the lease token). Any other actor name
+//! counts, the holder's root actor (`alice` for `alice/agent-1`) and its
+//! siblings too: each sub-actor is its own lease holder. A claim past its
+//! grace is anyone's to reclaim, claim, close or release; reserving or
+//! reassigning work nobody has claimed is not limited. A playbook run or
+//! group claimed by another actor stays open, still claimed, when its last
+//! open step closes. Claiming a live claim again needs its lease's token,
+//! even for the same actor ([`WriteCtx::claim`]).
 //!
-//! * **Claims** need [`Policy::admin`] to end or take over a live claim (an
-//!   `in_progress` issue) held by an actor other than the policy's actor and
-//!   its sub-actors (`<actor>/<agent>`): releasing it, closing it,
-//!   reassigning it or moving it out of `in_progress`, and deleting it.
-//!   Expired leases stay reclaimable by anyone (`reclaim`), and reserving
-//!   or reassigning work nobody has claimed is not limited.
+//! The CLI and the library run without a **policy**, so beyond that whoever
+//! holds the database may do anything. `bd serve` sets one for each request
+//! from its access token ([`WriteCtx::set_policy`]), and the engine enforces
+//! it where the override happens, so a command gets the same answer however
+//! it reaches the engine (on its own, in a `bd batch`, or through a
+//! playbook):
+//!
+//! * **Claims**: taking over another actor's live claim also needs
+//!   [`Policy::admin`], unless the policy's actor owns it (holds it itself,
+//!   or a sub-actor `<actor>/<agent>` does). A caller that may not take it
+//!   over is refused that way whether or not it passed `force` (except a
+//!   release or reassignment without `force`, which fails as before: not the
+//!   holder's).
 //! * **Human gates** need [`Policy::human`] to be opened (closed or pinned),
 //!   retyped, given another condition, or deleted while open, and for the
 //!   work they hold back to get past them early: removing its `blocks` edge
 //!   to the gate, closing it with `force`, pinning or deleting it (or a
 //!   container holding it), or moving it, or the gate, out of a live parent.
 //!   A playbook run or group whose last open step closes is refused too when
-//!   a human gate holds it; one claimed by another actor just stays open. An
-//!   import may not do any of that either.
+//!   a human gate holds it. An import may not do any of that either.
 //! * **`metadata.playbook`**, which makes runs and groups close themselves,
 //!   is written by playbook runs; other callers need [`Policy::admin`] to
 //!   change it on an existing issue (by update or import).
@@ -29,22 +46,26 @@
 //! Which repositories GitHub gates may watch is a workspace setting rather
 //! than a token's: see [`crate::gates::GateRepos`].
 
-use serde_json::Value;
+use std::collections::BTreeMap;
 
+use rusqlite::params;
+use serde_json::{Value, json};
+
+use crate::claims;
 use crate::error::{Error, Result};
 use crate::gates::GateKind;
 use crate::graph;
 use crate::issues::{self, ISSUE_COLUMNS, issue_from_row};
-use crate::model::{DepType, GATE_TYPE, Issue, Status};
+use crate::model::{DepType, GATE_TYPE, Issue, Lease, Status};
 use crate::store::WriteCtx;
 
 /// What the caller of a write transaction may override.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Policy {
     /// The caller's own actor: claims held by it or its sub-actors
-    /// (`<actor>/<agent>`) are the caller's own.
+    /// (`<actor>/<agent>`) are the caller's to take over (with `force`).
     pub actor: String,
-    /// May end or take over anyone's claims.
+    /// May take over anyone's live claims (with `force`, like everyone).
     pub admin: bool,
     /// A person: may open human gates and move work past them.
     pub human: bool,
@@ -188,6 +209,13 @@ struct HumanHold {
 /// holding back the same work.
 pub(crate) struct HumanHolds(Vec<HumanHold>);
 
+/// A live claim held by an actor other than the transaction's.
+pub(crate) struct LiveClaim {
+    pub holder: String,
+    /// `None` only if the claim lost its lease row (`doctor` reports that).
+    pub lease: Option<Lease>,
+}
+
 impl WriteCtx<'_> {
     /// Limits on claim overrides, unless the caller is an admin (or unlimited).
     fn claim_limits(&self) -> Option<&Policy> {
@@ -199,25 +227,47 @@ impl WriteCtx<'_> {
         self.policy().is_some_and(|p| !p.human)
     }
 
-    /// Refuse ending or taking over `issue`'s live claim when another actor holds it.
-    pub(crate) fn check_claim_override(&self, issue: &Issue) -> Result<()> {
-        let Some(policy) = self.claim_limits() else { return Ok(()) };
-        match &issue.assignee {
-            Some(holder) if issue.status == Status::InProgress && holder != self.actor() && !policy.owns(holder) => {
-                Err(Error::Unauthorized(format!(
-                    "{} is claimed by {holder}: ending or taking over another actor's claim needs an admin access token",
-                    issue.id
-                )))
-            }
-            _ => Ok(()),
+    /// `issue`'s claim, if it is live and held by an actor other than this
+    /// transaction's (see the module docs).
+    pub(crate) fn others_live_claim(&self, issue: &Issue) -> Result<Option<LiveClaim>> {
+        let Some(holder) = issue.assignee.as_deref().filter(|_| issue.status == Status::InProgress) else {
+            return Ok(None);
+        };
+        if holder == self.actor() {
+            return Ok(None);
         }
+        let lease = claims::get_lease(self.conn(), &issue.id)?;
+        if let Some(l) = &lease {
+            if claims::is_reclaimable(self.conn(), l, self.now())? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(LiveClaim { holder: holder.to_string(), lease }))
     }
 
-    /// Closing `issue` (with `force`: despite blockers or open children).
-    pub(crate) fn check_close(&self, issue: &Issue, force: bool) -> Result<()> {
-        self.check_claim_override(issue)?;
+    /// Ending or taking over `issue`'s claim. Another actor's live claim
+    /// needs `force` (and the policy's leave); returns the override to record
+    /// in the write's event, if it is one.
+    pub(crate) fn check_claim_override(&self, issue: &Issue, force: bool) -> Result<Option<Value>> {
+        let Some(LiveClaim { holder, lease }) = self.others_live_claim(issue)? else { return Ok(None) };
+        if self.claim_limits().is_some_and(|p| !p.owns(&holder)) {
+            return Err(Error::Unauthorized(format!(
+                "{} is claimed by {holder}: ending or taking over another actor's claim needs an admin access token",
+                issue.id
+            )));
+        }
+        if !force {
+            return Err(Error::NotOwner { id: issue.id.clone(), holder: Some(holder), actor: self.actor().into() });
+        }
+        Ok(Some(json!({ "holder": holder, "token": lease.map(|l| l.token) })))
+    }
+
+    /// Closing `issue` (with `force`: despite blockers, open children, or
+    /// another actor's live claim). Returns the claim override, if any.
+    pub(crate) fn check_close(&self, issue: &Issue, force: bool) -> Result<Option<Value>> {
+        let claim_override = self.check_claim_override(issue, force)?;
         if !self.gates_limited() {
-            return Ok(());
+            return Ok(claim_override);
         }
         if is_open_human_gate(issue) {
             return Err(human_only(&issue.id, &Hold::Is, "open it"));
@@ -228,21 +278,24 @@ impl WriteCtx<'_> {
                 return Err(human_only(&issue.id, &hold, "close it"));
             }
         }
-        Ok(())
+        Ok(claim_override)
     }
 
     /// Updating `old` to `new`, moving it out from under `moved_from` (its
     /// parent until now) if set. `playbook`: a run's own bookkeeping.
+    /// Returns the claim override, if any.
     pub(crate) fn check_update(
         &self,
         old: &Issue,
         new: &Issue,
         moved_from: Option<&str>,
         playbook: bool,
-    ) -> Result<()> {
+        force: bool,
+    ) -> Result<Option<Value>> {
         let claimed = old.status == Status::InProgress;
+        let mut claim_override = None;
         if claimed && (new.status != Status::InProgress || new.assignee != old.assignee) {
-            self.check_claim_override(old)?;
+            claim_override = self.check_claim_override(old, force)?;
         }
         if self.gates_limited() && !old.status.is_terminal() {
             if is_open_human_gate(old) && !is_open_human_gate(new) {
@@ -261,7 +314,7 @@ impl WriteCtx<'_> {
         if let Some(policy) = self.policy().filter(|_| !playbook) {
             check_playbook_metadata(policy, old, &new.metadata)?;
         }
-        Ok(())
+        Ok(claim_override)
     }
 
     /// Moving live `issue` out from under `parent`: if it is a human gate,
@@ -282,7 +335,7 @@ impl WriteCtx<'_> {
     /// work left), and a container a human gate holds is refused as if
     /// closed by hand. Returns whether it may close.
     pub(crate) fn check_auto_close(&self, c: &Issue) -> Result<bool> {
-        if self.check_claim_override(c).is_err() {
+        if self.others_live_claim(c)?.is_some() {
             return Ok(false);
         }
         if self.gates_limited() {
@@ -310,21 +363,39 @@ impl WriteCtx<'_> {
         self.check_move_out(&issues::require(self.conn(), issue)?, target)
     }
 
-    /// Deleting every issue in `ids` at once.
-    pub(crate) fn check_removal<'a>(&self, ids: impl IntoIterator<Item = &'a String>) -> Result<()> {
-        if self.policy().is_none() {
-            return Ok(());
-        }
+    /// Deleting every issue in `ids` at once (with `force`: despite other
+    /// actors' live claims). Returns the claim overrides by issue id.
+    pub(crate) fn check_removal<'a>(
+        &self,
+        ids: impl IntoIterator<Item = &'a String>,
+        force: bool,
+    ) -> Result<BTreeMap<String, Value>> {
+        let gates = self.gates_limited();
+        let mut overrides = BTreeMap::new();
         for id in ids {
+            // Only another actor's claim can stand in the way, unless gates are protected.
+            if !gates {
+                let held: bool = self
+                    .conn()
+                    .prepare_cached(
+                        "SELECT EXISTS (SELECT 1 FROM issues WHERE id = ?1 AND status = 'in_progress' AND assignee IS NOT ?2)",
+                    )?
+                    .query_row(params![id, self.actor()], |r| r.get(0))?;
+                if !held {
+                    continue;
+                }
+            }
             let Some(issue) = issues::get(self.conn(), id)? else { continue };
-            self.check_claim_override(&issue)?;
-            if self.gates_limited() {
+            if let Some(o) = self.check_claim_override(&issue, force)? {
+                overrides.insert(id.clone(), o);
+            }
+            if gates {
                 if let Some(hold) = human_hold(self.conn(), &issue)? {
                     return Err(human_only(id, &hold, "delete it"));
                 }
             }
         }
-        Ok(())
+        Ok(overrides)
     }
 
     /// Refuse an import changing `old`'s `metadata.playbook` (see [`check_playbook_metadata`]).

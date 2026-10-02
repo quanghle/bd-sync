@@ -128,6 +128,10 @@ pub fn export(conn: &Connection, now: Timestamp, out: &mut dyn Write, opts: &Exp
 pub struct ImportOptions {
     /// Accept unknown issue types as-is and map unknown statuses to `open`.
     pub lenient: bool,
+    /// Import over other actors' live claims too: an issue the import moves
+    /// out of `in_progress` or gives another assignee (recorded in its
+    /// `imported` event; see [`crate::policy`]).
+    pub force: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -326,14 +330,18 @@ impl WriteCtx<'_> {
             match issues::get(self.conn(), &issue.id)? {
                 Some(existing) if same_content(&existing, issue) => summary.unchanged += 1,
                 Some(existing) => {
+                    let ends_claim = existing.status == Status::InProgress
+                        && (issue.status != Status::InProgress || issue.assignee != existing.assignee);
+                    let claim_override =
+                        if ends_claim { self.check_claim_override(&existing, opts.force)? } else { None };
                     self.check_playbook_import(&existing, &issue.metadata)?;
                     self.check_gate_repo(&issue.issue_type, &issue.metadata, Some(&existing))?;
-                    self.write_imported_issue(issue, true)?;
+                    self.write_imported_issue(issue, true, claim_override)?;
                     summary.updated += 1;
                 }
                 None => {
                     self.check_gate_repo(&issue.issue_type, &issue.metadata, None)?;
-                    self.write_imported_issue(issue, false)?;
+                    self.write_imported_issue(issue, false, None)?;
                     summary.created += 1;
                 }
             }
@@ -588,7 +596,7 @@ impl WriteCtx<'_> {
         Ok(Some((issue, raw.dependencies.unwrap_or_default(), raw.comments.unwrap_or_default())))
     }
 
-    fn write_imported_issue(&mut self, issue: &Issue, exists: bool) -> Result<()> {
+    fn write_imported_issue(&mut self, issue: &Issue, exists: bool, claim_override: Option<Value>) -> Result<()> {
         let conn = self.conn();
         if exists {
             conn.prepare_cached(
@@ -648,7 +656,11 @@ impl WriteCtx<'_> {
         }
         let snapshot = issues::snapshot(self.conn(), &issue.id)?;
         let mode = if exists { "update" } else { "create" };
-        self.emit("imported", Some(&issue.id), json!({ "mode": mode, "issue": snapshot }))?;
+        let mut data = json!({ "mode": mode, "issue": snapshot });
+        if let Some(o) = claim_override {
+            data["claim_override"] = o;
+        }
+        self.emit("imported", Some(&issue.id), data)?;
         Ok(())
     }
 }

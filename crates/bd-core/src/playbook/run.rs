@@ -430,19 +430,22 @@ fn progress_of(conn: &Connection, run: &str, now: Timestamp, deferrals: &mut Def
 fn progress_of_runs(conn: &Connection, runs: &[Issue], now: Timestamp) -> Result<Vec<Progress>> {
     let mut deferrals = DeferralSources::new(now);
     let mut index: HashMap<String, usize> = HashMap::new();
-    // Per issue walked: its own progress, then everything below it added in;
-    // and its parent's index (None for a run walked from, until another
-    // run's walk reaches it).
-    let mut sums: Vec<Progress> = Vec::new();
+    // Per issue walked: its own progress, that of everything below it (a
+    // run's own counts only in the runs above it, as in `progress_of`), and
+    // its parent's index (None for a run walked from, until another run's
+    // walk reaches it).
+    let mut own: Vec<Progress> = Vec::new();
+    let mut below: Vec<Progress> = Vec::new();
     let mut parents: Vec<Option<usize>> = Vec::new();
     let mut is_tree = true;
     'runs: for run in runs {
         if index.contains_key(&run.id) {
             continue; // inside a run walked before
         }
-        let root = sums.len();
+        let root = own.len();
         index.insert(run.id.clone(), root);
-        sums.push(Progress::default());
+        own.push(own_progress(conn, run, now, &mut deferrals)?);
+        below.push(Progress::default());
         parents.push(None);
         // An explicit stack, as in walk_tree: a hierarchy has no depth limit.
         let mut stack = vec![(root, children_in_order(conn, &run.id)?.into_iter())];
@@ -460,9 +463,10 @@ fn progress_of_runs(conn: &Connection, runs: &[Issue], now: Timestamp) -> Result
                     break 'runs;
                 }
                 None => {
-                    let i = sums.len();
+                    let i = own.len();
                     index.insert(child.id.clone(), i);
-                    sums.push(own_progress(conn, &child, now, &mut deferrals)?);
+                    own.push(own_progress(conn, &child, now, &mut deferrals)?);
+                    below.push(Progress::default());
                     parents.push(Some(parent));
                     stack.push((i, children_in_order(conn, &child.id)?.into_iter()));
                 }
@@ -474,22 +478,23 @@ fn progress_of_runs(conn: &Connection, runs: &[Issue], now: Timestamp) -> Result
     }
     // Leaves up: an issue is added to its parent once all its children were
     // added to it. Runs reached from a later run's walk come before their
-    // parent in `sums`, so this goes by children left rather than by index.
-    let mut left = vec![0usize; sums.len()];
+    // parent in `own`, so this goes by children left rather than by index.
+    let mut left = vec![0usize; own.len()];
     for p in parents.iter().flatten() {
         left[*p] += 1;
     }
-    let mut done: Vec<usize> = (0..sums.len()).filter(|&i| left[i] == 0).collect();
+    let mut done: Vec<usize> = (0..own.len()).filter(|&i| left[i] == 0).collect();
     while let Some(i) = done.pop() {
         let Some(p) = parents[i] else { continue };
-        let below = sums[i].clone();
-        sums[p].add(&below);
+        let mut subtree = below[i].clone();
+        subtree.add(&own[i]);
+        below[p].add(&subtree);
         left[p] -= 1;
         if left[p] == 0 {
             done.push(p);
         }
     }
-    Ok(runs.iter().map(|run| sums[index[&run.id]].clone()).collect())
+    Ok(runs.iter().map(|run| below[index[&run.id]].clone()).collect())
 }
 
 /// Runs, newest first (open ones only unless asked).

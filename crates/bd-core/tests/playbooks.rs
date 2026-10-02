@@ -953,6 +953,33 @@ fn runs_count_the_steps_of_the_runs_nested_in_them() {
     let nested = vec![(innermost.clone(), innermost_p), (inner.clone(), inner_p), (outer.clone(), outer_p)];
     assert_eq!(progress_of_runs(&env, &all), nested);
 
+    // A gate-typed run counts as a gate in the runs above it, never in its own counts, as run_status has it;
+    // whether it is listed before (newer) or after (older, reparented) the runs above it.
+    let retype = |env: &mut Env, id: &str, t: &str| {
+        let patch = IssuePatch { issue_type: Some(t.into()), ..Default::default() };
+        env.store.write("retype", "alice", |tx| tx.update_issue(id, &patch, &Guard::default(), false)).unwrap();
+    };
+    let original = env.store.read(|r| r.issue(&innermost)).unwrap().issue_type;
+    let older = env.start(INNER, &[]);
+    let reparent = IssuePatch { parent: Some(Some(format!("{outer}.tag"))), ..Default::default() };
+    env.store.write("move", "alice", |tx| tx.update_issue(&older, &reparent, &Guard::default(), false)).unwrap();
+    for id in [&innermost, &older] {
+        retype(&mut env, id, "gate");
+    }
+    let listed = progress_of_runs(&env, &all);
+    for (id, counts) in &listed {
+        let p = env.store.read(|r| playbook::run_status(r.conn(), id, r.now())).unwrap().progress;
+        let status = [p.total, p.done, p.failed, p.active, p.ready, p.blocked, p.gates_open, p.escalated];
+        assert_eq!(*counts, status, "{id}: runs and run_status agree");
+    }
+    let gates = |id: &str| listed.iter().find(|(i, _)| i == id).unwrap().1[6];
+    assert_eq!((gates(&innermost), gates(&older)), (innermost_p[6], 1), "neither counts itself");
+    assert_eq!(gates(&inner), inner_p[6] + 1, "the run above counts it");
+    let gone = DeleteOptions { cascade: true, ..Default::default() };
+    env.store.write("delete", "alice", |tx| tx.delete_issues(std::slice::from_ref(&older), &gone)).unwrap();
+    retype(&mut env, &innermost, &original);
+    assert_eq!(progress_of_runs(&env, &all), nested);
+
     // A damaged database: a second parent across runs, then a parent cycle.
     let other = env.start(INNER, &[]);
     let edge = "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)

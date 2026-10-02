@@ -139,6 +139,13 @@ impl Account {
 
 /// Whether one of two actors is the other, or one of its sub-actors
 /// (`<actor>/<name>`), whatever their case.
+/// `bd serve`'s own actor ([`crate::jobs::ACTOR`]) or one of its sub-actors,
+/// whatever the case: no token or request may act as it, so the history
+/// tells the server's background writes from clients'.
+pub fn is_reserved_actor(actor: &str) -> bool {
+    related(crate::jobs::ACTOR, actor)
+}
+
 fn related(a: &str, b: &str) -> bool {
     let (a, b) = (a.to_lowercase(), b.to_lowercase());
     let covers = |a: &str, b: &str| a == b || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'));
@@ -526,6 +533,11 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
     if let Holder::Admin { name, actor } = &holder {
         check_name(name)?;
         check_actor(actor)?;
+        if is_reserved_actor(actor) {
+            return Err(Error::invalid(format!(
+                "actor {actor} is reserved for bd serve's background writes: pick another actor"
+            )));
+        }
     }
     let path = tokens_path(root);
     let _lock = lock_tokens(root)?;
@@ -546,6 +558,12 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
         }
         Holder::Github { user, expires_at, by_login } => {
             let actor = bind(&mut file.accounts, user, now, by_login)?;
+            if is_reserved_actor(&actor) {
+                return Err(Error::Unauthorized(format!(
+                    "GitHub user {} may not sign in to this bd server: its actor {actor} is bd serve's own",
+                    user.login
+                )));
+            }
             // A renamed account let in by a login that names another principal's actor must not pass for it.
             if by_login && !related(&actor, &user.login) {
                 if let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now) {
@@ -1097,6 +1115,24 @@ mod tests {
         revoke_github(dir.path(), "alice", true).unwrap();
         issue_github_token(dir.path(), &gh("alice", 4), grant, ttl, true).unwrap();
         manual("ci-2", "ci-agents").unwrap();
+    }
+
+    #[test]
+    fn the_servers_own_actor_is_never_a_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let ttl = Duration::from_secs(3600);
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![] };
+        for actor in ["bd-serve", "BD-Serve", "bd-serve/jobs"] {
+            let e = issue_token(dir.path(), "x", actor, Role::Admin, Kind::Agent, &[]).unwrap_err();
+            assert!(e.exit_code() == 2 && e.to_string().contains("reserved"), "{actor}: {e}");
+            let e = issue_github_token(dir.path(), &gh(actor, 1), grant.clone(), ttl, true).unwrap_err();
+            assert!(e.exit_code() == 7 && e.to_string().contains("bd serve's own"), "{actor}: {e}");
+        }
+        let file = load_file(&tokens_path(dir.path())).unwrap();
+        assert!(file.tokens.is_empty() && file.accounts.is_empty(), "nothing issued, nothing bound");
+        for (name, actor) in [("a", "bd-server"), ("b", "bd"), ("c", "alice/bd-serve")] {
+            issue_token(dir.path(), name, actor, Role::Write, Kind::Agent, &[]).unwrap();
+        }
     }
 
     #[test]

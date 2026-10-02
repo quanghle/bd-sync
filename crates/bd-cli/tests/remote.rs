@@ -387,6 +387,17 @@ fn tokens_bind_actor_role_and_workspace() {
     assert_eq!(serde_json::from_str::<Value>(&out).unwrap()["created_by"], "alice/agent-1");
     let out = alice.cmd(&["list"]).env("BD_ACTOR", "mallory").output().unwrap();
     assert_eq!(out.status.code(), Some(7), "BD_ACTOR is checked too");
+    // bd serve's own actor is no client's, not even an admin's.
+    for actor in ["bd-serve", "BD-SERVE/x"] {
+        let out = admin.cmd(&["create", "Forged"]).env("BD_ACTOR", actor).output().unwrap();
+        assert_eq!(out.status.code(), Some(7), "{actor}");
+    }
+    let out = bd(server.root.path())
+        .args(["serve", "token", "create", "forger", "--as", "bd-serve", "--root"])
+        .arg(server.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
 
     // Admin-only operations, directly or inside a batch.
     assert_eq!(alice.code(&["config", "set", "lease.ttl", "10m"]), 7);

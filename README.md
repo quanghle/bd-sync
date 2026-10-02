@@ -667,7 +667,9 @@ workspaces no client has used since it started (it looks for new ones every
 
 `0` or `off` turns a job off. Jobs run the commands' own code as actor
 `bd-serve`, so their events (`reclaimed`, `closed`, `gate_escalated`) read like
-the commands'. Each workspace's timers are jittered so workspaces do not fire
+the commands'. That actor is the server's own: no access token may act as it
+or its sub-actors (in any case), and a GitHub account whose actor would be
+it cannot sign in. Each workspace's timers are jittered so workspaces do not fire
 together, a job never overlaps itself, and only a few jobs run at once, on
 threads of their own, so client requests keep their slots. Writes are short
 transactions: `gh` runs outside any transaction, and a backup is a read

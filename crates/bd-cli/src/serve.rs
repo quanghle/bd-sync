@@ -976,6 +976,22 @@ pub(crate) fn access(cmd: &Command) -> Access {
 /// client's `$BD_ACTOR`) if the token allows it; else the token's actor, as
 /// `<token actor>/<session>` when the client runs in an agent session.
 fn resolve_actor(flag: Option<&str>, env: Option<&str>, session: Option<&str>, token: &Token) -> Result<Resolved> {
+    let resolved = resolve_token_actor(flag, env, session, token)?;
+    if auth::is_reserved_actor(&resolved.actor) {
+        return Err(Error::Unauthorized(format!(
+            "actor {} is reserved for bd serve's background writes; access token {} may not act as it",
+            resolved.actor, token.name
+        )));
+    }
+    Ok(resolved)
+}
+
+fn resolve_token_actor(
+    flag: Option<&str>,
+    env: Option<&str>,
+    session: Option<&str>,
+    token: &Token,
+) -> Result<Resolved> {
     let named = |a: &str, source, from: &str| match a {
         // Actors end up in the server log and the event history.
         a if a.chars().any(char::is_control) => Err(Error::invalid("actor names must not contain control characters")),
@@ -1466,6 +1482,12 @@ mod tests {
         assert_eq!(actor(None, None, Some(" ")).unwrap().0, "alice");
         for bad in ["../bob", "a/b", "x\nforged", "-x"] {
             assert_eq!(code(None, None, Some(bad)), 2, "{bad:?}");
+        }
+        // bd serve's own actor stays its own, even under a token that names it.
+        let server = Token { actor: "bd-serve".into(), ..t.clone() };
+        for (flag, session) in [(None, None), (Some("bd-serve/x"), None), (None, Some("copilot-1"))] {
+            let e = resolve_actor(flag, None, session, &server).unwrap_err();
+            assert!(e.exit_code() == 7 && e.to_string().contains("reserved"), "{flag:?} {session:?}: {e}");
         }
     }
 }

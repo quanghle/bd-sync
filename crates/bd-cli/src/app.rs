@@ -194,10 +194,12 @@ impl App {
     }
 }
 
-/// The absolute form of an existing directory given with `-C`.
-fn resolve_dir(d: &Path) -> std::io::Result<PathBuf> {
+/// The absolute form of an existing directory given with `-C` or
+/// `bd serve --root`: canonical on Unix, plain absolute on Windows.
+pub fn resolve_dir(d: &Path) -> std::io::Result<PathBuf> {
     // canonicalize returns a verbatim `\\?\C:\...` path on Windows, which
-    // cmd.exe (and so a `.cmd` BD_GH) refuses as a working directory.
+    // cmd.exe (and so a `.cmd` BD_GH) refuses as a working directory, and
+    // workspace dirs under `bd serve --root` are the cwd of its gh probes.
     #[cfg(windows)]
     {
         let p = std::path::absolute(d)?;

@@ -104,7 +104,10 @@ impl Server {
         BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
         let base =
             line.split_whitespace().find(|w| w.starts_with("http")).unwrap_or_else(|| panic!("{line}")).to_string();
-        Server { child, base, root }
+        let server = Server { child, base, root };
+        // Workspace dirs under the root are gh's working directory, which cmd.exe refuses verbatim.
+        assert!(!line.contains(r"\\?\"), "no verbatim Windows root: {line}");
+        server
     }
 
     fn url(&self) -> String {
@@ -1267,12 +1270,7 @@ fn background_jobs_reclaim_leases_and_open_gates_without_clients() {
 
     eventually("the dead worker's claim to be reclaimed", || alice.json(&["show", "t-1"])["status"] == "open");
     eventually("the timer gate to open", || alice.json(&["show", "t-4"])["status"] == "closed");
-    // On Windows, workspace paths under bd serve are verbatim (\\?\C:\...), which cmd.exe,
-    // and so this batch-file gh, refuses as a working directory (bd-sync-wnh).
-    let github = !cfg!(windows);
-    if github {
-        eventually("the server's gh to open the PR gate", || alice.json(&["show", "t-5"])["status"] == "closed");
-    }
+    eventually("the server's gh to open the PR gate", || alice.json(&["show", "t-5"])["status"] == "closed");
     let ready: Vec<String> =
         alice.json(&["ready"]).as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
     assert!(ready.contains(&"t-1".to_string()) && ready.contains(&"t-2".to_string()), "{ready:?}");
@@ -1280,7 +1278,7 @@ fn background_jobs_reclaim_leases_and_open_gates_without_clients() {
     let events = server_events(&alice);
     assert!(has(&events, "reclaimed", "t-1"), "written by the server as bd-serve: {events:?}");
     assert!(has(&events, "closed", "t-4"), "{events:?}");
-    assert!(!github || has(&events, "closed", "t-5"), "{events:?}");
+    assert!(has(&events, "closed", "t-5"), "{events:?}");
     assert_eq!(alice.json(&["show", "t-1"])["assignee"], Value::Null);
 }
 
@@ -1564,14 +1562,15 @@ fn force_takeovers_need_an_admin_token() {
 }
 
 /// A stand-in for `gh pr view` that reports PR 42 merged and appends its
-/// arguments to `gh-args.log` next to itself.
+/// arguments to `gh-args.log`, and its working directory to `gh-cwd.log`,
+/// next to itself.
 fn logging_fake_gh(dir: &Path) -> std::path::PathBuf {
     #[cfg(windows)]
     {
         let gh = dir.join("fake-gh.cmd");
         std::fs::write(
             &gh,
-            "@echo off\r\necho %*>>\"%~dp0gh-args.log\"\r\necho {\"state\":\"MERGED\",\"title\":\"Feature\"}\r\n",
+            "@echo off\r\necho %CD%>>\"%~dp0gh-cwd.log\"\r\necho %*>>\"%~dp0gh-args.log\"\r\necho {\"state\":\"MERGED\",\"title\":\"Feature\"}\r\n",
         )
         .unwrap();
         gh
@@ -1582,11 +1581,22 @@ fn logging_fake_gh(dir: &Path) -> std::path::PathBuf {
         let gh = dir.join("fake-gh");
         std::fs::write(
             &gh,
-            "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/gh-args.log\"\necho '{\"state\":\"MERGED\",\"title\":\"Feature\"}'\n",
+            "#!/bin/sh\npwd >> \"$(dirname \"$0\")/gh-cwd.log\"\necho \"$*\" >> \"$(dirname \"$0\")/gh-args.log\"\necho '{\"state\":\"MERGED\",\"title\":\"Feature\"}'\n",
         )
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         gh
+    }
+}
+
+/// Every call of [`logging_fake_gh`] in `tools` ran in workspace `dir`, where
+/// gh finds the repository a gate without `--repo` watches. (cmd.exe runs a
+/// batch file asked to start in a verbatim `\\?\` directory in `C:\Windows`.)
+fn gh_ran_in(tools: &Path, dir: &Path) {
+    let cwds = std::fs::read_to_string(tools.join("gh-cwd.log")).unwrap();
+    assert!(!cwds.trim().is_empty());
+    for cwd in cwds.lines() {
+        assert!(same_file(&Value::from(cwd.trim()), dir), "gh ran in {cwd}, not {}", dir.display());
     }
 }
 
@@ -1632,12 +1642,10 @@ fn github_gates_only_watch_allowed_repositories() {
     assert!(checked["checked"][1]["detail"].as_str().unwrap().contains("evil/x is not in gate.repos"), "{checked}");
     let log = std::fs::read_to_string(tools.path().join("gh-args.log")).unwrap_or_default();
     assert!(!log.contains("evil"), "evil/x was never probed: {log}");
-    // On Windows the server's batch-file gh cannot run in a verbatim workspace path (bd-sync-wnh).
-    if !cfg!(windows) {
-        assert_eq!(actions, vec![("t-4", "opened"), ("t-5", "escalated"), ("t-6", "opened")]);
-        assert_eq!(log.lines().count(), 2, "{log}");
-        assert!(log.contains("--repo=org/app"), "{log}");
-    }
+    assert_eq!(actions, vec![("t-4", "opened"), ("t-5", "escalated"), ("t-6", "opened")]);
+    assert_eq!(log.lines().count(), 2, "{log}");
+    assert!(log.contains("--repo=org/app"), "{log}");
+    gh_ran_in(tools.path(), &server.root.path().join("proj"));
     assert!(alice.ok(&["prime"]).contains("t-5"), "a person sees why it is stuck");
 }
 
@@ -1668,14 +1676,12 @@ fn background_gate_checks_only_probe_allowed_repositories() {
     let gate = alice.json(&["gate", "show", "t-4"]);
     assert!(gate["escalation"].as_str().unwrap().contains("evil/x is not in gate.repos"), "{gate}");
     assert!(has(&server_events(&alice), "gate_escalated", "t-4"), "the server's own check");
-    // On Windows the server's batch-file gh cannot run in a verbatim workspace path (bd-sync-wnh).
-    if !cfg!(windows) {
-        eventually("the allowed gates to be probed and open", || {
-            ["t-5", "t-6"].iter().all(|g| alice.json(&["show", g])["status"] == "closed")
-        });
-        let log = std::fs::read_to_string(tools.path().join("gh-args.log")).unwrap();
-        assert!(log.contains("--repo=org/app"), "{log}");
-    }
+    eventually("the allowed gates to be probed and open", || {
+        ["t-5", "t-6"].iter().all(|g| alice.json(&["show", g])["status"] == "closed")
+    });
+    let log = std::fs::read_to_string(tools.path().join("gh-args.log")).unwrap();
+    assert!(log.contains("--repo=org/app"), "{log}");
+    gh_ran_in(tools.path(), &server.root.path().join("proj"));
     // Its escalation came from the allowlist, before any gh call: evil/x was never probed.
     let log = std::fs::read_to_string(tools.path().join("gh-args.log")).unwrap_or_default();
     assert!(!log.contains("evil"), "{log}");

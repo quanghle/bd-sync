@@ -128,7 +128,7 @@ fn run(a: &ServeArgs) -> Result<()> {
             "bd serve needs --root DIR (or $BD_SERVE_ROOT): the directory holding <name>/.bd/bd.db workspaces",
         )
     })?;
-    let root = std::fs::canonicalize(root).map_err(|e| Error::invalid(format!("--root {}: {e}", root.display())))?;
+    let root = crate::app::resolve_dir(root).map_err(|e| Error::invalid(format!("--root {}: {e}", root.display())))?;
     if !root.is_dir() {
         return Err(Error::invalid(format!("--root {}: not a directory", root.display())));
     }

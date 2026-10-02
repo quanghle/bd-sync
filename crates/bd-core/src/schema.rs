@@ -186,9 +186,45 @@ pub fn migrate(conn: &mut Connection) -> Result<i64> {
     Ok(LATEST_VERSION)
 }
 
+/// Drop the planner's statistics (`sqlite_stat1`, `sqlite_stat4`) if the
+/// database has any, and have `conn` read the schema again without them:
+/// bd plans its queries without statistics (see `store`). Returns the tables
+/// dropped.
+pub fn drop_statistics(conn: &mut Connection) -> Result<Vec<String>> {
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name GLOB 'sqlite_stat[0-9]*' ORDER BY name")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !tables.is_empty() {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for table in &tables {
+            tx.execute_batch(&format!("DROP TABLE IF EXISTS \"{table}\""))?;
+        }
+        tx.commit()?;
+        // `conn` read them with the schema: read it again.
+        conn.execute_batch("PRAGMA writable_schema = RESET")?;
+    }
+    Ok(tables)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn planner_statistics_are_dropped() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        assert!(drop_statistics(&mut conn).unwrap().is_empty());
+        conn.execute_batch("INSERT INTO events (tx, ts, actor, op) VALUES (1, 0, 'bd', 'init'); ANALYZE;").unwrap();
+        assert_eq!(drop_statistics(&mut conn).unwrap(), ["sqlite_stat1", "sqlite_stat4"]);
+        // Planned as if the log were large, not the one event analyzed.
+        let plan: String = conn
+            .query_row("EXPLAIN QUERY PLAN SELECT seq FROM events WHERE seq > ?1 ORDER BY seq", [0], |r| r.get(3))
+            .unwrap();
+        assert_eq!(plan, "SEARCH events USING INTEGER PRIMARY KEY (rowid>?)");
+        assert!(drop_statistics(&mut conn).unwrap().is_empty());
+    }
 
     #[test]
     fn v1_databases_migrate_to_ephemeral_column() {

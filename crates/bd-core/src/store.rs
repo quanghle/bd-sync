@@ -1,5 +1,17 @@
 //! Connection management: WAL configuration, snapshot reads, serialized
 //! writes, and the per-transaction write context.
+//!
+//! Planner statistics: bd keeps none. SQLite plans each statement from the
+//! statistics `ANALYZE` (which `PRAGMA optimize` runs) records, and those
+//! describe the data when they were taken: in a young workspace, tables of a
+//! row or two. Believing that, SQLite scans whole tables where it should seek
+//! (the events past a follower's cursor, the ready count, a prune), and a
+//! long-lived connection (`bd serve`'s) keeps what it read. Without them it
+//! assumes every table is large and every index selective, which is what
+//! bd's queries and indexes are designed for, at any size. So a store never
+//! analyzes, and [`Store::open`] drops any statistics a database holds
+//! (`ANALYZE` run by hand, or an older bd's `PRAGMA optimize`).
+//! `tests/plans.rs` checks the plans.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -203,8 +215,21 @@ impl Store {
             }
             _ => {}
         }
+        store.drop_statistics();
         store.apply_durability()?;
         Ok(store)
+    }
+
+    /// Drop the planner's statistics, if the database holds any (see the
+    /// module docs). A database that cannot be written keeps them.
+    fn drop_statistics(&mut self) {
+        match schema::drop_statistics(&mut self.conn) {
+            Ok(tables) if !tables.is_empty() => {
+                tracing::debug!(target: "bd::store", ?tables, "dropped planner statistics");
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!(target: "bd::store", error = %e, "cannot drop planner statistics"),
+        }
     }
 
     fn configure(conn: Connection, path: &Path, opts: OpenOptions) -> Result<Store> {
@@ -365,12 +390,6 @@ fn verify_copy(path: &Path) -> Result<()> {
     // Write access: Windows flushes only handles that may write.
     std::fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
     Ok(())
-}
-
-impl Drop for Store {
-    fn drop(&mut self) {
-        let _ = self.conn.execute_batch("PRAGMA optimize");
-    }
 }
 
 /// The body of [`Store::write`]: one `BEGIN IMMEDIATE` transaction.

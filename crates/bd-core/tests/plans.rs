@@ -1,26 +1,32 @@
-//! Query plans under stale planner statistics.
+//! Query plans under the planner's statistics.
 //!
 //! SQLite plans each statement from the statistics `ANALYZE` (which `PRAGMA
 //! optimize` runs) recorded, and those can be far from the data: a young
-//! workspace records them while it holds an issue or two, and `bd serve`'s
-//! pooled connections keep theirs. Believing a table holds a row, SQLite
-//! happily scans all of it per lookup, and a walk over a deep hierarchy
-//! (recomputing blocked flags, closing nested groups, descendants, a
-//! deferred subtree) turns quadratic. This test runs the operations that walk
-//! the graph while recording every statement they prepare, then has SQLite
-//! plan each one under stale statistics and without any: no statement may
-//! scan a table inside a loop (a correlated subquery, a recursive step, the
-//! inner side of a join), and only the few in [`WHOLE_TABLE`], which read
-//! every issue by design, may scan one at all.
+//! workspace records them while it holds an issue or two, and a long-lived
+//! connection (`bd serve`'s) keeps what it opened with. Believing a table
+//! holds a row, SQLite happily scans all of it: per lookup, where a walk over
+//! a deep hierarchy (recomputing blocked flags, closing nested groups,
+//! descendants, a deferred subtree) turns quadratic; and per command, where a
+//! follower's poll for the events past its cursor reads the whole log. So bd
+//! records no statistics, and drops any a database has when it opens it (see
+//! `store.rs`), and the walks fix their plans besides.
+//!
+//! These tests run the operations that walk the graph, and single commands,
+//! while recording every statement they prepare, then have SQLite plan each
+//! one: no statement may scan a table inside a loop (a correlated subquery, a
+//! recursive step, the inner side of a join), and only the few in
+//! [`WHOLE_TABLE`], which scan by design, may scan one at all. The walks'
+//! statements must plan so under stale statistics too; every statement must
+//! plan so in a workspace as bd leaves it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bd_core::gates::{GateKind, GateSpec, NewGate};
-use bd_core::playbook;
+use bd_core::gates::{self, GateKind, GateSpec, NewGate};
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::*;
+use bd_core::{comments, config, events, metrics, playbook, requests};
 use rusqlite::Connection;
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use serde_json::json;
@@ -28,39 +34,69 @@ use tempfile::TempDir;
 
 const T0: i64 = 1_700_000_000_000;
 
-/// Statements that read every issue (or edge) by design, once per command:
-/// they may scan a table as their outermost loop, never inside another.
-const WHOLE_TABLE: &[&str] = &[
+/// Statements that scan a table by design, once per command (every row, or
+/// rows in order until they have enough), and that table: they may scan it
+/// as their outermost loop, never inside another.
+const WHOLE_TABLE: &[(&str, &str)] = &[
     // list, ready and blocked (`QueryParts`), with their filters
-    "WHERE 1=1",
+    ("FROM issues i WHERE 1=1", "issues"),
     // the blocked flags from scratch (`doctor`, imports), and cycles
-    "WITH RECURSIVE direct(id) AS",
-    "SELECT id, is_blocked FROM issues ORDER BY id",
-    "SELECT issue_id, depends_on_id FROM dependencies WHERE dep_type IN",
-    // stats
-    "SELECT COUNT(*) FROM issues",
-    "SELECT status, COUNT(*) FROM issues GROUP BY status",
-    "FROM issues e WHERE e.issue_type = 'epic'",
+    ("WITH RECURSIVE direct(id) AS", "issues"),
+    ("SELECT id, is_blocked FROM issues ORDER BY id", "issues"),
+    ("SELECT issue_id, depends_on_id FROM dependencies WHERE dep_type IN", "dependencies"),
+    // stats: issues by status, blocked, closable epics, label counts
+    ("SELECT status, COUNT(*) FROM issues GROUP BY status", "issues"),
+    ("SELECT COUNT(*) FROM issues WHERE is_blocked = 1 AND status NOT IN", "issues"),
+    ("FROM issues e WHERE e.issue_type = 'epic'", "issues"),
+    ("SELECT label, COUNT(*) FROM labels", "labels"),
+    // metrics: lead and cycle times of the issues closed, and queue waits of
+    // those started, in the last 30 days
+    ("FROM issues WHERE status = 'closed' AND", "issues"),
+    ("FROM issues WHERE started_at IS NOT NULL AND", "issues"),
     // purge candidates
-    "SELECT id FROM issues WHERE ephemeral = 1",
-    // the open gates a policy protects
-    "FROM issues i WHERE i.issue_type = 'gate'",
+    ("SELECT id FROM issues WHERE ephemeral = 1", "issues"),
+    // gates: every open one (`bd gate list` and checks), those a policy protects
+    ("FROM issues i WHERE i.issue_type = 'gate'", "issues"),
     // playbook runs
-    "WHERE json_extract(i.metadata, '$.playbook.role') = 'run'",
-    // leases and memories
-    "FROM leases",
-    "FROM memories",
+    ("WHERE json_extract(i.metadata, '$.playbook.role') = 'run'", "issues"),
+    // an id prefix: the ids in order, up to a few matches (bd-sync-wfr)
+    ("SELECT id FROM issues WHERE id LIKE ?1", "issues"),
+    // request records, oldest first: up to a batch (pruned hourly)
+    ("SELECT rowid FROM requests WHERE created_at < ?1 ORDER BY rowid LIMIT", "requests"),
+    // leases (and reclaim's expired ones), memories, config and counters
+    ("FROM leases", "leases"),
+    ("FROM memories", "memories"),
+    ("SELECT key, value FROM config ORDER BY key", "config"),
+    ("SELECT name, value FROM counters WHERE name NOT IN", "counters"),
+    // the newest events (of some ops or actors), read back from the end of
+    // the log until the page is full; and the oldest one `prune --keep` keeps
+    ("FROM events WHERE 1=1 ORDER BY seq DESC LIMIT", "events"),
+    ("FROM events WHERE 1=1 AND op IN", "events"),
+    ("FROM events WHERE 1=1 AND actor = ?", "events"),
+    ("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET", "events"),
 ];
 
 static STATEMENTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+static RECORDING: Mutex<()> = Mutex::new(());
 
 fn record(event: TraceEvent<'_>) {
     if let TraceEvent::Stmt(_, sql) = event {
         // Foreign key actions run as `-- TRIGGER ...` programs of their statement.
         if !sql.starts_with("--") {
-            STATEMENTS.lock().unwrap().insert(sql.to_string());
+            STATEMENTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(sql.to_string());
         }
     }
+}
+
+/// The statements `work` prepares in a new workspace.
+fn statements_of(work: fn(&mut Ws)) -> BTreeSet<String> {
+    let _one_at_a_time = RECORDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    STATEMENTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+    let mut ws = Ws::new();
+    ws.store.connection().trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(record));
+    work(&mut ws);
+    ws.store.connection().trace_v2(TraceEventCodes::empty(), None);
+    std::mem::take(&mut *STATEMENTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
 }
 
 struct Ws {
@@ -95,6 +131,21 @@ impl Ws {
 
     fn sql(&mut self, sql: &str) {
         self.store.write("sql", "alice", |tx| Ok(tx.conn().execute_batch(sql)?)).unwrap();
+    }
+
+    /// Close the database, as a command does when it exits, and open it again.
+    fn reopen(self) -> Ws {
+        let Ws { _dir, store, clock } = self;
+        let path = store.path().to_path_buf();
+        drop(store);
+        let opts = OpenOptions { clock: clock.clone(), ..Default::default() };
+        Ws { _dir, store: Store::open(&path, opts).unwrap(), clock }
+    }
+
+    /// Whether the database holds planner statistics.
+    fn analyzed(&self) -> bool {
+        let sql = "SELECT COUNT(*) FROM sqlite_schema WHERE name LIKE 'sqlite_stat%'";
+        self.store.connection().query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap() > 0
     }
 }
 
@@ -215,11 +266,117 @@ fn walk_the_graph(ws: &mut Ws) {
     });
 }
 
-/// Statistics as a workspace's first commands leave them: `PRAGMA optimize`,
-/// run as each command exits, analyzes a table the first time it is used,
-/// the issues with one issue in them and the edges with one edge, and again
-/// only once it is ten times larger. A long-lived connection (`bd serve`'s,
-/// or one import of many issues) keeps the statistics it opened with.
+/// What single commands run, outside the walks: event pages and the polls of
+/// followers, pruning, the counts `bd prime` and `bd stats` print, claims and
+/// leases, reclaim, memories, comments, request records, gates and config.
+fn run_the_commands(ws: &mut Ws) {
+    let work = ws.create(NewIssue { labels: vec!["infra".into()], ..NewIssue::titled("Work") });
+    let other = ws.create(NewIssue::titled("Other"));
+    ws.create(NewIssue { assignee: Some("bob".into()), ..NewIssue::titled("Bob's") });
+    ws.write("alice", None, |tx| config::set(tx, "events.retain_rows", "100"));
+    // Enough events for the automatic prune to run.
+    for n in 0..520 {
+        ws.write("alice", None, |tx| tx.add_comment(&other, &format!("note {n}")));
+    }
+
+    let commands = |ws: &Ws| {
+        ws.store
+            .read(|r| {
+                let head = r.event_head()?;
+                for since in [None, Some(head.saturating_sub(10)), Some(head)] {
+                    for limit in [None, Some(1), Some(50)] {
+                        let page = EventQuery { since, limit, ..Default::default() };
+                        r.events(&page)?;
+                        r.events(&EventQuery { issue_id: Some(work.clone()), ..page.clone() })?;
+                        r.events(&EventQuery { ops: vec!["claimed".into(), "closed".into()], ..page.clone() })?;
+                        r.events(&EventQuery { actor: Some("bot".into()), ..page.clone() })?;
+                    }
+                }
+                r.history(&work)?;
+                events::floor(r.conn())?;
+                r.stats()?;
+                metrics::metrics(r.conn(), r.now(), None)?;
+                r.leases()?;
+                r.lease(&work)?;
+                r.memories(None)?;
+                r.memories(Some("deploy"))?;
+                r.memory("deploy-notes")?;
+                r.comments(&other)?;
+                comments::count(r.conn(), &other)?;
+                r.config_entries()?;
+                r.config_value("lease.ttl")?;
+                r.label_counts()?;
+                r.find_issue(&work)?;
+                // An id prefix: ambiguous here.
+                assert!(r.resolve_id("t-").is_err());
+                gates::list(r.conn(), false)?;
+                gates::list(r.conn(), true)?;
+                requests::get(r.conn(), "req-1")?;
+                let mine = WorkFilter { assignee: Some("bot".into()), ..Default::default() };
+                r.ready(&ReadyQuery { filter: mine.clone(), ..Default::default() })?;
+                r.list(&ListQuery { filter: mine, statuses: vec![Status::InProgress], ..Default::default() })?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    commands(ws);
+
+    let claim = ws.write("bot", agent(), |tx| tx.claim(&work, &ClaimOptions::default()));
+    ws.write("bot", agent(), |tx| tx.heartbeat(&work, Some(claim.lease.token), None));
+    commands(ws);
+    let next = ws.write("bot", agent(), |tx| tx.claim_next(&ReadyQuery::default(), &ClaimOptions::default()));
+    let next = next.expect("ready work").issue.id;
+    ws.write("bot", agent(), |tx| tx.release(&next, &ReleaseOptions::default()));
+    ws.write("bot", agent(), |tx| tx.claim(&other, &ClaimOptions::default()));
+    ws.clock.advance(Duration::from_secs(3600));
+    ws.write("bd-serve", None, |tx| tx.reclaim_expired(&ReclaimOptions { dry_run: true, ..Default::default() }));
+    ws.write("bd-serve", None, |tx| tx.reclaim_expired(&ReclaimOptions::default()));
+    ws.write("alice", None, |tx| tx.remember(Some("deploy-notes"), "Deploys go through CI", None));
+    ws.write("alice", None, |tx| tx.forget("deploy-notes"));
+    let timer = GateSpec { timeout: Some("1m".into()), ..GateSpec::new(GateKind::Timer) };
+    let gate = ws.write("alice", None, |tx| {
+        tx.create_gate(NewGate {
+            spec: timer,
+            blocks: vec![other.clone()],
+            title: None,
+            description: String::new(),
+            assignee: None,
+            parent: None,
+            priority: None,
+            ephemeral: false,
+        })
+    });
+    ws.store
+        .read(|r| {
+            for g in gates::list(r.conn(), false)? {
+                gates::evaluate_local(r.conn(), &g, r.now())?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    ws.write("bd-serve", None, |tx| tx.escalate_gate(&gate.id, "overdue"));
+    ws.write("bd-serve", None, |tx| tx.resolve_gate(&gate.id, Some("timer passed"), false));
+    ws.write("alice", None, |tx| {
+        tx.record_request("req-1", "token-1", "close")?;
+        tx.close_issue(&work, &CloseOptions { take_over: true, ..Default::default() })?;
+        tx.save_request_response("req-1", "{}")
+    });
+    ws.write("bd-serve", None, |tx| tx.prune_requests(Timestamp(T0 + 86_400_000), 10));
+    let head = ws.store.read(|r| r.event_head()).unwrap();
+    ws.write("alice", None, |tx| tx.prune_events(&PruneOptions { before: Some(head - 20), ..Default::default() }));
+    ws.write("alice", None, |tx| tx.prune_events(&PruneOptions { keep: Some(10), ..Default::default() }));
+    ws.write("alice", None, |tx| {
+        tx.prune_events(&PruneOptions { older_than: Some(Duration::from_secs(60)), ..Default::default() })
+    });
+    commands(ws);
+}
+
+/// Statistics a workspace's first commands left when bd still ran `PRAGMA
+/// optimize` as each command exited (or that `ANALYZE` run by hand leaves):
+/// it analyzes a table the first time it is used, the issues with one issue
+/// in them and the edges with one edge, and again only once it is ten times
+/// larger. A long-lived connection (`bd serve`'s, or one import of many
+/// issues) keeps the statistics it opened with.
 const YOUNG: &str = "INSERT INTO issues (id, title, created_at, updated_at) VALUES ('p', 'Parent', 0, 0);
     ANALYZE;
     INSERT INTO issues (id, title, created_at, updated_at) VALUES ('c', 'Child', 0, 0);
@@ -250,7 +407,7 @@ fn plan(conn: &Connection, sql: &str) -> Vec<(i64, i64, String)> {
 /// Aliases of the tables a statement reads, by name.
 fn tables(sql: &str) -> BTreeMap<String, String> {
     let re = regex_lite::Regex::new(concat!(
-        r"(?i)\b(?:FROM|JOIN)\s+(issues|dependencies|labels|comments|leases|events|memories|requests)\b",
+        r"(?i)\b(?:FROM|JOIN)\s+(issues|dependencies|labels|comments|leases|events|memories|requests|config|counters|meta|child_counters)\b",
         r"(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?",
     ))
     .unwrap();
@@ -275,7 +432,6 @@ fn scans(conn: &Connection, sql: &str) -> Vec<String> {
     let rows = plan(conn, sql);
     let tables = tables(sql);
     let flat = sql.split_whitespace().collect::<Vec<_>>().join(" ");
-    let whole_table = WHOLE_TABLE.iter().any(|w| flat.contains(w));
     let detail = |id: i64| rows.iter().find(|r| r.0 == id).map(|r| r.2.as_str()).unwrap_or("");
     let parent = |id: i64| rows.iter().find(|r| r.0 == id).map(|r| r.1).unwrap_or(0);
     let is_loop = |d: &str| d.starts_with("SCAN ") || d.starts_with("SEARCH ");
@@ -286,9 +442,10 @@ fn scans(conn: &Connection, sql: &str) -> Vec<String> {
             continue;
         }
         let Some(name) = d.strip_prefix("SCAN ").and_then(|s| s.split(' ').next()) else { continue };
-        if !tables.contains_key(name) {
+        let Some(table) = tables.get(name) else {
             continue; // a CTE or subquery
-        }
+        };
+        let whole_table = WHOLE_TABLE.iter().any(|(w, t)| t == table && flat.contains(w));
         // Inside a loop: the inner side of a join, a correlated subquery or a
         // recursive step, run once per row of something else.
         let inner = rows.iter().any(|r| r.1 == *up && r.0 < *id && is_loop(&r.2));
@@ -297,7 +454,9 @@ fn scans(conn: &Connection, sql: &str) -> Vec<String> {
         while at != 0 {
             let a = detail(at);
             nested |= a.starts_with("CORRELATED") || a == "RECURSIVE STEP";
-            nested |= rows.iter().any(|r| r.1 == parent(at) && r.0 < at && is_loop(&r.2));
+            // A subquery that is not correlated runs once, wherever it is listed.
+            let once = a.starts_with("LIST SUBQUERY") || a.starts_with("SCALAR SUBQUERY");
+            nested |= !once && rows.iter().any(|r| r.1 == parent(at) && r.0 < at && is_loop(&r.2));
             at = parent(at);
         }
         if inner || nested || !whole_table {
@@ -307,30 +466,84 @@ fn scans(conn: &Connection, sql: &str) -> Vec<String> {
     bad
 }
 
+/// Each statement of `statements` that scans a table where it may not in
+/// `ws`, with its plan.
+fn failures(name: &str, ws: &Ws, statements: &BTreeSet<String>) -> Vec<String> {
+    let conn = ws.store.connection();
+    let mut out = Vec::new();
+    for sql in statements {
+        let bad = scans(conn, sql);
+        if !bad.is_empty() {
+            let plan: Vec<String> = plan(conn, sql).into_iter().map(|r| r.2).collect();
+            out.push(format!("{name}: {sql}\n  scans: {bad:?}\n  plan: {plan:#?}"));
+        }
+    }
+    out
+}
+
 #[test]
 fn graph_walks_plan_index_lookups_under_stale_statistics() {
-    let mut ws = Ws::new();
-    ws.store.connection().trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(record));
-    walk_the_graph(&mut ws);
-    ws.store.connection().trace_v2(TraceEventCodes::empty(), None);
-    let statements = std::mem::take(&mut *STATEMENTS.lock().unwrap());
+    let statements = statements_of(walk_the_graph);
     assert!(statements.len() > 50, "{} statements", statements.len());
 
     let mut failures = Vec::new();
     for (name, setup) in [("young", YOUNG), ("grown", GROWN), ("never analyzed", "")] {
         let mut stale = Ws::new();
         stale.sql(setup);
-        let conn = stale.store.connection();
-        let analyzed: i64 =
-            conn.query_row("SELECT COUNT(*) FROM sqlite_schema WHERE name = 'sqlite_stat1'", [], |r| r.get(0)).unwrap();
-        assert_eq!(analyzed, i64::from(!setup.is_empty()), "{name}");
-        for sql in &statements {
-            let bad = scans(conn, sql);
-            if !bad.is_empty() {
-                let plan: Vec<String> = plan(conn, sql).into_iter().map(|r| r.2).collect();
-                failures.push(format!("{name}: {sql}\n  scans: {bad:?}\n  plan: {plan:#?}"));
-            }
-        }
+        assert_eq!(stale.analyzed(), !setup.is_empty(), "{name}");
+        failures.extend(self::failures(name, &stale, &statements));
     }
     assert!(failures.is_empty(), "{} statements scan a table:\n\n{}", failures.len(), failures.join("\n\n"));
+}
+
+/// A young workspace as bd leaves it: a few commands, each opening the
+/// database and closing it as it exits.
+fn used_by_commands() -> Ws {
+    let mut ws = Ws::new().reopen();
+    for title in ["First", "Second", "Third"] {
+        let id = ws.create(NewIssue::titled(title));
+        ws.store
+            .read(|r| {
+                r.ready(&ReadyQuery::default())?;
+                r.list(&ListQuery::default())?;
+                r.events(&EventQuery { since: Some(0), ..Default::default() })?;
+                r.history(&id)?;
+                r.stats()?;
+                Ok(())
+            })
+            .unwrap();
+        ws = ws.reopen();
+    }
+    ws
+}
+
+/// A young workspace whose tables were analyzed (by `ANALYZE` run by hand, or
+/// an older bd's `PRAGMA optimize`), then opened by bd.
+fn analyzed_then_opened() -> Ws {
+    let mut ws = Ws::new();
+    ws.create(NewIssue::titled("First"));
+    ws.sql(YOUNG);
+    assert!(ws.analyzed());
+    ws.reopen()
+}
+
+#[test]
+fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
+    let mut statements = statements_of(walk_the_graph);
+    let commands = statements_of(run_the_commands);
+    assert!(commands.len() > 50, "{} statements", commands.len());
+    statements.extend(commands);
+
+    let mut failures = Vec::new();
+    for (name, ws) in [
+        ("used by commands", used_by_commands()),
+        ("analyzed, then opened", analyzed_then_opened()),
+        ("new", Ws::new()),
+    ] {
+        if ws.analyzed() {
+            failures.push(format!("{name}: holds planner statistics"));
+        }
+        failures.extend(self::failures(name, &ws, &statements));
+    }
+    assert!(failures.is_empty(), "{} failures:\n\n{}", failures.len(), failures.join("\n\n"));
 }

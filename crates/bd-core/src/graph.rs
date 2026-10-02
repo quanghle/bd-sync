@@ -18,13 +18,14 @@
 //!
 //! Query plans: queries run once per issue of a walk (recomputing a subtree,
 //! a tree's edges, blockers, descendants, ...) fix their plan instead of
-//! trusting the planner's statistics, which can be badly stale: `PRAGMA
-//! optimize` first records them while a young workspace holds an issue or
-//! two, and a long-lived connection (`bd serve`'s, or one large import) keeps
-//! what it opened with. Believing a table holds a row, SQLite scans all of it
-//! per lookup, and the walk turns quadratic. Such a query starts from the
-//! edges, its `CROSS JOIN`s keeping the tables in the order written, and
-//! reaches every issue by its id through `issues INDEXED BY
+//! leaving it to the planner. bd keeps no planner statistics (see `store`),
+//! but statistics recorded anyway (`ANALYZE` run by hand, or an older bd's
+//! `PRAGMA optimize`) can be badly stale: taken while a young workspace held
+//! an issue or two, and kept by a long-lived connection (`bd serve`'s) until
+//! it opens the database again. Believing a table holds a row, SQLite scans
+//! all of it per lookup, and the walk turns quadratic. Such a query starts
+//! from the edges, its `CROSS JOIN`s keeping the tables in the order written,
+//! and reaches every issue by its id through `issues INDEXED BY
 //! sqlite_autoindex_issues_1` (the primary key's index). `tests/plans.rs`
 //! checks the plans of what the walks prepare under stale statistics.
 

@@ -570,9 +570,9 @@ fn deep_hierarchies_fit_a_server_threads_stack() {
 
 /// A run `{prefix}0` with `levels` open groups `{prefix}1..` below it, each
 /// the only child of the one before, and an open step below the last one.
-/// Plain SQL, as in [`chain_below`], then table statistics as a real
-/// workspace has them (`PRAGMA optimize`), which change query plans. Returns
-/// the step.
+/// Plain SQL, as in [`chain_below`], then table statistics (`ANALYZE`, which
+/// bd never runs but a workspace may have run anyway), which change query
+/// plans. Returns the step.
 fn group_chain(env: &mut Env, prefix: &str, levels: usize) -> String {
     let issues = "WITH RECURSIVE n(k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
         INSERT INTO issues (id, title, issue_type, metadata, created_at, updated_at)

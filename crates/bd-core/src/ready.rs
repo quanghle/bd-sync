@@ -209,18 +209,20 @@ pub fn blocked(conn: &Connection, filter: &WorkFilter, limit: Option<usize>) -> 
     issues.into_iter().map(|issue| Ok(BlockedIssue { blockers: graph::blockers(conn, &issue.id)?, issue })).collect()
 }
 
+// The counts `bd prime` and `bd stats` print read the ready issues through
+// idx_issues_ready, and the deferred ones by id, whatever the statistics say.
 pub fn count_ready(conn: &Connection, now: Timestamp) -> Result<i64> {
     if !any_deferred(conn, now)? {
         return Ok(conn
             .prepare_cached(
-                "SELECT COUNT(*) FROM issues
+                "SELECT COUNT(*) FROM issues INDEXED BY idx_issues_ready
                  WHERE status = 'open' AND is_blocked = 0 AND issue_type NOT IN ('epic','gate')",
             )?
             .query_row([], |r| r.get(0))?);
     }
     let sql = format!(
         "WITH RECURSIVE {DEFERRED_CTE}
-         SELECT COUNT(*) FROM issues i
+         SELECT COUNT(*) FROM issues i INDEXED BY idx_issues_ready
          WHERE i.status = 'open' AND i.is_blocked = 0 AND i.issue_type NOT IN ('epic','gate')
            AND i.id NOT IN (SELECT id FROM deferred)"
     );
@@ -233,7 +235,7 @@ pub fn count_deferred(conn: &Connection, now: Timestamp) -> Result<i64> {
     }
     let sql = format!(
         "WITH RECURSIVE {DEFERRED_CTE}
-         SELECT COUNT(*) FROM issues i
+         SELECT COUNT(*) FROM issues i INDEXED BY sqlite_autoindex_issues_1
          WHERE i.status NOT IN ('closed','pinned') AND i.id IN (SELECT id FROM deferred)"
     );
     Ok(conn.prepare_cached(&sql)?.query_row([now.millis()], |r| r.get(0))?)

@@ -495,3 +495,70 @@ fn import_maps_beads_workflow_fields() {
     assert!(env.ready_ids() == vec!["t-51"], "the gate holds t-53 and is not ready itself");
     env.assert_healthy();
 }
+
+/// Adds `levels` closed issues `{prefix}1..` below `root`, each the only child
+/// of the one before (`bd update --parent` chains issues without a limit).
+/// Plain SQL: checking each new edge would take quadratic time.
+fn chain_below(env: &mut Env, root: &str, prefix: &str, levels: usize) {
+    let issues = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO issues (id, title, status, created_at, updated_at, closed_at, close_reason)
+        SELECT ?3 || k, 'Level ' || k, 'closed', ?2 + k, ?2 + k, ?2 + k, 'done' FROM n";
+    let edges = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+        SELECT ?3 || k, CASE k WHEN 1 THEN ?4 ELSE ?3 || (k - 1) END, 'parent-child', ?2 FROM n";
+    env.store
+        .write("chain", "alice", |tx| {
+            tx.conn().execute(issues, (levels as i64, T0, prefix))?;
+            tx.conn().execute(edges, (levels as i64, T0, prefix, root))?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn deep_hierarchies_fit_a_server_threads_stack() {
+    const LEVELS: usize = 100_000;
+    let mut env = Env::new();
+    let mut root =
+        |title: &str| env.store.write("create", "alice", |tx| tx.create_issue(NewIssue::titled(title))).unwrap().id;
+    let (deep, long) = (root("Deep"), root("Long"));
+    chain_below(&mut env, &deep, "d", LEVELS);
+    chain_below(&mut env, &long, "l", playbook::MAX_RUN_ISSUES);
+    // bd serve runs commands on blocking threads with a 2 MiB stack.
+    std::thread::Builder::new()
+        .stack_size(2 << 20)
+        .spawn(move || {
+            let status = env.store.read(|r| playbook::run_status(r.conn(), &deep, r.now())).unwrap();
+            assert_eq!(status.nodes.len(), LEVELS);
+            assert!(status.nodes.iter().enumerate().all(|(i, n)| n.depth == i + 1 && n.id == format!("d{}", i + 1)));
+            assert_eq!(status.progress.done, LEVELS);
+
+            let tree = env.store.read(|r| r.dep_tree(&deep, Direction::Up, usize::MAX)).unwrap();
+            assert_eq!(tree.len(), LEVELS + 1);
+            assert_eq!((tree[LEVELS].depth, tree[LEVELS].id.as_str()), (LEVELS, format!("d{LEVELS}").as_str()));
+
+            let extract = |root: &str| env.store.read(|r| playbook::extract(r.conn(), root, Some("deep")));
+            let err = extract(&deep).unwrap_err().to_string();
+            assert_eq!(err, format!("playbook deep: has {LEVELS} steps (at most {})", playbook::MAX_RUN_ISSUES));
+            let err = extract(&long).unwrap_err().to_string();
+            let first_too_deep = playbook::MAX_DEPTH + 1;
+            assert_eq!(
+                err,
+                format!(
+                    "playbook deep: step level-{first_too_deep} is nested more than {} levels deep",
+                    playbook::MAX_DEPTH
+                )
+            );
+            // As deep as a playbook may nest.
+            let top = playbook::MAX_RUN_ISSUES - playbook::MAX_DEPTH;
+            let pb = extract(&format!("l{top}")).unwrap();
+            assert_eq!(pb.all_steps().len(), playbook::MAX_DEPTH);
+            assert_eq!(pb.all_steps().last().unwrap().id, format!("level-{}", playbook::MAX_RUN_ISSUES));
+            let again = playbook::parse_toml(&playbook::to_toml(&pb).unwrap(), "deep.toml", "deep").unwrap();
+            again.validate().unwrap();
+            assert_eq!(again.all_steps().len(), playbook::MAX_DEPTH);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

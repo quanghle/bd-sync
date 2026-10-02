@@ -6,14 +6,14 @@
 //! issues outside the subtree are dropped, and so are notes and run-specific
 //! metadata. Steps of a playbook run keep their original step ids.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rusqlite::Connection;
 use serde_json::{Map, Value};
 
 use super::compile::Role;
-use super::model::{Playbook, Step, StepGate, WaitsFor, valid_name, valid_step_id};
+use super::model::{MAX_DEPTH, MAX_RUN_ISSUES, Playbook, Step, StepGate, WaitsFor, valid_name, valid_step_id};
 use super::run::role_of;
 use crate::error::{Error, Result};
 use crate::gates;
@@ -74,25 +74,39 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
     if !valid_name(&name) {
         return Err(Error::invalid(format!("invalid playbook name {name:?}; pass --name")));
     }
-    // Collect the subtree in pre-order, grouped by parent (None = the epic).
-    fn collect(
-        conn: &Connection,
-        id: &str,
-        parent: Option<String>,
-        by_parent: &mut HashMap<Option<String>, Vec<Issue>>,
-        all: &mut Vec<Issue>,
-    ) -> Result<()> {
-        for kid in children_in_order(conn, id)? {
-            let kid_id = kid.id.clone();
-            by_parent.entry(parent.clone()).or_default().push(kid.clone());
-            all.push(kid);
-            collect(conn, &kid_id, Some(kid_id.clone()), by_parent, all)?;
-        }
-        Ok(())
-    }
+    // Collect the subtree in pre-order, grouped by parent (None = the epic),
+    // with an explicit stack (parent, whether its own children would become
+    // steps, children left to visit): a hierarchy has no depth limit, and this
+    // runs on `bd serve`'s small-stack threads. `path` holds the issues on the
+    // stack, so a parent-child cycle in a damaged database cannot loop forever.
     let mut by_parent: HashMap<Option<String>, Vec<Issue>> = HashMap::new();
     let mut all: Vec<Issue> = Vec::new();
-    collect(conn, root, None, &mut by_parent, &mut all)?;
+    // The steps `build` would make: issues other than gates, not inside a gate.
+    let mut total = 0;
+    let mut path: HashSet<String> = HashSet::from([root.to_string()]);
+    let mut stack = vec![(None::<String>, true, children_in_order(conn, root)?.into_iter())];
+    while let Some((parent, steps_below, kids)) = stack.last_mut() {
+        let Some(kid) = kids.next() else {
+            if let Some(p) = stack.pop().and_then(|(p, ..)| p) {
+                path.remove(&p);
+            }
+            continue;
+        };
+        if path.contains(&kid.id) {
+            continue;
+        }
+        let is_step = *steps_below && kid.issue_type != GATE_TYPE;
+        total += usize::from(is_step);
+        by_parent.entry(parent.clone()).or_default().push(kid.clone());
+        let below = children_in_order(conn, &kid.id)?;
+        path.insert(kid.id.clone());
+        stack.push((Some(kid.id.clone()), is_step, below.into_iter()));
+        all.push(kid);
+    }
+    // What validation would say about the playbook, before building it.
+    if total > MAX_RUN_ISSUES {
+        return Err(Error::invalid(format!("playbook {name}: has {total} steps (at most {MAX_RUN_ISSUES})")));
+    }
 
     let mut step_ids: HashMap<String, String> = HashMap::new();
     let mut used: BTreeMap<String, usize> = BTreeMap::new();
@@ -141,9 +155,15 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
         }
     }
 
+    // Steps `depth` levels below the top. Validation rejects steps deeper than
+    // MAX_DEPTH, so the subtree stops there (`cut` notes it): the first step
+    // that deep still fails validation, with the same error, and the nesting
+    // that validation, rendering and dropping recurse over stays bounded.
     fn build(
         conn: &Connection,
         parent: Option<String>,
+        depth: usize,
+        cut: &mut bool,
         by_parent: &HashMap<Option<String>, Vec<Issue>>,
         step_ids: &HashMap<String, String>,
         gates_for: &HashMap<String, StepGate>,
@@ -158,7 +178,12 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
             step.description = issue.description.clone();
             step.design = issue.design.clone();
             step.acceptance_criteria = issue.acceptance_criteria.clone();
-            let children = build(conn, Some(issue.id.clone()), by_parent, step_ids, gates_for)?;
+            let children = if depth < MAX_DEPTH {
+                build(conn, Some(issue.id.clone()), depth + 1, cut, by_parent, step_ids, gates_for)?
+            } else {
+                *cut |= by_parent.contains_key(&Some(issue.id.clone()));
+                Vec::new()
+            };
             let is_group = !children.is_empty() || matches!(role_of(issue), Some(Role::Group));
             if !is_group && issue.issue_type != "task" {
                 step.issue_type = Some(issue.issue_type.clone());
@@ -198,7 +223,8 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
         }
         Ok(out)
     }
-    let steps = build(conn, None, &by_parent, &step_ids, &gates_for)?;
+    let mut cut = false;
+    let steps = build(conn, None, 0, &mut cut, &by_parent, &step_ids, &gates_for)?;
     if steps.is_empty() {
         return Err(Error::invalid(format!("{root} has no children to turn into steps")));
     }
@@ -216,5 +242,8 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
         source: None,
     };
     pb.validate()?;
+    if cut {
+        return Err(Error::invalid(format!("playbook {}: steps nest more than {MAX_DEPTH} levels deep", pb.name)));
+    }
     Ok(pb)
 }

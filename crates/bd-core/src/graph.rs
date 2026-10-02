@@ -671,20 +671,12 @@ pub fn dep_tree(conn: &Connection, root: &str, direction: Direction, max_depth: 
     }];
     let mut expanded = HashSet::from([root.to_string()]);
     let sql = if direction == Direction::Down { sql_out } else { sql_in };
-    fn visit(
-        conn: &Connection,
-        sql: &str,
-        id: &str,
-        depth: usize,
-        max_depth: usize,
-        expanded: &mut HashSet<String>,
-        out: &mut Vec<TreeNode>,
-    ) -> Result<()> {
+    let neighbors = |id: &str, depth: usize| -> Result<Vec<TreeNode>> {
         if depth >= max_depth {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut stmt = conn.prepare_cached(sql)?;
-        let kids: Vec<TreeNode> = stmt
+        let kids = stmt
             .query_map([id], |r| {
                 Ok(TreeNode {
                     depth: depth + 1,
@@ -698,19 +690,22 @@ pub fn dep_tree(conn: &Connection, root: &str, direction: Direction, max_depth: 
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
-        for mut kid in kids {
-            let first = expanded.insert(kid.id.clone());
-            kid.repeated = !first;
-            let kid_id = kid.id.clone();
-            out.push(kid);
-            if first {
-                visit(conn, sql, &kid_id, depth + 1, max_depth, expanded, out)?;
-            }
-        }
-        Ok(())
+        Ok(kids)
+    };
+    // Depth first with an explicit stack of the neighbors left to visit:
+    // `max_depth` comes from the caller and chains can be arbitrarily long.
+    let mut stack = vec![neighbors(root, 0)?.into_iter()];
+    while let Some(kids) = stack.last_mut() {
+        let Some(mut kid) = kids.next() else {
+            stack.pop();
+            continue;
+        };
+        let first = expanded.insert(kid.id.clone());
+        kid.repeated = !first;
+        let below = if first { neighbors(&kid.id, kid.depth)? } else { Vec::new() };
+        out.push(kid);
+        stack.push(below.into_iter());
     }
-    visit(conn, sql, root, 0, max_depth, &mut expanded, &mut out)?;
     Ok(out)
 }
 

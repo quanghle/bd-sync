@@ -180,27 +180,26 @@ fn children_in_order(conn: &Connection, id: &str) -> Result<Vec<Issue>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Depth-first walk below `id` in creation order: (depth, issue).
+/// Depth-first walk below `id` in creation order: (depth, issue). Uses an
+/// explicit stack (depth, children left to visit): a hierarchy has no depth
+/// limit, and this runs on `bd serve`'s small-stack threads.
 fn walk(conn: &Connection, id: &str) -> Result<Vec<(usize, Issue)>> {
-    fn go(
-        conn: &Connection,
-        id: &str,
-        depth: usize,
-        out: &mut Vec<(usize, Issue)>,
-        seen: &mut BTreeSet<String>,
-    ) -> Result<()> {
-        for child in children_in_order(conn, id)? {
-            if !seen.insert(child.id.clone()) {
-                continue;
-            }
-            let cid = child.id.clone();
-            out.push((depth, child));
-            go(conn, &cid, depth + 1, out, seen)?;
-        }
-        Ok(())
-    }
     let mut out = Vec::new();
-    go(conn, id, 1, &mut out, &mut BTreeSet::new())?;
+    let mut seen = BTreeSet::new();
+    let mut stack = vec![(1, children_in_order(conn, id)?.into_iter())];
+    while let Some((depth, children)) = stack.last_mut() {
+        let depth = *depth;
+        let Some(child) = children.next() else {
+            stack.pop();
+            continue;
+        };
+        if !seen.insert(child.id.clone()) {
+            continue;
+        }
+        let below = children_in_order(conn, &child.id)?;
+        out.push((depth, child));
+        stack.push((depth + 1, below.into_iter()));
+    }
     Ok(out)
 }
 

@@ -73,16 +73,22 @@ impl Playbook {
         self.ephemeral.unwrap_or(false)
     }
 
-    /// Every step, depth first (children before the next sibling).
+    /// Every step, depth first (children before the next sibling). Uses an
+    /// explicit stack: validation calls this before it checks the nesting.
     pub fn all_steps(&self) -> Vec<&Step> {
-        fn walk<'a>(steps: &'a [Arc<Step>], out: &mut Vec<&'a Step>) {
-            for s in steps {
-                out.push(s);
-                walk(&s.children, out);
+        let mut out = Vec::new();
+        let mut stack = vec![self.steps.iter()];
+        while let Some(steps) = stack.last_mut() {
+            match steps.next() {
+                Some(s) => {
+                    out.push(&**s);
+                    stack.push(s.children.iter());
+                }
+                None => {
+                    stack.pop();
+                }
             }
         }
-        let mut out = Vec::new();
-        walk(&self.steps, &mut out);
         out
     }
 }

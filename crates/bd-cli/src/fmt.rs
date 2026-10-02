@@ -246,6 +246,10 @@ pub fn event_summary(e: &Event) -> String {
         "run_compacted" | "purged" => format!("removed {} issue(s)", s(d, "count")),
         "gate_escalated" => truncate(&s(d, "reason"), 80),
         "gate_updated" => format!("watching run {}", s(d, "run_id")),
+        "agents_changed" => {
+            let short = |k: &str| s(d, k).chars().take(12).collect::<String>();
+            format!("{} set: revision {} (was {})", s(d, "harness"), short("revision"), short("previous"))
+        }
         _ => {
             if d.as_object().is_some_and(|m| m.is_empty()) {
                 String::new()

@@ -140,11 +140,13 @@ dependencies = [
  "bd-core",
  "chrono",
  "clap",
+ "fs4",
  "getrandom 0.2.17",
  "http-body-util",
  "hyper",
  "hyper-util",
  "rcgen",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",
@@ -153,6 +155,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
  "ureq",
@@ -163,6 +166,7 @@ name = "bd-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libc",
  "regex-lite",
  "rusqlite",
  "serde",
@@ -400,6 +404,16 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "futures-channel"
@@ -1274,6 +1288,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml_edit"
+version = "0.25.15+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1340ea94a5856333492c9064b02c778b191dd2c853778d9609debdcdfea3a614"
+dependencies = [
+ "indexmap",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_parser"
 version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1638,6 +1665,9 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "x509-parser"

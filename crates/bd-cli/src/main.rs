@@ -1,4 +1,5 @@
 mod actor;
+mod agents;
 mod app;
 mod auth;
 mod batch;
@@ -9,6 +10,7 @@ mod credentials;
 mod fmt;
 mod follow;
 mod gates;
+mod hook;
 mod io;
 mod jobs;
 mod logging;
@@ -46,12 +48,15 @@ fn run(cli: Cli) -> i32 {
             return report(&e, json);
         }
     }
+    if hook::works_in_session_dir(&cli.command) {
+        hook::enter_session_dir(&mut app);
+    }
     if !always_local(&cli.command) {
         match remote::detect(&app) {
             Ok(Some(r)) => return remote::run(&mut app, r, &cli),
             Ok(None) => {}
             // `bd prime` from a session hook: report the problem as context, never fail the hook.
-            Err(e) if remote::is_hook(&cli) => return remote::unavailable(&e),
+            Err(e) if remote::is_hook(&cli) => return remote::unavailable(&cli, &e),
             Err(e) => return report(&e, json),
         }
     }
@@ -87,7 +92,13 @@ fn execute(app: &mut App, cmd: &Command) -> i32 {
     if total_ms >= slow_ms
         && !matches!(
             cmd,
-            Command::Events(_) | Command::Bench(_) | Command::BenchWorker(_) | Command::Serve(_) | Command::Remote(_)
+            Command::Events(_)
+                | Command::Bench(_)
+                | Command::BenchWorker(_)
+                | Command::Serve(_)
+                | Command::Remote(_)
+                | Command::Hook(_)
+                | Command::Agents(cli::AgentsCommand::Approve(_) | cli::AgentsCommand::Watch(_))
         )
     {
         tracing::warn!(target: "bd::slow", command = name, total_ms, "slow command");
@@ -234,7 +245,7 @@ fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
             Err(Error::NoWorkspace(_)) => Ok(0),
             other => other.map(|_| 0),
         },
-        Command::Hook(HookCommand::SessionStart) => actor::cmd_session_start(app),
+        Command::Hook(HookCommand::SessionStart(a)) => actor::cmd_session_start(app, a),
         Command::Hook(HookCommand::SubagentStart) => actor::cmd_subagent_start(app),
         Command::Hook(HookCommand::PreToolUse) => actor::cmd_pre_tool_use(app),
         Command::Stats => cmd_stats(app).map(|_| 0),
@@ -247,6 +258,7 @@ fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Playbook(c) => playbooks::cmd_playbook(app, c).map(|_| 0),
         Command::Gate(c) => gates::cmd_gate(app, c).map(|_| 0),
         Command::Purge(a) => playbooks::cmd_purge(app, a).map(|_| 0),
+        Command::Agents(c) => agents::cmd_agents(app, c).map(|_| 0),
         Command::Bench(a) => bench::cmd_bench(app, a).map(|_| 0),
         Command::BenchWorker(a) => bench::cmd_bench_worker(a).map(|_| 0),
         Command::Serve(a) => serve::cmd_serve(app, a).map(|_| 0),
@@ -304,6 +316,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Playbook(_) => "playbook",
         Command::Gate(_) => "gate",
         Command::Purge(_) => "purge",
+        Command::Agents(_) => "agents",
         Command::Bench(_) | Command::BenchWorker(_) => "bench",
         Command::Serve(_) => "serve",
         Command::Remote(_) => "remote",

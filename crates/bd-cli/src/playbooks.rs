@@ -570,14 +570,19 @@ const BUNDLE_FILE: &str = "playbooks.bundle.json";
 /// Names the bundle on the command line.
 const BUNDLE_FLAG: &str = "--playbook-bundle";
 
+/// A remote workspace's checkout `.bd` directory: the one holding
+/// `remote.toml`, else the nearest one.
+pub(crate) fn checkout_bd(app: &App) -> Result<Option<PathBuf>> {
+    Ok(match remote::configured(app)?.map(|c| c.source) {
+        Some(remote::Source::File(file)) => file.parent().map(Path::to_path_buf),
+        _ => app.cwd.ancestors().map(|d| d.join(".bd")).find(|d| d.is_dir()),
+    })
+}
+
 /// A remote workspace's checkout playbooks: `.bd/playbooks` next to
 /// `remote.toml`, else in the nearest `.bd` directory.
 fn checkout_playbooks(app: &App) -> Result<PathBuf> {
-    let bd = match remote::configured(app)?.map(|c| c.source) {
-        Some(remote::Source::File(file)) => file.parent().map(Path::to_path_buf),
-        _ => app.cwd.ancestors().map(|d| d.join(".bd")).find(|d| d.is_dir()),
-    };
-    Ok(bd.unwrap_or_else(|| app.cwd.join(".bd")).join("playbooks"))
+    Ok(checkout_bd(app)?.unwrap_or_else(|| app.cwd.join(".bd")).join("playbooks"))
 }
 
 /// Runs the `bd playbook` commands a remote workspace's client handles
@@ -637,7 +642,7 @@ pub fn attach_bundle(app: &App, cmd: &Command, request: &mut ExecRequest) -> Res
 }
 
 /// A read the client composes (in JSON) rather than the user's command line.
-fn server_read(app: &App, remote: &Remote, mut argv: Vec<String>) -> Result<ExecResponse> {
+pub(crate) fn server_read(app: &App, remote: &Remote, mut argv: Vec<String>) -> Result<ExecResponse> {
     if let Some(actor) = &app.g.actor {
         argv.splice(0..0, ["--actor".to_string(), actor.clone()]);
     }

@@ -25,6 +25,8 @@
 //!   wait conditions that arm when their step could start.
 //! * **Write policies** ([`policy`]): what a transaction's caller may
 //!   override (other actors' claims, human gates), enforced where it happens.
+//! * **Agent assets** ([`agents`]): the skills and MCP server definitions a
+//!   workspace serves to each agent harness, read strictly and hashed.
 //!
 //! ```no_run
 //! use bd_core::{ClaimOptions, InitOptions, NewIssue, OpenOptions, Queries, ReadyQuery, Store};
@@ -42,6 +44,7 @@
 //! # Ok::<(), bd_core::Error>(())
 //! ```
 
+pub mod agents;
 pub mod claims;
 pub mod comments;
 pub mod config;

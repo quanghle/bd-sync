@@ -697,6 +697,10 @@ pub(crate) fn access(cmd: &Command) -> Access {
         C::Events(a) if a.follow => Access::Local,
         C::Events(a) if a.action.is_none() => Access::Read,
         C::Playbook(PlaybookCommand::Extract(a)) if a.save => Access::Local,
+        // They write into the client's checkout, reading the server's sets with Read requests.
+        C::Agents(
+            AgentsCommand::Status(_) | AgentsCommand::Pull(_) | AgentsCommand::Approve(_) | AgentsCommand::Watch(_),
+        ) => Access::Local,
         C::Show(_)
         | C::List(_)
         | C::Ready(_)
@@ -724,7 +728,8 @@ pub(crate) fn access(cmd: &Command) -> Access {
             | PlaybookCommand::Runs(_)
             | PlaybookCommand::Extract(_),
         )
-        | C::Gate(GateCommand::List(_) | GateCommand::Show(_)) => Access::Read,
+        | C::Gate(GateCommand::List(_) | GateCommand::Show(_))
+        | C::Agents(AgentsCommand::Manifest(_) | AgentsCommand::Fetch(_)) => Access::Read,
         _ => Access::Write,
     }
 }
@@ -1139,6 +1144,10 @@ mod tests {
             (&["remote", "show"][..], Access::Local),
             (&["events", "--follow"][..], Access::Local),
             (&["playbook", "extract", "x", "--save"][..], Access::Local),
+            (&["agents", "status"][..], Access::Local),
+            (&["agents", "pull", "--harness", "claude", "--force"][..], Access::Local),
+            (&["agents", "approve", "github", "--harness", "codex"][..], Access::Local),
+            (&["agents", "watch", "--harness", "claude", "--interval", "1s"][..], Access::Local),
             (&["show", "t-1"][..], Access::Read),
             (&["ready"][..], Access::Read),
             (&["events"][..], Access::Read),
@@ -1147,6 +1156,8 @@ mod tests {
             (&["config", "get", "lease.ttl"][..], Access::Read),
             (&["playbook", "extract", "x"][..], Access::Read),
             (&["prime"][..], Access::Read),
+            (&["agents", "manifest"][..], Access::Read),
+            (&["agents", "fetch", "--harness", "codex"][..], Access::Read),
             (&["create", "x"][..], Access::Write),
             (&["claim", "--next"][..], Access::Write),
             (&["dep", "add", "a", "b"][..], Access::Write),

@@ -22,18 +22,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bd prime"
-          }
-        ]
-      }
-    ],
-    "PreCompact": [
-      {
-        "matcher": "",
-        "hooks": [
+            "command": "bd hook session-start --harness copilot"
+          },
           {
             "type": "command",
-            "command": "bd prime"
+            "command": "bd prime --hook copilot"
           }
         ]
       }

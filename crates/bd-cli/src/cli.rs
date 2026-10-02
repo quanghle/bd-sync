@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use bd_core::agents::Harness;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
@@ -157,6 +158,9 @@ pub enum Command {
     Gate(GateCommand),
     /// Delete closed ephemeral issues (finished ephemeral runs) for good
     Purge(PurgeArgs),
+    /// Agent skills and MCP server definitions the workspace serves per harness (claude, codex, copilot) from .bd/agents
+    #[command(subcommand)]
+    Agents(AgentsCommand),
     /// Benchmark concurrent claim throughput on a scratch database
     Bench(BenchArgs),
     #[command(hide = true)]
@@ -765,6 +769,12 @@ pub struct PrimeArgs {
     /// Number of ready items shown
     #[arg(long, default_value_t = 10)]
     pub ready: usize,
+    /// Run as a session hook of this agent harness: work in the session's directory (the cwd of the hook's JSON
+    /// input on stdin), and print the context as the harness reads it: copilot gets one JSON object
+    /// {"additionalContext": "..."}, as Copilot CLI drops plain text; claude and codex read plain text. Takes
+    /// precedence over --json
+    #[arg(long, value_name = "HARNESS", value_parser = harness_parser())]
+    pub hook: Option<Harness>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -1048,6 +1058,118 @@ pub struct GateCreateArgs {
     pub priority: Option<u8>,
 }
 
+#[derive(Subcommand, Debug, Clone)]
+pub enum AgentsCommand {
+    /// What the workspace serves to each harness: skills (a SHA-256 per file), MCP server entries (a SHA-256 per
+    /// entry) and a revision; checks .bd/agents/<harness> strictly
+    Manifest(AgentsManifestArgs),
+    /// One harness's skill files and MCP server entries, as JSON (what bd clients pull)
+    #[command(hide = true)]
+    Fetch(AgentsFetchArgs),
+    /// Compare this checkout's agent skills and MCP server entries with the workspace's (the server's in a remote
+    /// workspace): what a pull would add, update or remove, MCP changes waiting for approval, local edits and
+    /// conflicts. Changes nothing
+    #[command(after_help = AGENTS_SYNC_HELP)]
+    Status(AgentsStatusArgs),
+    /// Bring this checkout's agent skills up to date with the workspace's (.claude/skills, .agents/skills,
+    /// .github/skills), recorded in .bd/agents.lock; MCP entries the server removed are removed, new or changed
+    /// MCP definitions wait for `bd agents approve`. Never overwrites or deletes what bd did not write, or local
+    /// edits (without --force)
+    #[command(after_help = AGENTS_SYNC_HELP)]
+    Pull(AgentsPullArgs),
+    /// Review new and changed MCP server definitions waiting for approval and approve them one by one: shows each
+    /// (what it runs or connects to, the environment variables it reads, what changed) and asks y/N, then writes
+    /// those approved into the harness's MCP file (.mcp.json, .github/mcp.json, .codex/config.toml) and
+    /// .bd/agents.lock. Runs only in a terminal, outside agent sessions
+    #[command(after_help = AGENTS_APPROVE_HELP)]
+    Approve(AgentsApproveArgs),
+    /// Keep pulling until interrupted: each change to the workspace's sets is pulled as `bd agents pull` would
+    /// (skills applied, MCP removals applied, new or changed MCP definitions left for `bd agents approve`), and
+    /// reported. A remote workspace's server says when its sets change (bd serve --agents-every), and its sets
+    /// are compared with those pulled after each wait for that ends with no change; a local workspace's .bd/agents
+    /// is checked every --interval
+    #[command(after_help = AGENTS_WATCH_HELP)]
+    Watch(AgentsWatchArgs),
+}
+
+const AGENTS_SYNC_HELP: &str = "Harnesses: --harness, else the running agent session's ($CLAUDE_CODE_SESSION_ID, $COPILOT_AGENT_SESSION_ID, $CODEX_THREAD_ID), else those .bd/agents.lock records.\nExit codes: 0 done (MCP changes waiting for approval, conflicts and local edits are reported, not failures); 2 no harness, no checkout or an unusable .bd/agents.lock; 3 no workspace; 5 another bd process is changing this checkout's agent assets; 7 access denied; 8 server unreachable, or its answer failed its checks (nothing was written).";
+
+const AGENTS_APPROVE_HELP: &str = "Harnesses: --harness, else those .bd/agents.lock records. Refused inside an agent session ($CLAUDE_CODE_SESSION_ID, $COPILOT_AGENT_SESSION_ID, $CODEX_THREAD_ID or $CODEX_SESSION_ID set), and when there is something to ask about but stdin is not a terminal, with no way around either: run it in a separate terminal. Entries bd did not write (conflicts) are never replaced.\nExit codes: 0 done (declined entries stay pending); 2 refused, no harness, a name not served, no checkout or an unusable .bd/agents.lock; 3 no workspace; 5 another bd process is changing this checkout's agent assets; 7 access denied; 8 server unreachable, or its answer failed its checks (nothing was written).";
+
+const AGENTS_WATCH_HELP: &str = "Harnesses: --harness, else the running agent session's ($CLAUDE_CODE_SESSION_ID, $COPILOT_AGENT_SESSION_ID, $CODEX_THREAD_ID), else those .bd/agents.lock records.\nOutput: a report per pull, as `bd agents pull` prints it (one JSON object per line with --json). Never approves anything. Failures (the server unreachable, the checkout busy, an unusable set or lock file) are reported on stderr once, when they start and when they end, and tried again: in a remote workspace after growing pauses (30 s at most), in a local one every --interval. Ctrl-C stops it, once a pull under way has finished; a second Ctrl-C stops it at once (exit 130).\nExit codes: 0 stopped by Ctrl-C; 2 no harness or no checkout; 3 no workspace; 7 access denied (also once running).";
+
+#[derive(Args, Debug, Clone)]
+pub struct AgentsWatchArgs {
+    /// Harnesses to keep up to date (repeatable or comma separated; default: the running agent session's, else those
+    /// in .bd/agents.lock)
+    #[arg(long = "harness", value_delimiter = ',', value_parser = harness_parser())]
+    pub harnesses: Vec<Harness>,
+    /// Local workspace: how often to check .bd/agents. Remote workspace: the least time between two requests to the
+    /// server, which otherwise holds each one until a set changes
+    #[arg(long, default_value = "10s", value_name = "DURATION", value_parser = parse_watch_interval)]
+    pub interval: Duration,
+}
+
+fn parse_watch_interval(s: &str) -> Result<Duration, String> {
+    let d = bd_core::time::parse_duration(s).map_err(|e| e.to_string())?;
+    if d < Duration::from_millis(100) || d > Duration::from_secs(3600) {
+        return Err("use 100ms to 1h".into());
+    }
+    Ok(d)
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AgentsApproveArgs {
+    /// Only these MCP servers (default: every one waiting for approval)
+    pub names: Vec<String>,
+    /// Harnesses to approve for (repeatable or comma separated; default: those in .bd/agents.lock)
+    #[arg(long = "harness", value_delimiter = ',', value_parser = harness_parser())]
+    pub harnesses: Vec<Harness>,
+    /// Show long values, arrays and tables of the definitions in full instead of cut short (the summary of what
+    /// each runs, repeated before its prompt, stays short)
+    #[arg(long)]
+    pub full: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AgentsManifestArgs {
+    /// Only these harnesses (repeatable or comma separated; default: all)
+    #[arg(long = "harness", value_delimiter = ',', value_parser = harness_parser())]
+    pub harnesses: Vec<Harness>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AgentsStatusArgs {
+    /// Harnesses to check (repeatable or comma separated; default: the running agent session's, else those in
+    /// .bd/agents.lock)
+    #[arg(long = "harness", value_delimiter = ',', value_parser = harness_parser())]
+    pub harnesses: Vec<Harness>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AgentsPullArgs {
+    /// Harnesses to pull (repeatable or comma separated; default: the running agent session's, else those in
+    /// .bd/agents.lock)
+    #[arg(long = "harness", value_delimiter = ',', value_parser = harness_parser())]
+    pub harnesses: Vec<Harness>,
+    /// Also replace or remove local edits of skill files and MCP entries bd wrote. Never touches what bd did not
+    /// write, and new or changed MCP definitions still wait for approval
+    #[arg(long)]
+    pub force: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct AgentsFetchArgs {
+    #[arg(long, value_parser = harness_parser())]
+    pub harness: Harness,
+}
+
+fn harness_parser() -> impl clap::builder::TypedValueParser<Value = Harness> {
+    use clap::builder::{PossibleValuesParser, TypedValueParser};
+    PossibleValuesParser::new(Harness::ALL.map(Harness::name))
+        .map(|name| name.parse::<Harness>().expect("one of the possible values"))
+}
+
 #[derive(Args, Debug, Clone)]
 pub struct PurgeArgs {
     /// Only issues closed at least this long ago (e.g. 7d)
@@ -1146,6 +1268,10 @@ pub struct ServeArgs {
     /// Check GitHub gates with this host's gh this often (0 = off)
     #[arg(long, default_value = "5m", value_name = "DURATION")]
     pub gh_check_every: String,
+    /// Check every workspace's agent sets (.bd/agents) for changes this often; a change appends an
+    /// agents_changed event, which `bd agents watch` clients wait for (0 = off)
+    #[arg(long, default_value = "30s", value_name = "DURATION")]
+    pub agents_every: String,
     /// Back up every workspace into DIR/<name>/ (default: no backups)
     #[arg(long, value_name = "DIR")]
     pub backup_dir: Option<PathBuf>,
@@ -1216,12 +1342,27 @@ pub struct TokenRevokeArgs {
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum HookCommand {
-    /// Claude Code SessionStart hook: give the session its own actor by writing `export CLAUDE_CODE_SESSION_ID=<id>` (the session's own id, from the hook's JSON input on stdin) to $CLAUDE_ENV_FILE, for Claude Code versions that do not set it; does nothing without $CLAUDE_ENV_FILE
-    SessionStart,
+    /// SessionStart hook: check the checkout's agent skills and MCP definitions against the workspace's (pulling
+    /// skill changes, never writing new or changed MCP definitions) and say what changed; in Claude Code, also
+    /// give the session its own actor by writing `export CLAUDE_CODE_SESSION_ID=<id>` (the session's own id, from
+    /// the hook's JSON input on stdin) to $CLAUDE_ENV_FILE. Prints nothing when there is nothing to say
+    #[command(after_help = HOOK_SESSION_START_HELP)]
+    SessionStart(HookSessionStartArgs),
     /// Claude Code SubagentStart hook: tell the subagent (in its context) to pass `--session agent-<id>` to its bd commands, so that it acts as its own actor rather than as its parent session, whose session id its commands carry
     SubagentStart,
     /// Claude Code PreToolUse hook for Bash: in a subagent, refuse a command that runs bd without `--session`, $BD_SESSION or an actor of its own, giving the command to run instead; never approves anything
     PreToolUse,
+}
+
+const HOOK_SESSION_START_HELP: &str = "Hook entries: `bd hook session-start --harness claude` (.claude/settings.json), `--harness codex` (.codex/hooks.json), `--harness copilot` (a Copilot CLI plugin or .github/hooks), each followed by `bd prime` (`bd prime --hook copilot` for Copilot CLI).\nIt works in the session's directory, the cwd of the hook's JSON input on stdin (Copilot CLI runs a plugin's hooks in the plugin's own directory).\nOutput: plain text for claude and codex; one JSON object {\"additionalContext\": \"...\"} for copilot, which reads nothing else; nothing when there is nothing to say. Never fails the hook: it exits 0, gives up on the server within a few seconds, and reports problems in one line.";
+
+#[derive(Args, Debug, Clone)]
+pub struct HookSessionStartArgs {
+    /// The agent harness running the hook: what it prints, and whose agent assets it checks (default: the agent
+    /// session's, from $CLAUDE_CODE_SESSION_ID, $COPILOT_AGENT_SESSION_ID or $CODEX_THREAD_ID, which Codex and
+    /// Copilot CLI do not set for hooks; else those .bd/agents.lock records, with plain-text output)
+    #[arg(long, value_parser = harness_parser())]
+    pub harness: Option<Harness>,
 }
 
 #[derive(Subcommand, Debug, Clone)]

@@ -572,6 +572,12 @@ impl WriteCtx<'_> {
     }
 }
 
-fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
+pub(crate) fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
     Ok(conn.prepare_cached("SELECT value FROM meta WHERE key = ?1")?.query_row([key], |r| r.get(0)).optional()?)
+}
+
+/// Set an internal metadata value, in a write transaction ([`WriteCtx::conn`]).
+pub(crate) fn meta_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
+    conn.prepare_cached("INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)")?.execute(params![key, value])?;
+    Ok(())
 }

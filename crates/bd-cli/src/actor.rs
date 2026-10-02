@@ -35,6 +35,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::app::App;
+use crate::cli::HookSessionStartArgs;
 use crate::io;
 
 /// Names a session explicitly, for scripts and harnesses bd does not know:
@@ -274,6 +275,13 @@ pub fn take_over_command(id: &str, actor: &str) -> String {
 }
 
 /// `bd hook session-start`: run by an agent harness when a session starts.
+/// It brings the checkout's agent skills up to date and reports MCP
+/// definitions waiting for approval ([`crate::agents::hook`]), and prints
+/// what the session needs to know in the format of the harness running it
+/// (`--harness`, else the agent session's; [`crate::hook`]): one JSON
+/// object for Copilot CLI, plain text otherwise. A `--harness` that is not
+/// the caller's ([`crate::hook::runs_in`]) makes it do and print nothing.
+///
 /// Claude Code gives SessionStart hooks `$CLAUDE_ENV_FILE`, a script its
 /// later Bash commands source: this appends `export
 /// CLAUDE_CODE_SESSION_ID=<id>` to it, with the id from the hook's JSON
@@ -282,27 +290,43 @@ pub fn take_over_command(id: &str, actor: &str) -> String {
 /// (before 2.1.132). It always writes the session's own id, never one
 /// inherited from the environment, so a session started from another
 /// session's shell does not act as its parent. Never fails the hook: a
-/// problem is a warning on stderr.
-pub fn cmd_session_start(_app: &mut App) -> Result<i32> {
+/// problem is a warning on stderr, or a line of context.
+pub fn cmd_session_start(app: &mut App, a: &HookSessionStartArgs) -> Result<i32> {
     io::require_local("bd hook session-start")?;
-    let Some(file) = env("CLAUDE_ENV_FILE") else { return Ok(0) };
-    let input = if std::io::stdin().is_terminal() { String::new() } else { io::read_stdin().unwrap_or_default() };
-    let usable = |id: &String| id.len() <= MAX_SESSION_ID && !id.chars().any(char::is_control);
-    let Some(id) = hook_session_id(&input).filter(usable) else {
-        io::errln("bd hook session-start: no usable session_id in the hook input; nothing written to $CLAUDE_ENV_FILE");
-        return Ok(0);
-    };
-    if let Err(e) = append_export(std::path::Path::new(&file), CLAUDE_SESSION_VAR, &id) {
-        io::errln(format!("bd hook session-start: cannot write {file}: {e}"));
+    // Another harness running this one's hook file (Copilot CLI runs `.claude/settings.json`'s): not its session.
+    if a.harness.is_some_and(|h| !crate::hook::runs_in(h)) {
         return Ok(0);
     }
-    if env("BD_ACTOR").is_none() && env("BEADS_ACTOR").is_none() {
-        let own = |v: &str| if v == CLAUDE_SESSION_VAR { Some(id.clone()) } else { env(v) };
-        if let Some(s) = session(&own) {
-            io::outln(format!("bd: this session's bd commands act as their own actor, `<you>/{}`.", s.label));
-        }
+    let mut lines = Vec::new();
+    if let Some(file) = env("CLAUDE_ENV_FILE") {
+        lines.extend(export_session_id(&file));
     }
+    lines.extend(crate::agents::hook::session_start(app, a.harness));
+    let harness = a.harness.or_else(|| match crate::agents::session_harnesses()[..] {
+        [h] => Some(h),
+        _ => None,
+    });
+    crate::hook::print_context(harness, crate::hook::Event::SessionStart, &lines.join("\n"));
     Ok(0)
+}
+
+/// Append the session's id from the hook's input to Claude Code's `file`;
+/// returns the line that tells the session about its actor, if any.
+fn export_session_id(file: &str) -> Option<String> {
+    let usable = |id: &String| id.len() <= MAX_SESSION_ID && !id.chars().any(char::is_control);
+    let Some(id) = hook_session_id(crate::hook::input()).filter(usable) else {
+        io::errln("bd hook session-start: no usable session_id in the hook input; nothing written to $CLAUDE_ENV_FILE");
+        return None;
+    };
+    if let Err(e) = append_export(std::path::Path::new(file), CLAUDE_SESSION_VAR, &id) {
+        io::errln(format!("bd hook session-start: cannot write {file}: {e}"));
+        return None;
+    }
+    if env("BD_ACTOR").is_some() || env("BEADS_ACTOR").is_some() {
+        return None;
+    }
+    let own = |v: &str| if v == CLAUDE_SESSION_VAR { Some(id.clone()) } else { env(v) };
+    session(&own).map(|s| format!("bd: this session's bd commands act as their own actor, `<you>/{}`.", s.label))
 }
 
 /// `session_id` (Claude Code, and Copilot's VS Code compatible hooks) or
@@ -395,12 +419,7 @@ pub fn cmd_subagent_start(app: &mut App) -> Result<i32> {
         assignee,
         name = s.name,
     );
-    io::outln(
-        serde_json::json!({
-            "hookSpecificOutput": { "hookEventName": "SubagentStart", "additionalContext": context }
-        })
-        .to_string(),
-    );
+    crate::hook::print_context(None, crate::hook::Event::SubagentStart, &context);
     Ok(0)
 }
 

@@ -1,5 +1,6 @@
-//! Background jobs of `bd serve`: lease reclaim, gate checks, backups, and
-//! pruning of request records, in every workspace under the root, on timers.
+//! Background jobs of `bd serve`: lease reclaim, gate checks, agent set
+//! changes, backups, and pruning of request records, in every workspace under
+//! the root, on timers.
 //!
 //! The scheduler scans `<root>/*/.bd/bd.db` every so often, so workspaces no
 //! client has used since the server started are kept up too: dead workers'
@@ -15,6 +16,9 @@
 //! Jobs run the CLI's own commands (`bd reclaim`, `bd gate check --type
 //! local` or `--type gh`) as actor [`ACTOR`], with their I/O captured the way
 //! a request's is, so events, checks and policies are those of the commands.
+//! The agents job reads each harness's set from the workspace's
+//! `.bd/agents` and records its revision ([`bd_core::agents::record_revisions`]),
+//! appending an `agents_changed` event for each set that changed.
 //! Backups are [`Store::snapshot`]s (`VACUUM INTO`) written under a temporary
 //! name and then renamed to `<backup dir>/<name>/<name>-<UTC time>.db`; the
 //! newest `keep` are kept.
@@ -31,6 +35,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bd_core::agents::{AGENTS_DIR, AgentSet, Harness};
 use bd_core::time::{format_duration_ms, parse_duration};
 use bd_core::{Error, OpenOptions, Result, Store};
 use clap::Parser;
@@ -65,6 +70,8 @@ pub enum Job {
     /// Timer, issue and human gates (and malformed ones): no `gh` needed.
     Gates,
     GhGates,
+    /// Agent sets read for changes.
+    Agents,
     Backup,
     Prune,
 }
@@ -73,13 +80,14 @@ pub enum Job {
 const LANES: [usize; 3] = [2, 2, 1];
 
 impl Job {
-    const ALL: [Job; 5] = [Job::Reclaim, Job::Gates, Job::GhGates, Job::Backup, Job::Prune];
+    const ALL: [Job; 6] = [Job::Reclaim, Job::Gates, Job::GhGates, Job::Agents, Job::Backup, Job::Prune];
 
     pub fn name(self) -> &'static str {
         match self {
             Job::Reclaim => "reclaim",
             Job::Gates => "gate-check",
             Job::GhGates => "gh-check",
+            Job::Agents => "agents",
             Job::Backup => "backup",
             Job::Prune => "prune",
         }
@@ -87,7 +95,7 @@ impl Job {
 
     fn lane(self) -> usize {
         match self {
-            Job::Reclaim | Job::Gates | Job::Prune => 0,
+            Job::Reclaim | Job::Gates | Job::Agents | Job::Prune => 0,
             Job::GhGates => 1,
             Job::Backup => 2,
         }
@@ -108,6 +116,7 @@ pub struct Config {
     pub reclaim_every: Option<Duration>,
     pub gate_check_every: Option<Duration>,
     pub gh_check_every: Option<Duration>,
+    pub agents_every: Option<Duration>,
     pub backups: Option<Backups>,
     pub prune_every: Option<Duration>,
 }
@@ -127,6 +136,7 @@ impl Config {
             reclaim_every: every("--reclaim-every", &a.reclaim_every)?,
             gate_check_every: every("--gate-check-every", &a.gate_check_every)?,
             gh_check_every: every("--gh-check-every", &a.gh_check_every)?,
+            agents_every: every("--agents-every", &a.agents_every)?,
             backups,
             prune_every: Some(PRUNE_EVERY),
         })
@@ -137,6 +147,7 @@ impl Config {
             Job::Reclaim => self.reclaim_every,
             Job::Gates => self.gate_check_every,
             Job::GhGates => self.gh_check_every,
+            Job::Agents => self.agents_every,
             Job::Backup => self.backups.as_ref().map(|b| b.every),
             Job::Prune => self.prune_every,
         }
@@ -211,6 +222,7 @@ pub fn start(config: Config, root: PathBuf, open: OpenOptions, committed: Commit
             reclaim_every = %show(config.reclaim_every),
             gate_check_every = %show(config.gate_check_every),
             gh_check_every = %show(config.gh_check_every),
+            agents_every = %show(config.agents_every),
             backup_every = %show(Some(b.every)),
             backup_keep = b.keep,
             backup_dir = %b.dir.display(),
@@ -221,15 +233,17 @@ pub fn start(config: Config, root: PathBuf, open: OpenOptions, committed: Commit
             reclaim_every = %show(config.reclaim_every),
             gate_check_every = %show(config.gate_check_every),
             gh_check_every = %show(config.gh_check_every),
+            agents_every = %show(config.agents_every),
             backups = "off",
             "background jobs"
         ),
     }
     let backups = config.backups.clone();
+    let unreadable = Unreadable::default();
     let runner: Runner = Arc::new(move |ws: &Workspace, job| {
-        let ok = run(ws, job, &open, backups.as_ref());
+        let ok = run(ws, job, &open, backups.as_ref(), &unreadable);
         if job != Job::Backup {
-            // Reclaims and gate checks append events: followers check again.
+            // Reclaims, gate checks and agent set changes append events: followers check again.
             committed(&ws.name);
         }
         ok
@@ -397,12 +411,13 @@ fn ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn run(ws: &Workspace, job: Job, open: &OpenOptions, backups: Option<&Backups>) -> bool {
+fn run(ws: &Workspace, job: Job, open: &OpenOptions, backups: Option<&Backups>, unreadable: &Unreadable) -> bool {
     let started = Instant::now();
     let done = match (job, backups) {
         (Job::Reclaim, _) => reclaim(ws, open, started),
         (Job::Gates, _) => check_gates(ws, open, job, "local", started),
         (Job::GhGates, _) => check_gates(ws, open, job, "gh", started),
+        (Job::Agents, _) => agents(ws, open, started, unreadable),
         (Job::Backup, Some(b)) => backup(ws, open, b, started).map(|_| ()),
         (Job::Backup, None) => Ok(()),
         (Job::Prune, _) => prune(ws, open, started),
@@ -532,6 +547,83 @@ fn check_gates(ws: &Workspace, open: &OpenOptions, job: Job, kind: &str, started
             gates = %changed.join(","),
             ms = ms(started),
             "checked gates"
+        );
+    }
+    Ok(())
+}
+
+/// What reading each harness's set gave when it could not be read, by
+/// workspace: a warning is logged when that changes, not on every run.
+#[derive(Default)]
+struct Unreadable(std::sync::Mutex<HashMap<(String, Harness), String>>);
+
+impl Unreadable {
+    /// Note what reading `h`'s set in workspace `ws` gave: `error`, or
+    /// none. Returns whether that is news: an error other than the one
+    /// noted before, or the first read since one.
+    fn note(&self, ws: &str, h: Harness, error: Option<&str>) -> bool {
+        let mut seen = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let key = (ws.to_string(), h);
+        match error {
+            Some(e) if seen.get(&key).is_some_and(|before| before == e) => false,
+            Some(e) => {
+                seen.insert(key, e.to_string());
+                true
+            }
+            None => seen.remove(&key).is_some(),
+        }
+    }
+}
+
+/// Read each harness's set in `ws` and record its revision: an
+/// `agents_changed` event for each set that changed. A set that cannot be
+/// read is left out (no event; its clients keep what they have) with a
+/// warning when its error changes, and the job goes on as usual: only
+/// failing to record fails it.
+///
+/// Each run reads and hashes every set (up to [`bd_core::agents::MAX_SET_BYTES`]
+/// each), which is affordable at this job's interval; keeping each
+/// workspace's last manifests (which `agents manifest` could serve too) is a
+/// possible optimization.
+fn agents(ws: &Workspace, open: &OpenOptions, started: Instant, unreadable: &Unreadable) -> Result<()> {
+    let dir = ws.db.parent().unwrap_or(&ws.dir).join(AGENTS_DIR);
+    let mut revisions = std::collections::BTreeMap::new();
+    for h in Harness::ALL {
+        match AgentSet::load(&dir, h) {
+            Ok(set) => {
+                if unreadable.note(&ws.name, h, None) {
+                    tracing::info!(target: "bd::serve", workspace = %ws.name, job = "agents", harness = %h, "agent set readable again");
+                }
+                revisions.insert(h, set.revision);
+            }
+            Err(e) => {
+                let error = e.to_string();
+                if unreadable.note(&ws.name, h, Some(&error)) {
+                    tracing::warn!(
+                        target: "bd::serve",
+                        workspace = %ws.name,
+                        job = "agents",
+                        harness = %h,
+                        error = %error,
+                        "agent set cannot be read; its clients keep what they have"
+                    );
+                }
+            }
+        }
+    }
+    let mut store = Store::open(&ws.db, open.clone())?;
+    let changed = bd_core::agents::record_revisions(&mut store, ACTOR, &revisions)?;
+    if changed.is_empty() {
+        tracing::debug!(target: "bd::serve", workspace = %ws.name, job = "agents", ms = ms(started), "agent sets unchanged");
+    } else {
+        let harnesses: Vec<&str> = changed.iter().map(|c| c.harness.name()).collect();
+        tracing::info!(
+            target: "bd::serve",
+            workspace = %ws.name,
+            job = "agents",
+            harnesses = %harnesses.join(","),
+            ms = ms(started),
+            "agent sets changed"
         );
     }
     Ok(())
@@ -848,6 +940,56 @@ mod tests {
         std::thread::sleep(millis(5));
         let third = backup(&ws, &OpenOptions::default(), &b, Instant::now()).unwrap();
         assert_eq!(backup_files(&dir, "proj").unwrap(), [third], "keep 1 keeps the new one");
+    }
+
+    #[test]
+    fn the_agents_job_records_changed_sets_and_skips_unreadable_ones() {
+        let (_root, ws) = real_workspace();
+        let dir = ws.db.parent().unwrap().join(AGENTS_DIR);
+        let (open, unreadable) = (OpenOptions::default(), Unreadable::default());
+        let changes = || {
+            let store = Store::open(&ws.db, OpenOptions::default()).unwrap();
+            let q = bd_core::EventQuery { since: Some(0), ops: vec!["agents_changed".into()], ..Default::default() };
+            store.read(|r| r.events(&q)).unwrap().events
+        };
+        agents(&ws, &open, Instant::now(), &unreadable).unwrap();
+        assert!(changes().is_empty(), "nothing served");
+
+        let skill = dir.join("claude").join("skills").join("deploy");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "deploy\n").unwrap();
+        agents(&ws, &open, Instant::now(), &unreadable).unwrap();
+        agents(&ws, &open, Instant::now(), &unreadable).unwrap();
+        let events = changes();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!((events[0].actor.as_str(), events[0].data["harness"].as_str()), (ACTOR, Some("claude")));
+        assert_eq!(events[0].data["revision"], AgentSet::load(&dir, Harness::Claude).unwrap().revision);
+
+        // An unreadable set gets no event and fails nothing; the others are still recorded.
+        std::fs::create_dir_all(dir.join("codex")).unwrap();
+        std::fs::write(dir.join("codex").join("mcp.toml"), "not = [toml").unwrap();
+        std::fs::write(skill.join("SKILL.md"), "deploy v2\n").unwrap();
+        agents(&ws, &open, Instant::now(), &unreadable).unwrap();
+        let events = changes();
+        assert_eq!(events.iter().map(|e| e.data["harness"].as_str().unwrap()).collect::<Vec<_>>(), ["claude"; 2]);
+        let noted = unreadable.0.lock().unwrap().get(&(ws.name.clone(), Harness::Codex)).cloned().unwrap();
+        assert!(noted.contains("codex/mcp.toml"), "{noted}");
+        assert!(!unreadable.note(&ws.name, Harness::Codex, Some(&noted)), "warned about already");
+    }
+
+    #[test]
+    fn unreadable_sets_are_news_once_per_error() {
+        let u = Unreadable::default();
+        let (claude, codex) = (Harness::Claude, Harness::Codex);
+        assert!(!u.note("proj", claude, None), "readable all along");
+        assert!(u.note("proj", claude, Some("a: no SKILL.md")));
+        assert!(!u.note("proj", claude, Some("a: no SKILL.md")), "the same error again");
+        assert!(u.note("other", claude, Some("a: no SKILL.md")), "per workspace");
+        assert!(u.note("proj", codex, Some("a: no SKILL.md")), "per harness");
+        assert!(u.note("proj", claude, Some("mcp.json: not JSON")), "another error");
+        assert!(u.note("proj", claude, None), "readable again");
+        assert!(!u.note("proj", claude, None));
+        assert!(u.note("proj", claude, Some("mcp.json: not JSON")), "broken again");
     }
 
     #[cfg(unix)]

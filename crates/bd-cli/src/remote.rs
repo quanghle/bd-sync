@@ -73,6 +73,9 @@ pub struct Remote {
     attempt_timeout: Duration,
     /// Limit for a whole attempt, for commands that must answer quickly.
     total_timeout: Option<Duration>,
+    /// When every request must have ended, retries included, and the time
+    /// that leaves from when it was set ([`Remote::within`]).
+    deadline: Option<(Instant, Duration)>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -325,21 +328,27 @@ fn is_loopback(authority: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
-/// `bd prime` in text mode: session hooks run it, so it gives up quickly and
-/// reports an unavailable workspace as context instead of failing the hook.
+/// `bd prime` in text mode, or with `--hook`: session hooks run it, so it
+/// gives up quickly and reports an unavailable workspace as context instead
+/// of failing the hook.
 pub fn is_hook(cli: &Cli) -> bool {
-    matches!(cli.command, Command::Prime(_)) && !cli.global.json
+    matches!(&cli.command, Command::Prime(a) if a.hook.is_some() || !cli.global.json)
 }
 
 /// What `bd prime` prints in place of workspace context when the remote
-/// workspace cannot be used. Exits 0, so the session hook still succeeds.
-pub fn unavailable(e: &Error) -> i32 {
-    io::outln("# bd workflow context");
-    io::outln(format!("The remote bd workspace is unavailable: {e}"));
-    io::outln(
-        "bd commands fail until this is fixed; `bd remote show` checks the connection and the access token (BD_TOKEN \
-         or `bd remote login`).",
+/// workspace cannot be used, in the format of the hook running it
+/// (`--hook`). Exits 0, so the session hook still succeeds.
+pub fn unavailable(cli: &Cli, e: &Error) -> i32 {
+    let harness = match &cli.command {
+        Command::Prime(a) => a.hook,
+        _ => None,
+    };
+    let text = format!(
+        "# bd workflow context\nThe remote bd workspace is unavailable: {}\nbd commands fail until this is fixed; `bd \
+         remote show` checks the connection and the access token (BD_TOKEN or `bd remote login`).",
+        crate::agents::show::printable(&e.to_string())
     );
+    crate::hook::print_context(harness, crate::hook::Event::SessionStart, &text);
     0
 }
 
@@ -348,13 +357,13 @@ pub fn run(app: &mut App, remote: Remote, cli: &Cli) -> i32 {
     let hook = is_hook(cli);
     let remote = if hook { remote.quick() } else { remote };
     match forward(app, &remote, cli, hook) {
-        Ok(response) if hook && response.exit_code != 0 => unavailable(&response_error(&response, &remote.url)),
+        Ok(response) if hook && response.exit_code != 0 => unavailable(cli, &response_error(&response, &remote.url)),
         Ok(response) => {
             io::out(&response.stdout);
             let _ = std::io::stderr().write_all(response.stderr.as_bytes());
             response.exit_code
         }
-        Err(e) if hook => unavailable(&e),
+        Err(e) if hook => unavailable(cli, &e),
         Err(e) => crate::report(&e, app.g.json),
     }
 }
@@ -380,6 +389,11 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
         }
         Command::Playbook(cmd) => {
             if let Some(code) = playbooks::client_command(app, remote, cmd)? {
+                return Ok(ExecResponse { exit_code: code, ..Default::default() });
+            }
+        }
+        Command::Agents(cmd) => {
+            if let Some(code) = crate::agents::client_command(app, remote, cmd)? {
                 return Ok(ExecResponse { exit_code: code, ..Default::default() });
             }
         }
@@ -410,7 +424,7 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
 }
 
 /// The error a failed command reported (its `--json` error, or its first stderr line).
-fn response_error(r: &ExecResponse, url: &str) -> Error {
+pub(crate) fn response_error(r: &ExecResponse, url: &str) -> Error {
     let detail = r.stderr.lines().find_map(|l| serde_json::from_str::<ErrorBody>(l).ok()).map(|b| b.error);
     let message = match &detail {
         Some(d) => d.message.clone(),
@@ -760,6 +774,15 @@ fn wait_for_events(app: &App, remote: &Remote, a: &EventsArgs, since: i64, wait:
     }
 }
 
+/// What a long poll for events found ([`Remote::poll_events`]).
+pub enum Polled {
+    /// The events that followed the cursor (none when the wait ended
+    /// first), and the cursor to continue from.
+    Events(Vec<bd_core::Event>, i64),
+    /// Retention deleted events that followed the cursor before they were read.
+    Truncated,
+}
+
 impl Remote {
     /// The CA certificates come from `trust`, never from `c.ca_cert` again.
     pub fn new(c: Configured, trust: Trust, token: String) -> Remote {
@@ -771,6 +794,7 @@ impl Remote {
             connect_timeout: Duration::from_secs(10),
             attempt_timeout: Duration::from_secs(120),
             total_timeout: None,
+            deadline: None,
         }
     }
 
@@ -784,6 +808,19 @@ impl Remote {
         self.attempt_timeout = Duration::from_secs(15);
         self.total_timeout = Some(self.attempt_timeout);
         self
+    }
+
+    /// Every request ends within `budget` from now, retries included, even
+    /// against a server that accepts the connection and never answers: for
+    /// session hooks, which must not hold up the session.
+    pub fn within(mut self, budget: Duration) -> Remote {
+        self.deadline = Some((Instant::now() + budget, budget));
+        self
+    }
+
+    /// The time left before the deadline, if there is one.
+    fn time_left(&self) -> Option<Duration> {
+        self.deadline.map(|(at, _)| at.saturating_duration_since(Instant::now()))
     }
 
     fn agent(&self) -> Result<ureq::Agent> {
@@ -829,6 +866,14 @@ impl Remote {
         let endpoint = format!("{}/v{PROTOCOL}/exec", self.url);
         let authorization = format!("Bearer {}", self.token);
         let budget = self.retry;
+        // A request made once the deadline has passed (a set wanted after the mutex wait) fails at once.
+        if let Some((_, allowed)) = self.deadline.filter(|&(at, _)| Instant::now() >= at) {
+            return Err(Error::Remote(format!(
+                "{}: no time left of the {:.1}s allowed",
+                self.url,
+                allowed.as_secs_f64()
+            )));
+        }
         let mut deadline = (!out.long_poll).then(|| Instant::now() + budget);
         let mut delay = Duration::from_millis(200);
         let mut fresh_windows = 0;
@@ -842,8 +887,16 @@ impl Remote {
             let attempt = Instant::now();
             // bd serve itself answered that it cannot run the command now (busy, or shutting down).
             let mut refused = false;
-            let sent = agent
-                .post(&endpoint)
+            let mut post = agent.post(&endpoint);
+            if let Some(left) = self.time_left() {
+                let whole = self.total_timeout.map_or(left, |t| t.min(left));
+                post = post
+                    .config()
+                    .timeout_global(Some(whole))
+                    .timeout_connect(Some(self.connect_timeout.min(left)))
+                    .build();
+            }
+            let sent = post
                 .header("authorization", &authorization)
                 .header("accept", FRAMES_CONTENT_TYPE)
                 .content_type("application/json")
@@ -932,8 +985,14 @@ impl Remote {
                 delay = Duration::from_millis(200);
             }
             deadline = Some(until);
-            if now + delay > until {
-                let failure = format!("{failure} (gave up after retrying for {}s)", budget.as_secs());
+            let past_deadline = self.deadline.filter(|&(at, _)| now + delay > at);
+            if now + delay > until || past_deadline.is_some() {
+                let failure = match past_deadline {
+                    Some((_, allowed)) => {
+                        format!("{failure} (no answer within the {:.1}s allowed)", allowed.as_secs_f64())
+                    }
+                    None => format!("{failure} (gave up after retrying for {}s)", budget.as_secs()),
+                };
                 if reached && out.write {
                     return Err(lost(failure));
                 }
@@ -959,7 +1018,8 @@ impl Remote {
             return Ok(Err(Cut::Malformed(format!("content type {content_type:?}, not a bd answer (check the URL)"))));
         }
         out.start(headers.contains_key("content-length"));
-        let frames = FrameReader::spawn(response.into_body().into_reader(), self.attempt_timeout)?;
+        let idle = self.time_left().map_or(self.attempt_timeout, |left| left.min(self.attempt_timeout));
+        let frames = FrameReader::spawn(response.into_body().into_reader(), idle)?;
         loop {
             match frames.next() {
                 Ok(Some(Frame::Stdout(text))) => out.stdout(&text)?,
@@ -972,7 +1032,38 @@ impl Remote {
         }
     }
 
-    fn event_head(&self) -> Result<i64> {
+    /// Events with one of `ops` after `since`: a long poll that the server
+    /// holds until one is committed, for at most [`FOLLOW_WAIT`] (its
+    /// `--max-wait` caps that), retried like any.
+    pub fn poll_events(&self, ops: &[&str], since: i64) -> Result<Polled> {
+        let mut argv: Vec<String> = vec!["--json".into(), "events".into(), "--since".into(), since.to_string()];
+        argv.extend(["--limit".into(), FOLLOW_BATCH.to_string()]);
+        argv.extend(["--wait".into(), format!("{}ms", FOLLOW_WAIT.as_millis())]);
+        for op in ops {
+            argv.extend(["--op".into(), op.to_string()]);
+        }
+        let (actor, session) = identity();
+        let request = ExecRequest { argv, actor, session, location: Some(self.url.clone()), ..Default::default() };
+        let response = self.long_poll(&request)?;
+        match response.exit_code {
+            0 => {}
+            6 => return Ok(Polled::Truncated),
+            _ => return Err(response_error(&response, &self.url)),
+        }
+        let unexpected = |why: String| Error::Remote(format!("{}: unexpected events answer: {why}", self.url));
+        let cursor = response.cursor.ok_or_else(|| unexpected("no event cursor".into()))?;
+        let events = response
+            .stdout
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<Vec<bd_core::Event>, _>>()
+            .map_err(|e| unexpected(e.to_string()))?;
+        Ok(Polled::Events(events, cursor))
+    }
+
+    /// The workspace's events head: the cursor after its newest event.
+    pub fn event_head(&self) -> Result<i64> {
         let (actor, session) = identity();
         let request = ExecRequest {
             argv: vec!["info".into(), "--json".into()],
@@ -982,6 +1073,9 @@ impl Remote {
             ..Default::default()
         };
         let response = self.exec(&request)?;
+        if response.exit_code == 7 {
+            return Err(response_error(&response, &self.url));
+        }
         if response.exit_code != 0 {
             return Err(Error::Remote(format!("{}: bd info failed: {}", self.url, response.stderr.trim())));
         }
@@ -1060,14 +1154,52 @@ fn set(app: &mut App, a: &RemoteSetArgs) -> Result<()> {
         out = out.line("  note: --remote or $BD_REMOTE is set, and takes precedence over this file");
     }
     let ca_path = ca_cert.as_ref().map(|c| dir.join(c));
-    let has_token = Trust::load(ca_path.as_deref()).and_then(|t| token_for(&url, &t)).ok().flatten().is_some();
-    out = out.line(if has_token {
+    let trust = Trust::load(ca_path.as_deref()).ok();
+    let token = trust.as_ref().and_then(|t| token_for(&url, t).ok().flatten());
+    out = out.line(if token.is_some() {
         "  check the connection: bd remote show"
     } else {
         "  next: `bd remote login` (or set BD_TOKEN), then check the connection with `bd remote show`"
     });
+    if let (Some(trust), Some(token), None) = (trust, token, &app.g.remote) {
+        let c = Configured { url: url.clone(), source: Source::File(path.clone()), ca_cert: ca_path };
+        if let Some(hint) = agents_hint(app, Remote::new(c, trust, token.secret())) {
+            out = out.line(hint);
+        }
+    }
     app.print(out.id(url));
     Ok(())
+}
+
+/// How long `bd remote set` and `bd remote login` wait for the server's agent manifests.
+const HINT_BUDGET: Duration = Duration::from_secs(3);
+
+/// The line `bd remote set` and `bd remote login` add when the workspace
+/// serves agent assets: for which harnesses, and the pull that places them
+/// in the checkout before the first agent session (no harness is known
+/// yet, so nothing is pulled). `None` when nothing is served, or no usable
+/// answer came within [`HINT_BUDGET`].
+fn agents_hint(app: &App, remote: Remote) -> Option<String> {
+    use bd_core::agents::{Harness, Manifest};
+    let remote = remote.quick().within(HINT_BUDGET);
+    let argv = ["--json", "agents", "manifest"].map(String::from).to_vec();
+    let response = playbooks::server_read(app, &remote, argv).ok().filter(|r| r.exit_code == 0)?;
+    let manifests: std::collections::BTreeMap<Harness, Manifest> = serde_json::from_str(&response.stdout).ok()?;
+    let served: Vec<&str> = manifests
+        .iter()
+        .filter(|(h, m)| m.harness == **h && m.check().is_ok() && !m.is_empty())
+        .map(|(h, _)| h.name())
+        .collect();
+    let harness = match served[..] {
+        [] => return None,
+        [one] => one.to_string(),
+        _ => format!("<{}>", served.join("|")),
+    };
+    Some(format!(
+        "  agent assets are served for {}: `bd agents pull --harness {harness}` (for each harness used here) places \
+         them in this checkout before the first agent session",
+        served.join(", ")
+    ))
 }
 
 fn show(app: &mut App) -> Result<i32> {
@@ -1301,6 +1433,12 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
     }
     if env("BD_TOKEN").is_some() {
         out = out.line("  note: $BD_TOKEN is set, and takes precedence over saved tokens");
+    }
+    let here = configured(app).ok().flatten().is_some_and(|here| here.url == c.url);
+    if !a.no_verify && here {
+        if let Some(hint) = agents_hint(app, Remote::new(c, trust, token)) {
+            out = out.line(hint);
+        }
     }
     app.print(out.id(saved.key));
     Ok(())

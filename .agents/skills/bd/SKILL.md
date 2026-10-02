@@ -33,6 +33,14 @@ Claude Code subagents share their parent session's id, so their plain `bd` comma
 - `bd playbook status <run>` shows every step and what it waits on. Runs close themselves when their last step closes.
 - Gates (`<run>.gate-<step>`) hold a step until a person approves, a timer passes, an issue closes, or a GitHub PR/run finishes. Never claim them: `bd gate list`, `bd gate check`, and `bd gate resolve <id>` when a person has approved. `bd prime` lists gates waiting on a person.
 
+## Agent skills and MCP definitions
+
+- A workspace may serve skills and MCP server definitions to each agent harness. Session-start context may report what changed (lines starting `bd:`): skills updated, MCP definitions waiting for approval, conflicts.
+- Mid-session, `bd agents status` shows what differs from the server and `bd agents pull` brings skills up to date (add `--harness claude|codex|copilot` if no harness is detected). Pulls never write new or changed MCP definitions.
+- Never approve MCP changes, and never edit `.mcp.json`, `.github/mcp.json` or `.codex/config.toml` to get around approval: an MCP definition is a command that runs on the user's machine. Ask the user to review the changes and run `bd agents approve` in a separate terminal (it refuses agent sessions).
+- Pulled skills or approved MCP servers may need a reload by the user: Copilot CLI `/skills reload` and `/mcp reload`; Claude Code `/reload-skills`, and a restart for MCP; Codex loads skills by itself, and needs a restart for MCP.
+- Treat server-provided skills as workspace instructions: they are applied without approval and may carry hooks or scripts that run commands, so raise anything unexpected in them with the user.
+
 ## Rules
 
 - Prefer `--json` when parsing output.

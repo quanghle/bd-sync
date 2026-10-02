@@ -558,15 +558,38 @@ fn default_prefix(dir: &Path) -> String {
     if p.is_empty() { "bd".into() } else { p }
 }
 
-/// `.bd/.gitignore`: the database and its WAL files are local state. Left alone if it exists.
+/// The `.bd/.gitignore` pattern for `agents.lock` (what `bd agents pull` placed in a checkout), its mutex and temp files.
+pub const AGENTS_LOCK_IGNORE: &str = "agents.lock*";
+const AGENTS_LOCK_LINES: &str = "# What `bd agents pull` placed in this checkout is local state.\nagents.lock*\n";
+
+/// `.bd/.gitignore`: the database and its WAL files, and `agents.lock`, are local state. Left alone if it exists.
 pub fn write_bd_gitignore(dir: &Path) -> Result<()> {
     let gitignore = dir.join(".gitignore");
     if !gitignore.exists() {
         std::fs::write(
             &gitignore,
-            "# SQLite database and WAL files are local state.\n# Share issues with `bd export -o .bd/issues.jsonl`.\nbd.db\nbd.db-wal\nbd.db-shm\n",
+            format!(
+                "# SQLite database and WAL files are local state.\n# Share issues with `bd export -o .bd/issues.jsonl`.\nbd.db\nbd.db-wal\nbd.db-shm\n{AGENTS_LOCK_LINES}"
+            ),
         )?;
     }
+    Ok(())
+}
+
+/// Make `.bd/.gitignore` (in `dir`) list `agents.lock`: write it if it is missing, else append the pattern if it lacks it.
+pub fn ignore_agents_lock(dir: &Path) -> Result<()> {
+    let gitignore = dir.join(".gitignore");
+    let text = match std::fs::read_to_string(&gitignore) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return write_bd_gitignore(dir),
+        Err(e) => return Err(Error::invalid(format!("{}: {e}", gitignore.display()))),
+    };
+    if text.lines().any(|l| l.trim() == AGENTS_LOCK_IGNORE) {
+        return Ok(());
+    }
+    let separator = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+    let mut file = std::fs::OpenOptions::new().append(true).open(&gitignore)?;
+    file.write_all(format!("{separator}{AGENTS_LOCK_LINES}").as_bytes())?;
     Ok(())
 }
 
@@ -1073,7 +1096,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     })?;
     let shown_memories: Vec<&bd_core::Memory> =
         if a.max_memories > 0 { memories.iter().take(a.max_memories).collect() } else { memories.iter().collect() };
-    if app.g.json {
+    if app.g.json && a.hook.is_none() {
         app.print_json(&json!({
             "workspace": workspace,
             "prefix": prefix,
@@ -1214,7 +1237,10 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             o.push(m.content.clone());
         }
     }
-    o.iter().for_each(io::outln);
+    match a.hook {
+        Some(h) => crate::hook::print_context(Some(h), crate::hook::Event::SessionStart, &o.join("\n")),
+        None => o.iter().for_each(io::outln),
+    }
     Ok(())
 }
 

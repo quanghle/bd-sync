@@ -753,11 +753,15 @@ answers at once: a follower sees an event within milliseconds of its commit,
 and an idle follower costs one request per `--max-wait` (25 s by default)
 instead of one per poll interval. Each answer says where the next request
 continues, so a follower prints every event once and in order, even when an
-answer is lost and asked for again. A follower that falls so far behind that
-retention deleted events it had not read says so on stderr and continues
-from the newest event. Under load, a follower asks at most once per
-`--interval-ms` (default 500), so events arrive in batches; a `--wait` longer
-than the server's `--max-wait` takes several requests.
+answer is lost and asked for again: a request that waited is retried for the
+whole retry time (`BD_REMOTE_RETRY_SECS`, default 30 s) from its failure,
+however long it had waited, and a retry that the server held and then
+refused (busy, or shutting down) gets the whole retry time again, up to 5
+times in a row, so a follower rides out server restarts. A follower that
+falls so far behind that retention deleted events it had not read says so on
+stderr and continues from the newest event. Under load, a follower asks at
+most once per `--interval-ms` (default 500), so events arrive in batches; a
+`--wait` longer than the server's `--max-wait` takes several requests.
 
 A waiting request holds no command slot, database connection, transaction or
 memory budget on the server, only its connection and its small request (one

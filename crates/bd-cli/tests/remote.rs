@@ -128,6 +128,18 @@ impl Server {
         self.local_cmd(actor, args).output().unwrap()
     }
 
+    /// Stop the server as an operator would (SIGTERM), and start it again on the same address.
+    #[cfg(unix)]
+    fn restart(mut self) -> Server {
+        let pid = self.child.id().to_string();
+        check(Command::new("kill").args(["-TERM", &pid]).output().unwrap(), "kill -TERM");
+        assert!(self.child.wait().unwrap().success());
+        let root = std::mem::replace(&mut self.root, tempfile::tempdir().unwrap());
+        let listen = self.base.trim_start_matches("http://").to_string();
+        drop(self);
+        Server::launch(root, &listen, &[])
+    }
+
     fn local_cmd(&self, actor: &str, args: &[&str]) -> Command {
         let db = self.root.path().join("proj").join(".bd").join("bd.db");
         let mut c = bd(self.root.path());
@@ -1516,6 +1528,126 @@ fn shutdown_answers_waiting_followers_at_once() {
     };
     assert!(status.success(), "{status:?}");
     assert!(stopping.elapsed() < Duration::from_secs(5), "{:?}", stopping.elapsed());
+}
+
+#[cfg(unix)]
+#[test]
+fn followers_ride_out_a_server_restart_during_their_wait() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "Before"]);
+    let mut cmd = alice.cmd(&["--json", "events", "--follow", "--interval-ms", "200"]);
+    let mut follower = Follower::start(cmd.env("BD_REMOTE_RETRY_SECS", "4").stderr(Stdio::null()));
+    follower.wait_for(&["\"issue_id\":\"t-1\""]);
+    // Further into its wait than its retry time: the restart's 503, and the
+    // refused connections after it, are retried for that long from then on.
+    std::thread::sleep(Duration::from_secs(5));
+    let _server = server.restart();
+    alice.ok(&["create", "After"]);
+    follower.wait_for(&["\"issue_id\":\"t-2\""]);
+    let seqs: Vec<i64> =
+        follower.seen.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()["seq"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, [1, 2, 3, 4], "each event once, in order");
+    assert!(follower.running());
+}
+
+/// An event as `bd events --json` prints it.
+fn event_line(seq: i64, issue: &str) -> String {
+    format!(
+        r#"{{"seq":{seq},"tx":{seq},"ts":"2026-10-01T12:00:00.000Z","actor":"alice","op":"created","issue_id":"{issue}","data":{{}}}}"#
+    )
+}
+
+fn cursor_frame(seq: i64) -> String {
+    json!({ "cursor": seq }).to_string()
+}
+
+#[test]
+fn long_polls_are_retried_however_long_they_waited() {
+    // A stand-in server: an event, then a busy answer after a wait longer than
+    // the client's retry time, then the next event.
+    let with = |seq: i64, issue: &str| {
+        answer(
+            &[stdout_frame(&format!("{}\n", event_line(seq, issue))), cursor_frame(seq), exit_frame(0, "")],
+            false,
+            0,
+        )
+    };
+    let server = FakeServer::start(move |n| match n {
+        0 => with(1, "t-1"),
+        1 => {
+            std::thread::sleep(Duration::from_secs(3));
+            status_answer("503 Service Unavailable", true, &error_json("busy", 5))
+        }
+        2 => with(2, "t-2"),
+        _ => {
+            std::thread::sleep(Duration::from_secs(120));
+            Vec::new()
+        }
+    });
+    let client = server.client();
+    let mut cmd = client.cmd(&["--json", "events", "--follow", "--since", "0", "--interval-ms", "200"]);
+    let mut follower = Follower::start(cmd.env("BD_REMOTE_RETRY_SECS", "2").stderr(Stdio::null()));
+    follower.wait_for(&["\"issue_id\":\"t-1\""]);
+    follower.wait_for(&["\"issue_id\":\"t-2\""]);
+    assert_eq!(follower.seen, [event_line(1, "t-1"), event_line(2, "t-2")]);
+    assert!(follower.running());
+}
+
+/// A long poll's answer with one event.
+fn event_answer(seq: i64, issue: &str) -> Vec<u8> {
+    answer(&[stdout_frame(&format!("{}\n", event_line(seq, issue))), cursor_frame(seq), exit_frame(0, "")], false, 0)
+}
+
+/// bd serve's busy answer, after holding the request for `held`.
+fn busy_after(held: Duration) -> Vec<u8> {
+    std::thread::sleep(held);
+    status_answer("503 Service Unavailable", true, &error_json("busy", 5))
+}
+
+#[test]
+fn retries_that_wait_get_a_fresh_retry_time_but_not_forever() {
+    let follow = |server: &FakeServer| {
+        let client = server.client();
+        let mut cmd = client.cmd(&["--json", "events", "--follow", "--since", "0", "--interval-ms", "200"]);
+        (Follower::start(cmd.env("BD_REMOTE_RETRY_SECS", "2").stderr(Stdio::null())), client)
+    };
+    // The retry of a failed long poll waits too, and fails again past the
+    // first failure's retry time: bd serve held it, so it gets a fresh one.
+    let waits = FakeServer::start(|n| match n {
+        0 => event_answer(1, "t-1"),
+        1 | 2 => busy_after(Duration::from_secs(3)),
+        3 => event_answer(2, "t-2"),
+        _ => {
+            std::thread::sleep(Duration::from_secs(120));
+            Vec::new()
+        }
+    });
+    // Refused connections after a fresh retry time do not extend it.
+    let gone = FakeServer::start(|n| match n {
+        0 => event_answer(1, "t-1"),
+        1 => busy_after(Duration::from_secs(3)),
+        _ => Vec::new(),
+    });
+    // Nor does a server that holds every request and refuses it, past a few times.
+    let stuck = FakeServer::start(|n| match n {
+        0 => event_answer(1, "t-1"),
+        _ => busy_after(Duration::from_millis(1200)),
+    });
+    let ((mut waiting, _a), (mut cut_off, _b), (mut held_off, _c)) = (follow(&waits), follow(&gone), follow(&stuck));
+
+    waiting.wait_for(&["\"issue_id\":\"t-1\""]);
+    waiting.wait_for(&["\"issue_id\":\"t-2\""]);
+    assert_eq!(waiting.seen, [event_line(1, "t-1"), event_line(2, "t-2")], "each event once, in order");
+    assert!(waiting.running());
+
+    assert_eq!(cut_off.exit_code(), Some(8), "a server that is gone ends the follower");
+    assert_eq!(held_off.exit_code(), Some(8), "and so does one that never answers");
+    assert!(
+        stuck.requests.load(Ordering::SeqCst) >= 7,
+        "after 5 fresh retry times: {}",
+        stuck.requests.load(Ordering::SeqCst)
+    );
 }
 
 /// An HTTPS server whose certificate a private CA signed; returns the server and the CA and key PEM files in `dir`.

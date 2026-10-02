@@ -47,6 +47,11 @@ use crate::stream::{Cut, FrameReader};
 const RETRY_BUDGET: Duration = Duration::from_secs(30);
 /// `bd prime` runs from session hooks, which must not stall: it retries this long.
 const PRIME_RETRY_BUDGET: Duration = Duration::from_secs(3);
+/// A long poll that bd serve held at least this long, then refused (busy,
+/// or shutting down), waited on a live server: its retries get a fresh
+/// retry time, up to [`FRESH_WINDOWS`] times in a row.
+const HELD: Duration = Duration::from_secs(1);
+const FRESH_WINDOWS: u32 = 5;
 
 fn retry_budget() -> Duration {
     env("BD_REMOTE_RETRY_SECS").and_then(|s| s.parse().ok()).map_or(RETRY_BUDGET, Duration::from_secs)
@@ -454,6 +459,9 @@ struct Delivery {
     files: Vec<OutputFile>,
     /// The cursor frame of this attempt.
     cursor: Option<i64>,
+    /// The server may hold the request a long time before answering (a long
+    /// poll): its retry time starts at its first failure.
+    long_poll: bool,
 }
 
 /// An output file, written to `<target>.tmp` and renamed into place once the command succeeds.
@@ -471,7 +479,16 @@ impl Delivery {
     fn new(files: Vec<OutputFile>, hold: bool, write: bool) -> Delivery {
         // A command writing files prints a summary: it waits until the files are in place.
         let hold = hold || write || !files.is_empty();
-        Delivery { write, hold, printing: false, held: String::new(), printed: false, files, cursor: None }
+        Delivery {
+            write,
+            hold,
+            printing: false,
+            held: String::new(),
+            printed: false,
+            files,
+            cursor: None,
+            long_poll: false,
+        }
     }
 
     /// Everything kept in memory, for the client's own requests (reads).
@@ -672,7 +689,8 @@ fn follow_events(app: &App, remote: &Remote, a: &EventsArgs) -> Result<i32> {
             Some(n) if first => n.min(FOLLOW_BATCH),
             _ => FOLLOW_BATCH,
         };
-        let response = remote.exec(&events_request(app, remote, a, Some(cursor), Some(limit), Some(FOLLOW_WAIT)))?;
+        let response =
+            remote.long_poll(&events_request(app, remote, a, Some(cursor), Some(limit), Some(FOLLOW_WAIT)))?;
         if response.exit_code == 6 && !first {
             // Retention pruned past the cursor (the follower fell far behind): resume at the head.
             let head = remote.event_head()?;
@@ -703,7 +721,7 @@ fn wait_for_events(app: &App, remote: &Remote, a: &EventsArgs, since: i64, wait:
         let round = Instant::now();
         let left = wait.saturating_sub(started.elapsed());
         let request = events_request(app, remote, a, Some(cursor), a.limit, Some(left.min(FOLLOW_WAIT)));
-        let response = remote.exec(&request)?;
+        let response = remote.long_poll(&request)?;
         let found = !response.stdout.is_empty();
         cursor = match print_events(remote, response)? {
             Ok(next) => next,
@@ -767,6 +785,15 @@ impl Remote {
         self.exec_into(request, &mut Delivery::collect())
     }
 
+    /// Like [`Remote::exec`], for a request the server may hold until it has
+    /// something to say: it is retried for as long after its first failure,
+    /// not after it was sent.
+    fn long_poll(&self, request: &ExecRequest) -> Result<ExecResponse> {
+        let mut out = Delivery::collect();
+        out.long_poll = true;
+        self.exec_into(request, &mut out)
+    }
+
     /// Send one request; its answer goes to `out`. Failures in transit and
     /// busy answers are retried with the same request id, for up to the
     /// remote's retry budget, as long as no output has reached the user. A
@@ -778,8 +805,9 @@ impl Remote {
         let endpoint = format!("{}/v{PROTOCOL}/exec", self.url);
         let authorization = format!("Bearer {}", self.token);
         let budget = self.retry;
-        let mut deadline = Instant::now() + budget;
+        let mut deadline = (!out.long_poll).then(|| Instant::now() + budget);
         let mut delay = Duration::from_millis(200);
+        let mut fresh_windows = 0;
         // Some attempt may have run the command on the server.
         let mut reached = false;
         let lost = |why: String| {
@@ -787,6 +815,9 @@ impl Remote {
         };
         loop {
             let was_reached = reached;
+            let attempt = Instant::now();
+            // bd serve itself answered that it cannot run the command now (busy, or shutting down).
+            let mut refused = false;
             let sent = agent
                 .post(&endpoint)
                 .header("authorization", &authorization)
@@ -827,7 +858,10 @@ impl Remote {
                         (500, Ok(text)) if bd && out.write => {
                             return Err(lost(format!("HTTP 500{}", error_message(&text))));
                         }
-                        (429 | 503, Ok(text)) if !may_have_run => format!("HTTP {status}{}", error_message(&text)),
+                        (429 | 503, Ok(text)) if !may_have_run => {
+                            refused = bd && status == 503;
+                            format!("HTTP {status}{}", error_message(&text))
+                        }
                         (_, Ok(text)) if may_have_run && !bd => {
                             reached = true;
                             format!("HTTP {status}{}", error_message(&text))
@@ -860,10 +894,21 @@ impl Remote {
             // arrives only once the proxy's own has passed (Cloudflare's 524 after 100 s), maybe past
             // the retry time, and the write's stored answer must still be asked for.
             let now = Instant::now();
+            let mut until = deadline.unwrap_or(now + budget);
             if reached && !was_reached && out.write && !budget.is_zero() {
-                deadline = deadline.max(now + budget.max(delay));
+                until = until.max(now + budget.max(delay));
             }
-            if now + delay > deadline {
+            // A long poll's retry may wait on the server too: when bd serve held it and then
+            // refused it, the server is up, and the time went to waiting, not to reaching it.
+            // Refused connections and timeouts never extend the retry time: a server that is
+            // gone still ends the request after one.
+            if out.long_poll && refused && now - attempt >= HELD && fresh_windows < FRESH_WINDOWS {
+                fresh_windows += 1;
+                until = until.max(now + budget);
+                delay = Duration::from_millis(200);
+            }
+            deadline = Some(until);
+            if now + delay > until {
                 let failure = format!("{failure} (gave up after retrying for {}s)", budget.as_secs());
                 if reached && out.write {
                     return Err(lost(failure));

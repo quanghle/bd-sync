@@ -690,3 +690,130 @@ fn deep_open_chains_take_linear_time() {
     let took = started.elapsed();
     assert!(took < Duration::from_secs(60), "status and progress took {took:?}");
 }
+
+const INNER: &str = r#"
+playbook = "inner"
+
+[[steps]]
+id = "a"
+[[steps.children]]
+id = "x"
+[[steps.children]]
+id = "y"
+
+[[steps]]
+id = "b"
+needs = ["a"]
+[steps.gate]
+type = "human"
+"#;
+
+fn progress_of_runs(env: &Env, q: &playbook::RunsQuery) -> Vec<(String, [usize; 8])> {
+    let runs = env.store.read(|r| playbook::runs(r.conn(), q, r.now())).unwrap();
+    runs.into_iter()
+        .map(|s| {
+            let p = s.progress;
+            (s.id, [p.total, p.done, p.failed, p.active, p.ready, p.blocked, p.gates_open, p.escalated])
+        })
+        .collect()
+}
+
+#[test]
+fn runs_count_the_steps_of_the_runs_nested_in_them() {
+    let mut env = Env::new();
+    let outer = env.start(RELEASE, &[("version", "1.0.0")]);
+    let start_below = |env: &mut Env, parent: &str| {
+        let plan = env.plan(INNER, &[]);
+        let opts = StartOptions { parent: Some(parent.into()), ..Default::default() };
+        env.store.write("run", "alice", |tx| tx.start_run(&plan, &opts)).unwrap().run.id
+    };
+    let inner = start_below(&mut env, &format!("{outer}.bump"));
+    env.close(&format!("{inner}.a.x"));
+    env.store.write("claim", "bob", |tx| tx.claim(&format!("{inner}.a.y"), &ClaimOptions::default())).unwrap();
+    // [total, done, failed, active, ready, blocked, gates_open, escalated]
+    let all = playbook::RunsQuery::default();
+    let (inner_p, outer_p) = ([3, 1, 0, 1, 0, 1, 1, 0], [6, 1, 0, 1, 1, 3, 1, 0]);
+    assert_eq!(progress_of_runs(&env, &all), vec![(inner.clone(), inner_p), (outer.clone(), outer_p)]);
+    // A run counts the runs inside it whether or not they are listed.
+    let only_outer = playbook::RunsQuery { playbook: Some("release".into()), ..Default::default() };
+    assert_eq!(progress_of_runs(&env, &only_outer), vec![(outer.clone(), outer_p)]);
+    let newest = playbook::RunsQuery { limit: Some(1), ..Default::default() };
+    assert_eq!(progress_of_runs(&env, &newest), vec![(inner.clone(), inner_p)]);
+    let innermost = start_below(&mut env, &format!("{inner}.b"));
+    let (innermost_p, inner_p, outer_p) =
+        ([3, 0, 0, 0, 0, 3, 1, 0], [6, 1, 0, 1, 0, 4, 2, 0], [9, 1, 0, 1, 1, 6, 2, 0]);
+    let nested = vec![(innermost.clone(), innermost_p), (inner.clone(), inner_p), (outer.clone(), outer_p)];
+    assert_eq!(progress_of_runs(&env, &all), nested);
+
+    // A damaged database: a second parent across runs, then a parent cycle.
+    let other = env.start(INNER, &[]);
+    let edge = "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+        VALUES (?1, ?2, 'parent-child', 0)";
+    let add = |env: &mut Env, child: String, parent: String| {
+        env.store.write("damage", "alice", |tx| Ok(tx.conn().execute(edge, [&child, &parent])?)).unwrap();
+    };
+    add(&mut env, format!("{other}.a"), format!("{outer}.tag"));
+    let (other_p, outer_p) = ([3, 0, 0, 0, 2, 1, 1, 0], [11, 1, 0, 1, 3, 6, 2, 0]);
+    assert_eq!(
+        progress_of_runs(&env, &all),
+        vec![
+            (other.clone(), other_p),
+            (innermost.clone(), innermost_p),
+            (inner.clone(), inner_p),
+            (outer.clone(), outer_p)
+        ]
+    );
+    add(&mut env, outer.clone(), format!("{innermost}.b"));
+    assert_eq!(
+        progress_of_runs(&env, &all),
+        vec![(other, other_p), (innermost, outer_p), (inner, outer_p), (outer, outer_p)]
+    );
+}
+
+/// `levels` open runs `{prefix}1..`, each the only child of the one before,
+/// and below each a step `{prefix}s{k}`, closed for even `k`. Plain SQL, as
+/// in [`chain_below`].
+fn nested_runs(env: &mut Env, prefix: &str, levels: usize) {
+    let issues = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO issues (id, title, status, created_at, updated_at, closed_at, metadata)
+        SELECT ?3 || k, 'Run ' || k, 'open', ?2 + 2 * k, ?2 + 2 * k, NULL,
+               '{\"playbook\":{\"role\":\"run\",\"name\":\"nest\"}}' FROM n
+        UNION ALL
+        SELECT ?3 || 's' || k, 'Step ' || k, CASE k % 2 WHEN 0 THEN 'closed' ELSE 'open' END,
+               ?2 + 2 * k + 1, ?2 + 2 * k + 1, CASE k % 2 WHEN 0 THEN ?2 END, '{}' FROM n";
+    let edges = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+        INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+        SELECT ?3 || k, ?3 || (k - 1), 'parent-child', ?2 FROM n WHERE k > 1
+        UNION ALL
+        SELECT ?3 || 's' || k, ?3 || k, 'parent-child', ?2 FROM n";
+    env.store
+        .write("nest", "alice", |tx| {
+            tx.conn().execute(issues, (levels as i64, T0, prefix))?;
+            tx.conn().execute(edges, (levels as i64, T0, prefix))?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn deeply_nested_runs_take_linear_time() {
+    // Each run walked its own subtree, which holds every run inside it.
+    const LEVELS: usize = 20_000;
+    let mut env = Env::new();
+    nested_runs(&mut env, "r", LEVELS);
+    let started = std::time::Instant::now();
+    let runs = env.store.read(|r| playbook::runs(r.conn(), &Default::default(), r.now())).unwrap();
+    let took = started.elapsed();
+    assert_eq!(runs.len(), LEVELS);
+    for (i, run) in runs.iter().enumerate() {
+        // Newest first: the innermost run, with one step, comes first.
+        let k = LEVELS - i;
+        let steps = LEVELS - k + 1;
+        let done = LEVELS / 2 - (k - 1) / 2;
+        assert_eq!(run.id, format!("r{k}"));
+        let p = &run.progress;
+        assert_eq!((p.total, p.done, p.ready, p.blocked), (steps, done, steps - done, 0), "{}", run.id);
+    }
+    // Generous for slow CI machines; the quadratic version took minutes.
+    assert!(took < Duration::from_secs(60), "runs took {took:?}");
+}

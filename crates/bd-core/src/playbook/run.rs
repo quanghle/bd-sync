@@ -1,7 +1,7 @@
 //! Runs: creating a run from a [`Plan`] in one transaction, and everything
 //! afterwards (status, listing, compaction, discarding).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use rusqlite::Connection;
 use serde::Serialize;
@@ -102,6 +102,19 @@ pub struct Progress {
     /// Gates still shut (waiting, armed, or escalated).
     pub gates_open: usize,
     pub escalated: usize,
+}
+
+impl Progress {
+    fn add(&mut self, other: &Progress) {
+        self.total += other.total;
+        self.done += other.done;
+        self.failed += other.failed;
+        self.active += other.active;
+        self.ready += other.ready;
+        self.blocked += other.blocked;
+        self.gates_open += other.gates_open;
+        self.escalated += other.escalated;
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -389,17 +402,94 @@ pub fn run_status(conn: &Connection, run: &str, now: Timestamp) -> Result<RunSta
     Ok(RunStatus { run: root, playbook, progress, nodes })
 }
 
-fn progress_of(conn: &Connection, run: &str, now: Timestamp) -> Result<Progress> {
-    let mut deferrals = DeferralSources::new(now);
+/// What one issue adds to the progress of every run above it.
+fn own_progress(conn: &Connection, issue: &Issue, now: Timestamp, deferrals: &mut DeferralSources) -> Result<Progress> {
+    let mut progress = Progress::default();
+    if is_container(issue) && issue.issue_type != GATE_TYPE {
+        return Ok(progress); // counts nothing whatever its state
+    }
+    let (state, _) = state_of(conn, issue, now, deferrals, || work_below(conn, &issue.id))?;
+    tally(&mut progress, issue, state);
+    Ok(progress)
+}
+
+fn progress_of(conn: &Connection, run: &str, now: Timestamp, deferrals: &mut DeferralSources) -> Result<Progress> {
     let mut progress = Progress::default();
     for issue in issues::descendants(conn, run)? {
-        if is_container(&issue) && issue.issue_type != GATE_TYPE {
-            continue; // counts nothing whatever its state
-        }
-        let (state, _) = state_of(conn, &issue, now, &mut deferrals, || work_below(conn, &issue.id))?;
-        tally(&mut progress, &issue, state);
+        progress.add(&own_progress(conn, &issue, now, deferrals)?);
     }
     Ok(progress)
+}
+
+/// Each run's progress, from one walk over the union of their subtrees: a
+/// run nested in another is walked once, not once per run above it. Each
+/// issue's progress is summed from the leaves up, so a run gets that of
+/// every issue below it, nested runs' included. A damaged hierarchy (an
+/// issue reached twice: a second parent or a parent cycle), where that sum
+/// would count some issues twice, asks the database per run instead.
+fn progress_of_runs(conn: &Connection, runs: &[Issue], now: Timestamp) -> Result<Vec<Progress>> {
+    let mut deferrals = DeferralSources::new(now);
+    let mut index: HashMap<String, usize> = HashMap::new();
+    // Per issue walked: its own progress, then everything below it added in;
+    // and its parent's index (None for a run walked from, until another
+    // run's walk reaches it).
+    let mut sums: Vec<Progress> = Vec::new();
+    let mut parents: Vec<Option<usize>> = Vec::new();
+    let mut is_tree = true;
+    'runs: for run in runs {
+        if index.contains_key(&run.id) {
+            continue; // inside a run walked before
+        }
+        let root = sums.len();
+        index.insert(run.id.clone(), root);
+        sums.push(Progress::default());
+        parents.push(None);
+        // An explicit stack, as in walk_tree: a hierarchy has no depth limit.
+        let mut stack = vec![(root, children_in_order(conn, &run.id)?.into_iter())];
+        while let Some((parent, children)) = stack.last_mut() {
+            let parent = *parent;
+            let Some(child) = children.next() else {
+                stack.pop();
+                continue;
+            };
+            match index.get(&child.id) {
+                // A run walked before, reached from the one above it.
+                Some(&i) if i != root && parents[i].is_none() => parents[i] = Some(parent),
+                Some(_) => {
+                    is_tree = false;
+                    break 'runs;
+                }
+                None => {
+                    let i = sums.len();
+                    index.insert(child.id.clone(), i);
+                    sums.push(own_progress(conn, &child, now, &mut deferrals)?);
+                    parents.push(Some(parent));
+                    stack.push((i, children_in_order(conn, &child.id)?.into_iter()));
+                }
+            }
+        }
+    }
+    if !is_tree {
+        return runs.iter().map(|run| progress_of(conn, &run.id, now, &mut deferrals)).collect();
+    }
+    // Leaves up: an issue is added to its parent once all its children were
+    // added to it. Runs reached from a later run's walk come before their
+    // parent in `sums`, so this goes by children left rather than by index.
+    let mut left = vec![0usize; sums.len()];
+    for p in parents.iter().flatten() {
+        left[*p] += 1;
+    }
+    let mut done: Vec<usize> = (0..sums.len()).filter(|&i| left[i] == 0).collect();
+    while let Some(i) = done.pop() {
+        let Some(p) = parents[i] else { continue };
+        let below = sums[i].clone();
+        sums[p].add(&below);
+        left[p] -= 1;
+        if left[p] == 0 {
+            done.push(p);
+        }
+    }
+    Ok(runs.iter().map(|run| sums[index[&run.id]].clone()).collect())
 }
 
 /// Runs, newest first (open ones only unless asked).
@@ -417,22 +507,22 @@ pub fn runs(conn: &Connection, q: &RunsQuery, now: Timestamp) -> Result<Vec<RunS
         let rows = stmt.query_map(rusqlite::params![q.playbook, limit], issue_from_row)?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    found
+    let progress = progress_of_runs(conn, &found, now)?;
+    Ok(found
         .into_iter()
-        .map(|i| {
-            Ok(RunSummary {
-                progress: progress_of(conn, &i.id, now)?,
-                playbook: i.metadata.pointer("/playbook/name").and_then(Value::as_str).map(String::from),
-                id: i.id,
-                title: i.title,
-                status: i.status,
-                outcome: i.close_outcome,
-                ephemeral: i.ephemeral,
-                created_at: i.created_at,
-                closed_at: i.closed_at,
-            })
+        .zip(progress)
+        .map(|(i, progress)| RunSummary {
+            progress,
+            playbook: i.metadata.pointer("/playbook/name").and_then(Value::as_str).map(String::from),
+            id: i.id,
+            title: i.title,
+            status: i.status,
+            outcome: i.close_outcome,
+            ephemeral: i.ephemeral,
+            created_at: i.created_at,
+            closed_at: i.closed_at,
         })
-        .collect()
+        .collect())
 }
 
 fn require_run(conn: &Connection, id: &str) -> Result<Issue> {

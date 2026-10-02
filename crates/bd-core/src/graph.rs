@@ -26,7 +26,7 @@
 //! sqlite_autoindex_issues_1` (the primary key's index). `tests/plans.rs`
 //! checks the plans of what the walks prepare under stale statistics.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
@@ -808,60 +808,68 @@ pub fn dep_tree(conn: &Connection, root: &str, direction: Direction, max_depth: 
 /// Every cycle among scheduling edges (blocks, conditional-blocks,
 /// parent-child), each rotated to start at its smallest id. Empty iff acyclic.
 pub fn find_cycles(conn: &Connection) -> Result<Vec<Vec<String>>> {
-    let mut adj: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut stmt = conn.prepare_cached(
         "SELECT issue_id, depends_on_id FROM dependencies
          WHERE dep_type IN ('blocks','conditional-blocks','parent-child')
          ORDER BY issue_id, depends_on_id",
     )?;
-    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
-        let (a, b) = row?;
-        adj.entry(a).or_default().push(b);
+    let edges = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(cycles_of(edges.collect::<rusqlite::Result<Vec<_>>>()?))
+}
+
+/// [`find_cycles`] over `edges`, sorted and distinct: a depth-first search
+/// from each issue with edges, in id order, reporting the path from where an
+/// edge meets it back to that edge's start. The path holds numbers, and each
+/// issue knows its place on it, so a cycle costs its own length, not the
+/// path's.
+fn cycles_of(edges: Vec<(String, String)>) -> Vec<Vec<String>> {
+    // Issues by number, numbered in id order: comparing numbers compares ids.
+    let ids: Vec<String> =
+        edges.iter().flat_map(|(a, b)| [a, b]).collect::<BTreeSet<_>>().into_iter().cloned().collect();
+    let number: HashMap<&str, usize> = ids.iter().enumerate().map(|(i, id)| (id.as_str(), i)).collect();
+    let mut adj: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
+    for (a, b) in &edges {
+        adj[number[a.as_str()]].push(number[b.as_str()]);
     }
-    let nodes: Vec<String> = adj.keys().cloned().collect();
-    let mut color: HashMap<String, u8> = HashMap::new(); // 0 new, 1 on stack, 2 done
-    let mut cycles: BTreeSet<Vec<String>> = BTreeSet::new();
-    for start in nodes {
-        if color.get(&start).copied().unwrap_or(0) != 0 {
+    // Each issue's position on the current path, or whether it is new or done.
+    const NEW: usize = usize::MAX;
+    const DONE: usize = usize::MAX - 1;
+    let mut at = vec![NEW; ids.len()];
+    let mut cycles: BTreeSet<Vec<usize>> = BTreeSet::new();
+    for start in 0..ids.len() {
+        if at[start] != NEW || adj[start].is_empty() {
             continue;
         }
-        // Iterative DFS keeping the current path for cycle extraction.
-        let mut path: Vec<String> = Vec::new();
-        let mut iters: Vec<usize> = Vec::new();
-        path.push(start.clone());
-        iters.push(0);
-        color.insert(start.clone(), 1);
-        while let Some(node) = path.last().cloned() {
-            let idx = *iters.last().expect("parallel stacks");
-            let next = adj.get(&node).and_then(|v| v.get(idx)).cloned();
-            match next {
-                Some(n) => {
-                    *iters.last_mut().expect("parallel stacks") += 1;
-                    match color.get(&n).copied().unwrap_or(0) {
-                        0 => {
-                            color.insert(n.clone(), 1);
-                            path.push(n);
-                            iters.push(0);
-                        }
-                        1 => {
-                            let pos = path.iter().position(|x| *x == n).expect("on stack");
-                            let mut cycle: Vec<String> = path[pos..].to_vec();
-                            let min = cycle.iter().enumerate().min_by(|a, b| a.1.cmp(b.1)).map(|(i, _)| i).unwrap_or(0);
-                            cycle.rotate_left(min);
-                            cycles.insert(cycle);
-                        }
-                        _ => {}
-                    }
+        // Iterative DFS: the path, and how many edges of each issue on it
+        // were followed.
+        let mut path = vec![start];
+        let mut followed = vec![0];
+        at[start] = 0;
+        while let Some(&node) = path.last() {
+            let k = followed.last_mut().expect("parallel stacks");
+            let Some(&n) = adj[node].get(*k) else {
+                at[node] = DONE;
+                path.pop();
+                followed.pop();
+                continue;
+            };
+            *k += 1;
+            match at[n] {
+                NEW => {
+                    at[n] = path.len();
+                    path.push(n);
+                    followed.push(0);
                 }
-                None => {
-                    color.insert(node, 2);
-                    path.pop();
-                    iters.pop();
+                DONE => {}
+                pos => {
+                    let cycle = &path[pos..];
+                    let min = (0..cycle.len()).min_by_key(|&i| cycle[i]).unwrap_or(0);
+                    cycles.insert([&cycle[min..], &cycle[..min]].concat());
                 }
             }
         }
     }
-    Ok(cycles.into_iter().collect())
+    cycles.into_iter().map(|cycle| cycle.into_iter().map(|i| ids[i].clone()).collect()).collect()
 }
 
 #[cfg(test)]

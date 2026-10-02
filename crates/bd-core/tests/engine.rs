@@ -910,3 +910,60 @@ fn snapshots_are_verified_self_contained_copies() {
     assert_eq!(restored.read(|r| r.issue(&id)).unwrap().priority, 1);
     assert_eq!(restored.meta("workspace_id").unwrap(), env.store.meta("workspace_id").unwrap());
 }
+
+#[test]
+fn cycles_in_a_damaged_database_are_each_listed_once() {
+    let mut env = Env::new();
+    let edges = [
+        ("c-a", "c-b", "blocks"),
+        ("c-b", "c-c", "blocks"),
+        ("c-c", "c-a", "blocks"),
+        ("c-b", "c-d", "parent-child"),
+        ("c-d", "c-b", "parent-child"),
+        ("c-c", "c-e", "conditional-blocks"),
+        ("c-e", "c-f", "conditional-blocks"),
+        ("c-f", "c-c", "blocks"),
+        ("c-g", "c-a", "blocks"),
+        ("c-f", "c-g", "related"),
+    ];
+    // Plain SQL: adding these edges is refused. Then a chain of 200,000
+    // issues, each blocking the one before and blocked by it.
+    const LEVELS: i64 = 200_000;
+    env.store
+        .write("damage", "alice", |tx| {
+            for id in ["c-a", "c-b", "c-c", "c-d", "c-e", "c-f", "c-g"] {
+                tx.conn().execute(
+                    "INSERT INTO issues (id, title, created_at, updated_at) VALUES (?1, ?1, ?2, ?2)",
+                    (id, T0),
+                )?;
+            }
+            for (a, b, t) in edges {
+                tx.conn().execute(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    (a, b, t, T0),
+                )?;
+            }
+            let chain = "WITH RECURSIVE n(k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+                INSERT INTO issues (id, title, created_at, updated_at)
+                SELECT printf('d-%06d', k), 'Level ' || k, ?2, ?2 FROM n";
+            tx.conn().execute(chain, (LEVELS, T0))?;
+            let both_ways = "WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < ?1)
+                INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+                SELECT printf('d-%06d', k), printf('d-%06d', k - 1), 'blocks', ?2 FROM n
+                UNION ALL SELECT printf('d-%06d', k - 1), printf('d-%06d', k), 'blocks', ?2 FROM n";
+            tx.conn().execute(both_ways, (LEVELS, T0))?;
+            Ok(())
+        })
+        .unwrap();
+    let started = std::time::Instant::now();
+    let cycles = env.store.read(|r| r.cycles()).unwrap();
+    let took = started.elapsed();
+    let ids = |c: &[&str]| c.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    assert_eq!(cycles[..3], [ids(&["c-a", "c-b", "c-c"]), ids(&["c-b", "c-d"]), ids(&["c-c", "c-e", "c-f"])]);
+    assert_eq!(cycles.len(), 3 + LEVELS as usize);
+    for (k, cycle) in cycles[3..].iter().enumerate() {
+        assert_eq!(*cycle, [format!("d-{k:06}"), format!("d-{:06}", k + 1)]);
+    }
+    // Each cycle cost a scan of the whole path: minutes in a debug build.
+    assert!(took < Duration::from_secs(60), "dep cycles took {took:?}");
+}

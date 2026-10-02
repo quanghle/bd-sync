@@ -128,6 +128,28 @@ fn show_list_and_short_ids() {
 }
 
 #[test]
+fn list_nests_children_under_listed_parents() {
+    let ws = Ws::new();
+    let epic = ws.id(&["create", "Epic", "-t", "epic", "-p", "3"]);
+    let child = ws.id(&["create", "Child", "--parent", &epic, "-p", "1"]);
+    ws.id(&["create", "Grandchild", "--parent", &child, "-p", "2"]);
+    ws.id(&["create", "Other", "-p", "0"]);
+    let rows = |args: &[&str]| -> Vec<(usize, String)> {
+        ws.ok(args)
+            .lines()
+            .filter(|l| !l.starts_with("--"))
+            .map(|l| (l.len() - l.trim_start().len(), l.split_whitespace().nth(1).unwrap().to_string()))
+            .collect()
+    };
+    let at = |d: usize, id: &str| (d, id.to_string());
+    assert_eq!(rows(&["list"]), [at(0, "t-2"), at(0, "t-1"), at(2, "t-1.1"), at(4, "t-1.1.1")]);
+    // A child whose parent is filtered out starts at the left margin.
+    assert_eq!(rows(&["list", "--search", "Child"]), [at(0, "t-1.1"), at(2, "t-1.1.1")]);
+    let ids: Vec<Value> = ws.json(&["list"]).as_array().unwrap().iter().map(|i| i["id"].clone()).collect();
+    assert_eq!(ids, ["t-2", "t-1.1", "t-1.1.1", "t-1"], "JSON keeps the sort order");
+}
+
+#[test]
 fn batch_is_atomic_with_back_references() {
     let ws = Ws::new();
     let script = ws.dir.path().join("ops.txt");

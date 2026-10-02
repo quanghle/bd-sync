@@ -645,7 +645,8 @@ pub fn cmd_show(app: &mut App, a: &ShowArgs) -> Result<()> {
 }
 
 pub fn cmd_list(app: &mut App, a: &ListArgs) -> Result<()> {
-    let (issues, now) = app.read(|r| {
+    let json = app.g.json;
+    let (issues, parents, now) = app.read(|r| {
         let q = ListQuery {
             filter: filter_from(r, &a.filter)?,
             statuses: a.status.iter().map(|s| Status::parse(s)).collect::<Result<_>>()?,
@@ -656,14 +657,16 @@ pub fn cmd_list(app: &mut App, a: &ListArgs) -> Result<()> {
             reverse: a.reverse,
             limit: (a.limit > 0).then_some(a.limit),
         };
-        Ok((r.list(&q)?, r.now()))
+        let issues = r.list(&q)?;
+        let parents = if json { Vec::new() } else { issues.iter().map(|i| r.parent(&i.id)).collect::<Result<_>>()? };
+        Ok((issues, parents, r.now()))
     })?;
     let n = issues.len();
-    let out = Out::new(&issues).lines(issues.iter().map(|i| fmt::issue_line(i, now))).line(if n == 0 {
-        "No issues".to_string()
-    } else {
-        format!("-- {n} issue(s)")
-    });
+    let lines = fmt::nest(&issues, &parents)
+        .into_iter()
+        .map(|(depth, i)| format!("{}{}", bd_core::graph::indent(depth), fmt::issue_line(i, now)));
+    let out =
+        Out::new(&issues).lines(lines).line(if n == 0 { "No issues".to_string() } else { format!("-- {n} issue(s)") });
     let ids: Vec<String> = issues.iter().map(|i| i.id.clone()).collect();
     app.print(Out { ids, ..out });
     Ok(())

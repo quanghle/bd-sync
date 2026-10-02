@@ -3,6 +3,7 @@
 use bd_core::time::format_duration_ms;
 use bd_core::{Event, Issue, IssueDetails, IssueRef, Lease, Status, Timestamp, TreeNode};
 use serde_json::Value;
+use std::collections::HashMap;
 
 pub fn rel(t: Timestamp, now: Timestamp) -> String {
     let d = t.since(now);
@@ -27,6 +28,35 @@ pub fn issue_line(i: &Issue, now: Timestamp) -> String {
         s.push_str(&format!(" {{{}}}", i.labels.join(", ")));
     }
     s
+}
+
+/// Orders `issues` so each one listed with its parent (`parents[n]` is the
+/// parent of `issues[n]`) follows that parent, paired with its depth below the
+/// nearest unlisted ancestor. Siblings keep their order in `issues`; an empty
+/// `parents` leaves every issue at depth 0.
+pub fn nest<'a>(issues: &'a [Issue], parents: &[Option<String>]) -> Vec<(usize, &'a Issue)> {
+    let pos: HashMap<&str, usize> = issues.iter().enumerate().map(|(n, i)| (i.id.as_str(), n)).collect();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); issues.len()];
+    let mut roots = Vec::new();
+    for n in 0..issues.len() {
+        match parents.get(n).and_then(|p| p.as_deref()).and_then(|p| pos.get(p)) {
+            Some(&p) if p != n => children[p].push(n),
+            _ => roots.push(n),
+        }
+    }
+    let mut out = Vec::with_capacity(issues.len());
+    let mut seen = vec![false; issues.len()];
+    let mut stack: Vec<(usize, usize)> = roots.iter().rev().map(|&n| (0, n)).collect();
+    while let Some((depth, n)) = stack.pop() {
+        if std::mem::replace(&mut seen[n], true) {
+            continue;
+        }
+        out.push((depth, &issues[n]));
+        stack.extend(children[n].iter().rev().map(|&c| (depth + 1, c)));
+    }
+    // Parent links form a forest, but never drop an issue if they did not.
+    out.extend((0..issues.len()).filter(|&n| !seen[n]).map(|n| (0, &issues[n])));
+    out
 }
 
 pub fn ref_line(r: &IssueRef) -> String {

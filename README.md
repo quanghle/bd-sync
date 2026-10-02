@@ -931,9 +931,12 @@ an actor of its own, `<user>/claude-<id>.agent-<id>`:
 
 Both do nothing in the main conversation, when `$BD_ACTOR` or
 `$BEADS_ACTOR` names the actor, and on input they cannot read; `|| true`
-keeps an older bd without them from failing the hook. A bd run the hook
-cannot see in the command line (from a script, through `xargs`) still
-acts as the parent. Without the hooks, give each subagent its own session
+keeps an older bd without them from failing the hook. The guard looks
+through assignments and the wrappers `timeout`, `nice`, `env`, `sudo`,
+`stdbuf`, `nohup`, `time`, `command` and `exec` with their options, and
+reads here-document bodies as text. A form it does not understand is let
+through rather than refused, and a bd run it cannot see in the command
+line (from a script, through `xargs`) still acts as the parent. Without the hooks, give each subagent its own session
 in its prompt: "run every bd command as `bd --session <name> ...`", with a
 distinct `<name>` per subagent.
 
@@ -963,9 +966,8 @@ may only name the token's actor or one of its sub-actors. Without them, a
 client in an agent session sends its session, not its user name, and acts
 as `<token actor>/<session>`; `bd serve` never derives an actor from its own
 environment. Servers older than this ignore the session and use the
-token's actor. The client sends `--session` as part of its session; a
-server older than that flag refuses it as unknown, so use `BD_SESSION`
-with one. The token's actor is then the user: its sub-actors are the
+token's actor. A client's `--session` travels in its session label, not
+in the command line it sends. The token's actor is then the user: its sub-actors are the
 "other sessions" of a request that names no actor, while a request whose
 actor comes from `--actor` or the client's `$BD_ACTOR` has none.
 

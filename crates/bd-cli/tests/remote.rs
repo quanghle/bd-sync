@@ -2621,6 +2621,8 @@ fn clients_that_go_away_mid_answer_do_not_wedge_the_server() {
 struct FakeServer {
     url: String,
     requests: Arc<AtomicUsize>,
+    /// The request bodies it received.
+    bodies: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl FakeServer {
@@ -2629,6 +2631,8 @@ impl FakeServer {
         let url = format!("http://{}/w/proj", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
         let counter = requests.clone();
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = bodies.clone();
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(mut conn) = conn else { return };
@@ -2645,11 +2649,12 @@ impl FakeServer {
                 }
                 let mut body = vec![0; length];
                 let _ = reader.read_exact(&mut body);
+                received.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
                 let n = counter.fetch_add(1, Ordering::SeqCst);
                 let _ = conn.write_all(&answer(n));
             }
         });
-        FakeServer { url, requests }
+        FakeServer { url, requests, bodies }
     }
 
     fn client(&self) -> Client {
@@ -3556,4 +3561,21 @@ fn a_session_flag_reaches_the_server_with_the_session() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     let context = v["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
     assert!(context.contains("your own actor, `<token actor>/claude-3b4c5d6e.agent-792257ed`"), "{context}");
+}
+
+#[test]
+fn the_session_flag_travels_as_the_session_not_in_argv() {
+    // A server that predates --session would refuse it in argv; the label carries it.
+    let server = FakeServer::start(|_| answer(&[stdout_frame("ok\n"), exit_frame(0, "")], false, 0));
+    let out = server
+        .client()
+        .cmd(&["--session", "agent-792257ed", "close", "t-1", "--session=agent-792257ed", "--reason", "done"])
+        .env("CLAUDE_CODE_SESSION_ID", "8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr_of(&out));
+    let bodies = server.bodies.lock().unwrap();
+    let request: Value = serde_json::from_str(&bodies[0]).unwrap();
+    assert_eq!(request["argv"], json!(["close", "t-1", "--reason", "done"]));
+    assert_eq!(request["session"], "claude-3b4c5d6e.agent-792257ed");
 }

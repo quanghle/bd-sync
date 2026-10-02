@@ -1279,6 +1279,12 @@ fn claude_subagents_bd_commands_without_a_session_are_denied() {
     for allowed in [
         input(Some("acfc95cf1792257ed"), "Bash", "bd --session agent-792257ed close t-1"),
         input(Some("acfc95cf1792257ed"), "Bash", "cargo test"),
+        input(
+            Some("acfc95cf1792257ed"),
+            "Bash",
+            "bd --session agent-792257ed comment add t-1 --stdin <<'EOF'\nbd ready lists t-2.\nEOF",
+        ),
+        input(Some("acfc95cf1792257ed"), "Bash", "command -v bd && sudo -u bd whoami"),
         input(Some("acfc95cf1792257ed"), "PowerShell", "bd close t-1"),
         input(None, "Bash", "bd close t-1"),
         "{}".to_string(),
@@ -1286,6 +1292,8 @@ fn claude_subagents_bd_commands_without_a_session_are_denied() {
     ] {
         assert!(hook(&ws, "pre-tool-use", &[], &allowed).stdout.is_empty(), "{allowed}");
     }
+    let wrapped = input(Some("acfc95cf1792257ed"), "Bash", "timeout 30 bd close t-1");
+    assert!(String::from_utf8(hook(&ws, "pre-tool-use", &[], &wrapped).stdout).unwrap().contains("\"deny\""));
     let named = input(Some("acfc95cf1792257ed"), "Bash", "bd close t-1");
     assert!(hook(&ws, "pre-tool-use", &[("BD_ACTOR", "pool/w1")], &named).stdout.is_empty());
 }

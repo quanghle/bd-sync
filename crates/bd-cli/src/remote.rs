@@ -108,6 +108,28 @@ pub fn env_actor() -> Option<String> {
     env("BD_ACTOR").or_else(|| env("BEADS_ACTOR"))
 }
 
+/// `argv` without its global `--session <name>` or `--session=<name>`: the
+/// session label carries it (see [`identity`]), and a server that predates
+/// the flag would refuse it. Arguments after `--` are left alone.
+pub fn without_session_flag(argv: Vec<String>) -> Vec<String> {
+    let mut out = Vec::with_capacity(argv.len());
+    let mut args = argv.into_iter();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--" => {
+                out.push(a);
+                out.extend(args.by_ref());
+            }
+            "--session" => {
+                args.next();
+            }
+            s if s.starts_with("--session=") => {}
+            _ => out.push(a),
+        }
+    }
+    out
+}
+
 /// Who a request asks to act as, besides an `--actor` in its argv: the
 /// client's `$BD_ACTOR`, else its agent session ([`actor::session`]), which
 /// the server turns into the sub-actor `<token actor>/<session>`.
@@ -363,10 +385,13 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
         }
         _ => {}
     }
-    let argv = std::env::args_os()
+    let mut argv = std::env::args_os()
         .skip(1)
         .map(|a| a.into_string().map_err(|a| Error::invalid(format!("argument {a:?} is not valid UTF-8"))))
         .collect::<Result<Vec<_>>>()?;
+    if app.g.session.is_some() {
+        argv = without_session_flag(argv);
+    }
     let (actor, session) = identity();
     let mut request = ExecRequest {
         argv,
@@ -1455,6 +1480,21 @@ fn http_error(status: u16, body: &str, url: &str, bd: bool) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_session_flag_is_not_forwarded() {
+        let v = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            without_session_flag(v(&["--session", "agent-1", "close", "t-1", "--session=x", "--reason", "r"])),
+            v(&["close", "t-1", "--reason", "r"])
+        );
+        assert_eq!(
+            without_session_flag(v(&["comment", "add", "t-1", "--", "--session", "x"])),
+            v(&["comment", "add", "t-1", "--", "--session", "x"]),
+            "after --, text"
+        );
+        assert_eq!(without_session_flag(v(&["create", "--session x"])), v(&["create", "--session x"]));
+    }
 
     #[test]
     fn workspace_urls() {

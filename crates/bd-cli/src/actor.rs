@@ -460,8 +460,11 @@ fn remote_actor(app: &App, actor: &str) -> String {
 /// Where `command` (a shell command line) runs bd without naming a session
 /// or an actor: the byte offset just past each such `bd` word. A rough
 /// reading of the shell's grammar: quotes and escapes, command separators,
-/// leading assignments and wrappers (`env`, `sudo`, `then`, ...). A bd run
-/// it cannot see (from a script, through `xargs`) passes.
+/// here-documents, leading assignments, and the wrappers in [`WRAPPERS`]
+/// with their options. Where it is unsure (a wrapper option it does not
+/// know to take a value, `env -S`, a bd run from a script or through
+/// `xargs`) it finds nothing, so it never refuses a command that does not
+/// run bd.
 fn bd_without_actor(command: &str) -> Vec<usize> {
     let words = shell_words(command);
     let names = |w: &str| {
@@ -475,40 +478,36 @@ fn bd_without_actor(command: &str) -> Vec<usize> {
     }
     let mut found = Vec::new();
     for segment in words.split(|t| matches!(t, Token::Sep)) {
-        let mut at_command = true;
+        let word = |i: usize| match segment.get(i) {
+            Some(Token::Word { text, .. }) => Some(text.as_str()),
+            _ => None,
+        };
+        let named =
+            (0..segment.len()).any(|i| matches!(word(i), Some("--session" | "--actor")) && word(i + 1).is_some());
         let mut bd = None;
-        let mut named = false;
-        for (i, t) in segment.iter().enumerate() {
-            let Token::Word { text, end } = t else {
+        let mut at_command = true;
+        let mut i = 0;
+        while i < segment.len() {
+            let Token::Word { text, end } = &segment[i] else {
                 at_command = true;
+                i += 1;
                 continue;
             };
-            let next = segment.get(i + 1).and_then(|t| match t {
-                Token::Word { text, .. } => Some(text.as_str()),
-                _ => None,
-            });
-            if matches!(text.as_str(), "--session" | "--actor") && next.is_some() {
-                named = true;
-            }
             if !at_command {
+                i += 1;
                 continue;
             }
-            let assignment = text.split_once('=').is_some_and(|(k, _)| {
-                !k.is_empty()
-                    && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    && !k.starts_with(|c: char| c.is_ascii_digit())
-            });
-            const WRAPPERS: &[&str] = &[
-                "if", "then", "else", "elif", "do", "while", "until", "!", "{", "}", "time", "command", "exec",
-                "nohup", "env", "sudo", "nice", "builtin",
-            ];
-            if assignment || WRAPPERS.contains(&text.as_str()) || text.starts_with('-') {
-                continue;
-            }
-            at_command = false;
-            let program = text.rsplit(['/', '\\']).next().unwrap_or(text);
-            if bd.is_none() && matches!(program, "bd" | "bd.exe") {
-                bd = Some(*end);
+            match command_word(&word, i) {
+                Step::Skip(n) => i += n,
+                Step::Unsure => break,
+                Step::Command => {
+                    at_command = false;
+                    let program = text.rsplit(['/', '\\']).next().unwrap_or(text);
+                    if bd.is_none() && matches!(program, "bd" | "bd.exe") {
+                        bd = Some(*end);
+                    }
+                    i += 1;
+                }
             }
         }
         if let (Some(end), false) = (bd, named) {
@@ -516,6 +515,122 @@ fn bd_without_actor(command: &str) -> Vec<usize> {
         }
     }
     found
+}
+
+/// What a word in command position is.
+enum Step {
+    /// Not the command: an assignment, a keyword, or a wrapper with its
+    /// options and arguments, this many words; the command comes after.
+    Skip(usize),
+    /// Not a command run, or a form not understood: nothing to check here.
+    Unsure,
+    /// The command.
+    Command,
+}
+
+/// A command that runs the command after its options: its name, the short
+/// and long options that take a value, the short and long options after
+/// which it does not run one (or that are not understood), and how many
+/// arguments come before the command.
+struct Wrapper {
+    name: &'static str,
+    short_values: &'static str,
+    long_values: &'static [&'static str],
+    short_unsure: &'static str,
+    long_unsure: &'static [&'static str],
+    arguments: usize,
+}
+
+const fn wrapper(name: &'static str) -> Wrapper {
+    Wrapper { name, short_values: "", long_values: &[], short_unsure: "", long_unsure: &[], arguments: 0 }
+}
+
+/// Wrappers Claude Code also looks through when it matches a rule like `Bash(bd *)`.
+const WRAPPERS: &[Wrapper] = &[
+    Wrapper { short_unsure: "vV", ..wrapper("command") },
+    Wrapper {
+        short_values: "uC",
+        long_values: &["--unset", "--chdir"],
+        short_unsure: "S",
+        long_unsure: &["--split-string"],
+        ..wrapper("env")
+    },
+    Wrapper {
+        short_values: "ugCDRTpUrth",
+        long_values: &[
+            "--user",
+            "--group",
+            "--close-from",
+            "--chdir",
+            "--chroot",
+            "--command-timeout",
+            "--prompt",
+            "--other-user",
+            "--role",
+            "--type",
+            "--host",
+        ],
+        short_unsure: "lveVK",
+        long_unsure: &["--list", "--validate", "--edit", "--version", "--remove-timestamp"],
+        ..wrapper("sudo")
+    },
+    Wrapper { short_values: "n", long_values: &["--adjustment"], ..wrapper("nice") },
+    Wrapper { short_values: "sk", long_values: &["--signal", "--kill-after"], arguments: 1, ..wrapper("timeout") },
+    Wrapper { short_values: "ioe", long_values: &["--input", "--output", "--error"], ..wrapper("stdbuf") },
+    Wrapper { short_values: "a", ..wrapper("exec") },
+    wrapper("nohup"),
+    wrapper("builtin"),
+    wrapper("time"),
+];
+
+/// What the word `i` of a command (`word(i)`), in command position, is.
+fn command_word<'a>(word: &dyn Fn(usize) -> Option<&'a str>, i: usize) -> Step {
+    let Some(text) = word(i) else { return Step::Command };
+    let assignment = text.split_once('=').is_some_and(|(k, _)| {
+        !k.is_empty()
+            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && !k.starts_with(|c: char| c.is_ascii_digit())
+    });
+    const KEYWORDS: &[&str] = &["if", "then", "else", "elif", "do", "while", "until", "!", "{", "}"];
+    if assignment || KEYWORDS.contains(&text) {
+        return Step::Skip(1);
+    }
+    let Some(w) = WRAPPERS.iter().find(|w| w.name == text) else { return Step::Command };
+    let mut n = 1;
+    while let Some(arg) = word(i + n) {
+        if arg == "--" {
+            n += 1;
+            break;
+        }
+        if arg == "-" || !arg.starts_with('-') {
+            break;
+        }
+        n += 1;
+        if let Some(long) = arg.strip_prefix("--") {
+            let name = format!("--{}", long.split('=').next().unwrap_or(long));
+            if w.long_unsure.contains(&name.as_str()) {
+                return Step::Unsure;
+            }
+            if w.long_values.contains(&name.as_str()) && !long.contains('=') {
+                n += 1;
+            }
+            continue;
+        }
+        // Short options, combined (`-Eu root`) or with the value attached (`-n5`).
+        for (k, c) in arg[1..].char_indices() {
+            if w.short_unsure.contains(c) {
+                return Step::Unsure;
+            }
+            if w.short_values.contains(c) {
+                if k + c.len_utf8() == arg.len() - 1 {
+                    n += 1;
+                }
+                break;
+            }
+        }
+    }
+    n += w.arguments;
+    if word(i + n - 1).is_none() { Step::Unsure } else { Step::Skip(n) }
 }
 
 #[derive(Debug, PartialEq)]
@@ -529,11 +644,13 @@ enum Token {
 }
 
 /// `command` split into words and separators, roughly as a POSIX shell
-/// would; `#` comments are dropped.
+/// would; `#` comments and here-document bodies are dropped.
 fn shell_words(command: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut word: Option<String> = None;
     let mut quote: Option<char> = None;
+    // Here-documents whose bodies start after this line: their terminator, and whether `<<-` strips tabs.
+    let mut heredocs: Vec<(String, bool)> = Vec::new();
     let mut chars = command.char_indices().peekable();
     let finish = |word: &mut Option<String>, tokens: &mut Vec<Token>, end: usize| {
         if let Some(text) = word.take() {
@@ -559,7 +676,24 @@ fn shell_words(command: &str) -> Vec<Token> {
                 None => {}
             },
             (None, '#') if word.is_none() => while chars.next_if(|&(_, n)| n != '\n').is_some() {},
-            (None, ';' | '&' | '|' | '\n') => {
+            (None, '\n') => {
+                finish(&mut word, &mut tokens, i);
+                tokens.push(Token::Sep);
+                for (end, strip_tabs) in heredocs.drain(..) {
+                    loop {
+                        let mut line = String::new();
+                        while let Some((_, n)) = chars.next_if(|&(_, n)| n != '\n') {
+                            line.push(n);
+                        }
+                        let last = chars.next().is_none();
+                        let line = if strip_tabs { line.trim_start_matches('\t') } else { &line };
+                        if line == end || last {
+                            break;
+                        }
+                    }
+                }
+            }
+            (None, ';' | '&' | '|') => {
                 finish(&mut word, &mut tokens, i);
                 tokens.push(Token::Sep);
             }
@@ -573,6 +707,16 @@ fn shell_words(command: &str) -> Vec<Token> {
                 finish(&mut word, &mut tokens, i);
                 tokens.push(Token::Sub);
             }
+            (None, '<') if chars.peek().is_some_and(|&(_, n)| n == '<') => {
+                finish(&mut word, &mut tokens, i);
+                chars.next();
+                // `<<<` is a here-string: its word is an argument.
+                if chars.next_if(|&(_, n)| n == '<').is_none() {
+                    let strip_tabs = chars.next_if(|&(_, n)| n == '-').is_some();
+                    while chars.next_if(|&(_, n)| n == ' ' || n == '\t').is_some() {}
+                    heredocs.push((heredoc_end(&mut chars), strip_tabs));
+                }
+            }
             (None, '<' | '>') => finish(&mut word, &mut tokens, i),
             (None, c) if c.is_whitespace() => finish(&mut word, &mut tokens, i),
             (None, c) => word.get_or_insert_default().push(c),
@@ -580,6 +724,28 @@ fn shell_words(command: &str) -> Vec<Token> {
     }
     finish(&mut word, &mut tokens, command.len());
     tokens
+}
+
+/// The terminator word of a here-document (`<<EOF`, `<<'EOF'`, `<<"E"OF`), quotes removed.
+fn heredoc_end(chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>) -> String {
+    let mut end = String::new();
+    while let Some((_, c)) = chars.next_if(|&(_, c)| !c.is_whitespace() && !";&|<>()".contains(c)) {
+        match c {
+            '\'' | '"' => {
+                while let Some((_, n)) = chars.next_if(|&(_, n)| n != c) {
+                    end.push(n);
+                }
+                chars.next();
+            }
+            '\\' => {
+                if let Some((_, n)) = chars.next() {
+                    end.push(n);
+                }
+            }
+            c => end.push(c),
+        }
+    }
+    end
 }
 
 #[cfg(test)]
@@ -788,6 +954,69 @@ fi",
             "ls bd/ # bd ready",
             "cargo build && ./target/release/bdx ready",
             "rg bd",
+        ] {
+            assert_eq!(bd_without_actor(command), Vec::<usize>::new(), "{command}");
+        }
+    }
+
+    #[test]
+    fn here_documents_are_text_not_commands() {
+        let note = "bd --session agent-792257ed comment add t-1 --stdin <<'EOF'\nHandoff: tests pass.\nbd ready lists t-2 next.\nEOF";
+        for command in [
+            note,
+            "cat > notes.md <<EOF\nbd close t-1\nEOF",
+            "cat <<\"E\"OF\nbd close t-1\nEOF\necho done",
+            "cat <<-EOF\n\tbd close t-1\n\tEOF",
+            "cat <<A <<B\nbd x\nA\nbd y\nB",
+            "cat <<EOF\nbd close t-1",
+        ] {
+            assert_eq!(bd_without_actor(command), Vec::<usize>::new(), "{command:?}");
+        }
+        // The command after a here-document, or on its line, still counts; `<<<` is a here-string.
+        for (command, fixed) in [
+            ("cat <<EOF\nbd x\nEOF\nbd close t-1", "cat <<EOF\nbd x\nEOF\nbd --session X close t-1"),
+            ("bd comment add t-1 --stdin <<EOF\nbd x\nEOF", "bd --session X comment add t-1 --stdin <<EOF\nbd x\nEOF"),
+            ("cat <<-EOF\n\tx\n\tEOF\nbd ready", "cat <<-EOF\n\tx\n\tEOF\nbd --session X ready"),
+            ("bd batch <<< 'close t-1'", "bd --session X batch <<< 'close t-1'"),
+        ] {
+            assert_eq!(flagged(command), fixed, "{command:?}");
+        }
+    }
+
+    #[test]
+    fn wrappers_are_looked_through_with_their_options() {
+        for (command, fixed) in [
+            ("timeout 30 bd close t-1", "timeout 30 bd --session X close t-1"),
+            ("timeout -s KILL -k 5 30s bd close t-1", "timeout -s KILL -k 5 30s bd --session X close t-1"),
+            ("timeout --signal=TERM 1m bd ready", "timeout --signal=TERM 1m bd --session X ready"),
+            ("nice -n 5 bd close t-1", "nice -n 5 bd --session X close t-1"),
+            ("nice -n5 bd ready", "nice -n5 bd --session X ready"),
+            ("nice --adjustment 5 bd ready", "nice --adjustment 5 bd --session X ready"),
+            ("env -u FOO bd ready", "env -u FOO bd --session X ready"),
+            ("env -i -C /w FOO=1 bd ready", "env -i -C /w FOO=1 bd --session X ready"),
+            ("sudo -u root bd ready", "sudo -u root bd --session X ready"),
+            ("sudo -Eu root -- bd ready", "sudo -Eu root -- bd --session X ready"),
+            ("stdbuf -o L -eL bd ready", "stdbuf -o L -eL bd --session X ready"),
+            ("nohup time -p bd ready", "nohup time -p bd --session X ready"),
+            ("command bd close t-1", "command bd --session X close t-1"),
+            ("exec -a name bd ready", "exec -a name bd --session X ready"),
+        ] {
+            assert_eq!(flagged(command), fixed, "{command}");
+        }
+        for command in [
+            "command -v bd",
+            "command -V bd",
+            "if command -v bd >/dev/null; then echo ok; fi",
+            "sudo -u bd whoami",
+            "sudo -g bd id",
+            "env -u bd printenv",
+            "timeout 30 cargo test",
+            "timeout -k bd 5 true",
+            "nice -n 5 make",
+            "stdbuf -o bd cat",
+            "env -S 'bd ready'",
+            "sudo -l bd",
+            "sudo -u",
         ] {
             assert_eq!(bd_without_actor(command), Vec::<usize>::new(), "{command}");
         }

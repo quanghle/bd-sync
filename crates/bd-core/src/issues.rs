@@ -1036,10 +1036,10 @@ impl WriteCtx<'_> {
         }
         let mut seeds: Vec<String> = detached.clone();
         for s in &deleted {
-            if let Some(p) = graph::parent_of(self.conn(), s)? {
-                if !set.contains(&p) {
-                    seeds.extend(graph::waiters_on(self.conn(), &p)?);
-                }
+            if let Some(p) = graph::parent_of(self.conn(), s)?
+                && !set.contains(&p)
+            {
+                seeds.extend(graph::waiters_on(self.conn(), &p)?);
             }
         }
         for s in &deleted {
@@ -1100,10 +1100,10 @@ impl WriteCtx<'_> {
         }
         seeds.extend(detached.iter().cloned());
         for s in set {
-            if let Some(p) = graph::parent_of(self.conn(), s)? {
-                if !set.contains(&p) {
-                    seeds.extend(graph::waiters_on(self.conn(), &p)?);
-                }
+            if let Some(p) = graph::parent_of(self.conn(), s)?
+                && !set.contains(&p)
+            {
+                seeds.extend(graph::waiters_on(self.conn(), &p)?);
             }
         }
         data["ids"] = json!(set);

@@ -189,10 +189,10 @@ fn gate_below(conn: &rusqlite::Connection, id: &str) -> Result<Option<String>> {
         if is_open_human_gate(&d) {
             return Ok(Some(d.id));
         }
-        if !d.status.is_terminal() {
-            if let Some(g) = human_gates_on(conn, &d.id)? {
-                return Ok(Some(g));
-            }
+        if !d.status.is_terminal()
+            && let Some(g) = human_gates_on(conn, &d.id)?
+        {
+            return Ok(Some(g));
         }
     }
     Ok(None)
@@ -298,10 +298,10 @@ impl WriteCtx<'_> {
             return Ok(None);
         }
         let lease = claims::get_lease(self.conn(), &issue.id)?;
-        if let Some(l) = &lease {
-            if claims::is_reclaimable(self.conn(), l, self.now())? {
-                return Ok(None);
-            }
+        if let Some(l) = &lease
+            && claims::is_reclaimable(self.conn(), l, self.now())?
+        {
+            return Ok(None);
         }
         Ok(Some(LiveClaim { holder: holder.to_string(), lease }))
     }
@@ -415,10 +415,8 @@ impl WriteCtx<'_> {
             return Err(human_only(&issue.id, &Hold::Is, "open it"));
         }
         // Without force, a close that gets here is not held back by anything.
-        if force {
-            if let Some(hold) = human_hold(self.conn(), issue)? {
-                return Err(human_only(&issue.id, &hold, "close it"));
-            }
+        if force && let Some(hold) = human_hold(self.conn(), issue)? {
+            return Err(human_only(&issue.id, &hold, "close it"));
         }
         Ok(())
     }
@@ -444,10 +442,10 @@ impl WriteCtx<'_> {
                 let what = if new.status.is_terminal() { "open it" } else { "change its type or condition" };
                 return Err(human_only(&old.id, &Hold::Is, what));
             }
-            if new.status.is_terminal() {
-                if let Some(hold) = human_hold(self.conn(), old)? {
-                    return Err(human_only(&old.id, &hold, "pin it"));
-                }
+            if new.status.is_terminal()
+                && let Some(hold) = human_hold(self.conn(), old)?
+            {
+                return Err(human_only(&old.id, &hold, "pin it"));
             }
             if let Some(parent) = moved_from {
                 self.check_move_out(old, parent)?;

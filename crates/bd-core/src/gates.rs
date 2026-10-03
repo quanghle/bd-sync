@@ -168,10 +168,10 @@ impl GateSpec {
                 )));
             }
         }
-        if let Some(t) = &self.timeout {
-            if parse_duration(t)?.is_zero() {
-                return Err(Error::invalid(format!("gate timeout {t:?} must be positive")));
-            }
+        if let Some(t) = &self.timeout
+            && parse_duration(t)?.is_zero()
+        {
+            return Err(Error::invalid(format!("gate timeout {t:?} must be positive")));
         }
         if let Some(repo) = &self.repo {
             if !self.kind.is_github() {
@@ -189,17 +189,17 @@ impl GateSpec {
                 )));
             }
         }
-        if let Some(b) = &self.branch {
-            if b.is_empty() || b.len() > 255 || b.chars().any(|c| c.is_whitespace() || c.is_control()) {
-                return Err(Error::invalid(format!("invalid branch {b:?}")));
-            }
+        if let Some(b) = &self.branch
+            && (b.is_empty() || b.len() > 255 || b.chars().any(|c| c.is_whitespace() || c.is_control()))
+        {
+            return Err(Error::invalid(format!("invalid branch {b:?}")));
         }
-        if let Some(e) = &self.event {
-            if e.is_empty() || !e.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
-                return Err(Error::invalid(format!(
-                    "invalid event {e:?} (a GitHub event name such as push or workflow_dispatch)"
-                )));
-            }
+        if let Some(e) = &self.event
+            && (e.is_empty() || !e.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+        {
+            return Err(Error::invalid(format!(
+                "invalid event {e:?} (a GitHub event name such as push or workflow_dispatch)"
+            )));
         }
         Ok(())
     }

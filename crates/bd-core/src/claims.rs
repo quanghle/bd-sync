@@ -276,10 +276,11 @@ impl WriteCtx<'_> {
         if issue.status != Status::Open {
             return Err(Error::NotClaimable { id: id.to_string(), status: issue.status });
         }
-        if let Some(holder) = &issue.assignee {
-            if *holder != actor && !config::claim_pools(self.conn())?.contains(holder) {
-                return Err(Error::AlreadyClaimed { id: id.to_string(), holder: holder.clone() });
-            }
+        if let Some(holder) = &issue.assignee
+            && *holder != actor
+            && !config::claim_pools(self.conn())?.contains(holder)
+        {
+            return Err(Error::AlreadyClaimed { id: id.to_string(), holder: holder.clone() });
         }
         if !opts.allow_blocked && !ready_verified {
             let reasons = ready::not_ready_reasons(self.conn(), &issue, now)?;
@@ -346,14 +347,14 @@ impl WriteCtx<'_> {
                         holder: Some(lease.holder),
                     });
                 }
-                if let Some(t) = token {
-                    if t != lease.token {
-                        return Err(Error::LeaseLost {
-                            id: id.to_string(),
-                            detail: format!("token {t} is stale (current token {})", lease.token),
-                            holder: Some(lease.holder),
-                        });
-                    }
+                if let Some(t) = token
+                    && t != lease.token
+                {
+                    return Err(Error::LeaseLost {
+                        id: id.to_string(),
+                        detail: format!("token {t} is stale (current token {})", lease.token),
+                        holder: Some(lease.holder),
+                    });
                 }
                 renew_lease(self.conn(), id, now, ttl)
             }

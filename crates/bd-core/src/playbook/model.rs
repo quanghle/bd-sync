@@ -761,12 +761,12 @@ fn convert_step(raw: RawStep, path: &str) -> std::result::Result<Step, String> {
 }
 
 fn convert(raw: RawPlaybook, default_name: &str) -> std::result::Result<Playbook, String> {
-    if let Some(kind) = &raw.kind {
-        if !kind.eq_ignore_ascii_case("workflow") {
-            return Err(format!(
-                "type {kind:?} is not supported: playbooks are workflows (beads expansion/aspect formulas have no equivalent; compose with expand)"
-            ));
-        }
+    if let Some(kind) = &raw.kind
+        && !kind.eq_ignore_ascii_case("workflow")
+    {
+        return Err(format!(
+            "type {kind:?} is not supported: playbooks are workflows (beads expansion/aspect formulas have no equivalent; compose with expand)"
+        ));
     }
     let name = raw.playbook.clone().unwrap_or_else(|| default_name.to_string());
     if !valid_name(&name) {

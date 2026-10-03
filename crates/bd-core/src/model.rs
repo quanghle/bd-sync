@@ -588,36 +588,36 @@ impl Guard {
     }
 
     pub fn check(&self, issue: &Issue) -> Result<()> {
-        if let Some(rev) = self.if_revision {
-            if issue.revision != rev {
-                return Err(Error::Conflict {
-                    id: issue.id.clone(),
-                    field: "revision",
-                    expected: rev.to_string(),
-                    actual: issue.revision.to_string(),
-                });
-            }
+        if let Some(rev) = self.if_revision
+            && issue.revision != rev
+        {
+            return Err(Error::Conflict {
+                id: issue.id.clone(),
+                field: "revision",
+                expected: rev.to_string(),
+                actual: issue.revision.to_string(),
+            });
         }
-        if let Some(status) = self.if_status {
-            if issue.status != status {
-                return Err(Error::Conflict {
-                    id: issue.id.clone(),
-                    field: "status",
-                    expected: status.to_string(),
-                    actual: issue.status.to_string(),
-                });
-            }
+        if let Some(status) = self.if_status
+            && issue.status != status
+        {
+            return Err(Error::Conflict {
+                id: issue.id.clone(),
+                field: "status",
+                expected: status.to_string(),
+                actual: issue.status.to_string(),
+            });
         }
-        if let Some(expected) = &self.if_assignee {
-            if issue.assignee.as_deref() != expected.as_deref() {
-                let show = |a: Option<&str>| a.map(|s| format!("{s:?}")).unwrap_or_else(|| "unassigned".into());
-                return Err(Error::Conflict {
-                    id: issue.id.clone(),
-                    field: "assignee",
-                    expected: show(expected.as_deref()),
-                    actual: show(issue.assignee.as_deref()),
-                });
-            }
+        if let Some(expected) = &self.if_assignee
+            && issue.assignee.as_deref() != expected.as_deref()
+        {
+            let show = |a: Option<&str>| a.map(|s| format!("{s:?}")).unwrap_or_else(|| "unassigned".into());
+            return Err(Error::Conflict {
+                id: issue.id.clone(),
+                field: "assignee",
+                expected: show(expected.as_deref()),
+                actual: show(issue.assignee.as_deref()),
+            });
         }
         Ok(())
     }

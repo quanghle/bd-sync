@@ -656,10 +656,10 @@ impl Drop for FrameWriter {
         // A writer dropped unfinished (a panic) ends a streamed answer in an
         // error; an answer not started yet is never sent, which the server
         // reports as a failure.
-        if !self.finished {
-            if let Some(pipe) = &self.pipe {
-                pipe.end(false);
-            }
+        if !self.finished
+            && let Some(pipe) = &self.pipe
+        {
+            pipe.end(false);
         }
     }
 }

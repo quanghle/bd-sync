@@ -668,10 +668,11 @@ pub fn rotate(
             user.login, file.tokens[i].actor
         )));
     }
-    if by_login && !related(&actor, &user.login) {
-        if let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now) {
-            return Err(conflict_error(&user.login, Some(user), other));
-        }
+    if by_login
+        && !related(&actor, &user.login)
+        && let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now)
+    {
+        return Err(conflict_error(&user.login, Some(user), other));
     }
     if let Some(other) = actor_conflict(&file.tokens, &actor, Some(user), now) {
         return Err(conflict_error(&actor, Some(user), other));
@@ -765,10 +766,11 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
                 )));
             }
             // A renamed account let in by a login that names another principal's actor must not pass for it.
-            if by_login && !related(&actor, &user.login) {
-                if let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now) {
-                    return Err(conflict_error(&user.login, Some(user), other));
-                }
+            if by_login
+                && !related(&actor, &user.login)
+                && let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now)
+            {
+                return Err(conflict_error(&user.login, Some(user), other));
             }
             let label: String = actor.chars().take(40).collect();
             let name = format!("github-{label}-{}", random_hex(4)?);

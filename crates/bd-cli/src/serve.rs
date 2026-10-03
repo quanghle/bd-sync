@@ -1389,10 +1389,10 @@ impl Server {
             self.feeds.committed(&ws.name);
         }
         let recorded = app.request.as_ref().filter(|k| k.recorded).map(|k| k.id.clone());
-        if let Some(store) = app.take_store() {
-            if !read_only || store.connection().pragma_update(None, "query_only", false).is_ok() {
-                ws.give(store);
-            }
+        if let Some(store) = app.take_store()
+            && (!read_only || store.connection().pragma_update(None, "query_only", false).is_ok())
+        {
+            ws.give(store);
         }
         let sent = out.borrow_mut().finish(Exit { exit_code, stderr: lossy(captured.stderr), replayed: false });
         let sent = match sent.held {

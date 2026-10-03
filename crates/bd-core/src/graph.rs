@@ -594,12 +594,12 @@ fn validate_edge_metadata(dep_type: &DepType, metadata: &Value) -> Result<()> {
     if !metadata.is_object() {
         return Err(Error::invalid("dependency metadata must be a JSON object"));
     }
-    if *dep_type == DepType::WaitsFor {
-        if let Some(gate) = metadata.get("gate") {
-            match gate.as_str() {
-                Some("all-children") | Some("any-children") => {}
-                _ => return Err(Error::invalid("waits-for gate must be \"all-children\" or \"any-children\"")),
-            }
+    if *dep_type == DepType::WaitsFor
+        && let Some(gate) = metadata.get("gate")
+    {
+        match gate.as_str() {
+            Some("all-children") | Some("any-children") => {}
+            _ => return Err(Error::invalid("waits-for gate must be \"all-children\" or \"any-children\"")),
         }
     }
     Ok(())
@@ -658,12 +658,12 @@ pub(crate) fn insert_edge_checked(
             return Err(Error::Refused(format!("parent {target} is closed; reopen it before adding open children")));
         }
     }
-    if dep_type.is_scheduling() {
-        if let Some(path) = scheduling_path(conn, target, issue)? {
-            let mut cycle = vec![issue.to_string()];
-            cycle.extend(path);
-            return Err(Error::Cycle { path: cycle });
-        }
+    if dep_type.is_scheduling()
+        && let Some(path) = scheduling_path(conn, target, issue)?
+    {
+        let mut cycle = vec![issue.to_string()];
+        cycle.extend(path);
+        return Err(Error::Cycle { path: cycle });
     }
     if matches!(dep_type, DepType::Blocks | DepType::ConditionalBlocks) {
         // An ancestor/descendant blocking edge is a deadlock: a parent can't

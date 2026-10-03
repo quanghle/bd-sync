@@ -89,12 +89,11 @@ fn clearable_time(v: &Option<String>, now: Timestamp) -> Result<Option<Option<Ti
 
 fn dep_spec<Q: Queries + ?Sized>(q: &Q, s: &str) -> Result<(DepType, String)> {
     let s = s.trim();
-    if let Some((t, id)) = s.split_once(':') {
-        if !id.is_empty() {
-            if let Ok(dep_type) = DepType::parse(t) {
-                return Ok((dep_type, q.resolve_id(id)?));
-            }
-        }
+    if let Some((t, id)) = s.split_once(':')
+        && !id.is_empty()
+        && let Ok(dep_type) = DepType::parse(t)
+    {
+        return Ok((dep_type, q.resolve_id(id)?));
     }
     Ok((DepType::Blocks, q.resolve_id(s)?))
 }
@@ -607,10 +606,10 @@ pub fn cmd_init(app: &mut App, a: &InitArgs) -> Result<()> {
         IdModeArg::Counter => IdMode::Counter,
     };
     let store = Store::init(&path, InitOptions { prefix: prefix.clone(), id_mode }, app.open_options())?;
-    if let Some(dir) = path.parent() {
-        if dir.file_name().is_some_and(|n| n == ".bd") {
-            write_bd_gitignore(dir)?;
-        }
+    if let Some(dir) = path.parent()
+        && dir.file_name().is_some_and(|n| n == ".bd")
+    {
+        write_bd_gitignore(dir)?;
     }
     app.set_store(store);
     let out = Out::new(json!({ "path": path, "prefix": prefix, "id_mode": id_mode.as_str() }))

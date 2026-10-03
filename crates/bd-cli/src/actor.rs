@@ -128,10 +128,10 @@ pub fn set_session_flag(name: &str) -> Result<()> {
 /// A non-empty, trimmed environment variable; for `$BD_SESSION`, this
 /// process's `--session` if it has one.
 pub fn env(name: &str) -> Option<String> {
-    if name == SESSION_VAR {
-        if let Some(s) = SESSION_FLAG.get() {
-            return Some(s.clone());
-        }
+    if name == SESSION_VAR
+        && let Some(s) = SESSION_FLAG.get()
+    {
+        return Some(s.clone());
     }
     std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }

@@ -45,10 +45,10 @@ fn run(cli: Cli) -> i32 {
         Ok(app) => app,
         Err(e) => return report(&e, json),
     };
-    if let Some(name) = &cli.global.session {
-        if let Err(e) = actor::set_session_flag(name) {
-            return report(&e, json);
-        }
+    if let Some(name) = &cli.global.session
+        && let Err(e) = actor::set_session_flag(name)
+    {
+        return report(&e, json);
     }
     if hook::works_in_session_dir(&cli.command) {
         hook::enter_session_dir(&mut app);
@@ -146,12 +146,12 @@ fn report_as(e: &Error, json: bool, actor: Option<&actor::Resolved>) -> i32 {
 /// Only an actor bd derived has other sessions ([`actor::user_root`]).
 fn other_session_hint(e: &Error, resolved: &actor::Resolved) -> Option<String> {
     let me = resolved.actor.as_str();
-    if let Error::LeaseLost { id, holder: Some(h), .. } = e {
-        if h == me {
-            return Some(format!(
-                "you still hold {id}, under a newer lease token (named above; `bd show {id}` shows it): use that one"
-            ));
-        }
+    if let Error::LeaseLost { id, holder: Some(h), .. } = e
+        && h == me
+    {
+        return Some(format!(
+            "you still hold {id}, under a newer lease token (named above; `bd show {id}` shows it): use that one"
+        ));
     }
     let (id, holder) = match e {
         Error::NotOwner { id, holder: Some(h), .. } | Error::LeaseLost { id, holder: Some(h), .. } => (id, h),

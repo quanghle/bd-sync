@@ -2073,10 +2073,11 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
         out = out.line("  note: $BD_TOKEN is set, and takes precedence over saved tokens for the server named by --remote or $BD_REMOTE");
     }
     let here = configured(app).ok().flatten().is_some_and(|here| here.url == c.url);
-    if !a.no_verify && here {
-        if let Some(hint) = agents_hint(app, Remote::new(c, trust, token)) {
-            out = out.line(hint);
-        }
+    if !a.no_verify
+        && here
+        && let Some(hint) = agents_hint(app, Remote::new(c, trust, token))
+    {
+        out = out.line(hint);
     }
     app.print(out.id(saved.key));
     Ok(())

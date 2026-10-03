@@ -169,10 +169,10 @@ impl Store {
                 return Err(Error::invalid(format!("{} is already initialized", path.display())));
             }
         }
-        if let Some(dir) = path.parent() {
-            if !dir.as_os_str().is_empty() {
-                std::fs::create_dir_all(dir)?;
-            }
+        if let Some(dir) = path.parent()
+            && !dir.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(dir)?;
         }
         let conn = Connection::open(path)?;
         let mut store = Store::configure(conn, path, opts)?;

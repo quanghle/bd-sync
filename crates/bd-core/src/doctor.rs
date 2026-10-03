@@ -204,12 +204,12 @@ fn repair_leases(tx: &mut WriteCtx<'_>, missing: &[String], stray: &[String]) ->
         let (status, assignee): (String, Option<String>) =
             tx.conn()
                 .query_row("SELECT status, assignee FROM issues WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
-        if status == "in_progress" {
-            if let Some(holder) = assignee {
-                let seq = tx.emit("lease_granted", Some(id), json!({ "reason": "doctor" }))?;
-                let now = tx.now();
-                claims::upsert_lease(tx.conn(), id, &holder, seq, now, ttl)?;
-            }
+        if status == "in_progress"
+            && let Some(holder) = assignee
+        {
+            let seq = tx.emit("lease_granted", Some(id), json!({ "reason": "doctor" }))?;
+            let now = tx.now();
+            claims::upsert_lease(tx.conn(), id, &holder, seq, now, ttl)?;
         }
     }
     Ok(())

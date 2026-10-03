@@ -40,7 +40,7 @@ Add dependencies so that `Cargo.lock` stays compatible with the MSRV:
 
 ```bash
 CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo add <crate>
-cargo +1.85 check --workspace --all-targets --locked
+cargo +1.88 check --workspace --all-targets --locked
 ```
 
 ## Conventions

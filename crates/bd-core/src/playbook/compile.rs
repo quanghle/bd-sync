@@ -780,10 +780,10 @@ impl Builder<'_> {
             // one of its groups; an edge there would deadlock.
             let own = format!("{}.", node.key);
             needs.retain(|k| *k != node.key && !k.starts_with(&own) && !node.key.starts_with(&format!("{k}.")));
-            if let Some(p) = &node.prev {
-                if !needs.contains(p) {
-                    needs.push(p.clone());
-                }
+            if let Some(p) = &node.prev
+                && !needs.contains(p)
+            {
+                needs.push(p.clone());
             }
             let mut waits: Option<(String, Value)> = None;
             if let Some(w) = &step.waits_for {

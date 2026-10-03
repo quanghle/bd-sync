@@ -199,23 +199,24 @@ impl App {
         let out = store.write(op, &actor, |tx| {
             tx.set_policy(policy);
             let out = f(tx)?;
-            if let Some((id, principal)) = &key {
-                if !tx.is_rollback_only() {
-                    tx.record_request(id, principal, op)?;
-                    recorded = true;
-                }
+            if let Some((id, principal)) = &key
+                && !tx.is_rollback_only()
+            {
+                tx.record_request(id, principal, op)?;
+                recorded = true;
             }
             Ok(out)
         });
-        if let Some(stats) = store.last_tx_stats().cloned() {
-            if out.is_ok() {
-                self.tx.push(stats);
-            }
+        if let Some(stats) = store.last_tx_stats().cloned()
+            && out.is_ok()
+        {
+            self.tx.push(stats);
         }
-        if out.is_ok() && recorded {
-            if let Some(k) = self.request.as_mut() {
-                k.recorded = true;
-            }
+        if out.is_ok()
+            && recorded
+            && let Some(k) = self.request.as_mut()
+        {
+            k.recorded = true;
         }
         out
     }

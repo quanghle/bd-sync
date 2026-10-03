@@ -451,10 +451,10 @@ fn tables(sql: &str) -> BTreeMap<String, String> {
     for c in re.captures_iter(sql) {
         let table = c[1].to_ascii_lowercase();
         out.insert(table.clone(), table.clone());
-        if let Some(alias) = c.get(2).map(|m| m.as_str()) {
-            if !KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(alias)) {
-                out.insert(alias.to_string(), table);
-            }
+        if let Some(alias) = c.get(2).map(|m| m.as_str())
+            && !KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(alias))
+        {
+            out.insert(alias.to_string(), table);
         }
     }
     out

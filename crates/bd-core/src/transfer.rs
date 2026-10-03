@@ -362,16 +362,14 @@ impl WriteCtx<'_> {
                         .push(format!("{}: skipped edge to missing/invalid target {}", issue.id, d.depends_on_id));
                     continue;
                 }
-                if dep_type == DepType::ParentChild {
-                    if let Some(p) = graph::parent_of(self.conn(), &issue.id)? {
-                        if p != d.depends_on_id {
-                            summary.warnings.push(format!(
-                                "{}: kept parent {p}, skipped second parent {}",
-                                issue.id, d.depends_on_id
-                            ));
-                            continue;
-                        }
-                    }
+                if dep_type == DepType::ParentChild
+                    && let Some(p) = graph::parent_of(self.conn(), &issue.id)?
+                    && p != d.depends_on_id
+                {
+                    summary
+                        .warnings
+                        .push(format!("{}: kept parent {p}, skipped second parent {}", issue.id, d.depends_on_id));
+                    continue;
                 }
                 let metadata = object_metadata(d.metadata.clone());
                 let existing = graph::load_edge(self.conn(), &issue.id, &d.depends_on_id)?;
@@ -560,10 +558,10 @@ impl WriteCtx<'_> {
             .into_iter()
             .filter_map(|(k, v)| v.as_ref().filter(|s| !s.is_empty()).map(|s| (k.to_string(), json!(s))))
             .collect();
-        if !beads.is_empty() {
-            if let Some(obj) = metadata.as_object_mut() {
-                obj.entry("beads").or_insert(Value::Object(beads));
-            }
+        if !beads.is_empty()
+            && let Some(obj) = metadata.as_object_mut()
+        {
+            obj.entry("beads").or_insert(Value::Object(beads));
         }
         let issue = Issue {
             id: raw.id.trim().to_string(),

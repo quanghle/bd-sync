@@ -262,6 +262,13 @@ impl Store {
         // Fewer, larger checkpoints: each one fsyncs, and that is the main
         // source of tail latency for small transactions.
         conn.pragma_update(None, "wal_autocheckpoint", 4_000)?;
+        // The query planner stability guarantee: plans never depend on the
+        // values bound to a statement. Without it, SQLite (built with STAT4)
+        // plans with some bound values, such as a LIMIT's or a LIKE pattern,
+        // and prepares the statement again each time one is bound, so every
+        // run of a cached statement pays its planning (`tests/plans.rs`).
+        // bd fixes its plans whatever the values and statistics anyway.
+        conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG, true)?;
         conn.set_prepared_statement_cache_capacity(256);
         Ok(Store { conn, path: path.to_path_buf(), opts, last_tx: None })
     }

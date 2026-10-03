@@ -27,8 +27,8 @@ use bd_core::gates::{self, GateKind, GateSpec, NewGate};
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::*;
 use bd_core::{comments, config, events, metrics, playbook, requests};
-use rusqlite::Connection;
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
+use rusqlite::{Connection, StatementStatus};
 use serde_json::json;
 use tempfile::TempDir;
 
@@ -77,26 +77,44 @@ const WHOLE_TABLE: &[(&str, &str)] = &[
 ];
 
 static STATEMENTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+/// The statements SQLite prepared again, and how many times.
+static PREPARED_AGAIN: Mutex<BTreeMap<String, i32>> = Mutex::new(BTreeMap::new());
 static RECORDING: Mutex<()> = Mutex::new(());
 
 fn record(event: TraceEvent<'_>) {
-    if let TraceEvent::Stmt(_, sql) = event {
+    if let TraceEvent::Stmt(stmt, sql) = event {
         // Foreign key actions run as `-- TRIGGER ...` programs of their statement.
         if !sql.starts_with("--") {
             STATEMENTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).insert(sql.to_string());
+            let again = stmt.get_status(StatementStatus::RePrepare);
+            if again > 0 {
+                let mut prepared = PREPARED_AGAIN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let n = prepared.entry(sql.to_string()).or_default();
+                *n = (*n).max(again);
+            }
         }
     }
 }
 
-/// The statements `work` prepares in a new workspace.
-fn statements_of(work: fn(&mut Ws)) -> BTreeSet<String> {
+/// The statements `work` prepares in a new workspace, and those of them
+/// SQLite prepared again, with how many times.
+fn recorded(work: fn(&mut Ws)) -> (BTreeSet<String>, BTreeMap<String, i32>) {
     let _one_at_a_time = RECORDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     STATEMENTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
+    PREPARED_AGAIN.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clear();
     let mut ws = Ws::new();
     ws.store.connection().trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(record));
     work(&mut ws);
     ws.store.connection().trace_v2(TraceEventCodes::empty(), None);
-    std::mem::take(&mut *STATEMENTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+    (
+        std::mem::take(&mut *STATEMENTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())),
+        std::mem::take(&mut *PREPARED_AGAIN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())),
+    )
+}
+
+/// The statements `work` prepares in a new workspace.
+fn statements_of(work: fn(&mut Ws)) -> BTreeSet<String> {
+    recorded(work).0
 }
 
 struct Ws {
@@ -320,6 +338,13 @@ fn run_the_commands(ws: &mut Ws) {
                 let mine = WorkFilter { assignee: Some("bot".into()), ..Default::default() };
                 r.ready(&ReadyQuery { filter: mine.clone(), ..Default::default() })?;
                 r.list(&ListQuery { filter: mine, statuses: vec![Status::InProgress], ..Default::default() })?;
+                // Bound limits and patterns, which must not make SQLite prepare a statement again.
+                r.ready(&ReadyQuery { sort: SortPolicy::Hybrid, limit: Some(5), ..Default::default() })?;
+                r.list(&ListQuery { limit: Some(10), search: Some("wor".into()), ..Default::default() })?;
+                r.blocked(&WorkFilter::default(), Some(10))?;
+                r.events_each(&EventQuery { limit: Some(5), ..Default::default() }, 2, &mut |_| Ok(()))?;
+                let after = EventQuery { since: Some(head.saturating_sub(10)), limit: Some(7), ..Default::default() };
+                r.events_each(&after, 3, &mut |_| Ok(()))?;
                 Ok(())
             })
             .unwrap();
@@ -554,6 +579,20 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         failures.extend(self::failures(name, &ws, &statements));
     }
     assert!(failures.is_empty(), "{} failures:\n\n{}", failures.len(), failures.join("\n\n"));
+}
+
+/// bd's connections keep the query planner stability guarantee (see
+/// `Store`): without it, SQLite (built with STAT4) plans with some bound
+/// values, such as a LIMIT's or a LIKE pattern, and so prepares a statement
+/// again each time one is bound, and each run of a cached statement pays its
+/// planning.
+#[test]
+fn no_statement_is_prepared_again() {
+    let mut again = BTreeMap::new();
+    for work in [walk_the_graph as fn(&mut Ws), run_the_commands] {
+        again.extend(recorded(work).1);
+    }
+    assert!(again.is_empty(), "{} statements prepared again: {again:#?}", again.len());
 }
 
 #[test]

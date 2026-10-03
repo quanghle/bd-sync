@@ -117,11 +117,9 @@ pub(crate) fn ready_for(
                 .to_string()
         }
     };
-    // A literal, not a parameter: SQLite (built with STAT4) plans with a bound
-    // LIMIT's value, and so prepares the statement again each time it is bound,
-    // which `claim --next` would pay on every claim.
     if let Some(n) = q.limit {
-        tail.push_str(&format!(" LIMIT {}", i64::try_from(n).unwrap_or(i64::MAX)));
+        tail.push_str(" LIMIT ?");
+        tail_params.push(SqlValue::Integer(i64::try_from(n).unwrap_or(i64::MAX)));
     }
     let (sql, params) = parts.build(&format!("SELECT {ISSUE_COLUMNS} FROM issues i"), &tail, tail_params);
     let mut stmt = conn.prepare_cached(&sql)?;

@@ -37,7 +37,12 @@
 //! ([`SignInPoll`] -> [`SignInAnswer`]). Their answers are JSON, and their
 //! failures [`ErrorBody`]s. `POST <server>/v2/auth/revoke`, sent with a
 //! token as its bearer token, revokes that token if it came from GitHub
-//! sign-in ([`RevokeAnswer`]; `bd remote logout`).
+//! sign-in ([`RevokeAnswer`]; `bd remote logout`); sent with a sign-in's
+//! refresh token (and `{"request_id"}` of a refresh whose answer was lost),
+//! it revokes the sign-in. `POST
+//! <server>/v2/auth/refresh`, sent with a sign-in's refresh token as its
+//! bearer token ([`RefreshRequest`] -> [`Issued`]), gives the sign-in new
+//! access and refresh tokens; the refresh token sent is spent.
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -200,11 +205,25 @@ pub struct RevokeAnswer {
     pub revoked: bool,
 }
 
-/// An access token issued by GitHub sign-in.
+/// Body of `POST <server>/v2/auth/refresh`, sent with the refresh token as
+/// its bearer token.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RefreshRequest {
+    /// Every retry of one refresh sends the same id: the server answers it
+    /// again with the tokens it issued, where another request with the same
+    /// refresh token revokes the sign-in.
+    pub request_id: String,
+}
+
+/// An access token issued by GitHub sign-in, or by a refresh.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Issued {
     /// The secret: saved by the client, never shown.
     pub token: String,
+    /// The refresh secret, where the server refreshes tokens: saved by the
+    /// client, never shown, and sent only to `/v2/auth/refresh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
     pub name: String,
     pub actor: String,
     pub role: String,
@@ -214,6 +233,12 @@ pub struct Issued {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_claims: Option<u32>,
     pub expires_at: String,
+    /// Seconds until it expires: what the client plans its refresh by, on its own clock.
+    #[serde(default)]
+    pub expires_in: u64,
+    /// Until when it may be refreshed, as of now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refreshable_until: Option<String>,
     /// The GitHub login that signed in.
     pub login: String,
     /// What let the account in: `GitHub user alice`, `member of acme`, `member of team acme/bd`.

@@ -76,17 +76,24 @@ the server issues an access token if a rule of `<root>/auth.toml` lets the
 GitHub account in, with that rule's role, kind and workspaces. An account no
 rule lets in gets nothing.
 
-1. Register a [GitHub OAuth app](https://github.com/settings/developers) (any
-   homepage and callback URL will do) or a GitHub App, and tick **Enable
-   Device Flow** in its settings. Only its client ID is needed, no secret. A
-   GitHub App that checks memberships needs the **Members** organization
-   permission (read), and must be installed in those organizations.
+1. Register a [GitHub App](https://github.com/settings/apps) (any homepage
+   URL will do, no webhook), and tick **Enable Device Flow** in its settings.
+   Give it the **Members** organization permission (read), install it on
+   each organization the rules name (with rules that name none, on any
+   account), and generate a private key: the server keeps signed-in people's
+   tokens fresh with it ([Refreshing](#refreshing-sign-ins)). Without a
+   private key, sign-in still works, also with a [GitHub OAuth
+   app](https://github.com/settings/developers), but its tokens are not
+   refreshed: people sign in again each `token_ttl`.
 2. Write `<root>/auth.toml` on the server:
 
 ```toml
 [github]
-client_id = "Ov23li0123456789abcd"
-token_ttl = "30d"                       # issued tokens expire (1h to 366d; default 30d)
+client_id = "Iv23li0123456789abcd"
+private_key = "github-app.pem"          # the GitHub App's private key, relative to the root (mode 0600)
+token_ttl = "1h"                        # access tokens expire (5m to 366d; default 1h)
+refresh_limit = "30d"                   # refreshed for at most this long after the sign-in (default 30d)
+refresh_idle = "7d"                     # and not after this long without one (default 7d)
 # url = "https://ghe.example.com"       # GitHub Enterprise Server; its API defaults to <url>/api/v3 (api_url)
 # deny = [12345]                        # GitHub user ids that may never sign in (`bd serve token accounts`)
 
@@ -117,8 +124,9 @@ workspaces = ["proj"]                   # default: every workspace
 mistake in it (an unknown field, a rule that names nobody, an `http` URL to
 another host, an `anyone` rule that is not the last or gives more than a rule
 before it). After that, each sign-in reads it again, so changes need no
-restart; a mistake made meanwhile fails sign-ins, with the reason in the
-server log only.
+restart; a mistake made meanwhile fails sign-ins and refreshes, with the
+reason in the server log only. It also says at start whether tokens are
+refreshed.
 
 - A rule lets an account in if `users` lists its login, or if it is an active
   member (not just invited) of one of its `orgs` or `teams`. Memberships are
@@ -164,8 +172,10 @@ server log only.
   the account's login when it first signed in, which it keeps when its login
   changes. The token is named `github-<actor>-<random>` and expires after
   `token_ttl`; each sign-in gets a token of its own, so one account may sign
-  in on several machines. Once it expires, commands fail with exit 7 naming
-  the time, and `bd remote login --github` gets a new one.
+  in on several machines. With a private key, the client renews it before
+  it expires ([Refreshing](#refreshing-sign-ins)); once it can no longer be
+  renewed and expires, commands fail with exit 7 naming the time, and
+  `bd remote login --github` gets a new one.
 - An actor belongs to one principal, and to an account for good: the server
   binds each account (by its GitHub user id) to its actor at its first
   sign-in, in `tokens.json`, and keeps the binding when the account's tokens
@@ -182,13 +192,57 @@ server log only.
   bindings, and `bd serve token revoke --github <login> --forget` releases
   one: it revokes the account's tokens, and the next account to sign in as
   that login binds the actor again.
-- A change to `auth.toml` (`deny` included) applies to the next sign-ins:
-  tokens already issued keep their permissions until they expire. To cut an
-  account off at once,
+- A change to `auth.toml` (`deny` included) applies to the next sign-ins
+  and refreshes: tokens already issued keep their permissions until they
+  expire, at most `token_ttl`. To cut an account off at once,
   `bd serve token revoke --github alice --root /srv/bd` revokes every token it
   got by signing in, including those from before a rename (`alice` may be its
   latest login or its actor). `bd serve token list` shows each token's
-  GitHub account and expiry; expired ones leave the list a week later.
+  GitHub account, expiry, and until when it is refreshed; expired ones leave
+  the list a week after they can no longer be refreshed either.
+
+### Refreshing sign-ins
+
+With `private_key`, each sign-in also gets a refresh token, saved with its
+access token on the client and sent only to `POST /v2/auth/refresh`. The
+client renews the access token by itself, before a command, once a fifth of
+its lifetime is left (10 minutes at most), or when the server finds it
+expired first; so does a long-running one (`bd agents watch`, `bd events
+--follow`) between its requests. Each refresh:
+
+- applies `auth.toml` again, as a sign-in does, by the workspace the sign-in
+  was for: `deny`, the rules in order (`users` by the account's current
+  login, which the server reads by its GitHub user id; `orgs` and `teams` by
+  active membership; `min_account_age`), and what the first matching rule
+  grants now: role, kind, workspaces and `max_claims` may change at a
+  refresh. GitHub is asked as the GitHub App, with installation tokens: the
+  server never keeps anyone's own GitHub token. An organization the App is
+  not installed on, or whose members it may not read, does not tell: if
+  that decides, the refresh fails for now (exit 8, nothing revoked), and the
+  server log says why. Account lookups use any installation of the App that
+  is not suspended.
+- replaces both the access token and the refresh token: the old ones stop
+  working at once. A refresh token works once. One used again, as by someone
+  who copied it, revokes the sign-in for everyone holding it. A retry of the
+  same refresh is no reuse: the client saves each refresh's request id
+  before sending it, and sends it again until an answer is saved, so a
+  refresh whose answer was lost (a timeout, Ctrl-C) refreshes again later
+  (within 5 minutes, the server answers it with the same new tokens). bd
+  processes of one user on one machine renew one at a time (they share
+  `credentials.lock`), so they never spend one twice; one whose token still
+  works does not wait for another renewing, and a refresh ends within a
+  minute.
+- is refused, and the sign-in revoked, when the rules no longer let the
+  account in, the account is in `deny`, or GitHub no longer has it. The
+  client then keeps the access token until it expires, says why on stderr,
+  and stops trying; `bd remote login --github` signs in again.
+- works until `refresh_limit` after the sign-in, and while no more than
+  `refresh_idle` passed since the last one (a machine off for longer signs
+  in again). `token_ttl`, `refresh_idle` and `refresh_limit` must each be at
+  most the next.
+- fails as a sign-in does when GitHub or the server cannot be reached (exit
+  8): nothing changes, and the client tries again a minute later (at its
+  next command) while its access token works, then fails with it.
 
 The server runs GitHub's device flow itself, so the client needs to reach only
 the bd server, and the GitHub token never leaves the server: it reads the
@@ -206,7 +260,8 @@ logged. A few things to keep in mind:
 - Whoever started a sign-in gets its token: enter only codes shown by one's
   own `bd remote login --github`.
 - The sign-in endpoints, `POST /v2/auth/github/device` and
-  `POST /v2/auth/github/token`, need no token. `POST /v2/auth/revoke`, sent
+  `POST /v2/auth/github/token`, need no token, and `POST /v2/auth/refresh`
+  takes a refresh token. `POST /v2/auth/revoke`, sent
   with a token, revokes it if it came from sign-in: `bd remote logout` and a
   new sign-in on the same machine use it, so a token people no longer use
   stops working at once rather than when it expires. At most 8 sign-in requests run
@@ -329,7 +384,9 @@ With `--github`, `login` gets the token from the server instead of reading
 one: it shows a one-time code to enter at GitHub
 (`https://github.com/login/device`), waits until it is entered (Ctrl-C
 cancels; the code lasts 15 minutes), and saves the token the server issues,
-reporting its actor, role, kind, workspaces and expiry. The server must have
+with its refresh token where the server refreshes sign-ins, reporting its
+actor, role, kind, workspaces, expiry, and until when it is renewed. The
+server must have
 GitHub sign-in on, and must let the account in
 ([Signing in with GitHub](#signing-in-with-github)).
 
@@ -359,8 +416,9 @@ directory created 0700, and bd refuses to use it if other users can read it. On 
 protected by the per-user permissions of `%APPDATA%`. `bd remote logout`
 forgets the token saved for a workspace URL and for its server (`--workspace-only`
 keeps the server's), or for a server URL and all its workspaces. A token from
-GitHub sign-in is revoked on its server too, and so is one that signing in
-again replaces: within a few seconds, and only trusting the server as when
+GitHub sign-in is revoked on its server too (with its refresh token, where
+it has one, so also after a refresh whose answer was lost), and so is one
+that signing in again replaces: within a few seconds, and only trusting the server as when
 the token was saved. If that fails (the server cannot be reached, say), the
 token is forgotten all the same and works on the server until it expires. A
 token an admin created may serve elsewhere too, so it stays valid until it is

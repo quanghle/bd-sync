@@ -4640,6 +4640,12 @@ struct GithubState {
     created: std::collections::HashMap<String, String>,
     /// `METHOD /path` of each request, with its form body.
     log: Vec<String>,
+    /// Organizations the GitHub App is installed on, in order: installation `i + 1`.
+    installed: Vec<String>,
+    /// Accounts by user id, as `/user` saw them, or as renamed since.
+    known: std::collections::HashMap<u64, String>,
+    /// Organizations whose installation of the App is suspended.
+    suspended: Vec<String>,
 }
 
 impl FakeGithub {
@@ -4680,6 +4686,31 @@ impl FakeGithub {
     fn log(&self) -> Vec<String> {
         self.state.lock().unwrap().log.clone()
     }
+
+    /// The GitHub App is installed on `org`.
+    fn install(&self, org: &str) {
+        self.state.lock().unwrap().installed.push(org.to_string());
+    }
+
+    /// The App's installation on `org` is suspended: listed, but it gets no tokens.
+    fn suspend(&self, org: &str) {
+        self.state.lock().unwrap().suspended.push(org.to_string());
+    }
+
+    fn leave(&self, login: &str, of: &str) {
+        self.state.lock().unwrap().members.retain(|(l, o)| !(l == login && o == of));
+    }
+}
+
+/// Whether `jwt` is one the GitHub App `Iv1.test` signed, unexpired (the
+/// signature is checked by bd's own tests).
+fn app_jwt(jwt: &str) -> bool {
+    use base64::Engine;
+    let Some(claims) = jwt.split('.').nth(1) else { return false };
+    let Ok(claims) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(claims) else { return false };
+    let claims: Value = serde_json::from_slice(&claims).unwrap_or_default();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    jwt.split('.').count() == 3 && claims["iss"] == "Iv1.test" && claims["exp"].as_i64().is_some_and(|exp| exp > now)
 }
 
 fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubState>) {
@@ -4688,7 +4719,7 @@ fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubS
     if reader.read_line(&mut request).unwrap_or(0) == 0 {
         return;
     }
-    let (mut length, mut login) = (0, None);
+    let (mut length, mut bearer) = (0, None::<String>);
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
@@ -4697,13 +4728,17 @@ fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubS
         let (name, value) = line.split_once(':').unwrap();
         match name.to_ascii_lowercase().as_str() {
             "content-length" => length = value.trim().parse().unwrap(),
-            "authorization" => login = value.trim().strip_prefix("Bearer gho_").map(String::from),
+            "authorization" => bearer = value.trim().strip_prefix("Bearer ").map(String::from),
             _ => {}
         }
     }
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
     let body = String::from_utf8(body).unwrap();
+    let login = bearer.as_deref().and_then(|b| b.strip_prefix("gho_")).map(String::from);
+    let app = bearer.as_deref().is_some_and(app_jwt);
+    // Installation tokens are `ghs_<installation>`.
+    let installation = bearer.as_deref().and_then(|b| b.strip_prefix("ghs_")).and_then(|i| i.parse::<usize>().ok());
     let form = |key: &str| body.split('&').find_map(|kv| kv.strip_prefix(&format!("{key}="))).map(String::from);
     let mut words = request.split_whitespace();
     let (method, path) = (words.next().unwrap(), words.next().unwrap());
@@ -4755,11 +4790,44 @@ fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubS
             Some(l) => {
                 // A distinct id per login, as GitHub's are, unless set.
                 let id = s.ids.get(l).copied().unwrap_or_else(|| l.bytes().fold(7u64, |h, b| h * 31 + u64::from(b)));
-                let created = s.created.get(l).map_or("2015-01-01T00:00:00Z", String::as_str);
+                let created = s.created.get(l).map_or("2015-01-01T00:00:00Z", String::as_str).to_string();
+                s.known.insert(id, l.clone());
                 (200, json!({ "login": l, "id": id, "type": "User", "created_at": created }))
             }
             None => (401, json!({ "message": "Bad credentials" })),
         },
+        ("GET", p) if p.starts_with("/app/installations") && app => {
+            let all: Vec<Value> = s
+                .installed
+                .iter()
+                .enumerate()
+                .map(|(i, org)| {
+                    let suspended = s.suspended.contains(org).then_some("2026-01-01T00:00:00Z");
+                    json!({ "id": i + 1, "suspended_at": suspended })
+                })
+                .collect();
+            (200, json!(all))
+        }
+        ("POST", p) if p.starts_with("/app/installations/") && p.ends_with("/access_tokens") && app => {
+            let id = p["/app/installations/".len()..p.len() - "/access_tokens".len()].to_string();
+            let org = id.parse::<usize>().ok().and_then(|i| s.installed.get(i - 1));
+            match org {
+                Some(org) if s.suspended.contains(org) => {
+                    (403, json!({ "message": "This installation has been suspended" }))
+                }
+                _ => (201, json!({ "token": format!("ghs_{id}"), "expires_at": "2099-01-01T00:00:00Z" })),
+            }
+        }
+        ("GET", p) if p.starts_with("/user/") && p[6..].parse::<u64>().is_ok() && installation.is_some() => {
+            let id: u64 = p[6..].parse().unwrap();
+            match s.known.get(&id) {
+                Some(l) => {
+                    let created = s.created.get(l).map_or("2015-01-01T00:00:00Z", String::as_str);
+                    (200, json!({ "login": l, "id": id, "type": "User", "created_at": created }))
+                }
+                None => not_found,
+            }
+        }
         ("GET", p) if p.starts_with("/user/memberships/orgs/") => {
             let org = &p["/user/memberships/orgs/".len()..];
             match &login {
@@ -4773,9 +4841,17 @@ fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubS
         ("GET", p) if p.starts_with("/orgs/") => {
             // /orgs/<org>/teams/<team>/memberships/<login>
             let parts: Vec<&str> = p["/orgs/".len()..].split('/').collect();
+            // An installation token reads the members of its own organization only.
+            let installed_on =
+                |org: &str| installation.is_some_and(|i| s.installed.get(i - 1).is_some_and(|o| o == org));
             match parts[..] {
+                [org, "installation"] if app => match s.installed.iter().position(|o| o == org) {
+                    Some(i) => (200, json!({ "id": i + 1 })),
+                    None => not_found,
+                },
+                [org, "memberships", user] if installed_on(org) && member(&s, user, org) => (200, active),
                 [org, "teams", team, "memberships", user]
-                    if login.is_some() && member(&s, user, &format!("{org}/{team}")) =>
+                    if (login.is_some() || installed_on(org)) && member(&s, user, &format!("{org}/{team}")) =>
                 {
                     (200, active)
                 }
@@ -4933,6 +5009,261 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     assert_eq!(out.status.code(), Some(7), "{stderr}");
     assert!(stderr.contains("expired at 2026-01-01") && stderr.contains("bd remote login --github"), "{stderr}");
     check(signed_in(carol.path(), &url, &["list"]), "other tokens still work");
+}
+
+/// A server whose GitHub sign-in goes to `github` and refreshes tokens with
+/// the GitHub App `Iv1.test` (its key in `app.pem`), with these settings and rules.
+fn refresh_server(github: &FakeGithub, rules: &str) -> Server {
+    let root = Server::prepare();
+    std::fs::write(root.path().join("app.pem"), include_str!("fixtures/github-app.pem")).unwrap();
+    let config = format!(
+        "[github]\nclient_id = \"Iv1.test\"\nurl = \"{0}\"\napi_url = \"{0}\"\nprivate_key = \"app.pem\"\n\n{rules}",
+        github.url
+    );
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    Server::launch(root, "127.0.0.1:0", &[])
+}
+
+/// The credentials file of the client machine `dir`, and its entry for the server `url` names.
+fn credentials(dir: &Path) -> (std::path::PathBuf, toml::Table) {
+    let path = dir.join(".xdg").join("bd").join("credentials.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    (path, toml::from_str(&text).unwrap())
+}
+
+/// A field of the one server entry saved on `dir`.
+fn saved(dir: &Path, field: &str) -> Option<String> {
+    let (_, file) = credentials(dir);
+    let entry = file["servers"].as_table()?.values().next()?.as_table()?;
+    entry.get(field).and_then(|v| v.as_str()).map(String::from)
+}
+
+/// Make the token saved on `dir` due for renewal.
+fn renewal_due(dir: &Path) {
+    let (path, mut file) = credentials(dir);
+    for (_, entry) in file["servers"].as_table_mut().unwrap().iter_mut() {
+        entry.as_table_mut().unwrap().insert("refresh_after".into(), "2020-01-01T00:00:00.000Z".into());
+    }
+    std::fs::write(path, toml::to_string(&file).unwrap()).unwrap();
+}
+
+#[test]
+fn github_sign_ins_are_renewed_by_the_rules_through_the_github_app() {
+    let github = FakeGithub::start();
+    github.install("frozen");
+    github.suspend("frozen");
+    github.install("acme");
+    github.member("bob", "acme");
+    let server = refresh_server(
+        &github,
+        "[[github.allow]]\nusers = [\"alice\"]\nrole = \"admin\"\n\n[[github.allow]]\norgs = [\"acme\"]\n",
+    );
+    let url = server.url();
+    let root = server.root.path().to_path_buf();
+
+    // A sign-in gets an hour, and a refresh token saved with it.
+    github.next("alice", 0);
+    let alice = tempfile::tempdir().unwrap();
+    let out = github_login(alice.path(), &url);
+    let stdout = check(out, "login");
+    let v: Value = serde_json::from_str(&stdout).unwrap();
+    let until = v["token"]["refreshable_until"].as_str().expect("refreshed").to_string();
+    assert!(until.as_str() > v["token"]["expires_at"].as_str().unwrap(), "{v}");
+    let first = (saved(alice.path(), "token").unwrap(), saved(alice.path(), "refresh_token").unwrap());
+    assert!(first.1.starts_with("bdr_") && !stdout.contains(&first.1), "never printed");
+    let tokens = std::fs::read_to_string(root.join("tokens.json")).unwrap();
+    assert!(!tokens.contains(&first.0) && !tokens.contains(&first.1), "only hashes are stored");
+    let shown = check(signed_in(alice.path(), &url, &["remote", "show"]), "show");
+    assert!(shown.contains("renewed automatically") && shown.contains("refreshed until"), "{shown}");
+
+    // Not due yet: nothing is renewed. Due: renewed before the command, asking GitHub as the App.
+    check(signed_in(alice.path(), &url, &["list"]), "list");
+    assert_eq!(saved(alice.path(), "token").unwrap(), first.0);
+    let thief = tempfile::tempdir().unwrap();
+    let creds = alice.path().join(".xdg").join("bd");
+    std::fs::create_dir_all(thief.path().join(".xdg")).unwrap();
+    std::fs::create_dir_all(thief.path().join(".xdg").join("bd")).unwrap();
+    std::fs::copy(creds.join("credentials.toml"), thief.path().join(".xdg/bd/credentials.toml")).unwrap();
+    renewal_due(alice.path());
+    assert_eq!(check(signed_in(alice.path(), &url, &["-q", "create", "Renewed"]), "create").trim(), "t-1");
+    let second = (saved(alice.path(), "token").unwrap(), saved(alice.path(), "refresh_token").unwrap());
+    assert!(second.0 != first.0 && second.1 != first.1, "both replaced");
+    let log = github.log();
+    assert!(log.iter().any(|l| l.starts_with("POST /app/installations/2/access_tokens")), "{log:?}");
+    assert!(!log.iter().any(|l| l.starts_with("POST /app/installations/1/")), "not the suspended one: {log:?}");
+    assert!(log.iter().any(|l| l.starts_with("GET /user/")), "the account by its id: {log:?}");
+    let old = bd(alice.path()).env("BD_REMOTE", &url).env("BD_TOKEN", &first.0).arg("list").output().unwrap();
+    assert_eq!(old.status.code(), Some(7), "the old access token is gone");
+    check(signed_in(alice.path(), &url, &["list"]), "the new one works");
+
+    // A spent refresh token used again (a copy of the credentials) revokes the sign-in for everyone.
+    renewal_due(thief.path());
+    let out = signed_in(thief.path(), &url, &["list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    assert!(stderr.contains("used already"), "{stderr}");
+    let out = signed_in(alice.path(), &url, &["list"]);
+    assert_eq!(out.status.code(), Some(7), "revoked: {}", String::from_utf8_lossy(&out.stderr));
+
+    // A token the server finds expired first (another clock) is renewed and the command sent again.
+    github.next("bob", 0);
+    let bob = tempfile::tempdir().unwrap();
+    check(github_login(bob.path(), &url), "bob's login");
+    // Processes renewing at once: one refresh, which the others take up.
+    renewal_due(bob.path());
+    let before = saved(bob.path(), "refresh_token").unwrap();
+    let lookups = || github.log().iter().filter(|l| l.starts_with("GET /user/")).count();
+    let earlier = lookups();
+    let running: Vec<Child> = (0..4)
+        .map(|_| {
+            bd(bob.path())
+                .env("BD_REMOTE", &url)
+                .arg("list")
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for child in running {
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+    assert_ne!(saved(bob.path(), "refresh_token").unwrap(), before);
+    assert_eq!(lookups(), earlier + 1, "one refresh");
+    check(signed_in(bob.path(), &url, &["list"]), "still signed in");
+    assert_eq!(lookups(), earlier + 1);
+    let path = root.join("tokens.json");
+    let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    for t in file["tokens"].as_array_mut().unwrap().iter_mut().filter(|t| t["github"]["login"] == "bob") {
+        t["expires_at"] = json!("2026-01-01T00:00:00.000Z");
+    }
+    std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+    let before = saved(bob.path(), "token").unwrap();
+    check(signed_in(bob.path(), &url, &["create", "By bob"]), "create after a 401");
+    assert_ne!(saved(bob.path(), "token").unwrap(), before);
+    let members = github.log().iter().filter(|l| l.starts_with("GET /orgs/acme/memberships/bob")).count();
+    assert!(members >= 1, "membership asked with an installation token: {:?}", github.log());
+
+    // Out of the organization: the refresh is refused and the sign-in revoked.
+    github.leave("bob", "acme");
+    renewal_due(bob.path());
+    let out = signed_in(bob.path(), &url, &["list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    assert!(stderr.contains("could not be renewed") && stderr.contains("no rule"), "{stderr}");
+    assert_eq!(saved(bob.path(), "refresh_token"), None, "not tried again");
+    let list = bd(&root).args(["--json", "serve", "token", "list", "--root"]).arg(&root).output().unwrap();
+    let list: Value = serde_json::from_str(&check(list, "token list")).unwrap();
+    assert!(list.as_array().unwrap().iter().all(|t| t["revoked_at"].is_string()), "{list}");
+}
+
+#[test]
+fn github_sign_ins_stay_while_github_will_not_tell_memberships() {
+    let github = FakeGithub::start();
+    github.install("acme");
+    github.member("carol", "other");
+    let server = refresh_server(&github, "[[github.allow]]\norgs = [\"other\"]\n");
+    let url = server.url();
+    // The App is not installed on `other`: the refresh fails for now, and the sign-in stays.
+    github.next("carol", 0);
+    let carol = tempfile::tempdir().unwrap();
+    check(github_login(carol.path(), &url), "carol's login");
+    let before = saved(carol.path(), "token").unwrap();
+    renewal_due(carol.path());
+    check(signed_in(carol.path(), &url, &["list"]), "works until it expires");
+    assert_eq!(saved(carol.path(), "token").unwrap(), before, "not renewed");
+    assert!(saved(carol.path(), "refresh_token").is_some(), "kept, to try again");
+    assert!(saved(carol.path(), "refresh_request").is_some(), "the refresh is sent again as such");
+
+    // Another process renewing (holding the lock) does not hold up a command whose token still works.
+    github.install("other");
+    renewal_due(carol.path());
+    let lock = std::fs::File::create(carol.path().join(".xdg/bd/credentials.lock")).unwrap();
+    fs4::FileExt::try_lock(&lock).unwrap();
+    let started = Instant::now();
+    check(signed_in(carol.path(), &url, &["list"]), "not held up");
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    assert_eq!(saved(carol.path(), "token").unwrap(), before, "left to the other process");
+    fs4::FileExt::unlock(&lock).unwrap();
+
+    // Once the App is installed there, the same refresh goes through.
+    renewal_due(carol.path());
+    check(signed_in(carol.path(), &url, &["list"]), "renewed");
+    assert_ne!(saved(carol.path(), "token").unwrap(), before);
+    assert_eq!(saved(carol.path(), "refresh_request"), None);
+}
+
+/// Refresh the sign-in saved on `dir` behind its back, as a refresh whose
+/// answer was lost: the server rotates it, and `dir` keeps its old tokens
+/// with the request id saved before sending, due for renewal.
+fn lose_a_refresh_answer(dir: &Path, url: &str, request_id: &str) {
+    let refresh = saved(dir, "refresh_token").unwrap();
+    let endpoint = format!("{}/v2/auth/refresh", url.split("/w/").next().unwrap());
+    let answer = ureq::post(&endpoint)
+        .header("authorization", &format!("Bearer {refresh}"))
+        .content_type("application/json")
+        .send(json!({ "request_id": request_id }).to_string())
+        .unwrap();
+    assert_eq!(answer.status(), 200);
+    let (path, mut file) = credentials(dir);
+    for (_, entry) in file["servers"].as_table_mut().unwrap().iter_mut() {
+        let entry = entry.as_table_mut().unwrap();
+        entry.insert("refresh_request".into(), request_id.into());
+        entry.insert("refresh_after".into(), "2020-01-01T00:00:00.000Z".into());
+    }
+    std::fs::write(path, toml::to_string(&file).unwrap()).unwrap();
+}
+
+#[test]
+fn logging_out_revokes_a_sign_in_whose_refresh_answer_was_lost() {
+    let github = FakeGithub::start();
+    github.install("acme");
+    let server = refresh_server(&github, "[[github.allow]]\nusers = [\"alice\"]\n");
+    let url = server.url();
+    github.next("alice", 0);
+    let alice = tempfile::tempdir().unwrap();
+    check(github_login(alice.path(), &url), "login");
+    lose_a_refresh_answer(alice.path(), &url, "lost-1");
+    let copy = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(copy.path().join(".xdg/bd")).unwrap();
+    let (path, _) = credentials(alice.path());
+    std::fs::copy(&path, copy.path().join(".xdg/bd/credentials.toml")).unwrap();
+
+    let out = bd(alice.path()).args(["--json", "remote", "logout", &url]).output().unwrap();
+    let v: Value = serde_json::from_str(&check(out, "logout")).unwrap();
+    assert_eq!(v["revocations"][0]["outcome"], "revoked", "{v}");
+    let out = signed_in(copy.path(), &url, &["list"]);
+    assert_eq!(out.status.code(), Some(7), "the copy cannot refresh: {}", String::from_utf8_lossy(&out.stderr));
+    let root = server.root.path();
+    let list = bd(root).args(["--json", "serve", "token", "list", "--root"]).arg(root).output().unwrap();
+    let list: Value = serde_json::from_str(&check(list, "token list")).unwrap();
+    assert!(list.as_array().unwrap().iter().all(|t| t["revoked_at"].is_string()), "{list}");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_refresh_whose_answer_was_lost_is_sent_again_and_does_not_revoke_the_sign_in() {
+    let github = FakeGithub::start();
+    github.install("acme");
+    let server = refresh_server(&github, "[[github.allow]]\nusers = [\"alice\"]\n");
+    let url = server.url();
+    github.next("alice", 0);
+    let alice = tempfile::tempdir().unwrap();
+    check(github_login(alice.path(), &url), "login");
+    let (token, refresh) = (saved(alice.path(), "token").unwrap(), saved(alice.path(), "refresh_token").unwrap());
+
+    // The server rotates the sign-in, and its answer never reaches the client, which saved the request id.
+    lose_a_refresh_answer(alice.path(), &url, "lost-1");
+
+    // Even past the server's memory of its answer, the same request refreshes again.
+    let server = server.restart();
+    check(signed_in(alice.path(), &url, &["list"]), "renewed by the retry");
+    let now = (saved(alice.path(), "token").unwrap(), saved(alice.path(), "refresh_token").unwrap());
+    assert!(now.0 != token && now.1 != refresh);
+    assert_eq!(saved(alice.path(), "refresh_request"), None, "answered");
+    check(signed_in(alice.path(), &url, &["list"]), "still signed in");
+    drop(server);
 }
 
 #[test]
@@ -5276,7 +5607,7 @@ fn info_and_remote_show_tell_clients_what_their_token_may_do() {
     assert_eq!(
         token,
         json!({ "name": "alice-desk", "actor": "alice", "role": "admin", "kind": "human", "workspaces": ["proj"],
-                "expires_at": null, "github": null, "max_claims": null }),
+                "expires_at": null, "refreshable_until": null, "github": null, "max_claims": null }),
         "never the token's id or hash"
     );
     let shown = alice.ok(&["remote", "show"]);

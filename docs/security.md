@@ -71,6 +71,11 @@ Sign-in lets people get their own tokens, under rules in `<root>/auth.toml`
 - The server runs GitHub's device flow with an OAuth or GitHub App client ID,
   no secret. The account's GitHub token reads its account and memberships
   during the sign-in and is never stored or logged.
+- Refreshes ask GitHub as the GitHub App, with installation tokens minted
+  from its private key (`private_key`): the one secret the server holds for
+  sign-in. Keep the key file mode 0600, readable by `bd serve` only; whoever
+  has it can read what the App may (organization members). Give the App
+  nothing but **Members** (read).
 - An account no rule lets in gets nothing. An `anyone = true` rule must be
   the last, and its tokens read by default, may write at most, and are
   always `agent` tokens. `min_account_age` keeps out accounts made on the
@@ -79,8 +84,15 @@ Sign-in lets people get their own tokens, under rules in `<root>/auth.toml`
   first sign-in, so a renamed or re-registered login cannot pass for the
   previous holder. Only `bd serve token revoke --github <login> --forget`
   releases a binding.
-- Sign-in tokens expire (`token_ttl`, default 30 days). `bd remote logout`
-  and a replacing sign-in revoke them on the server.
+- Sign-in access tokens expire (`token_ttl`, default 1 hour), and each
+  refresh applies the rules again, so someone who leaves an organization
+  loses access within `token_ttl`. Refresh tokens rotate at every refresh
+  and work once: a copy used after the original (or the original after a
+  copy) revokes the sign-in. A sign-in is refreshed for at most
+  `refresh_limit` (30 days), and not after `refresh_idle` (7 days) unused.
+  `tokens.json` keeps only hashes of both. `bd remote logout` and a
+  replacing sign-in revoke them on the server; `bd serve token revoke` ends
+  refreshes too.
 - Whoever started a sign-in gets its token: enter only codes shown by one's
   own `bd remote login --github`.
 - Tokens saved by `bd remote login` serve every process of that user on that

@@ -12,8 +12,9 @@
 //! `<root>/tokens.json` holds the access tokens, and `<root>/auth.toml`
 //! turns on GitHub sign-in, served at `POST /v2/auth/github/{device,token}`
 //! without a token (`oauth.rs`); `POST /v2/auth/revoke` revokes the token it
-//! is sent with, if it came from sign-in. `GET /healthz` answers `ok`
-//! without a token.
+//! is sent with, if it came from sign-in, and `POST /v2/auth/refresh` renews
+//! the sign-in whose refresh token it is sent with. `GET /healthz` answers
+//! `ok` without a token.
 //!
 //! Memory and slots: up to `MAX_RUNNING` commands run at once. Requests in
 //! progress share a budget (`MIN_BODY_BUDGET`, or more for one maximum-size
@@ -74,7 +75,7 @@ use crate::jobs;
 use crate::oauth;
 use crate::protocol::{
     ErrorBody, ErrorDetail, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, PROTOCOL, PROTOCOL_HEADER,
-    RevokeAnswer, SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
+    RefreshRequest, RevokeAnswer, SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
 };
 use crate::stream::{FrameWriter, Limits, ResponseBody, Stalls};
 
@@ -186,13 +187,26 @@ fn run(a: &ServeArgs) -> Result<()> {
     let jobs = jobs::Config::from_args(a)?;
     // Checked now so that a mistake shows at once; each sign-in reads the file again.
     if let Some(github) = oauth::load(&root)? {
-        tracing::info!(
-            target: "bd::serve",
-            github = %github.url,
-            rules = github.rules.len(),
-            token_ttl = %bd_core::time::format_duration_ms(i64::try_from(github.token_ttl.as_millis()).unwrap_or(i64::MAX)),
-            "GitHub sign-in is on"
-        );
+        let shown = |d: Duration| bd_core::time::format_duration_ms(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        match &github.app {
+            Some(_) => tracing::info!(
+                target: "bd::serve",
+                github = %github.url,
+                rules = github.rules.len(),
+                token_ttl = %shown(github.token_ttl),
+                refresh_limit = %shown(github.refresh_limit),
+                refresh_idle = %shown(github.refresh_idle),
+                "GitHub sign-in is on, with refreshed tokens"
+            ),
+            None => tracing::warn!(
+                target: "bd::serve",
+                github = %github.url,
+                rules = github.rules.len(),
+                token_ttl = %shown(github.token_ttl),
+                "GitHub sign-in is on; its tokens are not refreshed (auth.toml has no github.private_key), so people \
+                 sign in again each token_ttl"
+            ),
+        }
     }
     // Before any request or background job: gate checks in this process use the server's defaults.
     io::mark_server_process();
@@ -452,6 +466,12 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
         } else {
             Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
         }
+    } else if path.ends_with(&format!("/v{PROTOCOL}/auth/refresh")) {
+        if req.method() == Method::POST {
+            refresh(&server, req).await
+        } else {
+            Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
+        }
     } else {
         let msg = format!("no such endpoint; workspaces are at /w/<name>/v{PROTOCOL}/exec");
         Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response()
@@ -525,7 +545,7 @@ async fn sign_in(server: &Arc<Server>, step: SignIn, req: Request<Incoming>) -> 
                     return busy("completing this sign-in");
                 }
             }
-            let completing = Completing { server: server.clone(), key: key.clone() };
+            let completing = Completing { server: server.clone(), key: key.clone(), refresh: false };
             let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
                 return busy("signing in other accounts");
             };
@@ -549,6 +569,11 @@ async fn sign_in(server: &Arc<Server>, step: SignIn, req: Request<Incoming>) -> 
             .await
         }
     };
+    auth_answer(answer)
+}
+
+/// The answer to a sign-in or refresh step.
+fn auth_answer(answer: Result<serde_json::Value>) -> Response<Body> {
     match answer {
         Ok(value) => json_response(StatusCode::OK, &value),
         Err(e) => {
@@ -562,6 +587,74 @@ async fn sign_in(server: &Arc<Server>, step: SignIn, req: Request<Incoming>) -> 
             Reject::new(status, e.code(), e.to_string(), e.exit_code()).response()
         }
     }
+}
+
+/// `POST /v2/auth/refresh`: renew the sign-in whose refresh token is the
+/// request's bearer token (`oauth::refresh`), on a blocking thread, as it
+/// waits on GitHub. A retry with the same request id gets the answer that
+/// issued tokens again, for [`ISSUED_REPLAY`]: the refresh token it sent is
+/// spent, and any other request with it revokes the sign-in.
+async fn refresh(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
+    let Some(secret) = bearer(req.headers()).map(str::to_string) else { return denied().response() };
+    let body = match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect())
+        .await
+    {
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(e)) => {
+            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
+        }
+        Err(_) => {
+            let msg = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
+            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
+        }
+    };
+    let request: RefreshRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("bad request body: {e}"), 2).response();
+        }
+    };
+    let id = request.request_id.as_str();
+    if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_graphic()) {
+        return Reject::new(StatusCode::BAD_REQUEST, "invalid", "a refresh needs a request id", 2).response();
+    }
+    let running = auth::hash(&secret);
+    let key = auth::hash(&format!("{secret} {id}"));
+    {
+        let mut refreshes = lock(&server.refreshes);
+        let now = Instant::now();
+        refreshes.answers.retain(|_, (at, _)| now.duration_since(*at) < ISSUED_REPLAY);
+        if let Some((_, answer)) = refreshes.answers.get(&key) {
+            return json_response(StatusCode::OK, answer);
+        }
+        // A retry while the first attempt still runs waits for its answer.
+        if !refreshes.running.insert(running.clone()) {
+            return busy("refreshing this sign-in");
+        }
+    }
+    let completing = Completing { server: server.clone(), key: running, refresh: true };
+    let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
+        return busy("signing in other accounts");
+    };
+    let (srv, request_id) = (server.clone(), request.request_id.clone());
+    auth_answer(
+        blocking(move || {
+            let _held = (permit, completing);
+            let refreshed = oauth::refresh(&srv.root, &secret, &request_id);
+            // Refreshed, or revoked.
+            srv.tokens.invalidate();
+            let value = serde_json::to_value(refreshed?)?;
+            // Kept even if this client is gone: its retry gets the tokens, as its refresh token is spent.
+            let mut refreshes = lock(&srv.refreshes);
+            if refreshes.answers.len() >= MAX_ISSUED {
+                let oldest = refreshes.answers.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone());
+                refreshes.answers.remove(&oldest.unwrap_or_default());
+            }
+            refreshes.answers.insert(key, (Instant::now(), value.clone()));
+            Ok(value)
+        })
+        .await,
+    )
 }
 
 /// How long the answer of a sign-in that issued a token is kept, for a
@@ -578,31 +671,60 @@ struct Issuances {
     running: HashSet<String>,
 }
 
-/// A sign-in completing: no other attempt of it runs until this is dropped.
+/// A sign-in or refresh completing: no other attempt of it runs until this
+/// is dropped.
 struct Completing {
     server: Arc<Server>,
     key: String,
+    /// A refresh, not a sign-in.
+    refresh: bool,
 }
 
 impl Drop for Completing {
     fn drop(&mut self) {
-        lock(&self.server.issued).running.remove(&self.key);
+        let running = if self.refresh { &self.server.refreshes } else { &self.server.issued };
+        lock(running).running.remove(&self.key);
     }
 }
 
 /// `POST /v2/auth/revoke`: revoke the request's own token, if it came from
 /// GitHub sign-in (`bd remote logout`). One an admin created is kept: it may
 /// serve elsewhere too, and only the admin revokes it. An expired token may
-/// still be revoked; an unknown one is refused like any request.
+/// still be revoked; an unknown one is refused like any request. A
+/// sign-in's refresh secret revokes the sign-in too: its current one, or
+/// the one its latest refresh spent with that refresh's request id (body
+/// `{"request_id"}`), whose answer the client may never have got.
 async fn revoke_own(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
     let Some(secret) = bearer(req.headers()).map(str::to_string) else { return denied().response() };
-    let token = match server.tokens.verify(&secret) {
-        Ok(Verified::Valid(t) | Verified::Expired(t)) => t,
-        Ok(Verified::Unknown) => return denied().response(),
-        Err(e) => return Reject::internal(e).response(),
+    // Small, so that the connection stays usable.
+    let body = tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await;
+    let token = if auth::refresh_family(&secret).is_some() {
+        let request_id = match body {
+            Ok(Ok(b)) => serde_json::from_slice::<serde_json::Value>(&b.to_bytes())
+                .ok()
+                .and_then(|v| v["request_id"].as_str().map(String::from)),
+            _ => None,
+        };
+        let root = server.root.clone();
+        let found = blocking(move || {
+            Ok(auth::find_refresh(&root, &secret)?.filter(|(t, current)| {
+                *current
+                    || t.refresh.as_ref().zip(request_id.as_deref()).is_some_and(|(r, id)| r.retries_last(&secret, id))
+            }))
+        })
+        .await;
+        match found {
+            Ok(Some((t, _))) => t,
+            Ok(None) => return denied().response(),
+            Err(e) => return Reject::internal(e).response(),
+        }
+    } else {
+        match server.tokens.verify(&secret) {
+            Ok(Verified::Valid(t) | Verified::Expired(t)) => t,
+            Ok(Verified::Unknown) => return denied().response(),
+            Err(e) => return Reject::internal(e).response(),
+        }
     };
-    // The body says nothing; read it all the same, small, so that the connection stays usable.
-    let _ = tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await;
     if token.github.is_none() {
         return json_response(StatusCode::OK, &RevokeAnswer { name: token.name, revoked: false });
     }
@@ -823,6 +945,9 @@ struct Server {
     sign_ins: Arc<Semaphore>,
     /// Sign-ins completing, and the answers of those that issued tokens.
     issued: Mutex<Issuances>,
+    /// Refreshes running, by their refresh token, and the answers of those
+    /// that issued tokens, by their refresh token and request id.
+    refreshes: Mutex<Issuances>,
     /// Set when the server shuts down.
     stopping: watch::Sender<bool>,
 }
@@ -1064,6 +1189,7 @@ impl Server {
             feeds: Arc::new(Feeds::new(follow::HEAD_CHECK_EVERY, follow::HEAD_CHECK_GAP)),
             sign_ins: Arc::new(Semaphore::new(MAX_SIGN_INS)),
             issued: Mutex::default(),
+            refreshes: Mutex::default(),
             stopping: watch::Sender::new(false),
         }
     }
@@ -1465,6 +1591,7 @@ mod tests {
             expires_at: None,
             github: None,
             max_claims: None,
+            refresh: None,
         };
         let actor = |flag, env, session| resolve_actor(flag, env, session, &t).map(|r| (r.actor, r.source));
         let code = |flag, env, session| resolve_actor(flag, env, session, &t).unwrap_err().exit_code();

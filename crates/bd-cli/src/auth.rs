@@ -4,7 +4,9 @@
 //! Tokens live in `<root>/tokens.json` (mode 0600 on Unix), which stores
 //! only the SHA-256 of each secret. `bd serve token create` prints a secret
 //! once; GitHub sign-in (`oauth.rs`) issues tokens that expire, recording
-//! the GitHub account. A token acts as one actor, or as `<actor>/<name>`
+//! the GitHub account, and with a GitHub App a refresh secret
+//! (`bdr_<family>_<random>`): each refresh replaces both secrets of the
+//! sign-in's entry in place, and a refresh secret used twice revokes it. A token acts as one actor, or as `<actor>/<name>`
 //! sub-actors (one per agent), so claims and leases keep meaning "this
 //! caller". Its role and kind become the request's [`bd_core::Policy`]:
 //! only admins end or take over other actors' claims, and only human tokens
@@ -104,6 +106,61 @@ pub struct Token {
     /// The most issues its actor and sub-actors may hold, claimed or reserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_claims: Option<u32>,
+    /// How a token from GitHub sign-in is refreshed, if it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<Refresh>,
+}
+
+/// The refresh state of a GitHub sign-in: one per token entry, whose
+/// secrets each refresh replaces.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Refresh {
+    /// Names the sign-in in its refresh secrets (`bdr_<family>_<random>`):
+    /// never shown or logged.
+    pub family: String,
+    /// Hex SHA-256 of the current refresh secret: any other secret of the
+    /// family is a spent one.
+    pub sha256: String,
+    /// The workspace the account signed in for: refreshes apply the rules for it.
+    pub workspace: String,
+    pub refreshed_at: Timestamp,
+    /// Until when it may be refreshed, as of its latest refresh.
+    pub until: Timestamp,
+    /// The latest refresh, which a client whose answer was lost may send
+    /// again: hashes of the secret it spent and of its request id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<LastRefresh>,
+}
+
+/// What [`Refresh::last`] keeps of a refresh.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LastRefresh {
+    /// Hex SHA-256 of the refresh secret it spent.
+    pub spent: String,
+    /// Hex SHA-256 of its request id.
+    pub request: String,
+}
+
+impl Refresh {
+    /// Whether `secret` and `request_id` are those of the latest refresh: a
+    /// retry whose answer was lost, not a spent secret used again.
+    pub fn retries_last(&self, secret: &str, request_id: &str) -> bool {
+        self.last.as_ref().is_some_and(|l| l.spent == hash(secret) && l.request == hash(request_id))
+    }
+}
+
+/// A refresh secret's family: `bdr_<family>_<random>` -> `<family>`.
+pub fn refresh_family(secret: &str) -> Option<&str> {
+    let (family, random) = secret.strip_prefix("bdr_")?.split_once('_')?;
+    let hex = |s: &str, n: usize| s.len() == n && s.bytes().all(|b| b.is_ascii_hexdigit());
+    (hex(family, 32) && hex(random, 64)).then_some(family)
+}
+
+/// A new refresh secret of `family`.
+fn refresh_secret(family: &str) -> Result<String> {
+    Ok(format!("bdr_{family}_{}", random_hex(32)?))
 }
 
 /// A GitHub account, as GitHub names it.
@@ -213,6 +270,9 @@ pub fn access_line(summary: &serde_json::Value) -> String {
     if let Some(at) = summary["expires_at"].as_str() {
         line.push_str(&format!(", expires {at}"));
     }
+    if let Some(at) = summary["refreshable_until"].as_str() {
+        line.push_str(&format!(", refreshed until {at}"));
+    }
     if let Some(login) = summary["github"]["login"].as_str() {
         line.push_str(&format!(", GitHub user {login}"));
     }
@@ -244,6 +304,16 @@ impl Token {
         self.expires_at.is_some_and(|at| at <= now)
     }
 
+    /// Whether the token expired and can no longer be refreshed either at `now`.
+    fn ended(&self, now: Timestamp) -> bool {
+        self.expired(now) && self.refresh.as_ref().is_none_or(|r| r.until <= now)
+    }
+
+    /// Until when a refresh may renew it, if it is refreshed.
+    fn refreshable_until(&self) -> Option<Timestamp> {
+        self.refresh.as_ref().map(|r| r.until)
+    }
+
     /// What `bd info` tells a client of the token it used: never its id or
     /// hash.
     pub fn summary(&self) -> serde_json::Value {
@@ -254,6 +324,7 @@ impl Token {
             "kind": self.kind,
             "workspaces": self.workspaces,
             "expires_at": self.expires_at,
+            "refreshable_until": self.refreshable_until(),
             "github": self.github,
             "max_claims": self.max_claims,
         })
@@ -270,6 +341,7 @@ impl Token {
             "created_at": self.created_at,
             "revoked_at": self.revoked_at,
             "expires_at": self.expires_at,
+            "refreshable_until": self.refreshable_until(),
             "github": self.github,
             "max_claims": self.max_claims,
         })
@@ -292,12 +364,17 @@ impl Token {
         text
     }
 
-    /// Created, and when it expires or expired; or when it was revoked.
+    /// Created, and when it expires or expired (and until when it is
+    /// refreshed); or when it was revoked.
     fn state(&self, now: Timestamp) -> String {
+        let refreshed = match self.refreshable_until() {
+            Some(until) if until > now => format!(", refreshed until {until}"),
+            _ => String::new(),
+        };
         match (&self.revoked_at, self.expires_at) {
             (Some(at), _) => format!("revoked {at}"),
-            (None, Some(at)) if at <= now => format!("expired {at}"),
-            (None, Some(at)) => format!("created {}, expires {at}", self.created_at),
+            (None, Some(at)) if at <= now => format!("expired {at}{refreshed}"),
+            (None, Some(at)) => format!("created {}, expires {at}{refreshed}", self.created_at),
             (None, None) => format!("created {}", self.created_at),
         }
     }
@@ -476,7 +553,8 @@ pub fn cmd_token(app: &mut App, cmd: &TokenCommand) -> Result<()> {
 fn create(app: &mut App, a: &TokenCreateArgs) -> Result<()> {
     let root = root_dir(&a.root)?;
     let grant = Grant { role: a.role, kind: a.kind, workspaces: a.workspaces.clone(), max_claims: a.max_claims };
-    let (token, secret) = add_token(&root, Holder::Admin { name: a.name.trim(), actor: a.act_as.trim() }, grant)?;
+    let (token, secret) = add_token(&root, Holder::Admin { name: a.name.trim(), actor: a.act_as.trim() }, grant)
+        .map(|issued| (issued.token, issued.secret))?;
     let mut view = token.view();
     view["token"] = json!(secret);
     let out = Out::new(view)
@@ -500,21 +578,122 @@ pub fn issue_token(
 ) -> Result<(Token, String)> {
     let grant = Grant { role, kind, workspaces: workspaces.to_vec(), max_claims: None };
     add_token(root, Holder::Admin { name: name.trim(), actor: actor.trim() }, grant)
+        .map(|issued| (issued.token, issued.secret))
 }
 
-/// Add an access token for a GitHub account that signed in, expiring after
-/// `ttl`. It acts as the account's actor: the one bound to it at an earlier
-/// sign-in, else its login, bound to it now. It is named
-/// `github-<actor>-<random>` (the actor cut to 40 characters). Returns it
-/// with its secret, which is not stored anywhere.
+/// A token just issued or refreshed, with its secrets, which are not
+/// stored anywhere.
+pub struct Issued {
+    pub token: Token,
+    pub secret: String,
+    /// The refresh secret, for a token that is refreshed.
+    pub refresh_secret: Option<String>,
+}
+
+/// How long a GitHub sign-in's tokens last.
+#[derive(Clone, Copy, Debug)]
+pub struct Lifetime {
+    /// How long each access token works.
+    pub ttl: Duration,
+    /// Until when its refreshes may renew it, if it is refreshed: they ask
+    /// GitHub again, by the workspace it signed in for.
+    pub refresh: Option<(Timestamp, Duration)>,
+}
+
+/// Add an access token for a GitHub account that signed in for
+/// `workspace`. It acts as the account's actor: the one bound to it at an
+/// earlier sign-in, else its login, bound to it now. It is named
+/// `github-<actor>-<random>` (the actor cut to 40 characters), and expires
+/// after `life.ttl`; with `life.refresh`, `(limit, idle)`, it may be
+/// refreshed until the earlier of `limit` and `idle` after each refresh.
 pub fn issue_github_token(
     root: &Path,
     user: &GithubUser,
     grant: Grant,
-    ttl: Duration,
+    life: Lifetime,
+    workspace: &str,
     by_login: bool,
-) -> Result<(Token, String)> {
-    add_token(root, Holder::Github { user, expires_at: Timestamp::now().plus(ttl), by_login }, grant)
+) -> Result<Issued> {
+    let now = Timestamp::now();
+    let refresh = life.refresh.map(|(limit, idle)| (workspace, limit.min(now.plus(idle))));
+    let expires_at = now.plus(life.ttl).min(refresh.map_or(Timestamp(i64::MAX), |(_, until)| until));
+    add_token(root, Holder::Github { user, expires_at, by_login, refresh }, grant)
+}
+
+/// The sign-in whose refresh secret this is, unless revoked: its token, and
+/// whether the secret is its current one (else it is spent, or forged).
+pub fn find_refresh(root: &Path, secret: &str) -> Result<Option<(Token, bool)>> {
+    let Some(family) = refresh_family(secret) else { return Ok(None) };
+    let file = load_file(&tokens_path(root))?;
+    let found = file
+        .tokens
+        .into_iter()
+        .find(|t| t.revoked_at.is_none() && t.refresh.as_ref().is_some_and(|r| r.family.eq_ignore_ascii_case(family)));
+    Ok(found.map(|t| {
+        let current = t.refresh.as_ref().is_some_and(|r| r.sha256 == hash(secret));
+        (t, current)
+    }))
+}
+
+/// Refresh the sign-in `id`, whose current refresh secret hashes to
+/// `current`, for the request `last` (the secret it presents, and its
+/// request id): new secrets, the account as GitHub names it now, what the
+/// rules grant it now, expiring at `expires_at` and refreshed until
+/// `until`. `None` when `current` is no longer the sign-in's (another
+/// refresh changed it meanwhile), or the sign-in was revoked.
+#[allow(clippy::too_many_arguments)]
+pub fn rotate(
+    root: &Path,
+    id: &str,
+    current: &str,
+    last: LastRefresh,
+    user: &GithubUser,
+    grant: Grant,
+    by_login: bool,
+    expires_at: Timestamp,
+    until: Timestamp,
+) -> Result<Option<Issued>> {
+    let workspaces = workspace_list(&grant.workspaces)?;
+    let path = tokens_path(root);
+    let _lock = lock_tokens(root)?;
+    let mut file = load_file(&path)?;
+    let now = Timestamp::now();
+    let live =
+        |t: &Token| t.id == id && t.revoked_at.is_none() && t.refresh.as_ref().is_some_and(|r| r.sha256 == current);
+    let Some(i) = file.tokens.iter().position(live) else { return Ok(None) };
+    let actor = bind(&mut file.accounts, user, now, by_login)?;
+    if actor != file.tokens[i].actor {
+        return Err(Error::Unauthorized(format!(
+            "GitHub user {} now acts as {actor}, not {}: sign in again (`bd remote login --github`)",
+            user.login, file.tokens[i].actor
+        )));
+    }
+    if by_login && !related(&actor, &user.login) {
+        if let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now) {
+            return Err(conflict_error(&user.login, Some(user), other));
+        }
+    }
+    if let Some(other) = actor_conflict(&file.tokens, &actor, Some(user), now) {
+        return Err(conflict_error(&actor, Some(user), other));
+    }
+    let secret = format!("bdt_{}", random_hex(32)?);
+    let t = &mut file.tokens[i];
+    let refresh = t.refresh.as_mut().expect("found by its refresh state");
+    let refresh_secret = refresh_secret(&refresh.family)?;
+    refresh.sha256 = hash(&refresh_secret);
+    refresh.refreshed_at = now;
+    refresh.until = until;
+    refresh.last = Some(last);
+    t.sha256 = hash(&secret);
+    t.expires_at = Some(expires_at.min(until));
+    t.role = grant.role;
+    t.kind = grant.kind;
+    t.workspaces = workspaces;
+    t.max_claims = grant.max_claims;
+    t.github = Some(user.clone());
+    let token = t.clone();
+    save_file(&path, &file)?;
+    Ok(Some(Issued { token, secret, refresh_secret: Some(refresh_secret) }))
 }
 
 /// Whom a new token is for.
@@ -522,8 +701,9 @@ enum Holder<'a> {
     /// An admin names it, and its actor.
     Admin { name: &'a str, actor: &'a str },
     /// A GitHub account that signed in; `by_login` when a rule let it in by
-    /// its login.
-    Github { user: &'a GithubUser, expires_at: Timestamp, by_login: bool },
+    /// its login; `refresh`, the workspace it signed in for and until when
+    /// it may be refreshed, if it may.
+    Github { user: &'a GithubUser, expires_at: Timestamp, by_login: bool, refresh: Option<(&'a str, Timestamp)> },
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -548,7 +728,7 @@ fn check_actor(actor: &str) -> Result<()> {
     Ok(())
 }
 
-fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String)> {
+fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
     let workspaces = workspace_list(&grant.workspaces)?;
     if let Holder::Admin { name, actor } = &holder {
         check_name(name)?;
@@ -563,9 +743,9 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
     let _lock = lock_tokens(root)?;
     let mut file = load_file(&path)?;
     let now = Timestamp::now();
-    // Tokens from GitHub sign-in stay listed for a while after they expire, then go.
-    file.tokens.retain(|t| t.github.is_none() || !t.expired(now.minus(PRUNE_AFTER)));
-    let (name, actor, expires_at, github) = match holder {
+    // Tokens from GitHub sign-in stay listed for a while after they expire (and can no longer be refreshed), then go.
+    file.tokens.retain(|t| t.github.is_none() || !t.ended(now.minus(PRUNE_AFTER)));
+    let (name, actor, expires_at, github, refresh) = match holder {
         Holder::Admin { name, actor } => {
             if let Some(account) = file.accounts.iter().find(|a| related(&a.actor, actor)) {
                 return Err(Error::Refused(format!(
@@ -574,9 +754,9 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
                     account.actor, account.login, account.login
                 )));
             }
-            (name.to_string(), actor.to_string(), None, None)
+            (name.to_string(), actor.to_string(), None, None, None)
         }
-        Holder::Github { user, expires_at, by_login } => {
+        Holder::Github { user, expires_at, by_login, refresh } => {
             let actor = bind(&mut file.accounts, user, now, by_login)?;
             if is_reserved_actor(&actor) {
                 return Err(Error::Unauthorized(format!(
@@ -594,7 +774,7 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
             let name = format!("github-{label}-{}", random_hex(4)?);
             check_name(&name)?;
             check_actor(&actor)?;
-            (name, actor, Some(expires_at), Some(user.clone()))
+            (name, actor, Some(expires_at), Some(user.clone()), refresh)
         }
     };
     if file.tokens.iter().any(|t| t.name == name && t.revoked_at.is_none()) {
@@ -604,6 +784,22 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
         return Err(conflict_error(&actor, github.as_ref(), other));
     }
     let secret = format!("bdt_{}", random_hex(32)?);
+    let (refresh, refresh_secret) = match refresh {
+        Some((workspace, until)) => {
+            let family = random_hex(16)?;
+            let secret = refresh_secret(&family)?;
+            let state = Refresh {
+                family,
+                sha256: hash(&secret),
+                workspace: workspace.to_string(),
+                refreshed_at: now,
+                until,
+                last: None,
+            };
+            (Some(state), Some(secret))
+        }
+        None => (None, None),
+    };
     let token = Token {
         id: random_hex(8)?,
         name,
@@ -617,10 +813,11 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<(Token, String
         expires_at,
         github,
         max_claims: grant.max_claims,
+        refresh,
     };
     file.tokens.push(token.clone());
     save_file(&path, &file)?;
-    Ok((token, secret))
+    Ok(Issued { token, secret, refresh_secret })
 }
 
 /// The actor of `user`'s tokens: the one bound to its account, else its
@@ -889,6 +1086,18 @@ fn revoke_github(root: &Path, login: &str, forget: bool) -> Result<GithubRevoked
 mod tests {
     use super::*;
 
+    /// A sign-in token lasting `ttl`, not refreshed.
+    fn github_token(
+        root: &Path,
+        user: &GithubUser,
+        grant: Grant,
+        ttl: Duration,
+        by_login: bool,
+    ) -> Result<(Token, String)> {
+        let life = Lifetime { ttl, refresh: None };
+        issue_github_token(root, user, grant, life, "proj", by_login).map(|i| (i.token, i.secret))
+    }
+
     fn token(actor: &str, workspaces: &[&str]) -> Token {
         Token {
             id: "id".into(),
@@ -903,6 +1112,7 @@ mod tests {
             expires_at: None,
             github: None,
             max_claims: None,
+            refresh: None,
         }
     }
 
@@ -987,7 +1197,7 @@ mod tests {
         };
         let ttl = Duration::from_secs(30 * 24 * 3600);
         let before = Timestamp::now();
-        let (t, secret) = issue_github_token(dir.path(), &alice, grant.clone(), ttl, true).unwrap();
+        let (t, secret) = github_token(dir.path(), &alice, grant.clone(), ttl, true).unwrap();
         assert!(secret.starts_with("bdt_") && t.sha256 == hash(&secret));
         assert!(t.name.starts_with("github-Alice-GH-") && t.name.len() == "github-Alice-GH-".len() + 8, "{}", t.name);
         assert_eq!((t.actor.as_str(), t.role, t.kind), ("Alice-GH", Role::Read, Kind::Human));
@@ -998,10 +1208,10 @@ mod tests {
         assert!(t.describe().contains("signed in as GitHub user Alice-GH"), "{}", t.describe());
         assert!(t.state(Timestamp::now()).contains("expires"), "{}", t.state(Timestamp::now()));
         assert!(t.state(expires).starts_with("expired"));
-        let (again, _) = issue_github_token(dir.path(), &alice, grant.clone(), ttl, true).unwrap();
+        let (again, _) = github_token(dir.path(), &alice, grant.clone(), ttl, true).unwrap();
         assert_ne!(again.name, t.name, "each sign-in gets a token of its own");
         let long = gh(&"a".repeat(60), 7);
-        let (t, _) = issue_github_token(dir.path(), &long, grant, ttl, true).unwrap();
+        let (t, _) = github_token(dir.path(), &long, grant, ttl, true).unwrap();
         assert_eq!((t.actor.len(), t.name.len()), (60, "github-".len() + 40 + 9), "the actor keeps the whole login");
 
         let v = Verifier::new(dir.path());
@@ -1034,12 +1244,102 @@ mod tests {
     }
 
     #[test]
+    fn refreshable_sign_ins_stay_listed_until_they_can_no_longer_be_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = tokens_path(dir.path());
+        let now = Timestamp::now();
+        let day = Duration::from_secs(24 * 3600);
+        let entry = |name: &str, until: Timestamp| {
+            let mut t = token("alice", &["*"]);
+            t.name = name.into();
+            t.expires_at = Some(now.minus(PRUNE_AFTER + day));
+            t.github = Some(gh("alice", 1));
+            let family = "0".repeat(32);
+            t.refresh = Some(Refresh {
+                family,
+                sha256: String::new(),
+                workspace: "proj".into(),
+                refreshed_at: now,
+                until,
+                last: None,
+            });
+            t
+        };
+        let tokens = vec![entry("refreshable", now.plus(day)), entry("ended", now.minus(PRUNE_AFTER + day))];
+        save_file(&path, &TokenFile { version: 1, tokens, accounts: Vec::new() }).unwrap();
+        issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
+        let names: Vec<String> = load_file(&path).unwrap().tokens.into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["refreshable", "ci"]);
+    }
+
+    #[test]
+    fn sign_ins_rotate_their_secrets_and_spent_ones_are_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let alice = gh("alice", 1);
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let (hour, week) = (Duration::from_secs(3600), Duration::from_secs(7 * 24 * 3600));
+        let now = Timestamp::now();
+        let life = Lifetime { ttl: hour, refresh: Some((now.plus(week * 4), week)) };
+        let issued = issue_github_token(dir.path(), &alice, grant.clone(), life, "proj", true).unwrap();
+        let first = issued.refresh_secret.expect("refreshed");
+        assert!(first.starts_with("bdr_") && refresh_family(&first).is_some(), "{}", first.len());
+        let t = issued.token;
+        let state = t.refresh.clone().unwrap();
+        assert_eq!(state.workspace, "proj");
+        assert!(state.until >= now.plus(week) && state.until <= Timestamp::now().plus(week), "idle, not the limit");
+        assert!(t.expires_at.unwrap() <= Timestamp::now().plus(hour));
+        assert!(t.summary()["refreshable_until"].is_string() && !t.summary().to_string().contains(&state.family));
+        let (found, current) = find_refresh(dir.path(), &first).unwrap().unwrap();
+        assert!(current && found.id == t.id);
+
+        let verifier = Verifier::new(dir.path());
+        assert!(matches!(verifier.verify(&issued.secret).unwrap(), Verified::Valid(_)));
+        let read = Grant { role: Role::Read, ..grant.clone() };
+        let renamed = gh("alice-new", 1);
+        let (expires, until) = (now.plus(hour * 2), now.plus(week));
+        let last = |secret: &str, id: &str| LastRefresh { spent: hash(secret), request: hash(id) };
+        let rotated =
+            rotate(dir.path(), &t.id, &hash(&first), last(&first, "r1"), &renamed, read, true, expires, until)
+                .unwrap()
+                .unwrap();
+        let second = rotated.refresh_secret.unwrap();
+        let r = rotated.token;
+        assert_eq!((r.id.as_str(), r.name.as_str(), r.actor.as_str()), (t.id.as_str(), t.name.as_str(), "alice"));
+        assert_eq!((r.role, r.github.as_ref().unwrap().login.as_str()), (Role::Read, "alice-new"), "the rules now");
+        assert_eq!((r.expires_at, r.refresh.as_ref().unwrap().until), (Some(expires), until));
+        assert_eq!(load_file(&tokens_path(dir.path())).unwrap().tokens.len(), 1, "replaced in place");
+        verifier.invalidate();
+        assert!(matches!(verifier.verify(&issued.secret).unwrap(), Verified::Unknown), "the old secret is gone");
+        assert!(matches!(verifier.verify(&rotated.secret).unwrap(), Verified::Valid(_)));
+
+        assert!(!find_refresh(dir.path(), &first).unwrap().unwrap().1, "spent");
+        assert!(find_refresh(dir.path(), &second).unwrap().unwrap().1);
+        let again =
+            rotate(dir.path(), &t.id, &hash(&first), last(&first, "r2"), &renamed, grant.clone(), true, expires, until);
+        assert!(again.unwrap().is_none(), "a spent secret rotates nothing");
+        let state = find_refresh(dir.path(), &second).unwrap().unwrap().0.refresh.unwrap();
+        assert!(state.retries_last(&first, "r1"), "the latest refresh, sent again");
+        assert!(!state.retries_last(&first, "r2") && !state.retries_last(&second, "r1"));
+        let forged = format!("{}_{}", &second[..36], "0".repeat(64));
+        assert!(!find_refresh(dir.path(), &forged).unwrap().unwrap().1, "the family alone is not enough");
+        for bad in ["bdt_x", "bdr_", "bdr_xyz_abc", &second[..second.len() - 1]] {
+            assert!(find_refresh(dir.path(), bad).unwrap().is_none(), "{bad}");
+        }
+        assert!(revoke_by_id(dir.path(), &t.id).unwrap());
+        assert!(find_refresh(dir.path(), &second).unwrap().is_none(), "revoked");
+
+        let once = Lifetime { ttl: hour, refresh: None };
+        let plain = issue_github_token(dir.path(), &alice, grant, once, "proj", true).unwrap();
+        assert!(plain.refresh_secret.is_none() && plain.token.refresh.is_none());
+    }
+
+    #[test]
     fn github_accounts_keep_their_actor_through_renames_and_after_their_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let path = tokens_path(dir.path());
         let hour = Duration::from_secs(3600);
         let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
-        let sign_in = |user: &GithubUser| issue_github_token(dir.path(), user, grant.clone(), hour, true);
+        let sign_in = |user: &GithubUser| github_token(dir.path(), user, grant.clone(), hour, true);
         let accounts = || load_file(&path).unwrap().accounts;
 
         let (first, _) = sign_in(&gh("alice", 1)).unwrap();
@@ -1089,9 +1389,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ttl = Duration::from_secs(3600);
         let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
-        let (a1, _) = issue_github_token(dir.path(), &gh("Alice", 1), grant.clone(), ttl, true).unwrap();
-        let (a2, _) = issue_github_token(dir.path(), &gh("alice-new", 1), grant.clone(), ttl, true).unwrap();
-        let (b, _) = issue_github_token(dir.path(), &gh("bob", 2), grant, ttl, true).unwrap();
+        let (a1, _) = github_token(dir.path(), &gh("Alice", 1), grant.clone(), ttl, true).unwrap();
+        let (a2, _) = github_token(dir.path(), &gh("alice-new", 1), grant.clone(), ttl, true).unwrap();
+        let (b, _) = github_token(dir.path(), &gh("bob", 2), grant, ttl, true).unwrap();
         issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
         let mut done = revoke_github(dir.path(), "ALICE-NEW", false).unwrap();
         done.revoked.sort();
@@ -1121,14 +1421,14 @@ mod tests {
         manual("ci", "ci-agents").unwrap();
         manual("carol-ci", "carol/ci").unwrap();
         for (login, id) in [("ci-agents", 1), ("CI-Agents", 1), ("carol", 2)] {
-            let e = issue_github_token(dir.path(), &gh(login, id), grant.clone(), ttl, true).unwrap_err();
+            let e = github_token(dir.path(), &gh(login, id), grant.clone(), ttl, true).unwrap_err();
             assert_eq!(e.exit_code(), 7, "{login}: {e}");
             assert!(e.to_string().contains("another access token acts as"), "{e}");
         }
         assert!(load_file(&tokens_path(dir.path())).unwrap().accounts.is_empty(), "a refused sign-in binds nothing");
-        issue_github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl, true).unwrap();
-        issue_github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl, true).unwrap();
-        assert!(issue_github_token(dir.path(), &gh("Alice", 4), grant.clone(), ttl, true).is_err(), "another account");
+        github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl, true).unwrap();
+        github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl, true).unwrap();
+        assert!(github_token(dir.path(), &gh("Alice", 4), grant.clone(), ttl, true).is_err(), "another account");
         for actor in ["alice", "ALICE/ci"] {
             let e = manual("x", actor).unwrap_err();
             assert!(e.to_string().contains("bd serve token revoke --github alice --forget"), "{e}");
@@ -1137,10 +1437,10 @@ mod tests {
 
         // Revoked, an account keeps its actor; released, the actor is free again. Admins' tokens may share theirs.
         revoke_github(dir.path(), "alice", false).unwrap();
-        assert!(issue_github_token(dir.path(), &gh("alice", 4), grant.clone(), ttl, true).is_err());
+        assert!(github_token(dir.path(), &gh("alice", 4), grant.clone(), ttl, true).is_err());
         assert!(manual("x", "alice").is_err());
         revoke_github(dir.path(), "alice", true).unwrap();
-        issue_github_token(dir.path(), &gh("alice", 4), grant, ttl, true).unwrap();
+        github_token(dir.path(), &gh("alice", 4), grant, ttl, true).unwrap();
         manual("ci-2", "ci-agents").unwrap();
     }
 
@@ -1152,7 +1452,7 @@ mod tests {
         for actor in ["bd-serve", "BD-Serve", "bd-serve/jobs"] {
             let e = issue_token(dir.path(), "x", actor, Role::Admin, Kind::Agent, &[]).unwrap_err();
             assert!(e.exit_code() == 2 && e.to_string().contains("reserved"), "{actor}: {e}");
-            let e = issue_github_token(dir.path(), &gh(actor, 1), grant.clone(), ttl, true).unwrap_err();
+            let e = github_token(dir.path(), &gh(actor, 1), grant.clone(), ttl, true).unwrap_err();
             assert!(e.exit_code() == 7 && e.to_string().contains("bd serve's own"), "{actor}: {e}");
         }
         let file = load_file(&tokens_path(dir.path())).unwrap();

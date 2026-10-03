@@ -13,7 +13,16 @@
 //! token = "bdt_..."
 //! ca = "sha256:..."
 //! github = true    # from GitHub sign-in: revoked on its server at logout
+//! refresh_token = "bdr_..."                 # where the server refreshes sign-ins
+//! refresh_after = "2026-10-02T19:20:00.000Z" # this machine's clock
+//! expires_at = "2026-10-02T19:30:00.000Z"
+//! refresh_request = "..."                   # a refresh sent and not answered yet
 //! ```
+//!
+//! A sign-in token with a refresh token is renewed before it expires (see
+//! `remote.rs`): the process that does it holds `credentials.lock`, next to
+//! the file, so that two never spend one refresh token, which would revoke
+//! the sign-in; saving and removing tokens hold it too.
 //!
 //! A server is its URL up to `/w/<workspace>`: scheme, host, port and any
 //! path prefix (lowercase scheme and host, no default port), since one token
@@ -37,7 +46,9 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use bd_core::{Error, Result};
+use std::time::{Duration, Instant};
+
+use bd_core::{Error, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::random_hex;
@@ -54,7 +65,7 @@ struct File {
     workspaces: BTreeMap<String, Entry>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 struct Entry {
     token: String,
     ca: String,
@@ -62,6 +73,79 @@ struct Entry {
     /// saving another token in its place, revokes it on its server.
     #[serde(default, skip_serializing_if = "is_false")]
     github: bool,
+    /// The sign-in's refresh token, where its server refreshes tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_token: Option<String>,
+    /// When to refresh the token, by this machine's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_after: Option<Timestamp>,
+    /// When the token expires, by this machine's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at: Option<Timestamp>,
+    /// The request id of a refresh sent and not answered yet: sent again
+    /// with the same refresh token, the server takes it for a retry, not a
+    /// reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    refresh_request: Option<String>,
+}
+
+impl Entry {
+    fn renewal(&self) -> Option<Renewal> {
+        match (&self.refresh_token, self.refresh_after, self.expires_at) {
+            (Some(refresh_token), Some(refresh_after), Some(expires_at)) => Some(Renewal {
+                refresh_token: refresh_token.clone(),
+                refresh_after,
+                expires_at,
+                pending: self.refresh_request.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    fn set_renewal(&mut self, renewal: Option<&Renewal>) {
+        self.refresh_token = renewal.map(|r| r.refresh_token.clone());
+        self.refresh_after = renewal.map(|r| r.refresh_after);
+        self.expires_at = renewal.map(|r| r.expires_at);
+        self.refresh_request = renewal.and_then(|r| r.pending.clone());
+    }
+}
+
+/// How a sign-in token is renewed: its refresh token, and when, by this
+/// machine's clock.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Renewal {
+    pub refresh_token: String,
+    /// When to refresh it: a while before it expires.
+    pub refresh_after: Timestamp,
+    pub expires_at: Timestamp,
+    /// The request id of a refresh sent with this refresh token and not
+    /// answered yet: the next attempt sends it again.
+    pub pending: Option<String>,
+}
+
+impl std::fmt::Debug for Renewal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the secret.
+        f.debug_struct("Renewal")
+            .field("refresh_after", &self.refresh_after)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl Renewal {
+    /// For a token that expires in `expires_in` from now: refreshed once a
+    /// fifth of that is left, or 10 minutes, whichever is less.
+    pub fn new(refresh_token: String, expires_in: Duration) -> Renewal {
+        let now = Timestamp::now();
+        let margin = (expires_in / 5).min(Duration::from_secs(600));
+        Renewal {
+            refresh_token,
+            refresh_after: now.plus(expires_in - margin),
+            expires_at: now.plus(expires_in),
+            pending: None,
+        }
+    }
 }
 
 fn is_false(b: &bool) -> bool {
@@ -107,6 +191,8 @@ pub struct Saved {
     /// The entry it is saved under.
     pub key: String,
     pub scope: Scope,
+    /// How it is renewed, if it is.
+    pub renewal: Option<Renewal>,
 }
 
 /// A saved token taken out of the file, by [`save`] or [`remove`].
@@ -119,6 +205,9 @@ pub struct Gone {
     pub ca: String,
     /// It came from GitHub sign-in.
     pub github: bool,
+    /// How it was renewed, if it was: its refresh token revokes the sign-in
+    /// even when a refresh whose answer was lost replaced the access token.
+    pub renewal: Option<Renewal>,
 }
 
 impl std::fmt::Debug for Gone {
@@ -130,7 +219,7 @@ impl std::fmt::Debug for Gone {
 
 impl Gone {
     fn new(key: String, entry: Entry) -> Gone {
-        Gone { key, token: entry.token, ca: entry.ca, github: entry.github }
+        Gone { key, renewal: entry.renewal(), token: entry.token, ca: entry.ca, github: entry.github }
     }
 }
 
@@ -215,6 +304,7 @@ fn lookup_in(path: &Path, url: &str) -> Result<Option<Saved>> {
     let workspace = keys.workspace.and_then(|k| file.workspaces.remove(&k).map(|e| (k, Scope::Workspace, e)));
     let found = workspace.or_else(|| file.servers.remove(&keys.server).map(|e| (keys.server, Scope::Server, e)));
     Ok(found.map(|(key, scope, entry)| Saved {
+        renewal: entry.renewal(),
         token: entry.token,
         ca: entry.ca,
         path: path.to_path_buf(),
@@ -235,13 +325,23 @@ pub fn check_token(token: &str) -> Result<()> {
 }
 
 /// Save `token` for `url`'s server, or for the workspace only, with the
-/// trust it was checked under (`ca`: [`SYSTEM_CA`] or `sha256:<hex>`), and
-/// whether it came from GitHub sign-in.
-pub fn save(path: &Path, url: &str, token: &str, ca: &str, scope: Scope, github: bool) -> Result<SaveReport> {
+/// trust it was checked under (`ca`: [`SYSTEM_CA`] or `sha256:<hex>`),
+/// whether it came from GitHub sign-in, and how it is renewed.
+pub fn save(
+    path: &Path,
+    url: &str,
+    token: &str,
+    ca: &str,
+    scope: Scope,
+    github: bool,
+    renewal: Option<&Renewal>,
+) -> Result<SaveReport> {
     check_token(token)?;
     let keys = keys(url)?;
+    let _held = lock(path, LOCK_WAIT)?;
     let (mut file, loose_mode) = load(path)?.unwrap_or_default();
-    let entry = Entry { token: token.to_string(), ca: ca.to_string(), github };
+    let mut entry = Entry { token: token.to_string(), ca: ca.to_string(), github, ..Entry::default() };
+    entry.set_renewal(renewal);
     let report = match scope {
         Scope::Server => {
             let dropped = keys.workspace.and_then(|k| file.workspaces.remove(&k).map(|e| Gone::new(k, e)));
@@ -266,6 +366,10 @@ pub fn remove(path: &Path, url: &str, workspace_only: bool) -> Result<RemoveRepo
     if workspace_only && keys.workspace.is_none() {
         return Err(Error::invalid(format!("--workspace-only needs a workspace URL (…/w/<workspace>), not {url}")));
     }
+    if load(path)?.is_none() {
+        return Ok(RemoveReport::default());
+    }
+    let _held = lock(path, LOCK_WAIT)?;
     let Some((mut file, _)) = load(path)? else { return Ok(RemoveReport::default()) };
     let mut removed = Vec::new();
     if !workspace_only {
@@ -296,6 +400,84 @@ pub fn remove(path: &Path, url: &str, workspace_only: bool) -> Result<RemoveRepo
         write(path, &file)?;
     }
     Ok(RemoveReport { removed, file_removed })
+}
+
+/// How long saving or removing a token waits for another bd process
+/// changing the file: one renewing a token holds it for a minute at most.
+const LOCK_WAIT: Duration = Duration::from_secs(90);
+
+/// `credentials.lock`, next to the credentials file, held: released when
+/// dropped, or when the process ends.
+pub struct Lock(std::fs::File);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = fs4::FileExt::unlock(&self.0);
+    }
+}
+
+/// Take the lock of the credentials file `path`, waiting up to `wait`.
+pub fn lock(path: &Path, wait: Duration) -> Result<Lock> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|e| io_error(dir, e))?;
+    let lock_path = dir.join("credentials.lock");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    let file = opts.open(&lock_path).map_err(|e| io_error(&lock_path, e))?;
+    let deadline = Instant::now() + wait;
+    let mut delay = Duration::from_millis(5);
+    loop {
+        // Called through the trait: std's own File::try_lock (Rust 1.89) is newer than bd's MSRV.
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => return Ok(Lock(file)),
+            Err(fs4::TryLockError::WouldBlock) => {}
+            Err(fs4::TryLockError::Error(e)) => return Err(io_error(&lock_path, e)),
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(Error::Busy(format!(
+                "another bd process is changing the saved access tokens ({} is locked); retry",
+                lock_path.display()
+            )));
+        }
+        std::thread::sleep(delay.min(left));
+        delay = (delay * 2).min(Duration::from_millis(50));
+    }
+}
+
+/// The saved token under `key`, read while holding the file's lock.
+pub fn lookup_key(_held: &Lock, path: &Path, key: &str) -> Result<Option<Saved>> {
+    let Some((mut file, _)) = load(path)? else { return Ok(None) };
+    let found = match file.workspaces.remove(key) {
+        Some(e) => Some((Scope::Workspace, e)),
+        None => file.servers.remove(key).map(|e| (Scope::Server, e)),
+    };
+    Ok(found.map(|(scope, entry)| Saved {
+        renewal: entry.renewal(),
+        token: entry.token,
+        ca: entry.ca,
+        path: path.to_path_buf(),
+        key: key.to_string(),
+        scope,
+    }))
+}
+
+/// Replace the token saved under `key`, and how it is renewed (`None`: it
+/// is not, any more), keeping its trust; while holding the file's lock.
+/// Nothing is written when the entry is gone.
+pub fn renewed(_held: &Lock, path: &Path, key: &str, token: &str, renewal: Option<&Renewal>) -> Result<()> {
+    check_token(token)?;
+    let Some((mut file, _)) = load(path)? else { return Ok(()) };
+    let Some(entry) = file.workspaces.get_mut(key).or_else(|| file.servers.get_mut(key)) else { return Ok(()) };
+    entry.token = token.to_string();
+    entry.set_renewal(renewal);
+    write(path, &file)
 }
 
 fn io_error(path: &Path, e: std::io::Error) -> Error {
@@ -378,14 +560,49 @@ mod tests {
     fn sign_in_tokens_are_marked() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.toml");
-        save(&path, "https://h/w/a", "bdt_gh", SYSTEM_CA, Scope::Server, true).unwrap();
+        save(&path, "https://h/w/a", "bdt_gh", SYSTEM_CA, Scope::Server, true, None).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("github = true"));
-        let r = save(&path, "https://h/w/a", "bdt_admin", SYSTEM_CA, Scope::Server, false).unwrap();
+        let r = save(&path, "https://h/w/a", "bdt_admin", SYSTEM_CA, Scope::Server, false, None).unwrap();
         let replaced = r.replaced.unwrap();
         assert!(replaced.github && replaced.token == "bdt_gh");
         assert!(!std::fs::read_to_string(&path).unwrap().contains("github"), "only sign-in tokens say so");
         let r = remove(&path, "https://h", false).unwrap();
         assert!(!r.removed[0].github && r.removed[0].token == "bdt_admin");
+    }
+
+    #[test]
+    fn renewals_are_saved_and_replaced_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.toml");
+        let renewal = Renewal::new("bdr_refresh".into(), Duration::from_secs(3600));
+        let now = Timestamp::now();
+        assert!(renewal.refresh_after >= now.plus(Duration::from_secs(49 * 60)), "10 minutes before the hour");
+        assert!(renewal.refresh_after <= now.plus(Duration::from_secs(50 * 60)));
+        let short = Renewal::new("r".into(), Duration::from_secs(60));
+        assert_eq!(short.expires_at.since(short.refresh_after), 12_000, "a fifth of a short lifetime");
+        assert!(!format!("{renewal:?}").contains("bdr_"), "never the secret");
+
+        save(&path, "https://h/w/a", "bdt_gh", SYSTEM_CA, Scope::Server, true, Some(&renewal)).unwrap();
+        let saved = lookup_in(&path, "https://h/w/a").unwrap().unwrap();
+        assert_eq!(saved.renewal.as_ref(), Some(&renewal));
+
+        let held = lock(&path, Duration::from_secs(1)).unwrap();
+        let e = lock(&path, Duration::from_millis(30)).err().expect("held by another handle");
+        assert_eq!(e.exit_code(), 5, "{e}");
+        let next = Renewal::new("bdr_next".into(), Duration::from_secs(3600));
+        renewed(&held, &path, "https://h", "bdt_next", Some(&next)).unwrap();
+        let found = lookup_key(&held, &path, "https://h").unwrap().unwrap();
+        assert_eq!(
+            (found.token.as_str(), found.renewal.as_ref(), found.ca.as_str()),
+            ("bdt_next", Some(&next), SYSTEM_CA)
+        );
+        renewed(&held, &path, "https://h", "bdt_next", None).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("github = true") && !text.contains("refresh"), "{text}");
+        renewed(&held, &path, "https://gone", "bdt_x", None).unwrap();
+        assert!(lookup_key(&held, &path, "https://gone").unwrap().is_none(), "nothing written for an entry gone");
+        drop(held);
+        assert!(lock(&path, Duration::from_millis(30)).is_ok());
     }
 
     fn k(server: &str, workspace: Option<&str>) -> Keys {
@@ -423,17 +640,17 @@ mod tests {
         assert!(lookup_in(&path, "https://h/w/a").unwrap().is_none(), "a missing file is no token");
         assert!(remove(&path, "https://h/w/a", false).unwrap().removed.is_empty());
 
-        let r = save(&path, "https://H:443/w/a", "bdt_server", SYSTEM_CA, Scope::Server, false).unwrap();
+        let r = save(&path, "https://H:443/w/a", "bdt_server", SYSTEM_CA, Scope::Server, false, None).unwrap();
         assert_eq!((r.key.as_str(), r.replaced.is_none(), r.dropped.is_none()), ("https://h", true, true));
-        save(&path, "https://other/w/a", "bdt_other", SYSTEM_CA, Scope::Server, false).unwrap();
-        save(&path, "https://h/w/b", "bdt_b", SYSTEM_CA, Scope::Workspace, false).unwrap();
+        save(&path, "https://other/w/a", "bdt_other", SYSTEM_CA, Scope::Server, false, None).unwrap();
+        save(&path, "https://h/w/b", "bdt_b", SYSTEM_CA, Scope::Workspace, false, None).unwrap();
         let found = |url: &str| lookup_in(&path, url).unwrap().map(|s| (s.token, s.key, s.scope));
         assert_eq!(found("https://h/w/a"), Some(("bdt_server".into(), "https://h".into(), Scope::Server)));
         assert_eq!(found("https://h/w/b"), Some(("bdt_b".into(), "https://h/w/b".into(), Scope::Workspace)));
         assert_eq!(found("https://h/prefix/w/a"), None, "another server behind the same host");
 
         // Logging in to b's server again replaces the server token and drops b's own, which would hide it.
-        let r = save(&path, "https://h/w/b", "bdt_new", SYSTEM_CA, Scope::Server, false).unwrap();
+        let r = save(&path, "https://h/w/b", "bdt_new", SYSTEM_CA, Scope::Server, false, None).unwrap();
         let replaced = r.replaced.unwrap();
         assert_eq!((replaced.key.as_str(), replaced.token.as_str()), ("https://h", "bdt_server"), "what it replaced");
         let dropped = r.dropped.unwrap();
@@ -441,8 +658,8 @@ mod tests {
         assert!(!format!("{dropped:?}").contains("bdt_b"), "never the secret");
         assert_eq!(found("https://h/w/b").unwrap().0, "bdt_new");
 
-        save(&path, "https://h/w/b", "bdt_b", SYSTEM_CA, Scope::Workspace, false).unwrap();
-        save(&path, "https://h/w/c", "bdt_c", SYSTEM_CA, Scope::Workspace, false).unwrap();
+        save(&path, "https://h/w/b", "bdt_b", SYSTEM_CA, Scope::Workspace, false, None).unwrap();
+        save(&path, "https://h/w/c", "bdt_c", SYSTEM_CA, Scope::Workspace, false, None).unwrap();
         let r = remove(&path, "https://h/w/b", true).unwrap();
         assert_eq!(keys_of(&r.removed), ["https://h/w/b"]);
         assert_eq!(found("https://h/w/b").unwrap().0, "bdt_new", "back to the server token");
@@ -462,7 +679,7 @@ mod tests {
     fn entries_keep_the_trust_they_were_checked_under() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.toml");
-        save(&path, "https://h/w/a", "bdt_x", "sha256:abc", Scope::Server, false).unwrap();
+        save(&path, "https://h/w/a", "bdt_x", "sha256:abc", Scope::Server, false, None).unwrap();
         assert!(std::fs::read_to_string(&path).unwrap().contains("ca = \"sha256:abc\""));
         assert_eq!(lookup_in(&path, "https://h/w/a").unwrap().unwrap().ca, "sha256:abc");
         std::fs::write(&path, "[servers.\"https://h\"]\ntoken = \"bdt_secret_value\"\n").unwrap();
@@ -479,9 +696,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.toml");
-        assert!(save(&path, "https://h/w/a", "", SYSTEM_CA, Scope::Server, false).is_err());
+        assert!(save(&path, "https://h/w/a", "", SYSTEM_CA, Scope::Server, false, None).is_err());
         assert!(
-            save(&path, "https://h", "bdt_x", SYSTEM_CA, Scope::Workspace, false).is_err(),
+            save(&path, "https://h", "bdt_x", SYSTEM_CA, Scope::Workspace, false, None).is_err(),
             "a workspace entry needs a workspace URL"
         );
         assert!(!path.exists(), "nothing is written for a refused save");
@@ -501,7 +718,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cfg").join("bd").join("credentials.toml");
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        save(&path, "https://h/w/a", "bdt_x", SYSTEM_CA, Scope::Server, false).unwrap();
+        save(&path, "https://h/w/a", "bdt_x", SYSTEM_CA, Scope::Server, false, None).unwrap();
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert_eq!(mode(&dir.path().join("cfg")), 0o700);
@@ -511,11 +728,16 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         let e = lookup_in(&path, "https://h/w/a").err().unwrap();
         assert!(e.to_string().contains("chmod 600") && e.exit_code() == 2, "{e}");
-        let r = save(&path, "https://h/w/a", "bdt_y", SYSTEM_CA, Scope::Server, false).unwrap();
+        let r = save(&path, "https://h/w/a", "bdt_y", SYSTEM_CA, Scope::Server, false, None).unwrap();
         assert_eq!(r.loose_mode, Some(0o644));
         assert_eq!(mode(&path), 0o600, "saving again makes it private");
         assert_eq!(lookup_in(&path, "https://h/w/a").unwrap().unwrap().token, "bdt_y");
-        let leftovers = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
-        assert_eq!(leftovers, 1, "no temp files are left behind");
+        let names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "no temp files are left behind: {names:?}");
+        assert!(names.contains(&"credentials.lock".to_string()), "{names:?}");
+        assert_eq!(mode(&path.with_file_name("credentials.lock")), 0o600);
     }
 }

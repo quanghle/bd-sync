@@ -24,9 +24,10 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use bd_core::{Error, Result};
+use bd_core::{Error, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -35,12 +36,12 @@ use crate::actor;
 use crate::app::{App, Out};
 use crate::auth::random_hex;
 use crate::cli::*;
-use crate::credentials::{self, Scope};
+use crate::credentials::{self, Renewal, Scope};
 use crate::io;
 use crate::playbooks;
 use crate::protocol::{
-    ErrorBody, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, Frame, PROTOCOL, PROTOCOL_HEADER, RevokeAnswer,
-    valid_workspace_name,
+    ErrorBody, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, Frame, PROTOCOL, PROTOCOL_HEADER, RefreshRequest,
+    RevokeAnswer, valid_workspace_name,
 };
 use crate::stream::{Cut, FrameReader};
 
@@ -64,7 +65,10 @@ fn retry_budget() -> Duration {
 pub struct Remote {
     /// Workspace URL without a trailing slash.
     pub url: String,
-    token: String,
+    /// The access token sent: a renewed one replaces it.
+    token: Mutex<String>,
+    /// The saved sign-in token this remote renews, if it does.
+    renewing: Option<Mutex<Renewing>>,
     /// The CA certificates to trust instead of the system's, as read by [`Trust::load`].
     roots: Option<Vec<ureq::tls::Certificate<'static>>>,
     /// How long failures in transit are retried.
@@ -209,6 +213,14 @@ impl Token {
             Token::Saved(s) => s.token,
         }
     }
+
+    /// A remote sending this token, renewing it if it is a saved sign-in's.
+    fn remote(self, c: Configured, trust: Trust) -> Remote {
+        match self {
+            Token::Env(t) => Remote::new(c, trust, t),
+            Token::Saved(s) => Remote::new(c, trust, s.token.clone()).renewing(&s),
+        }
+    }
 }
 
 /// What a remote's server certificate is checked against, read once per
@@ -300,7 +312,7 @@ pub fn detect(app: &App) -> Result<Option<Remote>> {
     let Some(c) = configured(app)? else { return Ok(None) };
     let trust = Trust::load(c.ca_cert.as_deref())?;
     let token = token_for(&c.url, &trust, &c.source)?.ok_or_else(|| missing_token(&c.url, trust.path.as_deref()))?;
-    Ok(Some(Remote::new(c, trust, token.secret())))
+    Ok(Some(token.remote(c, trust)))
 }
 
 /// The nearest `.bd/remote.toml`, unless a nearer `.bd/bd.db` comes first.
@@ -548,6 +560,8 @@ struct Delivery {
     long_poll: bool,
     /// Escapes stdout printed as it arrives, across frames.
     screen: io::Escaper,
+    /// bd serve refused the access token (HTTP 401): it may have expired.
+    token_refused: bool,
 }
 
 /// An output file, written to `<target>.tmp` and renamed into place once the command succeeds.
@@ -575,6 +589,7 @@ impl Delivery {
             cursor: None,
             long_poll: false,
             screen: io::Escaper::default(),
+            token_refused: false,
         }
     }
 
@@ -833,7 +848,8 @@ impl Remote {
     pub fn new(c: Configured, trust: Trust, token: String) -> Remote {
         Remote {
             url: c.url,
-            token,
+            token: Mutex::new(token),
+            renewing: None,
             roots: trust.certs,
             retry: retry_budget(),
             connect_timeout: Duration::from_secs(10),
@@ -906,10 +922,26 @@ impl Remote {
     /// write that may have run without its answer arriving fails with
     /// [`Error::AnswerLost`], never as safe to run again.
     fn exec_into(&self, request: &ExecRequest, out: &mut Delivery) -> Result<ExecResponse> {
+        let token = self.access_token(false)?;
+        let result = self.exec_as(&token, request, out);
+        // A token refused before the command ran may have expired here first (another clock, or a
+        // refresh by another process): renewed, the request is tried once more.
+        if !(result.is_err() && out.token_refused && self.renewing.is_some()) {
+            return result;
+        }
+        out.token_refused = false;
+        match self.access_token(true) {
+            Ok(renewed) if renewed != token => self.exec_as(&renewed, request, out),
+            _ => result,
+        }
+    }
+
+    /// [`Remote::exec_into`] with this access token.
+    fn exec_as(&self, token: &str, request: &ExecRequest, out: &mut Delivery) -> Result<ExecResponse> {
         let agent = self.agent()?;
         let body = serde_json::to_vec(request)?;
         let endpoint = format!("{}/v{PROTOCOL}/exec", self.url);
-        let authorization = format!("Bearer {}", self.token);
+        let authorization = format!("Bearer {token}");
         let budget = self.retry;
         // A request made once the deadline has passed (a set wanted after the mutex wait) fails at once.
         if let Some((_, allowed)) = self.deadline.filter(|&(at, _)| Instant::now() >= at) {
@@ -992,7 +1024,10 @@ impl Remote {
                             let why = format!("HTTP {status}{}", error_message(&text));
                             return Err(lost(format!("{why}, after an earlier attempt that may have run")));
                         }
-                        (_, Ok(text)) => return Err(http_error(status, &text, &self.url, bd)),
+                        (_, Ok(text)) => {
+                            out.token_refused = status == 401 && bd;
+                            return Err(http_error(status, &text, &self.url, bd));
+                        }
                         (_, Err(e)) => {
                             reached |= may_have_run || status == 409;
                             format!("HTTP {status}, reading the response: {e}")
@@ -1139,20 +1174,39 @@ impl Remote {
         body: &impl Serialize,
         pace: Duration,
     ) -> Result<T> {
+        let token = self.token.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        self.auth_post(path, &token, body, pace, None)
+    }
+
+    /// [`Remote::auth_request`] with `bearer` as its bearer token (none if
+    /// empty), ending within `limit` if given.
+    fn auth_post<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        bearer: &str,
+        body: &impl Serialize,
+        pace: Duration,
+        limit: Option<Duration>,
+    ) -> Result<T> {
         use crate::agents::show::printable;
         let server = credentials::keys(&self.url)?.server;
         let endpoint = format!("{server}/v{PROTOCOL}/auth/{path}");
         let agent = self.agent()?;
         let body = serde_json::to_vec(body)?;
         let deadline = Instant::now() + self.retry;
+        let hard = limit.map(|l| Instant::now() + l);
+        let left = || {
+            let to_hard = hard.map(|h| h.saturating_duration_since(Instant::now()));
+            [self.time_left(), to_hard].into_iter().flatten().min()
+        };
         let mut delay = pace.max(Duration::from_millis(200));
         loop {
             let mut post = agent.post(&endpoint);
-            if let Some(left) = self.time_left() {
+            if let Some(left) = left() {
                 post = post.config().timeout_global(Some(left)).build();
             }
-            if !self.token.is_empty() {
-                post = post.header("authorization", &format!("Bearer {}", self.token));
+            if !bearer.is_empty() {
+                post = post.header("authorization", &format!("Bearer {bearer}"));
             }
             let sent = post.header("accept", "application/json").content_type("application/json").send(&body[..]);
             let failure = match sent {
@@ -1182,7 +1236,7 @@ impl Remote {
                 Err(e) if retryable(&e) => e.to_string(),
                 Err(e) => return Err(Error::Remote(format!("{server}: {e}{}", certificate_advice(&e.to_string())))),
             };
-            let past_deadline = self.deadline.is_some_and(|(at, _)| Instant::now() + delay > at);
+            let past_deadline = left().is_some_and(|left| delay > left);
             if Instant::now() + delay > deadline || past_deadline {
                 return Err(Error::Remote(format!(
                     "{server}: {failure} (gave up after retrying for {}s)",
@@ -1200,7 +1254,170 @@ impl Remote {
     pub fn revoke_own_token(&self) -> Result<RevokeAnswer> {
         self.auth_request("revoke", &json!({}), Duration::ZERO)
     }
+
+    /// Revoke the sign-in `ren` renews, with its refresh token: also when a
+    /// refresh whose answer was lost (`ren.pending`) replaced this remote's
+    /// access token on the server.
+    fn revoke_sign_in(&self, ren: &Renewal) -> Result<RevokeAnswer> {
+        let body = json!({ "request_id": ren.pending });
+        self.auth_post("revoke", &ren.refresh_token, &body, Duration::ZERO, None)
+    }
+
+    /// Renew `saved`, the token this remote sends, when it is due: a sign-in
+    /// token with a refresh token.
+    pub fn renewing(mut self, saved: &credentials::Saved) -> Remote {
+        if saved.renewal.is_some() {
+            let expires_at = saved.renewal.as_ref().map_or(Timestamp(i64::MAX), |ren| ren.expires_at);
+            let r = Renewing {
+                path: saved.path.clone(),
+                key: saved.key.clone(),
+                renewal: saved.renewal.clone(),
+                expires_at,
+            };
+            self.renewing = Some(Mutex::new(r));
+        }
+        self
+    }
+
+    /// The access token to send now. A saved sign-in token due for renewal,
+    /// or with `force` (the server refused it), is renewed first. While the
+    /// token still works, renewing is optional: a renewal that fails, or
+    /// finds another process renewing, leaves it to work until it expires,
+    /// and this process tries again a minute later. One the server refuses
+    /// is not tried again.
+    fn access_token(&self, force: bool) -> Result<String> {
+        let current = self.token.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let Some(renewing) = &self.renewing else { return Ok(current) };
+        let mut r = renewing.lock().unwrap_or_else(|p| p.into_inner());
+        let now = Timestamp::now();
+        let Some(known) = r.renewal.clone() else { return Ok(current) };
+        if !force && now < known.refresh_after {
+            return Ok(current);
+        }
+        let optional = !force && now < known.expires_at;
+        let renewed = self.renew(&mut r, &current, force, optional);
+        // What renew left: the token in use may be another process's, with its own expiry.
+        let now = Timestamp::now();
+        let works = !force && now < r.expires_at;
+        match renewed {
+            Ok(token) => Ok(token),
+            Err(e) if works => {
+                match &e {
+                    Error::Unauthorized(_) => io::errln(format!("bd: {e}; it works until it expires")),
+                    _ => {
+                        tracing::debug!(target: "bd::remote", url = %self.url, error = %e, "access token not renewed yet")
+                    }
+                }
+                if let Some(ren) = r.renewal.as_mut() {
+                    ren.refresh_after = now.plus(RENEW_BACKOFF);
+                }
+                Ok(self.token.lock().unwrap_or_else(|p| p.into_inner()).clone())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Renew the saved token, holding the credentials file's lock (tried
+    /// once when `optional`): unless another process did it already, send
+    /// its refresh token, and save what comes back. The refresh's request
+    /// id is saved first, so that one whose answer is lost is sent again as
+    /// such, never as a spent refresh token (which revokes the sign-in).
+    fn renew(&self, r: &mut Renewing, current: &str, force: bool, optional: bool) -> Result<String> {
+        let wait = match optional {
+            true => Duration::ZERO,
+            false => self.time_left().unwrap_or(RENEW_LOCK_WAIT).min(RENEW_LOCK_WAIT),
+        };
+        let held = credentials::lock(&r.path, wait)?;
+        let Some(saved) = credentials::lookup_key(&held, &r.path, &r.key)? else {
+            // Logged out meanwhile: the token goes as it is.
+            r.renewal = None;
+            return Ok(current.to_string());
+        };
+        let set = |token: &str| *self.token.lock().unwrap_or_else(|p| p.into_inner()) = token.to_string();
+        set(&saved.token);
+        r.adopt(saved.renewal.clone());
+        let now = Timestamp::now();
+        // Another process renewed it, or a login replaced it.
+        if saved.token != current && saved.renewal.as_ref().is_none_or(|ren| now < ren.refresh_after) {
+            return Ok(saved.token);
+        }
+        let Some(mut ren) = saved.renewal.clone() else { return Ok(saved.token) };
+        if !force && now < ren.refresh_after {
+            return Ok(saved.token);
+        }
+        let request_id = match &ren.pending {
+            Some(id) => id.clone(),
+            None => {
+                let id = random_hex(16)?;
+                ren.pending = Some(id.clone());
+                credentials::renewed(&held, &r.path, &r.key, &saved.token, Some(&ren))?;
+                r.adopt(Some(ren.clone()));
+                id
+            }
+        };
+        let request = RefreshRequest { request_id };
+        let answer = self.auth_post::<crate::protocol::Issued>(
+            "refresh",
+            &ren.refresh_token,
+            &request,
+            Duration::ZERO,
+            Some(REFRESH_LIMIT),
+        );
+        match answer {
+            Ok(issued) => {
+                credentials::check_token(&issued.token).map_err(|_| {
+                    Error::Remote(format!("{}: unexpected refresh answer: not an access token", self.url))
+                })?;
+                let renewal =
+                    issued.refresh_token.map(|t| Renewal::new(t, Duration::from_secs(issued.expires_in.max(1))));
+                credentials::renewed(&held, &r.path, &r.key, &issued.token, renewal.as_ref())?;
+                tracing::debug!(target: "bd::remote", url = %self.url, "access token renewed");
+                r.adopt(renewal);
+                set(&issued.token);
+                Ok(issued.token)
+            }
+            Err(Error::Unauthorized(why)) => {
+                // Never again: the token works as it is until it expires.
+                credentials::renewed(&held, &r.path, &r.key, &saved.token, None)?;
+                r.renewal = None;
+                let why = crate::agents::show::printable(&why);
+                Err(Error::Unauthorized(format!("the access token could not be renewed: {why}")))
+            }
+            Err(e) => Err(e),
+        }
+    }
 }
+
+/// A saved sign-in token a [`Remote`] renews.
+struct Renewing {
+    /// The credentials file, and the entry it is saved under.
+    path: PathBuf,
+    key: String,
+    /// How it is renewed, as last read: `None` once it is not.
+    renewal: Option<Renewal>,
+    /// When the token in use expires, as far as known.
+    expires_at: Timestamp,
+}
+
+impl Renewing {
+    /// Use `renewal`, read with the token now in use; a token without one
+    /// keeps the expiry known before.
+    fn adopt(&mut self, renewal: Option<Renewal>) {
+        if let Some(ren) = &renewal {
+            self.expires_at = ren.expires_at;
+        }
+        self.renewal = renewal;
+    }
+}
+
+/// How long a renewal that cannot wait (the token expired) waits for
+/// another bd process renewing the same token.
+const RENEW_LOCK_WAIT: Duration = Duration::from_secs(30);
+/// A refresh, retries included, ends within this, so that the credentials
+/// file's lock is not held longer.
+const REFRESH_LIMIT: Duration = Duration::from_secs(60);
+/// How long a process waits to renew again after an optional renewal failed.
+const RENEW_BACKOFF: Duration = Duration::from_secs(60);
 
 /// How long `bd remote logout` and `login` give a server to revoke a token.
 const REVOKE_BUDGET: Duration = Duration::from_secs(5);
@@ -1264,7 +1481,11 @@ fn revoke_saved(gone: &credentials::Gone, trust: Option<&Trust>) -> Revocation {
     };
     let c = Configured { url: gone.key.clone(), source: Source::Flag, ca_cert: trust.path.clone() };
     let remote = Remote::new(c, trust, gone.token.clone()).quick().within(REVOKE_BUDGET);
-    match remote.revoke_own_token() {
+    let revoked = match &gone.renewal {
+        Some(ren) => remote.revoke_sign_in(ren),
+        None => remote.revoke_own_token(),
+    };
+    match revoked {
         Ok(answer) if answer.revoked => Revocation::Revoked(answer.name),
         Ok(_) => Revocation::Kept,
         Err(Error::Unauthorized(_)) => Revocation::Gone,
@@ -1450,8 +1671,15 @@ fn show(app: &mut App) -> Result<i32> {
         }
         Ok((Some(Token::Saved(s)), _)) => {
             view["token_from"] = json!("credentials");
-            view["credentials"] = json!({ "path": s.path, "key": s.key, "scope": s.scope.as_str() });
-            format!("token       saved for {} in {}", s.key, s.path.display())
+            let renewal =
+                s.renewal.as_ref().map(|r| json!({ "refresh_after": r.refresh_after, "expires_at": r.expires_at }));
+            view["credentials"] =
+                json!({ "path": s.path, "key": s.key, "scope": s.scope.as_str(), "renewal": renewal });
+            let renewed = match &s.renewal {
+                Some(r) => format!(" (renewed automatically, next after {})", r.refresh_after),
+                None => String::new(),
+            };
+            format!("token       saved for {} in {}{renewed}", s.key, s.path.display())
         }
         Ok((None, _)) => "token       none: run `bd remote login`, or set BD_TOKEN with BD_REMOTE".to_string(),
         Err(_) => "token       not usable".to_string(),
@@ -1460,7 +1688,7 @@ fn show(app: &mut App) -> Result<i32> {
         lines.push("note        $BD_TOKEN is set, and goes only to a server named by --remote or $BD_REMOTE".into());
     }
     let checked = match token {
-        Ok((Some(t), trust)) => check(Remote::new(c.clone(), trust, t.secret()).quick(), identity()),
+        Ok((Some(t), trust)) => check(t.remote(c.clone(), trust).quick(), identity()),
         Ok((None, trust)) => Err(missing_token(&c.url, trust.path.as_deref())),
         Err(e) => Err(e),
     };
@@ -1629,7 +1857,11 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
             info["actor"].as_str().map(String::from)
         }
     };
-    let saved = credentials::save(&path, &c.url, &token, &trust.anchor, scope, signed_in.is_some())?;
+    let renewal = signed_in.as_ref().and_then(|issued| {
+        let refresh = issued.refresh_token.clone().filter(|t| credentials::check_token(t).is_ok())?;
+        Some(Renewal::new(refresh, Duration::from_secs(issued.expires_in.max(1))))
+    });
+    let saved = credentials::save(&path, &c.url, &token, &trust.anchor, scope, signed_in.is_some(), renewal.as_ref())?;
     // A sign-in token this one takes the place of ends on its server too (unless no server is to be asked).
     let revoke = |gone: &credentials::Gone| {
         (gone.github && gone.token != token).then(|| match a.no_verify {
@@ -1669,6 +1901,7 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
             "workspaces": issued.workspaces,
             "max_claims": issued.max_claims,
             "expires_at": issued.expires_at,
+            "refreshable_until": renewal.as_ref().and(issued.refreshable_until.as_ref()),
         });
     }
     let saved_line = format!("✓ Saved the access token for {reach} in {}", path.display());
@@ -1682,11 +1915,15 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
             if let Some(n) = issued.max_claims {
                 workspaces.push_str(&format!(", at most {n} claims"));
             }
+            let renewed = match (&renewal, &issued.refreshable_until) {
+                (Some(_), Some(until)) => format!(", renewed automatically until {until}"),
+                _ => String::new(),
+            };
             Out::new(view)
                 .line(format!("✓ Signed in with GitHub as {} ({})", printable(&issued.login), printable(&issued.via)))
                 .line(saved_line)
                 .line(printable(&format!(
-                    "  acts as {0} or {0}/<agent>, role {1}, kind {2}, workspaces {workspaces}; expires {3}",
+                    "  acts as {0} or {0}/<agent>, role {1}, kind {2}, workspaces {workspaces}; expires {3}{renewed}",
                     issued.actor, issued.role, issued.kind, issued.expires_at
                 )))
         }

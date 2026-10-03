@@ -248,7 +248,7 @@ pub fn without_session_flag(argv: Vec<String>) -> Vec<String> {
 pub fn identity() -> (Option<String>, Option<String>) {
     match env_actor() {
         Some(a) => (Some(a), None),
-        None => (None, actor::session(&actor::env).map(|s| s.label)),
+        None => (None, actor::session(&actor::session_env).map(|s| s.label)),
     }
 }
 

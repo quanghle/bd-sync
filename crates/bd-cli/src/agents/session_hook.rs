@@ -9,7 +9,7 @@
 //!
 //! | harness   | file                          | entries                                                  |
 //! |-----------|-------------------------------|----------------------------------------------------------|
-//! | `claude`  | `.claude/settings.local.json` | `bd hook session-start --harness claude`, `bd prime`     |
+//! | `claude`  | `.claude/settings.local.json` | `bd hook session-start --harness claude`, `bd prime --hook claude` |
 //! | `codex`   | `.codex/hooks.json`           | `bd hook session-start --harness codex`, `bd prime`      |
 //! | `copilot` | `.github/hooks/bd.json`       | `bd hook session-start --harness copilot`, `bd prime --hook copilot` |
 //!
@@ -73,7 +73,9 @@ fn event(h: Harness) -> &'static str {
 fn items(h: Harness) -> Vec<Value> {
     let cmd = |c: &str| json!({ "type": "command", "command": c });
     match h {
-        Harness::Claude => vec![json!({ "hooks": [cmd("bd hook session-start --harness claude"), cmd("bd prime")] })],
+        Harness::Claude => {
+            vec![json!({ "hooks": [cmd("bd hook session-start --harness claude"), cmd("bd prime --hook claude")] })]
+        }
         Harness::Codex => {
             let timed = |c: &str| json!({ "type": "command", "command": c, "timeout": 30 });
             vec![json!({
@@ -344,7 +346,7 @@ mod tests {
         let starts = v["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(starts.len(), 2);
         assert_eq!(starts[0]["hooks"][0]["command"], "echo hi");
-        assert_eq!(starts[1]["hooks"][1]["command"], "bd prime");
+        assert_eq!(starts[1]["hooks"][1]["command"], "bd prime --hook claude");
         assert!(v.get("version").is_none());
     }
 

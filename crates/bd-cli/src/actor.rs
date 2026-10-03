@@ -7,7 +7,9 @@
 //! sessions of one user never share claims, while a terminal without a
 //! session keeps the plain user. The session comes from the session id an
 //! agent harness gives every shell command it runs ([`HARNESSES`]), and
-//! `$BD_SESSION`; it stays the same for every command of the session.
+//! `$BD_SESSION`; it stays the same for every command of the session. A
+//! session hook of a harness that keeps that variable from hook processes
+//! takes the same id from the hook's JSON input ([`set_hook_session`]).
 //!
 //! Environment variables are inherited: an agent started from another
 //! agent's shell (a coordinator running `claude -p` workers, Codex run from
@@ -30,6 +32,7 @@ use std::io::IsTerminal;
 use std::process::Command;
 use std::sync::OnceLock;
 
+use bd_core::agents::Harness;
 use bd_core::{Error, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -136,16 +139,58 @@ pub fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
-/// The actor of this process: [`resolve_with`] over the real environment.
-/// Under `bd serve` a request's actor is set by the server, never derived
-/// from the server's own environment.
+/// The session id of a session hook's JSON input, for the variable of the
+/// harness running the hook ([`set_hook_session`]).
+static HOOK_SESSION: OnceLock<(&'static str, String)> = OnceLock::new();
+
+/// The variable holding the session id that `harness` also gives its hooks
+/// in their JSON input (`sessionId` or `session_id`): the id its sessions'
+/// shell commands get. Copilot CLI (1.0.91) keeps the variable from hook
+/// processes, and so does Claude Code before 2.1.132. Codex's hook input is
+/// not known to carry the id of the thread its commands get, so none.
+pub fn hook_session_var(harness: Harness) -> Option<&'static str> {
+    match harness {
+        Harness::Claude => Some(CLAUDE_SESSION_VAR),
+        Harness::Copilot => Some("COPILOT_AGENT_SESSION_ID"),
+        Harness::Codex => None,
+    }
+}
+
+/// Take the session id of a hook's JSON `input` for the session variable of
+/// `harness`, which runs the hook, when the environment lacks it (once,
+/// before any command runs; never under `bd serve`): the hook then acts as
+/// the session's commands do, `bd prime` showing their actor and claims.
+pub fn set_hook_session(harness: Harness, input: &str) {
+    if let Some(var) = hook_session_var(harness)
+        && env(var).is_none()
+        && let Some(id) = hook_session_id(input).filter(|id| id.len() <= MAX_SESSION_ID)
+    {
+        let _ = HOOK_SESSION.set((var, id));
+    }
+}
+
+/// [`env`], with the session id of a hook's input standing in for its
+/// harness's variable ([`set_hook_session`]): what actors are derived from.
+pub fn session_env(name: &str) -> Option<String> {
+    env(name).or_else(|| HOOK_SESSION.get().filter(|(var, _)| *var == name).map(|(_, id)| id.clone()))
+}
+
+/// The actor of this process: [`resolve_with`] over the real environment
+/// (and a hook's session id, [`session_env`]). Under `bd serve` a request's
+/// actor is set by the server, never derived from the server's own
+/// environment.
 pub fn resolve(flag: Option<&str>) -> Resolved {
     if io::in_server_process() {
         return resolve_with(flag, &|_| None, &user_name);
     }
-    let mut r = resolve_with(flag, &env, &user_name);
-    if r.source == Source::Session && SESSION_FLAG.get().is_some() {
-        r.from = r.from.replace(&format!("${SESSION_VAR}"), "--session");
+    let mut r = resolve_with(flag, &session_env, &user_name);
+    if r.source == Source::Session {
+        if SESSION_FLAG.get().is_some() {
+            r.from = r.from.replace(&format!("${SESSION_VAR}"), "--session");
+        }
+        if let Some((var, _)) = HOOK_SESSION.get() {
+            r.from = r.from.replace(&format!("${var}"), &format!("the hook input's session id (the session's ${var})"));
+        }
     }
     r
 }

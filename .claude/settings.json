@@ -9,7 +9,7 @@
           },
           {
             "type": "command",
-            "command": "bd prime"
+            "command": "bd prime --hook claude"
           }
         ]
       }

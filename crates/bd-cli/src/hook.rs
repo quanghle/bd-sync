@@ -146,6 +146,22 @@ pub fn enter_session_dir(app: &mut App) {
     }
 }
 
+/// Act as the session's commands do: the session id of the hook's input,
+/// for a harness that keeps its session variable from hook processes
+/// ([`crate::actor::set_hook_session`]), when the hook runs in that harness
+/// ([`runs_in`]); `bd hook session-start --harness` and `bd prime --hook`.
+pub fn take_session_id(cmd: &Command) {
+    use crate::cli::HookCommand;
+    let harness = match cmd {
+        Command::Hook(HookCommand::SessionStart(a)) => a.harness,
+        Command::Prime(a) => a.hook,
+        _ => None,
+    };
+    if let Some(h) = harness.filter(|&h| runs_in(h)) {
+        crate::actor::set_hook_session(h, input());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,7 +208,7 @@ mod tests {
         let session_start = |commands: &[(String, String)]| -> Vec<String> {
             commands.iter().filter(|(e, _)| e == "SessionStart").map(|(_, c)| c.clone()).collect()
         };
-        assert_eq!(session_start(&claude), ["bd hook session-start --harness claude", "bd prime"]);
+        assert_eq!(session_start(&claude), ["bd hook session-start --harness claude", "bd prime --hook claude"]);
         assert_eq!(session_start(&copilot), ["bd hook session-start --harness copilot", "bd prime --hook copilot"]);
         // Copilot CLI uses no PreCompact hook's output.
         assert!(copilot.iter().all(|(e, _)| e == "SessionStart"), "{copilot:?}");

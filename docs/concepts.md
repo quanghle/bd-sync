@@ -151,8 +151,14 @@ session with the same `$BD_ACTOR` shares its claims again. For an older
 Claude Code, the `SessionStart` hook `bd hook session-start --harness claude`
 (in this repository's `.claude/settings.json`) writes the session's own id, from the
 hook's input, as `export CLAUDE_CODE_SESSION_ID=<id>` to `$CLAUDE_ENV_FILE`,
-replacing any id inherited from a parent session. `bd info` and `bd prime`
-show the actor and where it came from, and `bd claim` prints it.
+replacing any id inherited from a parent session. Session hooks act as the
+session too: Copilot CLI keeps `$COPILOT_AGENT_SESSION_ID` from hook
+processes, and an older Claude Code `$CLAUDE_CODE_SESSION_ID`, but both give
+the same id in the hook's input, which `bd prime --hook <harness>` and
+`bd hook session-start --harness <harness>` take, so the session-start
+context shows the actor and claims of the session's commands
+([Session-start hooks](agents.md#session-start-hooks)). `bd info` and
+`bd prime` show the actor and where it came from, and `bd claim` prints it.
 
 Claude Code subagents need hooks. A subagent (the Agent/Task tool) runs its shell commands with
 its parent session's environment: the same `$CLAUDE_CODE_SESSION_ID`, and
@@ -188,8 +194,9 @@ distinct `<name>` per subagent.
 
 A claim taken in one session is another actor's in the next: after Claude
 Code's `/clear` or a resume that starts a new session id, and in a subagent
-that has its own id (Codex threads, Copilot CLI, and Claude Code subagents
-with their `--session`). `bd prime` lists the in-progress claims of your user's
+that has its own id (Codex threads, Copilot CLI subagents, each given its
+own `$COPILOT_AGENT_SESSION_ID` (checked with 1.0.91), and Claude Code
+subagents with their `--session`). `bd prime` lists the in-progress claims of your user's
 other actors (`<user>` and `<user>/*`) under "Held by other sessions of
 yours", each with the command that takes it over, `bd update <id>
 --assignee <you> --take-over` (it prints the new lease token to renew and

@@ -3875,6 +3875,16 @@ fn agent_sessions_act_as_sub_actors_of_the_token_actor() {
     assert_eq!(alice.code(&["close", "t-1"]), 4, "nor the token's plain actor");
     let text = check(alice.cmd(&["prime"]).output().unwrap(), "prime");
     assert!(!text.contains('⚠'), "the plain actor holds nothing: {text}");
+    // A Copilot CLI hook process has no session variable: the id of its input travels as the session.
+    let mut hook = alice.cmd(&["prime", "--hook", "copilot"]);
+    hook.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = hook.spawn().unwrap();
+    let input = br#"{"sessionId":"286f56fd-c22e-458a-93ac-dfcfb9bb2788","source":"new"}"#;
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), input).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let context: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let text = context["additionalContext"].as_str().unwrap();
+    assert!(text.contains("you are `alice/copilot-b9bb2788`") && text.contains("## Your claims (1)"), "{text}");
     check(session("5139d45d-1aec-41fb-a65b-5e2515a04348", &["close", "t-1", "--take-over"]), "own token's sub-actor");
 
     // Actors the client names outright ($BD_ACTOR, --actor) are workers, not

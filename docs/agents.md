@@ -467,7 +467,14 @@ directory, the `cwd` of the hook's JSON input on stdin (`-C` wins), as
 Copilot CLI runs a plugin's hooks in the plugin's own directory. `bd prime
 --hook <harness>` does the same for the prime text: Copilot CLI gets it as
 one JSON object (it drops plain text), Claude Code and Codex as plain text.
-The skills it restores run in the session that starts, as approved before.
+Both act as the session's own actor ([Actors](concepts.md#actors)): Copilot
+CLI keeps `$COPILOT_AGENT_SESSION_ID` from hook processes, and Claude Code
+before 2.1.132 `$CLAUDE_CODE_SESSION_ID`, but both give the same id in the
+hook's input (`sessionId` or `session_id`), so `bd prime`'s context names
+the actor and claims of the session's commands. Codex's hook input is not
+known to carry the id of the thread its commands run in, so a Codex hook
+acts as the plain user. The skills it restores run in the session that
+starts, as approved before.
 
 It says nothing when nothing changed, outside a checkout, and with no
 harness known; a session start with nothing served writes nothing (no lock,
@@ -530,7 +537,7 @@ Code shell inherits `$CLAUDE_CODE_SESSION_ID` and is taken for Claude Code.
           },
           {
             "type": "command",
-            "command": "bd prime"
+            "command": "bd prime --hook claude"
           }
         ]
       }
@@ -550,6 +557,13 @@ copilot`, on `SessionStart`. A repository can use a hook file instead,
   {"type": "command", "command": "bd prime --hook copilot"}
 ]}}
 ```
+
+Copilot CLI (checked with 1.0.91) runs the hook file's commands in the
+checkout, and the plugin's in the plugin's own directory, whether installed
+(`copilot plugin install quanghle/bd-sync:.copilot-plugin`) or given with
+`--plugin-dir`; it adds each command's `additionalContext` to the session's
+context. A command printing anything but one JSON object (two in a row, say)
+adds nothing.
 
 Copilot CLI also runs a repository's `.claude/settings.json` hooks, where
 `--harness claude` stays inert and plain `bd prime`'s output is dropped.

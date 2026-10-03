@@ -52,6 +52,7 @@ fn run(cli: Cli) -> i32 {
     }
     if hook::works_in_session_dir(&cli.command) {
         hook::enter_session_dir(&mut app);
+        hook::take_session_id(&cli.command);
     }
     if !always_local(&cli.command) {
         match remote::detect(&app) {

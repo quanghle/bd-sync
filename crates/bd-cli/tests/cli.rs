@@ -1246,6 +1246,67 @@ fn prime_shows_the_actor_and_warns_when_it_may_be_shared() {
     assert!(!ws.ok(&["prime"]).contains('⚠'));
 }
 
+/// A session hook's process as a harness runs it: `env` set, and its JSON
+/// `input` on stdin.
+fn hook_as_user(ws: &Ws, env: &[(&str, &str)], input: &str, args: &[&str]) -> Output {
+    let mut c = Ws::cmd_in(ws.dir.path(), "", args);
+    c.env_remove("BD_ACTOR")
+        .env_remove("BEADS_ACTOR")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "user.name")
+        .env("GIT_CONFIG_VALUE_0", "tester");
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn session_hooks_act_as_the_session_their_input_names() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Work"]);
+    assert!(as_user(&ws, Some(SESSION_A), &["claim", "t-1"]).status.success(), "as tester/copilot-b9bb2788");
+    let copilot = |env: &[(&str, &str)], input: &str| {
+        let out = hook_as_user(&ws, env, input, &["prime", "--hook", "copilot"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["additionalContext"].as_str().unwrap().to_string()
+    };
+    // Copilot CLI gives its hook processes no session variable, only the input's id: camelCase from
+    // .github/hooks files, snake_case from plugins. The hook acts as the session's commands do.
+    for input in [
+        r#"{"sessionId":"286f56fd-c22e-458a-93ac-dfcfb9bb2788","cwd":"/nowhere"}"#,
+        r#"{"session_id":"286f56fd-c22e-458a-93ac-dfcfb9bb2788","hook_event_name":"SessionStart"}"#,
+    ] {
+        let text = copilot(&[], input);
+        let actor = "you are `tester/copilot-b9bb2788` (this agent session's own actor: git user.name + the hook \
+                     input's session id (the session's $COPILOT_AGENT_SESSION_ID))";
+        assert!(text.contains(actor), "{text}");
+        assert!(text.contains("## Your claims (1)") && !text.contains('⚠'), "{text}");
+    }
+    // The variable, where a harness sets it, wins over the input.
+    let text = copilot(&[SESSION_B], r#"{"sessionId":"286f56fd-c22e-458a-93ac-dfcfb9bb2788"}"#);
+    assert!(text.contains("you are `tester/copilot-15a04348`") && text.contains("## Held by other sessions"), "{text}");
+    let text = copilot(&[], r#"{"source":"new"}"#);
+    assert!(text.contains("you are `tester` (from git user.name; no agent session detected)"), "{text}");
+
+    // Claude Code before 2.1.132 gives SessionStart hooks $CLAUDE_ENV_FILE but not the session's variable.
+    let input = r#"{"session_id":"8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e","hook_event_name":"SessionStart"}"#;
+    let env_file = ws.dir.path().join("claude-env.sh");
+    let claude = |env: &[(&str, &str)]| {
+        let out = hook_as_user(&ws, env, input, &["prime", "--hook", "claude"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let text = claude(&[("CLAUDE_ENV_FILE", env_file.to_str().unwrap())]);
+    assert!(text.starts_with("# bd workflow context") && text.contains("you are `tester/claude-3b4c5d6e`"), "{text}");
+    // Copilot CLI runs .claude/settings.json hooks too, with the same input: those are not Claude Code's.
+    assert!(claude(&[]).contains("you are `tester` (from git user.name"));
+}
+
 #[test]
 fn session_start_hook_gives_claude_sessions_their_own_actor() {
     let ws = Ws::new();
@@ -1762,7 +1823,7 @@ fn agents_pull_adds_the_session_start_hook_once() {
     assert_eq!(pulled["harnesses"]["claude"]["hook"]["file"], ".claude/settings.local.json");
     let settings: Value = serde_json::from_str(&read(root, ".claude/settings.local.json").unwrap()).unwrap();
     assert_eq!(settings["permissions"]["allow"][0], "Bash(ls)");
-    assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][1]["command"], "bd prime");
+    assert_eq!(settings["hooks"]["SessionStart"][0]["hooks"][1]["command"], "bd prime --hook claude");
 
     // A file bd cannot merge into is left as it is.
     write_file(root, ".codex/hooks.json", "[]");

@@ -4216,6 +4216,29 @@ fn session_start_hook_escapes_what_the_server_says() {
 }
 
 #[test]
+fn remote_show_escapes_what_the_server_says() {
+    let hidden = "x\u{1b}[2K\u{202e}\nnext";
+    let info = json!({
+        "version": hidden, "schema_version": hidden, "prefix": hidden, "issues": hidden,
+        "events_head": hidden, "actor": hidden,
+    });
+    let server = FakeServer::start(move |_| answer(&[stdout_frame(&format!("{info}\n")), exit_frame(0, "")], false, 0));
+    let out = server.client().cmd(&["remote", "show"]).output().unwrap();
+    let text = check(out, "remote show");
+    assert!(text.contains("✓ connected"), "{text}");
+    assert_eq!(text.matches(r"x\u{1b}[2K\u{202e}\u{a}next").count(), 6, "{text}");
+    assert!(!text.contains(|c: char| c.is_control() && c != '\n' || c == '\u{202e}'), "{text:?}");
+
+    let error = json!({ "error": { "code": "unauthorized", "message": hidden, "exit_code": 7 } }).to_string();
+    let server = FakeServer::start(move |_| answer(&[exit_frame(7, &format!("{error}\n"))], false, 0));
+    let out = server.client().cmd(&["remote", "show"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(r"/w/proj: x\u{1b}[2K\u{202e}\u{a}next"), "{text}");
+    assert!(!text.contains(|c: char| c.is_control() && c != '\n' || c == '\u{202e}'), "{text:?}");
+}
+
+#[test]
 fn remote_set_and_login_point_to_the_agent_assets_served() {
     let server = Server::start();
     let token = server.token("laptops", "alice", &["--role", "read"]);

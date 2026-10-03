@@ -1475,10 +1475,8 @@ fn show(app: &mut App) -> Result<i32> {
                 s("events_head")
             ));
             lines.push(format!("actor       {}", s("actor")));
-            // The server's description of the token: escaped, as anything a server sends.
             if info["token"].is_object() {
-                let access = crate::auth::access_line(&info["token"]);
-                lines.push(crate::agents::show::printable(&format!("access      {access}")));
+                lines.push(format!("access      {}", crate::auth::access_line(&info["token"])));
             }
             lines.push("✓ connected".into());
             view["connected"] = json!(true);
@@ -1492,7 +1490,8 @@ fn show(app: &mut App) -> Result<i32> {
             e.exit_code()
         }
     };
-    app.print(Out::new(view).lines(lines));
+    // The server's info and errors are its own text: escaped, as anything a server sends.
+    app.print(Out::new(view).lines(lines.iter().map(|l| crate::agents::show::printable(l))));
     Ok(code)
 }
 

@@ -327,6 +327,10 @@ fn state_of(
         }
         Status::Open => match deferrals.get(conn, &issue.id)? {
             Some(src) => (StepState::Deferred, Some(format!("deferred by {src}"))),
+            // A step given children since: they come first.
+            None if crate::ready::waits_on_children(conn, &issue.id)? => {
+                (StepState::Blocked, Some("waiting on its children".into()))
+            }
             None => (StepState::Ready, None),
         },
     })

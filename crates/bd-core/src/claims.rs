@@ -124,7 +124,8 @@ fn validate_ttl(ttl: Duration) -> Result<Duration> {
 pub struct ClaimOptions {
     /// Lease duration; defaults to the `lease.ttl` config.
     pub ttl: Option<Duration>,
-    /// Claim even if the issue is blocked or deferred (by explicit id only).
+    /// Claim even if the issue is blocked or deferred, or has open children
+    /// (by explicit id only).
     pub allow_blocked: bool,
     pub guard: Guard,
     /// Fencing token of a claim the caller already holds: claiming it again
@@ -217,7 +218,8 @@ impl WriteCtx<'_> {
     /// Atomically claim one issue for the transaction's actor.
     ///
     /// Claimable means: status `open`, unassigned / reserved for the actor /
-    /// held by a `claim.pools` alias, and (unless `allow_blocked`) ready. A
+    /// held by a `claim.pools` alias, and (unless `allow_blocked`) ready: not
+    /// blocked or deferred, and without open children (see [`crate::ready`]). A
     /// dead claim (lease expired for `lease.grace`) is reclaimed first, as
     /// `reclaim` would. A live claim is refused, even to its own actor (two
     /// sessions sharing an actor name must not both hold it), unless

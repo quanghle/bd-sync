@@ -2,9 +2,17 @@
 //!
 //! An issue is ready iff it is `open`, not blocked (materialized flag), not
 //! deferred (neither it nor any ancestor has status `deferred` or a future
-//! `defer_until`), and not an epic (unless asked). Results are totally
-//! ordered by the sort policy with `id` as the final tiebreaker, so the same
-//! database state and clock always yield the same queue.
+//! `defer_until`), not waiting on its children, and not an epic (unless
+//! asked). A parent's children come first, whatever its type: one with a
+//! child that is not closed waits on its children, exactly when `bd close`
+//! refuses to close it for them, so it is claimable with no children, or
+//! again once every child has closed, to wrap it up (or with
+//! `allow_blocked`). A spawner, which others wait on through a `waits-for`
+//! edge, never waits on its children: it may finish before the work it
+//! spawned, which the waits-for gate tracks. Waiting is no block: the
+//! children are ready as before. Results are totally ordered by the sort
+//! policy with `id` as the final tiebreaker, so the same database state and
+//! clock always yield the same queue.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -34,6 +42,18 @@ const DEFERRED_CTE: &str = "deferred(id) AS (
     SELECT d.issue_id FROM deferred x CROSS JOIN dependencies d ON d.depends_on_id = x.id
     WHERE d.dep_type = 'parent-child')";
 
+/// Issue `i` waits on its children (see the module docs): it has a child
+/// that is not closed, and no `waits-for` edge on it, as `bd close` checks
+/// them. Index lookups of the edges below `i` and of each child, whatever the
+/// statistics say; an issue without children needs only the first.
+const WAITS_ON_CHILDREN: &str = "(EXISTS (
+    SELECT 1 FROM dependencies d CROSS JOIN issues c INDEXED BY sqlite_autoindex_issues_1 ON c.id = d.issue_id
+    WHERE d.depends_on_id = i.id AND d.dep_type = 'parent-child' AND c.status <> 'closed')
+  AND NOT EXISTS (SELECT 1 FROM dependencies w WHERE w.depends_on_id = i.id AND w.dep_type = 'waits-for'))";
+
+/// Children of a parent named in its not-ready reason; the rest are counted.
+const CHILDREN_SHOWN: usize = 5;
+
 /// Cheap probe (two index lookups) so the deferred-subtree CTE is only built
 /// when something is actually deferred.
 fn any_deferred(conn: &Connection, now: Timestamp) -> Result<bool> {
@@ -60,6 +80,7 @@ pub(crate) fn ready_for(
     let mut parts = QueryParts::default();
     parts.cond("i.status = 'open'", []);
     parts.cond("i.is_blocked = 0", []);
+    parts.cond(&format!("NOT {WAITS_ON_CHILDREN}"), []);
     if !q.include_deferred && any_deferred(conn, now)? {
         parts.cte(DEFERRED_CTE, [SqlValue::Integer(now.millis())]);
         parts.cond("i.id NOT IN (SELECT id FROM deferred)", []);
@@ -180,7 +201,47 @@ pub fn not_ready_reasons(conn: &Connection, issue: &Issue, now: Timestamp) -> Re
             None => reasons.push(what),
         }
     }
+    let open = open_children(conn, &issue.id)?;
+    if !open.is_empty() && graph::waiters_on(conn, &issue.id)?.is_empty() {
+        let mut shown: Vec<String> = open
+            .iter()
+            .take(CHILDREN_SHOWN)
+            .map(|(id, status, assignee)| match (status, assignee) {
+                (Status::InProgress, Some(a)) => format!("{id} claimed by {a}"),
+                (s, Some(a)) => format!("{id} {s}, assigned to {a}"),
+                (s, None) => format!("{id} {s}"),
+            })
+            .collect();
+        if open.len() > CHILDREN_SHOWN {
+            shown.push(format!("{} more", open.len() - CHILDREN_SHOWN));
+        }
+        let are = if open.len() == 1 { "is" } else { "are" };
+        reasons.push(format!(
+            "its children come first, and {} {are} open ({}): claim one of them (`bd claim --next --parent {}`)",
+            open.len(),
+            shown.join(", "),
+            issue.id
+        ));
+    }
     Ok(reasons)
+}
+
+/// The children of `id` that are not closed, by id, with their status and
+/// assignee: what makes a parent wait on its children (unless it is a spawner).
+fn open_children(conn: &Connection, id: &str) -> Result<Vec<(String, Status, Option<String>)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.id, c.status, c.assignee
+         FROM dependencies d CROSS JOIN issues c INDEXED BY sqlite_autoindex_issues_1 ON c.id = d.issue_id
+         WHERE d.depends_on_id = ?1 AND d.dep_type = 'parent-child' AND c.status <> 'closed'
+         ORDER BY c.id",
+    )?;
+    let rows = stmt.query_map([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Whether `id` waits on its children (see the module docs), so that it is not ready.
+pub(crate) fn waits_on_children(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(!open_children(conn, id)?.is_empty() && graph::waiters_on(conn, id)?.is_empty())
 }
 
 /// A blocked issue with the reasons it is blocked.
@@ -211,22 +272,29 @@ pub fn blocked(conn: &Connection, filter: &WorkFilter, limit: Option<usize>) -> 
     issues.into_iter().map(|issue| Ok(BlockedIssue { blockers: graph::blockers(conn, &issue.id)?, issue })).collect()
 }
 
-// The counts `bd prime` and `bd stats` print read the ready issues through
-// idx_issues_ready, and the deferred ones by id, whatever the statistics say.
+// The counts `bd prime` and `bd stats` print read the open issues through
+// idx_issues_ready, the deferred ones by id, and the children of each by
+// index, whatever the statistics say.
 pub fn count_ready(conn: &Connection, now: Timestamp) -> Result<i64> {
+    count_work(conn, now, &format!("NOT {WAITS_ON_CHILDREN}"))
+}
+
+/// Issues that would be ready but wait on their children (see the module docs).
+pub fn count_waiting(conn: &Connection, now: Timestamp) -> Result<i64> {
+    count_work(conn, now, WAITS_ON_CHILDREN)
+}
+
+/// Open, unblocked and undeferred issues, epics and gates aside, that meet `cond` too.
+fn count_work(conn: &Connection, now: Timestamp, cond: &str) -> Result<i64> {
+    let work = "i.status = 'open' AND i.is_blocked = 0 AND i.issue_type NOT IN ('epic','gate')";
     if !any_deferred(conn, now)? {
-        return Ok(conn
-            .prepare_cached(
-                "SELECT COUNT(*) FROM issues INDEXED BY idx_issues_ready
-                 WHERE status = 'open' AND is_blocked = 0 AND issue_type NOT IN ('epic','gate')",
-            )?
-            .query_row([], |r| r.get(0))?);
+        let sql = format!("SELECT COUNT(*) FROM issues i INDEXED BY idx_issues_ready WHERE {work} AND {cond}");
+        return Ok(conn.prepare_cached(&sql)?.query_row([], |r| r.get(0))?);
     }
     let sql = format!(
         "WITH RECURSIVE {DEFERRED_CTE}
          SELECT COUNT(*) FROM issues i INDEXED BY idx_issues_ready
-         WHERE i.status = 'open' AND i.is_blocked = 0 AND i.issue_type NOT IN ('epic','gate')
-           AND i.id NOT IN (SELECT id FROM deferred)"
+         WHERE {work} AND i.id NOT IN (SELECT id FROM deferred) AND {cond}"
     );
     Ok(conn.prepare_cached(&sql)?.query_row([now.millis()], |r| r.get(0))?)
 }

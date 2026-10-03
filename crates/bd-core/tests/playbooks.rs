@@ -873,15 +873,17 @@ fn deep_open_chains_take_linear_time() {
     let status = env.store.read(|r| playbook::run_status(r.conn(), &root, r.now())).unwrap();
     assert_eq!(status.nodes.len(), LEVELS);
     let p = &status.progress;
-    assert_eq!((p.total, p.ready, p.blocked, p.done), (LEVELS / 2, DEFERRED / 2, LEVELS / 2 - DEFERRED / 2, 0));
+    // Each step holds the next level's group: it waits on its children, deferred or not.
+    assert_eq!((p.total, p.ready, p.blocked, p.done), (LEVELS / 2, 0, LEVELS / 2, 0));
     let node = |level: usize| {
         let n = &status.nodes[level - 1];
         assert_eq!((n.depth, n.id.as_str()), (level, format!("d{level}").as_str()));
         (n.state, n.detail.clone().unwrap_or_default())
     };
-    assert_eq!(node(1), (StepState::Ready, String::new()));
+    let waiting = (StepState::Blocked, "waiting on its children".to_string());
+    assert_eq!(node(1), waiting);
     assert_eq!(node(2), (StepState::Open, format!("0/{} closed", (LEVELS - 2) / 2)));
-    assert_eq!(node(DEFERRED - 2), (StepState::Ready, String::new()));
+    assert_eq!(node(DEFERRED - 2), waiting);
     assert_eq!(node(DEFERRED), (StepState::Deferred, format!("deferred by d{DEFERRED}")));
     assert_eq!(node(LEVELS - 1), (StepState::Deferred, format!("deferred by d{DEFERRED}")));
     assert_eq!(node(LEVELS), (StepState::Open, "0/0 closed".to_string()));
@@ -940,7 +942,8 @@ fn runs_count_the_steps_of_the_runs_nested_in_them() {
     env.store.write("claim", "bob", |tx| tx.claim(&format!("{inner}.a.y"), &ClaimOptions::default())).unwrap();
     // [total, done, failed, active, ready, blocked, gates_open, escalated]
     let all = playbook::RunsQuery::default();
-    let (inner_p, outer_p) = ([3, 1, 0, 1, 0, 1, 1, 0], [6, 1, 0, 1, 1, 3, 1, 0]);
+    // The outer run's step `bump` holds the inner run: it waits on it, ready no more.
+    let (inner_p, outer_p) = ([3, 1, 0, 1, 0, 1, 1, 0], [6, 1, 0, 1, 0, 4, 1, 0]);
     assert_eq!(progress_of_runs(&env, &all), vec![(inner.clone(), inner_p), (outer.clone(), outer_p)]);
     // A run counts the runs inside it whether or not they are listed.
     let only_outer = playbook::RunsQuery { playbook: Some("release".into()), ..Default::default() };
@@ -949,7 +952,7 @@ fn runs_count_the_steps_of_the_runs_nested_in_them() {
     assert_eq!(progress_of_runs(&env, &newest), vec![(inner.clone(), inner_p)]);
     let innermost = start_below(&mut env, &format!("{inner}.b"));
     let (innermost_p, inner_p, outer_p) =
-        ([3, 0, 0, 0, 0, 3, 1, 0], [6, 1, 0, 1, 0, 4, 2, 0], [9, 1, 0, 1, 1, 6, 2, 0]);
+        ([3, 0, 0, 0, 0, 3, 1, 0], [6, 1, 0, 1, 0, 4, 2, 0], [9, 1, 0, 1, 0, 7, 2, 0]);
     let nested = vec![(innermost.clone(), innermost_p), (inner.clone(), inner_p), (outer.clone(), outer_p)];
     assert_eq!(progress_of_runs(&env, &all), nested);
 
@@ -988,7 +991,8 @@ fn runs_count_the_steps_of_the_runs_nested_in_them() {
         env.store.write("damage", "alice", |tx| Ok(tx.conn().execute(edge, [&child, &parent])?)).unwrap();
     };
     add(&mut env, format!("{other}.a"), format!("{outer}.tag"));
-    let (other_p, outer_p) = ([3, 0, 0, 0, 2, 1, 1, 0], [11, 1, 0, 1, 3, 6, 2, 0]);
+    // The outer run's step `tag` now holds `other.a` too: it waits on it.
+    let (other_p, outer_p) = ([3, 0, 0, 0, 2, 1, 1, 0], [11, 1, 0, 1, 2, 7, 2, 0]);
     assert_eq!(
         progress_of_runs(&env, &all),
         vec![
@@ -1242,7 +1246,8 @@ fn reopening_up_closed_groups_blocks_what_it_should_in_order() {
         let expected: Vec<_> = expected.into_iter().map(|(op, id, data)| (op.to_string(), id.clone(), data)).collect();
         assert_eq!(events, expected);
     }
-    // X holds G2 and its step; D, W and the leaf wait.
-    assert_eq!(env.ready_ids(), [run, g1, x, run2, h1, h2, h3]);
+    // X holds G2 and its step; D, W and the leaf wait, and so do the issues above open work, but for the
+    // run and H1: others wait for them, and a spawner may finish before the work it spawned.
+    assert_eq!(env.ready_ids(), [run, x, h1]);
     env.assert_healthy();
 }

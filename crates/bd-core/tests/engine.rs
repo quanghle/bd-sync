@@ -187,9 +187,9 @@ fn hierarchy_blocks_downward_only() {
 
     env.close(&gate);
     assert!(!env.issue(&grandchild).is_blocked);
-    assert_eq!(env.ready_ids(), vec![child.clone(), grandchild.clone()], "epics are excluded from ready");
+    assert_eq!(env.ready_ids(), vec![grandchild.clone()], "the epic is excluded, and the child waits on its own child");
     let with_epics = env.ready_ids_with(&ReadyQuery { include_epics: true, ..Default::default() });
-    assert!(with_epics.contains(&epic));
+    assert!(!with_epics.contains(&epic), "not blocked, but not ready either: its work is in its open child");
 
     // Parents cannot close over open children unless forced.
     let err = env.store.write("close", "alice", |tx| tx.close_issue(&epic, &CloseOptions::default())).unwrap_err();
@@ -351,9 +351,115 @@ fn deferral_hides_issue_and_subtree_until_time() {
     assert!(matches!(err, Error::NotReady { .. }));
 
     env.clock.advance(Duration::from_secs(3601));
-    assert_eq!(env.ready_ids(), vec![kid.clone(), grandkid.clone()]);
+    assert_eq!(env.ready_ids(), vec![grandkid.clone()], "the kid waits on its own kid");
     env.store.write("undefer", "alice", |tx| tx.undefer_issue(&solo)).unwrap();
     assert!(env.ready_ids().contains(&solo));
+}
+
+#[test]
+fn an_issue_with_open_children_is_not_ready_to_claim() {
+    let mut env = Env::new();
+    let epic_titled =
+        |title: &str| NewIssue { title: title.into(), issue_type: Some("epic".into()), ..Default::default() };
+    let epic = env.create_with(epic_titled("Epic"));
+    let mut kids = Vec::new();
+    for n in 1..=7 {
+        // The second is reserved for bob.
+        let assignee = (n == 2).then(|| "bob".to_string());
+        let kid = NewIssue { title: format!("Kid {n}"), parent: Some(epic.clone()), assignee, ..Default::default() };
+        kids.push(env.create_with(kid));
+    }
+    let unplanned = env.create_with(epic_titled("Not broken down yet"));
+    // Whatever its type: a task with a subtask, at the head of the queue by priority.
+    let task = env.create("A task with a subtask", 0);
+    let subtask =
+        NewIssue { title: "Subtask".into(), parent: Some(task.clone()), priority: Some(3), ..Default::default() };
+    let subtask = env.create_with(subtask);
+    env.store.write("claim", "agent-a", |tx| tx.claim(&kids[0], &ClaimOptions::default())).unwrap();
+
+    let reason = "its children come first, and 7 are open (t-1.1 claimed by agent-a, t-1.2 open, assigned to bob, \
+                  t-1.3 open, t-1.4 open, t-1.5 open, 2 more): claim one of them (`bd claim --next --parent t-1`)";
+    assert_eq!(env.store.read(|r| r.not_ready_reasons(&epic)).unwrap(), [reason]);
+    let err = env.store.write("claim", "bob", |tx| tx.claim(&epic, &ClaimOptions::default())).unwrap_err();
+    assert!(matches!(&err, Error::NotReady { reasons, .. } if reasons == &[reason]), "{err}");
+    assert_eq!(err.exit_code(), 4);
+    assert_eq!(env.issue(&epic).status, Status::Open, "refused: nothing changed");
+    let reason =
+        "its children come first, and 1 is open (t-3.1 open): claim one of them (`bd claim --next --parent t-3`)";
+    let err = env.store.write("claim", "dave", |tx| tx.claim(&task, &ClaimOptions::default())).unwrap_err();
+    assert!(matches!(&err, Error::NotReady { reasons, .. } if reasons == &[reason]), "{err}");
+
+    // The queue agrees, epics asked for or not, and so does `claim --next`.
+    let ready = env.ready_ids();
+    assert!(!ready.contains(&task) && ready.contains(&subtask), "{ready:?}");
+    let epics =
+        ReadyQuery { filter: WorkFilter { types: vec!["epic".into()], ..Default::default() }, ..Default::default() };
+    assert_eq!(env.ready_ids_with(&epics), std::slice::from_ref(&unplanned));
+    let all = env.ready_ids_with(&ReadyQuery { include_epics: true, ..Default::default() });
+    assert!(all.contains(&unplanned) && !all.contains(&epic) && !all.contains(&task), "{all:?}");
+    let next = env.store.write("claim", "carol", |tx| tx.claim_next(&epics, &ClaimOptions::default())).unwrap();
+    assert_eq!(next.map(|c| c.issue.id), Some(unplanned.clone()), "an epic not broken down yet");
+    assert!(env.store.write("claim", "carol", |tx| tx.claim_next(&epics, &ClaimOptions::default())).unwrap().is_none());
+    // No block: the children are ready as before. The first one erin may take beats the task's P0.
+    let next = env.store.write("claim", "erin", |tx| tx.claim_next(&ReadyQuery::default(), &ClaimOptions::default()));
+    assert_eq!(next.unwrap().map(|c| c.issue.id), Some(kids[2].clone()));
+
+    // The counts agree with the queue, and count the task as waiting on its children (epics are no work).
+    let counts = |env: &Env| {
+        let stats = env.store.read(|r| r.stats()).unwrap();
+        (stats.ready, stats.waiting_on_children)
+    };
+    assert_eq!(counts(&env), (env.ready_ids().len() as i64, 1));
+    let later = env.create("Later", 2);
+    env.store.write("defer", "alice", |tx| tx.defer_issue(&later, None)).unwrap();
+    assert_eq!(counts(&env), (env.ready_ids().len() as i64, 1), "with something deferred too");
+
+    // By id, --allow-blocked claims a parent anyway.
+    let anyway = ClaimOptions { allow_blocked: true, ..Default::default() };
+    env.store.write("claim", "bob", |tx| tx.claim(&epic, &anyway)).unwrap();
+    env.store.write("release", "bob", |tx| tx.release(&epic, &ReleaseOptions::default())).unwrap();
+
+    // Once every child is closed, a parent is ready again: wrapping it up is its own work.
+    for (kid, actor) in kids.iter().zip(["agent-a", "alice", "erin", "alice", "alice", "alice", "alice"]) {
+        env.store.write("close", actor, |tx| tx.close_issue(kid, &CloseOptions::default())).unwrap();
+    }
+    env.close(&subtask);
+    assert!(env.store.read(|r| r.not_ready_reasons(&epic)).unwrap().is_empty());
+    assert_eq!(env.ready_ids_with(&epics), std::slice::from_ref(&epic));
+    assert!(env.ready_ids().contains(&task));
+    assert_eq!(counts(&env), (env.ready_ids().len() as i64, 0));
+    env.store.write("claim", "bob", |tx| tx.claim(&epic, &ClaimOptions::default())).unwrap();
+    env.store.write("claim", "dave", |tx| tx.claim(&task, &ClaimOptions::default())).unwrap();
+    env.assert_healthy();
+}
+
+#[test]
+fn a_spawner_is_ready_before_the_work_it_spawned() {
+    // A fan-out: P spawns C while it holds its claim; C needs X, X needs P, and W collects P's children.
+    // `bd close` lets a spawner finish first, so the queue must offer P back once released, or nothing
+    // is ever ready again.
+    let mut env = Env::new();
+    let p = env.create("Spawner", 2);
+    let x = env.create("After the spawner", 2);
+    let w = env.create("Collector", 2);
+    env.store.write("claim", "bob", |tx| tx.claim(&p, &ClaimOptions::default())).unwrap();
+    let c = env.create_with(NewIssue { title: "Spawned".into(), parent: Some(p.clone()), ..Default::default() });
+    env.dep(&x, &p, DepType::Blocks);
+    env.dep(&c, &x, DepType::Blocks);
+    env.dep(&w, &p, DepType::WaitsFor);
+    env.store.write("release", "bob", |tx| tx.release(&p, &ReleaseOptions::default())).unwrap();
+
+    assert!(env.store.read(|r| r.not_ready_reasons(&p)).unwrap().is_empty());
+    assert_eq!(env.ready_ids(), std::slice::from_ref(&p));
+    let stats = env.store.read(|r| r.stats()).unwrap();
+    assert_eq!((stats.ready, stats.waiting_on_children), (1, 0));
+    for (id, actor) in [(&p, "carol"), (&x, "carol"), (&c, "dave"), (&w, "erin")] {
+        let next =
+            env.store.write("claim", actor, |tx| tx.claim_next(&ReadyQuery::default(), &ClaimOptions::default()));
+        assert_eq!(next.unwrap().map(|c| c.issue.id).as_ref(), Some(id), "in order");
+        env.store.write("close", actor, |tx| tx.close_issue(id, &CloseOptions::default())).unwrap();
+    }
+    env.assert_healthy();
 }
 
 #[test]

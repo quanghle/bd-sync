@@ -19,6 +19,8 @@ pub struct Stats {
     pub total: i64,
     pub by_status: BTreeMap<String, i64>,
     pub ready: i64,
+    /// Open issues waiting on their children, as `ready` counts (see [`crate::ready`]).
+    pub waiting_on_children: i64,
     /// Live issues held back by dependencies (materialized flag).
     pub blocked: i64,
     /// Live issues hidden by a deferral (own or an ancestor's).
@@ -66,6 +68,7 @@ pub fn stats(conn: &Connection, now: Timestamp) -> Result<Stats> {
         total,
         by_status,
         ready: ready::count_ready(conn, now)?,
+        waiting_on_children: ready::count_waiting(conn, now)?,
         blocked,
         deferred: ready::count_deferred(conn, now)?,
         leases_active,

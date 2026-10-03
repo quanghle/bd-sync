@@ -690,10 +690,11 @@ pub fn cmd_ready(app: &mut App, a: &ReadyArgs) -> Result<()> {
     let mut out = Out::default();
     if issues.is_empty() {
         out = out.line(format!(
-            "No ready work ({} blocked, {} in progress, {} deferred)",
+            "No ready work ({} blocked, {} in progress, {} deferred, {} waiting on children)",
             stats.blocked,
             stats.by_status.get("in_progress").copied().unwrap_or(0),
-            stats.deferred
+            stats.deferred,
+            stats.waiting_on_children
         ));
     } else {
         out = out.line(format!("Ready work ({} shown, queue order):", issues.len()));
@@ -1188,8 +1189,9 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     o.push("- `bd playbook run <name> --var k=v` starts repeatable multi-step work (`bd playbook list`); `bd playbook status <run>` shows its steps; gates in front of steps are listed by `bd gate list`.".into());
     o.push(String::new());
     o.push(format!(
-        "## Status: {} ready · {} in progress · {} blocked · {} deferred · {} open total",
+        "## Status: {} ready · {} waiting on children · {} in progress · {} blocked · {} deferred · {} open total",
         stats.ready,
+        stats.waiting_on_children,
         stats.by_status.get("in_progress").copied().unwrap_or(0),
         stats.blocked,
         stats.deferred,
@@ -1300,7 +1302,10 @@ pub fn cmd_stats(app: &mut App) -> Result<()> {
         out = out.line(format!("  {:<12} {n}", s));
     }
     out = out
-        .line(format!("Ready: {}   Blocked: {}   Deferred: {}", stats.ready, stats.blocked, stats.deferred))
+        .line(format!(
+            "Ready: {}   Waiting on children: {}   Blocked: {}   Deferred: {}",
+            stats.ready, stats.waiting_on_children, stats.blocked, stats.deferred
+        ))
         .line(format!("Leases: {} active, {} expired", stats.leases_active, stats.leases_expired));
     if !stats.closable_epics.is_empty() {
         out = out.line(format!("Epics ready to close: {}", stats.closable_epics.join(", ")));
@@ -1335,6 +1340,7 @@ pub fn prometheus(m: &Metrics) -> String {
     }
     for (name, help, v) in [
         ("bd_blocked_issues", "Live issues held back by dependencies", m.stats.blocked),
+        ("bd_waiting_issues", "Open issues held back by their open children", m.stats.waiting_on_children),
         ("bd_deferred_issues", "Live issues hidden by a deferral", m.stats.deferred),
         ("bd_leases_active", "Live claim leases", m.leases.active),
         ("bd_leases_expired", "Leases past expiry", m.leases.expired),

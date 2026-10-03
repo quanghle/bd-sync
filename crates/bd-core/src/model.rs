@@ -673,7 +673,8 @@ pub struct ReadyQuery {
     /// `None` = unlimited.
     pub limit: Option<usize>,
     pub include_deferred: bool,
-    /// Epics are containers, not work; they are excluded unless asked for.
+    /// Epics are containers, not work; they are excluded unless asked for
+    /// (and like any issue with open children, one is not ready: see [`crate::ready`]).
     pub include_epics: bool,
 }
 

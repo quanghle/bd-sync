@@ -171,7 +171,9 @@ fn hint(e: &Error) -> Option<&'static str> {
         Error::AlreadyClaimed { .. } => {
             "pick other work with `bd claim --next`; to renew a claim of yours, pass its lease token (`bd claim <id> --token <t>`). A claim whose holder stops heartbeating frees itself once its lease has been expired for lease.grace. Only to take it over deliberately: `bd update <id> --assignee <you> --take-over` (recorded in the event history)"
         }
-        Error::NotReady { .. } => "see `bd show <id>` for blockers; `bd claim <id> --allow-blocked` overrides",
+        Error::NotReady { .. } => {
+            "see `bd show <id>` for its blockers and children; `bd claim <id> --allow-blocked` overrides"
+        }
         Error::Conflict { .. } => {
             "another actor changed it first; re-read (`bd show <id> --json`) and retry with the new revision"
         }

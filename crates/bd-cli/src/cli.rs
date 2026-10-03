@@ -507,7 +507,7 @@ pub struct ClaimArgs {
     /// Lease duration (default: lease.ttl)
     #[arg(long)]
     pub ttl: Option<String>,
-    /// Claim even if blocked or deferred (by id only)
+    /// Claim even if blocked, deferred, or with open children (by id only)
     #[arg(long)]
     pub allow_blocked: bool,
     #[arg(long, value_name = "N")]

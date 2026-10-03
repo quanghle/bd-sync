@@ -213,6 +213,8 @@ fn walk_the_graph(ws: &mut Ws) {
                 let below = WorkFilter { parent: Some(run.clone()), ..Default::default() };
                 r.ready(&ReadyQuery::default())?;
                 r.ready(&ReadyQuery { filter: below.clone(), ..Default::default() })?;
+                r.ready(&ReadyQuery { include_epics: true, ..Default::default() })?;
+                r.ready(&ReadyQuery { filter: below.clone(), include_epics: true, ..Default::default() })?;
                 r.list(&ListQuery { filter: below.clone(), ..Default::default() })?;
                 r.blocked(&below, None)?;
                 playbook::run_status(r.conn(), &run, r.now())?;
@@ -330,6 +332,9 @@ fn run_the_commands(ws: &mut Ws) {
     let next = ws.write("bot", agent(), |tx| tx.claim_next(&ReadyQuery::default(), &ClaimOptions::default()));
     let next = next.expect("ready work").issue.id;
     ws.write("bot", agent(), |tx| tx.release(&next, &ReleaseOptions::default()));
+    let epics =
+        ReadyQuery { filter: WorkFilter { types: vec!["epic".into()], ..Default::default() }, ..Default::default() };
+    ws.write("bot", agent(), |tx| tx.claim_next(&epics, &ClaimOptions::default()));
     ws.write("bot", agent(), |tx| tx.claim(&other, &ClaimOptions::default()));
     ws.clock.advance(Duration::from_secs(3600));
     ws.write("bd-serve", None, |tx| tx.reclaim_expired(&ReclaimOptions { dry_run: true, ..Default::default() }));

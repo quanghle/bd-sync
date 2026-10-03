@@ -21,7 +21,7 @@ Claude Code subagents share their parent session's id, so their plain `bd` comma
 
 1. Find work: `bd ready` (queue order), `bd list --status in_progress`, `bd blocked`.
 2. Inspect before editing: `bd show <id>` (blockers, dependencies, comments, lease).
-3. Claim atomically: `bd claim <id>`, or `bd claim --next` for the head of the queue. Note the lease token it prints. A claim someone already holds is refused (exit 4), even when it was taken under your own actor name by another session; `bd claim <id> --token <t>` renews only a claim you hold.
+3. Claim atomically: `bd claim <id>`, or `bd claim --next` for the head of the queue. Note the lease token it prints. A claim someone already holds is refused (exit 4), even when it was taken under your own actor name by another session; `bd claim <id> --token <t>` renews only a claim you hold. An issue with open children is refused too: its children come first, so claim one of them (`bd claim --next --parent <id>`).
 4. During long work, renew the lease: `bd heartbeat <id> --token <t>`. If it fails, stop: the claim was lost.
 5. Record follow-up work: `bd create "Title" -d "why and what" --dep discovered-from:<id>`; order work with `bd dep add <issue> <depends-on>`.
 6. Finish: `bd close <id> --reason "..."` (add `--failed` if it failed), or give it back with `bd release <id>`.

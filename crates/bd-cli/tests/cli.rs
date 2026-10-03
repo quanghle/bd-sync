@@ -616,12 +616,49 @@ fn reclaiming_a_live_claim_early_is_a_takeover() {
 }
 
 #[test]
+fn a_parent_with_open_children_is_claimed_through_them() {
+    let ws = Ws::new();
+    let epic = ws.id(&["create", "Ship it", "-t", "epic"]);
+    let a = ws.id(&["create", "Part A", "--parent", &epic]);
+    let b = ws.id(&["create", "Part B", "--parent", &epic]);
+    ws.json_as("worker", &["claim", &a]);
+    let (code, err) = refusal(&ws, "lead", &["claim", &epic]);
+    let why = format!(
+        "{epic} is not ready: its children come first, and 2 are open ({a} claimed by worker, {b} open): claim one \
+         of them (`bd claim --next --parent {epic}`)"
+    );
+    assert!(code == 4 && err.contains(&why) && err.contains("--allow-blocked` overrides"), "{err}");
+    // The queue agrees: asked for epics, it has none to give, and the command suggested claims the open child.
+    assert_eq!(ws.json(&["ready", "-t", "epic"]), serde_json::json!([]));
+    assert!(ws.json_as("lead", &["claim", "--next", "-t", "epic"]).is_null());
+    assert_eq!(ws.json_as("lead", &["claim", "--next", "--parent", &epic])["issue"]["id"], b.as_str());
+    // By id, deliberately.
+    assert_eq!(ws.json_as("lead", &["claim", &epic, "--allow-blocked"])["issue"]["status"], "in_progress");
+
+    // Any parent: a task waits on its subtask, out of the queue, and the summaries count it.
+    let task = ws.id(&["create", "Task"]);
+    let sub = ws.id(&["create", "Subtask", "--parent", &task]);
+    ws.json_as("worker", &["claim", &sub]);
+    let (code, err) = refusal(&ws, "lead", &["claim", &task]);
+    assert!(code == 4 && err.contains(&format!("({sub} claimed by worker)")), "{err}");
+    assert!(ws.json_as("lead", &["claim", "--next"]).is_null(), "nothing else to claim");
+    let ready = ws.ok(&["ready"]);
+    assert!(ready.contains("No ready work (0 blocked, 4 in progress, 0 deferred, 1 waiting on children)"), "{ready}");
+    let stats = ws.ok(&["stats"]);
+    assert!(stats.contains("Ready: 0   Waiting on children: 1   Blocked: 0"), "{stats}");
+    assert!(ws.ok(&["prime"]).contains("## Status: 0 ready · 1 waiting on children · 4 in progress"));
+    // Its subtask done, the task is ready to wrap up.
+    ws.json_as("worker", &["close", &sub]);
+    assert_eq!(ws.json_as("lead", &["claim", "--next"])["issue"]["id"], task.as_str());
+}
+
+#[test]
 fn a_run_claimed_by_another_actor_stays_open_when_its_last_step_closes() {
     let ws = Ws::new();
     ws.playbook("two", "[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\n");
     let run = ws.json(&["playbook", "run", "two"])["run"]["id"].as_str().unwrap().to_string();
     let (a, b) = (format!("{run}.a"), format!("{run}.b"));
-    ws.json_as("coordinator", &["claim", &run]);
+    ws.json_as("coordinator", &["claim", &run, "--allow-blocked"]);
     ws.json_as("worker", &["claim", &a]);
     // Discarding the run would end the worker's claim: named first, --force or not.
     for args in [&["playbook", "discard", &run][..], &["playbook", "discard", &run, "--force"]] {
@@ -1473,7 +1510,8 @@ fn deep_hierarchies_print_linear_text() {
         assert!(last.starts_with(&format!("{pad}[depth {LEVELS}] ")), "{last}");
     };
     let status = ws.ok(&["playbook", "status", &root]);
-    lines(&status, 64, "○ c64 ", "[depth 65] ○ c65 ");
+    // Each level but the last waits on its child.
+    lines(&status, 64, "● c64 ", "[depth 65] ● c65 ");
     let up = ws.ok(&["dep", "tree", &root, "--direction", "up", "--max-depth", "1000000"]);
     lines(&up, 64, "[parent-child] ○ c64 ", "[depth 65] [parent-child] ○ c65 ");
     let leaf = format!("c{LEVELS}");

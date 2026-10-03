@@ -24,7 +24,7 @@ before the children it spawned, since the waits-for edge tracks them.
 |---|---|
 | `blocks` (default) | blocked while DEPENDS_ON is not closed/pinned |
 | `conditional-blocks` | runs only if DEPENDS_ON closes as **failed**; stays blocked if it succeeds |
-| `parent-child` | hierarchy (one parent); a blocked parent blocks its whole subtree, never the reverse |
+| `parent-child` | hierarchy (one parent); a blocked parent blocks its whole subtree, never the reverse; a parent with open children is not ready (its children come first), unless others wait on it through `waits-for` |
 | `waits-for` | fan-in gate on DEPENDS_ON's children: `--gate all-children` (default) or `any-children`; metadata `also_blocks: true` also waits on the spawner itself |
 | `related`, `discovered-from`, `tracks`, `caused-by`, `validates`, `supersedes`, `duplicates`, `replies-to`, custom | informational only |
 
@@ -33,13 +33,19 @@ before the children it spawned, since the waits-for edge tracks them.
 `--sort priority` (default): priority, then oldest, then id. `--sort oldest`:
 creation time, then id. `--sort hybrid`: issues from the last 48h by
 priority, then older ones by age. Every policy ends with `id`, so the same
-state and clock always give the same queue. Epics are containers and are
-excluded unless you pass `--include-epics` or `-t epic`. Gates are never
-ready work (`-t gate` lists them).
+state and clock always give the same queue. A parent's children come first:
+an issue with a child that is not closed waits on its children, whatever its
+type, until every child has closed, exactly when `bd close` refuses to close
+it for them. A spawner, which others wait on through `waits-for`, never
+waits: it may finish before the work it spawned. Waiting is no block: the
+children are ready as before, and `bd ready` and `bd stats` count the
+issues waiting on children. Epics are containers and are also excluded
+unless you pass `--include-epics` or `-t epic`. Gates are never ready work
+(`-t gate` lists them).
 
 ## Claims, leases, and recovery
 
-- `bd claim <id>` succeeds only if the issue is `open`, ready, and unassigned, reserved for you, or held by a `claim.pools` alias. A claim is *live* until `bd reclaim` could take it back (its lease expired more than `lease.grace` ago), and a live claim is never claimed twice: not even by its own actor, since two sessions may share an actor name. Its holder renews it with `bd claim <id> --token <t>` (an idempotent retry that returns the same lease); without the token, or with a stale one, the claim fails with exit 4. A dead claim (past `lease.grace`) is reclaimed by the claim first, with a `reclaimed` event.
+- `bd claim <id>` succeeds only if the issue is `open`, ready, and unassigned, reserved for you, or held by a `claim.pools` alias. An issue with open children is not ready: the refusal (exit 4) names them and their holders, and `bd claim --next --parent <id>` claims one; a parent with no children, or with every child closed, is claimable. `--allow-blocked` claims a blocked or deferred issue, or such a parent, by id anyway. A claim is *live* until `bd reclaim` could take it back (its lease expired more than `lease.grace` ago), and a live claim is never claimed twice: not even by its own actor, since two sessions may share an actor name. Its holder renews it with `bd claim <id> --token <t>` (an idempotent retry that returns the same lease); without the token, or with a stale one, the claim fails with exit 4. A dead claim (past `lease.grace`) is reclaimed by the claim first, with a `reclaimed` event.
 - `bd claim --next` claims the head of the ready queue inside one write transaction, so two agents can never take the same issue, and never returns work someone holds. It first reclaims leases that expired more than `lease.grace` ago.
 - The lease `token` is the sequence number of the `claimed` event: unique and increasing. Pass it to `claim`, `heartbeat`, `close`, or `release` so a stale worker cannot act on a claim it no longer holds.
 - A live claim is its holder's. Ending or taking over one held by another actor name fails with exit 4 (`not_owner`, or `already_claimed` for a reassignment), alone or in a `bd batch`: `close`, `release`, `update --status` out of `in_progress`, `update --assignee`, `delete`, `playbook discard` and `compact` (of the run issue or a step), `import`, and `reclaim` with a `--grace` shorter than `lease.grace`. Another actor name is any other: the holder's root actor (`alice` for `alice/agent-1`) and its sibling sub-actors too. Only `--take-over` takes it over, deliberately, and the event (`closed`, `released`, `updated`, `deleted`, `imported`, `reclaimed`, or `run_compacted`'s `claim_overrides`) records the takeover as `claim_override` with the holder and lease token. `--force` never does: it only gets past open children, blockers, dependents, unfinished runs and your own work in progress, and the claim is checked first, so the first refusal names its holder (an operation that would end several claims lists every one, with its holder). On `update` and `release`, where `--force` used to mean a takeover, it is now refused as a usage error (exit 2) pointing at `--take-over`; `release --if-assignee <holder>` is a guard, not a takeover. The holder needs neither `--take-over` nor its token (a token it passes must match), so sessions sharing one actor name can still end each other's claims: give each agent its own actor. A dead claim is anyone's to claim, close or release without `--take-over`. A playbook run or group claimed by another actor stays open, still claimed, when its last step closes; its holder closes it.

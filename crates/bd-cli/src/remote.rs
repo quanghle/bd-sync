@@ -469,6 +469,7 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
     };
     attach_inputs(&cli.command, &mut request)?;
     playbooks::attach_bundle(app, &cli.command, &mut request)?;
+    playbooks::attach_listing(app, &cli.command, &mut request);
     check_outputs(app, &cli.command)?;
     // A session hook prints `bd prime` only once it knows the command worked.
     let write = crate::serve::access(&cli.command) == crate::serve::Access::Write;

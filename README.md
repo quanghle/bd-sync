@@ -41,7 +41,7 @@ bd ready                                    # unblocked work, queue order
 bd claim --next                             # atomic claim + 5m lease (prints token)
 bd heartbeat demo-xyz --token 42            # renew while working
 bd close demo-xyz --reason "merged" --token 42
-bd prime                                    # agent context: claims, ready work, memories
+bd prime                                    # agent context: claims, ready work, playbooks, memories
 ```
 
 Agent loop: `bd claim --next --json` → work, heartbeating every few minutes

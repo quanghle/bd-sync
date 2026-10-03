@@ -102,6 +102,15 @@ server's, then your own ([Clients](remote.md#clients)). beads formula files load
 (`formula`, `depends_on`, `expand_vars`, gate `id`, `phase = "vapor"`); a
 `type = "human"` step is rejected with a pointer to human gates.
 
+`bd prime` lists the playbooks in that order, each name once (the one a
+command naming it loads), so agents know which work has one: its name, the
+first line of its `description` (cut at 100 characters), where it lives when
+not in the checkout (on the server, or the user's own), and a flag on one that
+does not load. It lists 10 at most (`--max-playbooks N`, 0 for all) and
+points to `bd playbook list` for the rest; `bd prime --json` has them under
+`playbooks` (`name`, `description`, `location`: `checkout`, `server` or
+`user`, `invalid`), with their number in `playbooks_total`.
+
 Limits keep a run, and the work of planning it, bounded: a playbook holds at
 most 2,000 steps, which nest at most 32 levels deep (counting expansions), and
 a run at most 2,000 issues, 20,000 dependencies and 16 MiB of text. Variables

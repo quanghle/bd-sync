@@ -1559,6 +1559,7 @@ mod tests {
             (&["config", "get", "lease.ttl"][..], Access::Read),
             (&["playbook", "extract", "x"][..], Access::Read),
             (&["prime"][..], Access::Read),
+            (&["--client-playbooks", "p.json", "prime"][..], Access::Read),
             (&["agents", "manifest"][..], Access::Read),
             (&["agents", "fetch", "--harness", "codex"][..], Access::Read),
             (&["create", "x"][..], Access::Write),

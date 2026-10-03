@@ -10,7 +10,7 @@ This repository tracks its own work with bd (`.bd/bd.db`, local and
 gitignored). Use it instead of markdown TODO lists:
 
 ```bash
-bd prime                                   # context: your actor, claims, ready work, memories
+bd prime                                   # context: your actor, claims, ready work, playbooks, memories
 bd ready                                   # unblocked work, in queue order
 bd claim <id>                              # or: bd claim --next
 bd create "Found while working" --dep discovered-from:<id>

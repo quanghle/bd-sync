@@ -109,6 +109,7 @@ bd memories docker ; bd recall <key> ; bd forget <key>
 ```
 
 `bd prime` prints workflow context, your actor and claims, top ready work,
+gates waiting on a person, the playbooks available ([Playbooks](playbooks.md#writing-a-playbook)),
 and all memories. Outside a workspace it prints nothing (safe in session
 hooks). It warns when you act as the plain default actor, shared by every
 session without one of its own, and that actor holds claims.

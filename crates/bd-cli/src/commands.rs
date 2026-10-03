@@ -1128,6 +1128,9 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     })?;
     let shown_memories: Vec<&bd_core::Memory> =
         if a.max_memories > 0 { memories.iter().take(a.max_memories).collect() } else { memories.iter().collect() };
+    let playbooks = crate::playbooks::for_prime(app, app.g.client_playbooks.as_deref());
+    let shown_playbooks =
+        &playbooks[..if a.max_playbooks > 0 { a.max_playbooks.min(playbooks.len()) } else { playbooks.len() }];
     if app.g.json && a.hook.is_none() {
         app.print_json(&json!({
             "workspace": workspace,
@@ -1147,6 +1150,8 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             "stats": stats,
             "gates_needing_attention": attention,
             "memories": shown_memories,
+            "playbooks": shown_playbooks,
+            "playbooks_total": playbooks.len(),
         }));
         return Ok(());
     }
@@ -1253,6 +1258,37 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
                 holds.join(", "),
                 g.id
             ));
+        }
+    }
+    if !playbooks.is_empty() {
+        o.push(String::new());
+        let shown = if shown_playbooks.len() < playbooks.len() {
+            format!("showing {} of {}", shown_playbooks.len(), playbooks.len())
+        } else {
+            playbooks.len().to_string()
+        };
+        o.push(format!("## Playbooks ({shown})"));
+        o.push(
+            "When work matches one, `bd playbook show <name>` gives its steps and vars and `bd playbook run <name> \
+             --var k=v` starts it."
+                .into(),
+        );
+        for p in shown_playbooks {
+            let mut line = format!("- {}", p.name);
+            if p.invalid {
+                line.push_str(" — invalid: `bd playbook list` shows why");
+            } else if !p.description.is_empty() {
+                line.push_str(&format!(" — {}", p.description));
+            }
+            line.push_str(match p.location {
+                crate::playbooks::Location::Checkout => "",
+                crate::playbooks::Location::Server => " (on the server)",
+                crate::playbooks::Location::User => " (user's own)",
+            });
+            o.push(line);
+        }
+        if shown_playbooks.len() < playbooks.len() {
+            o.push(format!("- … {} more: `bd playbook list`", playbooks.len() - shown_playbooks.len()));
         }
     }
     if !memories.is_empty() {

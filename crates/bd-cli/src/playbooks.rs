@@ -6,7 +6,8 @@
 //! client's. `show`, `plan` and `run` of a playbook found on the client send
 //! its files with the command (a bundle, named by `--playbook-bundle`), and
 //! the server loads it from the bundle alone. `list` shows all of them, and
-//! `extract --save` writes into the checkout.
+//! `extract --save` writes into the checkout. `bd prime` lists them too: the
+//! client sends the names and descriptions of its own (`--client-playbooks`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use bd_core::playbook::{
 };
 use bd_core::time::parse_duration;
 use bd_core::{Error, Queries, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::app::{App, Out};
@@ -159,6 +160,86 @@ fn list_out(json: Value, entries: &[(Listed, bool)], searched: &[(PathBuf, bool)
         out = out.line(line).id(l.name.clone());
     }
     out
+}
+
+// ------------------------------------------------------------- bd prime
+
+/// Where a playbook `bd prime` lists lives, in lookup order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Location {
+    /// The workspace's `.bd/playbooks` (the checkout's, in a remote workspace).
+    Checkout,
+    /// The playbook path of a remote workspace's server.
+    Server,
+    /// `$BD_PLAYBOOK_PATH` and the user config directory.
+    User,
+}
+
+/// A playbook as `bd prime` lists it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Summary {
+    pub name: String,
+    /// The description's first line, cut short.
+    #[serde(default)]
+    pub description: String,
+    pub location: Location,
+    /// The file does not parse or validate.
+    #[serde(default)]
+    pub invalid: bool,
+}
+
+/// How many characters of a description `bd prime` shows.
+const SUMMARY_CHARS: usize = 100;
+
+impl Summary {
+    fn of(l: &Listed, location: Location) -> Summary {
+        Summary { name: l.name.clone(), description: l.description.clone(), location, invalid: l.error.is_some() }
+            .tidy()
+    }
+
+    /// The description cut to one short line, and hidden characters escaped.
+    /// Tidying again changes nothing (a server tidies what a client sends).
+    fn tidy(self) -> Summary {
+        let mut lines = self.description.trim().lines();
+        let first = crate::agents::show::printable(lines.next().unwrap_or_default().trim());
+        let mut description: String = first.chars().take(SUMMARY_CHARS).collect();
+        if lines.next().is_some() || first.chars().count() > SUMMARY_CHARS {
+            description = format!("{}…", description.trim_end());
+        }
+        Summary { name: crate::agents::show::printable(&self.name), description, ..self }
+    }
+}
+
+/// The playbooks `bd prime` lists, in lookup order, each name once (the one
+/// a command naming it loads). `client` names the listing a remote client
+/// sent of its checkout's and its user's playbooks, which go before and
+/// after the server's own; a listing that cannot be read is left out.
+pub fn for_prime(app: &App, client: Option<&Path>) -> Vec<Summary> {
+    let client: Option<Vec<Summary>> = client.and_then(|file| {
+        let listing = io::read_file(file).and_then(|text| {
+            serde_json::from_str(&text).map_err(|e| Error::invalid(format!("{}: {e}", file.display())))
+        });
+        listing.map_err(|e| tracing::debug!(target: "bd::cli", error = %e, "client playbooks left out")).ok()
+    });
+    let paths = search_paths(app);
+    let remote = client.is_some() || io::serving();
+    let own = Loader::new(paths.clone()).list().into_iter().map(|l| {
+        let location = if remote {
+            Location::Server
+        } else if l.path.parent() == paths.first().map(PathBuf::as_path) {
+            Location::Checkout
+        } else {
+            Location::User
+        };
+        Summary::of(&l, location)
+    });
+    let (before, after): (Vec<Summary>, Vec<Summary>) =
+        client.unwrap_or_default().into_iter().partition(|s| s.location != Location::User);
+    let before = before.into_iter().map(|s| Summary { location: Location::Checkout, ..s.tidy() });
+    let after = after.into_iter().map(Summary::tidy);
+    let mut seen = std::collections::HashSet::new();
+    before.chain(own).chain(after).filter(|s| seen.insert(s.name.clone())).collect()
 }
 
 fn step_lines(steps: &[Arc<Step>], depth: usize, out: &mut Vec<String>) {
@@ -641,6 +722,40 @@ pub fn attach_bundle(app: &App, cmd: &Command, request: &mut ExecRequest) -> Res
     Ok(())
 }
 
+/// Where a client puts its playbook listing for `bd prime` among a request's files.
+const LISTING_FILE: &str = "prime.playbooks.json";
+/// Names the listing on the command line.
+const LISTING_FLAG: &str = "--client-playbooks";
+
+/// `bd prime`: send the names and descriptions of the checkout's playbooks
+/// and the user's own, which the server lists before and after its own.
+/// Never fails: without them, prime lists the server's alone.
+pub fn attach_listing(app: &App, cmd: &Command, request: &mut ExecRequest) {
+    if !matches!(cmd, Command::Prime(_)) {
+        return;
+    }
+    if let Some(file) = &app.g.client_playbooks {
+        // A listing named on the command line travels like any input file.
+        if let Ok(text) = io::read_file(file) {
+            request.files.insert(file.to_string_lossy().into_owned(), text);
+        }
+        return;
+    }
+    let Ok(checkout) = checkout_playbooks(app) else { return };
+    let listed = |paths: Vec<PathBuf>, location: Location| {
+        let found = Loader::new(paths).list().into_iter().filter(|l| l.shadowed_by.is_none());
+        found.map(move |l| Summary::of(&l, location))
+    };
+    let listing: Vec<Summary> =
+        listed(vec![checkout], Location::Checkout).chain(listed(with_user_paths(None), Location::User)).collect();
+    if listing.is_empty() {
+        return;
+    }
+    let Ok(listing) = serde_json::to_string(&listing) else { return };
+    request.files.insert(LISTING_FILE.to_string(), listing);
+    request.argv.splice(0..0, [LISTING_FLAG.to_string(), LISTING_FILE.to_string()]);
+}
+
 /// A read the client composes (in JSON) rather than the user's command line.
 pub(crate) fn server_read(app: &App, remote: &Remote, mut argv: Vec<String>) -> Result<ExecResponse> {
     if let Some(actor) = &app.g.actor {
@@ -738,5 +853,28 @@ mod tests {
     #[test]
     fn the_bundle_flag_parses() {
         assert!(Cli::try_parse_from(["bd", BUNDLE_FLAG, BUNDLE_FILE, "playbook", "list"]).is_ok());
+        assert!(Cli::try_parse_from(["bd", LISTING_FLAG, LISTING_FILE, "prime", "--hook", "copilot"]).is_ok());
+    }
+
+    #[test]
+    fn prime_summaries_are_one_short_line_and_tidy_once() {
+        let summary = |description: &str| {
+            Summary {
+                name: "x\u{1b}".into(),
+                description: description.into(),
+                location: Location::User,
+                invalid: false,
+            }
+            .tidy()
+        };
+        let short = summary("  Ship it\n\nThe details.");
+        assert_eq!((short.name.as_str(), short.description.as_str()), ("x\\u{1b}", "Ship it…"));
+        assert_eq!(summary(&format!("{} y", "a".repeat(99))).description, format!("{}…", "a".repeat(99)));
+        assert_eq!(summary("Turns \u{1b}[31mred").description, "Turns \\u{1b}[31mred");
+        for d in ["Ship it\nmore", &"b".repeat(300), &format!("{}\u{202e}", "c".repeat(98)), ""] {
+            let once = summary(d);
+            let twice = once.clone().tidy();
+            assert_eq!((&once.name, &once.description), (&twice.name, &twice.description), "{d:?}");
+        }
     }
 }

@@ -58,6 +58,9 @@ pub struct Global {
     /// Read playbooks only from this bundle (how a remote client sends the playbooks of its checkout)
     #[arg(long, global = true, hide = true, value_name = "FILE")]
     pub playbook_bundle: Option<PathBuf>,
+    /// The checkout's and the user's playbooks for `bd prime` to list (how a remote client sends them)
+    #[arg(long, global = true, hide = true, value_name = "FILE")]
+    pub client_playbooks: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -771,6 +774,9 @@ pub struct PrimeArgs {
     /// Number of ready items shown
     #[arg(long, default_value_t = 10)]
     pub ready: usize,
+    /// Cap the number of playbooks listed (0 = all)
+    #[arg(long, default_value_t = 10)]
+    pub max_playbooks: usize,
     /// Run as a session hook of this agent harness: work in the session's directory (the cwd of the hook's JSON
     /// input on stdin), and print the context as the harness reads it: copilot gets one JSON object
     /// {"additionalContext": "..."}, as Copilot CLI drops plain text; claude and codex read plain text. Takes

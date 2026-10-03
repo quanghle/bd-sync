@@ -1010,6 +1010,70 @@ fn prime_in_session_hooks_never_fails() {
 }
 
 #[test]
+fn prime_lists_the_checkouts_the_servers_and_the_users_playbooks() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let on_server = server.root.path().join("proj").join(".bd").join("playbooks");
+    write(&on_server, "deploy.toml", "description = \"server copy\"\n[[steps]]\nid = \"s\"\n");
+    write(&on_server, "ops.toml", "description = \"Page \\u001b[2Jsomeone\"\n[[steps]]\nid = \"page\"\n");
+    // Without a checkout or playbooks of its own, a client sees the server's.
+    let section = |text: &str| -> Vec<String> {
+        text.lines()
+            .skip_while(|l| !l.starts_with("## Playbooks"))
+            .skip(2)
+            .take_while(|l| l.starts_with("- "))
+            .map(String::from)
+            .collect()
+    };
+    let servers = ["- deploy — server copy (on the server)", "- ops — Page \\u{1b}[2Jsomeone (on the server)"];
+    let text = alice.ok(&["prime"]);
+    assert_eq!(section(&text), servers, "{text}");
+
+    let mine = alice.dir.path().join(".bd").join("playbooks");
+    write(&mine, "deploy.toml", "description = \"client copy\"\n[[steps]]\nid = \"c\"\n");
+    write(&mine, "broken.toml", "[[steps]]\nid = \"b\"\nbogus = 1\n");
+    let users = alice.dir.path().join(".xdg").join("bd").join("playbooks");
+    write(&users, "ops.toml", "description = \"user copy\"\n[[steps]]\nid = \"u\"\n");
+    write(&users, "mine.toml", "description = \"Tidy up\"\n[[steps]]\nid = \"m\"\n");
+    let text = alice.ok(&["prime"]);
+    let listed = [
+        "- broken — invalid: `bd playbook list` shows why",
+        "- deploy — client copy",
+        "- ops — Page \\u{1b}[2Jsomeone (on the server)",
+        "- mine — Tidy up (user's own)",
+    ];
+    assert_eq!(section(&text), listed, "{text}");
+    assert!(text.contains("## Playbooks (4)"), "{text}");
+    let context = copilot_context(&alice.ok(&["prime", "--hook", "copilot"])).unwrap();
+    assert_eq!(format!("{context}\n"), text, "the same context for Copilot CLI");
+
+    let capped = alice.ok(&["prime", "--max-playbooks", "1"]);
+    assert_eq!(section(&capped), [listed[0], "- … 3 more: `bd playbook list`"], "{capped}");
+    let v = alice.json(&["prime"]);
+    assert_eq!(v["playbooks_total"], 4);
+    let found: Vec<(&str, &str, bool)> = v["playbooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["name"].as_str().unwrap(), p["location"].as_str().unwrap(), p["invalid"].as_bool().unwrap()))
+        .collect();
+    assert_eq!(
+        found,
+        [
+            ("broken", "checkout", true),
+            ("deploy", "checkout", false),
+            ("ops", "server", false),
+            ("mine", "user", false)
+        ]
+    );
+
+    // A listing the server cannot read leaves the client's playbooks out, never prime.
+    write(alice.dir.path(), "listing.json", "not json");
+    let text = alice.ok(&["--client-playbooks", "listing.json", "prime"]);
+    assert_eq!(section(&text), servers, "{text}");
+}
+
+#[test]
 fn env_token_is_never_sent_to_a_url_from_remote_toml() {
     // A server named by a checkout (a pull request, a submodule): it must never see a connection.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

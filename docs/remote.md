@@ -526,6 +526,9 @@ What runs where:
   8 MiB in all), and the server checks and compiles it as a local run would,
   without reading any other file for it. `playbook list` shows them all in that
   order, marking the server's, and `show` marks a playbook from the server.
+  `bd prime` lists them in that order too: the client sends the names and
+  descriptions of the checkout's playbooks and the user's own with it (a
+  listing the server cannot read leaves them out, never fails prime).
   `playbook extract --save` writes into the checkout, with a note when the
   playbook is too large to send. GitHub gates are checked by the server's
   `gh`, for the repositories `gate.repos` allows, also on the server's own

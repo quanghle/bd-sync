@@ -2859,6 +2859,58 @@ fn prime_prints_one_json_object_for_copilot_hooks() {
 }
 
 #[test]
+fn prime_lists_the_playbooks_a_name_would_load() {
+    let ws = Ws::new();
+    let plain = ws.ok(&["prime"]);
+    assert!(!plain.contains("## Playbooks") && plain.contains("`bd playbook list`"), "{plain}");
+    assert_eq!(ws.json(&["prime"])["playbooks"], serde_json::json!([]));
+
+    ws.playbook("ship", "description = \"Cut a release\\n\\nLong story.\"\n[[steps]]\nid = \"a\"\n");
+    ws.playbook("broken", "[[steps]]\nid = \"a\"\nbogus = 1\n");
+    ws.playbook("tint", "description = \"Turns \\u001b[31mred\"\n[[steps]]\nid = \"a\"\n");
+    let user = ws.dir.path().join(".xdg").join("bd").join("playbooks");
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(user.join("ship.toml"), "description = \"user copy\"\n[[steps]]\nid = \"a\"\n").unwrap();
+    let long = "x".repeat(150);
+    std::fs::write(user.join("mine.toml"), format!("description = \"{long}\"\n[[steps]]\nid = \"a\"\n")).unwrap();
+
+    let text = ws.ok(&["prime"]);
+    let section: Vec<&str> = text.lines().skip_while(|l| !l.starts_with("## Playbooks")).take(6).collect();
+    assert_eq!(
+        section,
+        [
+            "## Playbooks (4)",
+            "When work matches one, `bd playbook show <name>` gives its steps and vars and `bd playbook run <name> \
+             --var k=v` starts it.",
+            "- broken — invalid: `bd playbook list` shows why",
+            "- ship — Cut a release…",
+            "- tint — Turns \\u{1b}[31mred",
+            &format!("- mine — {}… (user's own)", "x".repeat(100)),
+        ],
+        "{text}"
+    );
+    assert!(!text.contains("user copy"), "a shadowed playbook is listed once: {text}");
+
+    let capped = ws.ok(&["prime", "--max-playbooks", "2"]);
+    assert!(capped.contains("## Playbooks (showing 2 of 4)") && capped.contains("- … 2 more: `bd playbook list`"));
+    assert!(!capped.contains("- tint"), "{capped}");
+    let context = copilot_context(&ws.ok(&["prime", "--hook", "copilot", "--max-playbooks", "2"])).unwrap();
+    assert_eq!(format!("{context}\n"), capped);
+
+    let v = ws.json(&["prime", "--max-playbooks", "3"]);
+    assert_eq!(v["playbooks_total"], 4);
+    assert_eq!(
+        v["playbooks"],
+        serde_json::json!([
+            { "name": "broken", "description": "", "location": "checkout", "invalid": true },
+            { "name": "ship", "description": "Cut a release…", "location": "checkout", "invalid": false },
+            { "name": "tint", "description": "Turns \\u{1b}[31mred", "location": "checkout", "invalid": false },
+        ])
+    );
+    assert_eq!(ws.json(&["prime", "--max-playbooks", "0"])["playbooks"][3]["location"], "user");
+}
+
+#[test]
 fn session_hooks_work_in_the_directory_their_input_names() {
     let (ws, agents) = agents_ws();
     let root = ws.dir.path();

@@ -311,6 +311,35 @@ fn events_wait_for_a_matching_event() {
 }
 
 #[test]
+fn deleted_issues_keep_their_events_under_their_own_id() {
+    let ws = Ws::new();
+    for i in 1..=12 {
+        ws.ok(&["create", &format!("Task {i}")]);
+    }
+    ws.ok(&["create", "Child of t-2", "--parent", "t-2"]);
+    ws.ok(&["delete", "t-1"]);
+    ws.ok(&["delete", "--force", "t-2"]);
+    // Once deleted, t-1 is a prefix of t-10 to t-12 (ambiguous), and t-2 of t-2.1 alone: the id the
+    // events name still wins, given in full or without the prefix.
+    for (id, short, other) in [("t-1", "1", "t-10"), ("t-2", "2", "t-2.1")] {
+        for given in [id, short] {
+            let history = ws.json(&["history", given]);
+            let events = history.as_array().unwrap();
+            assert!(events.iter().all(|e| e["issue_id"] == id), "{given}: {history}");
+            let ops: Vec<&str> = events.iter().map(|e| e["op"].as_str().unwrap()).collect();
+            assert_eq!((ops.first(), ops.last()), (Some(&"created"), Some(&"deleted")), "{given}: {history}");
+            let listing = ws.ok(&["events", "--issue", given]);
+            assert!(listing.contains(&format!(" deleted {id}")), "{given}: {listing}");
+            assert!(!listing.contains(&format!(" {other}")), "{given}: {listing}");
+        }
+    }
+    // Existing issues still resolve by a unique prefix; unknown ids are still errors.
+    assert_eq!(ws.json(&["history", "11"])[0]["issue_id"], "t-11");
+    assert_eq!(ws.json(&["history", "t-2."])[0]["issue_id"], "t-2.1");
+    assert_eq!(ws.code_as("tester", &["history", "t-404"]), 3);
+}
+
+#[test]
 fn crash_recovery_via_reclaim() {
     let ws = Ws::new();
     ws.ok(&["create", "Fragile"]);

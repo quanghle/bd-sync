@@ -1020,20 +1020,35 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
 }
 
 /// The query `bd events` runs for `a`: its cursor, limit and filters, with
-/// `--issue` resolved. A deleted issue keeps its events, as for `bd history`,
-/// so a follower of it sees its deletion and is not cut off by it: its id,
-/// which stored events name, comes before the issues it is a prefix of (`t-1`
-/// of `t-10`, `bd-a1b2` of `bd-a1b2.1`), as an existing issue's id does.
+/// `--issue` resolved by [`events_issue`], so a follower of a deleted issue
+/// sees its deletion and is not cut off by it.
 pub fn event_query(r: &bd_core::ReadCtx<'_>, a: &EventsArgs) -> Result<EventQuery> {
     let issue_id = match &a.issue {
-        Some(raw) => Some(match r.resolve_id(raw) {
-            Ok(id) if id == raw.trim() => id,
-            _ if has_events(r, raw.trim())? => raw.trim().to_string(),
-            resolved => resolved?,
-        }),
+        Some(raw) => Some(events_issue(r, raw)?.0),
         None => None,
     };
     Ok(EventQuery { since: a.since, limit: a.limit, issue_id, ops: a.ops.clone(), actor: a.by_actor.clone() })
+}
+
+/// The issue whose events `bd events --issue` and `bd history` read, and
+/// whether it still exists: a deleted issue keeps its events. An exact id,
+/// as given and then with the workspace prefix (`1` for `t-1`), wins whether
+/// its issue exists or only its events do, so a deleted issue never resolves
+/// to the issues its id is a prefix of (`t-1` of `t-10`, `bd-a1b2` of
+/// `bd-a1b2.1`); otherwise a unique prefix of an existing issue's id.
+fn events_issue(r: &bd_core::ReadCtx<'_>, raw: &str) -> Result<(String, bool)> {
+    let raw = raw.trim();
+    let resolved = r.resolve_id(raw);
+    let prefixed = format!("{}-{raw}", bd_core::config::prefix(r.conn())?);
+    for exact in [raw, prefixed.as_str()] {
+        if resolved.as_ref().is_ok_and(|id| id == exact) {
+            return Ok((exact.to_string(), true));
+        }
+        if has_events(r, exact)? {
+            return Ok((exact.to_string(), false));
+        }
+    }
+    resolved.map(|id| (id, true))
 }
 
 fn has_events(r: &bd_core::ReadCtx<'_>, issue: &str) -> Result<bool> {
@@ -1068,12 +1083,8 @@ fn wait_for_events(app: &mut App, q: &EventQuery, wait: Duration, interval_ms: u
 
 pub fn cmd_history(app: &mut App, a: &HistoryArgs) -> Result<()> {
     let (id, exists, events) = app.read(|r| {
-        // Deleted issues keep their history, so an unknown id is looked up verbatim.
-        let (id, exists) = match r.resolve_id(&a.id) {
-            Ok(id) => (id, true),
-            Err(Error::NotFound { .. }) => (a.id.trim().to_string(), false),
-            Err(e) => return Err(e),
-        };
+        // Deleted issues keep their history.
+        let (id, exists) = events_issue(r, &a.id)?;
         let events = r.history(&id)?;
         Ok((id, exists, events))
     })?;

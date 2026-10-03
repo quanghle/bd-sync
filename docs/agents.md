@@ -129,36 +129,34 @@ in project skills such as those bd writes. Copilot CLI skills honour
 `allowed-tools` too (such as `shell`). Scripts bundled with a skill, which
 bd makes executable, are commands agents are told to run.
 
-bd applies skills without review: `bd agents pull`, the session-start hook
-at every session, and `bd agents watch` at every change. Only MCP
-definitions wait for `bd agents approve`. Editing `.bd/agents/*/skills` on
-the server, or taking over the server, is therefore running code on every
-client that syncs. So:
+So skills wait for a person, as MCP definitions do: a pull, the
+session-start hook and `bd agents watch` never write a new skill file, a
+changed one, or an executable bit the user has not approved; `bd agents
+approve` shows each waiting skill, file by file, and asks on a terminal
+([Approving skills and MCP definitions](#approving-skills-and-mcp-definitions)).
+What applies without approval adds nothing that runs: removals, files bd
+wrote that were deleted here written again as approved, files already here
+as the server has them adopted. Still, an approved skill runs with the
+user's privileges in every session, and someone who edits `.bd/agents/*`
+on the server, or takes the server over, can put anything up for approval.
+So:
 
 - Guard `.bd/agents` on the server like a code deployment: only admins
   edit it, and changes are reviewed as code is.
-- Enable the session-start hook and `bd agents watch` only for a server
-  trusted like the repository's own code.
-- To look before anything applies, leave the hook and watch out and pull
-  by hand. `bd agents status` lists what a pull would change (skills added,
-  updated or removed, by name and, with `--json`, by file path), not their
-  content; `bd agents manifest` gives hashes only. The server's text can be
+- Read what `bd agents approve` shows before answering: a skill's files in
+  full when new, as a diff when changed. `bd agents status` names the
+  skills waiting and their changed files; the server's text can also be
   read with the hidden `bd agents fetch --harness <h>` (a read token is
   enough), which prints the whole set as one JSON object with strings
   escaped (`jq '.skills'`); `jq -r` prints the text as the server sent it,
-  terminal control characters included. When the skill directories are
-  committed, `git diff` after `bd agents pull` shows what the pull wrote,
-  before an agent session uses it.
-
-A later change may gate skills that can run commands behind approval as
-well.
+  terminal control characters included.
 
 ## Pulling into a checkout
 
 ```bash
 bd agents status --harness claude       # what a pull would do; changes nothing
-bd agents pull --harness claude,codex   # skills written; MCP removals applied; new or changed MCP definitions wait
-bd agents approve                       # in a terminal: review and approve waiting MCP definitions
+bd agents pull --harness claude,codex   # removals and restores applied; new or changed skills and MCP definitions wait
+bd agents approve                       # in a terminal: review and approve waiting skills and MCP definitions
 bd agents watch                         # keep pulling as the server's sets change, until Ctrl-C
 ```
 
@@ -174,7 +172,9 @@ a nested session gets each), else those `.bd/agents.lock` records
 Each harness's set goes to its own places only: a copilot pull leaves the
 claude and codex ones alone. When nothing changed, a command makes one
 request (the manifests); a set is fetched whole only when files are to be
-written or MCP changes shown.
+written, adopted or made executable, or changes shown: those are decided
+again from hashes checked against the texts they name, never from a
+manifest's word for them.
 
 ```
 $ bd agents status --harness claude,copilot
@@ -185,9 +185,10 @@ copilot: conflict: .github/skills/triage/SKILL.md: differs from the server's and
 ```
 
 `.bd/agents.lock` records, per harness, the server revision last pulled,
-each skill file bd wrote or adopted (`sha256`, `lf_sha256` for a text with
-CRLF line endings, `executable`, and `executable_not_kept` where the file
-system did not keep that bit), and
+each skill file bd wrote or adopted (`sha256` of the bytes written, or of
+those found here when adopted, `lf_sha256` for a text with CRLF line
+endings, `executable`, and `executable_not_kept` where the file system did
+not keep that bit), and
 each MCP entry bd wrote or adopted, with the definition approved. It is
 local state: the first lock written adds `agents.lock*` to `.bd/.gitignore`
 (covering `agents.lock.mutex`, the checkout's OS-locked mutex, and temp
@@ -196,22 +197,38 @@ mutex, which the system releases when its process ends: a session hook and
 a watch can run at once, and one that waits past `--busy-timeout-ms` fails
 with exit 5. The rules a pull follows:
 
+- **Approval.** A skill file is written only with the bytes bd recorded for
+  it, which `bd agents approve` recorded (or a pull adopted), and made
+  executable only if it was then: a new file, a changed text, or an
+  executable bit the server now sets waits for approval, as the skill's
+  change (`skills waiting for approval: deploy (changed: SKILL.md)`; a
+  path with a space is quoted, and past five files the rest are counted). A
+  pull still records the server's revision, so later pulls and session
+  starts report the waiting skill until it is approved.
 - **Ownership.** A file or MCP entry bd did not record that already matches
   the server's is adopted: recorded, not written (a fresh clone with the
-  skills committed). One that differs is a conflict, reported and left
-  alone; moving it away lets the next pull write the server's.
+  skills committed), unless it needs an executable bit, which waits for
+  approval. One that differs is a conflict, reported and left alone;
+  moving it away lets the next pull put the server's up for approval.
 - **Line endings.** A skill file that differs from the server's, or from
   the one bd wrote, only in line endings (the same text once each CRLF in
   either is read as LF, as when git's `core.autocrlf` checks text files out
   with CRLF line endings on Windows) counts as the same file: adopted,
-  never an edit, and kept with its line endings, also when the server
-  changes only those.
+  never an edit, and kept with its line endings and its record, also when
+  the server changes only those. Writing them is another matter: line
+  endings can change what a script runs (a `\` before CRLF continues no
+  line in sh), so only the bytes recorded are written without approval: a
+  file deleted here whose server text has other line endings waits for
+  approval, its CRs shown (`\u{d}`), and `pull --force` keeps an edit to
+  such a file.
 - **Local edits.** A file or entry bd wrote that was edited here is kept and
-  reported as edited, or as a conflict when the server changed or removed it
-  too. `pull --force` replaces or removes such edits; it never touches what
-  bd did not write, and never writes a new or changed MCP definition.
+  reported as edited. When the server changed it too, it waits for
+  approval, which replaces the edit (`edited here`); when the server
+  removed it, it is a conflict. `pull --force` puts the recorded bytes back
+  over such edits, or removes them; it never touches what bd did not
+  write, and never writes a new or changed skill file or MCP definition.
 - **Restores and removals.** Files bd wrote that were deleted here are
-  written again, and so is an approved MCP definition deleted here and
+  written again with the bytes recorded, and so is an approved MCP definition deleted here and
   unchanged on the server. Files and MCP entries the server removed are
   deleted (unless edited here), with the directories that leaves empty
   below the skills directory, before anything is written: a file renamed on
@@ -222,8 +239,10 @@ with exit 5. The rules a pull follows:
   directory (the skills directory and its parents may be symlinks), and
   never writes an MCP file that is a symlink: those are conflicts.
 - **Executable bits** (Unix): files the server marks executable get their
-  executable bits, also when adopted or kept with the server's text; a
-  server change of the bit alone applies even to an edited file. An
+  executable bits once approved, also when adopted or kept with the
+  server's text; a server change of the bit alone (approved like any other)
+  touches no text, so it applies even to an edited file, and a bit the
+  server clears is cleared without approval. An
   executable bit the server never set is left alone (some file systems show
   every file executable). Where the file system does not keep the bit
   (`chmod` has no effect or is refused, and files read back without it:
@@ -276,14 +295,20 @@ Claude Code and Copilot CLI (not `${VAR:-default}`); `env_vars` (but not
 With `--json`, `status` and `pull` print `{"applied", "checkout",
 "harnesses": {"<harness>": {"server_revision", "applied_revision", "skills",
 "mcp", "unset_env", "hook"}}}`, where `skills` and `mcp` list what changed, was
-adopted, edited, left or is in conflict, and `mcp.pending` the definitions
-waiting (`name`, `change`: `new` or `changed`, the top-level `fields` that
-changed, and whether the entry was `edited` here), and `hook` the
-session-start hook's `file` and `state` (`present`, `added`, or `conflict`
-with a `reason`; left out with `--no-hook`); `approve` prints, per
-harness, the entries `approved`, `declined`, `skipped` (with a reason) and
-in `conflicts`. The module docs of `crates/bd-cli/src/agents.rs` have the
-full shapes. Exit codes: 0 when the command did its work (pending MCP
+adopted, edited, left or is in conflict; `skills.pending` the skills
+waiting, by name (`change`: `new` or `changed`, and their `files`, each
+with its `path`, `change`: `new`, `changed` or `executable`, whether it is
+`executable`, and whether it was `edited` here); `mcp.pending` the
+definitions waiting (`name`, `change`: `new` or `changed`, the top-level
+`fields` that changed, and whether the entry was `edited` here); and
+`hook` the session-start hook's `file` and `state` (`present`, `added`, or
+`conflict` with a `reason`; left out with `--no-hook`). `approve` prints,
+per harness, `skills` (the skills `dir`, and the skills `approved`,
+`declined`, `skipped` with a reason, and the paths `not_executable` here)
+and `mcp` (its `file`, and the entries `approved`, `declined`, `skipped`
+with a reason, and in `conflicts`). The module docs of
+`crates/bd-cli/src/agents.rs` have the full shapes. Exit codes: 0 when the
+command did its work (pending skills and MCP
 changes, conflicts, local edits, and declined or skipped approvals are
 findings, not failures); 2 no harness, no checkout, an unusable
 `.bd/agents.lock`, or an invalid set; for `approve` also a refusal (below)
@@ -304,22 +329,68 @@ unusable set or lock) print `bd agents watch: <error> (trying again)` on
 stderr once, then `bd agents watch: working again`, and are retried (after
 pauses growing to 30 s in a remote workspace); only a refused token ends it
 (exit 7). Ctrl-C exits 0 once a pull under way is done; a second one exits
-130 at once. For long agent sessions with a trusted server
-([Trust](#trust)), run it in a separate terminal: the session-start hook
-pulls only at session start.
+130 at once. For long agent sessions, run it in a separate terminal: the
+session-start hook pulls only at session start.
 
-## Approving MCP definitions
+## Approving skills and MCP definitions
 
 A stdio MCP definition is a command that every client runs, with the
-user's privileges, so a pull never writes a new or changed one: it waits
-until a person approves it. Skills, which can run commands too, are not
-gated this way ([Trust](#trust)). The harnesses' own checks do not cover this:
-Claude Code approves `.mcp.json` servers by name (a changed command under
-an approved name passes) and skips the prompt in `-p` and SDK runs, and
-Copilot CLI only checks folder trust.
+user's privileges, and a skill can run commands too ([Trust](#trust)), so a
+pull never writes a new or changed one: it waits until a person approves
+it. The harnesses' own checks do not cover this: Claude Code approves
+`.mcp.json` servers by name (a changed command under an approved name
+passes) and skips the prompt in `-p` and SDK runs, runs a project skill's
+`!` commands without asking, and Copilot CLI only checks folder trust.
 
 `bd agents approve [NAME...] [--harness ...] [--full]` shows each waiting
-definition on stderr and asks `Approve <name>? [y/N]` on the terminal:
+skill, then each waiting MCP definition, on stderr, and asks `Approve skill
+<name>? [y/N]` or `Approve MCP server <name>? [y/N]` on the terminal. NAME
+picks skills and MCP servers by name. A skill is shown file by file: a new
+file in full, a changed one as a diff against the file here (three lines
+of context), a file only made executable in full, each line behind a `+ `,
+`- ` or `  ` gutter:
+
+```
+claude: skill deploy: new, to be added to .claude/skills/deploy
+  SKILL.md: new
+    + ---
+    + name: deploy
+    + description: Deploy the app
+    + ---
+    + Run `scripts/run.sh`.
+  scripts/run.sh: new, executable
+    + #!/bin/sh
+    + make deploy
+  skill deploy: SKILL.md (new), scripts/run.sh (new, executable)
+Approve skill deploy? [y/N] y
+
+claude: approved skill deploy: written to .claude/skills/deploy
+claude: to load the skills, run `/reload-skills` in Claude Code if .claude/skills did not exist when the session started
+```
+
+```
+claude: skill deploy: changed, in .claude/skills/deploy
+  SKILL.md: changed
+    @@ -2,4 +2,4 @@
+      name: deploy
+      description: Deploy the app
+      ---
+    - Run `scripts/run.sh`.
+    + Run `scripts/run.sh --prod`.
+  skill deploy: SKILL.md (changed)
+Approve skill deploy? [y/N]
+```
+
+The files of a skill are listed again, with their change, right before its
+prompt, and a file edited here carries a warning that approving replaces
+the edit. As for definitions, nothing is printed as the server sent it:
+control characters, bidirectional and other invisible formatting
+characters (Unicode format characters, tag characters, variation
+selectors) are escaped, so no line can fake another, move the cursor or reorder what
+is shown; a file shows at most 200 lines and each line at most 400
+characters, with a note (`--full` shows them whole). A skill is approved
+or declined whole; files the server removed from it are deleted at the
+next pull, with no approval. An MCP definition is shown so:
 
 ```
 claude: MCP server github: new, to be added to .mcp.json
@@ -337,10 +408,10 @@ claude: MCP server github: new, to be added to .mcp.json
     }
   reads environment variables: GITHUB_TOKEN (unset here)
   runs on this machine: npx -y @modelcontextprotocol/server-github
-Approve github? [y/N] y
+Approve MCP server github? [y/N] y
 
-claude: approved github: written to .mcp.json
-claude: to load them, restart the Claude Code session; Claude Code may also ask to approve new .mcp.json servers itself
+claude: approved MCP server github: written to .mcp.json
+claude: to load the MCP servers, restart the Claude Code session; Claude Code may also ask to approve new .mcp.json servers itself
 ```
 
 Each entry shows what it runs (`runs on this machine: <command args>`) or
@@ -358,28 +429,32 @@ characters and arrays or tables over 100 items are cut short with a note
 characters).
 
 Once every answer is in, approve takes the checkout's mutex and writes
-exactly the definitions shown, recording them in `.bd/agents.lock`. It
-skips an entry whose place in the MCP file or the lock changed since it was
-shown, and never replaces an entry bd did not write (a conflict): remove or
-rename the local entry, then pull and approve again. A definition that
-changes again on the server before approval is shown in its newest version;
-an approved one is not asked about again until it changes.
+exactly the skill files and definitions shown, recording them in
+`.bd/agents.lock`. It skips a skill whose files here or in the lock
+changed since it was shown, and an entry whose place in the MCP file or
+the lock changed, and never replaces a file or entry bd did not write (a
+conflict): move it away, then pull and approve again. A skill with a
+removal still to apply is skipped until a pull applies it. Where the file
+system keeps no executable bit, approve says so (`not executable here`). A
+skill or definition that changes again on the server before approval is
+shown in its newest version; an approved one is not asked about again
+until it changes. A harness with nothing waiting says `nothing waiting for
+approval`.
 
 `approve` refuses to run inside an agent session (`$CLAUDE_CODE_SESSION_ID`,
 `$COPILOT_AGENT_SESSION_ID`, `$CODEX_THREAD_ID` or `$CODEX_SESSION_ID` set)
 and, when there is something to ask about, without a terminal on stdin
 (exit 2), with no flag or variable to get past either. That keeps agents
 from approving by accident; it is not a security boundary, since an agent
-with a shell can edit the MCP files directly. Agents are told to ask the
+with a shell can edit the skill and MCP files directly. Agents are told to ask the
 user to run `bd agents approve` in a separate terminal.
 
 ## Session-start hooks
 
 `bd hook session-start --harness <claude|codex|copilot>` pulls the
 harness's set at the start of each agent session, with pull semantics
-(skills added, updated, removed or restored; MCP removals and restores of
-approved definitions applied; new and changed MCP definitions only
-reported), and tells the session what changed, in the format the harness
+(removals and restores of approved skills and MCP definitions applied; new
+and changed skills and MCP definitions only reported), and tells the session what changed, in the format the harness
 reads: plain text for Claude Code and Codex, one `{"additionalContext":
 "..."}` JSON object for Copilot CLI. Without `--harness` it takes the
 session's harness from its session variable, else the lock's harnesses
@@ -389,23 +464,23 @@ directory, the `cwd` of the hook's JSON input on stdin (`-C` wins), as
 Copilot CLI runs a plugin's hooks in the plugin's own directory. `bd prime
 --hook <harness>` does the same for the prime text: Copilot CLI gets it as
 one JSON object (it drops plain text), Claude Code and Codex as plain text.
-The skills it applies run in the session that starts, unreviewed: enable it
-only for a server trusted like the repository's own code ([Trust](#trust)).
+The skills it restores run in the session that starts, as approved before.
 
 It says nothing when nothing changed, outside a checkout, and with no
 harness known; a session start with nothing served writes nothing (no lock,
 no mutex file). Otherwise each line starts with `bd:`:
 
 ```
-bd: agent skills updated from the bd server: deploy (updated), triage (added).
+bd: agent skills updated from the bd server: deploy (restored), old (removed).
 bd: if these skills are not available yet, ask the user to run `/reload-skills`.
+bd: agent skills changed on the bd server and not applied: lint (new), triage (changed: SKILL.md). Ask the user to review them and run `bd agents approve` in a separate terminal.
 bd: MCP server definitions applied to .mcp.json: old (removed). Ask the user to restart Claude Code to apply the change.
 bd: MCP server definitions changed on the bd server and not applied: github (changed: args), linear (new). Ask the user to review them and run `bd agents approve` in a separate terminal.
 bd: 1 agent asset conflict (files or MCP entries in the way, left as they are): `bd agents status` lists it.
 bd: environment variables the MCP servers read are unset: LINEAR_KEY.
 ```
 
-Pending MCP changes and conflicts are repeated at every session start
+Pending skills, pending MCP changes and conflicts are repeated at every session start
 until resolved. A problem (the server unreachable or stalling, the token
 missing or refused, the checkout's mutex busy, an invalid set or lock) is
 one line, `bd: agent skills and MCP definitions not checked: <reason>`, and

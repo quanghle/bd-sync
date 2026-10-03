@@ -3,11 +3,12 @@
 //! session needs to know, in a few lines of context.
 //!
 //! It is a pull ([`super::sync`]) for the harness running the hook (or the
-//! session's, or those `.bd/agents.lock` records): skills are added,
-//! updated, removed and restored, and MCP entries the server removed go
-//! (removals add nothing that runs), while new and changed MCP definitions
-//! are only reported, for the user to approve with `bd agents approve` in
-//! a separate terminal. It never approves, prompts or reads the terminal.
+//! session's, or those `.bd/agents.lock` records): skill files and MCP
+//! entries the server removed go, and those deleted here are restored as
+//! approved (none of which adds anything that runs), while new and changed
+//! skills and MCP definitions are only reported, for the user to approve
+//! with `bd agents approve` in a separate terminal. It never approves,
+//! prompts or reads the terminal.
 //!
 //! It says nothing when nothing changed, outside a checkout, and when no
 //! harness is known. A problem (the server unreachable or stalling, the
@@ -91,7 +92,7 @@ fn check(app: &App, requested: Option<Harness>) -> Result<Vec<String>> {
     let remote = if remote { remote::detect(app)?.map(|r| r.quick().within(server)) } else { None };
     let skills_dir = |h: Harness| under(&checkout.root, h.skills_dest());
     let absent: Vec<Harness> = harnesses.iter().copied().filter(|&h| !skills_dir(h).exists()).collect();
-    let opts = Options { apply: true, force: false, lock_wait };
+    let opts = Options { apply: true, force: false, review: false, lock_wait };
     let report = super::sync_checkout(app, remote.as_ref(), &checkout, &harnesses, opts)?;
     let source = if remote.is_some() { Source::Server } else { Source::Workspace };
     Ok(lines(&report, source, |h| absent.contains(&h) && skills_dir(h).is_dir()))
@@ -149,6 +150,15 @@ fn harness_lines(h: Harness, r: &HarnessReport, tag: &str, source: Source, creat
             m.file,
             applied.join(", "),
             mcp_reload(h)
+        ));
+    }
+    if !s.pending.is_empty() {
+        let skills: Vec<String> = s.pending.iter().map(|(name, p)| format!("{name} ({})", p.summary())).collect();
+        lines.push(format!(
+            "bd: {tag}agent skills changed {} and not applied: {}. Ask the user to review them and run `bd agents \
+             approve` in a separate terminal.",
+            source.on(),
+            skills.join(", ")
         ));
     }
     if !m.pending.is_empty() {
@@ -238,7 +248,7 @@ fn mcp_reload(h: Harness) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agents::sync::{Conflict, McpConflict, Pending};
+    use crate::agents::sync::{Conflict, McpConflict, Pending, PendingFile, PendingFileChange, PendingSkill};
 
     #[test]
     fn the_server_and_the_mutex_share_what_is_left_of_the_hooks_time() {
@@ -296,6 +306,13 @@ mod tests {
             local: None,
         });
         r.skills.conflicts.push(Conflict { skill: "x".into(), path: "p".into(), reason: "r".into() });
+        let files = vec![PendingFile::example("lint", "SKILL.md", PendingFileChange::New, false, false)];
+        r.skills.pending.insert("lint".into(), PendingSkill { change: PendingChange::New, files });
+        let files = vec![
+            PendingFile::example("release", "SKILL.md", PendingFileChange::Changed, false, true),
+            PendingFile::example("release", "run.sh", PendingFileChange::Executable, true, false),
+        ];
+        r.skills.pending.insert("release".into(), PendingSkill { change: PendingChange::Changed, files });
         assert_eq!(
             lines(&report(vec![(Harness::Copilot, r)]), Source::Server, |_| false),
             [
@@ -304,6 +321,9 @@ mod tests {
                  these in this session.",
                 "bd: MCP server definitions applied to .github/mcp.json: old (removed). Ask the user to run `/mcp \
                  reload` to apply the change.",
+                "bd: agent skills changed on the bd server and not applied: lint (new), release (changed: SKILL.md, \
+                 run.sh made executable; edited here). Ask the user to review them and run `bd agents approve` in a \
+                 separate terminal.",
                 "bd: MCP server definitions changed on the bd server and not applied: github (changed: args, env; \
                  edited here), linear (new). Ask the user to review them and run `bd agents approve` in a separate \
                  terminal.",

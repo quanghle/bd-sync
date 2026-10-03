@@ -27,8 +27,8 @@
 //! differs from the one last pulled.
 //!
 //! Each pull is `bd agents pull`'s ([`super::sync_checkout`], applying):
-//! skills written, MCP removals applied, new or changed MCP definitions
-//! left waiting for `bd agents approve`, which this never runs. The
+//! removals applied, new or changed skills and MCP definitions left
+//! waiting for `bd agents approve`, which this never runs. The
 //! checkout's mutex is held only while a pull writes, so session hooks and
 //! other bd commands in the checkout run meanwhile. Each pull's report is
 //! printed as `pull` prints it (with `--json`, as one line).
@@ -212,7 +212,12 @@ impl Watch<'_> {
     /// Pull as `bd agents pull` does, and print its report.
     fn pull(&mut self) -> Result<()> {
         let _pulling = lock(&self.pulling);
-        let opts = Options { apply: true, force: false, lock_wait: Duration::from_millis(self.app.g.busy_timeout_ms) };
+        let opts = Options {
+            apply: true,
+            force: false,
+            review: false,
+            lock_wait: Duration::from_millis(self.app.g.busy_timeout_ms),
+        };
         let report = super::sync_checkout(self.app, self.remote, &self.checkout, &self.harnesses, opts)?;
         if self.app.g.json {
             io::outln(serde_json::to_string(&report)?);

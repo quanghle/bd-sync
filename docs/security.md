@@ -110,15 +110,19 @@ Sign-in lets people get their own tokens, under rules in `<root>/auth.toml`
 A workspace can serve skills and MCP server definitions to agent harnesses
 ([Agent skills and MCP definitions](agents.md)).
 
-- **Skills are code.** They can run commands, register hooks and pre-approve
-  tools, and bd applies them without review (pulls, the session-start hook,
-  `bd agents watch`). Guard `.bd/agents` on the server like a code
-  deployment, and enable the hook and watch only for a server trusted like
-  the repository's own code ([Trust](agents.md#trust)).
-- **MCP definitions wait for a person.** A pull, hook or watch never writes
-  a new or changed one; `bd agents approve` shows each and asks on a
-  terminal, and refuses agent sessions and non-terminals with no bypass
-  ([Approving MCP definitions](agents.md#approving-mcp-definitions)).
+- **Skills and MCP definitions wait for a person.** Skills are code: they
+  can run commands, register hooks and pre-approve tools, as an MCP
+  definition runs a command. A pull, hook or watch never writes a new or
+  changed skill file, executable bit or MCP definition; `bd agents approve`
+  shows each skill file by file (in full, or as a diff) and each
+  definition, asks on a terminal, and refuses agent sessions and
+  non-terminals with no bypass ([Approving skills and MCP
+  definitions](agents.md#approving-skills-and-mcp-definitions)). A client
+  records only hashes it checked against the texts they name, never a
+  manifest's word for them, and writes without approval only the very
+  bytes approved, line endings included. Guard
+  `.bd/agents` on the server like a code deployment all the same
+  ([Trust](agents.md#trust)).
 - **No secrets on the server.** MCP servers run and authenticate on the
   client; bd never handles MCP credentials.
 - **Strict sets.** Sets are validated on the server and again by clients

@@ -3850,34 +3850,60 @@ fn agents_pull_and_status_place_the_servers_sets_in_client_checkouts() {
     let status = alice.json(&["agents", "status", "--harness", "claude"]);
     assert_eq!(status["applied"], false);
     let claude = &status["harnesses"]["claude"];
-    assert_eq!(claude["skills"]["changed"], json!({"deploy": "added"}));
+    assert_eq!(claude["skills"]["changed"], json!({}));
+    assert_eq!(claude["skills"]["pending"]["deploy"]["change"], "new", "{status}");
     assert_eq!(claude["mcp"]["pending"], json!([{"name": "github", "change": "new", "fields": [], "edited": false}]));
     assert!(!alice.dir.path().join(".claude").exists(), "status writes nothing");
 
     let text = alice.ok(&["agents", "pull", "--harness", "claude"]);
-    assert!(text.starts_with("claude: skills added: deploy\nclaude: MCP github new: not applied"), "{text}");
+    assert!(
+        text.starts_with(
+            "claude: skills waiting for approval: deploy (new): not applied; review and approve with `bd \
+                          agents approve` in a terminal\nclaude: MCP github new: not applied"
+        ),
+        "{text}"
+    );
     let deploy = alice.dir.path().join(".claude/skills/deploy");
-    assert_eq!(std::fs::read_to_string(deploy.join("SKILL.md")).unwrap(), "---\nname: deploy\n---\nDeploy.\n");
-    assert!(deploy.join("scripts/run.sh").is_file());
-    assert!(!alice.dir.path().join(".mcp.json").exists(), "MCP definitions wait for approval");
+    assert!(!deploy.exists() && !alice.dir.path().join(".mcp.json").exists(), "both wait for approval");
     assert!(!alice.dir.path().join(".agents").exists(), "only the harness asked for");
     assert!(!server.root.path().join("proj").join(".claude").exists(), "nothing is written on the server");
     let lock: Value =
         serde_json::from_str(&std::fs::read_to_string(alice.dir.path().join(".bd/agents.lock")).unwrap()).unwrap();
     assert_eq!(lock["harnesses"]["claude"]["revision"], claude["server_revision"]);
 
+    // Approved on the client, from the texts the server serves.
+    #[cfg(target_os = "linux")]
+    {
+        let mut t = pty::Terminal::spawn(alice.cmd(&["agents", "approve", "--harness", "claude"]));
+        let shown = t.expect("Approve skill deploy? [y/N] ");
+        assert!(shown.starts_with("claude: skill deploy: new, to be added to .claude/skills/deploy\n"), "{shown}");
+        assert!(shown.contains("    + Deploy.\n"), "{shown}");
+        t.answer("y");
+        t.expect("Approve MCP server github? [y/N] ");
+        t.answer("n");
+        let (out, shown) = t.finish();
+        assert!(out.status.success(), "{shown}");
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.starts_with("claude: approved skill deploy: written to .claude/skills/deploy\n"), "{text}");
+        assert_eq!(std::fs::read_to_string(deploy.join("SKILL.md")).unwrap(), "---\nname: deploy\n---\nDeploy.\n");
+        assert!(deploy.join("scripts/run.sh").is_file());
+        assert!(!alice.dir.path().join(".mcp.json").exists(), "declined");
+    }
+
     // Another checkout, another harness.
     let pulled = bob.json(&["agents", "pull", "--harness", "codex"]);
-    assert_eq!(pulled["harnesses"]["codex"]["skills"]["changed"], json!({"triage": "added"}));
-    assert!(bob.dir.path().join(".agents/skills/triage/SKILL.md").is_file());
-    assert!(!bob.dir.path().join(".claude").exists());
+    assert_eq!(pulled["harnesses"]["codex"]["skills"]["pending"]["triage"]["change"], "new", "{pulled}");
+    assert!(!bob.dir.path().join(".agents").exists() && !bob.dir.path().join(".claude").exists());
 
     // An edit on the server reaches the next pull; without one, a pull changes nothing.
     write(&agents, "claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nDeploy, v2.\n");
     let pulled = alice.json(&["agents", "pull"]);
     assert_eq!(pulled["harnesses"].as_object().unwrap().keys().collect::<Vec<_>>(), ["claude"], "from the lock");
-    assert_eq!(pulled["harnesses"]["claude"]["skills"]["changed"], json!({"deploy": "updated"}));
-    assert_eq!(std::fs::read_to_string(deploy.join("SKILL.md")).unwrap(), "---\nname: deploy\n---\nDeploy, v2.\n");
+    let deploy_now = &pulled["harnesses"]["claude"]["skills"]["pending"]["deploy"];
+    #[cfg(target_os = "linux")]
+    assert_eq!(deploy_now["change"], "changed", "{pulled}");
+    #[cfg(not(target_os = "linux"))]
+    assert_eq!(deploy_now["change"], "new", "{pulled}");
     let again = alice.json(&["agents", "pull"]);
     assert_eq!(again["harnesses"]["claude"]["skills"]["changed"], json!({}));
 
@@ -3891,8 +3917,9 @@ fn agents_pull_and_status_place_the_servers_sets_in_client_checkouts() {
     let out =
         bd(&deep).env("XDG_CONFIG_HOME", &config).args(["agents", "pull", "--harness", "codex"]).output().unwrap();
     check(out, "pull from below the checkout's root");
-    assert!(repo.path().join(".agents/skills/triage/SKILL.md").is_file());
-    assert!(!deep.join(".agents").exists());
+    let lock = std::fs::read_to_string(repo.path().join(".bd/agents.lock")).unwrap();
+    assert!(lock.contains("\"codex\""), "{lock}");
+    assert!(!deep.join(".bd").exists() && !deep.join(".agents").exists());
 
     // bd serve never runs them: they write into the client's checkout.
     for argv in [json!(["agents", "pull", "--harness", "claude"]), json!(["agents", "status"])] {
@@ -3966,7 +3993,7 @@ fn agents_approve_runs_on_the_client_with_a_read_token() {
         "does not run inside an agent session ($COPILOT_AGENT_SESSION_ID set)",
     );
     refused(alice.run(&approve), "runs only in a terminal (stdin is not one)");
-    refused(alice.run(&["agents", "approve", "nosuch", "--harness", "claude"]), "no MCP server named nosuch");
+    refused(alice.run(&["agents", "approve", "nosuch", "--harness", "claude"]), "no skill or MCP server named nosuch");
     // bd serve never runs it: it writes into the client's checkout.
     let (status, r) = post(&alice.url, &token, &json!({ "argv": approve }));
     assert_eq!((status, r["exit_code"].as_i64()), (200, Some(2)), "{r}");
@@ -3976,17 +4003,20 @@ fn agents_approve_runs_on_the_client_with_a_read_token() {
     #[cfg(target_os = "linux")]
     {
         let mut t = pty::Terminal::spawn(alice.cmd(&approve));
-        let shown = t.expect("Approve github? [y/N] ");
+        let shown = t.expect("Approve MCP server github? [y/N] ");
         assert!(shown.contains("claude: MCP server github: new, to be added to .mcp.json\n"), "{shown}");
         assert!(shown.contains("  runs on this machine: npx -y server-github\n"), "{shown}");
         t.answer("y");
         let (out, shown) = t.finish();
         assert!(out.status.success(), "{shown}");
-        assert!(String::from_utf8_lossy(&out.stdout).starts_with("claude: approved github: written to .mcp.json\n"));
+        assert!(
+            String::from_utf8_lossy(&out.stdout)
+                .starts_with("claude: approved MCP server github: written to .mcp.json\n")
+        );
         let file: Value =
             serde_json::from_str(&std::fs::read_to_string(alice.dir.path().join(".mcp.json")).unwrap()).unwrap();
         assert_eq!(file, json!({"mcpServers": {"github": {"command": "npx", "args": ["-y", "server-github"]}}}));
-        assert_eq!(alice.ok(&["agents", "approve"]), "claude: no MCP changes waiting for approval\n");
+        assert_eq!(alice.ok(&["agents", "approve"]), "claude: nothing waiting for approval\n");
         let status = alice.json(&["agents", "status"]);
         assert_eq!(status["harnesses"]["claude"]["mcp"]["pending"], json!([]));
     }
@@ -4031,23 +4061,32 @@ fn session_start_hook_pulls_the_servers_skills_and_reports_its_mcp_changes() {
     let alice = server.client(&token);
     std::fs::create_dir(alice.dir.path().join(".bd")).unwrap();
 
-    let pending = "bd: MCP server definitions changed on the bd server and not applied: github (new). Ask the user \
-                   to review them and run `bd agents approve` in a separate terminal.";
-    assert_eq!(
-        copilot_context(&session_start(&alice, "copilot")).unwrap(),
+    let waiting = |what: &str| {
         format!(
-            "bd: agent skills updated from the bd server: triage (added).\nbd: Copilot CLI read its skills before \
-             this hook ran: ask the user to run `/skills reload` to use these in this session.\n{pending}"
+            "bd: agent skills changed on the bd server and not applied: {what}. Ask the user to review them and run \
+             `bd agents approve` in a separate terminal."
         )
+    };
+    let pending = format!(
+        "{}\nbd: MCP server definitions changed on the bd server and not applied: github (new). Ask the user to \
+         review them and run `bd agents approve` in a separate terminal.",
+        waiting("triage (new)")
     );
-    assert!(alice.dir.path().join(".github/skills/triage/SKILL.md").is_file());
-    assert!(!alice.dir.path().join(".github/mcp.json").exists(), "MCP definitions wait for approval");
-    assert_eq!(copilot_context(&session_start(&alice, "copilot")).unwrap(), pending);
+    for _ in 0..2 {
+        assert_eq!(copilot_context(&session_start(&alice, "copilot")).unwrap(), pending);
+        assert!(!alice.dir.path().join(".github").exists(), "skills and MCP definitions wait for approval");
+    }
 
+    assert_eq!(session_start(&alice, "claude"), format!("{}\n", waiting("deploy (new)")));
+    // Here as the server has it: adopted; deleted here, restored from the server's text.
+    let skill = alice.dir.path().join(".claude/skills/deploy/SKILL.md");
+    write(alice.dir.path(), ".claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nDeploy.\n");
+    assert_eq!(session_start(&alice, "claude"), "", "adopted: nothing said");
+    std::fs::remove_dir_all(alice.dir.path().join(".claude/skills")).unwrap();
     let text = session_start(&alice, "claude");
-    assert!(text.starts_with("bd: agent skills updated from the bd server: deploy (added).\n"), "{text}");
+    assert!(text.starts_with("bd: agent skills updated from the bd server: deploy (restored).\n"), "{text}");
     assert_eq!(text.lines().count(), 2, "{text}");
-    assert!(alice.dir.path().join(".claude/skills/deploy/SKILL.md").is_file());
+    assert_eq!(std::fs::read_to_string(&skill).unwrap(), "---\nname: deploy\n---\nDeploy.\n");
     assert_eq!(session_start(&alice, "claude"), "", "nothing changed: nothing said");
     assert_eq!(session_start(&alice, "codex"), "", "nothing served");
     assert!(!alice.dir.path().join(".agents").exists());
@@ -4065,7 +4104,10 @@ fn session_start_hook_pulls_the_servers_skills_and_reports_its_mcp_changes() {
     login_in(repo.path(), &config, &token);
     let input = json!({ "sessionId": "s1", "timestamp": 1, "cwd": repo.path(), "source": "new" }).to_string();
     for (args, want) in [
-        (&["hook", "session-start", "--harness", "copilot"][..], "bd: agent skills updated from the bd server: triage"),
+        (
+            &["hook", "session-start", "--harness", "copilot"][..],
+            "bd: agent skills changed on the bd server and not applied: triage",
+        ),
         (&["prime", "--hook", "copilot"], "# bd workflow context\nWorkspace "),
     ] {
         let mut cmd = bd(plugin.path());
@@ -4074,8 +4116,8 @@ fn session_start_hook_pulls_the_servers_skills_and_reports_its_mcp_changes() {
         let context = copilot_context(&check(out, &format!("{args:?}"))).unwrap();
         assert!(context.starts_with(want), "{args:?}: {context}");
     }
-    assert!(repo.path().join(".github/skills/triage/SKILL.md").is_file());
-    assert!(!plugin.path().join(".github").exists());
+    assert!(repo.path().join(".bd/agents.lock").is_file());
+    assert!(!plugin.path().join(".bd").exists() && !plugin.path().join(".github").exists());
 }
 
 #[test]
@@ -4383,15 +4425,22 @@ fn agents_watch_pulls_the_servers_changes_as_they_happen() {
     std::fs::create_dir(alice.dir.path().join(".bd")).unwrap();
     let skill = alice.dir.path().join(".claude/skills/deploy/SKILL.md");
 
+    let waiting = |what: &str| {
+        format!(
+            "claude: skills waiting for approval: {what}: not applied; review and approve with `bd agents approve` in \
+             a terminal"
+        )
+    };
     let mut watch = Watcher::start(alice.cmd(&["agents", "watch", "--harness", "claude", "--interval", "200ms"]));
-    assert_eq!(watch.line(), "claude: skills added: deploy", "the first pull");
-    assert_eq!(std::fs::read_to_string(&skill).unwrap(), "---\nname: deploy\n---\nv1\n");
+    assert_eq!(watch.line(), waiting("deploy (new)"), "the first pull");
+    assert!(!skill.exists());
 
+    // Written here as the server has it: adopted.
+    write(alice.dir.path(), ".claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nv2\n");
     put(&agents, "claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nv2\n");
-    assert_eq!(watch.line(), "claude: skills updated: deploy");
-    assert_eq!(std::fs::read_to_string(&skill).unwrap(), "---\nname: deploy\n---\nv2\n");
+    assert_eq!(watch.line(), "claude: up to date");
 
-    // MCP definitions still wait for approval.
+    // MCP definitions wait for approval too.
     put(&agents, "claude/mcp.json", r#"{"mcpServers": {"github": {"command": "npx", "args": ["-y", "gh"]}}}"#);
     assert_eq!(
         watch.line(),
@@ -4403,13 +4452,12 @@ fn agents_watch_pulls_the_servers_changes_as_they_happen() {
     put(&agents, "codex/mcp.toml", "[mcp_servers.docs]\nurl = \"https://example.com/mcp\"\n");
     eventually("the codex set's event", || agents_changes(&alice).iter().any(|e| e["data"]["harness"] == "codex"));
     put(&agents, "claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nv3\n");
-    let line = watch.line();
-    assert!(line.starts_with("claude: skills updated: deploy"), "{line}");
+    assert_eq!(watch.line(), waiting("deploy (changed: SKILL.md)"));
     assert_eq!(
         watch.line(),
         "claude: MCP github new: not applied; review and approve with `bd agents approve` in a terminal"
     );
-    assert_eq!(std::fs::read_to_string(&skill).unwrap(), "---\nname: deploy\n---\nv3\n");
+    assert_eq!(std::fs::read_to_string(&skill).unwrap(), "---\nname: deploy\n---\nv2\n");
     assert!(!alice.dir.path().join(".agents").exists() && !alice.dir.path().join(".codex").exists());
     assert!(watch.err.try_recv().is_err(), "nothing went wrong");
 
@@ -4460,9 +4508,9 @@ fn agents_watch_rides_out_an_unreachable_server_and_stops_on_a_refused_token() {
     stop.store(true, Ordering::SeqCst);
     closer.join().unwrap();
     let server = Server::launch(root, &format!("127.0.0.1:{port}"), &["--agents-every", "100ms"]);
-    assert_eq!(watch.line(), "claude: skills added: deploy");
+    assert!(watch.line().starts_with("claude: skills waiting for approval: deploy (new): not applied"));
     assert_eq!(watch.err_line(), "bd agents watch: working again");
-    assert!(client.dir.path().join(".claude/skills/deploy/SKILL.md").is_file());
+    assert!(client.dir.path().join(".bd/agents.lock").is_file());
 
     // A refused token ends it, with its exit code.
     let refused = server.client("bdt_not_a_token");
@@ -4524,13 +4572,14 @@ fn agents_watch_catches_up_on_changes_no_event_announced() {
     let alice = server.client(&server.token("laptops", "alice", &["--role", "read"]));
     std::fs::create_dir(alice.dir.path().join(".bd")).unwrap();
     let skill = alice.dir.path().join(".claude/skills/deploy/SKILL.md");
+    write(alice.dir.path(), ".claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nv1\n");
     let mut watch = Watcher::start(alice.cmd(&["agents", "watch", "--harness", "claude", "--interval", "200ms"]));
-    assert_eq!(watch.line(), "claude: skills added: deploy");
+    assert_eq!(watch.line(), "claude: up to date", "adopted");
 
     // Changed with no event (or changed back between two runs of the job): pulled after a wait.
     put(&agents, "claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nv2\n");
-    assert_eq!(watch.line(), "claude: skills updated: deploy");
-    assert_eq!(std::fs::read_to_string(&skill).unwrap(), "---\nname: deploy\n---\nv2\n");
+    assert!(watch.line().starts_with("claude: skills waiting for approval: deploy (changed: SKILL.md): "));
+    assert_eq!(std::fs::read_to_string(&skill).unwrap(), "---\nname: deploy\n---\nv1\n");
     assert!(agents_changes(&alice).is_empty(), "no event announced it");
     assert!(watch.err.try_recv().is_err());
 }

@@ -1,42 +1,53 @@
-//! `bd agents approve`: the user's review of the new and changed MCP server
-//! definitions that `status` and `pull` leave waiting.
+//! `bd agents approve`: the user's review of the new and changed skills and
+//! MCP server definitions that `status` and `pull` leave waiting.
 //!
 //! What waits is worked out as `status` does ([`sync::run`] without
-//! applying). Each entry is shown on stderr and asked about on the terminal
-//! ([`entry_lines`], [`approves`]). Nothing the server sent is printed as
-//! sent: [`show`] renders each definition from its JSON form, every value
-//! on one line with whatever could fake or hide text escaped, and what the
-//! entry runs is shown again right before its prompt. Once every answer is in, the approved
-//! entries are written exactly as shown ([`sync::apply_approved`]), and any
-//! whose place in the MCP file or `.bd/agents.lock` changed in between is
-//! skipped. The checkout's mutex is taken only for that write, never while
-//! a person reads and answers, so session hooks and pulls go on meanwhile.
+//! applying, with [`Options::review`] for the skills' texts). Each skill
+//! and entry is shown on stderr and asked about on the terminal
+//! ([`skill_lines`], [`entry_lines`], [`approves`]). Nothing the server sent
+//! is printed as sent: a skill's files are shown line by line (new ones
+//! whole, changed ones as a diff against the file here) behind a gutter,
+//! with whatever could fake or hide text escaped, and [`show`] renders each
+//! MCP definition from its JSON form, every value on one line. What a skill
+//! changes, and what an entry runs, is shown again right before its prompt.
+//! Once every answer is in, what was approved is written exactly as shown
+//! ([`sync::apply_approved`]), and a skill or entry whose files, place in
+//! the MCP file or `.bd/agents.lock` changed in between is skipped. The
+//! checkout's mutex is taken only for that write, never while a person
+//! reads and answers, so session hooks and pulls go on meanwhile.
 //!
 //! It refuses to run inside an agent session and without a terminal on
 //! stdin, with no flag or variable to get past either, so that an agent
 //! does not approve by accident. That is not a security boundary: an agent
-//! with a shell can edit the MCP files itself.
+//! with a shell can edit the skill and MCP files itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bd_core::agents::{Harness, McpFormat, mcp_digest};
+use bd_core::agents::{Harness, McpFormat, mcp_digest, sha256_hex};
 use bd_core::{Error, Result};
 use serde::Serialize;
 use serde_json::Value;
+use similar::{ChangeTag, TextDiff};
 
-use super::checkout::Checkout;
+use super::checkout::{Checkout, Found};
 use super::lock::LockFile;
 use super::mcp_file::{McpFile, changed_fields, env_refs};
 use super::show;
-use super::sync::{self, Approval, McpConflict, McpReport, Options, Pending, PendingChange, Report};
+use super::sync::{
+    self, Approval, Approvals, McpConflict, McpReport, Options, Pending, PendingChange, PendingFile, PendingFileChange,
+    PendingSkill, Report, SkillApproval, SkillChange, SkillsReport,
+};
 use crate::actor;
 use crate::app::{App, Out};
 use crate::cli::AgentsApproveArgs;
 use crate::io;
 use crate::remote::Remote;
+
+/// Lines of a skill file shown, unless `--full`.
+const MAX_FILE_LINES: usize = 200;
 
 /// What `bd agents approve` did, printed with `--json` (see the [parent module](super)).
 #[derive(Debug, Serialize)]
@@ -47,6 +58,26 @@ pub struct Summary {
 
 #[derive(Debug, Serialize)]
 pub struct HarnessSummary {
+    pub skills: SkillsSummary,
+    pub mcp: McpSummary,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SkillsSummary {
+    /// The harness's skills directory, checkout-relative.
+    pub dir: String,
+    /// Written and recorded in `.bd/agents.lock`.
+    pub approved: Vec<String>,
+    /// Still waiting for approval.
+    pub declined: Vec<String>,
+    /// Not asked about or not written, with why.
+    pub skipped: Vec<Skipped>,
+    /// Files written whose executable bit the file system did not keep.
+    pub not_executable: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct McpSummary {
     /// The harness's MCP file, checkout-relative.
     pub file: String,
     /// Written and recorded in `.bd/agents.lock`.
@@ -71,14 +102,16 @@ pub fn cmd_approve(app: &App, remote: Option<&Remote>, a: &AgentsApproveArgs) ->
     let checkout = super::find_checkout(app, remote.is_some())?;
     let harnesses = super::harnesses(&a.harnesses, &checkout)?;
     let lock_wait = Duration::from_millis(app.g.busy_timeout_ms);
-    let opts = Options { apply: false, force: false, lock_wait };
+    let opts = Options { apply: false, force: false, review: true, lock_wait };
     let report = super::sync_checkout(app, remote, &checkout, &harnesses, opts)?;
     let mut review = Review::new(&checkout, report, &a.names)?;
     if review.asks() {
         // The process's own terminal: approve is machine-local (require_local above).
         if !std::io::stdin().is_terminal() {
             return Err(Error::Refused(
-                "bd agents approve asks about each MCP server and runs only in a terminal (stdin is not one)".into(),
+                "bd agents approve asks about each skill and MCP server and runs only in a terminal (stdin is not \
+                 one)"
+                    .into(),
             ));
         }
         review.ask(&mut std::io::stdin().lock(), &mut std::io::stderr(), &is_set, a.full);
@@ -100,8 +133,9 @@ fn refuse_in_agent_session(env: &dyn Fn(&str) -> Option<String>) -> Result<()> {
         return Ok(());
     }
     Err(Error::Refused(format!(
-        "bd agents approve does not run inside an agent session ({} set): approving the MCP servers a checkout runs \
-         is the user's decision. An agent should ask the user to run `bd agents approve` in a separate terminal",
+        "bd agents approve does not run inside an agent session ({} set): approving the skills and MCP servers a \
+         checkout runs is the user's decision. An agent should ask the user to run `bd agents approve` in a separate \
+         terminal",
         set.join(", ")
     )))
 }
@@ -117,15 +151,35 @@ pub fn approves(answer: &str) -> bool {
     answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
 }
 
-/// The entries to ask about per harness, and what is known already.
+/// Write `prompt` on `out` and read the answer from `input`. An empty line,
+/// anything but `y` or `yes`, a read error and the end of input decline.
+/// Write errors are ignored: the answer decides.
+fn ask_one(input: &mut dyn BufRead, out: &mut dyn Write, prompt: &str) -> bool {
+    let _ = write!(out, "{prompt} [y/N] ");
+    let _ = out.flush();
+    let mut answer = String::new();
+    let read = input.read_line(&mut answer);
+    if !matches!(read, Ok(n) if n > 0 && answer.ends_with('\n')) {
+        let _ = writeln!(out);
+    }
+    let _ = writeln!(out);
+    matches!(read, Ok(n) if n > 0) && approves(&answer)
+}
+
+/// What to ask about per harness, and what is known already.
 struct Review {
     checkout: PathBuf,
     harnesses: BTreeMap<Harness, HarnessReview>,
 }
 
 struct HarnessReview {
+    /// The skills to ask about, in order.
+    skills: Vec<SkillReview>,
+    /// The answers given, one per skill of `skills`.
+    skill_answers: Vec<bool>,
+    skills_skipped: Vec<Skipped>,
     file: String,
-    /// The entries to ask about, in order.
+    /// The MCP entries to ask about, in order.
     pending: Vec<Pending>,
     /// The answers given, one per entry of `pending`.
     answers: Vec<bool>,
@@ -133,10 +187,19 @@ struct HarnessReview {
     conflicts: Vec<McpConflict>,
 }
 
+/// A skill to ask about.
+struct SkillReview {
+    name: String,
+    skill: PendingSkill,
+    /// The text of each of its files here, if there is one: what a change is
+    /// shown against.
+    here: Vec<Option<String>>,
+}
+
 impl Review {
-    /// What to ask about, from a status `report`: every entry waiting for
-    /// approval, or only those of `names` (each of which must be served or
-    /// recorded for one of the harnesses).
+    /// What to ask about, from a status `report`: every skill and MCP entry
+    /// waiting for approval, or only those of `names` (each of which must be
+    /// a skill or MCP server served or recorded for one of the harnesses).
     fn new(checkout: &Checkout, report: Report, names: &[String]) -> Result<Review> {
         let lock = checkout.read_lock()?;
         let wanted: BTreeSet<&str> = names.iter().map(String::as_str).collect();
@@ -144,9 +207,12 @@ impl Review {
         let mut harnesses = BTreeMap::new();
         let asked: Vec<Harness> = report.harnesses.keys().copied().collect();
         for (h, r) in report.harnesses {
-            let mcp = r.mcp;
+            let (skills, mcp) = (r.skills, r.mcp);
             let file = McpFile::read(&checkout.root, h)?;
             let mut hr = HarnessReview {
+                skills: Vec::new(),
+                skill_answers: Vec::new(),
+                skills_skipped: Vec::new(),
                 file: mcp.file.clone(),
                 pending: Vec::new(),
                 answers: Vec::new(),
@@ -154,11 +220,26 @@ impl Review {
                 conflicts: Vec::new(),
             };
             for &name in &wanted {
+                if skills.pending.contains_key(name) {
+                    known.insert(name);
+                } else if let Some(reason) = skill_not_pending(h, name, &skills, &lock) {
+                    known.insert(name);
+                    hr.skills_skipped.push(Skipped { name: name.to_string(), reason });
+                }
                 if mcp.pending.iter().any(|p| p.name == name) {
                     known.insert(name);
                 } else if let Some(reason) = not_pending(h, name, &mcp, &lock) {
                     known.insert(name);
                     hr.skipped.push(Skipped { name: name.to_string(), reason });
+                }
+            }
+            for (name, skill) in skills.pending {
+                if !wanted.is_empty() && !wanted.contains(name.as_str()) {
+                    continue;
+                }
+                match review_skill(checkout, h, &name, &skill)? {
+                    Ok(here) => hr.skills.push(SkillReview { name, skill, here }),
+                    Err(reason) => hr.skills_skipped.push(Skipped { name, reason }),
                 }
             }
             for p in mcp.pending {
@@ -183,8 +264,8 @@ impl Review {
         if !unknown.is_empty() {
             let asked: Vec<&str> = asked.iter().map(|h| h.name()).collect();
             return Err(Error::invalid(format!(
-                "no MCP server named {} is served to {} or recorded in .bd/agents.lock (`bd agents status` lists \
-                 those waiting for approval)",
+                "no skill or MCP server named {} is served to {} or recorded in .bd/agents.lock (`bd agents status` \
+                 lists those waiting for approval)",
                 unknown.join(", "),
                 asked.join(" or ")
             )));
@@ -194,43 +275,44 @@ impl Review {
 
     /// Whether there is anything to ask about.
     fn asks(&self) -> bool {
-        self.harnesses.values().any(|hr| !hr.pending.is_empty())
+        self.harnesses.values().any(|hr| !hr.skills.is_empty() || !hr.pending.is_empty())
     }
 
-    /// Show each entry on `out` and read the answer to its prompt from
-    /// `input`. An empty line, anything but `y` or `yes`, a read error and
-    /// the end of input decline. Write errors are ignored: the answers decide.
+    /// Show each skill, then each MCP entry, on `out` and read the answer to
+    /// its prompt from `input` (see [`ask_one`]).
     fn ask(&mut self, input: &mut dyn BufRead, out: &mut dyn Write, is_set: &dyn Fn(&str) -> bool, full: bool) {
         for (&h, hr) in &mut self.harnesses {
+            for s in &hr.skills {
+                for line in skill_lines(h, &s.name, &s.skill, &s.here, full) {
+                    let _ = writeln!(out, "{line}");
+                }
+                hr.skill_answers.push(ask_one(input, out, &format!("Approve skill {}?", show::printable(&s.name))));
+            }
             for p in &hr.pending {
                 for line in entry_lines(h, p, is_set, full) {
                     let _ = writeln!(out, "{line}");
                 }
-                let _ = write!(out, "Approve {}? [y/N] ", p.name);
-                let _ = out.flush();
-                let mut answer = String::new();
-                let read = input.read_line(&mut answer);
-                if !matches!(read, Ok(n) if n > 0 && answer.ends_with('\n')) {
-                    let _ = writeln!(out);
-                }
-                hr.answers.push(matches!(read, Ok(n) if n > 0) && approves(&answer));
-                let _ = writeln!(out);
+                hr.answers.push(ask_one(input, out, &format!("Approve MCP server {}?", show::printable(&p.name))));
             }
         }
     }
 
-    /// Write the approved entries as they were shown (see [`sync::apply_approved`]).
+    /// Write what was approved as it was shown (see [`sync::apply_approved`]).
     fn write(self, checkout: &Checkout, lock_wait: Duration) -> Result<Summary> {
         let recorded: BTreeMap<Harness, Vec<Option<String>>> = self
             .harnesses
             .iter()
             .map(|(&h, hr)| (h, hr.pending.iter().map(|p| p.approved.as_ref().map(mcp_digest)).collect()))
             .collect();
-        let mut approvals: BTreeMap<Harness, Vec<Approval<'_>>> = BTreeMap::new();
+        let mut approvals: BTreeMap<Harness, Approvals<'_>> = BTreeMap::new();
         for (&h, hr) in &self.harnesses {
+            for (s, _) in hr.skills.iter().zip(&hr.skill_answers).filter(|(_, yes)| **yes) {
+                let approval = SkillApproval { name: &s.name, files: &s.skill.files };
+                approvals.entry(h).or_default().skills.push(approval);
+            }
             for ((p, &yes), recorded) in hr.pending.iter().zip(&hr.answers).zip(&recorded[&h]) {
                 let Some(server) = p.server.as_ref().filter(|_| yes) else { continue };
-                approvals.entry(h).or_default().push(Approval {
+                approvals.entry(h).or_default().mcp.push(Approval {
                     name: &p.name,
                     server,
                     local: p.local.as_deref(),
@@ -242,25 +324,87 @@ impl Review {
             if approvals.is_empty() { BTreeMap::new() } else { sync::apply_approved(checkout, &approvals, lock_wait)? };
         let mut harnesses = BTreeMap::new();
         for (h, hr) in self.harnesses {
-            let written = done.remove(&h).unwrap_or_default();
-            let declined = hr.pending.iter().zip(&hr.answers).filter(|(_, yes)| !**yes).map(|(p, _)| p.name.clone());
-            let mut skipped = hr.skipped;
-            skipped.extend(written.skipped.into_iter().map(|(name, reason)| Skipped { name, reason }));
-            let summary = HarnessSummary {
+            let done = done.remove(&h).unwrap_or_default();
+            let declined = |names: Vec<&String>, answers: &[bool]| -> Vec<String> {
+                names.into_iter().zip(answers).filter(|(_, yes)| !**yes).map(|(n, _)| n.clone()).collect()
+            };
+            let skipped = |mut skipped: Vec<Skipped>, more: Vec<(String, String)>| {
+                skipped.extend(more.into_iter().map(|(name, reason)| Skipped { name, reason }));
+                skipped
+            };
+            let skills = SkillsSummary {
+                dir: h.skills_dest().to_string(),
+                approved: done.skills.written,
+                declined: declined(hr.skills.iter().map(|s| &s.name).collect(), &hr.skill_answers),
+                skipped: skipped(hr.skills_skipped, done.skills.skipped),
+                not_executable: done.not_executable,
+            };
+            let mcp = McpSummary {
                 file: hr.file,
-                approved: written.written,
-                declined: declined.collect(),
-                skipped,
+                approved: done.mcp.written,
+                declined: declined(hr.pending.iter().map(|p| &p.name).collect(), &hr.answers),
+                skipped: skipped(hr.skipped, done.mcp.skipped),
                 conflicts: hr.conflicts,
             };
-            harnesses.insert(h, summary);
+            harnesses.insert(h, HarnessSummary { skills, mcp });
         }
         Ok(Summary { checkout: self.checkout, harnesses })
     }
 }
 
-/// Why `name`, which does not wait for approval for `h`, is not asked
+/// The text here of each of `skill`'s files, to show its changes against;
+/// or why it cannot be asked about.
+fn review_skill(
+    checkout: &Checkout,
+    h: Harness,
+    name: &str,
+    skill: &PendingSkill,
+) -> Result<std::result::Result<Vec<Option<String>>, String>> {
+    let mut here = Vec::new();
+    for f in &skill.files {
+        if f.blocked_by_removal {
+            return Ok(Err(format!(
+                "a file the server removed stands in the way of {}: run `bd agents pull`, then `bd agents approve` \
+                 again",
+                f.path
+            )));
+        }
+        if !f.mode_only && f.file.is_none() {
+            return Ok(Err("the server's files were not fetched; run `bd agents approve` again".into()));
+        }
+        let Found::File { sha256, .. } = &f.local else {
+            here.push(None);
+            continue;
+        };
+        match checkout.read_skill_file(h, name, &f.rel)? {
+            Some(bytes) if sha256_hex(&bytes) == *sha256 => here.push(Some(String::from_utf8_lossy(&bytes).into())),
+            _ => return Ok(Err("its files here changed while being read; run `bd agents approve` again".into())),
+        }
+    }
+    Ok(Ok(here))
+}
+
+/// Why skill `name`, which does not wait for approval for `h`, is not asked
 /// about; `None` if `h` neither serves nor records it.
+fn skill_not_pending(h: Harness, name: &str, skills: &SkillsReport, lock: &LockFile) -> Option<String> {
+    if let Some(c) = skills.conflicts.iter().find(|c| c.skill == name) {
+        return Some(format!("a conflict, not waiting for approval: {}: {}", c.path, c.reason));
+    }
+    if skills.changed.get(name) == Some(&SkillChange::Removed) {
+        return Some("removed from the server; `bd agents pull` removes it here".into());
+    }
+    let recorded = lock
+        .harnesses
+        .get(&h)
+        .is_some_and(|a| a.skills.keys().any(|path| super::lock::skill_of(h, path).is_some_and(|(n, _)| n == name)));
+    if recorded || skills.changed.contains_key(name) || skills.adopted.iter().any(|f| f.skill == name) {
+        return Some("approved already: nothing of it waits for approval".into());
+    }
+    None
+}
+
+/// Why MCP server `name`, which does not wait for approval for `h`, is not
+/// asked about; `None` if `h` neither serves nor records it.
 fn not_pending(h: Harness, name: &str, mcp: &McpReport, lock: &LockFile) -> Option<String> {
     if let Some(c) = mcp.conflicts.iter().find(|c| c.name.as_deref() == Some(name)) {
         return Some(format!("a conflict, not waiting for approval: {}", c.reason));
@@ -273,6 +417,107 @@ fn not_pending(h: Harness, name: &str, mcp: &McpReport, lock: &LockFile) -> Opti
         return Some("up to date: approved already, nothing waits for approval".into());
     }
     None
+}
+
+/// What the user is shown of pending skill `name` of `h` before being
+/// asked: each file waiting for approval, new ones whole and changed ones as
+/// a diff against `here` (the text of each file here, if any), a file that
+/// only becomes executable whole too; warnings for files edited here; and,
+/// on the last line, right before the prompt, what changes. Every line of a
+/// file is shown behind a gutter (`+`, `-` or a space) with whatever could
+/// hide text or leave its line escaped, and long lines and files are cut
+/// short unless `full`.
+pub fn skill_lines(h: Harness, name: &str, skill: &PendingSkill, here: &[Option<String>], full: bool) -> Vec<String> {
+    let dir = format!("{}/{name}", h.skills_dest());
+    let mut lines = vec![match skill.change {
+        PendingChange::New => format!("{h}: skill {name}: new, to be added to {dir}"),
+        PendingChange::Changed => format!("{h}: skill {name}: changed, in {dir}"),
+    }];
+    let mut changes = Vec::new();
+    for (f, here) in skill.files.iter().zip(here) {
+        let change = file_change(f);
+        lines.push(format!("  {}: {change}", f.rel));
+        lines.extend(file_lines(f, here.as_deref(), full).into_iter().map(|l| format!("    {l}")));
+        changes.push(format!("{} ({change})", f.rel));
+    }
+    for f in skill.files.iter().filter(|f| f.edited) {
+        lines.push(if f.mode_only {
+            format!(
+                "  warning: {} was edited here since bd wrote it; approving makes the edited file executable",
+                f.path
+            )
+        } else {
+            format!("  warning: {} was edited here since bd wrote it; approving replaces that edit", f.path)
+        });
+    }
+    lines.push(show::cap_line(format!("  skill {name}: {}", changes.join(", "))));
+    lines.iter().map(|l| show::printable(l)).collect()
+}
+
+/// How a pending file changes, in a few words.
+fn file_change(f: &PendingFile) -> String {
+    let mut words = vec![match f.change {
+        PendingFileChange::New => "new",
+        PendingFileChange::Changed => "changed",
+        PendingFileChange::Executable => "executable now",
+    }];
+    if f.executable && f.change != PendingFileChange::Executable {
+        words.push("executable");
+    }
+    if f.edited {
+        words.push("edited here");
+    }
+    words.join(", ")
+}
+
+/// The lines of a pending file shown: the text that becomes executable, a
+/// diff against the file here, or the new text.
+fn file_lines(f: &PendingFile, here: Option<&str>, full: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    match (here, f.file.as_ref()) {
+        (Some(text), _) if f.mode_only => out.extend(text.split_inclusive('\n').map(|l| content_line(' ', l, full))),
+        (Some(old), Some(new)) => diff_lines(old, &new.text, full, &mut out),
+        (None, Some(new)) => out.extend(new.text.split_inclusive('\n').map(|l| content_line('+', l, full))),
+        _ => {}
+    }
+    if out.is_empty() {
+        out.push("(empty)".into());
+    }
+    if !full && out.len() > MAX_FILE_LINES {
+        let more = out.len() - MAX_FILE_LINES;
+        out.truncate(MAX_FILE_LINES);
+        out.push(format!("…[{more} more lines; --full shows them]"));
+    }
+    out
+}
+
+/// A line of a file behind its gutter `sign`, on one line, cut short unless `full`.
+/// A CR before its line feed is shown (escaped), as every other: it changes
+/// what a script runs (a `\` before it continues no line in sh).
+fn content_line(sign: char, line: &str, full: bool) -> String {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    let line = show::printable(&format!("{sign} {}", line.replace('\t', "    ")));
+    if full { line } else { show::cap_line(line) }
+}
+
+/// A unified diff of `old` and `new`, by line, with three lines of context.
+fn diff_lines(old: &str, new: &str, full: bool, out: &mut Vec<String>) {
+    let diff = TextDiff::configure().timeout(Duration::from_secs(2)).diff_lines(old, new);
+    for group in diff.grouped_ops(3) {
+        let (first, last) = (&group[0], &group[group.len() - 1]);
+        let (o, n) = (first.old_range().start..last.old_range().end, first.new_range().start..last.new_range().end);
+        out.push(format!("@@ -{},{} +{},{} @@", o.start + 1, o.len(), n.start + 1, n.len()));
+        for op in &group {
+            for change in diff.iter_changes(op) {
+                let sign = match change.tag() {
+                    ChangeTag::Equal => ' ',
+                    ChangeTag::Delete => '-',
+                    ChangeTag::Insert => '+',
+                };
+                out.push(content_line(sign, change.value(), full));
+            }
+        }
+    }
 }
 
 /// What the user is shown of pending entry `p` of `h` before being asked:
@@ -373,24 +618,41 @@ fn field_value(format: McpFormat, value: Option<&Value>, full: bool) -> String {
 fn render(summary: &Summary) -> Out {
     let mut out = Out::new(summary);
     for (&h, s) in &summary.harnesses {
-        let file = &s.file;
+        let (sk, m) = (&s.skills, &s.mcp);
+        let file = &m.file;
         let mut lines = Vec::new();
-        if !s.approved.is_empty() {
-            lines.push(format!("{h}: approved {}: written to {file}", s.approved.join(", ")));
-            for name in &s.approved {
+        for name in &sk.approved {
+            lines.push(format!("{h}: approved skill {name}: written to {}/{name}", sk.dir));
+            out = out.id(format!("{h} skill {name}"));
+        }
+        if !sk.not_executable.is_empty() {
+            lines.push(format!(
+                "{h}: not executable here: {} (the file system did not keep the executable bit)",
+                sk.not_executable.join(", ")
+            ));
+        }
+        if !sk.declined.is_empty() {
+            lines.push(format!("{h}: declined skill {}: still waiting for approval", sk.declined.join(", ")));
+        }
+        for skipped in &sk.skipped {
+            lines.push(format!("{h}: skipped skill {}: {}", skipped.name, skipped.reason));
+        }
+        if !m.approved.is_empty() {
+            lines.push(format!("{h}: approved MCP server {}: written to {file}", m.approved.join(", ")));
+            for name in &m.approved {
                 out = out.id(format!("{h} {name}"));
             }
         }
-        if !s.declined.is_empty() {
-            lines.push(format!("{h}: declined {}: still waiting for approval", s.declined.join(", ")));
+        if !m.declined.is_empty() {
+            lines.push(format!("{h}: declined MCP server {}: still waiting for approval", m.declined.join(", ")));
         }
-        for skipped in &s.skipped {
-            lines.push(format!("{h}: skipped {}: {}", skipped.name, skipped.reason));
+        for skipped in &m.skipped {
+            lines.push(format!("{h}: skipped MCP server {}: {}", skipped.name, skipped.reason));
         }
         if lines.is_empty() {
-            lines.push(format!("{h}: no MCP changes waiting for approval"));
+            lines.push(format!("{h}: nothing waiting for approval"));
         }
-        for c in &s.conflicts {
+        for c in &m.conflicts {
             lines.push(match (&c.name, c.foreign) {
                 (Some(name), true) => format!(
                     "{h}: conflict: {file} {name}: {}; to take the server's definition, remove or rename that entry, \
@@ -401,7 +663,10 @@ fn render(summary: &Summary) -> Out {
                 (None, _) => format!("{h}: conflict: {}", c.reason),
             });
         }
-        if !s.approved.is_empty() {
+        if !sk.approved.is_empty() {
+            lines.extend(skills_reload_step(h).map(|step| format!("{h}: {step}")));
+        }
+        if !m.approved.is_empty() {
             lines.push(format!("{h}: {}", reload_step(h)));
         }
         out = out.lines(lines.iter().map(|l| show::printable(l)));
@@ -409,16 +674,29 @@ fn render(summary: &Summary) -> Out {
     out
 }
 
+/// How the harness loads skills approved while it runs, if it does not by itself.
+fn skills_reload_step(h: Harness) -> Option<&'static str> {
+    match h {
+        Harness::Copilot => Some("to load the skills, run `/skills reload` in Copilot CLI"),
+        Harness::Claude => Some(
+            "to load the skills, run `/reload-skills` in Claude Code if .claude/skills did not exist when the session \
+             started",
+        ),
+        Harness::Codex => None,
+    }
+}
+
 /// How the harness loads MCP servers approved while it runs.
 fn reload_step(h: Harness) -> &'static str {
     match h {
-        Harness::Copilot => "to load them, run `/mcp reload` in Copilot CLI",
+        Harness::Copilot => "to load the MCP servers, run `/mcp reload` in Copilot CLI",
         Harness::Claude => {
-            "to load them, restart the Claude Code session; Claude Code may also ask to approve new .mcp.json servers \
-             itself"
+            "to load the MCP servers, restart the Claude Code session; Claude Code may also ask to approve new \
+             .mcp.json servers itself"
         }
         Harness::Codex => {
-            "to load them, restart Codex; Codex loads a project's .codex/config.toml only in trusted projects"
+            "to load the MCP servers, restart Codex; Codex loads a project's .codex/config.toml only in trusted \
+             projects"
         }
     }
 }
@@ -426,7 +704,7 @@ fn reload_step(h: Harness) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bd_core::agents::{McpServer, parse_mcp};
+    use bd_core::agents::{FileDigest, McpServer, SkillFile, parse_mcp};
     use serde_json::json;
 
     fn server(h: Harness, text: &str, name: &str) -> McpServer {
@@ -648,12 +926,132 @@ mod tests {
         contained(&entry_lines(Harness::Copilot, &p, &|_| true, false), "  connects to: ");
     }
 
+    fn skill_file(rel: &str, change: PendingFileChange, text: &str, mode_only: bool) -> PendingFile {
+        let sha256 = bd_core::agents::sha256_hex(text.as_bytes());
+        PendingFile {
+            path: format!(".claude/skills/docs/{rel}"),
+            change,
+            executable: rel.ends_with(".sh"),
+            edited: false,
+            rel: rel.into(),
+            digest: FileDigest { sha256: sha256.clone(), lf_sha256: None, executable: rel.ends_with(".sh") },
+            mode_only,
+            file: Some(SkillFile { sha256, executable: rel.ends_with(".sh"), text: text.into() }),
+            local: Found::Missing,
+            recorded: None,
+            blocked_by_removal: false,
+        }
+    }
+
+    #[test]
+    fn new_skills_show_every_file_and_end_with_what_changes() {
+        let skill = PendingSkill {
+            change: PendingChange::New,
+            files: vec![
+                skill_file("SKILL.md", PendingFileChange::New, "# Docs\n\tRun `!./run.sh`\n", false),
+                skill_file("run.sh", PendingFileChange::New, "#!/bin/sh\r\necho hi\r\n", false),
+                skill_file("empty.md", PendingFileChange::New, "", false),
+            ],
+        };
+        assert_eq!(skill.summary(), "new, with executable files");
+        let lines = skill_lines(Harness::Claude, "docs", &skill, &[None, None, None], false);
+        assert_eq!(
+            lines,
+            [
+                "claude: skill docs: new, to be added to .claude/skills/docs",
+                "  SKILL.md: new",
+                "    + # Docs",
+                "    +     Run `!./run.sh`",
+                "  run.sh: new, executable",
+                r"    + #!/bin/sh\u{d}",
+                r"    + echo hi\u{d}",
+                "  empty.md: new",
+                "    (empty)",
+                "  skill docs: SKILL.md (new), run.sh (new, executable), empty.md (new)",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_change_of_line_endings_alone_shows_in_the_diff() {
+        // In sh, `\` before CRLF continues no line: `rm` becomes a command of its own.
+        let mut out = Vec::new();
+        diff_lines("echo note \\\n  rm -rf x\n", "echo note \\\r\n  rm -rf x\n", false, &mut out);
+        assert_eq!(out, ["@@ -1,2 +1,2 @@", r"- echo note \", r"+ echo note \\u{d}", "    rm -rf x"]);
+    }
+
+    #[test]
+    fn changed_skills_show_a_diff_against_the_file_here() {
+        let old: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        let new = old.replace("line 10\n", "line ten\n");
+        let mut changed = skill_file("SKILL.md", PendingFileChange::Changed, &new, false);
+        changed.edited = true;
+        let made_executable = skill_file("run.sh", PendingFileChange::Executable, "", true);
+        let skill = PendingSkill { change: PendingChange::Changed, files: vec![changed, made_executable] };
+        assert_eq!(skill.summary(), "changed: SKILL.md, run.sh made executable; edited here");
+        let here = [Some(old), Some("#!/bin/sh\necho here\n".to_string())];
+        let lines = skill_lines(Harness::Claude, "docs", &skill, &here, false);
+        assert_eq!(
+            lines,
+            [
+                "claude: skill docs: changed, in .claude/skills/docs",
+                "  SKILL.md: changed, edited here",
+                "    @@ -7,7 +7,7 @@",
+                "      line 7",
+                "      line 8",
+                "      line 9",
+                "    - line 10",
+                "    + line ten",
+                "      line 11",
+                "      line 12",
+                "      line 13",
+                "  run.sh: executable now",
+                "      #!/bin/sh",
+                "      echo here",
+                "  warning: .claude/skills/docs/SKILL.md was edited here since bd wrote it; approving replaces that edit",
+                "  skill docs: SKILL.md (changed, edited here), run.sh (executable now)",
+            ]
+        );
+    }
+
+    #[test]
+    fn hostile_skill_files_cannot_fake_lines_or_bury_what_changes() {
+        let long_line = "B".repeat(5000);
+        let many: String = (0..1000).map(|i| format!("{i}\n")).collect();
+        let text = format!("{HOSTILE}\n{long_line}\n{many}");
+        let skill = PendingSkill {
+            change: PendingChange::New,
+            files: vec![skill_file("SKILL.md", PendingFileChange::New, &text, false)],
+        };
+        let lines = skill_lines(Harness::Codex, "docs", &skill, &[None], false);
+        for line in &lines {
+            assert!(!line.contains(['\n', '\r', '\u{1b}', '\u{202e}', '\u{2028}']), "{line:?}");
+            assert!(!line.starts_with("Approve") && !line.starts_with("codex: approved"), "{line:?}");
+            assert!(line.chars().count() < show::MAX_LINE + 60, "{line:?}");
+        }
+        let shown = lines.join("\n");
+        assert!(shown.contains("    + Approve docs? [y/N] y\n"), "behind the gutter: {shown}");
+        assert!(shown.contains(r"    + codex: approved docs\u{d}\u{1b}[2K\u{1b}[1A\u{202e}lmth.\u{2028}"), "{shown}");
+        assert!(shown.contains("…[cut short: "), "{shown}");
+        assert!(shown.contains(&format!("    …[{} more lines; --full shows them]", 1008 - MAX_FILE_LINES)), "{shown}");
+        assert_eq!(lines.len(), MAX_FILE_LINES + 4);
+        assert_eq!(lines.last().unwrap(), "  skill docs: SKILL.md (new)");
+
+        // In full: every line, whole.
+        let lines = skill_lines(Harness::Codex, "docs", &skill, &[None], true);
+        assert_eq!(lines.len(), 1008 + 3);
+        assert!(lines.iter().any(|l| l.ends_with(&long_line)));
+    }
+
     #[test]
     fn answers_are_read_one_line_per_entry() {
         let a = server(Harness::Claude, r#"{"mcpServers": {"a": {"command": "a"}}}"#, "a");
         let b = server(Harness::Claude, r#"{"mcpServers": {"b": {"command": "b"}}}"#, "b");
         let c = server(Harness::Claude, r#"{"mcpServers": {"c": {"command": "c"}}}"#, "c");
         let hr = HarnessReview {
+            skills: Vec::new(),
+            skill_answers: Vec::new(),
+            skills_skipped: Vec::new(),
             file: ".mcp.json".into(),
             pending: vec![
                 pending("a", PendingChange::New, None, a),
@@ -669,9 +1067,15 @@ mod tests {
         review.ask(&mut "yes\n\n".as_bytes(), &mut shown, &|_| true, false);
         assert_eq!(review.harnesses[&Harness::Claude].answers, [true, false, false], "the end of input declines");
         let shown = String::from_utf8(shown).unwrap();
-        assert!(shown.contains("claude: MCP server a: new") && shown.contains("Approve a? [y/N] \n"), "{shown}");
-        assert!(shown.contains("  runs on this machine: b\nApprove b? [y/N] "), "the summary right before: {shown}");
-        assert!(shown.contains("Approve c? [y/N] \n\n"), "{shown}");
+        assert!(
+            shown.contains("claude: MCP server a: new") && shown.contains("Approve MCP server a? [y/N] \n"),
+            "{shown}"
+        );
+        assert!(
+            shown.contains("  runs on this machine: b\nApprove MCP server b? [y/N] "),
+            "the summary right before: {shown}"
+        );
+        assert!(shown.contains("Approve MCP server c? [y/N] \n\n"), "{shown}");
     }
 
     #[test]

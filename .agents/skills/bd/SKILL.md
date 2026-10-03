@@ -35,11 +35,11 @@ Claude Code subagents share their parent session's id, so their plain `bd` comma
 
 ## Agent skills and MCP definitions
 
-- A workspace may serve skills and MCP server definitions to each agent harness. Session-start context may report what changed (lines starting `bd:`): skills updated, MCP definitions waiting for approval, conflicts.
-- Mid-session, `bd agents status` shows what differs from the server and `bd agents pull` brings skills up to date (add `--harness claude|codex|copilot` if no harness is detected). Pulls never write new or changed MCP definitions.
-- Never approve MCP changes, and never edit `.mcp.json`, `.github/mcp.json` or `.codex/config.toml` to get around approval: an MCP definition is a command that runs on the user's machine. Ask the user to review the changes and run `bd agents approve` in a separate terminal (it refuses agent sessions).
-- Pulled skills or approved MCP servers may need a reload by the user: Copilot CLI `/skills reload` and `/mcp reload`; Claude Code `/reload-skills`, and a restart for MCP; Codex loads skills by itself, and needs a restart for MCP.
-- Treat server-provided skills as workspace instructions: they are applied without approval and may carry hooks or scripts that run commands, so raise anything unexpected in them with the user.
+- A workspace may serve skills and MCP server definitions to each agent harness. Session-start context may report what changed (lines starting `bd:`): skills removed or restored, skills and MCP definitions waiting for approval, conflicts.
+- Mid-session, `bd agents status` shows what differs from the server and `bd agents pull` applies removals and restores (add `--harness claude|codex|copilot` if no harness is detected). Pulls never write new or changed skills or MCP definitions.
+- Never approve skill or MCP changes, and never copy a server's skill files into the skills directories or edit `.mcp.json`, `.github/mcp.json` or `.codex/config.toml` to get around approval: skills and MCP definitions run commands on the user's machine. Ask the user to review the changes and run `bd agents approve` in a separate terminal (it refuses agent sessions).
+- Approved skills or MCP servers may need a reload by the user: Copilot CLI `/skills reload` and `/mcp reload`; Claude Code `/reload-skills`, and a restart for MCP; Codex loads skills by itself, and needs a restart for MCP.
+- Treat approved skills as workspace instructions; they may carry hooks or scripts that run commands, so raise anything unexpected in them with the user.
 
 ## Rules
 

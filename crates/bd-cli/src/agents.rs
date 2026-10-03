@@ -28,29 +28,41 @@
 //! `.bd/agents.lock` ([`lock`]) records each skill file and MCP server entry
 //! bd wrote or adopted. A pull makes the checkout hold the server's set:
 //!
-//! - It writes the server's skill files (each at once, through a temp file;
-//!   executable ones get their executable bits on Unix, and so does a file
-//!   adopted or kept with the server's text but without them, except where
-//!   the file system did not keep the bit before: see [`lock`]), restores
-//!   the ones bd wrote that were deleted, and deletes those the server
+//! - New and changed skills are never written: a skill can run commands
+//!   on this machine (Claude Code `!` lines and `hooks`, `allowed-tools`,
+//!   bundled scripts), so they wait for the user's approval (`bd agents
+//!   approve`), even with `--force`. A skill file waits when the server's
+//!   text is not the one recorded (approved, or adopted) for its path, or
+//!   it is executable where the recorded one was not. What adds nothing
+//!   that runs applies at once: it restores the files bd wrote that were
+//!   deleted (with the very bytes approved), clears executable bits, gives back
+//!   one the file system did not keep, and deletes the files the server
 //!   removed, with the directories that leaves empty below the skills
 //!   directory, before it writes anything: a file the server renamed only
 //!   in case is written under its new name where the file system ignores
 //!   case, and a file can become a directory of the same name, or the other
-//!   way round.
+//!   way round. Each file is written at once, through a temp file;
+//!   executable ones get their executable bits on Unix, except where the
+//!   file system did not keep the bit before: see [`lock`].
 //! - A file or entry bd did not record that already matches the server's
 //!   is adopted: recorded, not written (a fresh clone of committed files).
 //!   One that differs is a conflict, reported and left alone.
-//! - Line endings alone never make a skill file differ: one with the text
-//!   of the server's file, or of the one bd wrote, once each CRLF in either
-//!   is read as LF (git's `core.autocrlf` checks text files out with CRLF
-//!   line endings on Windows) counts as that file, and keeps its line
-//!   endings, also when the server changes only those.
+//! - Line endings alone never make a skill file here differ: one with the
+//!   text of the server's file, or of the one bd wrote, once each CRLF in
+//!   either is read as LF (git's `core.autocrlf` checks text files out with
+//!   CRLF line endings on Windows) counts as that file, and keeps its line
+//!   endings and its record, also when the server changes only those. Only
+//!   the very bytes recorded are ever written without approval: other line
+//!   endings can change what a script runs (`\` before CRLF continues no
+//!   line in sh), so a restore of a server text that differs in them waits.
 //! - A file or entry bd wrote that was edited here is kept: reported as
-//!   edited, or as a conflict when the server changed or removed it (a
-//!   change of a file's executable bit alone is applied to the edited file).
-//!   `--force` replaces or removes such edits; it never touches what bd did
-//!   not write.
+//!   edited, as waiting for approval (which replaces the edit) when the
+//!   server changed it, or as a conflict when the server removed it (a
+//!   change of a file's executable bit alone is applied to the edited
+//!   file, once approved if it sets the bit). `--force` replaces such edits
+//!   with the bytes approved when the server still serves them (another
+//!   text waits for approval), and removes them; it never touches what bd
+//!   did not write.
 //! - It never follows a symlink at or below a skill's directory (the skills
 //!   directory and its parents may be symlinks), nor writes an MCP file
 //!   that is a symlink: those are conflicts.
@@ -64,18 +76,19 @@
 //!   authenticate on the client and bd never handles their credentials.
 //!
 //! `status` reports what a pull would do and changes nothing. `approve`
-//! ([`approve`]) shows each new or changed MCP definition waiting (all, or
-//! those named; rendered by [`show`], never printed as the server sent it,
-//! long values cut short unless `--full`), asks y/N on the terminal, and
-//! writes those approved as
-//! they were shown, recording them in the lock; it never replaces an entry
-//! bd did not write (a conflict), nor one changed here since it was shown.
-//! It refuses to run inside an agent session or without a terminal on
-//! stdin. Changes to a
-//! checkout are serialized by its mutex ([`checkout`]). When nothing
-//! changed, either command makes one request of the server (the manifests);
-//! a set is fetched whole only when files are to be written or MCP changes
-//! shown.
+//! ([`approve`]) shows each skill and MCP definition waiting (all, or
+//! those named): a skill's new files whole and its changed ones as a diff
+//! against the file here, each line behind a gutter, and each definition
+//! rendered by [`show`], never printed as the server sent it, long files
+//! and values cut short unless `--full`. It asks y/N on the terminal per
+//! skill and per definition, and writes those approved as they were
+//! shown, recording them in the lock; it never replaces a file or entry bd
+//! did not write (a conflict), nor one changed here since it was shown. It
+//! refuses to run inside an agent session or without a terminal on stdin.
+//! Changes to a checkout are serialized by its mutex ([`checkout`]). When
+//! nothing changed, either command makes one request of the server (the
+//! manifests); a set is fetched whole only when files are to be written,
+//! MCP changes shown, or (`approve`) skills shown.
 //!
 //! `pull` also adds the harness's session-start hook where none is
 //! configured, and `status` reports that it would ([`session_hook`]); both
@@ -89,7 +102,8 @@
 //! # Output
 //!
 //! Text output has a line per finding and harness (`claude: skills updated:
-//! deploy, triage`), or `<harness>: up to date`. With `--json`, both print
+//! deploy, triage`, `claude: skills waiting for approval: lint (new)`), or
+//! `<harness>: up to date`. With `--json`, both print
 //! (and `watch`, for each pull, on one line):
 //!
 //! ```json
@@ -101,9 +115,18 @@
 //!       "server_revision": "<sha256>",
 //!       "applied_revision": "<sha256>",
 //!       "skills": {
-//!         "changed": {"deploy": "updated", "triage": "added"},
-//!         "added": [{"skill": "triage", "path": ".claude/skills/triage/SKILL.md"}],
-//!         "updated": [{"skill": "deploy", "path": ".claude/skills/deploy/SKILL.md"}],
+//!         "changed": {"deploy": "restored", "old": "removed"},
+//!         "pending": {
+//!           "triage": {"change": "new", "files": [
+//!             {"path": ".claude/skills/triage/SKILL.md", "change": "new", "executable": false, "edited": false}
+//!           ]},
+//!           "lint": {"change": "changed", "files": [
+//!             {"path": ".claude/skills/lint/run.sh", "change": "executable", "executable": true, "edited": false}
+//!           ]}
+//!         },
+//!         "added": [],
+//!         "updated": [],
+//!         "restored": [{"skill": "deploy", "path": ".claude/skills/deploy/SKILL.md"}],
 //!         "restored": [], "replaced": [], "removed": [], "adopted": [], "edited": [],
 //!         "not_executable": [],
 //!         "conflicts": [{"skill": "lint", "path": ".claude/skills/lint/SKILL.md", "reason": "..."}],
@@ -133,9 +156,16 @@
 //! - `skills`: `changed` maps each skill with files written or removed to
 //!   `added` (new here), `updated`, `removed` (gone from the server),
 //!   `restored` (deleted files written again) or `replaced` (`--force`);
-//!   the other lists name each file (`skill`, checkout-relative `path`):
-//!   `updated` also lists files whose executable bit alone was set or
-//!   cleared, `adopted` were already the server's, `edited` are local edits kept,
+//!   `pending` maps each skill waiting for approval to its `change` (`new`:
+//!   nothing of it is here yet, or `changed`) and its `files` waiting: each
+//!   `new` (nothing recorded for its path), `changed` (another text than
+//!   the one approved) or `executable` (the text approved, or found here,
+//!   now executable), whether the server's file is `executable`, and
+//!   whether it was `edited` here since bd wrote it (approving replaces the
+//!   edit); the other lists name each file (`skill`, checkout-relative
+//!   `path`), and only what was or would be applied:
+//!   `updated` lists files whose executable bit alone was set (as approved
+//!   before) or cleared, `adopted` were already the server's, `edited` are local edits kept,
 //!   `not_executable` (pull only) are executable files whose executable bit
 //!   the file system did not keep when bd set it, listed once,
 //!   `conflicts` are in the way (`path` is what is in the way: the file, or
@@ -152,36 +182,48 @@
 //!   it is configured, or goes) and `state`: `present`, `added`, or
 //!   `conflict` with a `reason`.
 //!
-//! `approve` shows each entry and its prompt on stderr; then its text
-//! output has a line per outcome and harness (`claude: approved github:
-//! written to .mcp.json`, `claude: declined linear: still waiting for
-//! approval`), the conflicts, and how to load what was approved. With
-//! `--json`, once the answers are in, it prints:
+//! `approve` shows each skill and entry and its prompt on stderr; then its
+//! text output has a line per outcome and harness (`claude: approved skill
+//! triage: written to .claude/skills/triage`, `claude: approved MCP server
+//! github: written to .mcp.json`, `claude: declined MCP server linear:
+//! still waiting for approval`), the conflicts, and how to load what was
+//! approved. With `--json`, once the answers are in, it prints:
 //!
 //! ```json
 //! {
 //!   "checkout": "/home/me/proj",
 //!   "harnesses": {
 //!     "claude": {
-//!       "file": ".mcp.json",
-//!       "approved": ["github"],
-//!       "declined": ["linear"],
-//!       "skipped": [{"name": "docs", "reason": "its entry in .mcp.json or .bd/agents.lock changed since it was shown; ..."}],
-//!       "conflicts": [{"name": "mine", "reason": "in .mcp.json, differs from the server's and was not written by bd; ..."}]
+//!       "skills": {
+//!         "dir": ".claude/skills",
+//!         "approved": ["triage"],
+//!         "declined": ["lint"],
+//!         "skipped": [{"name": "deploy", "reason": "its files here or in .bd/agents.lock changed since it was shown; ..."}],
+//!         "not_executable": []
+//!       },
+//!       "mcp": {
+//!         "file": ".mcp.json",
+//!         "approved": ["github"],
+//!         "declined": ["linear"],
+//!         "skipped": [{"name": "docs", "reason": "its entry in .mcp.json or .bd/agents.lock changed since it was shown; ..."}],
+//!         "conflicts": [{"name": "mine", "reason": "in .mcp.json, differs from the server's and was not written by bd; ..."}]
+//!       }
 //!     }
 //!   }
 //! }
 //! ```
 //!
-//! `approved` entries were written and recorded; `declined` ones still
-//! wait; `skipped` are those not asked about (a name given that waits for
-//! nothing: up to date, removed, a conflict) or not written (changed here
-//! since they were shown, or in an MCP file bd does not write); `conflicts`
-//! are as in `status`.
+//! `approved` skills and entries were written and recorded; `declined`
+//! ones still wait; `skipped` are those not asked about (a name given that
+//! waits for nothing: up to date, removed, a conflict) or not written
+//! (changed here since they were shown, behind a file a pull removes
+//! first, or in an MCP file bd does not write); `not_executable` lists
+//! files written whose executable bit the file system did not keep;
+//! `conflicts` are as in `status`.
 //!
 //! # Exit codes
 //!
-//! 0 when the command did its work: MCP changes waiting for approval,
+//! 0 when the command did its work: skills and MCP changes waiting for approval,
 //! conflicts and local edits are findings, not failures, and so are
 //! declined and skipped approvals. 2: no harness to work on, no checkout,
 //! or an unusable `.bd/agents.lock`; for `approve`, also inside an agent
@@ -305,7 +347,7 @@ fn cmd_sync(
     io::require_local(if apply { "bd agents pull" } else { "bd agents status" })?;
     let checkout = find_checkout(app, remote.is_some())?;
     let harnesses = harnesses(requested, &checkout)?;
-    let opts = Options { apply, force, lock_wait: Duration::from_millis(app.g.busy_timeout_ms) };
+    let opts = Options { apply, force, review: false, lock_wait: Duration::from_millis(app.g.busy_timeout_ms) };
     let mut report = sync_checkout(app, remote, &checkout, &harnesses, opts)?;
     if hook {
         let _mutex = match apply {
@@ -528,6 +570,14 @@ fn harness_lines(h: Harness, r: &HarnessReport, applied: bool) -> Vec<String> {
     for c in &s.left {
         lines.push(format!("{h}: left in place: {}: {}", c.path, c.reason));
     }
+    if !s.pending.is_empty() {
+        let skills: Vec<String> = s.pending.iter().map(|(name, p)| format!("{name} ({})", p.summary())).collect();
+        lines.push(format!(
+            "{h}: skills waiting for approval: {}: not applied; review and approve with `bd agents approve` in a \
+             terminal",
+            skills.join(", ")
+        ));
+    }
     if !m.pending.is_empty() {
         let entries: Vec<String> = m
             .pending
@@ -609,7 +659,7 @@ fn harness_lines(h: Harness, r: &HarnessReport, applied: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sync::{McpConflict, Pending};
+    use sync::{McpConflict, Pending, PendingFile, PendingFileChange, PendingSkill};
 
     #[test]
     fn status_text_escapes_what_a_server_or_file_could_put_in_it() {
@@ -626,10 +676,14 @@ mod tests {
         });
         let reason = "not valid JSON (\u{1b}]0;title\u{7} at line 1)".to_string();
         r.mcp.conflicts.push(McpConflict { name: None, reason, foreign: false });
+        let files = vec![PendingFile::example("deploy", "run.sh", PendingFileChange::New, true, false)];
+        r.skills.pending.insert("deploy".into(), PendingSkill { change: PendingChange::New, files });
         let lines = harness_lines(Harness::Claude, &r, false);
         assert_eq!(
             lines,
             [
+                "claude: skills waiting for approval: deploy (new, with executable files): not applied; review and \
+                 approve with `bd agents approve` in a terminal",
                 r#"claude: MCP github changed ("a\nclaude: up to date\n", "\u{1b}[2K\u{202e}", args, edited here): not applied; review and approve with `bd agents approve` in a terminal"#,
                 r"claude: conflict: not valid JSON (\u{1b}]0;title\u{7} at line 1)",
             ]

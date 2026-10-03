@@ -192,6 +192,17 @@ impl Checkout {
         unreachable!("the last part is a file, or something else in the way")
     }
 
+    /// The bytes of file `rel` of skill `name` of `harness`, if it is a
+    /// regular file reached through no symlink at or below the skill's
+    /// directory (see [`Checkout::find_skill_file`]).
+    pub fn read_skill_file(&self, harness: Harness, name: &str, rel: &str) -> Result<Option<Vec<u8>>> {
+        if !matches!(self.find_skill_file(harness, name, rel)?, Found::File { .. }) {
+            return Ok(None);
+        }
+        let path = under(&self.root, &format!("{}/{name}/{rel}", harness.skills_dest()));
+        std::fs::read(&path).map(Some).map_err(|e| path_error(&path, e))
+    }
+
     /// Write `file` as file `rel` of skill `name` of `harness`, at once (a
     /// temp file renamed into place), creating the directories it needs and
     /// never writing through a symlink below the skills directory. Returns

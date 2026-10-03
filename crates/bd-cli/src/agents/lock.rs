@@ -21,14 +21,15 @@
 //! }
 //! ```
 //!
-//! Per harness, `skills` holds every skill file bd wrote or adopted, by its
-//! `/`-separated path in the checkout, with the server's digests of its
-//! text (and `lf_sha256` for a text with CRLF line endings: see
-//! [`FileDigest::lf_sha256`]), and `mcp_servers` every MCP server entry bd
+//! Per harness, `skills` holds every skill file bd wrote or adopted (so
+//! approved), by its `/`-separated path in the checkout, with the digests
+//! of the bytes bd wrote, or found here when it adopted the file or changed
+//! its executable bit (and `lf_sha256` for a text with CRLF line endings:
+//! see [`FileDigest::lf_sha256`]), and `mcp_servers` every MCP server entry bd
 //! wrote or adopted (so approved), with its definition as approved
 //! (canonical JSON; codex: its table as JSON), to show what a newer version
-//! changes. Only applied and approved state is recorded: MCP changes that
-//! wait for approval are worked out from the server each time.
+//! changes. Only applied and approved state is recorded: skill and MCP
+//! changes that wait for approval are worked out from the server each time.
 //!
 //! `executable_not_kept` marks an executable file whose executable bit the
 //! file system did not keep when bd set it (vfat, an SMB mount whose fmask
@@ -69,7 +70,7 @@ impl Default for LockFile {
 #[serde(deny_unknown_fields)]
 pub struct Applied {
     /// The server revision last pulled; empty if none was, as when `bd
-    /// agents approve` wrote MCP entries first.
+    /// agents approve` wrote skills or MCP entries first.
     pub revision: String,
     /// The skill files bd wrote or adopted, by checkout-relative path.
     #[serde(default)]
@@ -84,7 +85,7 @@ pub struct Applied {
 #[serde(deny_unknown_fields)]
 pub struct OwnedFile {
     pub sha256: String,
-    /// The server's [`FileDigest::lf_sha256`].
+    /// [`bd_core::agents::lf_sha256`] of the text recorded, if it has CRLF line endings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lf_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -95,8 +96,10 @@ pub struct OwnedFile {
 }
 
 impl OwnedFile {
-    /// The server's file, as bd placed it: `not_kept` if the file system
-    /// did not keep its executable bit (only an executable file's counts).
+    /// A file with the digest `digest`, as bd placed or found it: the
+    /// server's file once written, else the bytes here (see `plan_skills`);
+    /// `not_kept` if the file system did not keep its executable bit (only
+    /// an executable file's counts).
     pub fn of(digest: &FileDigest, not_kept: bool) -> OwnedFile {
         OwnedFile {
             sha256: digest.sha256.clone(),

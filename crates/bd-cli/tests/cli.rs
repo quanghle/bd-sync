@@ -1577,13 +1577,14 @@ fn read(dir: &Path, rel: &str) -> Option<String> {
     std::fs::read_to_string(rel.split('/').fold(dir.to_path_buf(), |p, c| p.join(c))).ok()
 }
 
+#[cfg(target_os = "linux")]
 fn mtime(dir: &Path, rel: &str) -> std::time::SystemTime {
     std::fs::metadata(rel.split('/').fold(dir.to_path_buf(), |p, c| p.join(c))).unwrap().modified().unwrap()
 }
 
 /// Whether a mode set on a file in `dir` sticks: not where every file shows
 /// as executable and chmod is ignored (WSL's /mnt/c without metadata).
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn modes_stick(dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let probe = dir.join("mode-probe");
@@ -1595,6 +1596,7 @@ fn modes_stick(dir: &Path) -> bool {
 }
 
 /// Set a file's modification time back an hour, so a rewrite shows.
+#[cfg(target_os = "linux")]
 fn age(dir: &Path, rel: &str) {
     let path = rel.split('/').fold(dir.to_path_buf(), |p, c| p.join(c));
     let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
@@ -1640,6 +1642,10 @@ fn agents_pull_adds_the_session_start_hook_once() {
     assert!(skipped["harnesses"]["codex"].get("hook").is_none());
 }
 
+/// Skills wait for `bd agents approve`, which needs a terminal: Linux
+/// only, as for the other pseudo-terminal tests; the planning and writing
+/// are covered everywhere by the unit tests of `agents::sync`.
+#[cfg(target_os = "linux")]
 #[test]
 fn agents_pull_places_each_harness_set_in_its_own_places() {
     let (ws, agents) = agents_ws();
@@ -1661,12 +1667,32 @@ fn agents_pull_places_each_harness_set_in_its_own_places() {
 
     let status = ws.json(&["agents", "status", "--harness", "copilot"]);
     assert_eq!(status["applied"], false);
-    assert_eq!(status["harnesses"]["copilot"]["skills"]["changed"], serde_json::json!({"lint": "added"}));
+    let lint = serde_json::json!({"lint": {"change": "new", "files": [
+        {"path": ".github/skills/lint/SKILL.md", "change": "new", "executable": false, "edited": false}
+    ]}});
+    assert_eq!(status["harnesses"]["copilot"]["skills"]["pending"], lint);
+    assert_eq!(status["harnesses"]["copilot"]["skills"]["changed"], serde_json::json!({}));
     assert!(!root.join(".github").exists() && !root.join(".bd/agents.lock").exists(), "status writes nothing");
 
+    // A pull writes no skill: they wait for approval.
     let pulled = ws.json(&["agents", "pull", "--harness", "copilot"]);
     assert_eq!(pulled["applied"], true);
     assert_eq!(pulled["harnesses"].as_object().unwrap().keys().collect::<Vec<_>>(), ["copilot"]);
+    assert_eq!(pulled["harnesses"]["copilot"]["skills"]["pending"], lint);
+    assert!(!root.join(".github/skills").exists());
+    let (approved, shown) = approve_all(root, &["--harness", "copilot"]);
+    assert!(
+        shown.starts_with(
+            "copilot: skill lint: new, to be added to .github/skills/lint\n  SKILL.md: new\n    + ---\n    + name: lint\n"
+        ),
+        "{shown}"
+    );
+    assert!(shown.contains("\n  skill lint: SKILL.md (new)\nApprove skill lint? [y/N] "), "{shown}");
+    assert_eq!(
+        approved,
+        "copilot: approved skill lint: written to .github/skills/lint\ncopilot: to load the skills, run `/skills \
+         reload` in Copilot CLI\n"
+    );
     assert_eq!(read(root, ".github/skills/lint/SKILL.md").as_deref(), Some("---\nname: lint\n---\n"));
     assert!(!root.join(".claude").exists() && !root.join(".agents").exists(), "a copilot pull ignores the others");
     let gitignore = read(root, ".bd/.gitignore").unwrap();
@@ -1675,12 +1701,23 @@ fn agents_pull_places_each_harness_set_in_its_own_places() {
     let text = ws.ok(&["agents", "pull", "--harness", "claude,codex"]);
     let hook = "session-start hook added to";
     let runs = "new sessions run `bd hook session-start` and `bd prime`";
+    let waiting = "not applied; review and approve with `bd agents approve` in a terminal";
     assert_eq!(
         text,
         format!(
-            "claude: skills added: deploy, review\nclaude: {hook} .claude/settings.local.json: {runs}\ncodex: skills \
-             added: triage\ncodex: {hook} .codex/hooks.json: {runs} (once trusted in Codex's /hooks)\n"
+            "claude: skills waiting for approval: deploy (new, with executable files), review (new): {waiting}\n\
+             claude: {hook} .claude/settings.local.json: {runs}\ncodex: skills waiting for approval: triage (new): \
+             {waiting}\ncodex: {hook} .codex/hooks.json: {runs} (once trusted in Codex's /hooks)\n"
         )
+    );
+    let (approved, shown) = approve_all(root, &[]);
+    assert!(shown.contains("  scripts/run.sh: new, executable\n    + #!/bin/sh\n    + echo deploy\n"), "{shown}");
+    assert_eq!(
+        approved,
+        "claude: approved skill deploy: written to .claude/skills/deploy\nclaude: approved skill review: written to \
+         .claude/skills/review\nclaude: to load the skills, run `/reload-skills` in Claude Code if .claude/skills did \
+         not exist when the session started\ncodex: approved skill triage: written to .agents/skills/triage\n\
+         copilot: nothing waiting for approval\n"
     );
     assert_eq!(read(root, ".claude/skills/deploy/scripts/run.sh").as_deref(), Some("#!/bin/sh\necho deploy\n"));
     assert_eq!(read(root, ".agents/skills/triage/SKILL.md").as_deref(), Some("---\nname: triage\n---\n"));
@@ -1714,11 +1751,18 @@ fn agents_pull_places_each_harness_set_in_its_own_places() {
     std::fs::remove_dir_all(agents.join("claude/skills/review")).unwrap();
     write_file(&agents, "claude/skills/ship/SKILL.md", "---\nname: ship\n---\n");
     let text = ws.ok(&["agents", "status", "--harness", "claude"]);
-    assert_eq!(text, "claude: skills to add: ship; to update: deploy; to remove: review\n");
+    assert_eq!(
+        text,
+        "claude: skills to update: deploy; to remove: review\nclaude: skills waiting for approval: deploy (changed: \
+         SKILL.md), ship (new): not applied; review and approve with `bd agents approve` in a terminal\n"
+    );
     let pulled = ws.json(&["agents", "pull", "--harness", "claude"]);
     let skills = &pulled["harnesses"]["claude"]["skills"];
-    assert_eq!(skills["changed"], serde_json::json!({"deploy": "updated", "review": "removed", "ship": "added"}));
+    assert_eq!(skills["changed"], serde_json::json!({"deploy": "updated", "review": "removed"}));
     assert_eq!(skills["removed"][0]["path"], ".claude/skills/deploy/scripts/run.sh");
+    assert_eq!(skills["pending"].as_object().unwrap().keys().collect::<Vec<_>>(), ["deploy", "ship"]);
+    assert!(!root.join(".claude/skills/ship").exists());
+    approve_all(root, &["deploy", "ship"]);
     assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("---\nname: deploy\n---\nDeploy, v2.\n"));
     assert!(!root.join(".claude/skills/deploy/scripts").exists() && !root.join(".claude/skills/review").exists());
     assert!(root.join(".claude/skills/ship/SKILL.md").is_file());
@@ -1729,6 +1773,7 @@ fn agents_pull_places_each_harness_set_in_its_own_places() {
     assert_eq!(ws.ok(&["agents", "status", "--harness", "claude"]), "claude: nothing served\n");
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn agents_pull_keeps_local_edits_and_what_bd_did_not_write() {
     let (ws, agents) = agents_ws();
@@ -1747,8 +1792,10 @@ fn agents_pull_keeps_local_edits_and_what_bd_did_not_write() {
     assert_eq!(skills["conflicts"][0]["path"], ".claude/skills/theirs/SKILL.md");
     assert_eq!(mtime(root, ".claude/skills/same/SKILL.md"), adopted, "adopted, not written");
     assert_eq!(read(root, ".claude/skills/theirs/SKILL.md").as_deref(), Some("written by hand\n"));
+    assert_eq!(skills["pending"].as_object().unwrap().keys().collect::<Vec<_>>(), ["deploy", "review"]);
+    approve_all(root, &[]);
 
-    // Edited here: kept, a conflict once the server changes it too.
+    // Edited here: kept; once the server changes it too, its text waits for approval to replace the edit.
     write_file(root, ".claude/skills/deploy/SKILL.md", "deploy, edited here\n");
     write_file(root, ".claude/skills/review/SKILL.md", "review, edited here\n");
     write_file(&agents, "claude/skills/review/SKILL.md", "review v2\n");
@@ -1756,7 +1803,7 @@ fn agents_pull_keeps_local_edits_and_what_bd_did_not_write() {
     let text = ws.ok(&["agents", "pull", "--harness", "claude"]);
     assert!(text.contains("claude: local edits kept: .claude/skills/deploy/SKILL.md"), "{text}");
     assert!(
-        text.contains("conflict: .claude/skills/review/SKILL.md: edited here and changed on the server; kept"),
+        text.contains("claude: skills waiting for approval: review (changed: SKILL.md; edited here): not applied"),
         "{text}"
     );
     assert!(
@@ -1764,14 +1811,19 @@ fn agents_pull_keeps_local_edits_and_what_bd_did_not_write() {
     );
     assert_eq!(read(root, ".claude/skills/review/SKILL.md").as_deref(), Some("review, edited here\n"));
 
-    // --force replaces bd's own files only; a deleted one comes back.
+    // --force replaces bd's own files with what was approved, never with a text not approved; a deleted one comes back.
     std::fs::remove_file(root.join(".claude/skills/same/SKILL.md")).unwrap();
     let pulled = ws.json(&["agents", "pull", "--harness", "claude", "--force"]);
     let skills = &pulled["harnesses"]["claude"]["skills"];
     let replaced: Vec<&str> =
         skills["replaced"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
-    assert_eq!(replaced, [".claude/skills/deploy/SKILL.md", ".claude/skills/review/SKILL.md"]);
+    assert_eq!(replaced, [".claude/skills/deploy/SKILL.md"]);
     assert_eq!(skills["restored"][0]["path"], ".claude/skills/same/SKILL.md");
+    assert_eq!(skills["pending"]["review"]["files"][0]["edited"], true);
+    assert_eq!(read(root, ".claude/skills/review/SKILL.md").as_deref(), Some("review, edited here\n"));
+    let (_, shown) = approve_all(root, &[]);
+    assert!(shown.contains("    - review, edited here\n    + review v2\n"), "a diff against the edit: {shown}");
+    assert!(shown.contains("  warning: .claude/skills/review/SKILL.md was edited here since bd wrote it"), "{shown}");
     assert_eq!(read(root, ".claude/skills/review/SKILL.md").as_deref(), Some("review v2\n"));
     assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v1\n"));
     assert_eq!(read(root, ".claude/skills/same/SKILL.md").as_deref(), Some("same v1\n"));
@@ -1955,13 +2007,15 @@ fn agents_harnesses_come_from_the_agent_session_or_the_lock() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("pass --harness claude, codex or copilot"));
 
+    let recorded = || -> Vec<String> {
+        let lock: Value = serde_json::from_str(&read(root, ".bd/agents.lock").unwrap()).unwrap();
+        lock["harnesses"].as_object().unwrap().keys().cloned().collect()
+    };
     assert_eq!(pulled(&[("COPILOT_AGENT_SESSION_ID", "3f1c2b7e-0001")]), ["copilot"]);
-    assert!(root.join(".github/skills/copilot-skill/SKILL.md").is_file());
-    assert!(!root.join(".claude").exists() && !root.join(".agents").exists());
+    assert_eq!(recorded(), ["copilot"]);
     // A session started from another one's shell has both ids.
     assert_eq!(pulled(&[("CLAUDE_CODE_SESSION_ID", "a1"), ("CODEX_THREAD_ID", "b2")]), ["claude", "codex"]);
-    assert!(root.join(".claude/skills/claude-skill/SKILL.md").is_file());
-    assert!(root.join(".agents/skills/codex-skill/SKILL.md").is_file());
+    assert_eq!(recorded(), ["claude", "codex", "copilot"]);
     // Outside an agent session: the harnesses the lock records.
     assert_eq!(pulled(&[]), ["claude", "codex", "copilot"]);
     // --harness wins.
@@ -1983,29 +2037,49 @@ fn agents_pulls_started_together_take_turns() {
                 write_file(&agents, &format!("{h}/skills/s{i}/SKILL.md"), format!("{h} {i}\n"));
             }
         }
-        let children: Vec<_> = ["claude", "codex", "copilot"]
-            .iter()
-            .map(|h| {
-                Ws::cmd_in(root, "tester", &["--json", "agents", "pull", "--harness", h])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::piped())
-                    .spawn()
-                    .unwrap()
-            })
-            .collect();
-        for child in children {
-            let out = child.wait_with_output().unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-            serde_json::from_slice::<Value>(&out.stdout).unwrap();
+        let pull_together = || {
+            let children: Vec<_> = ["claude", "codex", "copilot"]
+                .iter()
+                .map(|h| {
+                    Ws::cmd_in(root, "tester", &["--json", "agents", "pull", "--harness", h])
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::piped())
+                        .spawn()
+                        .unwrap()
+                })
+                .collect();
+            for child in children {
+                let out = child.wait_with_output().unwrap();
+                assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+                serde_json::from_slice::<Value>(&out.stdout).unwrap();
+            }
+            let lock: Value = serde_json::from_str(&read(root, ".bd/agents.lock").unwrap()).unwrap();
+            let harnesses = lock["harnesses"].as_object().unwrap().clone();
+            assert_eq!(harnesses.keys().collect::<Vec<_>>(), ["claude", "codex", "copilot"], "no update was lost");
+            harnesses
+        };
+        // Skills wait for approval: each pull records its harness's revision.
+        for (_, applied) in pull_together() {
+            assert!(applied["revision"].is_string(), "{applied}");
         }
-        let lock: Value = serde_json::from_str(&read(root, ".bd/agents.lock").unwrap()).unwrap();
-        let harnesses = lock["harnesses"].as_object().unwrap();
-        assert_eq!(harnesses.keys().collect::<Vec<_>>(), ["claude", "codex", "copilot"], "no update was lost");
-        for (h, dest) in [("claude", ".claude"), ("codex", ".agents"), ("copilot", ".github")] {
-            assert_eq!(harnesses[h]["skills"].as_object().unwrap().len(), 20);
-            assert_eq!(read(root, &format!("{dest}/skills/s7/SKILL.md")), Some(format!("{h} 7\n")));
+        // Once approved, pulls restore what was deleted.
+        #[cfg(target_os = "linux")]
+        {
+            approve_all(root, &[]);
+            for dest in [".claude", ".agents", ".github"] {
+                std::fs::remove_dir_all(root.join(dest).join("skills")).unwrap();
+            }
+            for (h, applied) in pull_together() {
+                assert_eq!(applied["skills"].as_object().unwrap().len(), 20);
+                let dest = match h.as_str() {
+                    "claude" => ".claude",
+                    "codex" => ".agents",
+                    _ => ".github",
+                };
+                assert_eq!(read(root, &format!("{dest}/skills/s7/SKILL.md")), Some(format!("{h} 7\n")));
+            }
+            assert_eq!(ws.ok(&["agents", "pull"]), "claude: up to date\ncodex: up to date\ncopilot: up to date\n");
         }
-        assert_eq!(ws.ok(&["agents", "pull"]), "claude: up to date\ncodex: up to date\ncopilot: up to date\n");
         let leftovers: Vec<_> = std::fs::read_dir(root.join(".bd"))
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -2025,9 +2099,11 @@ fn agents_pull_follows_a_rename_by_case_where_the_file_system_ignores_case() {
     if !ignores_case {
         return; // The planning is covered everywhere by the agents::sync unit tests.
     }
-    write_file(&agents, "claude/skills/deploy/SKILL.md", "deploy\n");
-    write_file(&agents, "claude/skills/deploy/Notes.md", "notes\n");
-    write_file(&agents, "claude/skills/deploy/Docs/a.md", "a\n");
+    // Here already as the server has them (a clone of committed skills): adopted without approval.
+    for (rel, text) in [("SKILL.md", "deploy\n"), ("Notes.md", "notes\n"), ("Docs/a.md", "a\n")] {
+        write_file(&agents, &format!("claude/skills/deploy/{rel}"), text);
+        write_file(root, &format!(".claude/skills/deploy/{rel}"), text);
+    }
     ws.ok(&["agents", "pull", "--harness", "claude"]);
     std::fs::remove_file(agents.join("claude/skills/deploy/Notes.md")).unwrap();
     write_file(&agents, "claude/skills/deploy/notes.md", "notes, v2\n");
@@ -2037,6 +2113,9 @@ fn agents_pull_follows_a_rename_by_case_where_the_file_system_ignores_case() {
     let pulled = ws.json(&["agents", "pull", "--harness", "claude"]);
     let skills = &pulled["harnesses"]["claude"]["skills"];
     assert_eq!(skills["conflicts"], serde_json::json!([]), "{pulled}");
+    let waiting: Vec<&str> =
+        skills["pending"]["deploy"]["files"].as_array().unwrap().iter().map(|f| f["path"].as_str().unwrap()).collect();
+    assert_eq!(waiting, [".claude/skills/deploy/docs/a.md", ".claude/skills/deploy/notes.md"], "{pulled}");
     let names = |dir: &str| {
         let mut names: Vec<String> = std::fs::read_dir(root.join(dir))
             .unwrap()
@@ -2045,15 +2124,18 @@ fn agents_pull_follows_a_rename_by_case_where_the_file_system_ignores_case() {
         names.sort();
         names
     };
+    assert_eq!(names(".claude/skills/deploy"), ["SKILL.md"], "the old names went");
+    // Written by hand as the server has them: adopted.
+    write_file(root, ".claude/skills/deploy/notes.md", "notes, v2\n");
+    write_file(root, ".claude/skills/deploy/docs/a.md", "a\n");
+    ws.ok(&["agents", "pull", "--harness", "claude"]);
     assert_eq!(names(".claude/skills/deploy"), ["SKILL.md", "docs", "notes.md"]);
-    assert_eq!(read(root, ".claude/skills/deploy/notes.md").as_deref(), Some("notes, v2\n"));
-    assert_eq!(read(root, ".claude/skills/deploy/docs/a.md").as_deref(), Some("a\n"));
     assert_eq!(ws.ok(&["agents", "pull", "--harness", "claude"]), "claude: up to date\n");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
-fn agents_pull_makes_an_adopted_script_executable() {
+fn agents_approve_makes_an_adopted_script_executable() {
     use std::os::unix::fs::PermissionsExt;
     let (ws, agents) = agents_ws();
     let root = ws.dir.path();
@@ -2070,12 +2152,24 @@ fn agents_pull_makes_an_adopted_script_executable() {
     write_file(root, ".claude/skills/deploy/run.sh", "#!/bin/sh\n");
     mode(root.join(".claude/skills/deploy/run.sh"), 0o644);
     let text = ws.ok(&["agents", "status", "--harness", "claude", "--no-hook"]);
-    assert_eq!(text, "claude: skills to add: deploy\n", "the skill is new here");
+    assert_eq!(
+        text,
+        "claude: skills waiting for approval: deploy (new, with executable files): not applied; review and approve \
+         with `bd agents approve` in a terminal\n",
+        "the skill is new here"
+    );
     let pulled = ws.json(&["agents", "pull", "--harness", "claude"]);
-    let updated = &pulled["harnesses"]["claude"]["skills"]["updated"];
-    assert_eq!(updated, &serde_json::json!([{"skill": "deploy", "path": ".claude/skills/deploy/run.sh"}]));
-    let script = std::fs::metadata(root.join(".claude/skills/deploy/run.sh")).unwrap();
-    assert_ne!(script.permissions().mode() & 0o111, 0);
+    let files = &pulled["harnesses"]["claude"]["skills"]["pending"]["deploy"]["files"];
+    assert_eq!(
+        files[1],
+        serde_json::json!({"path": ".claude/skills/deploy/run.sh", "change": "executable", "executable": true, "edited": false})
+    );
+    let executable =
+        || std::fs::metadata(root.join(".claude/skills/deploy/run.sh")).unwrap().permissions().mode() & 0o111;
+    assert_eq!(executable(), 0, "not without approval");
+    let (_, shown) = approve_all(root, &[]);
+    assert!(shown.contains("  run.sh: executable now\n      #!/bin/sh\n"), "{shown}");
+    assert_ne!(executable(), 0);
     assert_eq!(
         ws.ok(&["agents", "status", "--harness", "claude"]),
         format!(
@@ -2085,7 +2179,7 @@ fn agents_pull_makes_an_adopted_script_executable() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn agents_pull_says_once_that_the_file_system_keeps_no_executable_bit() {
     use std::os::unix::fs::PermissionsExt;
@@ -2110,9 +2204,16 @@ fn agents_pull_says_once_that_the_file_system_keeps_no_executable_bit() {
         .to_string();
     assert_eq!(
         ok(&["agents", "pull", "--harness", "claude"]),
-        "claude: skills added: deploy\nclaude: not executable here, as the file system did not keep the executable \
-         bit: .claude/skills/deploy/run.sh\nclaude: session-start hook added to .claude/settings.local.json: new \
+        "claude: skills waiting for approval: deploy (new, with executable files): not applied; review and approve \
+         with `bd agents approve` in a terminal\nclaude: session-start hook added to .claude/settings.local.json: new \
          sessions run `bd hook session-start` and `bd prime`\n"
+    );
+    let (approved, _) = approve_all_with(root, &ignored, &[]);
+    assert_eq!(
+        approved,
+        "claude: approved skill deploy: written to .claude/skills/deploy\nclaude: not executable here: \
+         .claude/skills/deploy/run.sh (the file system did not keep the executable bit)\nclaude: to load the skills, \
+         run `/reload-skills` in Claude Code if .claude/skills did not exist when the session started\n"
     );
     let script = std::fs::metadata(root.join(".claude/skills/deploy/run.sh")).unwrap();
     assert_eq!(script.permissions().mode() & 0o111, 0, "the file system kept no bit");
@@ -2142,6 +2243,23 @@ fn agents_pull_says_once_that_the_file_system_keeps_no_executable_bit() {
     let lock: Value = serde_json::from_str(&read(root, ".bd/agents.lock").unwrap()).unwrap();
     assert!(lock["harnesses"]["claude"]["skills"][".claude/skills/deploy/run.sh"].get("executable_not_kept").is_none());
     assert_eq!(ws.ok(&["agents", "pull", "--harness", "claude"]), "claude: up to date\n");
+}
+
+/// `bd agents approve <args>` in `root` on a pseudo-terminal, approving
+/// everything it asks about: its stdout, and what the terminal showed.
+#[cfg(target_os = "linux")]
+fn approve_all(root: &Path, args: &[&str]) -> (String, String) {
+    approve_all_with(root, &[], args)
+}
+
+/// [`approve_all`] with `env` set.
+#[cfg(target_os = "linux")]
+fn approve_all_with(root: &Path, env: &[(&str, &str)], args: &[&str]) -> (String, String) {
+    let mut cmd = Ws::cmd_in(root, "tester", &[&["agents", "approve"][..], args].concat());
+    cmd.envs(env.iter().copied());
+    let (out, shown) = pty::Terminal::spawn(cmd).answer_every("? [y/N] ", "y");
+    assert!(out.status.success(), "{shown}");
+    (String::from_utf8(out.stdout).unwrap(), shown)
 }
 
 /// `bd agents approve` in `root` with `env` set and `stdin` piped in: not a terminal.
@@ -2215,15 +2333,17 @@ fn agents_approve_names_only_what_waits_and_says_when_nothing_does() {
         let out = approve_piped(root, &[], args, "");
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let text = String::from_utf8(out.stdout).unwrap();
-        assert_eq!(text, format!("claude: no MCP changes waiting for approval\n{conflict}"));
+        assert_eq!(text, format!("claude: nothing waiting for approval\n{conflict}"));
     }
 
     let out = approve_piped(root, &[], &["--json", "github", "docs"], "");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let claude = &summary["harnesses"]["claude"];
+    let claude = &summary["harnesses"]["claude"]["mcp"];
     assert_eq!(claude["file"], ".mcp.json");
     assert_eq!((&claude["approved"], &claude["declined"]), (&serde_json::json!([]), &serde_json::json!([])));
+    let skills = &summary["harnesses"]["claude"]["skills"];
+    assert_eq!(skills["approved"], serde_json::json!([]), "{summary}");
     let skipped: Vec<(&str, &str)> = claude["skipped"]
         .as_array()
         .unwrap()
@@ -2240,7 +2360,10 @@ fn agents_approve_names_only_what_waits_and_says_when_nothing_does() {
         let out = approve_piped(root, &[], args, "");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(2), "{stderr}");
-        assert!(stderr.contains(&format!("no MCP server named {unknown} is served to claude or recorded")), "{stderr}");
+        assert!(
+            stderr.contains(&format!("no skill or MCP server named {unknown} is served to claude or recorded")),
+            "{stderr}"
+        );
     }
 
     // A new definition waits: naming another one asks nothing, so needs no terminal.
@@ -2251,7 +2374,7 @@ fn agents_approve_names_only_what_waits_and_says_when_nothing_does() {
     );
     let out = approve_piped(root, &[], &["github"], "y\n");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with("claude: skipped github: up to date"));
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("claude: skipped MCP server github: up to date"));
     let out = approve_piped(root, &[], &["linear"], "y\n");
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(read(root, ".mcp.json"), before, "nothing was written");
@@ -2283,18 +2406,18 @@ fn agents_approve_asks_on_the_terminal_and_writes_what_was_shown() {
 
     // New entries: approve github and docs, decline linear.
     let mut t = approve(&["--harness", "claude,codex"]);
-    let shown = t.expect("Approve github? [y/N] ");
+    let shown = t.expect("Approve MCP server github? [y/N] ");
     assert!(shown.starts_with("claude: MCP server github: new, to be added to .mcp.json\n"), "{shown}");
     assert!(shown.contains("  runs on this machine: npx -y server-github\n"), "{shown}");
     assert!(shown.contains("      \"GITHUB_TOKEN\": \"${BD_TEST_GH_TOKEN}\"\n"), "{shown}");
     assert!(shown.contains("  reads environment variables: BD_TEST_GH_TOKEN (unset here)\n"), "{shown}");
     t.answer("y");
-    let shown = t.expect("Approve linear? [y/N] ");
+    let shown = t.expect("Approve MCP server linear? [y/N] ");
     assert!(shown.contains(
         "claude: MCP server linear: new, to be added to .mcp.json\n  connects to: https://mcp.linear.app/mcp\n"
     ));
     t.answer("");
-    let shown = t.expect("Approve docs? [y/N] ");
+    let shown = t.expect("Approve MCP server docs? [y/N] ");
     assert!(shown.contains("codex: MCP server docs: new, to be added to .codex/config.toml\n"), "{shown}");
     assert!(shown.contains("    [mcp_servers.docs]\n    bearer_token_env_var = \"BD_TEST_DOCS_TOKEN\"\n"), "{shown}");
     assert!(shown.contains("  reads environment variables: BD_TEST_DOCS_TOKEN\n"), "set here: {shown}");
@@ -2305,12 +2428,12 @@ fn agents_approve_asks_on_the_terminal_and_writes_what_was_shown() {
     let text = String::from_utf8(out.stdout).unwrap();
     assert_eq!(
         text,
-        "claude: approved github: written to .mcp.json\n\
-         claude: declined linear: still waiting for approval\n\
-         claude: to load them, restart the Claude Code session; Claude Code may also ask to approve new .mcp.json \
+        "claude: approved MCP server github: written to .mcp.json\n\
+         claude: declined MCP server linear: still waiting for approval\n\
+         claude: to load the MCP servers, restart the Claude Code session; Claude Code may also ask to approve new .mcp.json \
          servers itself\n\
-         codex: approved docs: written to .codex/config.toml\n\
-         codex: to load them, restart Codex; Codex loads a project's .codex/config.toml only in trusted projects\n"
+         codex: approved MCP server docs: written to .codex/config.toml\n\
+         codex: to load the MCP servers, restart Codex; Codex loads a project's .codex/config.toml only in trusted projects\n"
     );
     let file: Value = serde_json::from_str(&read(root, ".mcp.json").unwrap()).unwrap();
     assert_eq!(file["inputs"], serde_json::json!([{"id": "x"}]), "other keys stay");
@@ -2341,7 +2464,7 @@ fn agents_approve_asks_on_the_terminal_and_writes_what_was_shown() {
     edited["mcpServers"]["github"]["env"] = serde_json::json!({});
     write_file(root, ".mcp.json", serde_json::to_string_pretty(&edited).unwrap());
     let mut t = approve(&["--json"]);
-    let shown = t.expect("Approve github? [y/N] ");
+    let shown = t.expect("Approve MCP server github? [y/N] ");
     assert!(shown.starts_with("claude: MCP server github: changed, in .mcp.json\n"), "{shown}");
     assert!(
         shown.contains(
@@ -2354,10 +2477,10 @@ fn agents_approve_asks_on_the_terminal_and_writes_what_was_shown() {
         "{shown}"
     );
     assert!(shown.ends_with(
-        "approving replaces that edit\n  runs on this machine: npx -y server-github@2\nApprove github? [y/N] "
+        "approving replaces that edit\n  runs on this machine: npx -y server-github@2\nApprove MCP server github? [y/N] "
     ));
     t.answer("y");
-    t.expect("Approve linear? [y/N] ");
+    t.expect("Approve MCP server linear? [y/N] ");
     let mut by_hand: Value = serde_json::from_str(&read(root, ".mcp.json").unwrap()).unwrap();
     by_hand["mcpServers"]["linear"] = serde_json::json!({"url": "https://mine.example.com"});
     write_file(root, ".mcp.json", serde_json::to_string_pretty(&by_hand).unwrap());
@@ -2365,11 +2488,11 @@ fn agents_approve_asks_on_the_terminal_and_writes_what_was_shown() {
     let (out, _) = t.finish();
     assert!(out.status.success());
     let summary: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let claude = &summary["harnesses"]["claude"];
+    let claude = &summary["harnesses"]["claude"]["mcp"];
     assert_eq!(claude["approved"], serde_json::json!(["github"]));
     assert_eq!(claude["skipped"][0]["name"], "linear");
     assert!(claude["skipped"][0]["reason"].as_str().unwrap().contains("changed since it was shown"), "{summary}");
-    assert_eq!(summary["harnesses"]["codex"]["approved"], serde_json::json!([]), "nothing waits for codex");
+    assert_eq!(summary["harnesses"]["codex"]["mcp"]["approved"], serde_json::json!([]), "nothing waits for codex");
     let file: Value = serde_json::from_str(&read(root, ".mcp.json").unwrap()).unwrap();
     assert_eq!(file["mcpServers"]["github"], serde_json::from_str::<Value>(&github2).unwrap(), "the edit replaced");
     assert_eq!(file["mcpServers"]["linear"], serde_json::json!({"url": "https://mine.example.com"}), "left alone");
@@ -2394,8 +2517,8 @@ fn agents_approve_shows_hostile_definitions_escaped_on_the_terminal() {
     );
     write_file(&agents, "codex/mcp.toml", text);
     let mut t = pty::Terminal::spawn(Ws::cmd_in(root, "tester", &["agents", "approve", "--harness", "codex"]));
-    let shown = t.expect("\nApprove docs? [y/N] ");
-    let lines: Vec<&str> = shown.strip_suffix("Approve docs? [y/N] ").unwrap().lines().collect();
+    let shown = t.expect("\nApprove MCP server docs? [y/N] ");
+    let lines: Vec<&str> = shown.strip_suffix("Approve MCP server docs? [y/N] ").unwrap().lines().collect();
     assert!(lines.len() < 20, "{shown}");
     for line in &lines {
         assert!(!line.contains(['\u{1b}', '\u{202e}']), "{line:?}");
@@ -2409,7 +2532,7 @@ fn agents_approve_shows_hostile_definitions_escaped_on_the_terminal() {
     t.answer("n");
     let (out, _) = t.finish();
     assert!(out.status.success());
-    assert_eq!(String::from_utf8(out.stdout).unwrap(), "codex: declined docs: still waiting for approval\n");
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), "codex: declined MCP server docs: still waiting for approval\n");
     assert!(!root.join(".codex").exists());
 }
 
@@ -2423,15 +2546,18 @@ fn pty_helper_never_waits_forever() {
     write_file(&agents, "claude/mcp.json", r#"{"mcpServers": {"a": {"command": "a"}, "b": {"command": "b"}}}"#);
     let started = std::time::Instant::now();
     let mut t = pty::Terminal::spawn(Ws::cmd_in(root, "tester", &["agents", "approve", "--harness", "claude"]));
-    t.expect("Approve a? [y/N] ");
+    t.expect("Approve MCP server a? [y/N] ");
     t.answer("y");
     // b is never answered: it reads the end of input, which declines it.
     let (out, shown) = t.finish();
     assert!(started.elapsed() < std::time::Duration::from_secs(30));
     assert!(out.status.success(), "{shown}");
-    assert!(shown.contains("Approve b? [y/N] "), "{shown}");
+    assert!(shown.contains("Approve MCP server b? [y/N] "), "{shown}");
     let text = String::from_utf8(out.stdout).unwrap();
-    assert!(text.contains("claude: approved a:") && text.contains("claude: declined b:"), "{text}");
+    assert!(
+        text.contains("claude: approved MCP server a:") && text.contains("claude: declined MCP server b:"),
+        "{text}"
+    );
 
     // A command that ignores the end of input is killed at the deadline, and the helper panics.
     let mut sleep = Command::new("sleep");
@@ -2487,26 +2613,45 @@ fn session_start_hook_pulls_skills_and_reports_mcp_changes_in_each_harness_forma
     assert_eq!(session_start(root, &[], &[]), "", "no --harness, no agent session and no lock");
     assert!(!root.join(".claude").exists());
 
-    let added = "bd: agent skills updated from the workspace's .bd/agents: deploy (added).\n";
-    let created = "bd: Claude Code watches .claude/skills only when it exists at session start: ask the user to run \
-                   `/reload-skills` to use these in this session.\n";
-    assert_eq!(session_start(root, &["--harness", "claude"], &[CLAUDE]), format!("{added}{created}"));
+    // New skills wait for `bd agents approve`, and every session start says so until then.
+    let waiting = |what: &str| {
+        format!(
+            "bd: agent skills changed in the workspace's .bd/agents and not applied: {what}. Ask the user to review \
+             them and run `bd agents approve` in a separate terminal.\n"
+        )
+    };
+    for _ in 0..2 {
+        assert_eq!(session_start(root, &["--harness", "claude"], &[CLAUDE]), waiting("deploy (new)"));
+        assert!(!root.join(".claude/skills").exists());
+    }
+    // Here as the server has it: adopted, with nothing to say; deleted here, restored as recorded.
+    write_file(root, ".claude/skills/deploy/SKILL.md", "deploy v1\n");
+    assert_eq!(session_start(root, &["--harness", "claude"], &[CLAUDE]), "");
+    std::fs::remove_dir_all(root.join(".claude/skills")).unwrap();
+    assert_eq!(
+        session_start(root, &["--harness", "claude"], &[CLAUDE]),
+        "bd: agent skills updated from the workspace's .bd/agents: deploy (restored).\nbd: Claude Code watches \
+         .claude/skills only when it exists at session start: ask the user to run `/reload-skills` to use these in \
+         this session.\n"
+    );
     assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v1\n"));
     assert_eq!(session_start(root, &["--harness", "claude"], &[CLAUDE]), "", "nothing changed");
     write_file(&agents, "claude/skills/deploy/SKILL.md", "deploy v2\n");
+    assert_eq!(session_start(root, &["--harness", "claude"], &[CLAUDE]), waiting("deploy (changed: SKILL.md)"));
+    assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v1\n"));
+    // Removals apply without approval.
+    std::fs::remove_dir_all(agents.join("claude/skills")).unwrap();
     assert_eq!(
         session_start(root, &["--harness", "claude"], &[CLAUDE]),
-        "bd: agent skills updated from the workspace's .bd/agents: deploy (updated).\nbd: if these skills are not \
+        "bd: agent skills updated from the workspace's .bd/agents: deploy (removed).\nbd: if these skills are not \
          available yet, ask the user to run `/reload-skills`.\n"
     );
-    assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v2\n"));
+    assert!(!root.join(".claude/skills/deploy").exists());
 
     // Codex: plain text, and no reload step.
     write_file(&agents, "codex/skills/lint/SKILL.md", "lint\n");
-    assert_eq!(
-        session_start(root, &["--harness", "codex"], &[]),
-        "bd: agent skills updated from the workspace's .bd/agents: lint (added).\n"
-    );
+    assert_eq!(session_start(root, &["--harness", "codex"], &[]), waiting("lint (new)"));
+    std::fs::remove_dir_all(agents.join("codex/skills")).unwrap();
 
     // Copilot CLI: one JSON object; new MCP definitions are reported, never written.
     write_file(&agents, "copilot/skills/triage/SKILL.md", "triage\n");
@@ -2515,19 +2660,15 @@ fn session_start_hook_pulls_skills_and_reports_mcp_changes_in_each_harness_forma
         "copilot/mcp.json",
         r#"{"mcpServers": {"github": {"command": "npx", "env": {"T": "${BD_TEST_HOOK_TOKEN}"}}}}"#,
     );
-    let pending = "bd: MCP server definitions changed in the workspace's .bd/agents and not applied: github (new). \
-                   Ask the user to review them and run `bd agents approve` in a separate terminal.\nbd: environment \
-                   variables the MCP servers read are unset: BD_TEST_HOOK_TOKEN.";
-    let context = copilot_context(&session_start(root, &["--harness", "copilot"], &[])).unwrap();
-    assert_eq!(
-        context,
-        format!(
-            "bd: agent skills updated from the workspace's .bd/agents: triage (added).\nbd: Copilot CLI read its \
-             skills before this hook ran: ask the user to run `/skills reload` to use these in this session.\n{pending}"
-        )
+    let pending = format!(
+        "{}bd: MCP server definitions changed in the workspace's .bd/agents and not applied: github (new). Ask the \
+         user to review them and run `bd agents approve` in a separate terminal.\nbd: environment variables the MCP \
+         servers read are unset: BD_TEST_HOOK_TOKEN.",
+        waiting("triage (new)")
     );
-    assert!(root.join(".github/skills/triage/SKILL.md").is_file());
-    assert!(!root.join(".github/mcp.json").exists(), "waits for bd agents approve");
+    let context = copilot_context(&session_start(root, &["--harness", "copilot"], &[])).unwrap();
+    assert_eq!(context, pending);
+    assert!(!root.join(".github").exists(), "waits for bd agents approve");
     // Until approved, every session start says so.
     assert_eq!(copilot_context(&session_start(root, &["--harness", "copilot"], &[])).unwrap(), pending);
 
@@ -2536,7 +2677,7 @@ fn session_start_hook_pulls_skills_and_reports_mcp_changes_in_each_harness_forma
     assert_eq!(copilot_context(&copilot).unwrap(), pending);
     assert_eq!(session_start(root, &[], &[("CLAUDE_CODE_SESSION_ID", "a1")]), "");
     let text = session_start(root, &[], &[]);
-    assert!(text.starts_with("bd: copilot MCP server definitions changed in the workspace's .bd/agents"), "{text}");
+    assert!(text.starts_with("bd: copilot agent skills changed in the workspace's .bd/agents"), "{text}");
     assert!(!text.contains("claude") && !text.contains("codex") && !text.starts_with('{'), "{text}");
 }
 
@@ -2565,7 +2706,8 @@ fn session_start_hook_reports_problems_in_one_line() {
     let (ws, agents) = agents_ws();
     let root = ws.dir.path();
     write_file(&agents, "claude/skills/deploy/SKILL.md", "deploy v1\n");
-    assert_eq!(session_start(root, &["--harness", "claude"], &[CLAUDE]).lines().count(), 2);
+    write_file(root, ".claude/skills/deploy/SKILL.md", "deploy v1\n");
+    assert_eq!(session_start(root, &["--harness", "claude"], &[CLAUDE]), "", "adopted");
 
     // Another bd process changing the checkout: given up on after a second or so.
     write_file(&agents, "claude/skills/deploy/SKILL.md", "deploy v2\n");
@@ -2582,7 +2724,7 @@ fn session_start_hook_reports_problems_in_one_line() {
     assert_eq!(copilot.lines().count(), 1, "{copilot}");
     assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v1\n"));
     fs4::FileExt::unlock(&mutex).unwrap();
-    assert!(session_start(root, &["--harness", "claude"], &[CLAUDE]).contains("deploy (updated)"));
+    assert!(session_start(root, &["--harness", "claude"], &[CLAUDE]).contains("deploy (changed: SKILL.md)"));
 
     // A set the workspace cannot serve, a lock bd cannot read: local errors, said the same way.
     write_file(&agents, "claude/mcp.json", r#"{"mcpServers": {}, "hooks": {}}"#);
@@ -2639,9 +2781,11 @@ fn session_hooks_work_in_the_directory_their_input_names() {
     };
     let camel = serde_json::json!({ "sessionId": "s1", "timestamp": 1, "cwd": root, "source": "new" }).to_string();
     let context = copilot_context(&run(&["hook", "session-start", "--harness", "copilot"], &camel, false)).unwrap();
-    assert!(context.starts_with("bd: agent skills updated from the workspace's .bd/agents: triage (added).\n"));
-    assert!(root.join(".github/skills/triage/SKILL.md").is_file());
-    assert!(!plugin.path().join(".github").exists());
+    assert!(
+        context.starts_with("bd: agent skills changed in the workspace's .bd/agents and not applied: triage (new).")
+    );
+    assert!(root.join(".bd/agents.lock").is_file());
+    assert!(!plugin.path().join(".bd").exists() && !plugin.path().join(".github").exists());
     let snake = serde_json::json!({ "hook_event_name": "SessionStart", "session_id": "s1", "cwd": root }).to_string();
     let context = copilot_context(&run(&["prime", "--hook", "copilot"], &snake, false)).unwrap();
     assert!(context.starts_with("# bd workflow context\n"), "{context}");
@@ -2700,25 +2844,22 @@ fn claude_session_start_hooks_that_copilot_runs_do_nothing() {
     let text = run(&[("CLAUDE_ENV_FILE", env_file.as_os_str())]);
     assert_eq!(
         text,
-        "bd: agent skills updated from the workspace's .bd/agents: deploy (added).\nbd: Claude Code watches \
-         .claude/skills only when it exists at session start: ask the user to run `/reload-skills` to use these in \
-         this session.\n"
+        "bd: agent skills changed in the workspace's .bd/agents and not applied: deploy (new). Ask the user to review \
+         them and run `bd agents approve` in a separate terminal.\n"
     );
     assert_eq!(read(root, "claude-env.sh").as_deref(), Some("export CLAUDE_CODE_SESSION_ID=0000-copilot-1111\n"));
     let lock = read(root, ".bd/agents.lock").unwrap();
     assert!(lock.contains("\"claude\"") && lock.contains("\"github\""), "{lock}");
 
-    // A later change on the server: Copilot's run of the hook still leaves skills, .mcp.json and the lock alone.
-    write_file(&agents, "claude/skills/deploy/SKILL.md", "deploy v2\n");
+    // A later change on the server: Copilot's run of the hook still leaves .mcp.json and the lock alone.
     write_file(&agents, "claude/mcp.json", r#"{"mcpServers": {}}"#);
     let mcp = read(root, ".mcp.json");
     assert_eq!(run(&[]), "");
-    assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v1\n"));
     assert_eq!((read(root, ".mcp.json"), read(root, ".bd/agents.lock")), (mcp, Some(lock)));
     // Claude Code 2.1.132+ also sets its session id in hook processes.
     let text = run(&[CLAUDE].map(|(k, v)| (k, std::ffi::OsStr::new(v))));
-    assert!(text.contains("deploy (updated)") && text.contains("github (removed)"), "{text}");
-    assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v2\n"));
+    assert!(text.contains("deploy (new)") && text.contains("github (removed)"), "{text}");
+    assert!(!read(root, ".mcp.json").unwrap().contains("github"));
 }
 
 /// Kills a child process when dropped, even if the test panics.
@@ -2772,13 +2913,16 @@ fn agents_watch_pulls_a_local_workspaces_changes() {
 
     let first = report();
     assert_eq!(first["applied"], true);
-    assert_eq!(first["harnesses"]["claude"]["skills"]["changed"], serde_json::json!({"deploy": "added"}));
-    assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v1\n"));
+    assert_eq!(first["harnesses"]["claude"]["skills"]["pending"]["deploy"]["change"], "new", "{first}");
+    assert_eq!(read(root, ".claude/skills/deploy/SKILL.md"), None, "waits for bd agents approve");
 
+    // Written here as the server has it: adopted.
+    write_file(root, ".claude/skills/deploy/SKILL.md", "deploy v2\n");
     put_file(&agents, "claude/skills/deploy/SKILL.md", "deploy v2\n");
     let second = report();
-    assert_eq!(second["harnesses"]["claude"]["skills"]["changed"], serde_json::json!({"deploy": "updated"}));
-    assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v2\n"));
+    let skills = &second["harnesses"]["claude"]["skills"];
+    assert_eq!(skills["pending"], serde_json::json!({}), "{second}");
+    assert_eq!(skills["adopted"][0]["path"], ".claude/skills/deploy/SKILL.md", "{second}");
 
     // A set that cannot be read: said once, and once more when it can again.
     put_file(&agents, "claude/mcp.json", "{not json");
@@ -2788,8 +2932,9 @@ fn agents_watch_pulls_a_local_workspaces_changes() {
     assert_eq!(next_line(&err), "bd agents watch: working again");
     // Back as it was pulled: nothing to pull, so the next report is the next change's.
     put_file(&agents, "claude/skills/deploy/SKILL.md", "deploy v3\n");
-    assert_eq!(report()["harnesses"]["claude"]["skills"]["changed"], serde_json::json!({"deploy": "updated"}));
-    assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v3\n"));
+    let third = report();
+    assert_eq!(third["harnesses"]["claude"]["skills"]["pending"]["deploy"]["change"], "changed", "{third}");
+    assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v2\n"));
 
     #[cfg(unix)]
     {

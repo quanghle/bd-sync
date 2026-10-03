@@ -76,6 +76,25 @@ impl Terminal {
         self.master.write_all(format!("{line}\n").as_bytes()).unwrap();
     }
 
+    /// Type `line` and Enter at every `prompt` the terminal shows until the
+    /// command ends; then as [`Terminal::finish`].
+    pub fn answer_every(mut self, prompt: &str, line: &str) -> (Output, String) {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline {
+            while let Some(i) = self.unread.find(prompt) {
+                self.unread.drain(..i + prompt.len());
+                self.answer(line);
+            }
+            if self.child.as_mut().unwrap().try_wait().unwrap().is_some() {
+                break;
+            }
+            if let Err(RecvTimeoutError::Disconnected) = self.receive(Duration::from_millis(50)) {
+                break;
+            }
+        }
+        self.finish()
+    }
+
     /// The child's process id.
     pub fn pid(&self) -> u32 {
         self.child.as_ref().map_or(0, Child::id)

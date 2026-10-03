@@ -328,6 +328,8 @@ fn ready_order_is_deterministic_per_policy() {
     }
     let limited = env.ready_ids_with(&ReadyQuery { limit: Some(2), ..Default::default() });
     assert_eq!(limited, by_priority[..2].to_vec());
+    let unlimited = env.ready_ids_with(&ReadyQuery { limit: Some(usize::MAX), ..Default::default() });
+    assert_eq!(unlimited, by_priority, "a limit past SQLite's integers is no limit");
 }
 
 #[test]

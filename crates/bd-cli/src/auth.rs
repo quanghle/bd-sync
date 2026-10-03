@@ -423,7 +423,7 @@ fn lock_tokens(root: &Path) -> Result<TokensLock> {
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(Error::Busy(format!(
+            return Err(Error::Locked(format!(
                 "another bd process is changing the access tokens ({} is locked); retry",
                 path.display()
             )));

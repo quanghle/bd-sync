@@ -363,7 +363,7 @@ fn take(file: File, path: &Path, wait: Duration, exclusive: bool) -> Result<Mute
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(Error::Busy(format!(
+            return Err(Error::Locked(format!(
                 "another bd agents command is changing the agent assets of this checkout ({} is locked); retry",
                 path.display()
             )));
@@ -725,7 +725,9 @@ mod tests {
         assert!(c.shared(Duration::ZERO).unwrap().is_none(), "nothing to share before any change");
         let held = c.exclusive(Duration::ZERO).unwrap();
         let e = c.exclusive(Duration::from_millis(50)).err().expect("held");
-        assert_eq!(e.exit_code(), 5, "{e}");
+        assert_eq!((e.exit_code(), e.code()), (5, "busy"), "{e}");
+        assert!(e.to_string().starts_with("another bd agents command is changing"), "{e}");
+        assert!(!e.to_string().contains("database"), "{e}");
         assert!(c.shared(Duration::ZERO).is_err(), "readers wait for the writer");
         drop(held);
         let reader = c.shared(Duration::ZERO).unwrap().expect("the mutex file exists now");

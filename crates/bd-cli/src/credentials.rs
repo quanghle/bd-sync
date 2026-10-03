@@ -441,7 +441,7 @@ pub fn lock(path: &Path, wait: Duration) -> Result<Lock> {
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
-            return Err(Error::Busy(format!(
+            return Err(Error::Locked(format!(
                 "another bd process is changing the saved access tokens ({} is locked); retry",
                 lock_path.display()
             )));

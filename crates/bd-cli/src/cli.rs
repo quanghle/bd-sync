@@ -52,7 +52,7 @@ pub struct Global {
     /// Warn about operations slower than this many milliseconds
     #[arg(long, global = true, env = "BD_SLOW_MS", default_value_t = 250, value_name = "MS")]
     pub slow_ms: u64,
-    /// How long a writer waits for the database write lock
+    /// How long a writer waits for the database write lock (and bd agents for a checkout's agent assets mutex)
     #[arg(long, global = true, env = "BD_BUSY_TIMEOUT_MS", default_value_t = 10_000, value_name = "MS")]
     pub busy_timeout_ms: u64,
     /// Read playbooks only from this bundle (how a remote client sends the playbooks of its checkout)

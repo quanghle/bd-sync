@@ -34,7 +34,7 @@ global options, environment variables, configuration keys and exit codes.
 | `--log-format text\|json` | `BD_LOG_FORMAT` | diagnostics format on stderr (filter with `BD_LOG`) |
 | `--timing` | `BD_TIMING=1` | per-command timing on stderr |
 | `--slow-ms MS` | `BD_SLOW_MS` | warn about operations slower than this (default 250) |
-| `--busy-timeout-ms MS` | `BD_BUSY_TIMEOUT_MS` | how long a writer waits for the write lock (default 10000) |
+| `--busy-timeout-ms MS` | `BD_BUSY_TIMEOUT_MS` | how long a writer waits for the database write lock, and `bd agents` for a checkout's agent assets mutex (default 10000) |
 
 ## Environment variables
 
@@ -74,7 +74,7 @@ Besides the variables of the global options:
 | 2 | invalid input (including `--force` on `update`/`release`: use `--take-over`), cycle, or policy refusal |
 | 3 | not found or no workspace |
 | 4 | claim conflict: already claimed (a live claim, even your own actor's, without its `--token`), not ready, not the holder of a live claim (`--take-over` takes it over; `--force` does not), or lease lost |
-| 5 | database busy, or another bd process kept a checkout's agent assets mutex (`.bd/agents.lock.mutex`) past `--busy-timeout-ms` |
+| 5 | busy: the database write lock or a checkout's agent assets mutex (`.bd/agents.lock.mutex`) stayed held past `--busy-timeout-ms`, or another bd process kept the access tokens (`tokens.lock`) or saved credentials (`credentials.lock`) locked; retry |
 | 6 | event cursor truncated |
 | 7 | access denied: missing, invalid or expired token, or its role, kind, workspaces or actor do not allow it; or a GitHub sign-in that was refused |
 | 8 | bd server unreachable, its certificate not trusted, or a server failure: the command did not take effect (retrying is safe) |

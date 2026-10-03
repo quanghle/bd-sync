@@ -2759,6 +2759,7 @@ fn session_start_hook_reports_problems_in_one_line() {
     assert_eq!(text.lines().count(), 1, "{text}");
     assert!(text.starts_with("bd: agent skills and MCP definitions not checked: "), "{text}");
     assert!(text.contains("is changing the agent assets of this checkout"), "{text}");
+    assert!(!text.contains("database"), "{text}");
     assert_eq!(copilot.lines().count(), 1, "{copilot}");
     assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v1\n"));
     fs4::FileExt::unlock(&mutex).unwrap();

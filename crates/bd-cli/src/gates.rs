@@ -521,7 +521,9 @@ fn apply_verdicts(tx: &mut WriteCtx<'_>, checked: &mut [Checked]) -> Result<()> 
                 c.unblocked = unblocked;
             }
             Ok(None) => {}
-            Err(e @ (Error::Sqlite(_) | Error::Io(_) | Error::Busy(_) | Error::Json(_))) => return Err(e),
+            Err(e @ (Error::Sqlite(_) | Error::Io(_) | Error::Busy(_) | Error::Locked(_) | Error::Json(_))) => {
+                return Err(e);
+            }
             Err(e) => {
                 c.action = "error".into();
                 c.verdict = Verdict::Pending(e.to_string());

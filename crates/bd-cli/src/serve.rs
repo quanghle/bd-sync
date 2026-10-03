@@ -379,7 +379,7 @@ impl Reject {
 
     fn internal(e: Error) -> Reject {
         tracing::error!(target: "bd::serve", error = %e, "request failed");
-        let status = if matches!(e, Error::Busy(_)) {
+        let status = if matches!(e, Error::Busy(_) | Error::Locked(_)) {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -581,7 +581,7 @@ fn auth_answer(answer: Result<serde_json::Value>) -> Response<Body> {
                 Error::Unauthorized(_) => StatusCode::FORBIDDEN,
                 Error::Invalid(_) => StatusCode::BAD_REQUEST,
                 Error::Remote(_) => StatusCode::BAD_GATEWAY,
-                Error::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
+                Error::Busy(_) | Error::Locked(_) => StatusCode::SERVICE_UNAVAILABLE,
                 _ => return Reject::internal(e).response(),
             };
             Reject::new(status, e.code(), e.to_string(), e.exit_code()).response()

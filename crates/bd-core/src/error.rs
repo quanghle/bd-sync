@@ -58,6 +58,11 @@ pub enum Error {
     #[error("database is busy: {0}")]
     Busy(String),
 
+    /// Another bd process holds a lock file (not the database) past the
+    /// wait: the message names the file and says what to do.
+    #[error("{0}")]
+    Locked(String),
+
     #[error("database schema v{found} is newer than this binary supports (v{supported}); upgrade bd")]
     SchemaTooNew { found: i64, supported: i64 },
 
@@ -124,7 +129,7 @@ impl Error {
             Error::Cycle { .. } => "cycle",
             Error::Refused(_) => "refused",
             Error::EventsTruncated { .. } => "events_truncated",
-            Error::Busy(_) => "busy",
+            Error::Busy(_) | Error::Locked(_) => "busy",
             Error::SchemaTooNew { .. } => "schema_too_new",
             Error::NoWorkspace(_) => "no_workspace",
             Error::Unauthorized(_) => "unauthorized",
@@ -148,7 +153,7 @@ impl Error {
             | Error::NotOwner { .. }
             | Error::ClaimsHeld { .. }
             | Error::LeaseLost { .. } => 4,
-            Error::Busy(_) => 5,
+            Error::Busy(_) | Error::Locked(_) => 5,
             Error::EventsTruncated { .. } => 6,
             Error::Unauthorized(_) => 7,
             Error::Remote(_) => 8,

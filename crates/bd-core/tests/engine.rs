@@ -1184,3 +1184,17 @@ fn batched_event_pages_are_the_whole_pages() {
     assert!(matches!(env.store.read(|r| r.events(&behind)), Err(Error::EventsTruncated { .. })));
     assert!(matches!(each(&env.store, &behind, 2), Err(Error::EventsTruncated { .. })));
 }
+
+#[test]
+fn a_writer_past_the_busy_timeout_is_told_the_database_is_busy() {
+    let mut env = Env::new();
+    env.create("First", 2);
+    let writer = rusqlite::Connection::open(&env.path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let opts = OpenOptions { clock: env.clock.clone(), busy_timeout: Duration::from_millis(50), ..Default::default() };
+    let mut other = Store::open(&env.path, opts).unwrap();
+    let e = other.write("create", "bob", |tx| tx.create_issue(NewIssue::titled("Second"))).unwrap_err();
+    assert_eq!((e.code(), e.exit_code()), ("busy", 5), "{e}");
+    assert!(e.to_string().starts_with("database is busy: timed out after"), "{e}");
+    writer.execute_batch("COMMIT").unwrap();
+}

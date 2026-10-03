@@ -1776,8 +1776,8 @@ fn retries_that_wait_get_a_fresh_retry_time_but_not_forever() {
     );
 }
 
-/// An HTTPS server whose certificate a private CA signed; returns the server and the CA and key PEM files in `dir`.
-fn https_server(dir: &Path) -> (Server, std::path::PathBuf, std::path::PathBuf) {
+/// A private CA and a certificate it signed for 127.0.0.1: the CA, certificate and key PEM files in `dir`.
+fn private_ca(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -1789,7 +1789,12 @@ fn https_server(dir: &Path) -> (Server, std::path::PathBuf, std::path::PathBuf) 
     std::fs::write(&ca_pem, ca_cert.pem()).unwrap();
     std::fs::write(&cert_pem, cert.pem()).unwrap();
     std::fs::write(&key_pem, key.serialize_pem()).unwrap();
+    (ca_pem, cert_pem, key_pem)
+}
 
+/// An HTTPS server whose certificate a private CA signed; returns the server and the CA and key PEM files in `dir`.
+fn https_server(dir: &Path) -> (Server, std::path::PathBuf, std::path::PathBuf) {
+    let (ca_pem, cert_pem, key_pem) = private_ca(dir);
     let server =
         Server::start_with(&["--tls-cert", cert_pem.to_str().unwrap(), "--tls-key", key_pem.to_str().unwrap()]);
     assert!(server.base.starts_with("https://"), "{}", server.base);
@@ -4650,15 +4655,45 @@ struct GithubState {
 
 impl FakeGithub {
     fn start() -> FakeGithub {
+        FakeGithub::serve(None)
+    }
+
+    /// GitHub over HTTPS, with this certificate and key (PEM files).
+    fn start_https(cert: &Path, key: &Path) -> FakeGithub {
+        use tokio_rustls::rustls;
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let certs = CertificateDer::pem_file_iter(cert).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+        let key = PrivateKeyDer::from_pem_file(key).unwrap();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        FakeGithub::serve(Some(Arc::new(config)))
+    }
+
+    fn serve(tls: Option<Arc<tokio_rustls::rustls::ServerConfig>>) -> FakeGithub {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let url = format!("{scheme}://{}", listener.local_addr().unwrap());
         let state = Arc::new(std::sync::Mutex::new(GithubState::default()));
         let shared = state.clone();
         std::thread::spawn(move || {
             for conn in listener.incoming() {
                 let Ok(conn) = conn else { return };
-                let state = shared.clone();
-                std::thread::spawn(move || github_answer(conn, &state));
+                let (state, tls) = (shared.clone(), tls.clone());
+                std::thread::spawn(move || match tls {
+                    None => github_answer(conn, &state),
+                    Some(config) => {
+                        let tls = tokio_rustls::rustls::ServerConnection::new(config).unwrap();
+                        let mut stream = tokio_rustls::rustls::StreamOwned::new(tls, conn);
+                        github_answer(&mut stream, &state);
+                        stream.conn.send_close_notify();
+                        let _ = stream.flush();
+                    }
+                });
             }
         });
         FakeGithub { url, state }
@@ -4713,8 +4748,8 @@ fn app_jwt(jwt: &str) -> bool {
     jwt.split('.').count() == 3 && claims["iss"] == "Iv1.test" && claims["exp"].as_i64().is_some_and(|exp| exp > now)
 }
 
-fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubState>) {
-    let mut reader = BufReader::new(conn.try_clone().unwrap());
+fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>) {
+    let mut reader = BufReader::new(conn);
     let mut request = String::new();
     if reader.read_line(&mut request).unwrap_or(0) == 0 {
         return;
@@ -4863,7 +4898,9 @@ fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubS
     drop(s);
     let text = answer.to_string();
     let head = format!("HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n", text.len());
+    let conn = reader.get_mut();
     let _ = conn.write_all(format!("{head}connection: close\r\n\r\n{text}").as_bytes());
+    let _ = conn.flush();
 }
 
 /// A server whose GitHub sign-in goes to `github`, with these `[[github.allow]]` rules.
@@ -5685,4 +5722,44 @@ fn sign_in_tokens_end_on_the_server_when_logged_out_or_replaced() {
     let v = logout(&[("BD_REMOTE_RETRY_SECS", "0")]);
     assert_eq!(v["revocations"][0]["outcome"], "not_revoked", "{v}");
     assert_eq!(saved_token(machine.path()), None);
+}
+
+#[test]
+fn github_sign_in_trusts_a_private_ca_named_in_auth_toml() {
+    let certs = tempfile::tempdir().unwrap();
+    let (ca_pem, cert_pem, key_pem) = private_ca(certs.path());
+    let github = FakeGithub::start_https(&cert_pem, &key_pem);
+    assert!(github.url.starts_with("https://"), "{}", github.url);
+    github.install("acme");
+    github.member("alice", "acme");
+    let server = refresh_server(&github, "[[github.allow]]\norgs = [\"acme\"]\n");
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+
+    // Without ca_cert, GitHub's certificate is refused before anything reaches it.
+    github.next("alice", 0);
+    let alice = tempfile::tempdir().unwrap();
+    let out = github_login(alice.path(), &url);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(8), "{stderr}");
+    assert!(stderr.contains("invalid peer certificate") && stderr.contains("github.ca_cert"), "{stderr}");
+    assert!(github.log().is_empty(), "{:?}", github.log());
+    assert_eq!(saved_token(alice.path()), None);
+
+    // With it (relative to the root; auth.toml is read for each sign-in): the
+    // device flow, the account's API calls and the GitHub App's all trust it.
+    std::fs::copy(&ca_pem, root.join("ghes-ca.pem")).unwrap();
+    let config = std::fs::read_to_string(root.join("auth.toml")).unwrap();
+    let config = config.replacen("[github]\n", "[github]\nca_cert = \"ghes-ca.pem\"\n", 1);
+    std::fs::write(root.join("auth.toml"), config).unwrap();
+    let v: Value = serde_json::from_str(&check(github_login(alice.path(), &url), "login")).unwrap();
+    assert_eq!(v["github"]["via"], "member of acme");
+    let first = saved_token(alice.path()).unwrap();
+    renewal_due(alice.path());
+    check(signed_in(alice.path(), &url, &["list"]), "list, renewed first");
+    assert_ne!(saved_token(alice.path()).unwrap(), first, "renewed");
+    let log = github.log();
+    for asked in ["POST /login/device/code", "GET /user ", "POST /app/installations/1/access_tokens", "GET /orgs/acme/"]
+    {
+        assert!(log.iter().any(|l| l.starts_with(asked)), "{asked}: {log:?}");
+    }
 }

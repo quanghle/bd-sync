@@ -8,6 +8,7 @@
 //! [github]
 //! client_id = "Ov23li0123456789abcd"  # a GitHub OAuth app or GitHub App, with device flow enabled
 //! private_key = "github-app.pem"     # the GitHub App's private key (relative to the root): refreshes tokens
+//! ca_cert = "ghes-ca.pem"             # trust this CA for GitHub instead of the usual ones (relative to the root)
 //! token_ttl = "1h"                    # access tokens expire (default 1h)
 //! refresh_limit = "30d"               # refreshed for at most this long after the sign-in (default 30d)
 //! refresh_idle = "7d"                 # and not after this long without a refresh (default 7d)
@@ -55,6 +56,13 @@
 //! signed in for, the sign-in gets new secrets with what the first matching
 //! rule grants now; if not, it is revoked. A refresh secret works once: one
 //! used again revokes the sign-in, as someone else may hold a copy.
+//!
+//! `url` and `api_url` name a GitHub Enterprise Server instead of github.com
+//! (`api_url` defaults to `<url>/api/v3`). With `ca_cert`, a PEM file of CA
+//! certificates (a server behind a private CA), the certificates of `url` and
+//! `api_url` are checked against that file only, instead of the well-known
+//! CAs, for every request to GitHub: the device flow, the account's and the
+//! GitHub App's API calls. Like `private_key`, it is read with the file.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -111,6 +119,8 @@ struct GithubDoc {
     #[serde(default)]
     private_key: Option<PathBuf>,
     #[serde(default)]
+    ca_cert: Option<PathBuf>,
+    #[serde(default)]
     token_ttl: Option<String>,
     #[serde(default)]
     refresh_limit: Option<String>,
@@ -164,6 +174,11 @@ pub struct Github {
     pub private_key: Option<PathBuf>,
     /// The key itself, read by [`load`]: tokens are refreshed only with it.
     pub app: Option<AppKey>,
+    /// The CA certificate file GitHub's certificates are checked against, as
+    /// written (relative to the root); `None` for the well-known CAs.
+    pub ca_cert: Option<PathBuf>,
+    /// Its certificates, read by [`load`].
+    pub roots: Option<CaCerts>,
     /// How long after its sign-in a token may be refreshed.
     pub refresh_limit: Duration,
     /// How long a sign-in may go without a refresh.
@@ -262,6 +277,35 @@ impl AppKey {
     }
 }
 
+/// The certificates of `github.ca_cert`, which GitHub's are checked against
+/// instead of the well-known CAs'.
+#[derive(Clone)]
+pub struct CaCerts {
+    path: PathBuf,
+    roots: ureq::tls::RootCerts,
+}
+
+impl std::fmt::Debug for CaCerts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaCerts").field("path", &self.path).finish()
+    }
+}
+
+impl PartialEq for CaCerts {
+    fn eq(&self, other: &CaCerts) -> bool {
+        self.path == other.path
+    }
+}
+
+impl Eq for CaCerts {}
+
+impl CaCerts {
+    fn load(path: &Path) -> std::result::Result<CaCerts, String> {
+        let certs = crate::remote::ca_certificates(path).map_err(|e| format!("github.ca_cert {e}"))?;
+        Ok(CaCerts { path: path.to_path_buf(), roots: ureq::tls::RootCerts::new_with_certs(&certs) })
+    }
+}
+
 /// Installation tokens of GitHub Apps, by `<api_url> <client_id> <org or *>`,
 /// with when to stop using them: shared by every refresh.
 static INSTALLATION_TOKENS: LazyLock<Mutex<HashMap<String, (String, Instant)>>> = LazyLock::new(Default::default);
@@ -278,9 +322,13 @@ pub fn load(root: &Path) -> Result<Option<Github>> {
     let Some(mut github) = parse(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))? else {
         return Ok(None);
     };
+    let in_root = |p: &PathBuf| if p.is_relative() { root.join(p) } else { p.clone() };
+    let bad = |e: String| Error::invalid(format!("{}: {e}", path.display()));
     if let Some(key) = &github.private_key {
-        let key = if key.is_relative() { root.join(key) } else { key.clone() };
-        github.app = Some(AppKey::load(&key).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?);
+        github.app = Some(AppKey::load(&in_root(key)).map_err(bad)?);
+    }
+    if let Some(ca) = &github.ca_cert {
+        github.roots = Some(CaCerts::load(&in_root(ca)).map_err(bad)?);
     }
     Ok(Some(github))
 }
@@ -320,6 +368,11 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
         return Err("github.private_key is empty: name the GitHub App's private key file, or leave it out".into());
     }
     let private_key = g.private_key;
+    if g.ca_cert.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+        return Err("github.ca_cert is empty: name the file of the CA certificates GitHub's are checked against, or \
+                    leave it out"
+            .into());
+    }
     if private_key.is_none() && (g.refresh_limit.is_some() || g.refresh_idle.is_some()) {
         return Err("github.refresh_limit and refresh_idle need github.private_key: only a GitHub App refreshes \
                     tokens"
@@ -376,6 +429,8 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
         token_ttl,
         private_key,
         app: None,
+        ca_cert: g.ca_cert,
+        roots: None,
         refresh_limit,
         refresh_idle,
         deny: g.deny,
@@ -590,10 +645,15 @@ struct Api {
 
 impl Api {
     fn new(github: &Github) -> Api {
+        let mut tls = ureq::tls::TlsConfig::builder();
+        if let Some(ca) = &github.roots {
+            tls = tls.root_certs(ca.roots.clone());
+        }
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_global(Some(GITHUB_TIMEOUT))
             .user_agent(format!("bd/{}", env!("CARGO_PKG_VERSION")))
+            .tls_config(tls.build())
             .build();
         Api { url: github.url.clone(), api_url: github.api_url.clone(), agent: config.into() }
     }
@@ -634,7 +694,18 @@ impl Api {
 
 /// A GitHub answer's status, and its JSON body (`null` when it has none).
 fn answer(url: &str, sent: std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<(u16, Value)> {
-    let mut response = sent.map_err(|e| Error::Remote(format!("GitHub ({url}) did not answer: {e}")))?;
+    let mut response = sent.map_err(|e| {
+        let e = e.to_string();
+        // rustls describes a rejected certificate only in text.
+        if e.contains("invalid peer certificate") {
+            tracing::warn!(target: "bd::serve", %url, error = %e, "GitHub's certificate was refused: a GitHub Enterprise Server behind a private CA needs github.ca_cert in auth.toml");
+            return Error::Remote(format!(
+                "GitHub ({url}) could not be trusted: {e} (a GitHub Enterprise Server behind a private CA needs \
+                 github.ca_cert in the auth.toml of this bd server)"
+            ));
+        }
+        Error::Remote(format!("GitHub ({url}) did not answer: {e}"))
+    })?;
     let status = response.status().as_u16();
     let text = response
         .body_mut()
@@ -1303,6 +1374,42 @@ mod tests {
         let now = Timestamp::now();
         let life = g.lifetime(now).refresh.unwrap();
         assert_eq!(life, (now.plus(DEFAULT_REFRESH_LIMIT), DEFAULT_REFRESH_IDLE));
+    }
+
+    #[test]
+    fn auth_toml_trusts_a_private_ca_for_github() {
+        let base = "[github]\nclient_id = \"x\"\nurl = \"https://ghe.example.com\"\n";
+        let rule = "\n[[github.allow]]\nusers = [\"a\"]\n";
+        let g = github(&format!("{base}{rule}"));
+        assert_eq!((g.ca_cert.as_ref(), g.roots.as_ref()), (None, None), "the well-known CAs");
+        let g = github(&format!("{base}ca_cert = \"ghes-ca.pem\"{rule}"));
+        assert_eq!((g.ca_cert.as_deref(), g.roots.as_ref()), (Some(Path::new("ghes-ca.pem")), None), "read by load");
+        let e = error(&format!("{base}ca_cert = \"\"{rule}"));
+        assert!(e.contains("github.ca_cert is empty"), "{e}");
+
+        // load() reads the certificates, relative to the root, or at an absolute path.
+        let dir = tempfile::tempdir().unwrap();
+        let write_config = |ca: &str| {
+            std::fs::write(dir.path().join(FILE), format!("{base}ca_cert = {ca:?}{rule}")).unwrap();
+        };
+        write_config("ghes-ca.pem");
+        let e = load(dir.path()).unwrap_err();
+        let shown = e.to_string();
+        assert!(shown.contains(FILE) && shown.contains("github.ca_cert") && shown.contains("ghes-ca.pem"), "{e}");
+        assert_eq!(e.exit_code(), 2, "{e}");
+        std::fs::write(dir.path().join("ghes-ca.pem"), TEST_KEY).unwrap();
+        let e = load(dir.path()).unwrap_err().to_string();
+        assert!(e.contains("github.ca_cert") && e.contains("no certificate in the file"), "a key is not a CA: {e}");
+        let ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        let ca = ca.self_signed(&rcgen::KeyPair::generate().unwrap()).unwrap();
+        std::fs::write(dir.path().join("ghes-ca.pem"), ca.pem()).unwrap();
+        let g = load(dir.path()).unwrap().unwrap();
+        let roots = g.roots.as_ref().expect("loaded");
+        assert_eq!(roots.path, dir.path().join("ghes-ca.pem"));
+        assert!(!format!("{roots:?}").contains("BEGIN"), "{roots:?}");
+        let absolute = dir.path().join("ghes-ca.pem");
+        write_config(absolute.to_str().unwrap());
+        assert_eq!(load(dir.path()).unwrap().unwrap().roots.unwrap().path, absolute);
     }
 
     #[test]

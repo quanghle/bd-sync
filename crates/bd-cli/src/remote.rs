@@ -294,7 +294,13 @@ fn token_for(url: &str, trust: &Trust, source: &Source) -> Result<Option<Token>>
 
 /// The certificates of a PEM CA file.
 fn read_ca(path: &Path) -> Result<Vec<ureq::tls::Certificate<'static>>> {
-    let pem = std::fs::read(path).map_err(|e| Error::invalid(format!("CA certificate {}: {e}", path.display())))?;
+    ca_certificates(path).map_err(|e| Error::invalid(format!("CA certificate {e}")))
+}
+
+/// The certificates of a PEM CA file; the error starts with its path, for
+/// the caller to say which setting named it.
+pub fn ca_certificates(path: &Path) -> std::result::Result<Vec<ureq::tls::Certificate<'static>>, String> {
+    let pem = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let certs: Vec<ureq::tls::Certificate<'static>> = ureq::tls::parse_pem(&pem)
         .filter_map(|item| match item {
             Ok(ureq::tls::PemItem::Certificate(c)) => Some(c),
@@ -302,7 +308,7 @@ fn read_ca(path: &Path) -> Result<Vec<ureq::tls::Certificate<'static>>> {
         })
         .collect();
     if certs.is_empty() {
-        return Err(Error::invalid(format!("CA certificate {}: no certificate in the file", path.display())));
+        return Err(format!("{}: no certificate in the file", path.display()));
     }
     Ok(certs)
 }

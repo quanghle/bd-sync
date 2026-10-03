@@ -95,6 +95,7 @@ token_ttl = "1h"                        # access tokens expire (5m to 366d; defa
 refresh_limit = "30d"                   # refreshed for at most this long after the sign-in (default 30d)
 refresh_idle = "7d"                     # and not after this long without one (default 7d)
 # url = "https://ghe.example.com"       # GitHub Enterprise Server; its API defaults to <url>/api/v3 (api_url)
+# ca_cert = "ghes-ca.pem"               # its private CA, relative to the root: trusted instead of the usual CAs
 # deny = [12345]                        # GitHub user ids that may never sign in (`bd serve token accounts`)
 
 # Rules, in order: the first that lets an account into the workspace decides its token.
@@ -122,12 +123,20 @@ workspaces = ["proj"]                   # default: every workspace
 
 `bd serve` checks the file when it starts, and refuses to start with a
 mistake in it (an unknown field, a rule that names nobody, an `http` URL to
-another host, an `anyone` rule that is not the last or gives more than a rule
-before it). After that, each sign-in reads it again, so changes need no
-restart; a mistake made meanwhile fails sign-ins and refreshes, with the
-reason in the server log only. It also says at start whether tokens are
-refreshed.
+another host, a `private_key` or `ca_cert` it cannot read, an `anyone` rule
+that is not the last or gives more than a rule before it). After that, each
+sign-in reads it again, so changes need no restart; a mistake made meanwhile
+fails sign-ins and refreshes, with the reason in the server log only. It also
+says at start whether tokens are refreshed.
 
+- A GitHub Enterprise Server is named by `url` (and `api_url`, when its API
+  is elsewhere than `<url>/api/v3`). If its certificate comes from a private
+  CA, `ca_cert` names a PEM file of that CA's certificates (relative to the
+  root, like `private_key`): the server then checks the certificates of
+  `url` and `api_url` against that file only, instead of the well-known CAs,
+  for every request to GitHub (sign-ins, memberships, refreshes), as a
+  client's `ca_cert` does for a bd server. Without it, sign-ins fail with an
+  `invalid peer certificate` error that names `github.ca_cert`.
 - A rule lets an account in if `users` lists its login, or if it is an active
   member (not just invited) of one of its `orgs` or `teams`. Memberships are
   read with the account's own GitHub token, so the sign-in asks for the

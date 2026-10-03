@@ -1056,7 +1056,9 @@ pub(crate) enum Access {
 pub(crate) fn access(cmd: &Command) -> Access {
     use Command as C;
     match cmd {
-        C::Init(_) | C::Serve(_) | C::Remote(_) | C::Hook(_) | C::Bench(_) | C::BenchWorker(_) => Access::Local,
+        C::Init(_) | C::Serve(_) | C::Mcp(_) | C::Remote(_) | C::Hook(_) | C::Bench(_) | C::BenchWorker(_) => {
+            Access::Local
+        }
         C::Events(a) if a.follow => Access::Local,
         C::Events(a) if a.action.is_none() => Access::Read,
         C::Playbook(PlaybookCommand::Extract(a)) if a.save => Access::Local,
@@ -1368,7 +1370,11 @@ impl Server {
         app.location = request.location;
         app.request = key;
         // What the token may override: admin-only commands, other actors' claims, human gates.
-        let policy = token.policy();
+        let mut policy = token.policy();
+        if request.tool_call {
+            policy.admin = false;
+            policy.human = false;
+        }
         // Output streams to the client as the command writes it.
         let out = Rc::new(RefCell::new(out));
         let capture = Capture {

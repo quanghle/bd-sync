@@ -5686,3 +5686,121 @@ fn sign_in_tokens_end_on_the_server_when_logged_out_or_replaced() {
     assert_eq!(v["revocations"][0]["outcome"], "not_revoked", "{v}");
     assert_eq!(saved_token(machine.path()), None);
 }
+
+#[test]
+fn mcp_forwards_tool_calls_to_the_server() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "Design", "-p", "1"]);
+    alice.ok(&["create", "Build", "--dep", "t-1"]);
+
+    let mut child =
+        alice.cmd(&["mcp"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut call = |tool: &str, arguments: Value| -> Value {
+        let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": tool, "arguments": arguments, "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {} } } });
+        writeln!(stdin, "{request}").unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let answer: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(answer["result"]["isError"], false, "{answer}");
+        serde_json::from_str(answer["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+
+    let claim = call("claim", json!({ "next": true }));
+    assert_eq!(claim["issue"]["id"], "t-1");
+    let holder = claim["issue"]["assignee"].as_str().unwrap().to_string();
+    assert!(holder.starts_with("alice/mcp-"), "a session of the token's actor: {holder}");
+    let token = claim["lease"]["token"].clone();
+    assert!(call("heartbeat", json!({ "id": "t-1", "token": token }))["expires_at"].is_string());
+    let closed = call("close", json!({ "ids": ["t-1"], "reason": "done", "token": token }));
+    assert_eq!(closed["unblocked"][0]["id"], "t-2", "{closed}");
+    assert_eq!(call("ready", json!({}))["issues"][0]["id"], "t-2");
+    drop(call);
+    drop(stdin);
+    assert!(child.wait().unwrap().success(), "ends with its input");
+
+    let history = alice.json(&["history", "t-1"]);
+    assert!(history.as_array().unwrap().iter().all(|e| e["actor"] == holder || e["op"] == "created"), "{history}");
+}
+
+/// `bd mcp`'s answers to `messages`, sent one per line, then end of input.
+fn mcp_answers(mut cmd: Command, messages: &[Value]) -> Vec<Value> {
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for m in messages {
+        writeln!(stdin, "{m}").unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    check(out, "bd mcp").lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+fn mcp_tool_call(tool: &str, arguments: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": arguments,
+        "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {} } } })
+}
+
+/// A tool result's error, or `None` if it succeeded.
+fn mcp_tool_error(answer: &Value) -> Option<Value> {
+    let text = answer["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{answer}"));
+    (answer["result"]["isError"] == true).then(|| serde_json::from_str::<Value>(text).unwrap()["error"].clone())
+}
+
+#[test]
+fn mcp_tool_calls_never_carry_a_persons_rights() {
+    let server = Server::start();
+    let carol = server.client(&server.token("carol-desk", "carol", &["--kind", "human"]));
+    carol.ok(&["create", "Ship"]);
+    let gate = carol.ok(&["-q", "gate", "create", "-t", "human", "--blocks", "t-1"]).trim().to_string();
+
+    let answers = mcp_answers(
+        carol.cmd(&["mcp"]),
+        &[
+            mcp_tool_call("close", json!({ "ids": [gate], "reason": "approved by the model" })),
+            mcp_tool_call("update", json!({ "id": gate, "status": "pinned" })),
+        ],
+    );
+    for answer in &answers {
+        let error = mcp_tool_error(answer).unwrap_or_else(|| panic!("a model opened a human gate: {answer}"));
+        assert_eq!(error["code"], "unauthorized", "{error}");
+    }
+    assert_eq!(carol.json(&["show", &gate])["status"], "open");
+    // The person's own command line still opens it.
+    carol.ok(&["close", &gate, "--reason", "approved"]);
+}
+
+#[test]
+fn mcp_reports_lost_write_answers_as_lost() {
+    let server = FakeServer::start(|_| answer(&[], true, 5));
+    let client = server.client();
+    let mut cmd = client.cmd(&["mcp"]);
+    cmd.env("BD_REMOTE_RETRY_SECS", "1");
+    let answers =
+        mcp_answers(cmd, &[mcp_tool_call("create", json!({ "title": "Lost" })), mcp_tool_call("ready", json!({}))]);
+    let write = mcp_tool_error(&answers[0]).unwrap();
+    assert_eq!(write["exit_code"], 9, "{write}");
+    assert!(write["message"].as_str().unwrap().contains("may have taken effect"), "{write}");
+    let read = mcp_tool_error(&answers[1]).unwrap();
+    assert_eq!(read["exit_code"], 8, "a read is safe to run again: {read}");
+    let bodies = server.bodies.lock().unwrap();
+    assert!(bodies.iter().all(|b| b.contains("\"tool_call\":true")), "{bodies:?}");
+}
+
+#[test]
+fn mcp_never_prints_streamed_answers_on_its_protocol_stream() {
+    // A streamed answer (no Content-Length), as bd serve sends any answer over one chunk.
+    let issue = json!([{ "id": "t-1", "title": "Big", "status": "open", "priority": 2, "issue_type": "task",
+        "description": "x".repeat(100_000) }]);
+    let server =
+        FakeServer::start(move |_| answer(&[stdout_frame(&format!("{issue:#}\n")), exit_frame(0, "")], true, 0));
+    let answers = mcp_answers(server.client().cmd(&["mcp"]), &[mcp_tool_call("ready", json!({}))]);
+    assert_eq!(answers.len(), 1, "only protocol messages on stdout");
+    assert!(mcp_tool_error(&answers[0]).is_none(), "{}", answers[0]);
+    let text: Value = serde_json::from_str(answers[0]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["issues"][0]["id"], "t-1", "{text}");
+}

@@ -167,6 +167,8 @@ pub enum Command {
     BenchWorker(BenchWorkerArgs),
     /// Serve workspaces to remote bd clients over HTTPS; `bd serve token` manages access
     Serve(ServeArgs),
+    /// Serve this workspace to an AI assistant as MCP tools over stdio (local or remote workspace)
+    Mcp(McpArgs),
     /// Use a workspace on a bd server from this checkout: set, show (with a connection check), unset, login, logout
     #[command(subcommand)]
     Remote(RemoteCommand),
@@ -1243,6 +1245,13 @@ pub struct BenchWorkerArgs {
     pub heartbeat: bool,
     #[arg(long, default_value = "normal")]
     pub durability: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct McpArgs {
+    /// Offer only the tools that read (ready, list, show, memories)
+    #[arg(long)]
+    pub read_only: bool,
 }
 
 #[derive(Args, Debug, Clone)]

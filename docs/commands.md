@@ -14,7 +14,7 @@ global options, environment variables, configuration keys and exit codes.
 | Ready work and claims | `ready`, `claim` (`--next`), `heartbeat`, `release`, `reclaim`, `leases` | [Ready-work order](concepts.md#ready-work-order), [Claims](concepts.md#claims-leases-and-recovery) |
 | Comments and memory | `comment add`, `comments`, `memory`, `remember`, `recall`, `memories`, `forget` | [Comments and memory](concepts.md#comments-and-memory) |
 | Events | `events` (`--follow`, `--wait`, `prune`), `history` | [Event history](concepts.md#event-history) |
-| Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `agents status/pull/approve/watch/manifest` | [Actors](concepts.md#actors), [Agent skills](agents.md) |
+| Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `agents status/pull/approve/watch/manifest`, `mcp` (MCP tools over stdio) | [Actors](concepts.md#actors), [Agent skills](agents.md), [MCP server](mcp.md) |
 | Playbooks and gates | `playbook list/show/plan/run/status/runs/compact/discard/extract`, `gate list/show/check/resolve/create`, `purge` | [Playbooks](playbooks.md) |
 | Data | `export`, `import` (bd or beads JSONL, all or nothing), `batch` (many writes in one transaction, `--dry-run` rolls back) | [Migrating](beads.md#migrating-from-go-beads) |
 | Operations | `metrics`, `bench` | [Observability](observability.md), [Benchmarks](benchmarks.md) |

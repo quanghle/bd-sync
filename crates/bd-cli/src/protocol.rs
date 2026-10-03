@@ -85,6 +85,10 @@ pub struct ExecRequest {
     /// How the client names the workspace (its URL), shown by `prime` and `info`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
+    /// A model's tool call (`bd mcp`): it runs with the actor's own rights
+    /// only, never the token's admin or human ones.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool_call: bool,
 }
 
 /// One line of a 200 answer.

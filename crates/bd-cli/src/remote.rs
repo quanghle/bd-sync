@@ -907,6 +907,13 @@ impl Remote {
         self.exec_into(request, &mut Delivery::collect())
     }
 
+    /// Like [`Remote::exec`]; a `write` whose answer is lost fails with
+    /// [`Error::AnswerLost`], never as safe to run again. Nothing is printed,
+    /// however long the answer.
+    pub fn exec_collected(&self, request: &ExecRequest, write: bool) -> Result<ExecResponse> {
+        self.exec_into(request, &mut Delivery::new(Vec::new(), true, write))
+    }
+
     /// Like [`Remote::exec`], for a request the server may hold until it has
     /// something to say: it is retried for as long after its first failure,
     /// not after it was sent.

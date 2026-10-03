@@ -2951,3 +2951,123 @@ fn agents_watch_pulls_a_local_workspaces_changes() {
         assert_eq!(status.code(), Some(0), "Ctrl-C ends it");
     }
 }
+
+/// Send `messages` to `bd mcp` (one per line, then end of input); its answers.
+fn mcp_session(mut cmd: Command, messages: &[Value]) -> Vec<Value> {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for m in messages {
+        writeln!(stdin, "{m}").unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "bd mcp failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+/// A tools/call request in the 2026-07-28 protocol.
+fn mcp_call(id: i64, tool: &str, arguments: Value) -> Value {
+    serde_json::json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+        "name": tool, "arguments": arguments,
+        "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} },
+    } })
+}
+
+/// A tool result's JSON text, and whether it is an error.
+fn mcp_result(answer: &Value) -> (bool, Value) {
+    let result = &answer["result"];
+    assert_eq!(result["resultType"], "complete", "{answer}");
+    (result["isError"] == true, serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap())
+}
+
+#[test]
+fn mcp_serves_the_local_workspace_on_stdio() {
+    let ws = Ws::new();
+    ws.ok(&["create", "First", "-p", "1"]);
+    ws.ok(&["create", "Second", "-p", "2"]);
+    ws.ok(&["create", "Held elsewhere", "-p", "3"]);
+    ws.ok(&["claim", "t-3"]);
+
+    // Nothing names an actor or a session: the process gets a session of its own.
+    let mut cmd = Ws::cmd_in(ws.dir.path(), "", &["mcp"]);
+    cmd.env_remove("BD_ACTOR");
+    let legacy = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": { "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } } });
+    let answers = mcp_session(
+        cmd,
+        &[
+            legacy,
+            serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+            serde_json::json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+            mcp_call(3, "claim", serde_json::json!({ "next": true })),
+            mcp_call(4, "close", serde_json::json!({ "ids": ["t-3"], "reason": "not mine" })),
+            mcp_call(5, "create", serde_json::json!({ "title": "--flag-like title", "deps": ["discovered-from:t-1"] })),
+            mcp_call(6, "show", serde_json::json!({ "ids": ["t-404"] })),
+            mcp_call(7, "show", serde_json::json!({ "ids": ["t-1"], "verbose": true })),
+        ],
+    );
+    assert_eq!(answers.len(), 7, "no answer to the notification: {answers:?}");
+    assert_eq!(answers[0]["result"]["protocolVersion"], "2025-11-25", "{}", answers[0]);
+    // Within the session, requests go without _meta (the tool calls below carry it: both are served).
+    assert_eq!(answers[1]["result"]["tools"].as_array().unwrap().len(), 14);
+    assert!(answers[1]["result"].get("resultType").is_none(), "{}", answers[1]);
+
+    let (failed, claim) = mcp_result(&answers[2]);
+    assert!(!failed, "{claim}");
+    assert_eq!(claim["issue"]["id"], "t-1");
+    let holder = claim["issue"]["assignee"].as_str().unwrap();
+    let (_, session) = holder.rsplit_once("/mcp-").unwrap_or_else(|| panic!("{holder}"));
+    assert!(session.len() == 8 && session.chars().all(|c| c.is_ascii_hexdigit()), "{holder}");
+    assert!(claim["lease"]["token"].is_i64(), "{claim}");
+
+    let (failed, err) = mcp_result(&answers[3]);
+    assert!(failed);
+    // As for a non-admin access token on bd serve: the answer names the holder, and no takeover exists.
+    assert_eq!(err["error"]["code"], "unauthorized", "another actor's claim: {err}");
+    assert!(err["error"]["message"].as_str().unwrap().contains("claimed by tester"), "{err}");
+    assert_eq!(ws.json(&["show", "t-3"])["status"], "in_progress");
+
+    let (failed, created) = mcp_result(&answers[4]);
+    assert!(!failed, "{created}");
+    assert_eq!(created["title"], "--flag-like title");
+    assert!(created.get("assignee").is_none(), "empty fields are left out: {created}");
+
+    let (failed, err) = mcp_result(&answers[5]);
+    assert!(failed);
+    assert_eq!(err["error"]["code"], "not_found");
+    let (failed, err) = mcp_result(&answers[6]);
+    assert!(failed);
+    assert_eq!(err["error"]["code"], "invalid", "unknown arguments are refused: {err}");
+
+    // A message too long to take is answered and skipped; the server keeps serving.
+    let mut cmd = Ws::cmd_in(ws.dir.path(), "", &["mcp"]);
+    cmd.env_remove("BD_ACTOR");
+    let huge = mcp_call(1, "comment", serde_json::json!({ "id": "t-1", "text": "x".repeat(1 << 20) }));
+    let answers = mcp_session(cmd, &[huge, mcp_call(2, "show", serde_json::json!({ "ids": ["t-1"] }))]);
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert_eq!(answers[0]["error"]["code"], -32600);
+    assert_eq!(answers[0]["id"], serde_json::Value::Null);
+    assert_eq!(mcp_result(&answers[1]).1["id"], "t-1");
+
+    // Inside an agent session it acts as that session's actor, as the session's own bd commands do.
+    let mut cmd = Ws::cmd_in(ws.dir.path(), "", &["mcp", "--read-only"]);
+    cmd.env_remove("BD_ACTOR").env("BD_SESSION", "s1");
+    let answers = mcp_session(
+        cmd,
+        &[
+            serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": { "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientCapabilities": {} } } }),
+            mcp_call(2, "claim", serde_json::json!({ "next": true })),
+            mcp_call(3, "ready", serde_json::json!({ "limit": 1 })),
+        ],
+    );
+    let names: Vec<&str> =
+        answers[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["ready", "list", "show", "memories"]);
+    assert_eq!(answers[1]["error"]["code"], -32602, "not offered: {}", answers[1]);
+    let (_, ready) = mcp_result(&answers[2]);
+    assert_eq!(ready["issues"][0]["id"], "t-2");
+    assert_eq!(ready["more"], true, "{ready}");
+}

@@ -65,6 +65,7 @@ sharing its own, so each agent session acts as its own actor
 | [Playbooks and gates](docs/playbooks.md) | repeatable multi-step work, runs, human/timer/issue/GitHub gates |
 | [Remote server](docs/remote.md) | `bd serve`, access tokens, GitHub sign-in, background jobs and backups, clients, followers |
 | [Agent skills and MCP definitions](docs/agents.md) | serving, pulling and approving agent assets; session-start hooks |
+| [MCP server](docs/mcp.md) | bd's tools over MCP: `bd mcp` (stdio) setup, actors, tool catalog, results and errors (MCP `2026-07-28` and `2025-11-25`) |
 | [Command reference](docs/commands.md) | commands, global options, environment variables, configuration, exit codes |
 | [Observability](docs/observability.md) | logs, timing, metrics, `bd doctor` |
 | [Benchmarks](docs/benchmarks.md) | `bd bench` modes and results |

@@ -537,7 +537,9 @@ lock. `bd bench --mode remote` checks this end to end
 
 The protocol (version 2) is one endpoint, so other clients can call it
 directly: `POST /w/<name>/v2/exec` with `Authorization: Bearer <token>` and
-`{"argv": ["claim", "--next", "--json"], "request_id": "..."}`. The answer
+`{"argv": ["claim", "--next", "--json"], "request_id": "..."}` (`"tool_call":
+true` runs it with the actor's own rights only, as `bd mcp` sends a
+model's tool calls: never the token's admin or human ones). The answer
 (`application/x-ndjson`) has one JSON frame per line, in the order the command
 wrote them: `{"stdout": "..."}` for output, `{"file": {"path", "data"}}` for
 part of an output file, and last `{"exit": {"exit_code", "stderr", "replayed"}}`.

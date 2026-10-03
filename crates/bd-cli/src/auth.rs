@@ -403,37 +403,42 @@ pub fn tokens_path(root: &Path) -> PathBuf {
     root.join("tokens.json")
 }
 
-/// `<root>/tokens.lock`, held: released when dropped, or when the process ends.
-struct TokensLock(std::fs::File);
+/// A lock file, held: released when dropped, or when the process ends.
+pub(crate) struct FileLock(std::fs::File);
 
-impl Drop for TokensLock {
+impl Drop for FileLock {
     fn drop(&mut self) {
         let _ = fs4::FileExt::unlock(&self.0);
     }
 }
 
 /// Take `<root>/tokens.lock` before changing `tokens.json`, waiting up to [`LOCK_WAIT`].
-fn lock_tokens(root: &Path) -> Result<TokensLock> {
-    let path = root.join("tokens.lock");
+fn lock_tokens(root: &Path) -> Result<FileLock> {
+    lock_file(&root.join("tokens.lock"), "the access tokens")
+}
+
+/// Take the lock file `path` before changing the file it guards (`what`,
+/// for the error), waiting up to [`LOCK_WAIT`].
+pub(crate) fn lock_file(path: &Path, what: &str) -> Result<FileLock> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
     let io_error = |e: std::io::Error| Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())));
-    let file = opts.open(&path).map_err(io_error)?;
+    let file = opts.open(path).map_err(io_error)?;
     let deadline = Instant::now() + LOCK_WAIT;
     let mut delay = Duration::from_millis(5);
     loop {
         // Called through the trait: std's own File::try_lock (Rust 1.89) is newer than bd's MSRV.
         match fs4::FileExt::try_lock(&file) {
-            Ok(()) => return Ok(TokensLock(file)),
+            Ok(()) => return Ok(FileLock(file)),
             Err(fs4::TryLockError::WouldBlock) => {}
             Err(fs4::TryLockError::Error(e)) => return Err(io_error(e)),
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(Error::Busy(format!(
-                "another bd process is changing the access tokens ({} is locked); retry",
+                "another bd process is changing {what} ({} is locked); retry",
                 path.display()
             )));
         }
@@ -453,8 +458,13 @@ fn load_file(path: &Path) -> Result<TokenFile> {
 }
 
 fn save_file(path: &Path, file: &TokenFile) -> Result<()> {
+    save_json(path, file)
+}
+
+/// Replace the JSON file `path` (mode 0600) with `value`, all or nothing.
+pub(crate) fn save_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
     let tmp = path.with_extension("json.tmp");
-    let mut text = serde_json::to_string_pretty(file)?;
+    let mut text = serde_json::to_string_pretty(value)?;
     text.push('\n');
     // A leftover temp file would keep its permissions; start from a fresh one (mode 0600).
     let _ = std::fs::remove_file(&tmp);

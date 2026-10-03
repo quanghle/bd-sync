@@ -7,6 +7,13 @@
 
 use serde_json::{Value, json};
 
+// Until the authorization endpoint looks clients up, and it and the token
+// endpoint mark them used.
+#[cfg_attr(not(test), expect(dead_code, reason = "the authorization endpoint fetches documents"))]
+pub mod cimd;
+#[cfg_attr(not(test), expect(dead_code, reason = "the authorization endpoint looks clients up"))]
+pub mod clients;
+
 /// Where the metadata is served: this, then the issuer's path (RFC 8414
 /// section 3.1).
 pub const WELL_KNOWN: &str = "/.well-known/oauth-authorization-server";

@@ -210,7 +210,6 @@ impl OauthConfig {
     /// `redirect_hosts` without a port, or, with `loopback_redirects`, http to
     /// 127.0.0.1, [::1] or localhost on any port (RFC 8252). Never with user
     /// info or a fragment.
-    #[cfg_attr(not(test), expect(dead_code, reason = "client registration and authorization check redirect URIs"))]
     pub fn allows_redirect(&self, uri: &str) -> bool {
         let Some((scheme, rest)) = uri.split_once("://") else { return false };
         if uri.contains('#') || uri.chars().any(|c| c.is_whitespace() || c.is_control()) {
@@ -239,7 +238,7 @@ impl OauthConfig {
 
 /// A host name as `redirect_hosts` takes it: a DNS name of two labels or
 /// more, lowercased; no IP address, port or wildcard.
-fn redirect_host(raw: &str) -> Option<String> {
+pub(crate) fn dns_name(raw: &str) -> Option<String> {
     let host = raw.trim().to_ascii_lowercase();
     let labels: Vec<&str> = host.split('.').collect();
     let label = |l: &&str| {
@@ -255,7 +254,7 @@ fn redirect_host(raw: &str) -> Option<String> {
 fn oauth_config(o: OauthDoc) -> std::result::Result<OauthConfig, String> {
     let mut redirect_hosts = Vec::new();
     for raw in &o.redirect_hosts {
-        let Some(host) = redirect_host(raw) else {
+        let Some(host) = dns_name(raw) else {
             return Err(format!(
                 "oauth.redirect_hosts {raw:?} is not a host name such as chatgpt.com (loopback_redirects = true \
                  allows this machine)"

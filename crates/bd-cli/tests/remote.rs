@@ -6248,3 +6248,52 @@ fn the_authorization_server_needs_a_public_url_it_can_be_named_by() {
     );
     assert_eq!(get_json(&server.base, "/.well-known/oauth-authorization-server").1["issuer"], "http://127.0.0.1:1");
 }
+
+/// POST `body` to `url` as JSON: the status, headers and JSON answer.
+fn post_json(url: &str, body: &str) -> (u16, ureq::http::HeaderMap, Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let mut r = agent.post(url).header("content-type", "application/json").send(body).unwrap();
+    let text = r.body_mut().read_to_string().unwrap();
+    (r.status().as_u16(), r.headers().clone(), serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[test]
+fn oauth_clients_register_without_a_token_for_allowed_redirects() {
+    let server = Server::launch(
+        oauth_root("redirect_hosts = [\"claude.ai\"]\n"),
+        "127.0.0.1:0",
+        &["--public-url", "https://bd.example.com/bd"],
+    );
+    let (_, meta) = get_json(&server.base, "/.well-known/oauth-authorization-server/bd");
+    assert_eq!(meta["registration_endpoint"], "https://bd.example.com/bd/oauth/register");
+    // Under the proxy prefix, or with it stripped.
+    for path in ["/bd/oauth/register", "/oauth/register"] {
+        let request = r#"{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"client_name":"Claude",
+            "token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}"#;
+        let (status, headers, answer) = post_json(&format!("{}{path}", server.base), request);
+        assert_eq!(status, 201, "{answer}");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert!(answer["client_id"].as_str().unwrap().starts_with("bdc_"), "{answer}");
+        assert_eq!(answer["redirect_uris"], json!(["https://claude.ai/api/mcp/auth_callback"]));
+        assert_eq!(answer["token_endpoint_auth_method"], "none");
+    }
+    let file: Value =
+        serde_json::from_str(&std::fs::read_to_string(server.root.path().join("oauth-clients.json")).unwrap()).unwrap();
+    assert_eq!(file["clients"].as_array().unwrap().len(), 2);
+
+    let register = format!("{}/bd/oauth/register", server.base);
+    let (status, _, answer) = post_json(&register, r#"{"redirect_uris":["https://evil.example/cb"]}"#);
+    assert_eq!((status, &answer["error"]), (400, &json!("invalid_redirect_uri")), "{answer}");
+    let (status, _, answer) = post_json(&register, "not json");
+    assert_eq!((status, &answer["error"]), (400, &json!("invalid_client_metadata")), "{answer}");
+    let (status, _, answer) = post_json(&register, &format!("{{\"client_name\":\"{}\"}}", "x".repeat(20 << 10)));
+    assert_eq!((status, &answer["error"]), (413, &json!("invalid_client_metadata")), "{answer}");
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let got = agent.get(&register).call().unwrap();
+    assert_eq!((got.status().as_u16(), got.headers().get("allow").unwrap().to_str().unwrap()), (405, "POST"));
+
+    // Without [oauth], no registration.
+    std::fs::remove_file(server.root.path().join("auth.toml")).unwrap();
+    let (status, _, _) = post_json(&register, r#"{"redirect_uris":["https://claude.ai/cb"]}"#);
+    assert_eq!(status, 404);
+}

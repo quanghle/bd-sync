@@ -143,6 +143,9 @@ const FOLLOWERS_GRACE: Duration = Duration::from_secs(5);
 /// GitHub sign-in requests handled at once, each waiting on GitHub; more
 /// are answered 503 at once, which clients retry.
 const MAX_SIGN_INS: usize = 8;
+/// OAuth client registrations handled at once, each rewriting the
+/// registry; more are answered 503 at once.
+const MAX_REGISTERING: usize = 2;
 /// The largest body of a sign-in request.
 const MAX_SIGN_IN_BODY: usize = 16 << 10;
 /// The longest MCP message a client may POST.
@@ -505,6 +508,14 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
         } else {
             let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET", 2).response();
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
+            r
+        }
+    } else if path.ends_with(oauth_server::REGISTER) {
+        if req.method() == Method::POST {
+            register_client(&server, req).await
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
             r
         }
     } else if let Some((prefix, workspace)) = mcp_path(&path) {
@@ -1024,6 +1035,65 @@ fn authorization_server_metadata(server: &Server, path: &str) -> Response<Body> 
     }
 }
 
+/// `POST <issuer>/oauth/register`: register a public OAuth client (RFC
+/// 7591, `oauth_server/clients.rs`), without a token, if `[oauth]` is on.
+/// The proxy prefix before it is not checked, as for the other endpoints.
+async fn register_client(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
+    let body =
+        match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await {
+            Ok(Ok(b)) => b.to_bytes(),
+            Ok(Err(e)) if e.is::<LengthLimitError>() => {
+                let why = format!("the request is larger than {} KiB", MAX_SIGN_IN_BODY >> 10);
+                return oauth_error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_client_metadata", &why);
+            }
+            Ok(Err(e)) => {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", &format!("reading the request: {e}"));
+            }
+            Err(_) => {
+                let why = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
+                return oauth_error(StatusCode::REQUEST_TIMEOUT, "invalid_request", &why);
+            }
+        };
+    if let Err(e) = server.issuer() {
+        return sign_in_misconfigured(&e);
+    }
+    let Ok(permit) = server.registering.clone().try_acquire_owned() else {
+        let why = "registering other clients; retry";
+        return oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", why);
+    };
+    let root = server.root.clone();
+    let answer = blocking(move || {
+        let _permit = permit;
+        match oauth::load_oauth(&root)? {
+            Some(o) => oauth_server::clients::register(&root, &o, &body).map(Some),
+            None => Ok(None),
+        }
+    })
+    .await;
+    match answer {
+        Ok(Some(Ok(registered))) => {
+            let mut r = json_response(StatusCode::CREATED, &registered);
+            r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            r
+        }
+        Ok(Some(Err((error, why)))) => oauth_error(StatusCode::BAD_REQUEST, error, &why),
+        Ok(None) => Reject::new(StatusCode::NOT_FOUND, "not_found", "no such authorization server", 3).response(),
+        Err(Error::Busy(why)) => oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", &why),
+        Err(e) => {
+            tracing::error!(target: "bd::serve", error = %e, "registering an OAuth client");
+            let why = "the server could not register the client; see the server log";
+            oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", why)
+        }
+    }
+}
+
+/// An OAuth error answer (RFC 6749 section 5.2, RFC 7591 section 3.2.2).
+fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response<Body> {
+    let mut r = json_response(status, &serde_json::json!({ "error": error, "error_description": description }));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
+}
+
 /// `auth.toml` or `--public-url` do not let sign-in work: the details go
 /// to the log, not to whoever asked.
 fn sign_in_misconfigured(e: &str) -> Response<Body> {
@@ -1238,6 +1308,8 @@ struct Server {
     feeds: Arc<Feeds>,
     /// GitHub sign-in requests running.
     sign_ins: Arc<Semaphore>,
+    /// OAuth client registrations running.
+    registering: Arc<Semaphore>,
     /// Sign-ins completing, and the answers of those that issued tokens.
     issued: Mutex<Issuances>,
     /// Refreshes running, by their refresh token, and the answers of those
@@ -1504,6 +1576,7 @@ impl Server {
             waits,
             feeds: Arc::new(Feeds::new(follow::HEAD_CHECK_EVERY, follow::HEAD_CHECK_GAP)),
             sign_ins: Arc::new(Semaphore::new(MAX_SIGN_INS)),
+            registering: Arc::new(Semaphore::new(MAX_REGISTERING)),
             issued: Mutex::default(),
             refreshes: Mutex::default(),
             stopping: watch::Sender::new(false),

@@ -7,12 +7,11 @@
 
 use serde_json::{Value, json};
 
-// Until the authorization endpoint looks clients up, and it and the token
-// endpoint mark them used.
-#[cfg_attr(not(test), expect(dead_code, reason = "the authorization endpoint fetches documents"))]
+pub mod authorize;
 pub mod cimd;
-#[cfg_attr(not(test), expect(dead_code, reason = "the authorization endpoint looks clients up"))]
 pub mod clients;
+pub mod form;
+pub mod pages;
 
 /// Where the metadata is served: this, then the issuer's path (RFC 8414
 /// section 3.1).
@@ -22,6 +21,11 @@ pub const AUTHORIZE: &str = "/oauth/authorize";
 pub const TOKEN: &str = "/oauth/token";
 pub const REGISTER: &str = "/oauth/register";
 pub const REVOKE: &str = "/oauth/revoke";
+/// Where GitHub sends people back to after its web sign-in: the callback
+/// URL of the GitHub App.
+pub const CALLBACK: &str = "/oauth/github/callback";
+/// Where the consent page posts its decision.
+pub const CONSENT: &str = "/oauth/consent";
 
 /// The issuer of a server whose public URL is `public_url` (normalized by
 /// `mcp::http::public_url`): https, or http to this machine.

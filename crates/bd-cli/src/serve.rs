@@ -75,6 +75,7 @@ use crate::follow::{self, Feeds, HeadReader, Subscription};
 use crate::io::{self, Capture};
 use crate::jobs;
 use crate::mcp::{self, Ran, http as mcp_http};
+use crate::oauth_server::{authorize, cimd, pages};
 use crate::protocol::{
     ErrorBody, ErrorDetail, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, PROTOCOL, PROTOCOL_HEADER,
     RefreshRequest, RevokeAnswer, SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
@@ -148,6 +149,8 @@ const MAX_SIGN_INS: usize = 8;
 const MAX_REGISTERING: usize = 2;
 /// The largest body of a sign-in request.
 const MAX_SIGN_IN_BODY: usize = 16 << 10;
+/// The largest body of a consent page's decision.
+const MAX_CONSENT_BODY: usize = 4 << 10;
 /// The longest MCP message a client may POST.
 const MAX_MCP_BODY: usize = 1 << 20;
 /// An MCP answer's share of the body budget: its tool's output (up to
@@ -513,6 +516,30 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
     } else if path.ends_with(oauth_server::REGISTER) {
         if req.method() == Method::POST {
             register_client(&server, req).await
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
+            r
+        }
+    } else if path.ends_with(oauth_server::AUTHORIZE) {
+        if req.method() == Method::GET {
+            authorizing(&server, Authorizing::Begin, req).await
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
+            r
+        }
+    } else if path.ends_with(oauth_server::CALLBACK) {
+        if req.method() == Method::GET {
+            authorizing(&server, Authorizing::Callback, req).await
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
+            r
+        }
+    } else if path.ends_with(oauth_server::CONSENT) {
+        if req.method() == Method::POST {
+            authorizing(&server, Authorizing::Decide, req).await
         } else {
             let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response();
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
@@ -1087,6 +1114,119 @@ async fn register_client(server: &Arc<Server>, req: Request<Incoming>) -> Respon
     }
 }
 
+/// A step of an authorization (`oauth_server/authorize.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Authorizing {
+    /// `GET <issuer>/oauth/authorize`: on to GitHub.
+    Begin,
+    /// `GET <issuer>/oauth/github/callback`: back from GitHub, to the consent page.
+    Callback,
+    /// `POST <issuer>/oauth/consent`: back to the client.
+    Decide,
+}
+
+/// A step of an authorization, if `[oauth]` is on, answered for a browser:
+/// a page or a redirect. Sign-in at GitHub waits on GitHub on a blocking
+/// thread, with a sign-in slot; so does the first step, which may fetch the
+/// client's metadata document.
+async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incoming>) -> Response<Body> {
+    let issuer = match server.issuer() {
+        Ok(Some(issuer)) => issuer,
+        Ok(None) => {
+            return Reject::new(StatusCode::NOT_FOUND, "not_found", "no such authorization server", 3).response();
+        }
+        Err(e) => return sign_in_misconfigured(&e),
+    };
+    let browser = req
+        .headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|h| authorize::cookie(h).map(str::to_string));
+    let query = req.uri().query().unwrap_or_default().to_string();
+    let srv = server.clone();
+    let answered = match step {
+        Authorizing::Begin => {
+            blocking(move || Ok(srv.authorizing(&issuer, |cx| authorize::begin(cx, &query, browser.as_deref())))).await
+        }
+        Authorizing::Callback => {
+            let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
+                let why = "The bd server is signing in other accounts; reload this page in a moment.";
+                return html_page(pages::refusal(503, "Busy", why, None));
+            };
+            blocking(move || {
+                let _permit = permit;
+                Ok((srv.authorizing(&issuer, |cx| authorize::callback(cx, &query, browser.as_deref())), None))
+            })
+            .await
+        }
+        Authorizing::Decide => {
+            // Only the consent page posts here: SameSite keeps the cookie from other sites' forms, and this their
+            // requests.
+            let origin = req.headers().get(header::ORIGIN);
+            if origin.is_some_and(|o| o.as_bytes() != authorize::origin(&issuer).as_bytes()) {
+                let why = "The decision came from another site: start again from the application.";
+                return html_page(pages::refusal(403, "This authorization cannot go on", why, None));
+            }
+            let body =
+                match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_CONSENT_BODY).collect())
+                    .await
+                {
+                    Ok(Ok(b)) => b.to_bytes(),
+                    _ => {
+                        let why = "The decision did not arrive whole: start again from the application.";
+                        return html_page(pages::refusal(400, "This authorization cannot go on", why, None));
+                    }
+                };
+            let body = String::from_utf8_lossy(&body);
+            Ok((server.authorizing(&issuer, |cx| authorize::decide(cx, &body, browser.as_deref())), None))
+        }
+    };
+    let (answer, cookie) = match answered {
+        Ok(answered) => answered,
+        Err(e) => return Reject::internal(e).response(),
+    };
+    let mut r = match answer {
+        authorize::Answer::Page(page) => html_page(page),
+        authorize::Answer::Redirect(url) => {
+            let Ok(location) = HeaderValue::from_str(&url) else {
+                tracing::error!(target: "bd::serve", %url, "an authorization redirect is not a valid header value");
+                let why = "The application's address cannot be sent to the browser.";
+                return html_page(pages::refusal(500, "This authorization cannot go on", why, None));
+            };
+            // After the consent page's POST, the browser must GET the client's redirect URI.
+            let status = if step == Authorizing::Decide { StatusCode::SEE_OTHER } else { StatusCode::FOUND };
+            let mut r = response(status, "text/plain", Body::whole(Bytes::new()));
+            let headers = r.headers_mut();
+            headers.insert(header::LOCATION, location);
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+            r
+        }
+    };
+    if let Some(cookie) = cookie.and_then(|c| HeaderValue::from_str(&c).ok()) {
+        r.headers_mut().insert(header::SET_COOKIE, cookie);
+    }
+    r
+}
+
+/// An authorization page for a browser, which no other site may frame,
+/// with only what its Content-Security-Policy allows. The policy is
+/// same-origin, so that the consent form's POST carries the page's Origin.
+fn html_page(page: pages::Page) -> Response<Body> {
+    let status = StatusCode::from_u16(page.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let mut r = response(status, "text/html; charset=utf-8", Body::whole(page.html.into_bytes()));
+    let headers = r.headers_mut();
+    if let Ok(csp) = HeaderValue::from_str(&page.csp) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, csp);
+    }
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    r
+}
+
 /// An OAuth error answer (RFC 6749 section 5.2, RFC 7591 section 3.2.2).
 fn oauth_error(status: StatusCode, error: &str, description: &str) -> Response<Body> {
     let mut r = json_response(status, &serde_json::json!({ "error": error, "error_description": description }));
@@ -1310,6 +1450,10 @@ struct Server {
     sign_ins: Arc<Semaphore>,
     /// OAuth client registrations running.
     registering: Arc<Semaphore>,
+    /// OAuth clients' metadata documents, fetched and kept for a while.
+    documents: cimd::Documents,
+    /// Authorizations under way.
+    flows: Mutex<authorize::Flows>,
     /// Sign-ins completing, and the answers of those that issued tokens.
     issued: Mutex<Issuances>,
     /// Refreshes running, by their refresh token, and the answers of those
@@ -1577,6 +1721,8 @@ impl Server {
             feeds: Arc::new(Feeds::new(follow::HEAD_CHECK_EVERY, follow::HEAD_CHECK_GAP)),
             sign_ins: Arc::new(Semaphore::new(MAX_SIGN_INS)),
             registering: Arc::new(Semaphore::new(MAX_REGISTERING)),
+            documents: cimd::Documents::new(),
+            flows: Mutex::default(),
             issued: Mutex::default(),
             refreshes: Mutex::default(),
             stopping: watch::Sender::new(false),
@@ -1594,6 +1740,18 @@ impl Server {
             Ok(None) => Ok(None),
             Err(e) => Err(e.to_string()),
         }
+    }
+
+    /// Run `f`, a step of an authorization, with what it needs of the server.
+    fn authorizing<T>(&self, issuer: &str, f: impl FnOnce(&authorize::Ctx<'_>) -> T) -> T {
+        let exists = |name: &str| self.workspace(name).is_some();
+        f(&authorize::Ctx {
+            root: &self.root,
+            issuer,
+            documents: &self.documents,
+            flows: &self.flows,
+            workspace_exists: &exists,
+        })
     }
 
     /// The server's URL as clients reach it: `--public-url`, else derived

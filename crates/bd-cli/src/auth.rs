@@ -789,19 +789,7 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
             (name.to_string(), actor.to_string(), None, None, None)
         }
         Holder::Github { user, expires_at, by_login, refresh } => {
-            let actor = bind(&mut file.accounts, user, now, by_login)?;
-            if is_reserved_actor(&actor) {
-                return Err(Error::Unauthorized(format!(
-                    "GitHub user {} may not sign in to this bd server: its actor {actor} is bd serve's own",
-                    user.login
-                )));
-            }
-            // A renamed account let in by a login that names another principal's actor must not pass for it.
-            if by_login && !related(&actor, &user.login) {
-                if let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now) {
-                    return Err(conflict_error(&user.login, Some(user), other));
-                }
-            }
+            let actor = account_actor(&mut file, user, now, by_login)?;
             let label: String = actor.chars().take(40).collect();
             let name = format!("github-{label}-{}", random_hex(4)?);
             check_name(&name)?;
@@ -851,6 +839,37 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
     file.tokens.push(token.clone());
     save_file(&path, &file)?;
     Ok(Issued { token, secret, refresh_secret })
+}
+
+/// The actor a sign-in of `user` gets, bound to its account in `file`, or
+/// why it may not sign in for its actor's sake.
+fn account_actor(file: &mut TokenFile, user: &GithubUser, now: Timestamp, by_login: bool) -> Result<String> {
+    let actor = bind(&mut file.accounts, user, now, by_login)?;
+    if is_reserved_actor(&actor) {
+        return Err(Error::Unauthorized(format!(
+            "GitHub user {} may not sign in to this bd server: its actor {actor} is bd serve's own",
+            user.login
+        )));
+    }
+    // A renamed account let in by a login that names another principal's actor must not pass for it.
+    if by_login && !related(&actor, &user.login) {
+        if let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now) {
+            return Err(conflict_error(&user.login, Some(user), other));
+        }
+    }
+    if let Some(other) = actor_conflict(&file.tokens, &actor, Some(user), now) {
+        return Err(conflict_error(&actor, Some(user), other));
+    }
+    Ok(actor)
+}
+
+/// The actor a sign-in of `user` would get now, binding nothing: what
+/// [`issue_github_token`] would refuse for its actor's sake is refused
+/// before anyone is asked to approve a client (`oauth_server/authorize.rs`).
+/// Issuing the token checks again.
+pub fn preview_actor(root: &Path, user: &GithubUser, by_login: bool) -> Result<String> {
+    let mut file = load_file(&tokens_path(root))?;
+    account_actor(&mut file, user, Timestamp::now(), by_login)
 }
 
 /// The actor of `user`'s tokens: the one bound to its account, else its

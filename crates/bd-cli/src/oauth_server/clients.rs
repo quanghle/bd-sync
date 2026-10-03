@@ -71,6 +71,7 @@ pub fn lookup(root: &Path, documents: &Documents, id: &str) -> Result<Client> {
 
 /// Record that the registered client `id` was used (an authorization or a
 /// token), so it is kept; nothing for clients with a metadata document.
+#[cfg_attr(not(test), expect(dead_code, reason = "the token endpoint marks clients used"))]
 pub fn touch(root: &Path, id: &str) -> Result<()> {
     if cimd::is_document_url(id) {
         return Ok(());

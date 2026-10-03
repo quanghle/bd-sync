@@ -8,6 +8,7 @@
 //! [github]
 //! client_id = "Ov23li0123456789abcd"  # a GitHub OAuth app or GitHub App, with device flow enabled
 //! private_key = "github-app.pem"     # the GitHub App's private key (relative to the root): refreshes tokens
+//! client_secret_file = "github-secret" # a client secret of the GitHub App (relative to the root): for [oauth]
 //! token_ttl = "1h"                    # access tokens expire (default 1h)
 //! refresh_limit = "30d"               # refreshed for at most this long after the sign-in (default 30d)
 //! refresh_idle = "7d"                 # and not after this long without a refresh (default 7d)
@@ -64,7 +65,11 @@
 //! clients, such as ChatGPT, that sign people in with OAuth rather than
 //! send a token they were given: people sign in with GitHub under the same
 //! rules, and their tokens last and are refreshed as `[github]` says, so it
-//! needs `private_key`. The server's `--public-url` is its issuer.
+//! needs `private_key`. The server's `--public-url` is its issuer. As the
+//! person is in a browser, they sign in with GitHub's web flow, which comes
+//! back to `<issuer>/oauth/github/callback` (the GitHub App's callback URL)
+//! and gives a token only with a client secret of the App
+//! (`client_secret_file`); the same rules then apply ([`admit`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -132,6 +137,8 @@ struct GithubDoc {
     #[serde(default)]
     private_key: Option<PathBuf>,
     #[serde(default)]
+    client_secret_file: Option<PathBuf>,
+    #[serde(default)]
     token_ttl: Option<String>,
     #[serde(default)]
     refresh_limit: Option<String>,
@@ -185,6 +192,10 @@ pub struct Github {
     pub private_key: Option<PathBuf>,
     /// The key itself, read by [`load`]: tokens are refreshed only with it.
     pub app: Option<AppKey>,
+    /// The GitHub App's client secret file, as written (relative to the root).
+    pub client_secret_file: Option<PathBuf>,
+    /// The secret itself, read by [`load`]: the web flow needs it.
+    pub client_secret: Option<ClientSecret>,
     /// How long after its sign-in a token may be refreshed.
     pub refresh_limit: Duration,
     /// How long a sign-in may go without a refresh.
@@ -361,6 +372,31 @@ impl AppKey {
     }
 }
 
+/// A client secret of the GitHub App (`github.client_secret_file`), which
+/// GitHub's web flow wants with each code it gives a token for.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ClientSecret(String);
+
+impl std::fmt::Debug for ClientSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the secret.
+        f.write_str("ClientSecret(..)")
+    }
+}
+
+impl ClientSecret {
+    /// The secret in `path`: one line, as GitHub shows it.
+    fn load(path: &Path) -> std::result::Result<ClientSecret, String> {
+        let at = format!("github.client_secret_file {}", path.display());
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{at}: {e}"))?;
+        let secret = text.trim();
+        if secret.is_empty() || secret.len() > 256 || !secret.bytes().all(|b| b.is_ascii_graphic()) {
+            return Err(format!("{at}: not a client secret (one line of printable characters)"));
+        }
+        Ok(ClientSecret(secret.to_string()))
+    }
+}
+
 /// Installation tokens of GitHub Apps, by `<api_url> <client_id> <org or *>`,
 /// with when to stop using them: shared by every refresh.
 static INSTALLATION_TOKENS: LazyLock<Mutex<HashMap<String, (String, Instant)>>> = LazyLock::new(Default::default);
@@ -380,6 +416,11 @@ pub fn load(root: &Path) -> Result<Option<Github>> {
     if let Some(key) = &github.private_key {
         let key = if key.is_relative() { root.join(key) } else { key.clone() };
         github.app = Some(AppKey::load(&key).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?);
+    }
+    if let Some(file) = &github.client_secret_file {
+        let file = if file.is_relative() { root.join(file) } else { file.clone() };
+        let secret = ClientSecret::load(&file).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
+        github.client_secret = Some(secret);
     }
     Ok(Some(github))
 }
@@ -438,6 +479,12 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
         return Err("github.private_key is empty: name the GitHub App's private key file, or leave it out".into());
     }
     let private_key = g.private_key;
+    let client_secret_file = g.client_secret_file;
+    if client_secret_file.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+        return Err("github.client_secret_file is empty: name the file holding a client secret of the GitHub App, \
+                    or leave it out"
+            .into());
+    }
     if private_key.is_none() && (g.refresh_limit.is_some() || g.refresh_idle.is_some()) {
         return Err("github.refresh_limit and refresh_idle need github.private_key: only a GitHub App refreshes \
                     tokens"
@@ -493,6 +540,19 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
                     people would sign in again each token_ttl"
             .into());
     }
+    match (&oauth, &client_secret_file) {
+        (Some(_), None) => {
+            return Err("[oauth] needs github.client_secret_file: people sign in through GitHub's web flow, which \
+                        gives tokens only with a client secret of the GitHub App"
+                .into());
+        }
+        (None, Some(_)) => {
+            return Err(
+                "github.client_secret_file serves [oauth]'s web sign-in only: add [oauth], or leave it out".into()
+            );
+        }
+        _ => {}
+    }
     Ok(Some(Github {
         client_id,
         url,
@@ -500,6 +560,8 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
         token_ttl,
         private_key,
         app: None,
+        client_secret_file,
+        client_secret: None,
         refresh_limit,
         refresh_idle,
         deny: g.deny,
@@ -1035,41 +1097,7 @@ pub fn poll(root: &Path, poll: &SignInPoll) -> Result<SignInAnswer> {
     let Some(access) = body["access_token"].as_str().filter(|t| !t.is_empty()) else {
         return Err(refused(&github, "finish a sign-in", status, &body));
     };
-    let (user, created) = account(&api, access)?;
-    let age = created.map(|at| Duration::from_millis(Timestamp::now().since(at).max(0) as u64));
-    if github.deny.contains(&user.id) {
-        tracing::info!(target: "bd::serve", login = %user.login, id = user.id, "GitHub sign-in refused: the account is denied");
-        return Err(Error::Unauthorized(format!("GitHub user {} may not sign in to this bd server", user.login)));
-    }
-    let mut asked = Asked { api: &api, token: access, login: &user.login, seen: HashMap::new() };
-    let mut unknown = Vec::new();
-    let (grant, via, by_login) = match decide(&github, &user.login, age, &poll.workspace, &mut asked, &mut unknown)? {
-        Decision::In { grant, via, by_login } => (grant, via, by_login),
-        Decision::TooNew(min) => {
-            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, workspace = %poll.workspace, ?age, "GitHub sign-in refused: the account is too new");
-            return Err(Error::Unauthorized(format!(
-                "GitHub user {} may not sign in to this bd server yet: its GitHub account must be at least {} old",
-                user.login,
-                bd_core::time::format_duration_ms(i64::try_from(min.as_millis()).unwrap_or(i64::MAX))
-            )));
-        }
-        Decision::Elsewhere(workspaces) => {
-            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, workspace = %poll.workspace, ?unknown, "GitHub sign-in refused: workspace not allowed");
-            return Err(Error::Unauthorized(format!(
-                "GitHub user {} may sign in to this bd server, but not use workspace {} (only {})",
-                user.login,
-                poll.workspace,
-                workspaces.join(", ")
-            )));
-        }
-        Decision::Out => {
-            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, ?unknown, "GitHub sign-in refused: no rule lets the account in");
-            return Err(Error::Unauthorized(format!(
-                "GitHub user {} may not sign in to this bd server: no rule of its auth.toml lets the account in",
-                user.login
-            )));
-        }
-    };
+    let Admitted { user, grant, via, by_login, unknown } = admit(&github, &api, access, &poll.workspace)?;
     let life = github.lifetime(Timestamp::now());
     let issued = auth::issue_github_token(root, &user, grant, life, &poll.workspace, by_login)?;
     let token = &issued.token;
@@ -1087,6 +1115,108 @@ pub fn poll(root: &Path, poll: &SignInPoll) -> Result<SignInAnswer> {
         "GitHub sign-in issued an access token"
     );
     Ok(SignInAnswer::Issued(Box::new(answer_of(issued, user.login, via))))
+}
+
+/// An account the rules let into a workspace, and what they grant it there.
+#[derive(Clone, Debug)]
+pub struct Admitted {
+    pub user: GithubUser,
+    pub grant: Grant,
+    /// What let it in (`GitHub user alice`, `member of acme`).
+    pub via: String,
+    /// Whether that was its login in a rule's `users`.
+    pub by_login: bool,
+    /// Memberships GitHub would not tell, for the log.
+    pub unknown: Vec<String>,
+}
+
+/// What the rules let the account whose GitHub token `access` is do in
+/// `workspace`, asking GitHub with that token; `Error::Unauthorized` (said
+/// to the person signing in) if they do not let it in.
+fn admit(github: &Github, api: &Api, access: &str, workspace: &str) -> Result<Admitted> {
+    let (user, created) = account(api, access)?;
+    let age = created.map(|at| Duration::from_millis(Timestamp::now().since(at).max(0) as u64));
+    if github.deny.contains(&user.id) {
+        tracing::info!(target: "bd::serve", login = %user.login, id = user.id, "GitHub sign-in refused: the account is denied");
+        return Err(Error::Unauthorized(format!("GitHub user {} may not sign in to this bd server", user.login)));
+    }
+    let mut asked = Asked { api, token: access, login: &user.login, seen: HashMap::new() };
+    let mut unknown = Vec::new();
+    let (grant, via, by_login) = match decide(github, &user.login, age, workspace, &mut asked, &mut unknown)? {
+        Decision::In { grant, via, by_login } => (grant, via, by_login),
+        Decision::TooNew(min) => {
+            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, %workspace, ?age, "GitHub sign-in refused: the account is too new");
+            return Err(Error::Unauthorized(format!(
+                "GitHub user {} may not sign in to this bd server yet: its GitHub account must be at least {} old",
+                user.login,
+                bd_core::time::format_duration_ms(i64::try_from(min.as_millis()).unwrap_or(i64::MAX))
+            )));
+        }
+        Decision::Elsewhere(workspaces) => {
+            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, %workspace, ?unknown, "GitHub sign-in refused: workspace not allowed");
+            return Err(Error::Unauthorized(format!(
+                "GitHub user {} may sign in to this bd server, but not use workspace {} (only {})",
+                user.login,
+                workspace,
+                workspaces.join(", ")
+            )));
+        }
+        Decision::Out => {
+            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, ?unknown, "GitHub sign-in refused: no rule lets the account in");
+            return Err(Error::Unauthorized(format!(
+                "GitHub user {} may not sign in to this bd server: no rule of its auth.toml lets the account in",
+                user.login
+            )));
+        }
+    };
+    Ok(Admitted { user, grant, via, by_login, unknown })
+}
+
+/// GitHub's page where a person signs in for the web flow, coming back to
+/// `callback` with a code and `state`; the code's token is given only with
+/// the PKCE verifier whose S256 challenge is `challenge`.
+pub fn web_sign_in_url(github: &Github, callback: &str, state: &str, challenge: &str) -> String {
+    let mut query = vec![
+        ("client_id", github.client_id.as_str()),
+        ("redirect_uri", callback),
+        ("state", state),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+    ];
+    if github.reads_orgs() {
+        query.push(("scope", "read:org"));
+    }
+    format!("{}/login/oauth/authorize?{}", github.url, crate::oauth_server::form::encode(&query))
+}
+
+/// Finish a web sign-in: get the token GitHub gives for `code` (which came
+/// back to `callback`; `verifier` is its PKCE verifier), and see what the
+/// rules let its account do in `workspace` ([`admit`]). The GitHub token
+/// serves for this only: it is never stored, logged or sent on.
+pub fn web_sign_in(github: &Github, code: &str, callback: &str, verifier: &str, workspace: &str) -> Result<Admitted> {
+    let Some(secret) = &github.client_secret else {
+        return Err(Error::Remote("this bd server has no GitHub client secret for web sign-in".into()));
+    };
+    let api = Api::new(github);
+    let form = [
+        ("client_id", github.client_id.as_str()),
+        ("client_secret", secret.0.as_str()),
+        ("code", code),
+        ("redirect_uri", callback),
+        ("code_verifier", verifier),
+    ];
+    let (status, body) = api.form("/login/oauth/access_token", &form)?;
+    match body["error"].as_str() {
+        Some("bad_verification_code") => {
+            return Err(Error::invalid("GitHub no longer knows this sign-in (it took too long): start again"));
+        }
+        Some(_) => return Err(refused(github, "finish a sign-in", status, &body)),
+        None => {}
+    }
+    let Some(access) = body["access_token"].as_str().filter(|t| !t.is_empty()) else {
+        return Err(refused(github, "finish a sign-in", status, &body));
+    };
+    admit(github, &api, access, workspace)
 }
 
 /// What the client gets of a token issued or refreshed.
@@ -1392,8 +1522,10 @@ mod tests {
 
     #[test]
     fn auth_toml_turns_the_authorization_server_on() {
-        let github = "[github]\nclient_id = \"Iv1.x\"\nprivate_key = \"app.pem\"\n[[github.allow]]\nusers = [\"a\"]\n";
-        assert_eq!(parse(github).unwrap().unwrap().oauth, None, "off without [oauth]");
+        let no_secret =
+            "[github]\nclient_id = \"Iv1.x\"\nprivate_key = \"app.pem\"\n[[github.allow]]\nusers = [\"a\"]\n";
+        assert_eq!(parse(no_secret).unwrap().unwrap().oauth, None, "off without [oauth]");
+        let github = &no_secret.replace("private_key", "client_secret_file = \"secret\"\nprivate_key");
         let g =
             parse(&format!("{github}[oauth]\nredirect_hosts = [\" ChatGPT.com \", \"claude.ai\", \"chatgpt.com\"]\n"))
                 .unwrap()
@@ -1415,6 +1547,12 @@ mod tests {
             assert!(e.contains("is not a host name"), "{bad}: {e}");
         }
         assert!(error(&format!("{github}[oauth]\nissuer = \"https://x\"\n")).contains("unknown field"));
+        let hosts = "[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n";
+        assert!(error(&format!("{no_secret}{hosts}")).contains("needs github.client_secret_file"));
+        assert!(error(github).contains("serves [oauth]'s web sign-in only"));
+        let empty = no_secret.replace("private_key", "client_secret_file = \"\"\nprivate_key");
+        assert!(error(&format!("{empty}{hosts}")).contains("client_secret_file is empty"));
+        assert_eq!(parse(&format!("{github}{hosts}")).unwrap().unwrap().client_secret_file, Some("secret".into()));
     }
 
     #[test]
@@ -1499,6 +1637,18 @@ mod tests {
         let now = Timestamp::now();
         let life = g.lifetime(now).refresh.unwrap();
         assert_eq!(life, (now.plus(DEFAULT_REFRESH_LIMIT), DEFAULT_REFRESH_IDLE));
+
+        // ... and the client secret.
+        let keys = "private_key = \"app.pem\"\nclient_secret_file = \"secret\"";
+        let oauth = format!("{base}{keys}{rule}[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n");
+        std::fs::write(dir.path().join(FILE), oauth).unwrap();
+        assert!(load(dir.path()).unwrap_err().to_string().contains("github.client_secret_file"));
+        std::fs::write(dir.path().join("secret"), "two words\n").unwrap();
+        assert!(load(dir.path()).unwrap_err().to_string().contains("not a client secret"));
+        std::fs::write(dir.path().join("secret"), " s3cret \n").unwrap();
+        let g = load(dir.path()).unwrap().unwrap();
+        assert_eq!(g.client_secret.as_ref().map(|s| s.0.as_str()), Some("s3cret"));
+        assert!(!format!("{g:?}").contains("s3cret"), "never the secret");
     }
 
     #[test]

@@ -4610,9 +4610,11 @@ fn agents_watch_catches_up_on_changes_no_event_announced() {
 
 // ------------------------------------------------------------ GitHub sign-in
 
-/// A stand-in for GitHub: the device flow and the API endpoints GitHub
-/// sign-in uses. A device code is entered by the account `next` names when
-/// the code is given out, after `pending` polls, or cancelled with `deny`.
+/// A stand-in for GitHub: the device and web flows and the API endpoints
+/// GitHub sign-in uses. A device code is entered by the account `next`
+/// names when the code is given out, after `pending` polls, or cancelled
+/// with `deny`; the web flow signs `next` in at once, or is cancelled with
+/// `deny`, and gives its token for the client secret `s3cret` only.
 /// `members` pairs logins with `org` or `org/team`; organizations in
 /// `blocked` answer 403, as one restricting OAuth apps does.
 struct FakeGithub {
@@ -4635,6 +4637,8 @@ struct GithubState {
     codes: std::collections::HashMap<String, (String, usize, bool)>,
     /// Device codes given out, each unique, as GitHub's are.
     minted: usize,
+    /// Web flow code -> the login signed in, the PKCE challenge, and the redirect URI.
+    web_codes: std::collections::HashMap<String, (String, String, String)>,
     /// User ids by login, where not derived from the login: a renamed account keeps its id.
     ids: std::collections::HashMap<String, u64>,
     /// When GitHub created each account, where not long ago (`2015-01-01`).
@@ -4701,6 +4705,31 @@ impl FakeGithub {
     fn leave(&self, login: &str, of: &str) {
         self.state.lock().unwrap().members.retain(|(l, o)| !(l == login && o == of));
     }
+
+    /// Cancel the next sign-ins at GitHub, or not.
+    fn deny(&self, deny: bool) {
+        self.state.lock().unwrap().deny = deny;
+    }
+}
+
+/// The pairs of a query string or form body, percent-decoded.
+fn decode_form(query: &str) -> std::collections::HashMap<String, String> {
+    let unescape = |s: &str| {
+        let (bytes, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => out.push(b' '),
+                b'%' => {
+                    out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                    i += 2;
+                }
+                b => out.push(b),
+            }
+            i += 1;
+        }
+        String::from_utf8(out).unwrap()
+    };
+    query.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (unescape(k), unescape(v))).collect()
 }
 
 /// Whether `jwt` is one the GitHub App `Iv1.test` signed, unexpired (the
@@ -4750,6 +4779,26 @@ fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubS
     };
     std::thread::sleep(hold);
     let mut s = state.lock().unwrap();
+    // The web flow's sign-in page: back to the redirect URI at once.
+    if let Some(query) = path.strip_prefix("/login/oauth/authorize?").filter(|_| method == "GET") {
+        let q = decode_form(query);
+        let back = if s.deny {
+            format!("error=access_denied&state={}", q["state"])
+        } else {
+            s.minted += 1;
+            let code = format!("wc{}", s.minted);
+            let entry = (s.next.clone(), q["code_challenge"].clone(), q["redirect_uri"].clone());
+            s.web_codes.insert(code.clone(), entry);
+            assert_eq!(q["code_challenge_method"], "S256");
+            format!("code={code}&state={}", q["state"])
+        };
+        let location = format!("{}?{back}", q["redirect_uri"]);
+        let _ = conn.write_all(
+            format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        return;
+    }
     let member = |s: &GithubState, login: &str, of: &str| s.members.iter().any(|(l, o)| l == login && o == of);
     let active = json!({ "state": "active", "role": "member" });
     let not_found = (404, json!({ "message": "Not Found" }));
@@ -4768,6 +4817,22 @@ fn github_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<GithubS
                 200,
                 json!({ "device_code": code, "user_code": "WDJB-MJHT", "verification_uri": uri, "expires_in": 900, "interval": 1 }),
             )
+        }
+        ("POST", "/login/oauth/access_token") if form("code").is_some() => {
+            use base64::Engine;
+            use sha2::Digest;
+            let f = decode_form(&body);
+            let s256 = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(v));
+            match s.web_codes.remove(&f["code"]) {
+                Some((login, challenge, redirect))
+                    if f.get("client_secret").is_some_and(|c| c == "s3cret")
+                        && f.get("redirect_uri") == Some(&redirect)
+                        && f.get("code_verifier").is_some_and(|v| s256(v) == challenge) =>
+                {
+                    (200, json!({ "access_token": format!("gho_{login}"), "token_type": "bearer", "scope": "" }))
+                }
+                _ => (200, json!({ "error": "bad_verification_code" })),
+            }
         }
         ("POST", "/login/oauth/access_token") => {
             let code = form("device_code").unwrap_or_default();
@@ -6170,10 +6235,18 @@ fn mcp_over_http_works_under_a_proxy_prefix_and_retries_are_not_deduplicated() {
 /// A server root whose `auth.toml` signs in with the GitHub App `Iv1.test`
 /// and turns on the authorization server with `oauth` (the `[oauth]` body).
 fn oauth_root(oauth: &str) -> TempDir {
+    oauth_root_at(None, "[[github.allow]]\nusers = [\"alice\"]\n", oauth)
+}
+
+/// [`oauth_root`] signing in at `github`, with these `[[github.allow]]` rules.
+fn oauth_root_at(github: Option<&FakeGithub>, rules: &str, oauth: &str) -> TempDir {
     let root = Server::prepare();
     std::fs::write(root.path().join("app.pem"), include_str!("fixtures/github-app.pem")).unwrap();
+    std::fs::write(root.path().join("github-secret"), "s3cret\n").unwrap();
+    let urls = github.map(|g| format!("url = \"{0}\"\napi_url = \"{0}\"\n", g.url)).unwrap_or_default();
     let config = format!(
-        "[github]\nclient_id = \"Iv1.test\"\nprivate_key = \"app.pem\"\n[[github.allow]]\nusers = [\"alice\"]\n\n[oauth]\n{oauth}"
+        "[github]\nclient_id = \"Iv1.test\"\n{urls}private_key = \"app.pem\"\nclient_secret_file = \"github-secret\"\n\
+         {rules}\n[oauth]\n{oauth}"
     );
     std::fs::write(root.path().join("auth.toml"), config).unwrap();
     root
@@ -6296,4 +6369,210 @@ fn oauth_clients_register_without_a_token_for_allowed_redirects() {
     std::fs::remove_file(server.root.path().join("auth.toml")).unwrap();
     let (status, _, _) = post_json(&register, r#"{"redirect_uris":["https://claude.ai/cb"]}"#);
     assert_eq!(status, 404);
+}
+
+/// A browser request, following no redirects: the status, headers and body.
+fn browse(url: &str, cookie: Option<&str>, post: Option<(&str, &str)>) -> (u16, ureq::http::HeaderMap, String) {
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).proxy(None).build().into();
+    let mut r = match post {
+        Some((origin, body)) => {
+            let mut req = agent.post(url).header("content-type", "application/x-www-form-urlencoded");
+            if !origin.is_empty() {
+                req = req.header("origin", origin);
+            }
+            if let Some(c) = cookie {
+                req = req.header("cookie", &format!("other=1; bd_oauth={c}"));
+            }
+            req.send(body).unwrap()
+        }
+        None => {
+            let mut req = agent.get(url);
+            if let Some(c) = cookie {
+                req = req.header("cookie", &format!("bd_oauth={c}"));
+            }
+            req.call().unwrap()
+        }
+    };
+    let text = r.body_mut().read_to_string().unwrap_or_default();
+    (r.status().as_u16(), r.headers().clone(), text)
+}
+
+fn location(headers: &ureq::http::HeaderMap) -> String {
+    headers.get("location").expect("a redirect").to_str().unwrap().to_string()
+}
+
+/// The pairs of the query of `url`, which starts with `prefix`.
+fn query_of(url: &str, prefix: &str) -> std::collections::HashMap<String, String> {
+    assert!(url.starts_with(prefix), "{url}");
+    decode_form(url.split_once('?').map_or("", |(_, q)| q))
+}
+
+#[test]
+fn people_authorize_mcp_clients_after_signing_in_with_github() {
+    let github = FakeGithub::start();
+    let rules = "[[github.allow]]\nusers = [\"alice\"]\nrole = \"write\"\nworkspaces = [\"proj\"]\n";
+    let server = Server::launch(
+        oauth_root_at(Some(&github), rules, "redirect_hosts = [\"app.example\"]\n"),
+        "127.0.0.1:0",
+        &["--public-url", "https://bd.example.com/bd"],
+    );
+    let issuer = "https://bd.example.com/bd";
+    let iss = issuer.to_string();
+    // The browser reaches the server at its public URL: here, its test address with the prefix.
+    let here = |url: &str| url.replacen("https://bd.example.com", &server.base, 1);
+    let (status, _, registered) = post_json(
+        &format!("{}/bd/oauth/register", server.base),
+        r#"{"redirect_uris":["https://app.example/cb"],"client_name":"<b>App</b>"}"#,
+    );
+    assert_eq!(status, 201, "{registered}");
+    let client_id = registered["client_id"].as_str().unwrap().to_string();
+    let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let authorize = |extra: &[(&str, &str)]| {
+        let mut q = vec![
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", "https://app.example/cb"),
+            ("state", "st&1"),
+            ("response_type", "code"),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("resource", "https://bd.example.com/bd/w/proj/mcp"),
+        ];
+        for (k, v) in extra {
+            q.retain(|(name, _)| name != k);
+            if !v.is_empty() {
+                q.push((k, v));
+            }
+        }
+        let query: Vec<String> = q
+            .iter()
+            .map(|(k, v)| {
+                format!("{k}={}", v.replace('%', "%25").replace('&', "%26").replace(':', "%3A").replace('/', "%2F"))
+            })
+            .collect();
+        format!("{}/bd/oauth/authorize?{}", server.base, query.join("&"))
+    };
+    // To GitHub with a challenge of the server's own, and a cookie for the browser; back to the callback.
+    let start = |cookie: Option<&str>| -> (String, String) {
+        let (status, headers, body) = browse(&authorize(&[]), cookie, None);
+        assert_eq!(status, 302, "{body}");
+        let to_github = location(&headers);
+        let q = query_of(&to_github, &format!("{}/login/oauth/authorize?", github.url));
+        assert_eq!(q["client_id"], "Iv1.test");
+        assert_eq!(q["redirect_uri"], format!("{issuer}/oauth/github/callback"));
+        assert_ne!(q["code_challenge"], challenge, "not the client's");
+        let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+        assert!(set.ends_with("; Path=/bd/oauth; Max-Age=1200; HttpOnly; SameSite=Lax; Secure"), "{set}");
+        let cookie = set["bd_oauth=".len()..set.find(';').unwrap()].to_string();
+        let (status, headers, _) = browse(&to_github, None, None);
+        assert_eq!(status, 302);
+        (here(&location(&headers)), cookie)
+    };
+    let consent_id = |html: &str| {
+        let at = html.find("name=\"consent\" value=\"").unwrap() + "name=\"consent\" value=\"".len();
+        html[at..at + 64].to_string()
+    };
+    let decide = |cookie: &str, origin: &str, body: &str| {
+        browse(&format!("{}/bd/oauth/consent", server.base), Some(cookie), Some((origin, body)))
+    };
+
+    // Approved: a code for the client, with its state and the issuer.
+    github.next("alice", 0);
+    let (callback, cookie) = start(None);
+    let (status, headers, page) = browse(&callback, Some(&cookie), None);
+    assert_eq!(status, 200, "{page}");
+    for shown in ["alice", "proj", "app.example", "&lt;b&gt;App&lt;/b&gt;", "not verified", "role write"] {
+        assert!(page.contains(shown), "{shown}: {page}");
+    }
+    let csp = headers.get("content-security-policy").unwrap().to_str().unwrap();
+    assert!(csp.contains("form-action https://bd.example.com https://app.example;"), "{csp}");
+    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    let id = consent_id(&page);
+    let approve = format!("consent={id}&decision=approve");
+    let (status, _, body) = decide(&cookie, "https://evil.example", &approve);
+    assert_eq!(status, 403, "another site's form: {body}");
+    let (status, _, _) = decide(&"0".repeat(64), "https://bd.example.com", &approve);
+    assert_eq!(status, 400, "another browser");
+    // The other browser's attempt ended the consent: approve in a new one.
+    github.next("alice", 0);
+    let (callback, cookie) = start(Some(&cookie));
+    let (_, _, page) = browse(&callback, Some(&cookie), None);
+    let approve = format!("consent={}&decision=approve", consent_id(&page));
+    let (status, headers, _) = decide(&cookie, "https://bd.example.com", &approve);
+    assert_eq!(status, 303);
+    let back = query_of(&location(&headers), "https://app.example/cb?");
+    assert_eq!(back["code"].len(), 64);
+    assert_eq!((&back["state"], &back["iss"]), (&"st&1".to_string(), &iss));
+    assert_eq!(decide(&cookie, "", &approve).0, 400, "a consent is decided once");
+    let log = github.log();
+    let exchange =
+        log.iter().find(|l| l.starts_with("POST /login/oauth/access_token") && l.contains("code=wc")).unwrap();
+    assert!(exchange.contains("client_secret=s3cret") && exchange.contains("code_verifier="), "{exchange}");
+
+    // Denied.
+    github.next("alice", 0);
+    let (callback, cookie) = start(Some(&cookie));
+    let (_, _, page) = browse(&callback, Some(&cookie), None);
+    let (status, headers, _) =
+        decide(&cookie, "https://bd.example.com", &format!("consent={}&decision=deny", consent_id(&page)));
+    assert_eq!(status, 303);
+    let back = query_of(&location(&headers), "https://app.example/cb?");
+    assert_eq!(
+        (&back["error"], &back["state"], &back["iss"]),
+        (&"access_denied".to_string(), &"st&1".to_string(), &iss)
+    );
+
+    // Cancelled at GitHub.
+    github.deny(true);
+    let (callback, cookie) = start(None);
+    github.deny(false);
+    let (status, headers, _) = browse(&callback, Some(&cookie), None);
+    assert_eq!(status, 302);
+    assert_eq!(query_of(&location(&headers), "https://app.example/cb?")["error"], "access_denied");
+
+    // Back from GitHub in another browser, or again: no consent page.
+    github.next("alice", 0);
+    let (callback, _) = start(None);
+    assert_eq!(browse(&callback, Some(&"0".repeat(64)), None).0, 400);
+    assert_eq!(browse(&callback, None, None).0, 400, "the sign-in ended");
+
+    // An account the rules do not let in: a page, with a way back to the client.
+    github.next("mallory", 0);
+    let (callback, cookie) = start(None);
+    let (status, headers, page) = browse(&callback, Some(&cookie), None);
+    assert_eq!(status, 403);
+    assert!(headers.get("location").is_none());
+    assert!(page.contains("mallory") && page.contains("https://app.example/cb?error=access_denied"), "{page}");
+
+    // A client or redirect URI that cannot be trusted is never redirected to.
+    for extra in
+        [[("client_id", "bdc_unknown")], [("redirect_uri", "https://app.example/other")], [("redirect_uri", "")]]
+    {
+        let (status, headers, page) = browse(&authorize(&extra), None, None);
+        assert_eq!(status, 400, "{extra:?}: {page}");
+        assert!(headers.get("location").is_none(), "{extra:?}");
+        assert!(headers.get("content-security-policy").is_some());
+    }
+    // Other mistakes go back to the client, with the issuer.
+    for (extra, error) in [
+        ([("resource", "")], "invalid_request"),
+        ([("resource", "https://bd.example.com/bd/w/nope/mcp")], "invalid_target"),
+        ([("code_challenge_method", "plain")], "invalid_request"),
+        ([("response_type", "token")], "unsupported_response_type"),
+    ] {
+        let (status, headers, _) = browse(&authorize(&extra), None, None);
+        assert_eq!(status, 302, "{extra:?}");
+        let back = query_of(&location(&headers), "https://app.example/cb?");
+        assert_eq!((&back["error"], &back["iss"]), (&error.to_string(), &iss), "{extra:?}");
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let posted = agent.post(format!("{}/bd/oauth/authorize", server.base)).send("").unwrap();
+    assert_eq!((posted.status().as_u16(), posted.headers().get("allow").unwrap().to_str().unwrap()), (405, "GET"));
+    let got = agent.get(format!("{}/bd/oauth/consent", server.base)).call().unwrap();
+    assert_eq!((got.status().as_u16(), got.headers().get("allow").unwrap().to_str().unwrap()), (405, "POST"));
+
+    // Without [oauth], no authorizations.
+    std::fs::remove_file(server.root.path().join("auth.toml")).unwrap();
+    assert_eq!(browse(&authorize(&[]), None, None).0, 404);
 }

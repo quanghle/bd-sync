@@ -714,6 +714,70 @@ fn export_import_round_trip_via_cli() {
 }
 
 #[test]
+fn backups_are_self_contained_copies_kept_by_count() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Backed up"]);
+    let dir = ws.dir.path().join("backups").join("t");
+    let mut taken = Vec::new();
+    for _ in 0..3 {
+        // Relative to the working directory, like --db.
+        taken.push(ws.json(&["backup", "--to", "backups", "--keep", "2"]));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let counts: Vec<(u64, u64)> =
+        taken.iter().map(|t| (t["removed"].as_u64().unwrap(), t["kept"].as_u64().unwrap())).collect();
+    assert_eq!(counts, [(0, 1), (0, 2), (1, 2)]);
+    assert_eq!(taken[2]["name"], "t");
+    let files: Vec<std::path::PathBuf> = taken.iter().map(|t| t["file"].as_str().unwrap().into()).collect();
+    for (t, f) in taken.iter().zip(&files) {
+        let name = f.file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with("t-") && name.ends_with("Z.db"), "{name}");
+        assert_eq!(std::fs::canonicalize(f.parent().unwrap()).unwrap(), std::fs::canonicalize(&dir).unwrap());
+        assert!(t["bytes"].as_u64().unwrap() > 0);
+    }
+    let mut left: Vec<String> =
+        std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    left.sort();
+    let newest: Vec<String> = files[1..].iter().map(|f| f.file_name().unwrap().to_str().unwrap().into()).collect();
+    assert_eq!(left, newest, "the oldest was deleted");
+
+    // A copy is a whole workspace on its own.
+    let restore = tempfile::tempdir().unwrap();
+    let copy = restore.path().join("bd.db");
+    std::fs::copy(&files[2], &copy).unwrap();
+    let listed = ws.json(&["--db", copy.to_str().unwrap(), "list"]);
+    assert_eq!(listed[0]["title"], "Backed up");
+
+    // Text and quiet output, another name, and keep 0.
+    let text = ws.ok(&["backup", "--to", "backups", "--name", "nightly.v1", "--keep", "0"]);
+    assert!(text.starts_with("✓ Backed up ") && text.contains("nightly.v1-"), "{text}");
+    let quiet = ws.ok(&["-q", "backup", "--to", "backups", "--name", "nightly.v1", "--keep", "0"]);
+    assert!(Path::new(quiet.trim()).is_file(), "{quiet}");
+    assert_eq!(std::fs::read_dir(ws.dir.path().join("backups").join("nightly.v1")).unwrap().count(), 2);
+    assert_eq!(ws.code_as("tester", &["backup", "--to", "backups", "--name", "../up"]), 2);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&ws.dir.path().join("backups")), mode(&dir), mode(&files[2])), (0o700, 0o700, 0o600));
+    }
+}
+
+#[test]
+fn backup_refuses_a_remote_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".bd")).unwrap();
+    std::fs::write(dir.path().join(".bd/remote.toml"), "url = \"https://bd.example.com/w/proj\"\n").unwrap();
+    let out = Ws::cmd_in(dir.path(), "tester", &["backup", "--to", "backups"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("https://bd.example.com/w/proj") && err.contains("bd serve --backup-dir"), "{err}");
+    let flag = ["--remote", "https://bd.example.com/w/other", "backup", "--to", "backups"];
+    assert_eq!(Ws::cmd_in(dir.path(), "tester", &flag).output().unwrap().status.code(), Some(2));
+    assert!(!dir.path().join("backups").exists(), "nothing written");
+}
+
+#[test]
 fn prime_is_silent_outside_a_workspace() {
     let dir = tempfile::tempdir().unwrap();
     let out = Ws::cmd_in(dir.path(), "x", &["prime"]).output().unwrap();

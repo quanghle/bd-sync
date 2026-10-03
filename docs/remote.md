@@ -322,7 +322,9 @@ logs a warning then. Copies hold everything in a workspace, so on Unix they
 are readable by the user running `bd serve` only: files are created 0600, and
 the directories it creates 0700 (an existing `--backup-dir` keeps its mode).
 Keep the directory on another disk, or ship it elsewhere (rsync, restic,
-object storage). To restore a workspace from a copy:
+object storage). A local workspace gets the same copies without a server from
+`bd backup --to DIR` (e.g. from cron; [Backing up a local workspace](modes.md#backing-up-a-local-workspace)).
+To restore a workspace from a copy:
 
 ```bash
 # Stop bd serve first: it keeps the database open, and could open a half-copied file.

@@ -148,6 +148,8 @@ pub enum Command {
     Export(ExportArgs),
     /// Import a JSONL snapshot (bd or beads format), all or nothing
     Import(ImportArgs),
+    /// Back up the local workspace's database into DIR/<name>/, keeping the newest N copies
+    Backup(BackupArgs),
     /// Run many write operations in one transaction
     Batch(BatchArgs),
     /// Repeatable multi-step work: list, preview, start and manage playbook runs
@@ -825,6 +827,19 @@ pub struct ExportArgs {
     /// Include ephemeral issues (scratch runs), which are left out by default
     #[arg(long)]
     pub include_ephemeral: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct BackupArgs {
+    /// Directory to back up into: the copy goes to DIR/<name>/<name>-<UTC time>.db
+    #[arg(long, value_name = "DIR")]
+    pub to: PathBuf,
+    /// Backups kept in DIR/<name>/, the new one included; older ones are deleted (0 = keep all)
+    #[arg(long, default_value_t = 24, value_name = "N")]
+    pub keep: usize,
+    /// Name of the backups (default: the workspace's issue prefix)
+    #[arg(long)]
+    pub name: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]

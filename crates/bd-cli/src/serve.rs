@@ -1056,7 +1056,9 @@ pub(crate) enum Access {
 pub(crate) fn access(cmd: &Command) -> Access {
     use Command as C;
     match cmd {
-        C::Init(_) | C::Serve(_) | C::Remote(_) | C::Hook(_) | C::Bench(_) | C::BenchWorker(_) => Access::Local,
+        C::Init(_) | C::Backup(_) | C::Serve(_) | C::Remote(_) | C::Hook(_) | C::Bench(_) | C::BenchWorker(_) => {
+            Access::Local
+        }
         C::Events(a) if a.follow => Access::Local,
         C::Events(a) if a.action.is_none() => Access::Read,
         C::Playbook(PlaybookCommand::Extract(a)) if a.save => Access::Local,
@@ -1539,6 +1541,7 @@ mod tests {
     fn commands_are_classified_for_remote_access() {
         for (args, want) in [
             (&["init"][..], Access::Local),
+            (&["backup", "--to", "b"][..], Access::Local),
             (&["serve", "--root", "."][..], Access::Local),
             (&["bench"][..], Access::Local),
             (&["remote", "show"][..], Access::Local),

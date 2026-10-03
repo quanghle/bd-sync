@@ -61,7 +61,7 @@ sharing its own, so each agent session acts as its own actor
 | [Install](docs/install.md) | prebuilt binaries, checking them, building from source |
 | [Differences from beads](docs/beads.md) | what bd keeps and changes from beads, and migrating from Go beads |
 | [Concepts](docs/concepts.md) | statuses, dependency types, ready-work order, claims and leases, optimistic concurrency, events, memory, actors |
-| [Modes of operation](docs/modes.md) | local workspaces, remote workspaces, the embedded library |
+| [Modes of operation](docs/modes.md) | local workspaces and their backups, remote workspaces, the embedded library |
 | [Playbooks and gates](docs/playbooks.md) | repeatable multi-step work, runs, human/timer/issue/GitHub gates |
 | [Remote server](docs/remote.md) | `bd serve`, access tokens, GitHub sign-in, background jobs and backups, clients, followers |
 | [Agent skills and MCP definitions](docs/agents.md) | serving, pulling and approving agent assets; session-start hooks |

@@ -19,9 +19,9 @@
 //! The agents job reads each harness's set from the workspace's
 //! `.bd/agents` and records its revision ([`bd_core::agents::record_revisions`]),
 //! appending an `agents_changed` event for each set that changed.
-//! Backups are [`Store::snapshot`]s (`VACUUM INTO`) written under a temporary
-//! name and then renamed to `<backup dir>/<name>/<name>-<UTC time>.db`; the
-//! newest `keep` are kept.
+//! Backups ([`crate::backup`], shared with `bd backup`) are [`Store::snapshot`]s
+//! (`VACUUM INTO`) written under a temporary name and then renamed to
+//! `<backup dir>/<name>/<name>-<UTC time>.db`; the newest `keep` are kept.
 //!
 //! On shutdown no job starts any more, and running ones get a grace period.
 //! Abandoning one is safe: an unfinished transaction rolls back, and the
@@ -43,6 +43,7 @@ use serde_json::Value;
 use tokio::sync::{Semaphore, mpsc, watch};
 
 use crate::app::App;
+use crate::backup;
 use crate::cli::{Cli, Command, ServeArgs};
 use crate::io::{self, Capture};
 use crate::protocol::valid_workspace_name;
@@ -61,8 +62,6 @@ const PRUNE_BATCH: usize = 10_000;
 const SCAN_EVERY: Duration = Duration::from_secs(30);
 /// A failing job waits at most this many intervals before trying again.
 const MAX_BACKOFF: u32 = 32;
-/// Backup file times: UTC, sortable, and valid in file names everywhere.
-const STAMP: &str = "%Y%m%dT%H%M%S%.3fZ";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Job {
@@ -127,7 +126,7 @@ impl Config {
         let backups = match (&a.backup_dir, every("--backup-every", &a.backup_every)?) {
             (Some(dir), Some(every)) => {
                 let bad = |e: std::io::Error| Error::invalid(format!("--backup-dir {}: {e}", dir.display()));
-                create_private_dir(dir).map_err(bad)?;
+                backup::create_private_dir(dir).map_err(bad)?;
                 Some(Backups { dir: std::path::absolute(dir).map_err(bad)?, every, keep: a.backup_keep })
             }
             _ => None,
@@ -650,117 +649,31 @@ fn prune(ws: &Workspace, open: &OpenOptions, started: Instant) -> Result<()> {
 
 /// Back up `ws`; returns the new backup file.
 fn backup(ws: &Workspace, open: &OpenOptions, b: &Backups, started: Instant) -> Result<PathBuf> {
-    let dir = b.dir.join(&ws.name);
-    create_private_dir(&dir)?;
-    remove_unfinished(&dir, &ws.name);
-    let name = format!("{}-{}.db", ws.name, chrono::Utc::now().format(STAMP));
-    let (tmp, file) = (dir.join(format!("{name}.tmp")), dir.join(&name));
-    Store::open(&ws.db, open.clone())?.snapshot(&tmp)?;
-    std::fs::rename(&tmp, &file).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })?;
-    sync_dir(&dir);
-    let bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or_default();
-    let others: Vec<PathBuf> =
-        backup_files(&dir, &ws.name)?.into_iter().filter(|f| f.file_name() != file.file_name()).collect();
-    if let Some(newer) = others.last().filter(|f| f.file_name() > file.file_name()) {
+    let store = Store::open(&ws.db, open.clone())?;
+    let taken = backup::take(&store, &b.dir, &ws.name, b.keep)?;
+    if let Some(newer) = &taken.newer {
         tracing::warn!(
             target: "bd::serve",
             workspace = %ws.name,
-            file = %file.display(),
+            file = %taken.file.display(),
             newer = %newer.display(),
             "an existing backup is dated after the new one: check the clock (the oldest-dated backups are deleted first)"
         );
     }
-    let removed = retain(&others, b.keep);
+    for (old, e) in &taken.undeleted {
+        tracing::warn!(target: "bd::serve", file = %old.display(), error = %e, "cannot delete an old backup");
+    }
     tracing::info!(
         target: "bd::serve",
         workspace = %ws.name,
         job = "backup",
-        file = %file.display(),
-        bytes,
-        removed,
+        file = %taken.file.display(),
+        bytes = taken.bytes,
+        removed = taken.removed,
         ms = ms(started),
         "backed up"
     );
-    Ok(file)
-}
-
-/// `20261001T212233.123Z`, as [`STAMP`] formats it.
-fn is_stamp(s: &str) -> bool {
-    s.len() == 20
-        && s.bytes().enumerate().all(|(i, c)| match i {
-            8 => c == b'T',
-            15 => c == b'.',
-            19 => c == b'Z',
-            _ => c.is_ascii_digit(),
-        })
-}
-
-/// The finished backups of workspace `name` in `dir`, oldest first.
-fn backup_files(dir: &Path, name: &str) -> Result<Vec<PathBuf>> {
-    let prefix = format!("{name}-");
-    let mut files: Vec<(String, PathBuf)> = std::fs::read_dir(dir)?
-        .filter_map(|e| {
-            let e = e.ok()?;
-            let file = e.file_name().into_string().ok()?;
-            let stamp = file.strip_prefix(&prefix)?.strip_suffix(".db")?;
-            is_stamp(stamp).then(|| (file.clone(), e.path()))
-        })
-        .collect();
-    files.sort();
-    Ok(files.into_iter().map(|(_, path)| path).collect())
-}
-
-/// Delete backups so that `keep` remain (0 keeps all), counting the one just
-/// written, which is never deleted, whatever its date. `others` are the rest,
-/// oldest first. Returns how many were deleted; one that cannot be deleted
-/// now (open elsewhere, on Windows) is logged and left for the next backup.
-fn retain(others: &[PathBuf], keep: usize) -> usize {
-    if keep == 0 {
-        return 0;
-    }
-    let excess = others.len().saturating_sub(keep - 1);
-    let mut removed = 0;
-    for old in &others[..excess] {
-        match std::fs::remove_file(old) {
-            Ok(()) => removed += 1,
-            Err(e) => {
-                tracing::warn!(target: "bd::serve", file = %old.display(), error = %e, "cannot delete an old backup")
-            }
-        }
-    }
-    removed
-}
-
-/// Create `dir` and its missing parents, on Unix readable by this user only
-/// (0700): backups hold whole workspaces. Existing directories keep their mode.
-fn create_private_dir(dir: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder.create(dir)
-}
-
-/// Remove what an unfinished backup left behind (the server stopped during it).
-fn remove_unfinished(dir: &Path, name: &str) {
-    let prefix = format!("{name}-");
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        if e.file_name().to_str().is_some_and(|f| f.starts_with(&prefix) && f.contains(".db.tmp")) {
-            let _ = std::fs::remove_file(e.path());
-        }
-    }
-}
-
-/// Make a rename durable. Windows has no directory handle to flush.
-fn sync_dir(dir: &Path) {
-    #[cfg(unix)]
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    #[cfg(not(unix))]
-    let _ = dir;
+    Ok(taken.file)
 }
 
 #[cfg(test)]
@@ -843,50 +756,6 @@ mod tests {
         assert!(discover(&root.path().join("missing")).is_err());
     }
 
-    #[test]
-    fn retention_keeps_the_newest_backups_and_nothing_else_is_touched() {
-        let dir = tempfile::tempdir().unwrap();
-        let files = [
-            "proj-20260101T000000.000Z.db",
-            "proj-20260103T000000.000Z.db",
-            "proj-20260102T000000.000Z.db",
-            "proj-20260104T000000.000Z.db.tmp",
-            "proj-20260104T000000.000Z.db.tmp-journal",
-            "proj-2-20260105T000000.000Z.db",
-            "proj-latest.db",
-            "notes.txt",
-        ];
-        for f in files {
-            std::fs::write(dir.path().join(f), b"x").unwrap();
-        }
-        let names = |dir: &Path| {
-            let mut v: Vec<String> =
-                std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-            v.sort();
-            v
-        };
-        let listed: Vec<PathBuf> = backup_files(dir.path(), "proj").unwrap();
-        assert_eq!(listed.len(), 3);
-        assert!(listed[0].ends_with("proj-20260101T000000.000Z.db"), "oldest first: {listed:?}");
-
-        // The newest was just written; retention looks at the others.
-        assert_eq!(retain(&listed[..2], 0), 0, "0 keeps all");
-        assert_eq!(retain(&listed[..2], 2), 1);
-        assert_eq!(retain(&backup_files(dir.path(), "proj").unwrap()[..1], 2), 0);
-        remove_unfinished(dir.path(), "proj");
-        assert_eq!(
-            names(dir.path()),
-            [
-                "notes.txt",
-                "proj-2-20260105T000000.000Z.db",
-                "proj-20260102T000000.000Z.db",
-                "proj-20260103T000000.000Z.db",
-                "proj-latest.db"
-            ]
-        );
-        assert!(is_stamp(&chrono::Utc::now().format(STAMP).to_string()));
-    }
-
     /// A root holding workspace `proj` with one issue.
     fn real_workspace() -> (tempfile::TempDir, Workspace) {
         let root = tempfile::tempdir().unwrap();
@@ -907,7 +776,7 @@ mod tests {
             backup(&ws, &OpenOptions::default(), &b, Instant::now()).unwrap();
             std::thread::sleep(millis(5));
         }
-        let files = backup_files(&out.path().join("proj"), "proj").unwrap();
+        let files = backup::files(&out.path().join("proj"), "proj").unwrap();
         assert_eq!(files.len(), 2, "{files:?}");
         let restore = tempfile::tempdir().unwrap();
         let restored = restore.path().join("bd.db");
@@ -932,14 +801,14 @@ mod tests {
         let mut b = Backups { dir: out.path().to_path_buf(), every: Duration::from_secs(3600), keep: 2 };
         let first = backup(&ws, &OpenOptions::default(), &b, Instant::now()).unwrap();
         assert!(first.is_file(), "the backup just written is kept");
-        assert_eq!(backup_files(&dir, "proj").unwrap(), [first.clone(), future[1].clone()]);
+        assert_eq!(backup::files(&dir, "proj").unwrap(), [first.clone(), future[1].clone()]);
         std::thread::sleep(millis(5));
         let second = backup(&ws, &OpenOptions::default(), &b, Instant::now()).unwrap();
-        assert_eq!(backup_files(&dir, "proj").unwrap(), [second.clone(), future[1].clone()]);
+        assert_eq!(backup::files(&dir, "proj").unwrap(), [second.clone(), future[1].clone()]);
         b.keep = 1;
         std::thread::sleep(millis(5));
         let third = backup(&ws, &OpenOptions::default(), &b, Instant::now()).unwrap();
-        assert_eq!(backup_files(&dir, "proj").unwrap(), [third], "keep 1 keeps the new one");
+        assert_eq!(backup::files(&dir, "proj").unwrap(), [third], "keep 1 keeps the new one");
     }
 
     #[test]

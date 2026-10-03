@@ -2,6 +2,7 @@ mod actor;
 mod agents;
 mod app;
 mod auth;
+mod backup;
 mod batch;
 mod bench;
 mod cli;
@@ -70,6 +71,7 @@ fn always_local(cmd: &Command) -> bool {
         cmd,
         Command::Serve(_)
             | Command::Remote(_)
+            | Command::Backup(_)
             | Command::Hook(_)
             | Command::Version
             | Command::Bench(_)
@@ -94,6 +96,7 @@ fn execute(app: &mut App, cmd: &Command) -> i32 {
         && !matches!(
             cmd,
             Command::Events(_)
+                | Command::Backup(_)
                 | Command::Bench(_)
                 | Command::BenchWorker(_)
                 | Command::Serve(_)
@@ -257,6 +260,7 @@ fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Config(c) => cmd_config_read(app, c).map(|_| 0),
         Command::Export(a) => cmd_export(app, a).map(|_| 0),
         Command::Import(a) => cmd_import(app, a).map(|_| 0),
+        Command::Backup(a) => backup::cmd_backup(app, a).map(|_| 0),
         Command::Batch(a) => batch::cmd_batch(app, a).map(|_| 0),
         Command::Playbook(c) => playbooks::cmd_playbook(app, c).map(|_| 0),
         Command::Gate(c) => gates::cmd_gate(app, c).map(|_| 0),
@@ -315,6 +319,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Config(_) => "config",
         Command::Export(_) => "export",
         Command::Import(_) => "import",
+        Command::Backup(_) => "backup",
         Command::Batch(_) => "batch",
         Command::Playbook(_) => "playbook",
         Command::Gate(_) => "gate",

@@ -27,6 +27,34 @@ A local workspace serves one host only: SQLite's WAL needs every process on
 one host, so a `bd.db` on a network file system is not safe. To share work
 between machines, use a remote workspace.
 
+### Backing up a local workspace
+
+`bd backup --to DIR` copies the workspace's database to
+`DIR/<name>/<name>-<UTC time>.db` (e.g. `proj-20261001T214244.014Z.db`), where
+`<name>` is the workspace's issue prefix (`--name` picks another: letters,
+digits, `.`, `_` and `-`), and deletes all but the newest `--keep` copies
+(default 24, the new one included; `0` keeps them all). These are the copies
+`bd serve --backup-dir` takes of each workspace it serves, with the same
+guarantees ([Background jobs and backups](remote.md#background-jobs-and-backups)):
+each is a compact, self-contained database taken with `VACUUM INTO` without
+holding up writers, checked and flushed to disk under a temporary name before
+it is renamed into place, and the copy just written is never deleted, even
+when older ones are dated after it (a warning says so). On Unix, copies are created 0600
+and the directories `bd backup` creates 0700. It prints the new file, its
+size, and how many old copies were deleted and kept (`--json`: `file`,
+`bytes`, `removed`, `kept`, `name`, `workspace`; `-q`: the file only). Run it
+from cron for periodic copies:
+
+```bash
+# Every hour, keeping a day of copies in /backups/bd/proj/.
+0 * * * * bd -C /home/me/proj backup --to /backups/bd --keep 24 -q
+```
+
+To restore, stop the agents using the workspace, move `.bd/bd.db` and its
+`-wal` and `-shm` files aside, copy a backup to `.bd/bd.db`, and run
+`bd doctor`. In a remote workspace `bd backup` is refused: the server holds
+the database, and `bd serve --backup-dir` backs it up.
+
 ## Remote workspace
 
 `bd serve` holds the databases of several workspaces and runs each client's

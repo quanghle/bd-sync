@@ -16,7 +16,7 @@ global options, environment variables, configuration keys and exit codes.
 | Events | `events` (`--follow`, `--wait`, `prune`), `history` | [Event history](concepts.md#event-history) |
 | Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `agents status/pull/approve/watch/manifest` | [Actors](concepts.md#actors), [Agent skills](agents.md) |
 | Playbooks and gates | `playbook list/show/plan/run/status/runs/compact/discard/extract`, `gate list/show/check/resolve/create`, `purge` | [Playbooks](playbooks.md) |
-| Data | `export`, `import` (bd or beads JSONL, all or nothing), `batch` (many writes in one transaction, `--dry-run` rolls back) | [Migrating](beads.md#migrating-from-go-beads) |
+| Data | `export`, `import` (bd or beads JSONL, all or nothing), `batch` (many writes in one transaction, `--dry-run` rolls back), `backup --to DIR` (a verified copy of a local workspace's database; the newest `--keep` are kept) | [Migrating](beads.md#migrating-from-go-beads), [Backups](modes.md#backing-up-a-local-workspace) |
 | Operations | `metrics`, `bench` | [Observability](observability.md), [Benchmarks](benchmarks.md) |
 | Remote | `serve`, `serve token create/list/revoke/accounts`, `remote set/show/unset/login/logout` | [Remote server](remote.md) |
 

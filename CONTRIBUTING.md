@@ -82,6 +82,7 @@ crates/bd-core/src/   store (WAL, transactions, busy handling) · schema · issu
 crates/bd-core/tests/ engine integration tests (graph semantics, leases with a manual clock, concurrency,
                       playbook runs and gates, write policies)
 crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) · batch · bench · fmt · logging
+                      · backup (bd backup and bd serve's backups: snapshots, naming, retention)
                       io (stdio and files, or a captured request) · serve (bd serve) · jobs (its background
                       jobs: reclaim, gate checks, agent sets, backups) · auth (access tokens)
                       · oauth (GitHub sign-in) · remote (client) · credentials (bd remote login)

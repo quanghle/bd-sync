@@ -59,9 +59,10 @@ playbook run gets the same answer as a single command
   answered 503, which clients retry ([Followers](remote.md#followers)).
 - **The server's host is not limited by tokens.** `bd` run on the host opens
   `bd.db` directly; guard the root directory like the database it is.
-- **Backups hold everything.** On Unix, backup files are created 0600 and the
-  directories bd creates 0700; keep them on another disk or ship them
-  elsewhere ([Background jobs and backups](remote.md#background-jobs-and-backups)).
+- **Backups hold everything.** On Unix, backup files (`bd serve
+  --backup-dir`, `bd backup`) are created 0600 and the directories bd creates
+  0700; keep them on another disk or ship them elsewhere
+  ([Background jobs and backups](remote.md#background-jobs-and-backups)).
 
 ## GitHub sign-in
 

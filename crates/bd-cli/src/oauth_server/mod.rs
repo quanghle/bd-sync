@@ -12,6 +12,7 @@ pub mod cimd;
 pub mod clients;
 pub mod form;
 pub mod pages;
+pub mod token;
 
 /// Where the metadata is served: this, then the issuer's path (RFC 8414
 /// section 3.1).

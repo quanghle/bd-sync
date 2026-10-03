@@ -43,6 +43,14 @@ pub struct Client {
     /// Whether `id` is the URL of its metadata document, rather than
     /// registered here.
     pub document: bool,
+    /// The logo its metadata document names, which the document's site
+    /// vouches for, fetched with the document as a `data:` URL; never a
+    /// registered client's, which anyone may claim. Shared, not copied, by
+    /// every authorization under way for the client: anyone may start many.
+    pub logo: Option<std::sync::Arc<str>>,
+    /// Whether its document may be kept: its host did not say `no-store`
+    /// or `no-cache` (always, for a registered client).
+    pub cacheable: bool,
 }
 
 impl Client {
@@ -64,14 +72,20 @@ pub fn lookup(root: &Path, documents: &Documents, id: &str) -> Result<Client> {
     }
     let file = load(&path(root))?;
     match file.clients.into_iter().find(|c| c.client_id == id) {
-        Some(c) => Ok(Client { id: c.client_id, name: c.client_name, redirect_uris: c.redirect_uris, document: false }),
+        Some(c) => Ok(Client {
+            id: c.client_id,
+            name: c.client_name,
+            redirect_uris: c.redirect_uris,
+            document: false,
+            logo: None,
+            cacheable: true,
+        }),
         None => Err(Error::invalid(format!("no such client: {id:?} (registrations unused for a while are dropped)"))),
     }
 }
 
 /// Record that the registered client `id` was used (an authorization or a
 /// token), so it is kept; nothing for clients with a metadata document.
-#[cfg_attr(not(test), expect(dead_code, reason = "the token endpoint marks clients used"))]
 pub fn touch(root: &Path, id: &str) -> Result<()> {
     if cimd::is_document_url(id) {
         return Ok(());
@@ -90,7 +104,13 @@ pub fn touch(root: &Path, id: &str) -> Result<()> {
     auth::save_json(&path, &file)
 }
 
-/// `uri` without its port if it is an http URI to this machine.
+/// Whether `uri` sends the browser to this machine (`http` on 127.0.0.1,
+/// [::1] or localhost), where any program may be listening.
+pub fn is_loopback(uri: &str) -> bool {
+    matches!(without_loopback_port(uri), std::borrow::Cow::Owned(_))
+}
+
+/// `uri` without its port if it is a loopback one, owned only then.
 fn without_loopback_port(uri: &str) -> std::borrow::Cow<'_, str> {
     let Some(rest) = uri.strip_prefix("http://") else { return uri.into() };
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
@@ -120,7 +140,7 @@ pub fn register(root: &Path, oauth: &OauthConfig, request: &[u8]) -> Result<std:
     };
     let request = request.as_object().expect("an object");
     let checked = (|| {
-        let types = check_types(request)?;
+        let types = check_types(request, false)?;
         let redirect_uris = string_list(request.get("redirect_uris"), "redirect_uris", MAX_REDIRECTS)?;
         if let Some(uri) = redirect_uris.iter().find(|u| !oauth.allows_redirect(u)) {
             let why = format!(
@@ -173,12 +193,20 @@ pub fn register(root: &Path, oauth: &OauthConfig, request: &[u8]) -> Result<std:
     Ok(Ok(answer))
 }
 
-/// `grant_types` and `response_types`, which may be left out: of the ones
-/// bd supports, with authorization codes.
-pub fn check_types(meta: &Map<String, Value>) -> std::result::Result<(Vec<String>, Vec<String>), Refusal> {
+/// `grant_types` and `response_types`, which may be left out: with
+/// authorization codes, and of the ones bd supports. A client metadata
+/// document serves every server its client uses, so with `others_ignored`
+/// types bd does not support are left out rather than refused.
+pub fn check_types(
+    meta: &Map<String, Value>,
+    others_ignored: bool,
+) -> std::result::Result<(Vec<String>, Vec<String>), Refusal> {
     let list = |field: &str, supported: &[&str], needed: &str, default: &[&str]| {
         let Some(value) = meta.get(field) else { return Ok(default.iter().map(|s| s.to_string()).collect()) };
-        let list = string_list(Some(value), field, 8)?;
+        let mut list = string_list(Some(value), field, 8)?;
+        if others_ignored {
+            list.retain(|t| supported.contains(&t.as_str()));
+        }
         match list.iter().find(|t| !supported.contains(&t.as_str())) {
             Some(t) => Err(("invalid_client_metadata", format!("{field} {t:?} is not supported: {supported:?} are"))),
             None if !list.iter().any(|t| t == needed) => {
@@ -212,14 +240,66 @@ pub fn string_list(value: Option<&Value>, field: &str, max: usize) -> std::resul
     Ok(list)
 }
 
-/// `client_name`, if any: printable, trimmed, at most [`MAX_NAME`] characters.
+/// Whether `name` holds something that changes how it looks without being
+/// seen itself, which could make one client's name pass for another's:
+/// text direction controls (which reorder what follows, as in "Trojan
+/// Source"), invisible and blank characters, and spaces other than the
+/// ASCII one. Joiners (ZWJ, ZWNJ) are let through between two visible
+/// characters, where Persian, Indic scripts and emoji sequences need them,
+/// and emoji presentation selectors (VS15, VS16) after one.
+fn hides_something(name: &str) -> bool {
+    let chars: Vec<char> = name.chars().collect();
+    let visible = |i: Option<usize>| i.and_then(|i| chars.get(i)).is_some_and(|&c| c != ' ' && !hidden(c));
+    chars.iter().enumerate().any(|(i, &c)| match c {
+        '\u{200C}' | '\u{200D}' => !(visible(i.checked_sub(1)) && visible(Some(i + 1))),
+        '\u{FE0E}' | '\u{FE0F}' => !visible(i.checked_sub(1)),
+        c => c.is_control() || hidden(c),
+    })
+}
+
+/// Whether `c` is never shown in a name: see [`hides_something`].
+fn hidden(c: char) -> bool {
+    (c.is_whitespace() && c != ' ')
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{034F}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{08E2}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180F}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2060}'..='\u{206F}'
+                | '\u{2800}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FEFF}'
+                | '\u{FFA0}'
+                | '\u{FFF0}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1345F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D159}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0000}'..='\u{E0FFF}'
+        )
+}
+
+/// `client_name`, if any: printable, trimmed, at most [`MAX_NAME`]
+/// characters, hiding nothing ([`hides_something`]).
 pub fn client_name(value: Option<&Value>) -> std::result::Result<Option<String>, Refusal> {
     let name = match value {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(s)) => s.trim(),
         Some(_) => return Err(("invalid_client_metadata", "client_name is not a string".into())),
     };
-    if name.chars().count() > MAX_NAME || name.chars().any(char::is_control) {
+    if name.chars().count() > MAX_NAME || hides_something(name) {
         let why = format!("client_name is longer than {MAX_NAME} characters, or not printable");
         return Err(("invalid_client_metadata", why));
     }
@@ -266,6 +346,45 @@ fn millis(d: Duration) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_may_be_in_any_script_but_hide_nothing() {
+        let shown = [
+            "Café Ünïcode",
+            "日本語クライアント",
+            "Клиент",
+            "عميل",
+            "Claude ✨",
+            "Notes ✍\u{FE0F}",
+            "I \u{2764}\u{FE0F} bd",
+            "\u{1F469}\u{200D}\u{1F4BB} Dev",
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+            "\u{0915}\u{094D}\u{200D}\u{0937}",
+        ];
+        for shown in shown {
+            assert_eq!(client_name(Some(&json!(shown))).unwrap().as_deref(), Some(shown));
+        }
+        let hidden = [
+            "a\u{2066}b",
+            "a\u{FEFF}",
+            "a\u{E0041}",
+            "a\u{3000}b",
+            "a\u{2028}b",
+            "\u{200F}",
+            "\u{2800}",
+            "a\u{0600}b",
+            "Chat\u{200D}",
+            "\u{200C}GPT",
+            "Chat \u{200D}GPT",
+            "Chat\u{200D}\u{200D}GPT",
+            "\u{FE0F}GPT",
+            "Chat \u{FE0F}",
+            "Chat\u{FE01}GPT",
+        ];
+        for hidden in hidden {
+            assert!(client_name(Some(&json!(hidden))).is_err(), "{hidden:?}");
+        }
+    }
 
     fn oauth() -> OauthConfig {
         OauthConfig { redirect_hosts: vec!["chatgpt.com".into(), "claude.ai".into()], loopback_redirects: true }
@@ -361,6 +480,21 @@ mod tests {
             ),
             (
                 json!({ "redirect_uris": ["https://chatgpt.com/cb"], "client_name": "x".repeat(101) }),
+                "invalid_client_metadata",
+                "client_name",
+            ),
+            (
+                json!({ "redirect_uris": ["https://chatgpt.com/cb"], "client_name": "Chat\u{202E}TPG" }),
+                "invalid_client_metadata",
+                "client_name",
+            ),
+            (
+                json!({ "redirect_uris": ["https://chatgpt.com/cb"], "client_name": "Chat\u{200B}GPT" }),
+                "invalid_client_metadata",
+                "client_name",
+            ),
+            (
+                json!({ "redirect_uris": ["https://chatgpt.com/cb"], "client_name": "Chat\u{00A0}GPT" }),
                 "invalid_client_metadata",
                 "client_name",
             ),

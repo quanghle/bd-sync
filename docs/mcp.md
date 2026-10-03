@@ -12,7 +12,9 @@ and nothing here replaces it.
   `BD_REMOTE`), with the same token as the CLI.
 - `bd serve` serves each workspace at `/w/<workspace>/mcp` over Streamable
   HTTP, for remote clients, with a bd access token as its bearer token
-  ([Remote server](remote.md); see [Over HTTP](#over-http)).
+  ([Remote server](remote.md); see [Over HTTP](#over-http)), which a
+  client may also get by signing its user in with OAuth ([Signing in with
+  OAuth](#signing-in-with-oauth)).
 
 A server is bound to one workspace, chosen by where it runs (`bd mcp`) or
 by its URL (`bd serve`): no tool takes a workspace, so a tool call cannot
@@ -141,8 +143,11 @@ for a proxy that forwards it:
  "resource_name": "bd workspace proj"}
 ```
 
-It answers the same whether the workspace exists or not, and names no
-authorization server: tokens come from the server's admin or from GitHub
+It answers the same whether the workspace exists or not. With `[oauth]` in
+`<root>/auth.toml`, it also names the server's own authorization server
+(`"authorization_servers": ["https://bd.example.com/bd"]`), where clients
+sign people in ([Signing in with OAuth](#signing-in-with-oauth)); without
+it, it names none, and tokens come from the server's admin or from GitHub
 sign-in ([remote workspaces](remote.md)).
 
 Refusals point clients at it, as RFC 6750 challenges:
@@ -168,6 +173,153 @@ port, no trailing `/`), and for CLI requests (`/w/<name>/v2/exec`), so a
 leaked token works only through MCP's tools. The URL compared is the one the
 request computes, so set `--public-url` on a server whose clients reach it
 by more than one name. `bd serve token list` shows each token's `resource`.
+
+### Signing in with OAuth
+
+Some MCP clients sign people in rather than send a token they were given:
+ChatGPT, the Claude apps, and Claude Code or another client configured
+without an `Authorization` header. For them, `bd serve` runs an OAuth 2.1
+authorization server when `<root>/auth.toml` has an `[oauth]` table. People
+sign in with GitHub in their browser, under the same rules as `bd remote
+login --github` ([Signing in with GitHub](remote.md#signing-in-with-github)),
+approve the client, and the client gets a token bound to the endpoint it
+asked for.
+
+1. Set up GitHub sign-in with a GitHub App and its private key
+   ([remote workspaces](remote.md#signing-in-with-github)): OAuth clients'
+   tokens are refreshed through the App. In the App's settings, set the
+   **Callback URL** to the server's public URL followed by
+   `/oauth/github/callback` (`https://bd.example.com/bd/oauth/github/callback`),
+   and generate a client secret. Save the secret alone in a file under the
+   root, with mode 0600.
+2. Add to `<root>/auth.toml`:
+
+   ```toml
+   [github]
+   # client_id, private_key, token lifetimes and rules as for bd remote login --github
+   client_secret_file = "github-secret"   # the GitHub App's client secret, relative to the root
+
+   [oauth]
+   redirect_hosts = ["chatgpt.com", "claude.ai"]   # https redirect URIs on these hosts, without a port
+   loopback_redirects = true                       # and http://127.0.0.1, [::1] or localhost, any port
+   ```
+
+3. Run `bd serve` with an https `--public-url` (http only on a loopback
+   address, for trying it out): it is the issuer, which clients check.
+
+`bd serve` refuses to start with `[oauth]` but no `private_key`, no
+`client_secret_file`, no such `--public-url`, or no redirect allowed; and
+with `client_secret_file` but no `[oauth]`. Like the rest of `auth.toml`,
+`[oauth]` is read again for each request, so it can be changed without a
+restart, or removed together with `client_secret_file` to turn the
+authorization server off: a `client_secret_file` left without `[oauth]` is
+a mistake that fails every GitHub sign-in and refresh, and the endpoints'
+metadata, until fixed.
+
+The authorization server's metadata (RFC 8414) is at its RFC location,
+`https://bd.example.com/.well-known/oauth-authorization-server/bd` (with no
+path in the public URL, `/.well-known/oauth-authorization-server`). A client
+that reaches an endpoint without a token goes from the 401 challenge to the
+endpoint's metadata, then to the authorization server's, and then:
+
+1. **Identifies itself**, as a public client (no client secret), either way:
+   - with a Client ID Metadata Document: its `client_id` is an https URL of
+     a JSON document naming its redirect URIs, which bd fetches when it is
+     first used: from public addresses only, without following redirects
+     or using a proxy, at most 8 KiB within 5 seconds, four hosts at once
+     and one fetch per host. bd keeps it for its `Cache-Control` max-age
+     (5 minutes by default, an hour at most), and keeps using it for up to
+     an hour past that only while it cannot be fetched because every
+     fetch, or another from its host, is under way. If its host does not
+     answer (or answers 429 or 5xx) the authorization fails, and the copy is
+     kept; any other answer that is not a document, or one not to be
+     cached, ends it, and whether it was approved (approving a client whose
+     document is not to be cached keeps nothing). A `logo_uri` (https) is
+     fetched with the document, the same way and within the same 5
+     seconds (2 at most for the logo), and kept with it if it is a
+     PNG, JPEG, GIF or WebP image of at most 64 KiB; any other is left
+     out. Of the 256 documents kept in memory, those of clients
+     someone approved since `bd serve` started go last. A
+     document may list grant and response types bd does not offer (it
+     serves every server its client uses): they are left aside, as long as
+     it has the authorization code. The Claude apps and Claude Code
+     identify themselves this way, and ChatGPT may.
+   - by registering (RFC 7591) at `<public-url>/oauth/register`, without a
+     token: up to 8 redirect URIs of 512 bytes each. Registrations are kept
+     in `<root>/oauth-clients.json`: one never used is dropped after a day,
+     and one unused for 90 days after that. With 500 kept, a new
+     registration drops the oldest never used, or is refused (503) if all
+     are in use.
+
+   Each redirect URI must be one `[oauth]` allows: https on a host of
+   `redirect_hosts`, without a port, or, with `loopback_redirects`, http to
+   this machine, whose port is ignored when compared (a desktop client
+   listens on whatever port is free). No fragment, no user info. (Browsers
+   cannot be redirected to an IPv6 address after a form, so for `[::1]`
+   the consent page is followed by one that sends the browser on.)
+2. **Sends the person to `<public-url>/oauth/authorize`**, for an
+   authorization code with PKCE (`S256` only), naming as `resource`
+   (RFC 8707, required) the endpoint it wants, one of this server's. The browser signs
+   in at GitHub, which sends it back to the callback. If a rule lets the
+   account into the workspace, a consent page shows what the client will
+   get: the client's name and where its details come from (its metadata
+   document's full URL, with the logo the document names, or, for a
+   registered client, the client itself, with a warning that its name is
+   not verified), the full redirect URI the browser goes back to (with a
+   warning when it is this machine, or a site other than the document's),
+   the workspace, the GitHub login, the actor, the access its role gives,
+   the rule that let the account in, and how long access lasts
+   (`refresh_limit`, `refresh_idle`). A small script keeps the form from
+   being sent until the page has had focus for 600 ms, against
+   double-click tricks; the buttons stay enabled, so screen readers and
+   voice control work, and without scripts the form is sent as it is. Approving sends the browser back to the client with a code and the
+   issuer (`iss`, RFC 9207); denying, with `access_denied`.
+3. **Redeems the code** at `<public-url>/oauth/token` within 5 minutes, with
+   its `client_id` and PKCE verifier, and its redirect URI if it sends one
+   (OAuth 2.1 clients do not). A code is good for one request, refused or
+   not, except one the server could not answer (500, or 503 when busy):
+   it can be sent again.
+
+An account the rules refuse gets a page saying why, with a link back to the
+client. A workspace the server does not have is told (`invalid_target`)
+only after the rules let the person's account in, so the authorization
+endpoint does not tell strangers which workspaces exist. An authorization in
+progress is bound to the browser that started it (an `HttpOnly`,
+`SameSite=Lax` cookie, `__Secure-bd_oauth` on an https public URL,
+`bd_oauth` on http), each step must follow within 10 minutes,
+and they are kept in memory only, so a restart ends them. At most 1024
+sign-ins at GitHub are under way at once: past that, new authorizations get
+a 503 page until some finish or expire, and none under way is dropped for
+them. The steps after it, which only accounts the rules let in reach, keep
+up to 1024 consent pages and 1024 codes each, the oldest going first.
+
+The client's tokens:
+
+- act as the account's actor, as a sign-in by `bd remote login --github`
+  does, and tool calls as `<actor>/mcp` (see [Actors](#actors)), with what
+  the rule grants: role, kind, `max_claims`. They are bound to the endpoint
+  ([Tokens bound to an endpoint](#tokens-bound-to-an-endpoint)), so they
+  work there only, for that workspace, and never for CLI requests.
+- expire after `token_ttl`, and are refreshed at the token endpoint by the
+  client they were issued to, with the rules applied again as for any
+  sign-in ([Refreshing](remote.md#refreshing-sign-ins)), until
+  `refresh_limit` or `refresh_idle`. Each refresh replaces both tokens.
+- are protected against replay: a code works once, and any request naming
+  it ends it; a code sent again revokes the tokens it issued. A refresh
+  token works once, with no grace period: one sent again revokes the
+  sign-in. A client that lost a refresh's answer has the person authorize it
+  again. An OAuth refresh token is refused at `/v2/auth/refresh`, the CLI's.
+- can be revoked by the client (RFC 7009) at `<public-url>/oauth/revoke`, by
+  either secret: this ends the sign-in. The endpoint answers 200 to anything
+  else and leaves tokens other than OAuth clients' alone.
+
+Admins see each such token in `bd serve token list`, named
+`oauth-<client>-<actor>-<random>` with its `client`.
+`bd serve token revoke --client <client_id>` revokes every token of a
+client, and `bd serve token revoke --github <login>` every token of an
+account, OAuth clients' included. The endpoints under `/oauth/` need no
+token, so rate-limit them per address at the proxy (see [Behind a
+proxy](#behind-a-proxy)).
 
 ### Connecting clients
 
@@ -202,16 +354,31 @@ Clients that send a fixed `Authorization` header:
   copilot mcp add --transport http bd https://bd.example.com/w/proj/mcp --header "Authorization: Bearer $BD_TOKEN"
   ```
 
-- Claude apps (claude.ai, Claude Desktop): custom connectors sign in with
-  OAuth, or, for organizations in Anthropic's beta of request headers, send
-  an `Authorization` header that an organization Owner enters once. That
-  header is the whole organization's, so give it a token of a shared actor
+Clients that sign people in with OAuth need `[oauth]` ([Signing in with
+OAuth](#signing-in-with-oauth)); they connect to the endpoint's URL, find
+the authorization server by themselves, and open the browser for the person
+to sign in and approve:
+
+- Claude apps (claude.ai, Claude Desktop, Claude mobile): add a custom
+  connector with the endpoint's URL. They come back to
+  `https://claude.ai/api/mcp/auth_callback`, so `redirect_hosts` needs
+  `claude.ai`. Organizations in Anthropic's beta of request headers may
+  instead have an Owner enter an `Authorization` header once; that header is
+  the whole organization's, so give it a token of a shared actor
   (`--as team-claude`), with `--max-claims` if the organization should hold
   only so many issues at once.
-- ChatGPT (developer mode apps) connects with OAuth or without
-  authentication only, so it cannot connect until `bd serve` runs an OAuth
-  authorization server. A client that tries OAuth sign-in on a 401 (ChatGPT,
-  or Claude Code without the header) fails at client registration meanwhile.
+- ChatGPT (developer mode): create an app for the endpoint's URL, with OAuth
+  authentication. ChatGPT comes back to
+  `https://chatgpt.com/connector_platform_oauth_redirect` (bd names its
+  issuer in every answer, RFC 9207), so `redirect_hosts` needs
+  `chatgpt.com`.
+- Claude Code without the header: `claude mcp add --transport http bd
+  https://bd.example.com/w/proj/mcp`, then `/mcp` to sign in. It comes back
+  to this machine on a port of its choosing, so it needs
+  `loopback_redirects = true`.
+
+Without `[oauth]`, such a client fails at its sign-in, as the endpoint
+names no authorization server.
 
 Agents sharing a token add `?session=<name>` to the URL to hold their claims
 under their own names (`https://bd.example.com/w/proj/mcp?session=reviewer`);
@@ -222,11 +389,12 @@ a token bound with `--resource` works under any `?session`.
 A proxy that serves bd under a path prefix may forward requests with the
 prefix or without it. Set `--public-url` to the URL clients use, prefix
 included, so that endpoints name themselves by it whatever reaches the
-server, and forward the RFC 9728 location of the metadata too. With Caddy:
+server, and forward the RFC 9728 and RFC 8414 locations of the metadata
+too. With Caddy:
 
 ```text
 example.com {
-    @bd path /bd/* /.well-known/oauth-protected-resource/bd/*
+    @bd path /bd/* /.well-known/oauth-protected-resource/bd/* /.well-known/oauth-authorization-server/bd
     handle @bd {
         reverse_proxy 127.0.0.1:7420
     }
@@ -236,11 +404,22 @@ example.com {
 ```bash
 bd serve --root /srv/bd --public-url https://example.com/bd
 curl -s https://example.com/.well-known/oauth-protected-resource/bd/w/proj/mcp
+curl -s https://example.com/.well-known/oauth-authorization-server/bd   # with [oauth]
 ```
 
 Clients then use `https://example.com/bd/w/proj/mcp`, and tokens are bound
 to that URL. No MCP request waits for events (the server opens no SSE
 streams), so a proxy's idle timeout only needs to exceed a tool call's run.
+
+With `[oauth]`, anyone can call the endpoints under `/bd/oauth/` without a
+token: registering clients, starting sign-ins, sending codes. bd bounds
+what they keep (registered clients, sign-ins in progress), but does not
+limit how often a caller sends requests; the proxy should, per client
+address (nginx `limit_req`, or a Caddy rate-limit plugin). They answer at
+the public URL's path followed by `/oauth/` (`/bd/oauth/…`), or at
+`/oauth/…` for a proxy that strips the prefix, and nowhere else. A proxy
+that strips it forwards `/bd/bd/oauth/…` as `/bd/oauth/…`, so limit every
+request whose path has `/oauth/` in it, not only those under `/bd/oauth/`.
 
 ### Retries
 

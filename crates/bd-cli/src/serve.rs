@@ -75,7 +75,7 @@ use crate::follow::{self, Feeds, HeadReader, Subscription};
 use crate::io::{self, Capture};
 use crate::jobs;
 use crate::mcp::{self, Ran, http as mcp_http};
-use crate::oauth_server::{authorize, cimd, pages};
+use crate::oauth_server::{authorize, cimd, pages, token};
 use crate::protocol::{
     ErrorBody, ErrorDetail, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, PROTOCOL, PROTOCOL_HEADER,
     RefreshRequest, RevokeAnswer, SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
@@ -485,8 +485,20 @@ fn sign_in_path(path: &str) -> Option<SignIn> {
     }
 }
 
+/// The authorization server's endpoint at `path`: under the public URL's
+/// path, or with it stripped by a proxy, and nowhere else, so that a proxy
+/// limiting requests to these paths sees them all.
+fn oauth_endpoint(server: &Server, path: &str) -> Option<&'static str> {
+    let public = server.public_url.as_deref().and_then(|u| u.split_once("://")).map_or("", |(_, rest)| rest);
+    let prefix = public.find('/').map_or("", |i| &public[i..]);
+    let rest = path.strip_prefix(prefix).filter(|r| r.starts_with('/')).unwrap_or(path);
+    use oauth_server::{AUTHORIZE, CALLBACK, CONSENT, REGISTER, REVOKE, TOKEN};
+    [REGISTER, TOKEN, REVOKE, AUTHORIZE, CALLBACK, CONSENT].into_iter().find(|e| *e == rest)
+}
+
 async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Result<Response<Body>, Infallible> {
     let path = req.uri().path().to_string();
+    let oauth = oauth_endpoint(&server, &path);
     let response = if path == "/healthz" && req.method() == Method::GET {
         response(StatusCode::OK, "text/plain", Body::whole(Bytes::from_static(b"ok\n")))
     } else if let Some(workspace) = exec_path(&path) {
@@ -513,7 +525,7 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
             r
         }
-    } else if path.ends_with(oauth_server::REGISTER) {
+    } else if oauth == Some(oauth_server::REGISTER) {
         if req.method() == Method::POST {
             register_client(&server, req).await
         } else {
@@ -521,7 +533,16 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
             r
         }
-    } else if path.ends_with(oauth_server::AUTHORIZE) {
+    } else if oauth == Some(oauth_server::TOKEN) || oauth == Some(oauth_server::REVOKE) {
+        if req.method() == Method::POST {
+            let revoking = oauth == Some(oauth_server::REVOKE);
+            oauth_tokens(&server, revoking, req).await
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
+            r
+        }
+    } else if oauth == Some(oauth_server::AUTHORIZE) {
         if req.method() == Method::GET {
             authorizing(&server, Authorizing::Begin, req).await
         } else {
@@ -529,7 +550,7 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
             r
         }
-    } else if path.ends_with(oauth_server::CALLBACK) {
+    } else if oauth == Some(oauth_server::CALLBACK) {
         if req.method() == Method::GET {
             authorizing(&server, Authorizing::Callback, req).await
         } else {
@@ -537,7 +558,7 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
             r
         }
-    } else if path.ends_with(oauth_server::CONSENT) {
+    } else if oauth == Some(oauth_server::CONSENT) {
         if req.method() == Method::POST {
             authorizing(&server, Authorizing::Decide, req).await
         } else {
@@ -742,7 +763,7 @@ async fn refresh(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body>
     auth_answer(
         blocking(move || {
             let _held = (permit, completing);
-            let refreshed = oauth::refresh(&srv.root, &secret, &request_id);
+            let refreshed = oauth::refresh(&srv.root, &secret, &request_id, None);
             // Refreshed, or revoked.
             srv.tokens.invalidate();
             let value = serde_json::to_value(refreshed?)?;
@@ -1064,7 +1085,7 @@ fn authorization_server_metadata(server: &Server, path: &str) -> Response<Body> 
 
 /// `POST <issuer>/oauth/register`: register a public OAuth client (RFC
 /// 7591, `oauth_server/clients.rs`), without a token, if `[oauth]` is on.
-/// The proxy prefix before it is not checked, as for the other endpoints.
+/// Served at the public URL's path, or with it stripped ([`oauth_endpoint`]).
 async fn register_client(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
     let body =
         match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await {
@@ -1114,6 +1135,94 @@ async fn register_client(server: &Arc<Server>, req: Request<Incoming>) -> Respon
     }
 }
 
+/// `POST <issuer>/oauth/token` (or, `revoking`, `<issuer>/oauth/revoke`),
+/// if `[oauth]` is on: tokens for an authorization code or a refresh token,
+/// or a client's token revoked (`oauth_server/token.rs`). Each runs on a
+/// blocking thread with a sign-in slot; a refresh token is refreshed once
+/// at a time, so that a duplicate gets a retry, not its tokens revoked.
+async fn oauth_tokens(server: &Arc<Server>, revoking: bool, req: Request<Incoming>) -> Response<Body> {
+    let body =
+        match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await {
+            Ok(Ok(b)) => b.to_bytes(),
+            Ok(Err(e)) if e.is::<LengthLimitError>() => {
+                let why = format!("the request is larger than {} KiB", MAX_SIGN_IN_BODY >> 10);
+                return oauth_error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request", &why);
+            }
+            Ok(Err(e)) => {
+                return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", &format!("reading the request: {e}"));
+            }
+            Err(_) => {
+                let why = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
+                return oauth_error(StatusCode::REQUEST_TIMEOUT, "invalid_request", &why);
+            }
+        };
+    match server.issuer() {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Reject::new(StatusCode::NOT_FOUND, "not_found", "no such authorization server", 3).response();
+        }
+        Err(e) => return sign_in_misconfigured(&e),
+    }
+    let Ok(body) = String::from_utf8(body.to_vec()) else {
+        return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", "the request is not UTF-8");
+    };
+    let busy = || oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", "the server is busy; retry");
+    let request = if revoking {
+        None
+    } else {
+        match token::parse(&body) {
+            Ok(request) => Some(request),
+            Err(refusal) => return refused(&refusal),
+        }
+    };
+    let completing = match &request {
+        Some(token::Request::Refresh { secret, .. }) => {
+            let key = auth::hash(secret);
+            if !lock(&server.refreshes).running.insert(key.clone()) {
+                return busy();
+            }
+            Some(Completing { server: server.clone(), key, refresh: true })
+        }
+        _ => None,
+    };
+    let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else { return busy() };
+    let srv = server.clone();
+    let answered = blocking(move || {
+        let _held = (permit, completing);
+        let answer = match request {
+            None => token::revoke_named(&srv.root, &body).map(|()| None),
+            Some(request @ token::Request::Code { .. }) => token::redeem(&srv.root, &srv.flows, request).map(Some),
+            Some(request @ token::Request::Refresh { .. }) => token::refresh(&srv.root, request).map(Some),
+        };
+        // Tokens issued, rotated or revoked, refused or not: a refusal may revoke too.
+        srv.tokens.invalidate();
+        Ok(answer)
+    })
+    .await;
+    let mut r = match answered {
+        Ok(Ok(Some(tokens))) => json_response(StatusCode::OK, &tokens),
+        Ok(Ok(None)) => response(StatusCode::OK, "text/plain", Body::whole(Bytes::new())),
+        Ok(Err(refusal)) => return refused(&refusal),
+        Err(e) => {
+            tracing::error!(target: "bd::serve", error = %e, "answering at the OAuth token endpoint");
+            let why = "the server could not answer; see its log";
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", why);
+        }
+    };
+    let headers = r.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    r
+}
+
+/// The OAuth error answer of a token or revocation request refused.
+fn refused(refusal: &token::Refusal) -> Response<Body> {
+    let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::BAD_REQUEST);
+    let mut r = oauth_error(status, refusal.error, refusal.description);
+    r.headers_mut().insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    r
+}
+
 /// A step of an authorization (`oauth_server/authorize.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Authorizing {
@@ -1127,8 +1236,9 @@ enum Authorizing {
 
 /// A step of an authorization, if `[oauth]` is on, answered for a browser:
 /// a page or a redirect. Sign-in at GitHub waits on GitHub on a blocking
-/// thread, with a sign-in slot; so does the first step, which may fetch the
-/// client's metadata document.
+/// thread, with a sign-in slot. The first step, which may fetch the client's
+/// metadata document, runs on a blocking thread too, bounded by the
+/// document fetches' own limits (`cimd`) rather than a slot.
 async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incoming>) -> Response<Body> {
     let issuer = match server.issuer() {
         Ok(Some(issuer)) => issuer,
@@ -1142,7 +1252,7 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find_map(|h| authorize::cookie(h).map(str::to_string));
+        .find_map(|h| authorize::cookie(&issuer, h).map(str::to_string));
     let query = req.uri().query().unwrap_or_default().to_string();
     let srv = server.clone();
     let answered = match step {
@@ -1151,8 +1261,8 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
         }
         Authorizing::Callback => {
             let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
-                let why = "The bd server is signing in other accounts; reload this page in a moment.";
-                return html_page(pages::refusal(503, "Busy", why, None));
+                let why = "Too many sign-ins are in progress. Reload this page in a moment.";
+                return html_page(pages::refusal(503, "The server is busy", why, None));
             };
             blocking(move || {
                 let _permit = permit;
@@ -1165,8 +1275,8 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
             // requests.
             let origin = req.headers().get(header::ORIGIN);
             if origin.is_some_and(|o| o.as_bytes() != authorize::origin(&issuer).as_bytes()) {
-                let why = "The decision came from another site: start again from the application.";
-                return html_page(pages::refusal(403, "This authorization cannot go on", why, None));
+                let why = "The decision came from another site. Start again from the application.";
+                return html_page(pages::refusal(403, "Couldn't connect the application", why, None));
             }
             let body =
                 match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_CONSENT_BODY).collect())
@@ -1174,8 +1284,8 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
                 {
                     Ok(Ok(b)) => b.to_bytes(),
                     _ => {
-                        let why = "The decision did not arrive whole: start again from the application.";
-                        return html_page(pages::refusal(400, "This authorization cannot go on", why, None));
+                        let why = "The decision didn't arrive complete. Start again from the application.";
+                        return html_page(pages::refusal(400, "Couldn't connect the application", why, None));
                     }
                 };
             let body = String::from_utf8_lossy(&body);
@@ -1191,8 +1301,8 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
         authorize::Answer::Redirect(url) => {
             let Ok(location) = HeaderValue::from_str(&url) else {
                 tracing::error!(target: "bd::serve", %url, "an authorization redirect is not a valid header value");
-                let why = "The application's address cannot be sent to the browser.";
-                return html_page(pages::refusal(500, "This authorization cannot go on", why, None));
+                let why = "The server ran into a problem. Try again later.";
+                return html_page(pages::refusal(500, "Something went wrong", why, None));
             };
             // After the consent page's POST, the browser must GET the client's redirect URI.
             let status = if step == Authorizing::Decide { StatusCode::SEE_OTHER } else { StatusCode::FOUND };
@@ -1214,12 +1324,17 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
 /// with only what its Content-Security-Policy allows. The policy is
 /// same-origin, so that the consent form's POST carries the page's Origin.
 fn html_page(page: pages::Page) -> Response<Body> {
+    // A page is never sent without its policy: one that is not a valid
+    // header value (which nothing makes now) is replaced by a fixed one.
+    let Ok(csp) = HeaderValue::from_str(&page.csp) else {
+        tracing::error!(target: "bd::serve", csp = %page.csp, "an authorization page's policy is not a header value");
+        let why = "The server ran into a problem. Try again later.";
+        return html_page(pages::refusal(500, "Something went wrong", why, None));
+    };
     let status = StatusCode::from_u16(page.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let mut r = response(status, "text/html; charset=utf-8", Body::whole(page.html.into_bytes()));
     let headers = r.headers_mut();
-    if let Ok(csp) = HeaderValue::from_str(&page.csp) {
-        headers.insert(header::CONTENT_SECURITY_POLICY, csp);
-    }
+    headers.insert(header::CONTENT_SECURITY_POLICY, csp);
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -2069,6 +2184,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_authorization_page_is_never_sent_without_its_policy() {
+        let mut page = pages::refusal(403, "t", "w", None);
+        page.csp.push('\n');
+        let r = html_page(page);
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let csp = r.headers().get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap();
+        assert!(csp.starts_with("default-src 'none';"), "{csp}");
+        let r = html_page(pages::refusal(403, "t", "w", None));
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
     fn exec_paths() {
         assert_eq!(exec_path("/w/bd-sync/v2/exec"), Some("bd-sync"));
         assert_eq!(exec_path("/bd/w/proj/v2/exec"), Some("proj"), "under an unstripped proxy prefix");
@@ -2078,6 +2205,23 @@ mod tests {
         {
             assert_eq!(exec_path(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn oauth_endpoints_are_served_under_the_public_path_or_stripped_only() {
+        let mut server = Server::new(PathBuf::from("."), 1, Waits::default());
+        for public in [None, Some("https://bd.example.com")] {
+            server.public_url = public.map(String::from);
+            assert_eq!(oauth_endpoint(&server, "/oauth/token"), Some(oauth_server::TOKEN), "{public:?}");
+            assert_eq!(oauth_endpoint(&server, "/bd/oauth/token"), None, "{public:?}");
+        }
+        server.public_url = Some("https://bd.example.com/bd".into());
+        assert_eq!(oauth_endpoint(&server, "/bd/oauth/register"), Some(oauth_server::REGISTER));
+        assert_eq!(oauth_endpoint(&server, "/oauth/github/callback"), Some(oauth_server::CALLBACK), "stripped");
+        for elsewhere in ["/bd/x/oauth/token", "/bdx/oauth/token", "/bd/bd/oauth/token", "/w/proj/oauth/authorize"] {
+            assert_eq!(oauth_endpoint(&server, elsewhere), None, "{elsewhere}");
+        }
+        assert_eq!(oauth_endpoint(&server, "/bd/oauth/token/"), None);
     }
 
     #[test]
@@ -2179,6 +2323,7 @@ mod tests {
             max_claims: None,
             refresh: None,
             resource: None,
+            client: None,
         };
         let actor = |flag, env, session| resolve_actor(flag, env, session, &t).map(|r| (r.actor, r.source));
         let code = |flag, env, session| resolve_actor(flag, env, session, &t).unwrap_err().exit_code();

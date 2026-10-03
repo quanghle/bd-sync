@@ -114,6 +114,11 @@ pub struct Token {
     /// everywhere else, CLI requests included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    /// The OAuth client the token was issued to (its client ID), by the
+    /// authorization server (`oauth_server/`): only that client refreshes
+    /// or revokes it there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
 }
 
 /// The refresh state of a GitHub sign-in: one per token entry, whose
@@ -350,6 +355,7 @@ impl Token {
             "github": self.github,
             "max_claims": self.max_claims,
             "resource": self.resource,
+            "client": self.client,
         })
     }
 
@@ -366,6 +372,9 @@ impl Token {
         }
         if let Some(resource) = &self.resource {
             text.push_str(&format!(", only at MCP endpoint {resource}"));
+        }
+        if let Some(client) = &self.client {
+            text.push_str(&format!(", for OAuth client {client}"));
         }
         if let Some(user) = &self.github {
             text.push_str(&format!(", signed in as GitHub user {}", user.login));
@@ -636,7 +645,45 @@ pub fn issue_github_token(
     let now = Timestamp::now();
     let refresh = life.refresh.map(|(limit, idle)| (workspace, limit.min(now.plus(idle))));
     let expires_at = now.plus(life.ttl).min(refresh.map_or(Timestamp(i64::MAX), |(_, until)| until));
-    add_token(root, Holder::Github { user, expires_at, by_login, refresh }, grant)
+    add_token(root, Holder::Github { user, expires_at, by_login, refresh, client: None }, grant)
+}
+
+/// The OAuth client a token is issued to, and the MCP endpoint it is bound to.
+#[derive(Clone, Copy, Debug)]
+pub struct ForClient<'a> {
+    pub id: &'a str,
+    pub resource: &'a str,
+}
+
+/// [`issue_github_token`] for an OAuth `client` an account authorized
+/// (`oauth_server/token.rs`): bound to its MCP endpoint (and so to that
+/// workspace only), and named `oauth-<client>-<actor>-<random>`.
+pub fn issue_client_token(
+    root: &Path,
+    user: &GithubUser,
+    grant: Grant,
+    life: Lifetime,
+    client: ForClient<'_>,
+    by_login: bool,
+) -> Result<Issued> {
+    let (_, workspace) = crate::mcp::http::resource_url(client.resource).map_err(Error::invalid)?;
+    let now = Timestamp::now();
+    let refresh = life.refresh.map(|(limit, idle)| (workspace.as_str(), limit.min(now.plus(idle))));
+    let expires_at = now.plus(life.ttl).min(refresh.map_or(Timestamp(i64::MAX), |(_, until)| until));
+    add_token(root, Holder::Github { user, expires_at, by_login, refresh, client: Some(client) }, grant)
+}
+
+/// What names a client in its tokens' names: the host of its metadata
+/// document, or its registered ID; letters, digits, `.`, `_` and `-` only.
+fn client_label(id: &str) -> String {
+    let id = id.strip_prefix("https://").map_or(id, |rest| rest.split(['/', ':', '?', '#']).next().unwrap_or_default());
+    let label: String = id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        .take(20)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if label.is_empty() { "client".into() } else { label }
 }
 
 /// The sign-in whose refresh secret this is, unless revoked: its token, and
@@ -652,6 +699,16 @@ pub fn find_refresh(root: &Path, secret: &str) -> Result<Option<(Token, bool)>> 
         let current = t.refresh.as_ref().is_some_and(|r| r.sha256 == hash(secret));
         (t, current)
     }))
+}
+
+/// The token that is not revoked with this secret, or with this refresh
+/// secret (its current one, or one spent): what a revocation names.
+pub fn find_by_secret(root: &Path, secret: &str) -> Result<Option<Token>> {
+    if refresh_family(secret).is_some() {
+        return Ok(find_refresh(root, secret)?.map(|(t, _)| t));
+    }
+    let sha = hash(secret);
+    Ok(load_file(&tokens_path(root))?.tokens.into_iter().find(|t| t.revoked_at.is_none() && t.sha256 == sha))
 }
 
 /// Refresh the sign-in `id`, whose current refresh secret hashes to
@@ -680,6 +737,11 @@ pub fn rotate(
     let live =
         |t: &Token| t.id == id && t.revoked_at.is_none() && t.refresh.as_ref().is_some_and(|r| r.sha256 == current);
     let Some(i) = file.tokens.iter().position(live) else { return Ok(None) };
+    // A token bound to an MCP endpoint keeps to its workspace, which the rules were just applied for.
+    let workspaces = match (&file.tokens[i].resource, &file.tokens[i].refresh) {
+        (Some(_), Some(r)) => vec![r.workspace.clone()],
+        _ => workspaces,
+    };
     let actor = bind(&mut file.accounts, user, now, by_login)?;
     if actor != file.tokens[i].actor {
         return Err(Error::Unauthorized(format!(
@@ -721,8 +783,15 @@ enum Holder<'a> {
     Admin { name: &'a str, actor: &'a str, resource: Option<&'a str> },
     /// A GitHub account that signed in; `by_login` when a rule let it in by
     /// its login; `refresh`, the workspace it signed in for and until when
-    /// it may be refreshed, if it may.
-    Github { user: &'a GithubUser, expires_at: Timestamp, by_login: bool, refresh: Option<(&'a str, Timestamp)> },
+    /// it may be refreshed, if it may; `client`, the OAuth client it
+    /// authorized, if it did.
+    Github {
+        user: &'a GithubUser,
+        expires_at: Timestamp,
+        by_login: bool,
+        refresh: Option<(&'a str, Timestamp)>,
+        client: Option<ForClient<'a>>,
+    },
 }
 
 fn check_name(name: &str) -> Result<()> {
@@ -750,9 +819,16 @@ fn check_actor(actor: &str) -> Result<()> {
 fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
     let mut workspaces = workspace_list(&grant.workspaces)?;
     let mut resource = None;
-    if let Holder::Admin { resource: Some(url), .. } = &holder {
-        let (url, workspace) =
-            crate::mcp::http::resource_url(url).map_err(|e| Error::invalid(format!("--resource {e}")))?;
+    let bound = match &holder {
+        Holder::Admin { resource: Some(url), .. } => {
+            Some(crate::mcp::http::resource_url(url).map_err(|e| Error::invalid(format!("--resource {e}")))?)
+        }
+        Holder::Github { client: Some(client), .. } => {
+            Some(crate::mcp::http::resource_url(client.resource).map_err(Error::invalid)?)
+        }
+        _ => None,
+    };
+    if let Some((url, workspace)) = bound {
         if !workspaces.iter().any(|w| w == "*" || *w == workspace) {
             return Err(Error::invalid(format!(
                 "--resource {url} is workspace {workspace}'s, which the token may not use"
@@ -777,7 +853,7 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
     let now = Timestamp::now();
     // Tokens from GitHub sign-in stay listed for a while after they expire (and can no longer be refreshed), then go.
     file.tokens.retain(|t| t.github.is_none() || !t.ended(now.minus(PRUNE_AFTER)));
-    let (name, actor, expires_at, github, refresh) = match holder {
+    let (name, actor, expires_at, github, refresh, client) = match holder {
         Holder::Admin { name, actor, .. } => {
             if let Some(account) = file.accounts.iter().find(|a| related(&a.actor, actor)) {
                 return Err(Error::Refused(format!(
@@ -786,15 +862,20 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
                     account.actor, account.login, account.login
                 )));
             }
-            (name.to_string(), actor.to_string(), None, None, None)
+            (name.to_string(), actor.to_string(), None, None, None, None)
         }
-        Holder::Github { user, expires_at, by_login, refresh } => {
+        Holder::Github { user, expires_at, by_login, refresh, client } => {
             let actor = account_actor(&mut file, user, now, by_login)?;
-            let label: String = actor.chars().take(40).collect();
-            let name = format!("github-{label}-{}", random_hex(4)?);
+            let name = match client {
+                Some(c) => {
+                    let label: String = actor.chars().take(24).collect();
+                    format!("oauth-{}-{label}-{}", client_label(c.id), random_hex(4)?)
+                }
+                None => format!("github-{}-{}", actor.chars().take(40).collect::<String>(), random_hex(4)?),
+            };
             check_name(&name)?;
             check_actor(&actor)?;
-            (name, actor, Some(expires_at), Some(user.clone()), refresh)
+            (name, actor, Some(expires_at), Some(user.clone()), refresh, client.map(|c| c.id.to_string()))
         }
     };
     if file.tokens.iter().any(|t| t.name == name && t.revoked_at.is_none()) {
@@ -835,6 +916,7 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
         max_claims: grant.max_claims,
         refresh,
         resource,
+        client,
     };
     file.tokens.push(token.clone());
     save_file(&path, &file)?;
@@ -1021,6 +1103,22 @@ fn accounts(app: &mut App, a: &TokenRootArgs) -> Result<()> {
 
 fn revoke(app: &mut App, a: &TokenRevokeArgs) -> Result<()> {
     let root = root_dir(&a.root)?;
+    if let Some(client) = a.client.as_deref().map(str::trim) {
+        let theirs =
+            |tokens: &[Token]| (0..tokens.len()).filter(|&i| tokens[i].client.as_deref() == Some(client)).collect();
+        let (known, revoked) = revoke_where(&root, theirs)?;
+        if known == 0 {
+            return Err(Error::not_found("OAuth client with access tokens", client));
+        }
+        let text = match revoked.len() {
+            0 => format!("= OAuth client {client} has no live access tokens"),
+            1 => format!("✓ Revoked the access token of OAuth client {client}: {}", revoked[0]),
+            n => format!("✓ Revoked {n} access tokens of OAuth client {client}: {}", revoked.join(", ")),
+        };
+        let out = Out::new(json!({ "client": client, "revoked": revoked })).line(text);
+        app.print(revoked.iter().fold(out, |out, name| out.id(name.clone())));
+        return Ok(());
+    }
     match (&a.name, a.github.as_deref().map(str::trim)) {
         (Some(name), None) => {
             let named = |tokens: &[Token]| (0..tokens.len()).filter(|&i| tokens[i].name == *name).collect();
@@ -1166,6 +1264,7 @@ mod tests {
             max_claims: None,
             refresh: None,
             resource: None,
+            client: None,
         }
     }
 

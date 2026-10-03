@@ -1368,7 +1368,7 @@ pub struct TokenCreateArgs {
 #[derive(Args, Debug, Clone)]
 pub struct TokenRevokeArgs {
     /// The token's name
-    #[arg(required_unless_present = "github")]
+    #[arg(required_unless_present_any = ["github", "client"])]
     pub name: Option<String>,
     /// Revoke every token this GitHub user (a login, or the actor an account is bound to) got by signing in,
     /// instead of a named one
@@ -1378,6 +1378,10 @@ pub struct TokenRevokeArgs {
     /// login then) gets at its next sign-in
     #[arg(long, requires = "github", conflicts_with = "name")]
     pub forget: bool,
+    /// Revoke every token issued to this OAuth client (its client ID, as `bd serve token list` shows it), instead
+    /// of a named one
+    #[arg(long, value_name = "CLIENT_ID", conflicts_with_all = ["name", "github"])]
+    pub client: Option<String>,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }

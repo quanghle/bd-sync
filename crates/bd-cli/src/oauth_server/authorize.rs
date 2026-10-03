@@ -38,11 +38,17 @@ use crate::oauth::{self, Admitted, OauthConfig};
 
 /// The cookie binding an authorization's steps to one browser.
 pub const COOKIE: &str = "bd_oauth";
+/// The cookie's name on an `https` issuer: browsers keep a `__Secure-`
+/// cookie only if a secure page set it with `Secure`, so a page of a sibling
+/// host on plain http cannot plant one.
+const SECURE_COOKIE: &str = "__Secure-bd_oauth";
 /// How long people have to sign in at GitHub, and then to decide.
 const STEP_TTL: Duration = Duration::from_secs(10 * 60);
 /// How long an authorization code may wait to be redeemed.
 const CODE_TTL: Duration = Duration::from_secs(5 * 60);
-/// Authorizations kept at each step; past it, the oldest go first.
+/// Authorizations kept at each step. Past it, new sign-ins are refused
+/// (anyone may start one, and none under way should be lost to them); at
+/// later steps, which only people the rules let in reach, the oldest go.
 const MAX_FLOWS: usize = 1024;
 /// The longest `state` a client may send, which comes back in redirects.
 const MAX_STATE: usize = 1024;
@@ -53,7 +59,8 @@ pub struct Ctx<'a> {
     pub issuer: &'a str,
     pub documents: &'a Documents,
     pub flows: &'a Mutex<Flows>,
-    /// Whether the server has this workspace.
+    /// Whether the server has this workspace: told only to accounts the
+    /// rules let in, as the resource metadata tells no one.
     pub workspace_exists: &'a dyn Fn(&str) -> bool,
 }
 
@@ -93,14 +100,13 @@ impl Authorization {
 
 /// An authorization code, issued when someone approved a client.
 #[derive(Clone, Debug)]
-#[expect(dead_code, reason = "the token endpoint redeems codes")]
 pub struct Code {
     pub client_id: String,
     pub redirect_uri: String,
     /// The PKCE challenge the code is redeemed with the verifier of.
     pub challenge: String,
+    /// The MCP endpoint it is for: its tokens work there only.
     pub resource: String,
-    pub workspace: String,
     /// The account, and what the rules let it do in the workspace.
     pub admitted: Admitted,
     /// The actor its tokens would get, as the consent page showed.
@@ -130,19 +136,87 @@ pub struct Flows {
     started: Kept<Started>,
     consents: Kept<Consent>,
     codes: Kept<Code>,
+    /// Codes redeemed, for [`CODE_TTL`] after: one sent again revokes the
+    /// token it issued (RFC 6749 section 4.1.2).
+    spent: Kept<Spent>,
+}
+
+/// A code redeemed.
+struct Spent {
+    /// The id of the token it issued, once issued.
+    token: Option<String>,
+    /// Whether it was sent again.
+    again: bool,
+    /// When the code would have expired, had it not been redeemed.
+    until: Instant,
+}
+
+/// What a code sent to the token endpoint is.
+#[derive(Debug)]
+pub enum Redeemed {
+    /// Not redeemed before: what it stands for.
+    Fresh(Box<Code>),
+    /// Redeemed already, and the id of the token it issued, if it did yet.
+    Again(Option<String>),
+    /// Unknown, or expired.
+    Unknown,
 }
 
 impl Default for Flows {
     fn default() -> Flows {
-        Flows { started: Kept::new(STEP_TTL), consents: Kept::new(STEP_TTL), codes: Kept::new(CODE_TTL) }
+        Flows {
+            started: Kept::new(STEP_TTL),
+            consents: Kept::new(STEP_TTL),
+            codes: Kept::new(CODE_TTL),
+            spent: Kept::new(CODE_TTL),
+        }
     }
 }
 
 impl Flows {
-    /// The code `code` stands for, once, if it has not expired.
-    #[expect(dead_code, reason = "the token endpoint redeems codes")]
-    pub fn take_code(&mut self, code: &str) -> Option<Code> {
-        self.codes.take(&auth::hash(code))
+    /// Redeem `code`: what it stands for the first time, if it has not
+    /// expired; after that, the token it issued.
+    pub fn redeem(&mut self, code: &str) -> Redeemed {
+        let key = auth::hash(code);
+        if let Some((until, found)) = self.codes.take_entry(&key) {
+            self.spent.put(key, Spent { token: None, again: false, until });
+            return Redeemed::Fresh(Box::new(found));
+        }
+        match self.spent.get_mut(&key) {
+            Some(spent) => {
+                spent.again = true;
+                Redeemed::Again(spent.token.clone())
+            }
+            None => Redeemed::Unknown,
+        }
+    }
+
+    /// Undo [`Flows::redeem`] of `code`, which stands for `found`, when
+    /// it issued no token: it can be redeemed again until it expires, unless
+    /// it was sent again meanwhile.
+    pub fn unredeem(&mut self, code: &str, found: Code) {
+        let key = auth::hash(code);
+        let Some(spent) = self.spent.get_mut(&key) else { return };
+        if spent.again || spent.token.is_some() {
+            return;
+        }
+        let until = spent.until;
+        self.spent.map.remove(&key);
+        if until > Instant::now() {
+            self.codes.put_until(key, until, found);
+        }
+    }
+
+    /// Record that `code` issued the token `id`: whether the code was sent
+    /// again meanwhile, so that the token must go.
+    pub fn issued(&mut self, code: &str, id: &str) -> bool {
+        match self.spent.get_mut(&auth::hash(code)) {
+            Some(spent) => {
+                spent.token = Some(id.to_string());
+                spent.again
+            }
+            None => false,
+        }
     }
 }
 
@@ -158,6 +232,11 @@ impl<T> Kept<T> {
     }
 
     fn put(&mut self, key: String, value: T) {
+        self.put_until(key, Instant::now() + self.ttl, value);
+    }
+
+    /// [`Kept::put`], expiring at `until`.
+    fn put_until(&mut self, key: String, until: Instant, value: T) {
         let now = Instant::now();
         if self.map.len() >= MAX_FLOWS {
             self.map.retain(|_, (until, _)| *until > now);
@@ -166,16 +245,39 @@ impl<T> Kept<T> {
             let oldest = self.map.iter().min_by_key(|(_, (until, _))| *until).map(|(k, _)| k.clone());
             self.map.remove(&oldest.unwrap_or_default());
         }
-        self.map.insert(key, (now + self.ttl, value));
+        self.map.insert(key, (until, value));
+    }
+
+    /// [`Kept::put`], unless [`MAX_FLOWS`] are kept and none has expired.
+    fn put_new(&mut self, key: String, value: T) -> bool {
+        if self.map.len() >= MAX_FLOWS {
+            let now = Instant::now();
+            self.map.retain(|_, (until, _)| *until > now);
+            if self.map.len() >= MAX_FLOWS {
+                return false;
+            }
+        }
+        self.put(key, value);
+        true
     }
 
     fn take(&mut self, key: &str) -> Option<T> {
+        self.take_entry(key).map(|(_, value)| value)
+    }
+
+    /// [`Kept::take`], with when it would have expired.
+    fn take_entry(&mut self, key: &str) -> Option<(Instant, T)> {
         let (until, value) = self.map.remove(key)?;
-        (until > Instant::now()).then_some(value)
+        (until > Instant::now()).then_some((until, value))
+    }
+
+    fn get_mut(&mut self, key: &str) -> Option<&mut T> {
+        let now = Instant::now();
+        self.map.get_mut(key).filter(|(until, _)| *until > now).map(|(_, value)| value)
     }
 }
 
-fn lock(flows: &Mutex<Flows>) -> std::sync::MutexGuard<'_, Flows> {
+pub fn lock(flows: &Mutex<Flows>) -> std::sync::MutexGuard<'_, Flows> {
     flows.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -184,12 +286,19 @@ pub fn s256(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-/// The browser's [`COOKIE`] in a `Cookie` header, if well-formed.
-pub fn cookie(header: &str) -> Option<&str> {
+/// The cookie's name for `issuer`: prefixed where it can be `Secure`.
+fn cookie_name(issuer: &str) -> &'static str {
+    if issuer.starts_with("https://") { SECURE_COOKIE } else { COOKIE }
+}
+
+/// The browser's cookie for `issuer` in a `Cookie` header, if well-formed;
+/// on an `https` issuer, only the prefixed one.
+pub fn cookie<'h>(issuer: &str, header: &'h str) -> Option<&'h str> {
+    let wanted = cookie_name(issuer);
     header
         .split(';')
         .filter_map(|c| c.trim().split_once('='))
-        .find(|(name, _)| *name == COOKIE)
+        .find(|(name, _)| *name == wanted)
         .map(|(_, value)| value)
         .filter(|v| v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
 }
@@ -200,7 +309,21 @@ pub fn cookie(header: &str) -> Option<&str> {
 pub fn set_cookie(issuer: &str, value: &str) -> String {
     let secure = if issuer.starts_with("https://") { "; Secure" } else { "" };
     let path = format!("{}/oauth", path_of(issuer));
-    format!("{COOKIE}={value}; Path={path}; Max-Age={}; HttpOnly; SameSite=Lax{secure}", 2 * STEP_TTL.as_secs())
+    let name = cookie_name(issuer);
+    format!("{name}={value}; Path={path}; Max-Age={}; HttpOnly; SameSite=Lax{secure}", 2 * STEP_TTL.as_secs())
+}
+
+/// `d` in words for a person: whole days, hours or minutes.
+fn in_words(d: Duration) -> String {
+    let secs = d.as_secs();
+    let (n, unit) = if secs >= 86_400 && secs % 86_400 == 0 {
+        (secs / 86_400, "day")
+    } else if secs >= 3_600 && secs % 3_600 == 0 {
+        (secs / 3_600, "hour")
+    } else {
+        (secs.div_ceil(60).max(1), "minute")
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
 }
 
 /// `scheme://authority` of a URL.
@@ -233,12 +356,20 @@ fn answer_url(redirect_uri: &str, state: Option<&str>, issuer: &str, pairs: &[(&
 /// A page for something that went wrong here: the details go to the log.
 fn internal(e: &Error, doing: &str) -> Answer {
     tracing::error!(target: "bd::serve", error = %e, "{doing}");
-    let why = "The bd server could not go on; the details are in its log.";
+    let why = "The server ran into a problem. Try again later.";
     Answer::Page(pages::refusal(500, "Something went wrong", why, None))
 }
 
+/// Why a refusal page shows when the server takes no applications.
+const NO_APPS: &str = "This server doesn't accept connections from applications.";
+
+/// Why a refusal page shows for a request the application got wrong. Pages
+/// never name parameters, limits or the server's setup: what went wrong in
+/// detail is for the log.
+const MALFORMED: &str = "The application sent a request this server can't use. Start again from the application.";
+
 fn refused(status: u16, why: &str) -> Answer {
-    Answer::Page(pages::refusal(status, "This authorization cannot go on", why, None))
+    Answer::Page(pages::refusal(status, "Couldn't connect the application", why, None))
 }
 
 /// The parameters of an authorization request, before its client is known.
@@ -256,23 +387,23 @@ struct Params {
 /// told (no client or redirect URI, or an unusable `state`).
 fn parse(query: &str) -> Result<Params, Answer> {
     let Some(pairs) = form::decode(query) else {
-        return Err(refused(400, "The authorization request is not a valid query string."));
+        return Err(refused(400, MALFORMED));
     };
     let mut rest = HashMap::new();
     let mut repeated = None;
     let seen = |name: &str| pairs.iter().filter(|(k, _)| k == name).count();
     for name in ["client_id", "redirect_uri", "state"] {
         if seen(name) > 1 {
-            return Err(refused(400, &format!("The authorization request gives {name} more than once.")));
+            return Err(refused(400, MALFORMED));
         }
     }
     let one = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
     let (Some(client_id), Some(redirect_uri)) = (one("client_id"), one("redirect_uri")) else {
-        return Err(refused(400, "The authorization request needs a client_id and a redirect_uri."));
+        return Err(refused(400, MALFORMED));
     };
     let state = one("state");
     if state.as_ref().is_some_and(|s| s.len() > MAX_STATE) {
-        return Err(refused(400, &format!("The authorization request's state is longer than {MAX_STATE} bytes.")));
+        return Err(refused(400, MALFORMED));
     }
     for (k, v) in &pairs {
         if matches!(k.as_str(), "client_id" | "redirect_uri" | "state") {
@@ -287,15 +418,9 @@ fn parse(query: &str) -> Result<Params, Answer> {
 
 /// The authorization `params` ask for, from `client`: refused on a page if
 /// it may not be sent back to the redirect URI, else with an error at it.
-fn check(
-    params: Params,
-    client: Client,
-    oauth: &OauthConfig,
-    issuer: &str,
-    workspace_exists: &dyn Fn(&str) -> bool,
-) -> Result<Authorization, Answer> {
+fn check(params: Params, client: Client, oauth: &OauthConfig, issuer: &str) -> Result<Authorization, Answer> {
     if !client.redirects_to(&params.redirect_uri, oauth) {
-        let why = "The redirect_uri is not one the client registered, or not one this bd server sends people back to.";
+        let why = "The application asked to send you somewhere it isn't allowed to.";
         return Err(refused(400, why));
     }
     let error = |error: &str, description: &str| {
@@ -321,7 +446,7 @@ fn check(
         return error("invalid_request", "resource is required: the URL of the MCP endpoint (RFC 8707)");
     };
     let workspace = match mcp_http::resource_url(resource) {
-        Ok((url, name)) if url == mcp_http::resource(issuer, &name) && workspace_exists(&name) => name,
+        Ok((url, name)) if url == mcp_http::resource(issuer, &name) => name,
         _ => return error("invalid_target", "resource is not an MCP endpoint of this bd server"),
     };
     Ok(Authorization {
@@ -345,9 +470,9 @@ pub fn begin(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Optio
     let (github, oauth_config) = match oauth::load(cx.root) {
         Ok(Some(g)) => match g.oauth.clone() {
             Some(o) => (g, o),
-            None => return (refused(404, "This bd server does not authorize applications."), None),
+            None => return (refused(404, NO_APPS), None),
         },
-        Ok(None) => return (refused(404, "This bd server does not authorize applications."), None),
+        Ok(None) => return (refused(404, NO_APPS), None),
         Err(e) => return (internal(&e, "reading auth.toml for an authorization"), None),
     };
     let params = match parse(query) {
@@ -356,11 +481,15 @@ pub fn begin(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Optio
     };
     let client = match clients::lookup(cx.root, cx.documents, &params.client_id) {
         Ok(c) => c,
-        Err(Error::Invalid(why) | Error::Remote(why)) => return (refused(400, &why), None),
-        Err(Error::Busy(_)) => return (refused(503, "The bd server is busy; try again in a moment."), None),
+        Err(Error::Invalid(why) | Error::Remote(why)) => {
+            tracing::info!(target: "bd::serve", client = %params.client_id, error = %why, "OAuth client refused");
+            let why = "This application isn't set up to connect to this server.";
+            return (refused(400, why), None);
+        }
+        Err(Error::Busy(_)) => return (refused(503, "The server is busy. Try again in a moment."), None),
         Err(e) => return (internal(&e, "looking up an OAuth client"), None),
     };
-    let request = match check(params, client, &oauth_config, cx.issuer, cx.workspace_exists) {
+    let request = match check(params, client, &oauth_config, cx.issuer) {
         Ok(r) => r,
         Err(answer) => return (answer, None),
     };
@@ -372,7 +501,10 @@ pub fn begin(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Optio
     let browser = browser.map_or(new_cookie, str::to_string);
     let url = oauth::web_sign_in_url(&github, &format!("{}{CALLBACK}", cx.issuer), &state, &s256(&verifier));
     let started = Started { request, verifier, browser: auth::hash(&browser) };
-    lock(cx.flows).started.put(auth::hash(&state), started);
+    if !lock(cx.flows).started.put_new(auth::hash(&state), started) {
+        tracing::warn!(target: "bd::serve", "OAuth sign-in refused: {MAX_FLOWS} are under way");
+        return (refused(503, "Too many sign-ins are in progress. Try again in a moment."), None);
+    }
     (Answer::Redirect(url), Some(set_cookie(cx.issuer, &browser)))
 }
 
@@ -384,10 +516,10 @@ pub fn callback(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> Answer {
     let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
     let started = get("state").and_then(|state| lock(cx.flows).started.take(&auth::hash(state)));
     let Some(Started { request, verifier, browser: started_in }) = started else {
-        return refused(400, "This sign-in is unknown or expired: start again from the application.");
+        return refused(400, "This sign-in has expired. Start again from the application.");
     };
     if browser.map(auth::hash).as_deref() != Some(started_in.as_str()) {
-        return refused(400, "This sign-in started in another browser: start again from the application.");
+        return refused(400, "This sign-in started in a different browser. Start again from the application.");
     }
     let back = |error: &str, description: &str| request.error_url(cx.issuer, error, description);
     if let Some(error) = get("error") {
@@ -398,11 +530,11 @@ pub fn callback(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> Answer {
         return Answer::Redirect(back(error, description));
     }
     let Some(code) = get("code").filter(|c| !c.is_empty()) else {
-        return refused(400, "GitHub sent no sign-in code: start again from the application.");
+        return refused(400, "GitHub didn't return a sign-in code. Start again from the application.");
     };
     let github = match oauth::load(cx.root) {
         Ok(Some(g)) if g.oauth.is_some() => g,
-        Ok(_) => return refused(404, "This bd server does not authorize applications."),
+        Ok(_) => return refused(404, NO_APPS),
         Err(e) => return internal(&e, "reading auth.toml for an authorization"),
     };
     let callback_url = format!("{}{CALLBACK}", cx.issuer);
@@ -411,46 +543,72 @@ pub fn callback(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> Answer {
     let (actor, admitted) = match found {
         Ok(found) => found,
         Err(Error::Unauthorized(why)) => {
+            tracing::info!(target: "bd::serve", workspace = %request.workspace, error = %why, "GitHub web sign-in refused");
             let link = back("access_denied", "the account may not use this workspace");
-            return Answer::Page(pages::refusal(403, "Access refused", &why, Some(&link)));
+            let why = "Your GitHub account doesn't have access to this workspace. Ask the server's admin for access.";
+            return Answer::Page(pages::refusal(403, "Access denied", why, Some(&link)));
         }
         Err(Error::Invalid(why)) => {
+            tracing::info!(target: "bd::serve", error = %why, "GitHub web sign-in did not complete");
             let link = back("access_denied", "the sign-in did not complete");
-            return Answer::Page(pages::refusal(400, "The sign-in did not complete", &why, Some(&link)));
+            let why = "GitHub didn't finish signing you in. Start again from the application.";
+            return Answer::Page(pages::refusal(400, "Sign-in didn't finish", why, Some(&link)));
         }
         Err(Error::Remote(why)) => {
             tracing::warn!(target: "bd::serve", error = %why, "GitHub web sign-in failed");
             let link = back("temporarily_unavailable", "GitHub could not be reached");
-            let why = "GitHub did not answer as expected; the details are in the bd server's log.";
-            return Answer::Page(pages::refusal(502, "GitHub could not be reached", why, Some(&link)));
+            let why = "GitHub didn't respond as expected. Try again in a moment.";
+            return Answer::Page(pages::refusal(502, "Couldn't reach GitHub", why, Some(&link)));
         }
         Err(e) => return internal(&e, "finishing a GitHub web sign-in"),
     };
+    if !(cx.workspace_exists)(&request.workspace) {
+        return Answer::Redirect(back("invalid_target", "resource is not an MCP endpoint of this bd server"));
+    }
     let id = match auth::random_hex(32) {
         Ok(id) => id,
         Err(e) => return internal(&e, "asking for consent"),
     };
     let client = &request.client;
-    let (name, note) = match (&client.name, client.document) {
-        (Some(name), true) => (name.clone(), format!("named by {}", host_of(&client.id))),
-        (None, true) => (host_of(&client.id).to_string(), "identified by its address".into()),
-        (Some(name), false) => (name.clone(), "a name the application gave itself, not verified".into()),
-        (None, false) => ("An unnamed application".into(), format!("client {}", client.id)),
+    let name = match (&client.name, client.document) {
+        (Some(name), _) => name.clone(),
+        (None, true) => host_of(&client.id).to_string(),
+        (None, false) => "Unnamed application".into(),
     };
+    let identity = if client.document {
+        pages::Identity::Document { url: &client.id, host: host_of(&client.id) }
+    } else {
+        pages::Identity::Registered { client_id: &client.id }
+    };
+    let loopback = clients::is_loopback(&request.redirect_uri);
+    let returns_to = host_of(&request.redirect_uri);
+    let elsewhere = (client.document && !loopback && returns_to != host_of(&client.id)).then_some(returns_to);
+    let lasts = format!(
+        "at most {}, and ends after {} unused or when revoked",
+        in_words(github.refresh_limit),
+        in_words(github.refresh_idle)
+    );
     let action = format!("{}{CONSENT}", cx.issuer);
     let page = pages::consent(&pages::Consent {
         client: &name,
-        client_note: &note,
-        returns_to: host_of(&request.redirect_uri),
+        identity,
+        logo: client.logo.as_deref().filter(|_| client.document),
+        redirect_uri: &request.redirect_uri,
+        loopback,
+        elsewhere,
+        lasts: &lasts,
         workspace: &request.workspace,
         login: &admitted.user.login,
         actor: &actor,
-        role: admitted.grant.role.as_str(),
-        kind: admitted.grant.kind.as_str(),
+        access: match admitted.grant.role {
+            auth::Role::Read => "Read only",
+            auth::Role::Write => "Read and write",
+            auth::Role::Admin => "Full, including administration",
+        },
         via: &admitted.via,
         id: &id,
         action: &action,
-        form_origins: &[origin(cx.issuer), origin(&request.redirect_uri)],
+        form_origins: &form_origins(&request.redirect_uri),
     });
     let consent = Consent { request, admitted, actor, browser: started_in };
     lock(cx.flows).consents.put(auth::hash(&id), consent);
@@ -464,10 +622,25 @@ pub fn decide(cx: &Ctx<'_>, body: &str, browser: Option<&str>) -> Answer {
     let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
     let consent = get("consent").and_then(|id| lock(cx.flows).consents.take(&auth::hash(id)));
     let Some(Consent { request, admitted, actor, browser: started_in }) = consent else {
-        return refused(400, "This authorization is unknown or expired: start again from the application.");
+        return refused(400, "This request has expired. Start again from the application.");
     };
     if browser.map(auth::hash).as_deref() != Some(started_in.as_str()) {
-        return refused(400, "This authorization started in another browser: start again from the application.");
+        return refused(400, "This request started in a different browser. Start again from the application.");
+    }
+    // `[oauth]` may have changed since the request was checked: the browser
+    // goes back only where it allows now (RFC 9700 section 4.11).
+    match oauth::load(cx.root) {
+        Ok(Some(g)) => match g.oauth {
+            Some(o) if o.allows_redirect(&request.redirect_uri) => {}
+            Some(_) => {
+                tracing::info!(target: "bd::serve", redirect_uri = %request.redirect_uri, "OAuth redirect no longer allowed");
+                let why = "The application asked to send you somewhere this server no longer allows.";
+                return refused(400, why);
+            }
+            None => return refused(404, NO_APPS),
+        },
+        Ok(None) => return refused(404, NO_APPS),
+        Err(e) => return internal(&e, "reading auth.toml for a consent"),
     }
     let log = |decision: &str| {
         tracing::info!(
@@ -484,27 +657,84 @@ pub fn decide(cx: &Ctx<'_>, body: &str, browser: Option<&str>) -> Answer {
         Some("approve") => {}
         Some("deny") => {
             log("denied");
-            return Answer::Redirect(request.error_url(cx.issuer, "access_denied", "the authorization was denied"));
+            return back_to(request.error_url(cx.issuer, "access_denied", "the authorization was denied"));
         }
-        _ => return refused(400, "The consent form was not filled in: start again from the application."),
+        _ => return refused(400, "The form arrived incomplete. Start again from the application."),
     }
     let code = match auth::random_hex(32) {
         Ok(c) => c,
         Err(e) => return internal(&e, "issuing an authorization code"),
     };
     log("approved");
+    if request.client.document {
+        cx.documents.keep(&request.client);
+    }
     let url = answer_url(&request.redirect_uri, request.state.as_deref(), cx.issuer, &[("code", &code)]);
     let issued = Code {
         client_id: request.client.id,
         redirect_uri: request.redirect_uri,
         challenge: request.challenge,
         resource: request.resource,
-        workspace: request.workspace,
         admitted,
         actor,
     };
     lock(cx.flows).codes.put(auth::hash(&code), issued);
-    Answer::Redirect(url)
+    back_to(url)
+}
+
+/// Whether `url`'s host is an IPv6 address (`http://[::1]:8080/cb`).
+fn ipv6_host(url: &str) -> bool {
+    host_of(url).starts_with('[')
+}
+
+/// Where the consent form may post, and be redirected after: the page's
+/// own origin (`'self'`, which unlike a source naming it matches an IPv6
+/// host), and the client's redirect URI, which a policy can name unless its
+/// host is an IPv6 address ([`back_to`]).
+fn form_origins(redirect_uri: &str) -> Vec<&str> {
+    let mut origins = vec!["'self'"];
+    if !ipv6_host(redirect_uri) {
+        origins.push(origin(redirect_uri));
+    }
+    origins
+}
+
+/// Send the browser back to the client after the consent form, at `url`:
+/// redirected, or by a page where the form's policy cannot allow it.
+fn back_to(url: String) -> Answer {
+    if ipv6_host(&url) { Answer::Page(pages::onward(&url)) } else { Answer::Redirect(url) }
+}
+
+/// A code for `bdc_1`, as tests issue them.
+#[cfg(test)]
+pub fn sample_code() -> Code {
+    Code {
+        client_id: "bdc_1".into(),
+        redirect_uri: "https://app.example/cb".into(),
+        challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into(),
+        resource: "https://bd.example.com/bd/w/proj/mcp".into(),
+        admitted: Admitted {
+            user: auth::GithubUser { url: "https://github.com".into(), login: "alice".into(), id: 1 },
+            grant: auth::Grant {
+                role: auth::Role::Write,
+                kind: auth::Kind::Agent,
+                workspaces: vec!["proj".into()],
+                max_claims: None,
+            },
+            via: "GitHub user alice".into(),
+            by_login: true,
+            unknown: vec![],
+        },
+        actor: "alice".into(),
+    }
+}
+
+#[cfg(test)]
+impl Flows {
+    /// Issue `code` for `found`, as an approval does.
+    pub fn put_code(&mut self, code: &str, found: Code) {
+        self.codes.put(auth::hash(code), found);
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +750,8 @@ mod tests {
             name: Some("App".into()),
             redirect_uris: vec!["https://app.example/cb?x=1".into()],
             document: false,
+            logo: None,
+            cacheable: true,
         }
     }
 
@@ -548,7 +780,7 @@ mod tests {
     }
 
     fn checked(q: &str) -> Result<Authorization, Answer> {
-        check(parse(q)?, client(), &oauth(), ISSUER, &|name| name == "proj")
+        check(parse(q)?, client(), &oauth(), ISSUER)
     }
 
     fn page_status(answer: Answer) -> u16 {
@@ -595,7 +827,7 @@ mod tests {
             assert_eq!(page_status(checked(&q).unwrap_err()), 400, "{q}");
         }
         let allowed = OauthConfig { redirect_hosts: vec![], loopback_redirects: false };
-        let answer = check(parse(&query(&[])).unwrap(), client(), &allowed, ISSUER, &|_| true).unwrap_err();
+        let answer = check(parse(&query(&[])).unwrap(), client(), &allowed, ISSUER).unwrap_err();
         assert_eq!(page_status(answer), 400, "registered, but no longer allowed");
     }
 
@@ -610,7 +842,6 @@ mod tests {
             (&[("code_challenge", "short")], "invalid_request"),
             (&[("code_challenge", &CHALLENGE.replace('-', "+"))], "invalid_request"),
             (&[("resource", "")], "invalid_request"),
-            (&[("resource", "https://bd.example.com/bd/w/other/mcp")], "invalid_target"),
             (&[("resource", "https://elsewhere.example/bd/w/proj/mcp")], "invalid_target"),
             (&[("resource", "https://bd.example.com/w/proj/mcp")], "invalid_target"),
             (&[("resource", "https://bd.example.com/bd/w/proj")], "invalid_target"),
@@ -644,19 +875,37 @@ mod tests {
         assert_eq!(kept.map.len(), MAX_FLOWS);
         assert_eq!(kept.take("0"), None, "the oldest went first");
         assert_eq!(kept.take(&(MAX_FLOWS + 9).to_string()), Some(MAX_FLOWS + 9));
+        // New sign-ins wait for room instead.
+        assert!(kept.put_new("new".into(), 0));
+        assert!(!kept.put_new("newer".into(), 0));
+        assert_eq!(kept.take("10"), Some(10), "kept, until it expires or is taken");
+        assert!(kept.put_new("newer".into(), 0));
+        let mut expiring = Kept::new(Duration::ZERO);
+        for i in 0..MAX_FLOWS {
+            expiring.put(i.to_string(), i);
+        }
+        assert!(expiring.put_new("new".into(), 0), "the expired make room");
     }
 
     #[test]
     fn helpers() {
+        assert_eq!(in_words(Duration::from_secs(30 * 86_400)), "30 days");
+        assert_eq!(in_words(Duration::from_secs(86_400)), "1 day");
+        assert_eq!(in_words(Duration::from_secs(36 * 3_600)), "36 hours");
+        assert_eq!(in_words(Duration::from_secs(90)), "2 minutes");
         assert_eq!(s256("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), CHALLENGE, "RFC 7636 appendix B");
         let c = "a".repeat(64);
-        assert_eq!(cookie(&format!("x=1; {COOKIE}={c}; y=2")), Some(c.as_str()));
-        assert_eq!(cookie(&format!("{COOKIE}={}", "A".repeat(64))), None);
-        assert_eq!(cookie(&format!("{COOKIE}=abc")), None);
-        assert_eq!(cookie("x=1"), None);
+        let http = "http://127.0.0.1:7420";
+        assert_eq!(cookie(http, &format!("x=1; {COOKIE}={c}; y=2")), Some(c.as_str()));
+        assert_eq!(cookie(http, &format!("{COOKIE}={}", "A".repeat(64))), None);
+        assert_eq!(cookie(http, &format!("{COOKIE}=abc")), None);
+        assert_eq!(cookie(ISSUER, &format!("x=1; {SECURE_COOKIE}={c}")), Some(c.as_str()));
+        assert_eq!(cookie(ISSUER, &format!("{COOKIE}={c}")), None, "unprefixed, on https: planted, maybe");
+        assert_eq!(cookie(http, &format!("{SECURE_COOKIE}={c}")), None);
+        assert_eq!(cookie(http, "x=1"), None);
         assert_eq!(
             set_cookie(ISSUER, &c),
-            format!("{COOKIE}={c}; Path=/bd/oauth; Max-Age=1200; HttpOnly; SameSite=Lax; Secure")
+            format!("{SECURE_COOKIE}={c}; Path=/bd/oauth; Max-Age=1200; HttpOnly; SameSite=Lax; Secure")
         );
         assert_eq!(
             set_cookie("http://127.0.0.1:7420", &c),
@@ -671,5 +920,49 @@ mod tests {
             format!("https://a/cb?code=c&state=s&{iss}")
         );
         assert_eq!(answer_url("https://a/cb?x", None, ISSUER, &[]), format!("https://a/cb?x&{iss}"));
+    }
+
+    #[test]
+    fn the_browser_returns_by_a_page_to_an_ipv6_address() {
+        assert_eq!(form_origins("https://app.example/cb"), ["'self'", "https://app.example"]);
+        assert_eq!(form_origins("http://127.0.0.1:8080/cb"), ["'self'", "http://127.0.0.1:8080"]);
+        assert_eq!(form_origins("http://[::1]:8080/cb"), ["'self'"]);
+        assert_eq!(
+            back_to("http://127.0.0.1:8080/cb?code=c".into()),
+            Answer::Redirect("http://127.0.0.1:8080/cb?code=c".into())
+        );
+        let Answer::Page(page) = back_to("http://[::1]:8080/cb?code=c".into()) else { panic!("not a page") };
+        assert!(page.html.contains("href=\"http://[::1]:8080/cb?code=c\""), "{}", page.html);
+    }
+
+    #[test]
+    fn codes_are_redeemed_once_and_a_code_sent_again_names_its_token() {
+        let code = sample_code();
+        let mut flows = Flows::default();
+        flows.codes.put(auth::hash("c1"), code.clone());
+        assert!(matches!(flows.redeem("c1"), Redeemed::Fresh(_)));
+        assert!(!flows.issued("c1", "t1"));
+        assert!(matches!(flows.redeem("c1"), Redeemed::Again(Some(t)) if t == "t1"));
+        assert!(matches!(flows.redeem("c2"), Redeemed::Unknown));
+        // Sent again while its token was being issued: that token must go.
+        flows.codes.put(auth::hash("c3"), code.clone());
+        assert!(matches!(flows.redeem("c3"), Redeemed::Fresh(_)));
+        assert!(matches!(flows.redeem("c3"), Redeemed::Again(None)));
+        assert!(flows.issued("c3", "t3"));
+        // Undone, as no token was issued: good again, until it would have expired.
+        flows.codes.put(auth::hash("c4"), code.clone());
+        let until = flows.codes.map[&auth::hash("c4")].0;
+        assert!(matches!(flows.redeem("c4"), Redeemed::Fresh(_)));
+        flows.unredeem("c4", code.clone());
+        assert_eq!(flows.codes.map[&auth::hash("c4")].0, until);
+        assert!(matches!(flows.redeem("c4"), Redeemed::Fresh(_)));
+        // Not once sent again, nor once it issued a token.
+        flows.unredeem("c3", code.clone());
+        assert!(matches!(flows.redeem("c3"), Redeemed::Again(Some(t)) if t == "t3"));
+        flows.codes.put(auth::hash("c5"), code.clone());
+        assert!(matches!(flows.redeem("c5"), Redeemed::Fresh(_)));
+        assert!(matches!(flows.redeem("c5"), Redeemed::Again(None)));
+        flows.unredeem("c5", code);
+        assert!(matches!(flows.redeem("c5"), Redeemed::Again(None)));
     }
 }

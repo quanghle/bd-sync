@@ -26,6 +26,7 @@ bd serve token create intern --as intern --max-claims 2 --root /srv/bd   # holds
 bd serve token list --root /srv/bd
 bd serve token revoke ci --root /srv/bd          # takes effect at once, no restart
 # Or let people get their own by signing in with GitHub: <root>/auth.toml (below)
+# MCP clients that sign people in with OAuth (ChatGPT, Claude apps): docs/mcp.md
 
 bd serve --root /srv/bd --listen 0.0.0.0:7420 --tls-cert cert.pem --tls-key key.pem
 ```
@@ -96,6 +97,7 @@ refresh_limit = "30d"                   # refreshed for at most this long after 
 refresh_idle = "7d"                     # and not after this long without one (default 7d)
 # url = "https://ghe.example.com"       # GitHub Enterprise Server; its API defaults to <url>/api/v3 (api_url)
 # deny = [12345]                        # GitHub user ids that may never sign in (`bd serve token accounts`)
+# client_secret_file = "github-secret"  # the GitHub App's client secret, relative to the root: for [oauth]
 
 # Rules, in order: the first that lets an account into the workspace decides its token.
 [[github.allow]]
@@ -118,7 +120,16 @@ workspaces = ["proj"]                   # default: every workspace
 # role = "write"                        # read (default here) or write
 # min_account_age = "30d"               # GitHub accounts younger than this are not let in by the rule
 # max_claims = 3                        # its tokens' actors hold at most 3 issues at once
+
+# [oauth]                               # MCP clients such as ChatGPT sign people in with OAuth (docs/mcp.md)
+# redirect_hosts = ["chatgpt.com", "claude.ai"]
+# loopback_redirects = true
 ```
+
+The same rules let people sign in from MCP clients that use OAuth, such as
+ChatGPT and the Claude apps, when `[oauth]` turns on `bd serve`'s
+authorization server: see [Signing in with
+OAuth](mcp.md#signing-in-with-oauth).
 
 `bd serve` checks the file when it starts, and refuses to start with a
 mistake in it (an unknown field, a rule that names nobody, an `http` URL to
@@ -199,7 +210,10 @@ refreshed.
   got by signing in, including those from before a rename (`alice` may be its
   latest login or its actor). `bd serve token list` shows each token's
   GitHub account, expiry, and until when it is refreshed; expired ones leave
-  the list a week after they can no longer be refreshed either.
+  the list a week after they can no longer be refreshed either. Tokens of
+  MCP clients that signed someone in with OAuth also show their `client`,
+  and `bd serve token revoke --client <client_id>` revokes all of a
+  client's.
 
 ### Refreshing sign-ins
 

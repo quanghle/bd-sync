@@ -307,7 +307,7 @@ impl Github {
 
     /// How long the tokens of a sign-in at `now` last: refreshed only with
     /// the GitHub App's key.
-    fn lifetime(&self, now: Timestamp) -> auth::Lifetime {
+    pub fn lifetime(&self, now: Timestamp) -> auth::Lifetime {
         let refresh = self.app.as_ref().map(|_| (now.plus(self.refresh_limit), self.refresh_idle));
         auth::Lifetime { ttl: self.token_ttl, refresh }
     }
@@ -1248,7 +1248,11 @@ fn answer_of(issued: auth::Issued, login: String, via: String) -> Issued {
 /// `Error::Unauthorized`, and revokes the sign-in when the rules no longer
 /// let the account in, or the secret was spent already; GitHub's failures,
 /// and memberships it would not tell, are `Error::Remote`, and change nothing.
-pub fn refresh(root: &Path, secret: &str, request_id: &str) -> Result<Issued> {
+/// `client` is the OAuth client refreshing at the authorization server's
+/// token endpoint (`oauth_server/token.rs`), which only refreshes the
+/// tokens issued to it, as `/v2/auth/refresh` only refreshes those issued
+/// to no client.
+pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>) -> Result<Issued> {
     let refused = |why: String| Error::Unauthorized(format!("{why}; sign in again: `bd remote login --github`"));
     let github = enabled(root)?;
     let Some((token, current)) = auth::find_refresh(root, secret)? else {
@@ -1257,6 +1261,14 @@ pub fn refresh(root: &Path, secret: &str, request_id: &str) -> Result<Issued> {
     let (Some(user), Some(state)) = (token.github.clone(), token.refresh.clone()) else {
         return Err(refused("not a sign-in's refresh token".into()));
     };
+    if token.client.as_deref() != client {
+        return Err(refused(match &token.client {
+            Some(_) if client.is_none() => {
+                "this refresh token is an OAuth client's, refreshed at its token endpoint".into()
+            }
+            _ => "this refresh token was issued to another client".into(),
+        }));
+    }
     let revoke = |why: &str| -> Result<()> {
         auth::revoke_by_id(root, &token.id)?;
         tracing::warn!(target: "bd::serve", login = %user.login, id = user.id, token = %token.name, "GitHub sign-in revoked at refresh: {why}");

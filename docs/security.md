@@ -99,6 +99,103 @@ Sign-in lets people get their own tokens, under rules in `<root>/auth.toml`
   machine, agents included: a rule's `kind = "human"` lets those agents
   resolve human gates too.
 
+## OAuth for MCP clients
+
+With `[oauth]`, `bd serve` is an OAuth 2.1 authorization server for MCP
+clients that sign people in, such as ChatGPT
+([Signing in with OAuth](mcp.md#signing-in-with-oauth)). People sign in with
+GitHub under the same rules as above.
+
+- **Secrets.** GitHub's web flow needs a client secret of the GitHub App
+  (`client_secret_file`); keep it, like the private key, mode 0600 and
+  readable by `bd serve` only. The account's GitHub token is used during
+  the sign-in only, as for the device flow.
+- **Where people are sent back.** Only to redirect URIs `[oauth]` allows:
+  https on the hosts of `redirect_hosts`, or, with `loopback_redirects`,
+  http to the person's own machine. Any local program can listen on a
+  loopback port, so turn that on only for desktop clients that need it.
+  A client's redirect URI must match one it registered or its metadata
+  document names.
+- **The person sees what they approve.** The consent page names the client
+  and where its details come from: its metadata document's full URL (which
+  says only who can serve a file there, not who wrote it), or, for a
+  registered client, a warning that anyone can register under any name. It
+  shows the full redirect URI the browser returns to, warning when that is
+  the person's own machine (any program there could pose as the client) or
+  a site other than the document's, the workspace, the actor, the access
+  granted and how long it lasts. Client names may not hold direction
+  controls, invisible characters or spaces other than the ASCII one, which
+  could make one name pass for another; joiners (ZWJ, ZWNJ) between
+  visible characters and emoji presentation selectors after one, which
+  scripts and emoji need, are allowed. A metadata document whose name
+  breaks this rule is shown by its host. It shows a logo only from a
+  client's metadata document, which the document's site vouches for, never
+  one a registered client claims.
+  bd fetches that logo with the document and puts it in the page, so the
+  browser asks no other site for anything and the logo cannot change
+  between fetches (CIMD draft section 8.8). How the server is set up
+  (`auth.toml`, other workspaces, limits, what its log says) stays off the
+  pages; the consent page names only the rule that let the person in. The pages are served with
+  a strict Content Security Policy (styles and the one script by hash,
+  images only inside the page) and may not be framed. The consent form
+  refuses posts from other sites and from any browser but the one that
+  started the authorization (a `SameSite=Lax`, `HttpOnly` cookie, named
+  `__Secure-bd_oauth` on https so a sibling host on plain http cannot plant
+  it). The prefix is `__Secure-` rather than `__Host-` because the cookie is
+  scoped to the issuer's path, which `__Host-` forbids; a sibling https
+  host could still set one for the parent domain, which gains it nothing
+  over sending the person the authorization URL itself. Before a code is
+  issued, the redirect URI is checked against `[oauth]` again, in case it
+  changed during the sign-in. Framing rules do not stop DoubleClickjacking
+  (a page asking for a double click that brings the consent page forward
+  under the second), so the consent form is not sent until the page has
+  had focus for 600 ms; the buttons stay enabled, for screen readers and
+  voice control.
+- **Consent comes after GitHub sign-in.** The MCP specification asks a
+  proxy in front of a third-party authorization server to get consent for
+  each client before sending the person on to it. bd sends the person to
+  GitHub first, because it uses GitHub only to learn who they are: GitHub
+  grants the client nothing, and bd's consent page, shown every time and
+  never skipped, comes before any code reaches the client.
+- **Codes and tokens.** Codes need PKCE (`S256`), last 5 minutes and work
+  once; a code sent again revokes the tokens it issued. Tokens are bound to
+  one workspace's MCP endpoint (RFC 8707), so they work for its tool calls
+  only, which never carry admin or human rights. Refresh tokens rotate at
+  every refresh with no grace period: one used twice revokes the sign-in.
+  `bd serve token revoke --client <client_id>` revokes every token of a
+  client, and `--github <login>` every token of an account.
+- **Client metadata documents.** bd fetches a client's metadata document
+  over https from public addresses only (no loopback, private, link-local
+  or other reserved address, checked as it connects, so a name cannot
+  resolve to a public address for the check and a private one for the
+  fetch), without redirects or a proxy, at most 8 KiB in 5 seconds, four
+  hosts at once and one fetch per host. A document fetched before is used
+  for up to an hour past its time only while it cannot be fetched because
+  every fetch, or another from its host, is under way; when its host does
+  not answer, the authorization fails (CIMD draft section 5.1).
+  Those of clients someone approved go last when the
+  cache (256 documents, in memory) is full. So anyone naming many
+  documents keeps out only clients no one approved since `bd serve`
+  started, and slow hosts holding every fetch only clients whose document
+  was not fetched or approved in the past hour, unless the client's own
+  host has since refused its document or said not to cache it (which
+  ends both). A logo is fetched the same way, at most 64 KiB, and kept only
+  if its bytes are a PNG, JPEG, GIF or WebP image (no SVG).
+- **Unauthenticated endpoints.** Registration, authorization and the token
+  endpoint need no token. bd bounds what they keep: 500 registered clients
+  (a new one drops the oldest never used), and 1024 sign-ins at GitHub
+  under way, past which new ones are refused rather than old ones dropped;
+  consent pages and codes, which only accounts the rules let in reach, are
+  kept up to 1024 each, the oldest going first. The authorization endpoint
+  does not tell which workspaces exist before the rules let an account in
+  (the device flow of `bd remote login --github` does, before sending
+  anyone to GitHub). It does not
+  rate-limit them: do that per address at the proxy ([Behind a
+  proxy](mcp.md#behind-a-proxy)), on every path with `/oauth/` in it:
+  they answer under the public URL's path (`/bd/oauth/…`) or with it
+  stripped (`/oauth/…`), and a proxy that strips the prefix turns
+  `/bd/bd/oauth/…` into the former.
+
 ## Clients
 
 - **`$BD_TOKEN` goes only where `--remote` or `$BD_REMOTE` points**, never

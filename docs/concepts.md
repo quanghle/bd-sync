@@ -153,8 +153,9 @@ Claude Code, the `SessionStart` hook `bd hook session-start --harness claude`
 hook's input, as `export CLAUDE_CODE_SESSION_ID=<id>` to `$CLAUDE_ENV_FILE`,
 replacing any id inherited from a parent session. Session hooks act as the
 session too: Copilot CLI keeps `$COPILOT_AGENT_SESSION_ID` from hook
-processes, and an older Claude Code `$CLAUDE_CODE_SESSION_ID`, but both give
-the same id in the hook's input, which `bd prime --hook <harness>` and
+processes, Codex `$CODEX_THREAD_ID`, and an older Claude Code
+`$CLAUDE_CODE_SESSION_ID`, but each gives the same id in the hook's input,
+which `bd prime --hook <harness>` and
 `bd hook session-start --harness <harness>` take, so the session-start
 context shows the actor and claims of the session's commands
 ([Session-start hooks](agents.md#session-start-hooks)). `bd info` and

@@ -144,15 +144,24 @@ pub fn env(name: &str) -> Option<String> {
 static HOOK_SESSION: OnceLock<(&'static str, String)> = OnceLock::new();
 
 /// The variable holding the session id that `harness` also gives its hooks
-/// in their JSON input (`sessionId` or `session_id`): the id its sessions'
-/// shell commands get. Copilot CLI (1.0.91) keeps the variable from hook
-/// processes, and so does Claude Code before 2.1.132. Codex's hook input is
-/// not known to carry the id of the thread its commands get, so none.
-pub fn hook_session_var(harness: Harness) -> Option<&'static str> {
+/// in their JSON input: the id its sessions' shell commands get. Copilot CLI
+/// (1.0.91) keeps the variable from hook processes, and so do Codex
+/// (0.155.1) and Claude Code before 2.1.132.
+pub fn hook_session_var(harness: Harness) -> &'static str {
     match harness {
-        Harness::Claude => Some(CLAUDE_SESSION_VAR),
-        Harness::Copilot => Some("COPILOT_AGENT_SESSION_ID"),
-        Harness::Codex => None,
+        Harness::Claude => CLAUDE_SESSION_VAR,
+        Harness::Copilot => "COPILOT_AGENT_SESSION_ID",
+        Harness::Codex => "CODEX_THREAD_ID",
+    }
+}
+
+/// The id in a hook's JSON `input` that `harness`'s commands get as
+/// [`hook_session_var`]: `sessionId` or `session_id`; for Codex the thread's,
+/// a subagent's `agent_id` (its hooks' `session_id` is the root thread's).
+fn hook_input_id(harness: Harness, input: &str) -> Option<String> {
+    match harness {
+        Harness::Codex => input_field(input, &["agent_id", "session_id"]),
+        Harness::Claude | Harness::Copilot => hook_session_id(input),
     }
 }
 
@@ -161,9 +170,9 @@ pub fn hook_session_var(harness: Harness) -> Option<&'static str> {
 /// before any command runs; never under `bd serve`): the hook then acts as
 /// the session's commands do, `bd prime` showing their actor and claims.
 pub fn set_hook_session(harness: Harness, input: &str) {
-    if let Some(var) = hook_session_var(harness)
-        && env(var).is_none()
-        && let Some(id) = hook_session_id(input).filter(|id| id.len() <= MAX_SESSION_ID)
+    let var = hook_session_var(harness);
+    if env(var).is_none()
+        && let Some(id) = hook_input_id(harness, input).filter(|id| id.len() <= MAX_SESSION_ID)
     {
         let _ = HOOK_SESSION.set((var, id));
     }
@@ -377,12 +386,13 @@ fn export_session_id(file: &str) -> Option<String> {
 /// `session_id` (Claude Code, and Copilot's VS Code compatible hooks) or
 /// `sessionId` (Copilot's camelCase hooks) of a hook's JSON input.
 pub fn hook_session_id(input: &str) -> Option<String> {
+    input_field(input, &["session_id", "sessionId"])
+}
+
+/// The first of `keys` that a hook's JSON input holds as a non-empty string, trimmed.
+fn input_field(input: &str, keys: &[&str]) -> Option<String> {
     let v: Value = serde_json::from_str(input.trim()).ok()?;
-    ["session_id", "sessionId"]
-        .iter()
-        .find_map(|k| v.get(k).and_then(Value::as_str))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+    keys.iter().find_map(|k| v.get(k).and_then(Value::as_str)).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 fn append_export(path: &std::path::Path, var: &str, value: &str) -> std::io::Result<()> {

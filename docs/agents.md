@@ -468,12 +468,12 @@ Copilot CLI runs a plugin's hooks in the plugin's own directory. `bd prime
 --hook <harness>` does the same for the prime text: Copilot CLI gets it as
 one JSON object (it drops plain text), Claude Code and Codex as plain text.
 Both act as the session's own actor ([Actors](concepts.md#actors)): Copilot
-CLI keeps `$COPILOT_AGENT_SESSION_ID` from hook processes, and Claude Code
-before 2.1.132 `$CLAUDE_CODE_SESSION_ID`, but both give the same id in the
-hook's input (`sessionId` or `session_id`), so `bd prime`'s context names
-the actor and claims of the session's commands. Codex's hook input is not
-known to carry the id of the thread its commands run in, so a Codex hook
-acts as the plain user. The skills it restores run in the session that
+CLI keeps `$COPILOT_AGENT_SESSION_ID` from hook processes, Codex its
+`$CODEX_THREAD_ID`, and Claude Code before 2.1.132 `$CLAUDE_CODE_SESSION_ID`,
+but each gives the same id in the hook's input (`sessionId` or `session_id`;
+for a Codex subagent, whose hooks get the root thread's `session_id`, its own
+thread's `agent_id`), so `bd prime`'s context names the actor and claims of
+the session's commands. The skills it restores run in the session that
 starts, as approved before.
 
 It says nothing when nothing changed, outside a checkout, and with no
@@ -577,14 +577,16 @@ empty`) and skipping the whole file, while Claude Code treats both alike.
 ```json
 {"hooks": {"SessionStart": [{"matcher": "startup|resume|clear|compact", "hooks": [
   {"type": "command", "command": "bd hook session-start --harness codex", "timeout": 30},
-  {"type": "command", "command": "bd prime", "timeout": 30}
+  {"type": "command", "command": "bd prime --hook codex", "timeout": 30}
 ]}]}}
 ```
 
 Codex loads project hooks only when the project's `.codex/` layer is
-trusted, and each hook must be reviewed and trusted in `/hooks` (per hook
-hash: an edited hook needs trust again; `codex exec
---dangerously-bypass-hook-trust` skips that for one run). Codex shows the
+trusted (the project's own root: with Codex 0.155.1, a trusted parent
+folder did not load a repository's hooks), and each hook must be reviewed
+and trusted in `/hooks` (per hook hash: an edited hook needs trust again;
+`codex exec --dangerously-bypass-hook-trust` skips that for one run). A
+subagent's thread runs no `SessionStart` hooks. Codex shows the
 model about 2,500 tokens of hook output by default and spills the rest to a
 file: a long `bd prime` (many memories) may need `"additionalContextLimit"`
 raised on its handler.

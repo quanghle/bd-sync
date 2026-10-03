@@ -1305,6 +1305,21 @@ fn session_hooks_act_as_the_session_their_input_names() {
     assert!(text.starts_with("# bd workflow context") && text.contains("you are `tester/claude-3b4c5d6e`"), "{text}");
     // Copilot CLI runs .claude/settings.json hooks too, with the same input: those are not Claude Code's.
     assert!(claude(&[]).contains("you are `tester` (from git user.name"));
+
+    // Codex (0.155.1) sets no CODEX_* variable for hooks; its input's session_id is the root thread's
+    // $CODEX_THREAD_ID, and a subagent's hooks name its own thread by agent_id.
+    let codex = |env: &[(&str, &str)], input: &str| {
+        let out = hook_as_user(&ws, env, input, &["prime", "--hook", "codex"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let root = r#"{"session_id":"01a1039a-436c-7562-adc7-540b0a3cf1e9","hook_event_name":"SessionStart"}"#;
+    let text = codex(&[], root);
+    assert!(text.contains("you are `tester/codex-0a3cf1e9`") && text.contains("$CODEX_THREAD_ID"), "{text}");
+    let subagent =
+        r#"{"session_id":"01a1039a-436c-7562-adc7-540b0a3cf1e9","agent_id":"01a1039a-6378-7e82-92a2-4dab40e62962"}"#;
+    assert!(codex(&[], subagent).contains("you are `tester/codex-40e62962`"));
+    assert!(codex(&[("CODEX_THREAD_ID", "0199a213-81c0-7800-8aa1-bbab2a035a53")], root).contains("codex-2a035a53"));
 }
 
 #[test]

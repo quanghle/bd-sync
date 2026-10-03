@@ -10,7 +10,7 @@
 //! | harness   | file                          | entries                                                  |
 //! |-----------|-------------------------------|----------------------------------------------------------|
 //! | `claude`  | `.claude/settings.local.json` | `bd hook session-start --harness claude`, `bd prime --hook claude` |
-//! | `codex`   | `.codex/hooks.json`           | `bd hook session-start --harness codex`, `bd prime`      |
+//! | `codex`   | `.codex/hooks.json`           | `bd hook session-start --harness codex`, `bd prime --hook codex` |
 //! | `copilot` | `.github/hooks/bd.json`       | `bd hook session-start --harness copilot`, `bd prime --hook copilot` |
 //!
 //! Nothing is written when a bd session-start hook for the harness is
@@ -80,7 +80,7 @@ fn items(h: Harness) -> Vec<Value> {
             let timed = |c: &str| json!({ "type": "command", "command": c, "timeout": 30 });
             vec![json!({
                 "matcher": "startup|resume|clear|compact",
-                "hooks": [timed("bd hook session-start --harness codex"), timed("bd prime")],
+                "hooks": [timed("bd hook session-start --harness codex"), timed("bd prime --hook codex")],
             })]
         }
         Harness::Copilot => vec![cmd("bd hook session-start --harness copilot"), cmd("bd prime --hook copilot")],
@@ -379,6 +379,7 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join(".codex/hooks.json")).unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert_eq!(v["hooks"]["SessionStart"][0]["hooks"][1]["command"], "bd prime --hook codex");
 
         std::fs::create_dir_all(dir.path().join(".github/hooks")).unwrap();
         std::fs::write(dir.path().join(".github/hooks/bd.json"), "not json").unwrap();

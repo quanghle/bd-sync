@@ -193,9 +193,12 @@ each MCP entry bd wrote or adopted, with the definition approved. It is
 local state: the first lock written adds `agents.lock*` to `.bd/.gitignore`
 (covering `agents.lock.mutex`, the checkout's OS-locked mutex, and temp
 files), and `bd init` writes that line too. Changes to a checkout are serialized by the
-mutex, which the system releases when its process ends: a session hook and
-a watch can run at once, and one that waits past `--busy-timeout-ms` fails
-with exit 5. The rules a pull follows:
+mutex, which the system releases when its process ends, so a session hook and
+a watch can run at once. `bd agents status`, `pull` and `approve` wait up to
+`--busy-timeout-ms` for it, then fail with exit 5; a watch waits as long, then
+reports the checkout busy and tries again; the session-start hook waits only
+within its own time budget, then reports it in one line and still exits 0
+([Session-start hooks](#session-start-hooks)). The rules a pull follows:
 
 - **Approval.** A skill file is written only with the bytes bd recorded for
   it, which `bd agents approve` recorded (or a pull adopted), and made

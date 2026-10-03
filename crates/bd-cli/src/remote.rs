@@ -51,14 +51,117 @@ use crate::stream::{Cut, FrameReader};
 const RETRY_BUDGET: Duration = Duration::from_secs(30);
 /// `bd prime` runs from session hooks, which must not stall: it retries this long.
 const PRIME_RETRY_BUDGET: Duration = Duration::from_secs(3);
-/// A long poll that bd serve held at least this long, then refused (busy,
-/// or shutting down), waited on a live server: its retries get a fresh
-/// retry time, up to [`FRESH_WINDOWS`] times in a row.
+/// A long poll that failed at least this long after it was sent (refused by
+/// bd serve as busy or shutting down, or cut off by a crash, a proxy or a
+/// timeout) waited on the server: its retries get a fresh retry time, up to
+/// [`FRESH_WINDOWS`] times.
 const HELD: Duration = Duration::from_secs(1);
 const FRESH_WINDOWS: u32 = 5;
+/// The pause before the first retry, doubling up to [`MAX_RETRY_DELAY`].
+const FIRST_RETRY_DELAY: Duration = Duration::from_millis(200);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(4);
 
 fn retry_budget() -> Duration {
     env("BD_REMOTE_RETRY_SECS").and_then(|s| s.parse().ok()).map_or(RETRY_BUDGET, Duration::from_secs)
+}
+
+/// When the failed attempts of one request are tried again
+/// ([`Remote::exec_as`]): for the retry time from when it was sent, or for a
+/// long poll from its first failure.
+struct Retries {
+    budget: Duration,
+    long_poll: bool,
+    /// When the retries end (a long poll's is set at its first failure).
+    until: Option<Instant>,
+    /// The pause before the next attempt, from `first_delay` doubling up to `max_delay`.
+    delay: Duration,
+    first_delay: Duration,
+    max_delay: Duration,
+    /// Fresh retry times a long poll got.
+    fresh: u32,
+    first_failure: Option<Instant>,
+    retried: bool,
+}
+
+impl Retries {
+    fn new(budget: Duration, long_poll: bool, now: Instant) -> Retries {
+        Retries {
+            budget,
+            long_poll,
+            until: (!long_poll).then(|| now + budget),
+            delay: FIRST_RETRY_DELAY,
+            first_delay: FIRST_RETRY_DELAY,
+            max_delay: MAX_RETRY_DELAY,
+            fresh: 0,
+            first_failure: None,
+            retried: false,
+        }
+    }
+
+    /// Attempts at least `pace` apart.
+    fn paced(mut self, pace: Duration) -> Retries {
+        (self.first_delay, self.max_delay) = (FIRST_RETRY_DELAY.max(pace), MAX_RETRY_DELAY.max(pace));
+        self.delay = self.first_delay;
+        self
+    }
+
+    /// An attempt failed at `now`: whether to try again, after [`Retries::delay`].
+    /// `held`: the server had it for [`HELD`] or more once it was sent.
+    /// `restart`: the first failure after which a write may have run.
+    fn failed(&mut self, now: Instant, held: bool, restart: bool) -> bool {
+        self.first_failure.get_or_insert(now);
+        let mut until = self.until.unwrap_or(now + self.budget);
+        // The first failure that may have run a write restarts the retry time: a gateway timeout
+        // arrives only once the proxy's own has passed (Cloudflare's 524 after 100 s), maybe past
+        // the retry time, and the write's stored answer must still be asked for.
+        if restart && !self.budget.is_zero() {
+            until = until.max(now + self.budget.max(self.delay));
+        }
+        // A long poll's retry may wait on the server too: when it failed after the server had
+        // held it, the time went to waiting, not to reaching the server, so the retries get the
+        // whole retry time again from this failure. Only a retry time that ends later counts.
+        // Refused connections never extend it: a server that is gone still ends the request.
+        if self.long_poll && held && self.fresh < FRESH_WINDOWS && now + self.budget > until {
+            self.fresh += 1;
+            until = now + self.budget;
+            self.delay = self.first_delay;
+        }
+        self.until = Some(until);
+        now + self.delay <= until
+    }
+
+    /// The pause is over: the next attempt starts.
+    fn retrying(&mut self) {
+        self.retried = true;
+        self.delay = (self.delay * 2).min(self.max_delay);
+    }
+
+    /// How the retries ended at `now`: for how long they went on since the first failure.
+    fn gave_up(&self, now: Instant) -> String {
+        match self.first_failure.filter(|_| self.retried) {
+            Some(first) => {
+                format!("gave up after retrying for {:.1}s", now.saturating_duration_since(first).as_secs_f64())
+            }
+            None => format!("not retried: the retry time of {}s had passed", self.budget.as_secs()),
+        }
+    }
+}
+
+/// A request body that notes when its last byte was handed to the
+/// connection: after connecting, the TLS handshake and the headers.
+struct Sending<'a> {
+    rest: &'a [u8],
+    sent: Option<Instant>,
+}
+
+impl std::io::Read for Sending<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = std::io::Read::read(&mut self.rest, buf)?;
+        if self.rest.is_empty() && self.sent.is_none() {
+            self.sent = Some(Instant::now());
+        }
+        Ok(n)
+    }
 }
 
 /// A workspace on a bd server.
@@ -560,6 +663,8 @@ struct Delivery {
     /// Output reached the user, so the request cannot be tried again.
     printed: bool,
     files: Vec<OutputFile>,
+    /// The issue frame of this attempt.
+    issue: Option<String>,
     /// The cursor frame of this attempt.
     cursor: Option<i64>,
     /// The server may hold the request a long time before answering (a long
@@ -593,6 +698,7 @@ impl Delivery {
             held: String::new(),
             printed: false,
             files,
+            issue: None,
             cursor: None,
             long_poll: false,
             screen: io::Escaper::default(),
@@ -609,6 +715,7 @@ impl Delivery {
     fn start(&mut self, whole: bool) {
         self.discard();
         self.held.clear();
+        self.issue = None;
         self.cursor = None;
         self.screen = io::Escaper::default();
         self.printing = !self.hold && !whole;
@@ -650,6 +757,7 @@ impl Delivery {
             stdout: std::mem::take(&mut self.held),
             stderr: exit.stderr,
             replayed: exit.replayed,
+            issue: self.issue.take(),
             cursor: self.cursor.take(),
             ..Default::default()
         })
@@ -772,6 +880,17 @@ fn print_events(remote: &Remote, r: ExecResponse) -> Result<std::result::Result<
     Ok(Ok(cursor))
 }
 
+/// Continue with the full id of the issue `--issue` named, as the server
+/// resolved it (its issue frame): like a local follower, which resolves it
+/// once, a remote one keeps following that issue, also once it is deleted
+/// (a partial id no longer resolves then) or a new issue makes a partial id
+/// ambiguous.
+fn pin_issue(a: &mut EventsArgs, r: &ExecResponse) {
+    if let (Some(issue), Some(id)) = (&mut a.issue, &r.issue) {
+        issue.clone_from(id);
+    }
+}
+
 /// `events --follow`: long polls. Each request waits on the server until an
 /// event matching the filters follows the cursor (or the server's wait
 /// ends), and its answer says where to continue, so every event is printed
@@ -779,13 +898,18 @@ fn print_events(remote: &Remote, r: ExecResponse) -> Result<std::result::Result<
 /// events arrive in batches: a request starts at most once per interval.
 fn follow_events(app: &App, remote: &Remote, a: &EventsArgs) -> Result<i32> {
     let interval = Duration::from_millis(a.interval_ms.max(200));
+    let mut a = a.clone();
     let mut cursor = match a.since {
         Some(since) => since,
         // First the most recent events, as the local command prints them.
-        None => match print_events(remote, remote.exec(&events_request(app, remote, a, None, a.limit, None))?)? {
-            Ok(cursor) => cursor,
-            Err(code) => return Ok(code),
-        },
+        None => {
+            let response = remote.exec(&events_request(app, remote, &a, None, a.limit, None))?;
+            pin_issue(&mut a, &response);
+            match print_events(remote, response)? {
+                Ok(cursor) => cursor,
+                Err(code) => return Ok(code),
+            }
+        }
     };
     let mut first = a.since.is_some();
     loop {
@@ -795,21 +919,27 @@ fn follow_events(app: &App, remote: &Remote, a: &EventsArgs) -> Result<i32> {
             _ => FOLLOW_BATCH,
         };
         let response =
-            remote.long_poll(&events_request(app, remote, a, Some(cursor), Some(limit), Some(FOLLOW_WAIT)))?;
+            remote.long_poll(&events_request(app, remote, &a, Some(cursor), Some(limit), Some(FOLLOW_WAIT)))?;
+        pin_issue(&mut a, &response);
         if response.exit_code == 6 && !first {
-            // Retention pruned past the cursor (the follower fell far behind): resume at the head.
-            let head = remote.event_head()?;
-            io::errln(format!(
-                "warning: events after #{cursor} were pruned before they were read; following from #{head}"
-            ));
-            cursor = head;
-            continue;
+            // Retention deleted events after the cursor before they were read (the follower fell far
+            // behind): the answer's cursor continues at the oldest event kept.
+            let resume = response.cursor.filter(|&c| c > cursor).ok_or_else(|| {
+                Error::Remote(format!("{}: the server sent no event cursor past the pruned events", remote.url))
+            })?;
+            let pruned = match resume - cursor {
+                1 => format!("event #{resume} was pruned before it was read"),
+                _ => format!("events #{} to #{resume} were pruned before they were read", cursor + 1),
+            };
+            io::errln(format!("warning: {pruned}; continuing after #{resume}"));
+            cursor = resume;
+        } else {
+            cursor = match print_events(remote, response)? {
+                Ok(next) => next,
+                Err(code) => return Ok(code),
+            };
+            first = false;
         }
-        cursor = match print_events(remote, response)? {
-            Ok(next) => next,
-            Err(code) => return Ok(code),
-        };
-        first = false;
         if let Some(rest) = interval.checked_sub(started.elapsed()) {
             std::thread::sleep(rest);
         }
@@ -821,12 +951,14 @@ fn follow_events(app: &App, remote: &Remote, a: &EventsArgs) -> Result<i32> {
 fn wait_for_events(app: &App, remote: &Remote, a: &EventsArgs, since: i64, wait: Duration) -> Result<i32> {
     let interval = Duration::from_millis(a.interval_ms.max(200));
     let started = Instant::now();
+    let mut a = a.clone();
     let mut cursor = since;
     loop {
         let round = Instant::now();
         let left = wait.saturating_sub(started.elapsed());
-        let request = events_request(app, remote, a, Some(cursor), a.limit, Some(left.min(FOLLOW_WAIT)));
+        let request = events_request(app, remote, &a, Some(cursor), a.limit, Some(left.min(FOLLOW_WAIT)));
         let response = remote.long_poll(&request)?;
+        pin_issue(&mut a, &response);
         let found = !response.stdout.is_empty();
         cursor = match print_events(remote, response)? {
             Ok(next) => next,
@@ -949,7 +1081,6 @@ impl Remote {
         let body = serde_json::to_vec(request)?;
         let endpoint = format!("{}/v{PROTOCOL}/exec", self.url);
         let authorization = format!("Bearer {token}");
-        let budget = self.retry;
         // A request made once the deadline has passed (a set wanted after the mutex wait) fails at once.
         if let Some((_, allowed)) = self.deadline.filter(|&(at, _)| Instant::now() >= at) {
             return Err(Error::Remote(format!(
@@ -958,9 +1089,7 @@ impl Remote {
                 allowed.as_secs_f64()
             )));
         }
-        let mut deadline = (!out.long_poll).then(|| Instant::now() + budget);
-        let mut delay = Duration::from_millis(200);
-        let mut fresh_windows = 0;
+        let mut retries = Retries::new(self.retry, out.long_poll, Instant::now());
         // Some attempt may have run the command on the server.
         let mut reached = false;
         let lost = |why: String| {
@@ -968,9 +1097,7 @@ impl Remote {
         };
         loop {
             let was_reached = reached;
-            let attempt = Instant::now();
-            // bd serve itself answered that it cannot run the command now (busy, or shutting down).
-            let mut refused = false;
+            let mut sending = Sending { rest: &body, sent: None };
             let mut post = agent.post(&endpoint);
             if let Some(left) = self.time_left() {
                 let whole = self.total_timeout.map_or(left, |t| t.min(left));
@@ -983,8 +1110,9 @@ impl Remote {
             let sent = post
                 .header("authorization", &authorization)
                 .header("accept", FRAMES_CONTENT_TYPE)
+                .header("content-length", body.len())
                 .content_type("application/json")
-                .send(&body[..]);
+                .send(ureq::SendBody::from_reader(&mut sending));
             let failure = match sent {
                 Ok(response) if response.status() == 200 => match self.receive(response, out)? {
                     Ok(done) => return Ok(done),
@@ -1019,10 +1147,7 @@ impl Remote {
                         (500, Ok(text)) if bd && out.write => {
                             return Err(lost(format!("HTTP 500{}", error_message(&text))));
                         }
-                        (429 | 503, Ok(text)) if !may_have_run => {
-                            refused = bd && status == 503;
-                            format!("HTTP {status}{}", error_message(&text))
-                        }
+                        (429 | 503, Ok(text)) if !may_have_run => format!("HTTP {status}{}", error_message(&text)),
                         (_, Ok(text)) if may_have_run && !bd => {
                             reached = true;
                             format!("HTTP {status}{}", error_message(&text))
@@ -1042,6 +1167,9 @@ impl Remote {
                     }
                 }
                 Err(e) if retryable(&e) => {
+                    if before_sending(&e) {
+                        sending.sent = None;
+                    }
                     reached |= !before_sending(&e);
                     e.to_string()
                 }
@@ -1054,31 +1182,17 @@ impl Remote {
                     return Err(Error::Remote(format!("{}: {e}", self.url)));
                 }
             };
-            // The first failure that may have run a write restarts the retry time: a gateway timeout
-            // arrives only once the proxy's own has passed (Cloudflare's 524 after 100 s), maybe past
-            // the retry time, and the write's stored answer must still be asked for.
             let now = Instant::now();
-            let mut until = deadline.unwrap_or(now + budget);
-            if reached && !was_reached && out.write && !budget.is_zero() {
-                until = until.max(now + budget.max(delay));
-            }
-            // A long poll's retry may wait on the server too: when bd serve held it and then
-            // refused it, the server is up, and the time went to waiting, not to reaching it.
-            // Refused connections and timeouts never extend the retry time: a server that is
-            // gone still ends the request after one.
-            if out.long_poll && refused && now - attempt >= HELD && fresh_windows < FRESH_WINDOWS {
-                fresh_windows += 1;
-                until = until.max(now + budget);
-                delay = Duration::from_millis(200);
-            }
-            deadline = Some(until);
-            let past_deadline = self.deadline.filter(|&(at, _)| now + delay > at);
-            if now + delay > until || past_deadline.is_some() {
+            // Timed from when the request was sent, not from connecting: a slow TLS handshake is not held.
+            let held = sending.sent.is_some_and(|at| now.saturating_duration_since(at) >= HELD);
+            let again = retries.failed(now, held, reached && !was_reached && out.write);
+            let past_deadline = self.deadline.filter(|&(at, _)| now + retries.delay > at);
+            if !again || past_deadline.is_some() {
                 let failure = match past_deadline {
                     Some((_, allowed)) => {
                         format!("{failure} (no answer within the {:.1}s allowed)", allowed.as_secs_f64())
                     }
-                    None => format!("{failure} (gave up after retrying for {}s)", budget.as_secs()),
+                    None => format!("{failure} ({})", retries.gave_up(now)),
                 };
                 if reached && out.write {
                     return Err(lost(failure));
@@ -1086,8 +1200,8 @@ impl Remote {
                 return Err(Error::Remote(format!("{}: {failure}", self.url)));
             }
             tracing::debug!(target: "bd::remote", url = %self.url, %failure, "retrying");
-            std::thread::sleep(delay);
-            delay = (delay * 2).min(Duration::from_secs(4));
+            std::thread::sleep(retries.delay);
+            retries.retrying();
         }
     }
 
@@ -1111,6 +1225,7 @@ impl Remote {
             match frames.next() {
                 Ok(Some(Frame::Stdout(text))) => out.stdout(&text)?,
                 Ok(Some(Frame::File { path, data })) => out.file(&path, &data)?,
+                Ok(Some(Frame::Issue(id))) => out.issue = Some(id.into_owned()),
                 Ok(Some(Frame::Cursor(seq))) => out.cursor = Some(seq),
                 Ok(Some(Frame::Exit(exit))) => return out.exit(exit).map(Ok),
                 Ok(None) => return Ok(Err(Cut::Broken("the answer ended before the command did".into()))),
@@ -1200,13 +1315,12 @@ impl Remote {
         let endpoint = format!("{server}/v{PROTOCOL}/auth/{path}");
         let agent = self.agent()?;
         let body = serde_json::to_vec(body)?;
-        let deadline = Instant::now() + self.retry;
+        let mut retries = Retries::new(self.retry, false, Instant::now()).paced(pace);
         let hard = limit.map(|l| Instant::now() + l);
         let left = || {
             let to_hard = hard.map(|h| h.saturating_duration_since(Instant::now()));
             [self.time_left(), to_hard].into_iter().flatten().min()
         };
-        let mut delay = pace.max(Duration::from_millis(200));
         loop {
             let mut post = agent.post(&endpoint);
             if let Some(left) = left() {
@@ -1243,16 +1357,15 @@ impl Remote {
                 Err(e) if retryable(&e) => e.to_string(),
                 Err(e) => return Err(Error::Remote(format!("{server}: {e}{}", certificate_advice(&e.to_string())))),
             };
-            let past_deadline = left().is_some_and(|left| delay > left);
-            if Instant::now() + delay > deadline || past_deadline {
-                return Err(Error::Remote(format!(
-                    "{server}: {failure} (gave up after retrying for {}s)",
-                    self.retry.as_secs()
-                )));
+            let now = Instant::now();
+            let again = retries.failed(now, false, false);
+            if !again || left().is_some_and(|left| retries.delay > left) {
+                let why = if again { "no answer within the time allowed".to_string() } else { retries.gave_up(now) };
+                return Err(Error::Remote(format!("{server}: {failure} ({why})")));
             }
             tracing::debug!(target: "bd::remote", %server, %failure, "retrying");
-            std::thread::sleep(delay);
-            delay = (delay * 2).min(Duration::from_secs(4).max(pace));
+            std::thread::sleep(retries.delay);
+            retries.retrying();
         }
     }
 
@@ -2223,5 +2336,113 @@ mod tests {
         assert!(certificate_advice(ca).contains("CA:FALSE"));
         assert!(certificate_advice("io: invalid peer certificate: UnknownIssuer").contains("BD_CA_CERT"));
         assert_eq!(certificate_advice("io: Connection refused"), "");
+    }
+
+    /// Attempts of a request with `retries`, from `start`: each fails `took`
+    /// after it starts, held by the server if `held`. Returns when each
+    /// failed, and when the retries gave up.
+    fn attempts(retries: &mut Retries, start: Instant, mut each: impl FnMut(usize) -> (f64, bool)) -> Vec<Instant> {
+        let mut failed = Vec::new();
+        let mut at = start;
+        loop {
+            let (took, held) = each(failed.len());
+            let now = at + Duration::from_secs_f64(took);
+            failed.push(now);
+            if !retries.failed(now, held, false) {
+                return failed;
+            }
+            at = now + retries.delay;
+            retries.retrying();
+            assert!(failed.len() < 1000, "the retries never end");
+        }
+    }
+
+    fn secs(from: Instant, to: Instant) -> f64 {
+        (to - from).as_secs_f64()
+    }
+
+    #[test]
+    fn long_polls_are_retried_for_the_retry_time_from_their_first_failure() {
+        let start = Instant::now();
+        // A long wait, then refused connections while the server restarts.
+        let mut r = Retries::new(Duration::from_secs(30), true, start);
+        let failed = attempts(&mut r, start, |n| if n == 0 { (60.0, true) } else { (0.01, false) });
+        let (first, last) = (failed[0], *failed.last().unwrap());
+        assert!(failed.len() > 2, "retried: {}", failed.len());
+        assert!(secs(first, last) <= 30.0 && secs(first, last) > 25.0, "{}", secs(first, last));
+        assert_eq!(r.fresh, 0, "the first failure starts the retry time; it is not a fresh one");
+        assert_eq!(r.gave_up(last), format!("gave up after retrying for {:.1}s", secs(first, last)));
+
+        // Any other request: from when it was sent, whatever the server held.
+        let mut r = Retries::new(Duration::from_secs(30), false, start);
+        let failed = attempts(&mut r, start, |n| if n == 0 { (20.0, true) } else { (2.0, true) });
+        assert!(secs(start, *failed.last().unwrap()) - 2.0 <= 30.0, "the last attempt started in time");
+        assert_eq!(r.fresh, 0);
+
+        // One that failed after its retry time is not retried, and says so.
+        let mut r = Retries::new(Duration::from_secs(30), false, start);
+        assert_eq!(attempts(&mut r, start, |_| (120.0, true)).len(), 1);
+        assert_eq!(r.gave_up(start + Duration::from_secs(120)), "not retried: the retry time of 30s had passed");
+        let mut r = Retries::new(Duration::ZERO, true, start);
+        assert_eq!(attempts(&mut r, start, |_| (10.0, true)).len(), 1, "a retry time of 0: one attempt");
+    }
+
+    #[test]
+    fn long_polls_held_and_cut_get_a_fresh_retry_time_up_to_five_times() {
+        let start = Instant::now();
+        // A restart's 503 after a wait; refused connections; then the retry waits, and is cut off
+        // past the first retry time (a crash, a proxy's 502, a timeout): a fresh one.
+        let mut r = Retries::new(Duration::from_secs(30), true, start);
+        let failed = attempts(&mut r, start, |n| match n {
+            0 => (25.0, true),
+            1..=4 => (0.01, false),
+            5 => (25.0, true),
+            _ => (0.01, false),
+        });
+        assert_eq!(r.fresh, 1);
+        let fresh = failed[5];
+        assert!(secs(failed[0], fresh) > 30.0, "past the first retry time: {}", secs(failed[0], fresh));
+        assert!(secs(fresh, *failed.last().unwrap()) > 25.0, "a whole retry time from the cut");
+
+        // A server that holds every attempt and refuses it: each later failure ends the retry
+        // time later, which counts, until 5 fresh ones; then the last retry time runs out.
+        let mut r = Retries::new(Duration::from_secs(2), true, start);
+        let failed = attempts(&mut r, start, |_| (1.2, true));
+        assert_eq!(r.fresh, FRESH_WINDOWS);
+        assert_eq!(failed.len(), 8, "the first failure, 5 fresh retry times, and the rest of the last one");
+        let (first, last) = (failed[0], *failed.last().unwrap());
+        assert_eq!(r.gave_up(last), format!("gave up after retrying for {:.1}s", secs(first, last)));
+
+        // Quick failures never extend it.
+        let mut r = Retries::new(Duration::from_secs(2), true, start);
+        let failed = attempts(&mut r, start, |n| if n == 0 { (1.2, true) } else { (0.5, false) });
+        assert_eq!(r.fresh, 0);
+        assert!(secs(failed[0], *failed.last().unwrap()) <= 2.0);
+    }
+
+    #[test]
+    fn writes_get_the_retry_time_again_once_they_may_have_run() {
+        let start = Instant::now();
+        let mut r = Retries::new(Duration::from_secs(30), false, start);
+        // A gateway timeout after 100 s: the write may have run, and its answer is asked for.
+        assert!(r.failed(start + Duration::from_secs(100), true, true));
+        r.retrying();
+        assert!(r.failed(start + Duration::from_secs(125), false, false));
+        assert!(!r.failed(start + Duration::from_secs(131), false, false));
+        assert_eq!(r.fresh, 0, "only long polls get fresh retry times");
+        assert_eq!(r.gave_up(start + Duration::from_secs(131)), "gave up after retrying for 31.0s");
+    }
+
+    #[test]
+    fn request_bodies_note_when_they_were_sent() {
+        let body = b"0123456789";
+        let mut sending = Sending { rest: body, sent: None };
+        let mut buf = [0u8; 4];
+        assert_eq!(std::io::Read::read(&mut sending, &mut buf).unwrap(), 4);
+        assert!(sending.sent.is_none(), "not all of it yet");
+        let mut rest = Vec::new();
+        std::io::Read::read_to_end(&mut sending, &mut rest).unwrap();
+        assert_eq!(rest, b"456789");
+        assert!(sending.sent.is_some());
     }
 }

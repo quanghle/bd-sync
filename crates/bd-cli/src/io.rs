@@ -31,6 +31,8 @@ pub trait Sink {
     fn file(&mut self, path: &str, data: &[u8]) -> std::io::Result<()>;
     /// Where an event listing ends (see [`cursor`]); the last one counts.
     fn cursor(&mut self, _seq: i64) {}
+    /// The issue an event listing follows (see [`issue`]).
+    fn issue(&mut self, _id: &str) {}
 }
 
 /// A sink shared with the code that installed it, which reads it afterwards.
@@ -45,6 +47,10 @@ impl<S: Sink + ?Sized> Sink for Rc<RefCell<S>> {
 
     fn cursor(&mut self, seq: i64) {
         self.borrow_mut().cursor(seq)
+    }
+
+    fn issue(&mut self, id: &str) {
+        self.borrow_mut().issue(id)
     }
 }
 
@@ -377,6 +383,12 @@ pub fn errln(line: impl AsRef<str>) {
 /// `--since` value that continues after it. Locally it is not printed.
 pub fn cursor(seq: i64) {
     with_capture(|c| c.sink.cursor(seq));
+}
+
+/// Tell a remote client the full id of the issue an event listing's
+/// `--issue` names, to continue with. Locally it is not printed.
+pub fn issue(id: &str) {
+    with_capture(|c| c.sink.issue(id));
 }
 
 fn keep_stderr(stderr: &mut Vec<u8>, line: &str) {

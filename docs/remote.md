@@ -558,12 +558,16 @@ part of an output file, and last `{"exit": {"exit_code", "stderr", "replayed"}}`
 Blank lines are keep-alives, and an answer without the exit frame was cut
 off. An event listing (`events`) also sends `{"cursor": N}` before its exit
 frame: the `--since` value that continues after it, past the events its
-filters skipped. `["events", "--since", "N", "--wait", "25s", "--json"]` is a
-long poll: answered as soon as an event matching its filters follows `N`, or
-with no events (and the cursor) when the wait ends. Failures before the
-command runs return a non-200 status with the `--json` error shape. Every
-answer carries a `bd-protocol: 2` header, which tells bd serve's own answers
-(a 503 before the command ran, say) apart from a proxy's.
+filters skipped; when retention deleted events after its `--since` (exit 6),
+the one that continues at the oldest event kept. With `--issue`, it first
+sends `{"issue": "ID"}`: the issue's full id to continue with, as a partial
+id no longer resolves once the issue is deleted.
+`["events", "--since", "N", "--wait", "25s", "--json"]` is a long poll:
+answered as soon as an event matching its filters follows `N`, or with no
+events (and the cursor) when the wait ends. Failures before the command runs
+return a non-200 status with the `--json` error shape. Every answer carries
+a `bd-protocol: 2` header, which tells bd serve's own answers (a 503 before
+the command ran, say) apart from a proxy's.
 
 Printed output never drives a terminal: control characters (except line
 ends and tabs) and bidirectional formatting characters in titles,
@@ -583,14 +587,20 @@ and an idle follower costs one request per `--max-wait` (25 s by default)
 instead of one per poll interval. Each answer says where the next request
 continues, so a follower prints every event once and in order, even when an
 answer is lost and asked for again: a request that waited is retried for the
-whole retry time (`BD_REMOTE_RETRY_SECS`, default 30 s) from its failure,
-however long it had waited, and a retry that the server held and then
-refused (busy, or shutting down) gets the whole retry time again, up to 5
-times in a row, so a follower rides out server restarts. A follower that
-falls so far behind that retention deleted events it had not read says so on
-stderr and continues from the newest event. Under load, a follower asks at
-most once per `--interval-ms` (default 500), so events arrive in batches; a
-`--wait` longer than the server's `--max-wait` takes several requests.
+whole retry time (`BD_REMOTE_RETRY_SECS`, default 30 s) from its first
+failure, however long it had waited, and a retry that failed a second or
+more after it was sent (the server held it, then refused it as busy or
+shutting down, or it was cut off by a crash, a proxy or a timeout) gets the
+whole retry time again from that failure, up to 5 times, so a follower rides
+out server restarts. Refused connections never extend it: a server that
+stays down ends the follower after one retry time (exit 8). A follower of
+`--issue` keeps the issue's full id from the server's first answer, so it
+keeps following an issue it named by a partial id once that issue is
+deleted, as a local follower does. A follower that falls so far behind that
+retention deleted events it had not read says so on stderr and continues at
+the oldest event kept. Under load, a follower asks at most once per
+`--interval-ms` (default 500), so events arrive in batches; a `--wait`
+longer than the server's `--max-wait` takes several requests.
 
 A waiting request holds no command slot, database connection, transaction or
 memory budget on the server, only its connection and its small request (one

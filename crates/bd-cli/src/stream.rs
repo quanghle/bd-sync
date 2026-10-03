@@ -337,6 +337,8 @@ pub struct FrameWriter {
     finished: bool,
     bytes: u64,
     held: Option<Held>,
+    /// The issue frame of an event listing, sent before its cursor frame.
+    issue: Option<String>,
     /// The cursor frame of an event listing, sent before the exit frame.
     cursor: Option<i64>,
 }
@@ -420,6 +422,7 @@ impl FrameWriter {
             finished: false,
             bytes: 0,
             held: None,
+            issue: None,
             cursor: None,
         }
     }
@@ -445,6 +448,7 @@ impl FrameWriter {
     /// a held answer, all of a bounded size.
     pub fn respond(&mut self, r: &ExecResponse) -> Sent {
         self.whole = true;
+        self.issue.clone_from(&r.issue);
         self.cursor = r.cursor;
         let _ = self.write(None, r.stdout.as_bytes());
         for (path, data) in &r.files {
@@ -461,6 +465,7 @@ impl FrameWriter {
                 exit_code: exit.exit_code,
                 stderr: exit.stderr,
                 replayed: exit.replayed,
+                issue: self.issue.take(),
                 cursor: self.cursor,
                 ..Default::default()
             };
@@ -477,8 +482,9 @@ impl FrameWriter {
         if !self.finished {
             self.finished = true;
             let sent = self.frame(true).and_then(|()| {
+                let issue = self.issue.take().map(|id| Frame::Issue(id.into()));
                 let cursor = self.cursor.map(Frame::Cursor);
-                for frame in cursor.iter().chain([&Frame::Exit(exit)]) {
+                for frame in issue.iter().chain(&cursor).chain([&Frame::Exit(exit)]) {
                     serde_json::to_writer(&mut self.frames, frame).map_err(io::Error::other)?;
                     self.frames.push(b'\n');
                 }
@@ -639,6 +645,10 @@ impl Sink for FrameWriter {
     fn cursor(&mut self, seq: i64) {
         self.cursor = Some(seq);
     }
+
+    fn issue(&mut self, id: &str) {
+        self.issue = Some(id.to_string());
+    }
 }
 
 impl Drop for FrameWriter {
@@ -754,6 +764,7 @@ mod tests {
             match serde_json::from_slice::<Frame<'static>>(line).unwrap() {
                 Frame::Stdout(text) => r.stdout.push_str(&text),
                 Frame::File { path, data } => r.files.entry(path.into_owned()).or_default().push_str(&data),
+                Frame::Issue(id) => r.issue = Some(id.into_owned()),
                 Frame::Cursor(seq) => r.cursor = Some(seq),
                 Frame::Exit(exit) => {
                     (r.exit_code, r.stderr, r.replayed) = (exit.exit_code, exit.stderr, exit.replayed);
@@ -818,6 +829,19 @@ mod tests {
         w.finish(Exit::default());
         let bytes = runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap();
         assert!(!String::from_utf8_lossy(&bytes).contains("cursor"));
+
+        // With --issue, the issue's full id comes first.
+        let (mut w, answered) = writer(Limits::SERVE);
+        w.issue("t-1");
+        w.cursor(4);
+        w.finish(Exit { exit_code: 6, ..Default::default() });
+        let text = String::from_utf8(runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap()).unwrap();
+        assert_eq!(text.lines().take(2).collect::<Vec<_>>(), ["{\"issue\":\"t-1\"}", "{\"cursor\":4}"], "{text}");
+        let r = gather(text.as_bytes());
+        assert_eq!((r.issue.as_deref(), r.cursor, r.exit_code), (Some("t-1"), Some(4), 6));
+        let (mut w, answered) = writer(Limits::SERVE);
+        w.respond(&r);
+        assert_eq!(gather(&runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap()), r, "and replays");
     }
 
     #[test]
@@ -964,6 +988,7 @@ mod tests {
             .map(|l| match serde_json::from_slice::<Frame<'static>>(l).unwrap() {
                 Frame::Stdout(_) => "stdout",
                 Frame::File { .. } => "file",
+                Frame::Issue(_) => "issue",
                 Frame::Cursor(_) => "cursor",
                 Frame::Exit(_) => "exit",
             })

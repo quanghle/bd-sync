@@ -236,8 +236,9 @@ fn same_file(reported: &Value, expected: &Path) -> bool {
 }
 
 /// One raw exec request: the error body, or the answer's frames gathered into
-/// `{"exit_code", "stdout", "stderr", "replayed", "files"}`. Like the client,
-/// it waits out 409 "pending": an earlier attempt of the request still running.
+/// `{"exit_code", "stdout", "stderr", "replayed", "files", "cursor", "issue"}`.
+/// Like the client, it waits out 409 "pending": an earlier attempt of the
+/// request still running.
 fn post(url: &str, token: &str, body: &Value) -> (u16, Value) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -268,7 +269,8 @@ fn post_once(url: &str, token: &str, body: &Value) -> (u16, Value) {
 
 /// The frames of an answer, gathered into one object.
 fn gather(frames: &str) -> Value {
-    let (mut stdout, mut files, mut exit, mut cursor) = (String::new(), serde_json::Map::new(), None, None);
+    let (mut stdout, mut files, mut exit, mut cursor, mut issue) =
+        (String::new(), serde_json::Map::new(), None, None, None);
     for line in frames.lines().filter(|l| !l.trim().is_empty()) {
         assert!(exit.is_none(), "the exit frame comes last: {line}");
         let frame: Value = serde_json::from_str(line).unwrap();
@@ -280,6 +282,9 @@ fn gather(frames: &str) -> Value {
         } else if let Some(seq) = frame.get("cursor") {
             assert!(cursor.is_none(), "one cursor frame: {frames}");
             cursor = Some(seq.as_i64().unwrap());
+        } else if let Some(id) = frame.get("issue") {
+            assert!(issue.is_none() && cursor.is_none(), "one issue frame, before the cursor frame: {frames}");
+            issue = Some(id.as_str().unwrap().to_string());
         } else {
             exit = Some(frame.get("exit").unwrap_or_else(|| panic!("unknown frame {line}")).clone());
         }
@@ -292,6 +297,7 @@ fn gather(frames: &str) -> Value {
         "replayed": exit["replayed"],
         "files": files,
         "cursor": cursor,
+        "issue": issue,
     })
 }
 
@@ -1407,9 +1413,11 @@ fn remote_followers_print_what_local_followers_print() {
     alice.ok(&["create", "First"]);
     alice.ok(&["create", "Second"]);
     // Each case, and a line its last event prints.
-    let cases: [(&[&str], &[&str]); 3] = [
+    let cases: [(&[&str], &[&str]); 4] = [
         (&["--json", "events", "--follow", "--op", "created,closed"], &["\"op\":\"created\"", "\"issue_id\":\"t-3\""]),
         (&["events", "--follow", "--issue", "t-1"], &[" deleted t-1"]),
+        // A partial id, which no longer resolves once the issue is deleted.
+        (&["events", "--follow", "--issue", "1"], &[" deleted t-1"]),
         (&["--json", "events", "--follow", "--since", "0", "--limit", "2", "--by", "alice"], &["\"op\":\"deleted\""]),
     ];
     let mut followers: Vec<(Follower, Follower)> = cases
@@ -1433,9 +1441,100 @@ fn remote_followers_print_what_local_followers_print() {
         assert!(remote.seen.len() > 1, "{args:?}: {:?}", remote.seen);
         assert_eq!(remote.seen, local.seen, "{args:?}");
     }
-    // A deleted issue's follower keeps following it.
+    // A deleted issue's followers keep following it.
     std::thread::sleep(Duration::from_millis(700));
     assert!(followers[1].0.running(), "the remote follower of t-1 is still running");
+    assert!(followers[2].0.running(), "and so is the one that named it by a partial id");
+}
+
+/// The values of `flag` in the argv of each request a [`FakeServer`] received.
+fn flag_values(server: &FakeServer, flag: &str) -> Vec<String> {
+    let bodies = server.bodies.lock().unwrap();
+    bodies
+        .iter()
+        .map(|body| {
+            let argv: Vec<String> =
+                serde_json::from_value(serde_json::from_str::<Value>(body).unwrap()["argv"].clone()).unwrap();
+            let at = argv.iter().position(|a| a == flag).unwrap_or_else(|| panic!("no {flag} in {argv:?}"));
+            argv[at + 1].clone()
+        })
+        .collect()
+}
+
+#[test]
+fn followers_continue_with_the_full_id_a_partial_issue_id_resolved_to() {
+    // The server names the issue `--issue 1` resolved to: later requests name it too.
+    let with_issue = |seq: i64| {
+        let event = stdout_frame(&format!("{}\n", event_line(seq, "t-1")));
+        answer(&[event, json!({ "issue": "t-1" }).to_string(), cursor_frame(seq), exit_frame(0, "")], false, 0)
+    };
+    let server = FakeServer::start(move |n| match n {
+        0 | 1 => with_issue(n as i64 + 1),
+        _ => {
+            std::thread::sleep(Duration::from_secs(120));
+            Vec::new()
+        }
+    });
+    let client = server.client();
+    let mut cmd = client.cmd(&["--json", "events", "--follow", "--issue", "1", "--interval-ms", "200"]);
+    let mut follower = Follower::start(&mut cmd);
+    follower.wait_for(&["\"seq\":2"]);
+    eventually("the third request", || server.requests.load(Ordering::SeqCst) >= 3);
+    assert_eq!(flag_values(&server, "--issue"), ["1", "t-1", "t-1"]);
+    assert_eq!(follower.seen, [event_line(1, "t-1"), event_line(2, "t-1")]);
+}
+
+#[test]
+fn followers_of_a_deleted_issue_never_move_to_issues_its_id_is_a_prefix_of() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    for i in 1..=12 {
+        alice.ok(&["create", &format!("Task {i}")]);
+    }
+    alice.ok(&["create", "Child of t-2", "--parent", "t-2"]);
+    // Once deleted, t-1 is a prefix of t-10 to t-12 (ambiguous), and t-2 of t-2.1 alone.
+    let mut followers: Vec<(&str, Follower, Follower)> = [("1", "t-1"), ("2", "t-2")]
+        .into_iter()
+        .map(|(partial, id)| {
+            let args = ["--json", "events", "--follow", "--issue", partial, "--interval-ms", "200"];
+            let mut local = server.local_cmd("someone", &args);
+            let (remote, local) = (Follower::start(&mut alice.cmd(&args)), Follower::start(&mut local));
+            (id, remote, local)
+        })
+        .collect();
+    for (id, remote, local) in &mut followers {
+        remote.wait_for(&["\"op\":\"created\"", &format!("\"issue_id\":\"{id}\"")]);
+        local.wait_for(&["\"op\":\"created\"", &format!("\"issue_id\":\"{id}\"")]);
+    }
+    alice.ok(&["delete", "t-1"]);
+    alice.ok(&["delete", "--force", "t-2"]);
+    for issue in ["t-10", "t-2.1"] {
+        alice.ok(&["update", issue, "--title", "Renamed"]);
+    }
+    for (id, remote, local) in &mut followers {
+        let deleted = format!("\"issue_id\":\"{id}\"");
+        remote.wait_for(&["\"op\":\"deleted\"", &deleted]);
+        local.wait_for(&["\"op\":\"deleted\"", &deleted]);
+        assert_eq!(remote.seen, local.seen, "{id}");
+        let issues: Vec<Value> =
+            remote.seen.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()["issue_id"].clone()).collect();
+        assert!(issues.iter().all(|i| i == id), "only {id}'s events: {:?}", remote.seen);
+    }
+    std::thread::sleep(Duration::from_millis(700));
+    for (id, remote, _) in &mut followers {
+        assert!(remote.running(), "the follower of {id} still runs");
+        let more: Vec<String> = remote.lines.try_iter().collect();
+        assert!(more.is_empty(), "nothing of another issue: {more:?}");
+    }
+
+    // A listing of a deleted issue's events is of that issue too, remote or local.
+    for (id, other) in [("t-1", "t-10"), ("t-2", "t-2.1")] {
+        let listings = [alice.ok(&["events", "--issue", id]), check(server.local("x", &["events", "--issue", id]), id)];
+        for listing in listings {
+            assert!(listing.contains(&format!(" deleted {id}")), "{listing}");
+            assert!(!listing.contains(&format!(" {other}")), "{listing}");
+        }
+    }
 }
 
 #[test]
@@ -1462,7 +1561,7 @@ fn followers_resume_after_dropped_connections_without_gaps_or_duplicates() {
 
 #[cfg(unix)]
 #[test]
-fn followers_that_fall_behind_retention_resume_at_the_head() {
+fn followers_that_fall_behind_retention_resume_at_the_oldest_event_kept() {
     let (server, log) = logged_server(Server::prepare(), &[]);
     let alice = server.client(&server.token("alice-laptop", "alice", &[]));
     let admin = server.client(&server.token("admin", "root", &["--role", "admin"]));
@@ -1486,10 +1585,38 @@ fn followers_that_fall_behind_retention_resume_at_the_head() {
     }
     admin.ok(&["events", "prune", "--keep", "1"]);
     check(Command::new("kill").args(["-CONT", &pid]).output().unwrap(), "kill -CONT");
-    eventually("the follower's warning", || std::fs::read_to_string(&errors).unwrap().contains("were pruned"));
+    eventually("the follower's warning", || std::fs::read_to_string(&errors).unwrap().contains("pruned before"));
+    // It continues at the oldest event kept, t-4's.
+    follower.wait_for(&["\"op\":\"created\"", "\"issue_id\":\"t-4\""]);
     alice.ok(&["create", "Five"]);
     follower.wait_for(&["\"op\":\"created\"", "\"issue_id\":\"t-5\""]);
     assert!(!follower.seen.iter().any(|l| l.contains("\"issue_id\":\"t-3\"")), "{:?}", follower.seen);
+    assert!(follower.running());
+}
+
+#[test]
+fn followers_behind_retention_continue_where_the_server_says() {
+    // Events 2 to 5 were deleted before the follower read them: the answer's cursor continues at 6.
+    let truncated =
+        answer(&[cursor_frame(5), exit_frame(6, "error: event cursor 1 is behind retained history\n")], false, 0);
+    let server = FakeServer::start(move |n| match n {
+        0 => event_answer(1, "t-1"),
+        1 => truncated.clone(),
+        2 => event_answer(6, "t-4"),
+        _ => {
+            std::thread::sleep(Duration::from_secs(120));
+            Vec::new()
+        }
+    });
+    let client = server.client();
+    let errors = client.dir.path().join("follower.err");
+    let mut cmd = client.cmd(&["--json", "events", "--follow", "--since", "0", "--interval-ms", "200"]);
+    let mut follower = Follower::start(cmd.stderr(std::fs::File::create(&errors).unwrap()));
+    follower.wait_for(&["\"seq\":6"]);
+    assert_eq!(follower.seen, [event_line(1, "t-1"), event_line(6, "t-4")]);
+    assert_eq!(flag_values(&server, "--since")[..3], ["0", "1", "5"]);
+    let warning = std::fs::read_to_string(&errors).unwrap();
+    assert_eq!(warning, "warning: events #2 to #5 were pruned before they were read; continuing after #5\n");
     assert!(follower.running());
 }
 
@@ -1559,6 +1686,16 @@ fn event_listings_end_with_their_cursor() {
     let seqs: Vec<i64> =
         follower.seen.iter().map(|l| serde_json::from_str::<Value>(l).unwrap()["seq"].as_i64().unwrap()).collect();
     assert_eq!(seqs, (1..=events_head(&alice).parse().unwrap()).collect::<Vec<_>>(), "each event once, in order");
+
+    // With --issue, the issue's full id comes first, also for a partial one.
+    let (_, answer) = post(&server.url(), &secret, &json!({ "argv": ["events", "--issue", "1", "--since", "0"] }));
+    assert_eq!((&answer["exit_code"], &answer["issue"]), (&json!(0), &json!("t-1")), "{answer}");
+    assert!(other["issue"].is_null(), "{other}");
+    // A cursor that retention passed: the one that continues at the oldest event kept.
+    let admin = server.client(&server.token("admin", "root", &["--role", "admin"]));
+    admin.ok(&["events", "prune", "--before", "3"]);
+    let (_, answer) = post(&server.url(), &secret, &json!({ "argv": ["events", "--since", "1"] }));
+    assert_eq!((&answer["exit_code"], &answer["cursor"]), (&json!(6), &json!(2)), "{answer}");
 }
 
 #[test]
@@ -1838,6 +1975,32 @@ fn retries_that_wait_get_a_fresh_retry_time_but_not_forever() {
         "after 5 fresh retry times: {}",
         stuck.requests.load(Ordering::SeqCst)
     );
+}
+
+#[test]
+fn retries_cut_off_after_a_wait_get_a_fresh_retry_time_too() {
+    // Each retry waits on the server, past the retry time of the failure before it, and is cut
+    // off: by a crash (the connection closes without an answer), then a proxy's gateway timeout.
+    let held = |answer: Vec<u8>| {
+        std::thread::sleep(Duration::from_secs(2));
+        answer
+    };
+    let server = FakeServer::start(move |n| match n {
+        0 => event_answer(1, "t-1"),
+        1 | 3 => held(Vec::new()),
+        2 => held(status_answer("504 Gateway Timeout", false, "upstream request timeout")),
+        4 => event_answer(2, "t-2"),
+        _ => {
+            std::thread::sleep(Duration::from_secs(120));
+            Vec::new()
+        }
+    });
+    let client = server.client();
+    let mut cmd = client.cmd(&["--json", "events", "--follow", "--since", "0", "--interval-ms", "200"]);
+    let mut follower = Follower::start(cmd.env("BD_REMOTE_RETRY_SECS", "1").stderr(Stdio::null()));
+    follower.wait_for(&["\"issue_id\":\"t-2\""]);
+    assert_eq!(follower.seen, [event_line(1, "t-1"), event_line(2, "t-2")], "each event once, in order");
+    assert!(follower.running());
 }
 
 /// A private CA and a certificate it signed for 127.0.0.1: the CA, certificate and key PEM files in `dir`.

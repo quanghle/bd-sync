@@ -951,6 +951,9 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
         return Ok(());
     }
     let mut q = app.read(|r| event_query(r, a))?;
+    if let Some(id) = &q.issue_id {
+        io::issue(id);
+    }
     if a.follow {
         // Remote clients follow with `--wait` requests instead, which bd
         // serve answers without holding a command slot while they wait.
@@ -989,6 +992,11 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
     });
     let head = match read {
         _ if closed => return Ok(()),
+        Err(e @ Error::EventsTruncated { floor, .. }) => {
+            // A follower that fell behind continues at the oldest event kept.
+            io::cursor(floor - 1);
+            return Err(e);
+        }
         read => read?.0,
     };
     let mut cursor = last.unwrap_or(head.max(q.since.unwrap_or(0)));
@@ -1014,13 +1022,15 @@ pub fn cmd_events(app: &mut App, a: &EventsArgs) -> Result<()> {
 
 /// The query `bd events` runs for `a`: its cursor, limit and filters, with
 /// `--issue` resolved. A deleted issue keeps its events, as for `bd history`,
-/// so a follower of it sees its deletion and is not cut off by it.
+/// so a follower of it sees its deletion and is not cut off by it: its id,
+/// which stored events name, comes before the issues it is a prefix of (`t-1`
+/// of `t-10`, `bd-a1b2` of `bd-a1b2.1`), as an existing issue's id does.
 pub fn event_query(r: &bd_core::ReadCtx<'_>, a: &EventsArgs) -> Result<EventQuery> {
     let issue_id = match &a.issue {
         Some(raw) => Some(match r.resolve_id(raw) {
-            Ok(id) => id,
-            Err(Error::NotFound { .. }) if has_events(r, raw.trim())? => raw.trim().to_string(),
-            Err(e) => return Err(e),
+            Ok(id) if id == raw.trim() => id,
+            _ if has_events(r, raw.trim())? => raw.trim().to_string(),
+            resolved => resolved?,
         }),
         None => None,
     };

@@ -18,7 +18,11 @@
 //! while it runs, so neither side holds a whole export in memory. An event
 //! listing (`events`) also carries a cursor frame, `{"cursor":1234}`, before
 //! its exit frame: the `--since` value that continues after it, past events
-//! its filters skipped.
+//! its filters skipped; when retention deleted events after its `--since`
+//! (exit 6), the one that continues at the oldest event kept. With
+//! `--issue`, an issue frame, `{"issue":"bd-a1b2"}`, comes first: the full
+//! id to continue with, which still names the issue once it is deleted
+//! (a partial id then no longer resolves).
 //!
 //! `events --since N --wait DURATION` is a long poll: the server waits,
 //! without holding a command slot, until an event matching the filters
@@ -96,8 +100,14 @@ pub enum Frame<'a> {
     /// The next part of an output file named on the command line (`export
     /// -o`), keyed by the path as given; the client writes it locally.
     File { path: Cow<'a, str>, data: Cow<'a, str> },
+    /// The issue an event listing's `--issue` names, by its full id: what a
+    /// listing continuing it names instead, as a partial id stops resolving
+    /// once the issue is deleted. Sent before the cursor frame.
+    Issue(Cow<'a, str>),
     /// Where an event listing (`bd events`) ends: the `--since` value that
-    /// continues after it. Sent before the exit frame of such answers only.
+    /// continues after it. Sent before the exit frame of such answers only;
+    /// one whose `--since` retention passed (exit 6) continues at the
+    /// oldest event kept.
     Cursor(i64),
     /// The command finished: always the last frame.
     Exit(Exit),
@@ -128,6 +138,9 @@ pub struct ExecResponse {
     /// Output files, keyed by the path as given.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, String>,
+    /// The issue frame of an event listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<String>,
     /// The cursor frame of an event listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<i64>,

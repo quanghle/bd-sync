@@ -13,8 +13,10 @@
 //! turns on GitHub sign-in, served at `POST /v2/auth/github/{device,token}`
 //! without a token (`oauth.rs`); `POST /v2/auth/revoke` revokes the token it
 //! is sent with, if it came from sign-in, and `POST /v2/auth/refresh` renews
-//! the sign-in whose refresh token it is sent with. `GET /healthz` answers
-//! `ok` without a token.
+//! the sign-in whose refresh token it is sent with. `POST /w/<name>/mcp`
+//! serves the workspace's MCP tools over Streamable HTTP (`mcp/http.rs`; tool
+//! calls run as `run` runs a command line, through `ToolRunner`). `GET
+//! /healthz` answers `ok` without a token.
 //!
 //! Memory and slots: up to `MAX_RUNNING` commands run at once. Requests in
 //! progress share a budget (`MIN_BODY_BUDGET`, or more for one maximum-size
@@ -72,6 +74,7 @@ use crate::cli::*;
 use crate::follow::{self, Feeds, HeadReader, Subscription};
 use crate::io::{self, Capture};
 use crate::jobs;
+use crate::mcp::{self, Ran, http as mcp_http};
 use crate::oauth;
 use crate::protocol::{
     ErrorBody, ErrorDetail, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, PROTOCOL, PROTOCOL_HEADER,
@@ -142,6 +145,12 @@ const FOLLOWERS_GRACE: Duration = Duration::from_secs(5);
 const MAX_SIGN_INS: usize = 8;
 /// The largest body of a sign-in request.
 const MAX_SIGN_IN_BODY: usize = 16 << 10;
+/// The longest MCP message a client may POST.
+const MAX_MCP_BODY: usize = 1 << 20;
+/// An MCP answer's share of the body budget: its tool's output (up to
+/// `mcp::local::OUTPUT_LIMIT`) is held, escaped into the result's text, and
+/// serialized, and the serialized answer is held until it is sent.
+const MCP_ANSWER_BUDGET: usize = 3 * mcp::local::OUTPUT_LIMIT;
 
 type Body = ResponseBody;
 
@@ -185,6 +194,12 @@ fn run(a: &ServeArgs) -> Result<()> {
     let max_body = usize::try_from(a.max_body_mib << 20).unwrap_or(usize::MAX);
     let waits = Waits::from_args(a)?;
     let jobs = jobs::Config::from_args(a)?;
+    let public_url = a
+        .public_url
+        .as_deref()
+        .map(mcp_http::public_url)
+        .transpose()
+        .map_err(|e| Error::invalid(format!("--public-url {e}")))?;
     // Checked now so that a mistake shows at once; each sign-in reads the file again.
     if let Some(github) = oauth::load(&root)? {
         let shown = |d: Duration| bd_core::time::format_duration_ms(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
@@ -210,7 +225,10 @@ fn run(a: &ServeArgs) -> Result<()> {
     }
     // Before any request or background job: gate checks in this process use the server's defaults.
     io::mark_server_process();
-    let server = Arc::new(Server::new(root, max_body, waits));
+    let mut server = Server::new(root, max_body, waits);
+    server.https = tls.is_some();
+    server.public_url = public_url;
+    let server = Arc::new(server);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("bd-serve")
@@ -425,6 +443,13 @@ fn exec_path(path: &str) -> Option<&str> {
     Some(name).filter(|w| version == PROTOCOL.to_string() && !w.is_empty() && !w.contains('/'))
 }
 
+/// `[/<prefix>]/w/<name>/mcp` -> `[/<prefix>]` and `<name>`.
+fn mcp_path(path: &str) -> Option<(&str, &str)> {
+    let (prefix, name) = path.strip_suffix("/mcp")?.rsplit_once("/w/")?;
+    // Valid names only: the name goes into the URLs of WWW-Authenticate challenges.
+    Some((prefix, name)).filter(|(_, w)| valid_workspace_name(w))
+}
+
 /// A step of GitHub sign-in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SignIn {
@@ -453,6 +478,27 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
             exec(&server, workspace.to_string(), req).await
         } else {
             Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
+        }
+    } else if let Some((prefix, workspace)) = mcp_http::metadata_path(&path) {
+        if req.method() == Method::GET {
+            resource_metadata(&server, &prefix, workspace, &req)
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
+            r
+        }
+    } else if path.contains(mcp_http::WELL_KNOWN) {
+        Reject::new(StatusCode::NOT_FOUND, "not_found", "no such protected resource", 3).response()
+    } else if let Some((prefix, workspace)) = mcp_path(&path) {
+        if req.method() == Method::POST {
+            let endpoint = Endpoint::of(&server, prefix, workspace, &req);
+            mcp(&server, endpoint, req).await
+        } else {
+            // No event stream to open (GET) and no session to end (DELETE).
+            let msg = "use POST: this MCP endpoint opens no event streams and keeps no sessions";
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", msg, 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
+            r
         }
     } else if let Some(step) = sign_in_path(&path) {
         if req.method() == Method::POST {
@@ -792,6 +838,10 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
         Ok(t) => t,
         Err(r) => return r.response(),
     };
+    if let Some(resource) = &token.resource {
+        let msg = format!("access token {} works only at MCP endpoint {resource}", token.name);
+        return Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7).response();
+    }
     if !token.allows_workspace(&workspace) {
         let msg = format!("access token {} may not use workspace {workspace}", token.name);
         return Reject::new(StatusCode::FORBIDDEN, "unauthorized", msg, 7).response();
@@ -900,6 +950,209 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
     }
 }
 
+/// One MCP message for `workspace` (Streamable HTTP, see `mcp/http.rs`):
+/// its tool calls run as [`Server::run`] runs a command line, on a blocking
+/// thread with a command slot, acting as `<token actor>/mcp` (or
+/// `/<session>` with `?session=<session>`), without the token's rights over
+/// other actors' claims and human gates.
+/// A workspace's MCP endpoint, as a request reached it.
+struct Endpoint {
+    workspace: String,
+    /// Its URL (the OAuth resource) and its metadata's, unless the request's
+    /// host is not valid and no `--public-url` is set.
+    resource: Option<String>,
+    metadata: Option<String>,
+}
+
+impl Endpoint {
+    fn of<B>(server: &Server, prefix: &str, workspace: &str, req: &Request<B>) -> Endpoint {
+        let base = server.base_url(req.headers(), req.uri(), prefix);
+        Endpoint {
+            workspace: workspace.to_string(),
+            resource: base.as_deref().map(|b| mcp_http::resource(b, workspace)),
+            metadata: base.as_deref().map(|b| mcp_http::metadata_url(b, workspace)),
+        }
+    }
+
+    /// `reject` with a challenge pointing at the metadata, and its error code if any.
+    fn challenge(&self, reject: Reject, error: Option<&str>) -> Response<Body> {
+        let challenge =
+            mcp_http::challenge(self.metadata.as_deref(), error.map(|code| (code, reject.message.as_str())));
+        let mut r = reject.response();
+        if let Ok(value) = HeaderValue::from_str(&challenge) {
+            r.headers_mut().insert(header::WWW_AUTHENTICATE, value);
+        }
+        r
+    }
+}
+
+/// The protected resource metadata of a workspace's MCP endpoint (RFC 9728).
+/// It needs no token, and says nothing of whether the workspace exists.
+fn resource_metadata<B>(server: &Server, prefix: &str, workspace: &str, req: &Request<B>) -> Response<Body> {
+    match server.base_url(req.headers(), req.uri(), prefix) {
+        Some(base) => json_response(StatusCode::OK, &mcp_http::metadata(&base, workspace)),
+        None => Reject::new(StatusCode::BAD_REQUEST, "invalid", "the request's Host header is not valid", 2).response(),
+    }
+}
+
+async fn mcp(server: &Arc<Server>, endpoint: Endpoint, req: Request<Incoming>) -> Response<Body> {
+    let started = Instant::now();
+    if let Err(a) = mcp_http::check_origin(req.headers()) {
+        return mcp_response(a, None);
+    }
+    let token = match authenticate(server, req.headers()) {
+        Ok(t) => t,
+        Err(r) if r.status == StatusCode::UNAUTHORIZED => {
+            // A request without a token learns where to get one, with no error (RFC 6750).
+            let error = bearer(req.headers()).is_some().then_some("invalid_token");
+            return endpoint.challenge(r, error);
+        }
+        Err(r) => return r.response(),
+    };
+    if let Some(bound) = token.resource.as_ref().filter(|bound| endpoint.resource.as_ref() != Some(*bound)) {
+        let msg = format!("access token {} works only at MCP endpoint {bound}", token.name);
+        return endpoint
+            .challenge(Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7), Some("invalid_token"));
+    }
+    if !token.allows_workspace(&endpoint.workspace) {
+        let msg = format!("access token {} may not use workspace {}", token.name, endpoint.workspace);
+        let reject = Reject::new(StatusCode::FORBIDDEN, "unauthorized", msg, 7);
+        return endpoint.challenge(reject, Some("insufficient_scope"));
+    }
+    let workspace = endpoint.workspace;
+    let Some(ws) = server.workspace(&workspace) else {
+        return Reject::new(StatusCode::NOT_FOUND, "not_found", format!("workspace not found: {workspace}"), 3)
+            .response();
+    };
+    let session = match mcp_session(req.uri().query()) {
+        Ok(s) => s,
+        Err(e) => return Reject::new(StatusCode::BAD_REQUEST, "invalid", e.to_string(), 2).response(),
+    };
+    if let Err(a) = mcp_http::check_content_type(req.headers()) {
+        return mcp_response(a, None);
+    }
+    if hyper::body::Body::size_hint(req.body()).exact().is_some_and(|n| n > MAX_MCP_BODY as u64) {
+        return mcp_too_large();
+    }
+    let permits = kib(MAX_MCP_BODY * BODY_COPIES + MCP_ANSWER_BUDGET);
+    let budget = match tokio::time::timeout(QUEUE_WAIT, server.body_budget.clone().acquire_many_owned(permits)).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return shutting_down(),
+        Err(_) => return busy("receiving other requests"),
+    };
+    let (parts, body) = req.into_parts();
+    let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, MAX_MCP_BODY).collect()).await {
+        Ok(Ok(b)) => b.to_bytes(),
+        Ok(Err(e)) if e.is::<LengthLimitError>() => return mcp_too_large(),
+        Ok(Err(e)) => {
+            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
+        }
+        Err(_) => {
+            let msg = format!("the request body did not arrive within {}s", BODY_TIMEOUT.as_secs());
+            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
+        }
+    };
+    let slot = match tokio::time::timeout(QUEUE_WAIT, server.running.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(_)) => return shutting_down(),
+        Err(_) => return busy("running other commands"),
+    };
+    let srv = server.clone();
+    let job = tokio::task::spawn_blocking(move || {
+        // The answer's share is held until it is sent; the body's, and the slot, until the message is answered.
+        let mut budget = budget;
+        let answer_budget = budget.split(kib(MCP_ANSWER_BUDGET) as usize);
+        let _held = (slot, budget);
+        let runner = ToolRunner { server: &srv, ws: &ws, token: &token, session: &session };
+        let mut mcp = mcp::Server::for_request(runner, token.role == Role::Read);
+        let answer = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            mcp_response(mcp_http::answer(&mut mcp, &parts.headers, &body), answer_budget)
+        }));
+        tracing::debug!(target: "bd::serve", workspace = %ws.name, token = %token.name, ms = started.elapsed().as_millis() as u64, "mcp message");
+        answer.map_err(|_| tracing::error!(target: "bd::serve", workspace = %ws.name, "MCP request panicked"))
+    });
+    match job.await {
+        Ok(Ok(response)) => response,
+        Ok(Err(())) | Err(_) => Reject::failed().response(),
+    }
+}
+
+/// The session of `?session=<name>`, else `mcp`: tool calls act as
+/// `<token actor>/<session>`.
+fn mcp_session(query: Option<&str>) -> Result<String> {
+    let named = query.into_iter().flat_map(|q| q.split('&')).find_map(|p| p.strip_prefix("session="));
+    match named {
+        None => Ok("mcp".into()),
+        Some(s) if actor::is_label(s) => Ok(s.into()),
+        Some(s) => Err(Error::invalid(format!(
+            "invalid session {s:?}: letters, digits, '.', '_' and '-', at most {} characters",
+            actor::MAX_LABEL
+        ))),
+    }
+}
+
+/// The response to an MCP message, its body holding `budget` until sent.
+fn mcp_response(answer: mcp_http::Answer, budget: Option<OwnedSemaphorePermit>) -> Response<Body> {
+    match answer {
+        mcp_http::Answer::Accepted => response(StatusCode::ACCEPTED, "application/json", Body::whole(Bytes::new())),
+        mcp_http::Answer::Message(status, message) => {
+            let bytes = serde_json::to_vec(&message).unwrap_or_default();
+            response(status, "application/json", Body::whole_within(bytes, budget))
+        }
+    }
+}
+
+fn mcp_too_large() -> Response<Body> {
+    let msg = format!("an MCP message is larger than {} MiB", MAX_MCP_BODY >> 20);
+    Reject::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid", msg, 2).response()
+}
+
+/// Runs the tool calls of an MCP request in its workspace, as `token`.
+struct ToolRunner<'a> {
+    server: &'a Server,
+    ws: &'a Workspace,
+    token: &'a Token,
+    session: &'a str,
+}
+
+impl mcp::Runner for ToolRunner<'_> {
+    fn run(&mut self, argv: &[String], _write: bool) -> Result<Ran> {
+        let started = Instant::now();
+        let cli = Cli::try_parse_from(std::iter::once("bd").chain(argv.iter().map(String::as_str)))
+            .map_err(|e| Error::invalid(e.to_string().lines().next().unwrap_or("invalid command line").to_string()))?;
+        let (access, resolved) = authorize(&cli, self.token, None, Some(self.session))?;
+        let actor = resolved.actor.clone();
+        let mut app = self.server.open_app(self.ws, self.token, &cli.global, resolved)?;
+        // A model's tool calls never carry a person's rights: no admin-only
+        // commands, other actors' claims or human gates.
+        let policy = self.token.policy();
+        let (buffer, capture) = Capture::buffered(mcp::local::OUTPUT_LIMIT);
+        let capture = Capture {
+            token_actor: policy.actor,
+            max_claims: policy.max_claims,
+            token: Some(self.token.clone()),
+            ..capture
+        };
+        let (exit_code, captured) = io::capture(capture, || crate::execute(&mut app, &cli.command));
+        if access == Access::Write {
+            self.server.feeds.committed(&self.ws.name);
+        }
+        self.server.close_app(self.ws, self.token, &mut app);
+        tracing::info!(
+            target: "bd::serve",
+            workspace = %self.ws.name,
+            token = %self.token.name,
+            %actor,
+            command = crate::command_name(&cli.command),
+            exit_code,
+            ms = started.elapsed().as_millis() as u64,
+            "mcp tool call"
+        );
+        let stdout = String::from_utf8_lossy(buffer.borrow().output()?).into_owned();
+        Ok(Ran { exit_code, stdout, stderr: lossy(captured.stderr) })
+    }
+}
+
 const fn max(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
@@ -950,6 +1203,10 @@ struct Server {
     refreshes: Mutex<Issuances>,
     /// Set when the server shuts down.
     stopping: watch::Sender<bool>,
+    /// `--public-url`, normalized: MCP endpoints name themselves by it.
+    public_url: Option<String>,
+    /// Whether clients connect over TLS, for URLs derived from requests.
+    https: bool,
 }
 
 /// How a request waiting for events ended its wait.
@@ -1099,6 +1356,21 @@ pub(crate) fn access(cmd: &Command) -> Access {
     }
 }
 
+/// Whether `token` may run `cli`'s command here, and the actor it runs as
+/// (see [`resolve_actor`]).
+fn authorize(cli: &Cli, token: &Token, env: Option<&str>, session: Option<&str>) -> Result<(Access, Resolved)> {
+    let name = crate::command_name(&cli.command);
+    let access = access(&cli.command);
+    if access == Access::Local {
+        return Err(Error::Refused(format!("bd {name} is not available through bd serve")));
+    }
+    if access == Access::Write && token.role == Role::Read {
+        let msg = format!("access token {} is read-only; bd {name} needs a write token", token.name);
+        return Err(Error::Unauthorized(msg));
+    }
+    Ok((access, resolve_actor(cli.global.actor.as_deref(), env, session, token)?))
+}
+
 /// The actor a request runs as: the one it asks for (`--actor`, then the
 /// client's `$BD_ACTOR`) if the token allows it; else the token's actor, as
 /// `<token actor>/<session>` when the client runs in an agent session.
@@ -1193,7 +1465,20 @@ impl Server {
             issued: Mutex::default(),
             refreshes: Mutex::default(),
             stopping: watch::Sender::new(false),
+            public_url: None,
+            https: false,
         }
+    }
+
+    /// The server's URL as clients reach it: `--public-url`, else derived
+    /// from the request (`Host`, the path prefix before `/w/`).
+    fn base_url(&self, headers: &HeaderMap, uri: &hyper::Uri, prefix: &str) -> Option<String> {
+        if let Some(url) = &self.public_url {
+            return Some(url.clone());
+        }
+        let host =
+            headers.get(header::HOST).and_then(|h| h.to_str().ok()).or_else(|| uri.authority().map(|a| a.as_str()));
+        mcp_http::request_base(self.https, host, prefix)
     }
 
     /// The workspace `<root>/<name>/.bd/bd.db`, if it exists.
@@ -1315,22 +1600,7 @@ impl Server {
         }
         let json = cli.global.json;
         let name = crate::command_name(&cli.command);
-        let access = access(&cli.command);
-        if access == Access::Local {
-            let e = Error::Refused(format!("bd {name} is not available through bd serve"));
-            return respond(&mut out, &failure(&e, json));
-        }
-        if access == Access::Write && token.role == Role::Read {
-            let e =
-                Error::Unauthorized(format!("access token {} is read-only; bd {name} needs a write token", token.name));
-            return respond(&mut out, &failure(&e, json));
-        }
-        let resolved = match resolve_actor(
-            cli.global.actor.as_deref(),
-            request.actor.as_deref(),
-            request.session.as_deref(),
-            token,
-        ) {
+        let (access, resolved) = match authorize(&cli, token, request.actor.as_deref(), request.session.as_deref()) {
             Ok(a) => a,
             Err(e) => return respond(&mut out, &failure(&e, json)),
         };
@@ -1353,20 +1623,7 @@ impl Server {
             out.hold(REPLAY_LIMIT);
         }
 
-        let store = ws.take(&self.open).map_err(Reject::internal)?;
-        let read_only = token.role == Role::Read;
-        if read_only {
-            // Belt and braces: read tokens cannot write even through a misclassified command.
-            store.connection().pragma_update(None, "query_only", true).map_err(|e| Reject::internal(e.into()))?;
-        }
-        // The pooled store brings the server's own options (busy timeout, durability).
-        let mut g = cli.global.clone();
-        g.db = Some(ws.db.clone());
-        g.directory = Some(ws.dir.clone());
-        g.remote = None;
-        let mut app = App::new(g).map_err(Reject::internal)?;
-        app.set_actor(resolved);
-        app.set_store(store);
+        let mut app = self.open_app(ws, token, &cli.global, resolved).map_err(Reject::internal)?;
         app.location = request.location;
         app.request = key;
         // What the token may override: admin-only commands, other actors' claims, human gates.
@@ -1393,11 +1650,7 @@ impl Server {
             self.feeds.committed(&ws.name);
         }
         let recorded = app.request.as_ref().filter(|k| k.recorded).map(|k| k.id.clone());
-        if let Some(store) = app.take_store() {
-            if !read_only || store.connection().pragma_update(None, "query_only", false).is_ok() {
-                ws.give(store);
-            }
-        }
+        self.close_app(ws, token, &mut app);
         let sent = out.borrow_mut().finish(Exit { exit_code, stderr: lossy(captured.stderr), replayed: false });
         let sent = match sent.held {
             // A write's answer is stored before it is sent, and the request
@@ -1441,6 +1694,34 @@ impl Server {
             tracing::debug!(target: "bd::serve", workspace = %ws.name, bytes = sent.bytes, peak = sent.peak, "streamed");
         }
         Ok(())
+    }
+
+    /// An app for a command of `token` in `ws`, acting as `actor`, with a
+    /// pooled store: read-only for a read token.
+    fn open_app(&self, ws: &Workspace, token: &Token, global: &Global, actor: Resolved) -> Result<App> {
+        let store = ws.take(&self.open)?;
+        if token.role == Role::Read {
+            // Belt and braces: read tokens cannot write even through a misclassified command.
+            store.connection().pragma_update(None, "query_only", true)?;
+        }
+        // The pooled store brings the server's own options (busy timeout, durability).
+        let mut g = global.clone();
+        g.db = Some(ws.db.clone());
+        g.directory = Some(ws.dir.clone());
+        g.remote = None;
+        let mut app = App::new(g)?;
+        app.set_actor(actor);
+        app.set_store(store);
+        Ok(app)
+    }
+
+    /// Give the store of an app from [`Server::open_app`] back to the pool.
+    fn close_app(&self, ws: &Workspace, token: &Token, app: &mut App) {
+        if let Some(store) = app.take_store() {
+            if token.role != Role::Read || store.connection().pragma_update(None, "query_only", false).is_ok() {
+                ws.give(store);
+            }
+        }
     }
 
     fn start_request(&self, ws: &Workspace, id: &str) -> std::result::Result<InFlight<'_>, Reject> {
@@ -1512,6 +1793,21 @@ mod tests {
             ["/w//v2/exec", "/w/a/b/v2/exec", "/v2/exec", "/w/x/v2/exec/", "/w/x/vx/exec", "/w/x", "/w/x/v1/exec"]
         {
             assert_eq!(exec_path(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn mcp_paths_and_sessions() {
+        assert_eq!(mcp_path("/w/proj/mcp"), Some(("", "proj")));
+        assert_eq!(mcp_path("/bd/w/proj/mcp"), Some(("/bd", "proj")), "under an unstripped proxy prefix");
+        for bad in ["/w//mcp", "/w/a/b/mcp", "/mcp", "/w/proj/mcp/", "/w/proj/v2/exec", "/w/a\"b/mcp", "/w/-x/mcp"] {
+            assert_eq!(mcp_path(bad), None, "{bad}");
+        }
+        assert_eq!(exec_path("/w/proj/mcp"), None);
+        assert_eq!(mcp_session(None).unwrap(), "mcp");
+        assert_eq!(mcp_session(Some("x=1&session=w-2")).unwrap(), "w-2");
+        for bad in ["session=", "session=a/b", "session=a%20b"] {
+            assert!(mcp_session(Some(bad)).is_err(), "{bad}");
         }
     }
 
@@ -1598,6 +1894,7 @@ mod tests {
             github: None,
             max_claims: None,
             refresh: None,
+            resource: None,
         };
         let actor = |flag, env, session| resolve_actor(flag, env, session, &t).map(|r| (r.actor, r.source));
         let code = |flag, env, session| resolve_actor(flag, env, session, &t).unwrap_err().exit_code();

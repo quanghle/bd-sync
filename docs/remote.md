@@ -553,6 +553,17 @@ command runs return a non-200 status with the `--json` error shape. Every
 answer carries a `bd-protocol: 2` header, which tells bd serve's own answers
 (a 503 before the command ran, say) apart from a proxy's.
 
+Each workspace is also an MCP server, at `/w/<name>/mcp` (Streamable HTTP,
+with the same bearer tokens): MCP clients such as Claude, ChatGPT or an
+agent harness without a shell call bd's coordination tools there, acting as
+`<token actor>/mcp` ([MCP server](mcp.md#over-http); setup of each client in
+[connecting clients](mcp.md#connecting-clients)). `--public-url URL`
+(or `$BD_SERVE_PUBLIC_URL`) is the URL clients reach the server at, path
+prefix included (`https://example.com/bd`): MCP endpoints name themselves by
+it in their OAuth metadata, and tokens created with `--resource` are bound to
+an endpoint's URL under it ([discovery](mcp.md#discovery)). Set it behind a
+proxy; without it, the URL is taken from each request's `Host` header.
+
 Printed output never drives a terminal: control characters (except line
 ends and tabs) and bidirectional formatting characters in titles,
 descriptions, comments or a server's answer are printed as `\uXXXX`, both by

@@ -1,8 +1,10 @@
 //! bd's MCP server: JSON-RPC 2.0 messages in, answers out, in the stateless
-//! protocol revision and the session-based one before it (see docs/mcp.md). Transports (`bd mcp` on stdio, `bd
-//! serve`'s `/mcp` endpoint) hand each message to [`Server::handle`]; tool
-//! calls run bd commands through a [`Runner`].
+//! protocol revision and the session-based one before it (see docs/mcp.md).
+//! Transports (`bd mcp` on stdio, `bd serve`'s `/w/<name>/mcp` endpoint in
+//! [`http`]) hand each message to [`Server::handle`]; tool calls run bd
+//! commands through a [`Runner`].
 
+pub mod http;
 pub mod local;
 mod stdio;
 pub mod tools;
@@ -67,6 +69,14 @@ impl<R: Runner> Server<R> {
         Server { runner, read_only, initialized: false }
     }
 
+    /// A server for one HTTP request. Over HTTP a `LEGACY` client names its
+    /// session's version in a header (see [`http`]), not by an `initialize`
+    /// earlier in the same process, so requests without `_meta` are served
+    /// as `LEGACY` from the start.
+    pub fn for_request(runner: R, read_only: bool) -> Server<R> {
+        Server { runner, read_only, initialized: true }
+    }
+
     /// Answer one JSON-RPC message (`None` for notifications and responses).
     pub fn handle(&mut self, message: &Value) -> Option<Value> {
         let Some(m) = message.as_object() else {
@@ -116,7 +126,7 @@ impl<R: Runner> Server<R> {
     }
 
     fn request(&mut self, method: &str, params: &Map<String, Value>) -> std::result::Result<Value, Failure> {
-        let modern = params.get("_meta").and_then(Value::as_object).is_some_and(|m| m.contains_key(VERSION_KEY));
+        let modern = names_version(params);
         if modern {
             check_version(params)?;
         } else if method == "initialize" {
@@ -204,6 +214,11 @@ impl<R: Runner> Server<R> {
 
 /// A JSON-RPC error: code, message, data.
 type Failure = (i64, String, Option<Value>);
+
+/// A request names its protocol version in `_meta`: it is stateless.
+fn names_version(params: &Map<String, Value>) -> bool {
+    params.get("_meta").and_then(Value::as_object).is_some_and(|m| m.contains_key(VERSION_KEY))
+}
 
 /// A stateless request names the protocol version it speaks, and its
 /// client's capabilities, in `_meta`; only `MODERN` is stateless.

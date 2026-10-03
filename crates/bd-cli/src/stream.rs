@@ -202,6 +202,11 @@ impl ResponseBody {
     pub fn whole(bytes: impl Into<Bytes>) -> ResponseBody {
         ResponseBody { kind: Kind::Whole(Some(bytes.into())), _budget: None }
     }
+
+    /// A whole answer holding `budget` until it is sent or dropped.
+    pub fn whole_within(bytes: impl Into<Bytes>, budget: Option<OwnedSemaphorePermit>) -> ResponseBody {
+        ResponseBody { kind: Kind::Whole(Some(bytes.into())), _budget: budget }
+    }
 }
 
 impl Body for ResponseBody {

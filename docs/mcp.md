@@ -10,9 +10,9 @@ and nothing here replaces it.
 - `bd mcp` serves a workspace over stdio, for a client on the same machine:
   the checkout's local workspace, or its remote one (`.bd/remote.toml`,
   `BD_REMOTE`), with the same token as the CLI.
-- Planned: `bd serve` serving each workspace at `/w/<workspace>/mcp` over
-  Streamable HTTP, for remote clients, with a bd access token as its bearer
-  token ([Remote server](remote.md)).
+- `bd serve` serves each workspace at `/w/<workspace>/mcp` over Streamable
+  HTTP, for remote clients, with a bd access token as its bearer token
+  ([Remote server](remote.md); see [Over HTTP](#over-http)).
 
 A server is bound to one workspace, chosen by where it runs (`bd mcp`) or
 by its URL (`bd serve`): no tool takes a workspace, so a tool call cannot
@@ -64,6 +64,198 @@ claim, nor open a human gate.
 A message longer than 1 MiB is answered with an error (`-32600`, id
 `null`) and skipped; the server keeps serving.
 
+## Over HTTP
+
+`bd serve` serves the MCP endpoint of each workspace it serves at
+`https://<host>/w/<workspace>/mcp` (under the same path prefix as
+`/w/<workspace>/v2/exec` behind a proxy). Each request authenticates with a
+bd access token as a bearer token (`Authorization: Bearer <secret>`), with
+the same role, workspace and `--max-claims` limits as the token's CLI
+requests: a read token is offered only the read-only tools, and a token
+limited to other workspaces is refused (403). A missing, unknown or expired
+token is answered with 401 and a `WWW-Authenticate` challenge (see
+[Discovery](#discovery)).
+
+[Connecting clients](#connecting-clients) shows the setup of each client.
+
+Tool calls act as `<token actor>/mcp`, a sub-actor of the token's actor, or
+as `<token actor>/<name>` for a URL ending `?session=<name>` (letters,
+digits, `.`, `_` and `-`), so that several agents sharing a token hold
+their claims under their own names; the request cannot name another actor.
+As over stdio, tool calls never carry the token's admin or human rights.
+
+Each POST carries one JSON-RPC message (`Content-Type: application/json`,
+at most 1 MiB) and is answered with one JSON object; no request opens an
+SSE stream, and the server issues no `Mcp-Session-Id`. GET and DELETE are
+answered with 405. Each tool call runs as a CLI request does, in one of the
+server's command slots (503 when they stay busy).
+
+- A `2026-07-28` request mirrors its body in headers: `MCP-Protocol-Version`
+  (the version in `_meta`), `Mcp-Method` (its `method`) and, for
+  `tools/call`, `Mcp-Name` (the tool's name, or `=?base64?<name>?=`). One
+  missing or not matching the body is answered with 400 and
+  `HeaderMismatch` (`-32020`), and the request does not run.
+- A `2025-11-25` client sends `initialize`, then names the version in
+  `MCP-Protocol-Version`. Each request stands alone (the server keeps no
+  session), so a request without `_meta` is served as `2025-11-25` with or
+  without `initialize` before it; one without the header is taken as
+  `2025-11-25`, and one naming another version is answered with 400 and
+  `-32022`.
+
+Statuses: 202 with no body for notifications and responses; 400 for
+malformed JSON or messages, header mismatches and unsupported versions;
+404 for a `2026-07-28` method the server does not serve; 413 for a body
+over 1 MiB; 415 for another `Content-Type`; 200 for every other answer,
+tool errors and invalid parameters included. A request with an `Origin`
+header (403) or another `Content-Type` (415) is answered with a JSON-RPC
+error whose `id` is `null`. Other failures before the message is read (401,
+403 for another workspace, 404 for an unknown workspace, 413, 503) carry
+bd's error object (`{"error": {"code", "message", "exit_code"}}`) rather
+than a JSON-RPC one.
+
+A request with an `Origin` header is refused (403): browsers send one with
+every POST, and other clients none, and `bd serve` serves no pages, so a
+web page cannot reach the endpoint, even through DNS rebinding. Browser-based
+MCP clients are not supported (the server sends no CORS headers). The bearer
+token is the protection that matters: a page cannot send it.
+
+### Discovery
+
+Each endpoint is an OAuth protected resource (RFC 9728), whose URL (the
+resource) is the server's URL followed by `/w/<workspace>/mcp`. The server's
+URL is `bd serve --public-url` (or `$BD_SERVE_PUBLIC_URL`), path prefix
+included, such as `https://bd.example.com/bd`. Without it, the server's URL
+is taken from each request: `https` with `--tls-cert`, else `http`; the
+`Host` header; and the path before `/w/`. `X-Forwarded-*` headers are never
+trusted (any client can send them), so behind a TLS-terminating proxy, set
+`--public-url`.
+
+The endpoint's metadata is served without a token at the server's URL
+followed by `/.well-known/oauth-protected-resource/w/<workspace>/mcp`, and
+at the RFC's own location, with the prefix after the well-known part
+(`https://bd.example.com/.well-known/oauth-protected-resource/bd/w/proj/mcp`)
+for a proxy that forwards it:
+
+```json
+{"resource": "https://bd.example.com/bd/w/proj/mcp", "bearer_methods_supported": ["header"],
+ "resource_name": "bd workspace proj"}
+```
+
+It answers the same whether the workspace exists or not, and names no
+authorization server: tokens come from the server's admin or from GitHub
+sign-in ([remote workspaces](remote.md)).
+
+Refusals point clients at it, as RFC 6750 challenges:
+
+- no token: 401 with `WWW-Authenticate: Bearer resource_metadata="<metadata URL>"`;
+- an unknown, expired or bound-elsewhere token: 401 with
+  `error="invalid_token"` and an `error_description` before `resource_metadata`;
+- a token limited to other workspaces: 403 with `error="insufficient_scope"`.
+
+### Tokens bound to an endpoint
+
+A token for an MCP client that should reach one workspace's tools and
+nothing else names that endpoint:
+
+```bash
+bd serve token create assistant --as alice --resource https://bd.example.com/bd/w/proj/mcp --root /srv/bd
+```
+
+The token's workspaces become that workspace alone (`--workspace`, if given,
+must allow it). It is refused (401) at any other endpoint, at an endpoint
+reached under another URL (normalized: lowercase scheme and host, no default
+port, no trailing `/`), and for CLI requests (`/w/<name>/v2/exec`), so a
+leaked token works only through MCP's tools. The URL compared is the one the
+request computes, so set `--public-url` on a server whose clients reach it
+by more than one name. `bd serve token list` shows each token's `resource`.
+
+### Connecting clients
+
+Create a token for the client on the server's host, bound to the endpoint
+it uses, and keep its secret in an environment variable rather than in a
+file:
+
+```bash
+bd serve token create laptop-agents --as alice --resource https://bd.example.com/w/proj/mcp --root /srv/bd
+export BD_TOKEN=bd_...   # the printed secret
+```
+
+Clients that send a fixed `Authorization` header:
+
+- Claude Code, in `.mcp.json` (Claude Code expands `${BD_TOKEN}` from its
+  environment), then `claude mcp list` shows `✔ Connected`:
+
+  ```json
+  {"mcpServers": {"bd": {"type": "http", "url": "https://bd.example.com/w/proj/mcp",
+    "headers": {"Authorization": "Bearer ${BD_TOKEN}"}}}}
+  ```
+
+- Codex, reading the token from the environment on each start:
+
+  ```bash
+  codex mcp add bd --url https://bd.example.com/w/proj/mcp --bearer-token-env-var BD_TOKEN
+  ```
+
+- Copilot CLI (stores the secret in `~/.copilot/mcp-config.json`):
+
+  ```bash
+  copilot mcp add --transport http bd https://bd.example.com/w/proj/mcp --header "Authorization: Bearer $BD_TOKEN"
+  ```
+
+- Claude apps (claude.ai, Claude Desktop): custom connectors sign in with
+  OAuth, or, for organizations in Anthropic's beta of request headers, send
+  an `Authorization` header that an organization Owner enters once. That
+  header is the whole organization's, so give it a token of a shared actor
+  (`--as team-claude`), with `--max-claims` if the organization should hold
+  only so many issues at once.
+- ChatGPT (developer mode apps) connects with OAuth or without
+  authentication only, so it cannot connect until `bd serve` runs an OAuth
+  authorization server. A client that tries OAuth sign-in on a 401 (ChatGPT,
+  or Claude Code without the header) fails at client registration meanwhile.
+
+Agents sharing a token add `?session=<name>` to the URL to hold their claims
+under their own names (`https://bd.example.com/w/proj/mcp?session=reviewer`);
+a token bound with `--resource` works under any `?session`.
+
+### Behind a proxy
+
+A proxy that serves bd under a path prefix may forward requests with the
+prefix or without it. Set `--public-url` to the URL clients use, prefix
+included, so that endpoints name themselves by it whatever reaches the
+server, and forward the RFC 9728 location of the metadata too. With Caddy:
+
+```text
+example.com {
+    @bd path /bd/* /.well-known/oauth-protected-resource/bd/*
+    handle @bd {
+        reverse_proxy 127.0.0.1:7420
+    }
+}
+```
+
+```bash
+bd serve --root /srv/bd --public-url https://example.com/bd
+curl -s https://example.com/.well-known/oauth-protected-resource/bd/w/proj/mcp
+```
+
+Clients then use `https://example.com/bd/w/proj/mcp`, and tokens are bound
+to that URL. No MCP request waits for events (the server opens no SSE
+streams), so a proxy's idle timeout only needs to exceed a tool call's run.
+
+### Retries
+
+MCP gives a tool call no request id to deduplicate by (as `bd`'s CLI
+requests have), so a client that resends a call after losing its answer
+runs it again:
+
+- `create` creates a second issue;
+- `claim` of the issue it already claimed fails with `already_claimed`,
+  naming its own actor: the lease token is lost, but the holder may still
+  `release` or `close` the issue without it, and claim it again;
+- `close` of a closed issue succeeds with `already_closed: true`.
+
+After a lost answer, `show` or `list` tells whether a write took effect.
+
 ## Protocol
 
 bd implements MCP itself (JSON-RPC 2.0 over serde, no SDK) and speaks two
@@ -82,7 +274,8 @@ revisions:
   asked for (the client disconnects if it cannot speak it), with the
   server's capabilities, `serverInfo` and `instructions`. From then on,
   until the stdio process ends, requests without `_meta` are served in that
-  revision's format, without the stateless fields.
+  revision's format, without the stateless fields. Over HTTP, which keeps
+  no sessions, the `MCP-Protocol-Version` header names it instead.
 
 A request without `_meta` before `initialize` is refused with `-32602`,
 except `ping`. Methods served: `initialize`, `ping`, `tools/list` and
@@ -90,7 +283,7 @@ except `ping`. Methods served: `initialize`, `ping`, `tools/list` and
 
 Only tools are served: no resources, prompts, subscriptions, sampling,
 elicitation or tasks, and HTTP requests are answered with
-`application/json`, never an SSE stream. The tool list does not change
+`application/json`, never an SSE stream ([Over HTTP](#over-http)). The tool list does not change
 while a server runs (`listChanged` is false) and is returned in a fixed
 order.
 

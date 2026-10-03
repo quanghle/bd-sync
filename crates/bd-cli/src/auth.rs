@@ -109,6 +109,11 @@ pub struct Token {
     /// How a token from GitHub sign-in is refreshed, if it is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refresh: Option<Refresh>,
+    /// The only MCP endpoint the token works at (its audience): the URL of
+    /// `/w/<name>/mcp` as clients reach it. A bound token is refused
+    /// everywhere else, CLI requests included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 /// The refresh state of a GitHub sign-in: one per token entry, whose
@@ -344,6 +349,7 @@ impl Token {
             "refreshable_until": self.refreshable_until(),
             "github": self.github,
             "max_claims": self.max_claims,
+            "resource": self.resource,
         })
     }
 
@@ -357,6 +363,9 @@ impl Token {
         );
         if let Some(n) = self.max_claims {
             text.push_str(&format!(", at most {n} claims"));
+        }
+        if let Some(resource) = &self.resource {
+            text.push_str(&format!(", only at MCP endpoint {resource}"));
         }
         if let Some(user) = &self.github {
             text.push_str(&format!(", signed in as GitHub user {}", user.login));
@@ -553,8 +562,8 @@ pub fn cmd_token(app: &mut App, cmd: &TokenCommand) -> Result<()> {
 fn create(app: &mut App, a: &TokenCreateArgs) -> Result<()> {
     let root = root_dir(&a.root)?;
     let grant = Grant { role: a.role, kind: a.kind, workspaces: a.workspaces.clone(), max_claims: a.max_claims };
-    let (token, secret) = add_token(&root, Holder::Admin { name: a.name.trim(), actor: a.act_as.trim() }, grant)
-        .map(|issued| (issued.token, issued.secret))?;
+    let holder = Holder::Admin { name: a.name.trim(), actor: a.act_as.trim(), resource: a.resource.as_deref() };
+    let (token, secret) = add_token(&root, holder, grant).map(|issued| (issued.token, issued.secret))?;
     let mut view = token.view();
     view["token"] = json!(secret);
     let out = Out::new(view)
@@ -577,7 +586,7 @@ pub fn issue_token(
     workspaces: &[String],
 ) -> Result<(Token, String)> {
     let grant = Grant { role, kind, workspaces: workspaces.to_vec(), max_claims: None };
-    add_token(root, Holder::Admin { name: name.trim(), actor: actor.trim() }, grant)
+    add_token(root, Holder::Admin { name: name.trim(), actor: actor.trim(), resource: None }, grant)
         .map(|issued| (issued.token, issued.secret))
 }
 
@@ -698,8 +707,8 @@ pub fn rotate(
 
 /// Whom a new token is for.
 enum Holder<'a> {
-    /// An admin names it, and its actor.
-    Admin { name: &'a str, actor: &'a str },
+    /// An admin names it, its actor, and maybe the MCP endpoint it is bound to.
+    Admin { name: &'a str, actor: &'a str, resource: Option<&'a str> },
     /// A GitHub account that signed in; `by_login` when a rule let it in by
     /// its login; `refresh`, the workspace it signed in for and until when
     /// it may be refreshed, if it may.
@@ -729,8 +738,21 @@ fn check_actor(actor: &str) -> Result<()> {
 }
 
 fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
-    let workspaces = workspace_list(&grant.workspaces)?;
-    if let Holder::Admin { name, actor } = &holder {
+    let mut workspaces = workspace_list(&grant.workspaces)?;
+    let mut resource = None;
+    if let Holder::Admin { resource: Some(url), .. } = &holder {
+        let (url, workspace) =
+            crate::mcp::http::resource_url(url).map_err(|e| Error::invalid(format!("--resource {e}")))?;
+        if !workspaces.iter().any(|w| w == "*" || *w == workspace) {
+            return Err(Error::invalid(format!(
+                "--resource {url} is workspace {workspace}'s, which the token may not use"
+            )));
+        }
+        // A bound token works at that workspace only.
+        workspaces = vec![workspace];
+        resource = Some(url);
+    }
+    if let Holder::Admin { name, actor, .. } = &holder {
         check_name(name)?;
         check_actor(actor)?;
         if is_reserved_actor(actor) {
@@ -746,7 +768,7 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
     // Tokens from GitHub sign-in stay listed for a while after they expire (and can no longer be refreshed), then go.
     file.tokens.retain(|t| t.github.is_none() || !t.ended(now.minus(PRUNE_AFTER)));
     let (name, actor, expires_at, github, refresh) = match holder {
-        Holder::Admin { name, actor } => {
+        Holder::Admin { name, actor, .. } => {
             if let Some(account) = file.accounts.iter().find(|a| related(&a.actor, actor)) {
                 return Err(Error::Refused(format!(
                     "actor {actor} would share actor {} with GitHub user {}, who signed in: pick another actor, or \
@@ -814,6 +836,7 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
         github,
         max_claims: grant.max_claims,
         refresh,
+        resource,
     };
     file.tokens.push(token.clone());
     save_file(&path, &file)?;
@@ -1113,6 +1136,7 @@ mod tests {
             github: None,
             max_claims: None,
             refresh: None,
+            resource: None,
         }
     }
 

@@ -12,7 +12,7 @@ use crate::cli::{Cli, Global};
 use crate::io::{self, Capture};
 
 /// The most a command may print for one tool call.
-const OUTPUT_LIMIT: usize = 4 << 20;
+pub const OUTPUT_LIMIT: usize = 4 << 20;
 
 /// Runs tool calls in-process, as one actor, keeping the store open between
 /// calls.

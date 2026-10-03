@@ -5804,3 +5804,364 @@ fn mcp_never_prints_streamed_answers_on_its_protocol_stream() {
     let text: Value = serde_json::from_str(answers[0]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(text["issues"][0]["id"], "t-1", "{text}");
 }
+
+/// POST `message` to workspace `proj`'s MCP endpoint (`/w/proj/mcp<query>`)
+/// with `headers`, and the `MODERN` headers its body calls for unless
+/// `headers` names them; the status, the response's headers and its JSON
+/// (`Null` when empty).
+fn mcp_post(
+    server: &Server,
+    token: Option<&str>,
+    query: &str,
+    headers: &[(&str, &str)],
+    message: &Value,
+) -> (u16, ureq::http::HeaderMap, Value) {
+    mcp_post_to(&format!("{}/mcp{query}", server.url()), token, headers, message)
+}
+
+/// POST `message` to the MCP endpoint at `url`, mirroring a modern message in its headers.
+fn mcp_post_to(
+    url: &str,
+    token: Option<&str>,
+    headers: &[(&str, &str)],
+    message: &Value,
+) -> (u16, ureq::http::HeaderMap, Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let mut r = agent.post(url).content_type("application/json");
+    if let Some(t) = token {
+        r = r.header("authorization", bearer(t));
+    }
+    let params = &message["params"];
+    let version = params["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str();
+    let named = |h: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h));
+    if let (Some(v), false) = (version, named("mcp-protocol-version")) {
+        r = r.header("mcp-protocol-version", v);
+    }
+    if let (Some(_), Some(m), false) = (version, message["method"].as_str(), named("mcp-method")) {
+        r = r.header("mcp-method", m);
+    }
+    if let (Some(_), Some(n), false) = (version, params["name"].as_str(), named("mcp-name")) {
+        r = r.header("mcp-name", n);
+    }
+    for (k, v) in headers {
+        r = r.header(*k, *v);
+    }
+    let mut answer = r.send(message.to_string().as_bytes()).unwrap();
+    let text = answer.body_mut().read_to_string().unwrap();
+    let body = if text.is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap() };
+    (answer.status().as_u16(), answer.headers().clone(), body)
+}
+
+fn mcp_modern(id: u64, method: &str, params: Value) -> Value {
+    let mut params = params;
+    params["_meta"] = json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {} });
+    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+/// A tool call's result through `/w/proj/mcp<query>`, parsed.
+fn mcp_http_call(server: &Server, token: &str, query: &str, tool: &str, arguments: Value) -> Value {
+    let (status, _, answer) = mcp_post(server, Some(token), query, &[], &mcp_tool_call(tool, arguments));
+    assert_eq!(status, 200, "{answer}");
+    assert!(mcp_tool_error(&answer).is_none(), "{answer}");
+    serde_json::from_str(answer["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[test]
+fn mcp_over_http_runs_tool_calls_as_a_session_of_the_tokens_actor() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    alice.ok(&["create", "Design", "-p", "1"]);
+    alice.ok(&["create", "Build", "--dep", "t-1"]);
+    alice.ok(&["create", "Docs", "-p", "3"]);
+
+    let (status, _, d) = mcp_post(&server, Some(&secret), "", &[], &mcp_modern(1, "server/discover", json!({})));
+    assert_eq!(status, 200, "{d}");
+    assert_eq!(d["result"]["supportedVersions"], json!(["2026-07-28", "2025-11-25"]));
+    let (_, _, list) = mcp_post(&server, Some(&secret), "", &[], &mcp_modern(2, "tools/list", json!({})));
+    assert!(list["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "claim"), "{list}");
+
+    let claim = mcp_http_call(&server, &secret, "", "claim", json!({ "next": true }));
+    assert_eq!((&claim["issue"]["id"], &claim["issue"]["assignee"]), (&json!("t-1"), &json!("alice/mcp")));
+    let token = claim["lease"]["token"].clone();
+    let closed =
+        mcp_http_call(&server, &secret, "", "close", json!({ "ids": ["t-1"], "reason": "done", "token": token }));
+    assert_eq!(closed["unblocked"][0]["id"], "t-2", "{closed}");
+    let other = mcp_http_call(&server, &secret, "?session=w2", "claim", json!({ "id": "t-3" }));
+    assert_eq!(other["issue"]["assignee"], "alice/w2");
+    let (status, _, _) = mcp_post(&server, Some(&secret), "?session=a%2Fb", &[], &mcp_tool_call("ready", json!({})));
+    assert_eq!(status, 400, "a session is a label");
+
+    // The headers must match the body; the call does not run otherwise.
+    let call = mcp_tool_call("claim", json!({ "id": "t-2" }));
+    let (status, _, e) = mcp_post(&server, Some(&secret), "", &[("mcp-name", "ready")], &call);
+    assert_eq!((status, &e["error"]["code"], &e["id"]), (400, &json!(-32020), &json!(1)), "{e}");
+    let (status, _, e) = mcp_post(&server, Some(&secret), "", &[("mcp-method", "")], &call);
+    assert_eq!((status, &e["error"]["code"]), (400, &json!(-32020)), "{e}");
+    assert_eq!(alice.json(&["show", "t-2"])["status"], "open");
+
+    let note = json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1 } });
+    let (status, _, body) = mcp_post(&server, Some(&secret), "", &[], &note);
+    assert_eq!((status, body), (202, Value::Null));
+
+    // 2025-11-25: initialize, then requests naming the version in a header.
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } } });
+    let (status, headers, r) = mcp_post(&server, Some(&secret), "", &[], &init);
+    assert_eq!((status, &r["result"]["protocolVersion"]), (200, &json!("2025-11-25")), "{r}");
+    assert!(headers.get("mcp-session-id").is_none(), "no sessions");
+    let legacy = [("mcp-protocol-version", "2025-11-25")];
+    let list = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+    let (status, _, r) = mcp_post(&server, Some(&secret), "", &legacy, &list);
+    assert_eq!(status, 200);
+    assert!(r["result"]["tools"].is_array() && r["result"].get("ttlMs").is_none(), "{r}");
+    let (status, _, r) = mcp_post(&server, Some(&secret), "", &[("mcp-protocol-version", "2024-11-05")], &list);
+    assert_eq!((status, &r["error"]["code"]), (400, &json!(-32022)), "{r}");
+}
+
+#[test]
+fn mcp_over_http_refuses_what_the_request_may_not_do() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let list = mcp_modern(1, "tools/list", json!({}));
+
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let r = agent.get(format!("{}/mcp", server.url())).header("authorization", bearer(&secret)).call().unwrap();
+    assert_eq!(r.status().as_u16(), 405, "no event streams");
+    assert_eq!(r.headers().get("allow").unwrap(), "POST");
+
+    let (status, headers, _) = mcp_post(&server, None, "", &[], &list);
+    assert_eq!(status, 401);
+    assert!(headers.get("www-authenticate").unwrap().to_str().unwrap().starts_with("Bearer"));
+    let (status, _, _) = mcp_post(&server, Some("bd_nope"), "", &[], &list);
+    assert_eq!(status, 401);
+
+    let host = server.base.trim_start_matches("http://").to_string();
+    let (status, _, e) = mcp_post(&server, Some(&secret), "", &[("origin", "https://evil.example")], &list);
+    assert_eq!((status, &e["error"]["code"]), (403, &json!(-32600)), "{e}");
+    let (status, _, _) = mcp_post(&server, Some(&secret), "", &[("origin", &format!("http://{host}"))], &list);
+    assert_eq!(status, 403, "a page whose name was rebound to the server");
+
+    let agent_post = |content_type: &str| {
+        let r = agent
+            .post(format!("{}/mcp", server.url()))
+            .header("authorization", bearer(&secret))
+            .content_type(content_type)
+            .send(list.to_string().as_bytes())
+            .unwrap();
+        r.status().as_u16()
+    };
+    assert_eq!(agent_post("text/plain"), 415, "a form a page may send without asking");
+    // Refused from its declared size, before its body is read.
+    let mut conn = std::net::TcpStream::connect(&host).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let auth = bearer(&secret);
+    write!(
+        conn,
+        "POST /w/proj/mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        2 << 20
+    )
+    .unwrap();
+    let mut status = String::new();
+    BufReader::new(&conn).read_line(&mut status).unwrap();
+    assert!(status.starts_with("HTTP/1.1 413"), "{status}");
+
+    let elsewhere = server.token("other-ws", "carol", &["--workspace", "other"]);
+    assert_eq!(mcp_post(&server, Some(&elsewhere), "", &[], &list).0, 403);
+
+    // A read token is offered the read tools, and runs nothing else.
+    let reader = server.token("dashboard", "dash", &["--role", "read"]);
+    let (_, _, r) = mcp_post(&server, Some(&reader), "", &[], &list);
+    let tools: Vec<&str> =
+        r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(tools.contains(&"ready") && !tools.contains(&"create"), "{tools:?}");
+    let (status, _, r) = mcp_post(&server, Some(&reader), "", &[], &mcp_tool_call("create", json!({ "title": "x" })));
+    assert_eq!((status, &r["error"]["code"]), (200, &json!(-32602)), "{r}");
+    let ready = mcp_http_call(&server, &reader, "", "ready", json!({}));
+    assert_eq!(ready, json!({}), "no ready work (empty lists are left out)");
+
+    // A person's token: its tool calls still may not open human gates.
+    let carol = server.token("carol-desk", "carol", &["--kind", "human"]);
+    let person = server.client(&carol);
+    person.ok(&["create", "Ship"]);
+    let gate = person.ok(&["-q", "gate", "create", "-t", "human", "--blocks", "t-1"]).trim().to_string();
+    let close = mcp_tool_call("close", json!({ "ids": [gate], "reason": "approved by the model" }));
+    let (status, _, r) = mcp_post(&server, Some(&carol), "", &[], &close);
+    assert_eq!(status, 200);
+    assert_eq!(mcp_tool_error(&r).unwrap()["code"], "unauthorized", "{r}");
+    assert_eq!(person.json(&["show", &gate])["status"], "open");
+}
+
+fn bearer(secret: &str) -> String {
+    ["Bearer", secret].join(" ")
+}
+
+#[test]
+fn mcp_over_http_keeps_the_tokens_claim_limit_and_other_actors_claims() {
+    let server = Server::start();
+    let secret = server.token("capped", "capped", &["--max-claims", "1"]);
+    let admin = server.token("ops", "ops", &["--role", "admin", "--kind", "human"]);
+    let ops = server.client(&admin);
+    ops.ok(&["create", "One"]);
+    ops.ok(&["create", "Two"]);
+
+    // The limit counts every session of the token's actor.
+    let claim = mcp_http_call(&server, &secret, "?session=a1", "claim", json!({ "id": "t-1" }));
+    assert_eq!(claim["issue"]["assignee"], "capped/a1");
+    let (_, _, r) =
+        mcp_post(&server, Some(&secret), "?session=a2", &[], &mcp_tool_call("claim", json!({ "id": "t-2" })));
+    let error = mcp_tool_error(&r).unwrap_or_else(|| panic!("a second claim: {r}"));
+    assert_eq!(error["exit_code"], 7, "{error}");
+    assert!(error["message"].as_str().unwrap().contains("at most 1"), "{error}");
+
+    // An admin's tool calls cannot end another actor's claim, as its command line can.
+    let close = mcp_tool_call("close", json!({ "ids": ["t-1"], "reason": "mine now" }));
+    let (_, _, r) = mcp_post(&server, Some(&admin), "", &[], &close);
+    assert_eq!(mcp_tool_error(&r).unwrap()["code"], "unauthorized", "{r}");
+    let release = mcp_tool_call("release", json!({ "id": "t-1" }));
+    let (_, _, r) = mcp_post(&server, Some(&admin), "", &[], &release);
+    assert!(mcp_tool_error(&r).is_some(), "{r}");
+    assert_eq!(ops.json(&["show", "t-1"])["assignee"], "capped/a1");
+    ops.ok(&["close", "t-1", "--reason", "taken over by ops", "--take-over"]);
+}
+
+/// GET `<base><path>` without a token: status and JSON body.
+fn get_json(base: &str, path: &str) -> (u16, Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let mut r = agent.get(format!("{base}{path}")).call().unwrap();
+    let text = r.body_mut().read_to_string().unwrap();
+    (r.status().as_u16(), serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+fn challenge_of(headers: &ureq::http::HeaderMap) -> String {
+    headers.get("www-authenticate").unwrap().to_str().unwrap().to_string()
+}
+
+#[test]
+fn mcp_over_http_names_its_resource_and_binds_tokens_to_it() {
+    let server = Server::start();
+    let base = server.base.clone();
+    let resource = format!("{base}/w/proj/mcp");
+    let meta = |prefix: &str, name: &str| {
+        json!({ "resource": format!("{base}{prefix}/w/{name}/mcp"), "bearer_methods_supported": ["header"],
+            "resource_name": format!("bd workspace {name}") })
+    };
+    let well_known = "/.well-known/oauth-protected-resource";
+    assert_eq!(get_json(&base, &format!("{well_known}/w/proj/mcp")), (200, meta("", "proj")));
+    // Under a proxy's path prefix, on either side of the well-known part.
+    assert_eq!(get_json(&base, &format!("/bd{well_known}/w/proj/mcp")), (200, meta("/bd", "proj")));
+    assert_eq!(get_json(&base, &format!("{well_known}/bd/w/proj/mcp")), (200, meta("/bd", "proj")));
+    assert_eq!(get_json(&base, &format!("{well_known}/w/nope/mcp")), (200, meta("", "nope")), "no existence leak");
+    assert_eq!(get_json(&base, &format!("{well_known}/w/-x/mcp")).0, 404);
+
+    // Challenges point at the metadata; only a token sent gets an error code.
+    let metadata = format!("{base}{well_known}/w/proj/mcp");
+    let list = mcp_modern(1, "tools/list", json!({}));
+    let (status, headers, _) = mcp_post(&server, None, "", &[], &list);
+    assert_eq!((status, challenge_of(&headers)), (401, format!("Bearer resource_metadata=\"{metadata}\"")));
+    let (status, headers, _) = mcp_post(&server, Some("bd_nope"), "", &[], &list);
+    let challenge = challenge_of(&headers);
+    assert_eq!(status, 401);
+    assert!(challenge.starts_with("Bearer error=\"invalid_token\", error_description=\""), "{challenge}");
+    assert!(challenge.ends_with(&format!("resource_metadata=\"{metadata}\"")), "{challenge}");
+    let elsewhere = server.token("other-ws", "carol", &["--workspace", "other"]);
+    let (status, headers, _) = mcp_post(&server, Some(&elsewhere), "", &[], &list);
+    assert_eq!(status, 403);
+    assert!(challenge_of(&headers).starts_with("Bearer error=\"insufficient_scope\""), "{headers:?}");
+
+    // A token bound to the endpoint works there and nowhere else.
+    let bound = server.token("assistant", "alice", &["--resource", &resource]);
+    let (status, _, r) = mcp_post(&server, Some(&bound), "", &[], &list);
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(mcp_post(&server, Some(&bound), "?session=w2", &[], &list).0, 200, "under any session");
+    assert_eq!(server.client(&bound).code(&["list"]), 7, "CLI requests");
+    let listed = check(
+        bd(server.root.path())
+            .args(["serve", "token", "list", "--json", "--root"])
+            .arg(server.root.path())
+            .output()
+            .unwrap(),
+        "token list",
+    );
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    let token = listed.as_array().unwrap().iter().find(|t| t["name"] == "assistant").unwrap().clone();
+    assert_eq!((&token["resource"], &token["workspaces"]), (&json!(resource), &json!(["proj"])), "{token}");
+
+    let refused = |extra: &[&str]| {
+        let out = bd(server.root.path())
+            .args(["serve", "token", "create", "x", "--as", "x", "--root"])
+            .arg(server.root.path())
+            .args(extra)
+            .output()
+            .unwrap();
+        out.status.code()
+    };
+    assert_eq!(refused(&["--resource", &format!("{base}/w/proj")]), Some(2), "not an MCP endpoint");
+    assert_eq!(refused(&["--resource", &resource, "--workspace", "other"]), Some(2), "a workspace it may not use");
+
+    let bad = bd(server.root.path())
+        .args(["serve", "--listen", "127.0.0.1:0", "--public-url", "https://bd.example.com/?x", "--root"])
+        .arg(server.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2), "{}", String::from_utf8_lossy(&bad.stderr));
+
+    // With --public-url, endpoints are named by it whatever the request's Host.
+    let public = Server::start_with(&["--public-url", "https://BD.example.com/bd/"]);
+    let named = "https://bd.example.com/bd/w/proj/mcp";
+    let (_, body) = get_json(&public.base, &format!("{well_known}/w/proj/mcp"));
+    assert_eq!(body["resource"], named);
+    let (_, headers, _) = mcp_post(&public, None, "", &[], &list);
+    let expected = format!("Bearer resource_metadata=\"https://bd.example.com/bd{well_known}/w/proj/mcp\"");
+    assert_eq!(challenge_of(&headers), expected);
+    let there = public.token("assistant", "alice", &["--resource", named]);
+    assert_eq!(mcp_post(&public, Some(&there), "", &[], &list).0, 200);
+    let local = public.token("local", "alice", &["--resource", &format!("{}/w/proj/mcp", public.base)]);
+    let (status, headers, _) = mcp_post(&public, Some(&local), "", &[], &list);
+    assert_eq!(status, 401, "bound to another URL");
+    assert!(challenge_of(&headers).starts_with("Bearer error=\"invalid_token\""));
+}
+
+#[test]
+fn mcp_over_http_works_under_a_proxy_prefix_and_retries_are_not_deduplicated() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    alice.ok(&["create", "Design"]);
+
+    // A proxy serving bd under /bd without stripping it: the endpoint and its challenge keep the prefix.
+    let endpoint = format!("{}/bd/w/proj/mcp?session=p", server.base);
+    let ready = mcp_tool_call("ready", json!({}));
+    let (status, _, r) = mcp_post_to(&endpoint, Some(&secret), &[], &ready);
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["result"]["content"][0]["text"].as_str().map(|t| t.contains("t-1")), Some(true), "{r}");
+    let (status, headers, _) = mcp_post_to(&endpoint, None, &[], &ready);
+    let metadata = format!("{}/bd/.well-known/oauth-protected-resource/w/proj/mcp", server.base);
+    assert_eq!((status, challenge_of(&headers)), (401, format!("Bearer resource_metadata=\"{metadata}\"")));
+    assert_eq!(get_json(&metadata, "").1["resource"], format!("{}/bd/w/proj/mcp", server.base));
+
+    // MCP carries no request id to deduplicate by: a retried tool call runs again.
+    let twice = || mcp_http_call(&server, &secret, "", "create", json!({ "title": "Twice" }))["id"].clone();
+    assert_eq!((twice(), twice()), (json!("t-2"), json!("t-3")), "a retried create creates again");
+    let claimed = mcp_http_call(&server, &secret, "", "claim", json!({ "id": "t-1" }));
+    let (_, _, again) = mcp_post(&server, Some(&secret), "", &[], &mcp_tool_call("claim", json!({ "id": "t-1" })));
+    let error = mcp_tool_error(&again).unwrap();
+    assert_eq!(
+        (&error["code"], error["message"].as_str().map(|m| m.contains("alice/mcp"))),
+        (&json!("already_claimed"), Some(true))
+    );
+    assert!(claimed["lease"]["token"].is_number());
+    // Its holder still ends the claim without the lost lease token.
+    let released = mcp_http_call(&server, &secret, "", "release", json!({ "id": "t-1" }));
+    assert_eq!(released["status"], "open", "{released}");
+    let reclaimed = mcp_http_call(&server, &secret, "", "claim", json!({ "id": "t-1" }));
+    assert_eq!(reclaimed["issue"]["assignee"], "alice/mcp", "{reclaimed}");
+    let closed = mcp_http_call(&server, &secret, "", "close", json!({ "ids": ["t-1"], "reason": "done" }));
+    assert_eq!(closed["issue"]["status"], "closed", "{closed}");
+    for already in [false, true] {
+        let closed = mcp_http_call(&server, &secret, "", "close", json!({ "ids": ["t-2"], "reason": "duplicate" }));
+        assert_eq!(closed["already_closed"], already, "{closed}");
+    }
+}

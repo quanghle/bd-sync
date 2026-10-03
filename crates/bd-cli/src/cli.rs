@@ -1306,6 +1306,10 @@ pub struct ServeArgs {
     /// The longest a request waits for new events: keep it below the idle timeout of proxies in front
     #[arg(long, default_value = "25s", value_name = "DURATION")]
     pub max_wait: String,
+    /// The URL clients reach the server at, path prefix included (https://bd.example.com/bd): MCP endpoints name
+    /// themselves by it. Default: the request's Host, its path prefix, and https with --tls-cert
+    #[arg(long, env = "BD_SERVE_PUBLIC_URL", value_name = "URL")]
+    pub public_url: Option<String>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1353,6 +1357,10 @@ pub struct TokenCreateArgs {
     /// The most issues its actor and its agents may hold, claimed or reserved (default no limit)
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub max_claims: Option<u32>,
+    /// Bind the token to one workspace's MCP endpoint, as clients reach it (https://<host>[/<prefix>]/w/<name>/mcp):
+    /// refused anywhere else, CLI requests included
+    #[arg(long, value_name = "URL")]
+    pub resource: Option<String>,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }

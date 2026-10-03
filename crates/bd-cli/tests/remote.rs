@@ -32,6 +32,7 @@ fn bd(dir: &Path) -> Command {
         "BD_CA_CERT",
         "BD_INSECURE_HTTP",
         "BD_SERVE_ROOT",
+        "BD_SERVE_PUBLIC_URL",
         "BD_PLAYBOOK_PATH",
         "BD_GH",
         "BD_TIMING",
@@ -6164,4 +6165,86 @@ fn mcp_over_http_works_under_a_proxy_prefix_and_retries_are_not_deduplicated() {
         let closed = mcp_http_call(&server, &secret, "", "close", json!({ "ids": ["t-2"], "reason": "duplicate" }));
         assert_eq!(closed["already_closed"], already, "{closed}");
     }
+}
+
+/// A server root whose `auth.toml` signs in with the GitHub App `Iv1.test`
+/// and turns on the authorization server with `oauth` (the `[oauth]` body).
+fn oauth_root(oauth: &str) -> TempDir {
+    let root = Server::prepare();
+    std::fs::write(root.path().join("app.pem"), include_str!("fixtures/github-app.pem")).unwrap();
+    let config = format!(
+        "[github]\nclient_id = \"Iv1.test\"\nprivate_key = \"app.pem\"\n[[github.allow]]\nusers = [\"alice\"]\n\n[oauth]\n{oauth}"
+    );
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    root
+}
+
+#[test]
+fn the_authorization_server_publishes_its_metadata_at_its_issuer() {
+    let server = Server::launch(
+        oauth_root("redirect_hosts = [\"chatgpt.com\"]\n"),
+        "127.0.0.1:0",
+        &["--public-url", "https://BD.example.com/bd/"],
+    );
+    let issuer = "https://bd.example.com/bd";
+    let (status, meta) = get_json(&server.base, "/.well-known/oauth-authorization-server/bd");
+    assert_eq!(status, 200, "{meta}");
+    assert_eq!(meta["issuer"], issuer);
+    assert_eq!(meta["authorization_endpoint"], format!("{issuer}/oauth/authorize"));
+    assert_eq!(meta["token_endpoint"], format!("{issuer}/oauth/token"));
+    assert_eq!(meta["code_challenge_methods_supported"], json!(["S256"]));
+    assert_eq!(meta["client_id_metadata_document_supported"], true);
+    // A proxy forwarding the path as clients send it, prefix and all.
+    assert_eq!(get_json(&server.base, "/bd/.well-known/oauth-authorization-server/bd").0, 404);
+    for other in ["/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/x"] {
+        assert_eq!(get_json(&server.base, other).0, 404, "{other}");
+    }
+    let (_, resource) = get_json(&server.base, "/.well-known/oauth-protected-resource/w/proj/mcp");
+    assert_eq!(resource["authorization_servers"], json!([issuer]), "{resource}");
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let posted = agent.post(format!("{}/.well-known/oauth-authorization-server/bd", server.base)).send("").unwrap();
+    assert_eq!(posted.status().as_u16(), 405);
+    assert_eq!(posted.headers().get("allow").unwrap(), "GET");
+
+    // auth.toml is read for each request: a broken one shows as a 500 naming nothing.
+    std::fs::write(server.root.path().join("auth.toml"), "[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n").unwrap();
+    for path in ["/.well-known/oauth-authorization-server/bd", "/.well-known/oauth-protected-resource/w/proj/mcp"] {
+        let (status, body) = get_json(&server.base, path);
+        assert_eq!(status, 500, "{path}");
+        let message = body["error"]["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains("see the server log") && !message.contains("auth.toml"), "{body}");
+    }
+    // Without [oauth], no authorization server and no authorization_servers.
+    std::fs::remove_file(server.root.path().join("auth.toml")).unwrap();
+    assert_eq!(get_json(&server.base, "/.well-known/oauth-authorization-server/bd").0, 404);
+    let (status, resource) = get_json(&server.base, "/.well-known/oauth-protected-resource/w/proj/mcp");
+    assert_eq!((status, resource.get("authorization_servers")), (200, None), "{resource}");
+}
+
+#[test]
+fn the_authorization_server_needs_a_public_url_it_can_be_named_by() {
+    for (extra, expected) in [
+        (&[][..], "--public-url"),
+        (&["--public-url", "http://bd.example.com"][..], "https"),
+        (&["--public-url", "https://bd.example.com/bd?x=1"][..], "--public-url"),
+    ] {
+        let root = oauth_root("loopback_redirects = true\n");
+        let out = bd(root.path())
+            .args(["serve", "--root"])
+            .arg(root.path())
+            .args(["--listen", "127.0.0.1:0"])
+            .args(extra)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}: {stderr}");
+        assert!(stderr.contains(expected), "{extra:?}: {stderr}");
+    }
+    // Over http on this machine, for trying it out.
+    let server = Server::launch(
+        oauth_root("loopback_redirects = true\n"),
+        "127.0.0.1:0",
+        &["--public-url", "http://127.0.0.1:1"],
+    );
+    assert_eq!(get_json(&server.base, "/.well-known/oauth-authorization-server").1["issuer"], "http://127.0.0.1:1");
 }

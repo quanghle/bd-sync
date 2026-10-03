@@ -303,14 +303,19 @@ pub fn metadata_url(base: &str, name: &str) -> String {
 }
 
 /// The protected resource metadata (RFC 9728) of workspace `name`'s
-/// endpoint. It names no authorization server: tokens come from the
-/// server's admin (`bd serve token create`) or GitHub sign-in.
-pub fn metadata(base: &str, name: &str) -> Value {
-    json!({
+/// endpoint, naming the server's authorization server if it runs one
+/// (`oauth_server.rs`); without it, tokens come from the server's admin
+/// (`bd serve token create`) or GitHub sign-in.
+pub fn metadata(base: &str, name: &str, issuer: Option<&str>) -> Value {
+    let mut m = json!({
         "resource": resource(base, name),
         "bearer_methods_supported": ["header"],
         "resource_name": format!("bd workspace {name}"),
-    })
+    });
+    if let Some(issuer) = issuer {
+        m["authorization_servers"] = json!([issuer]);
+    }
+    m
 }
 
 /// A `WWW-Authenticate` challenge (RFC 6750) pointing at the metadata, if
@@ -532,9 +537,10 @@ mod tests {
         let base = "https://h/bd";
         assert_eq!(metadata_url(base, "p"), "https://h/bd/.well-known/oauth-protected-resource/w/p/mcp");
         assert_eq!(
-            metadata(base, "p"),
+            metadata(base, "p", None),
             json!({"resource": "https://h/bd/w/p/mcp", "bearer_methods_supported": ["header"], "resource_name": "bd workspace p"})
         );
+        assert_eq!(metadata(base, "p", Some("https://h/bd"))["authorization_servers"], json!(["https://h/bd"]));
     }
 
     #[test]

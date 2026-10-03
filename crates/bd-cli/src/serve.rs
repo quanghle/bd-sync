@@ -75,12 +75,12 @@ use crate::follow::{self, Feeds, HeadReader, Subscription};
 use crate::io::{self, Capture};
 use crate::jobs;
 use crate::mcp::{self, Ran, http as mcp_http};
-use crate::oauth;
 use crate::protocol::{
     ErrorBody, ErrorDetail, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, PROTOCOL, PROTOCOL_HEADER,
     RefreshRequest, RevokeAnswer, SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
 };
 use crate::stream::{FrameWriter, Limits, ResponseBody, Stalls};
+use crate::{oauth, oauth_server};
 
 /// Commands running at once; further requests wait for a slot.
 const MAX_RUNNING: usize = 32;
@@ -202,6 +202,16 @@ fn run(a: &ServeArgs) -> Result<()> {
         .map_err(|e| Error::invalid(format!("--public-url {e}")))?;
     // Checked now so that a mistake shows at once; each sign-in reads the file again.
     if let Some(github) = oauth::load(&root)? {
+        if let Some(o) = &github.oauth {
+            let issuer = oauth_server::issuer(public_url.as_deref()).map_err(Error::invalid)?;
+            tracing::info!(
+                target: "bd::serve",
+                %issuer,
+                redirect_hosts = %o.redirect_hosts.join(","),
+                loopback_redirects = o.loopback_redirects,
+                "OAuth sign-in for MCP clients is on"
+            );
+        }
         let shown = |d: Duration| bd_core::time::format_duration_ms(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
         match &github.app {
             Some(_) => tracing::info!(
@@ -489,6 +499,14 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
         }
     } else if path.contains(mcp_http::WELL_KNOWN) {
         Reject::new(StatusCode::NOT_FOUND, "not_found", "no such protected resource", 3).response()
+    } else if path.contains(oauth_server::WELL_KNOWN) {
+        if req.method() == Method::GET {
+            authorization_server_metadata(&server, &path)
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
+            r
+        }
     } else if let Some((prefix, workspace)) = mcp_path(&path) {
         if req.method() == Method::POST {
             let endpoint = Endpoint::of(&server, prefix, workspace, &req);
@@ -950,11 +968,6 @@ async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -
     }
 }
 
-/// One MCP message for `workspace` (Streamable HTTP, see `mcp/http.rs`):
-/// its tool calls run as [`Server::run`] runs a command line, on a blocking
-/// thread with a command slot, acting as `<token actor>/mcp` (or
-/// `/<session>` with `?session=<session>`), without the token's rights over
-/// other actors' claims and human gates.
 /// A workspace's MCP endpoint, as a request reached it.
 struct Endpoint {
     workspace: String,
@@ -989,12 +1002,41 @@ impl Endpoint {
 /// The protected resource metadata of a workspace's MCP endpoint (RFC 9728).
 /// It needs no token, and says nothing of whether the workspace exists.
 fn resource_metadata<B>(server: &Server, prefix: &str, workspace: &str, req: &Request<B>) -> Response<Body> {
+    let issuer = match server.issuer() {
+        Ok(issuer) => issuer,
+        Err(e) => return sign_in_misconfigured(&e),
+    };
     match server.base_url(req.headers(), req.uri(), prefix) {
-        Some(base) => json_response(StatusCode::OK, &mcp_http::metadata(&base, workspace)),
+        Some(base) => json_response(StatusCode::OK, &mcp_http::metadata(&base, workspace, issuer.as_deref())),
         None => Reject::new(StatusCode::BAD_REQUEST, "invalid", "the request's Host header is not valid", 2).response(),
     }
 }
 
+/// The metadata of the server's authorization server (RFC 8414), at the
+/// path its issuer gives. It needs no token.
+fn authorization_server_metadata(server: &Server, path: &str) -> Response<Body> {
+    match server.issuer() {
+        Ok(Some(issuer)) if path == oauth_server::metadata_path(&issuer) => {
+            json_response(StatusCode::OK, &oauth_server::metadata(&issuer))
+        }
+        Ok(_) => Reject::new(StatusCode::NOT_FOUND, "not_found", "no such authorization server", 3).response(),
+        Err(e) => sign_in_misconfigured(&e),
+    }
+}
+
+/// `auth.toml` or `--public-url` do not let sign-in work: the details go
+/// to the log, not to whoever asked.
+fn sign_in_misconfigured(e: &str) -> Response<Body> {
+    tracing::error!(target: "bd::serve", error = %e, "sign-in is misconfigured");
+    let msg = "the server's sign-in settings are not valid; see the server log";
+    Reject::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg, 1).response()
+}
+
+/// One MCP message for `workspace` (Streamable HTTP, see `mcp/http.rs`):
+/// its tool calls run as [`Server::run`] runs a command line, on a blocking
+/// thread with a command slot, acting as `<token actor>/mcp` (or
+/// `/<session>` with `?session=<session>`), without the token's rights over
+/// other actors' claims and human gates.
 async fn mcp(server: &Arc<Server>, endpoint: Endpoint, req: Request<Incoming>) -> Response<Body> {
     let started = Instant::now();
     if let Err(a) = mcp_http::check_origin(req.headers()) {
@@ -1467,6 +1509,17 @@ impl Server {
             stopping: watch::Sender::new(false),
             public_url: None,
             https: false,
+        }
+    }
+
+    /// The issuer of the server's authorization server, if `auth.toml` turns
+    /// it on (read for each request, as sign-ins do); an error if `auth.toml`
+    /// is not valid or `--public-url` cannot be an issuer.
+    fn issuer(&self) -> std::result::Result<Option<String>, String> {
+        match oauth::load_oauth(&self.root) {
+            Ok(Some(_)) => oauth_server::issuer(self.public_url.as_deref()).map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.to_string()),
         }
     }
 

@@ -16,6 +16,7 @@ mod jobs;
 mod logging;
 mod mcp;
 mod oauth;
+mod oauth_server;
 mod paths;
 mod playbooks;
 mod protocol;

@@ -28,6 +28,10 @@
 //! workspaces = ["oss"]
 //! min_account_age = "30d"             # GitHub accounts younger than this are not let in by the rule
 //! max_claims = 3                      # its tokens' actors may hold at most 3 issues, claimed or reserved
+//!
+//! [oauth]                             # MCP clients sign people in with OAuth (oauth_server.rs)
+//! redirect_hosts = ["chatgpt.com", "claude.ai"]  # https redirect URIs on these hosts, without a port
+//! loopback_redirects = true           # and http://127.0.0.1, [::1] or localhost on any port (desktop clients)
 //! ```
 //!
 //! The server runs GitHub's device flow for the client, so the GitHub token
@@ -55,6 +59,12 @@
 //! signed in for, the sign-in gets new secrets with what the first matching
 //! rule grants now; if not, it is revoked. A refresh secret works once: one
 //! used again revokes the sign-in, as someone else may hold a copy.
+//!
+//! `[oauth]` makes `bd serve` an OAuth authorization server for MCP
+//! clients, such as ChatGPT, that sign people in with OAuth rather than
+//! send a token they were given: people sign in with GitHub under the same
+//! rules, and their tokens last and are refreshed as `[github]` says, so it
+//! needs `private_key`. The server's `--public-url` is its issuer.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -98,6 +108,17 @@ const MAX_CODE_LIFE: u64 = 3600;
 struct Doc {
     #[serde(default)]
     github: Option<GithubDoc>,
+    #[serde(default)]
+    oauth: Option<OauthDoc>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OauthDoc {
+    #[serde(default)]
+    redirect_hosts: Vec<String>,
+    #[serde(default)]
+    loopback_redirects: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +192,85 @@ pub struct Github {
     /// GitHub user ids that may never sign in, whatever the rules say.
     pub deny: Vec<u64>,
     pub rules: Vec<Rule>,
+    /// The authorization server for MCP clients, if `[oauth]` turns it on.
+    pub oauth: Option<OauthConfig>,
+}
+
+/// `[oauth]`: where the authorization server may send people back to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OauthConfig {
+    /// Hosts of https redirect URIs, lowercased.
+    pub redirect_hosts: Vec<String>,
+    /// Whether http redirect URIs to this machine are allowed (desktop clients).
+    pub loopback_redirects: bool,
+}
+
+impl OauthConfig {
+    /// Whether a client may be sent back to `uri`: https on one of
+    /// `redirect_hosts` without a port, or, with `loopback_redirects`, http to
+    /// 127.0.0.1, [::1] or localhost on any port (RFC 8252). Never with user
+    /// info or a fragment.
+    #[cfg_attr(not(test), expect(dead_code, reason = "client registration and authorization check redirect URIs"))]
+    pub fn allows_redirect(&self, uri: &str) -> bool {
+        let Some((scheme, rest)) = uri.split_once("://") else { return false };
+        if uri.contains('#') || uri.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return false;
+        }
+        let authority = &rest[..rest.find(['/', '?']).unwrap_or(rest.len())];
+        if !authority.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']')) {
+            return false;
+        }
+        let (host, port) = match authority.rfind(':') {
+            Some(i) if !authority[i..].contains(']') => (&authority[..i], Some(&authority[i + 1..])),
+            _ => (authority, None),
+        };
+        let host = host.to_ascii_lowercase();
+        match scheme {
+            "https" => port.is_none() && self.redirect_hosts.contains(&host),
+            "http" => {
+                self.loopback_redirects
+                    && matches!(host.as_str(), "127.0.0.1" | "[::1]" | "localhost")
+                    && port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// A host name as `redirect_hosts` takes it: a DNS name of two labels or
+/// more, lowercased; no IP address, port or wildcard.
+fn redirect_host(raw: &str) -> Option<String> {
+    let host = raw.trim().to_ascii_lowercase();
+    let labels: Vec<&str> = host.split('.').collect();
+    let label = |l: &&str| {
+        (1..=63).contains(&l.len())
+            && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+    };
+    let numeric = labels.last().is_some_and(|l| l.bytes().all(|b| b.is_ascii_digit()));
+    (host.len() <= 253 && labels.len() >= 2 && labels.iter().all(label) && !numeric).then_some(host)
+}
+
+fn oauth_config(o: OauthDoc) -> std::result::Result<OauthConfig, String> {
+    let mut redirect_hosts = Vec::new();
+    for raw in &o.redirect_hosts {
+        let Some(host) = redirect_host(raw) else {
+            return Err(format!(
+                "oauth.redirect_hosts {raw:?} is not a host name such as chatgpt.com (loopback_redirects = true \
+                 allows this machine)"
+            ));
+        };
+        if !redirect_hosts.contains(&host) {
+            redirect_hosts.push(host);
+        }
+    }
+    if redirect_hosts.is_empty() && !o.loopback_redirects {
+        return Err("[oauth] allows no redirect URIs, so no client may sign anyone in: name redirect_hosts, or set \
+                    loopback_redirects = true"
+            .into());
+    }
+    Ok(OauthConfig { redirect_hosts, loopback_redirects: o.loopback_redirects })
 }
 
 /// One `[[github.allow]]` rule: whom it lets in, and what their token may do.
@@ -285,13 +385,32 @@ pub fn load(root: &Path) -> Result<Option<Github>> {
     Ok(Some(github))
 }
 
+/// The authorization server's settings in `<root>/auth.toml` (`[oauth]`),
+/// if it is on: `[github]` checked too, but not its private key, which
+/// sign-ins and refreshes read.
+pub fn load_oauth(root: &Path) -> Result<Option<OauthConfig>> {
+    let path = root.join(FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::invalid(format!("{}: {e}", path.display()))),
+    };
+    let github = parse(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
+    Ok(github.and_then(|g| g.oauth))
+}
+
 fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
     let doc: Doc = toml::from_str(text).map_err(|e| {
         // The parser's own text quotes the file, which may hold what should not be shown: name the line only.
         let line = e.span().map(|s| text.as_bytes()[..s.start.min(text.len())].iter().filter(|&&b| b == b'\n').count());
         format!("{}{}", line.map(|n| format!("line {}: ", n + 1)).unwrap_or_default(), e.message().trim_end())
     })?;
-    let Some(g) = doc.github else { return Ok(None) };
+    let Some(g) = doc.github else {
+        return match doc.oauth {
+            Some(_) => Err("[oauth] signs people in with GitHub, so it needs [github]".into()),
+            None => Ok(None),
+        };
+    };
     let client_id = g.client_id.trim().to_string();
     if client_id.is_empty() || client_id.len() > 100 || !client_id.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(format!(
@@ -369,6 +488,12 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
             ));
         }
     }
+    let oauth = doc.oauth.map(oauth_config).transpose()?;
+    if oauth.is_some() && private_key.is_none() {
+        return Err("[oauth] needs github.private_key: MCP clients' tokens are refreshed through the GitHub App, or \
+                    people would sign in again each token_ttl"
+            .into());
+    }
     Ok(Some(Github {
         client_id,
         url,
@@ -380,6 +505,7 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
         refresh_idle,
         deny: g.deny,
         rules,
+        oauth,
     }))
 }
 
@@ -1263,6 +1389,77 @@ mod tests {
             "[github]\nclient_id = \"x\"\n[[github.allow]]\norgs = [\"acme\"]\nmax_claims = 2\n[[github.allow]]\nanyone = true\n",
         );
         assert_eq!(g.rules[0].grant.max_claims, Some(2), "strangers who only read hold nothing to compare with");
+    }
+
+    #[test]
+    fn auth_toml_turns_the_authorization_server_on() {
+        let github = "[github]\nclient_id = \"Iv1.x\"\nprivate_key = \"app.pem\"\n[[github.allow]]\nusers = [\"a\"]\n";
+        assert_eq!(parse(github).unwrap().unwrap().oauth, None, "off without [oauth]");
+        let g =
+            parse(&format!("{github}[oauth]\nredirect_hosts = [\" ChatGPT.com \", \"claude.ai\", \"chatgpt.com\"]\n"))
+                .unwrap()
+                .unwrap();
+        let o = g.oauth.unwrap();
+        assert_eq!(o.redirect_hosts, ["chatgpt.com", "claude.ai"], "lowercased, once each");
+        assert!(!o.loopback_redirects);
+        let o = parse(&format!("{github}[oauth]\nloopback_redirects = true\n")).unwrap().unwrap().oauth.unwrap();
+        assert!(o.redirect_hosts.is_empty() && o.loopback_redirects);
+
+        assert!(error("[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n").contains("needs [github]"));
+        let no_key = "[github]\nclient_id = \"x\"\n[[github.allow]]\nusers = [\"a\"]\n";
+        assert!(error(&format!("{no_key}[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n")).contains("private_key"));
+        assert!(error(&format!("{github}[oauth]\n")).contains("allows no redirect URIs"));
+        for bad in
+            ["localhost", "127.0.0.1", "*.example.com", "chatgpt.com:443", "-a.com", "a..com", "https://a.com", ""]
+        {
+            let e = error(&format!("{github}[oauth]\nredirect_hosts = [\"{bad}\"]\n"));
+            assert!(e.contains("is not a host name"), "{bad}: {e}");
+        }
+        assert!(error(&format!("{github}[oauth]\nissuer = \"https://x\"\n")).contains("unknown field"));
+    }
+
+    #[test]
+    fn redirects_go_to_the_allowed_hosts_and_maybe_this_machine() {
+        let hosts = OauthConfig { redirect_hosts: vec!["chatgpt.com".into()], loopback_redirects: false };
+        for ok in [
+            "https://chatgpt.com/connector_platform_oauth_redirect",
+            "https://ChatGPT.com/connector/oauth/abc?x=1",
+            "https://chatgpt.com",
+        ] {
+            assert!(hosts.allows_redirect(ok), "{ok}");
+        }
+        for bad in [
+            "http://chatgpt.com/cb",
+            "HTTPS://chatgpt.com/cb",
+            "https://chatgpt.com:8443/cb",
+            "https://chatgpt.com.evil.example/cb",
+            "https://evil.example/https://chatgpt.com/",
+            "https://user@chatgpt.com/cb",
+            "https://evil.example\\@chatgpt.com/cb",
+            "https://chatgpt.com/cb#frag",
+            "https://chatgpt.com/c b",
+            "http://127.0.0.1:3000/callback",
+            "chatgpt.com/cb",
+            "javascript://chatgpt.com/%0aalert(1)",
+        ] {
+            assert!(!hosts.allows_redirect(bad), "{bad}");
+        }
+        let loopback = OauthConfig { redirect_hosts: vec![], loopback_redirects: true };
+        for ok in
+            ["http://127.0.0.1:3000/callback", "http://localhost:33418/cb", "http://[::1]:9/cb", "http://127.0.0.1/cb"]
+        {
+            assert!(loopback.allows_redirect(ok), "{ok}");
+        }
+        for bad in [
+            "https://127.0.0.1:3000/callback",
+            "http://127.0.0.2/cb",
+            "http://localhost.evil.example/cb",
+            "http://localhost:99999x/cb",
+            "http://localhost:/cb",
+            "https://chatgpt.com/cb",
+        ] {
+            assert!(!loopback.allows_redirect(bad), "{bad}");
+        }
     }
 
     const TEST_KEY: &str = include_str!("../tests/fixtures/github-app.pem");

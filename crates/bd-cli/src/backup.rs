@@ -37,12 +37,18 @@ pub struct Taken {
 /// Back up `store` into `<base>/<name>/`, keeping the newest `keep` backups of
 /// `name` there (0 keeps all), the new one included whatever its date.
 pub fn take(store: &Store, base: &Path, name: &str, keep: usize) -> Result<Taken> {
+    take_with(base, name, keep, |tmp| store.snapshot(tmp))
+}
+
+/// [`take`] of a database `snapshot` copies to the path it is given (one
+/// that does not exist): `bd serve`'s `server.db` too.
+pub fn take_with(base: &Path, name: &str, keep: usize, snapshot: impl FnOnce(&Path) -> Result<()>) -> Result<Taken> {
     let dir = base.join(name);
     create_private_dir(&dir)?;
     remove_unfinished(&dir, name);
     let file_name = format!("{name}-{}.db", chrono::Utc::now().format(STAMP));
     let (tmp, file) = (dir.join(format!("{file_name}.tmp")), dir.join(&file_name));
-    store.snapshot(&tmp)?;
+    snapshot(&tmp)?;
     std::fs::rename(&tmp, &file).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;

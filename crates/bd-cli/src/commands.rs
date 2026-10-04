@@ -149,20 +149,7 @@ pub fn exec_create(tx: &mut WriteCtx<'_>, a: &CreateArgs) -> Result<Out> {
     Ok(out.id(issue.id))
 }
 
-/// `--force` on `update` and `release`, where it once meant a takeover: refused
-/// rather than ignored, since only `--take-over` takes over a claim.
-fn refuse_force(command: &str, force: bool) -> Result<()> {
-    if force {
-        return Err(Error::invalid(format!(
-            "`bd {command} --force` is not accepted: --force never takes over a claim. Pass --take-over to take over \
-             another actor's claim deliberately (recorded in the event history), or drop --force"
-        )));
-    }
-    Ok(())
-}
-
 pub fn exec_update(tx: &mut WriteCtx<'_>, a: &UpdateArgs) -> Result<Out> {
-    refuse_force("update", a.force)?;
     let id = tx.resolve_id(&a.id)?;
     let now = tx.now();
     let patch = IssuePatch {
@@ -474,7 +461,6 @@ pub fn exec_heartbeat(tx: &mut WriteCtx<'_>, a: &HeartbeatArgs) -> Result<Out> {
 }
 
 pub fn exec_release(tx: &mut WriteCtx<'_>, a: &ReleaseArgs) -> Result<Out> {
-    refuse_force("release", a.force)?;
     let opts = ReleaseOptions {
         reason: a.reason.clone(),
         take_over: a.take_over,

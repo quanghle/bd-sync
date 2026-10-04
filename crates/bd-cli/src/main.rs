@@ -2,6 +2,7 @@ mod actor;
 mod agents;
 mod app;
 mod auth;
+mod authorizer;
 mod backup;
 mod batch;
 mod bench;
@@ -15,12 +16,16 @@ mod hook;
 mod io;
 mod jobs;
 mod logging;
+mod mcp;
 mod oauth;
+mod oauth_server;
+mod oidc;
 mod paths;
 mod playbooks;
 mod protocol;
 mod remote;
 mod serve;
+mod server_db;
 mod stream;
 
 use bd_core::{Error, Result};
@@ -71,6 +76,7 @@ fn always_local(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::Serve(_)
+            | Command::Mcp(_)
             | Command::Remote(_)
             | Command::Backup(_)
             | Command::Hook(_)
@@ -101,6 +107,7 @@ fn execute(app: &mut App, cmd: &Command) -> i32 {
                 | Command::Bench(_)
                 | Command::BenchWorker(_)
                 | Command::Serve(_)
+                | Command::Mcp(_)
                 | Command::Remote(_)
                 | Command::Hook(_)
                 | Command::Agents(cli::AgentsCommand::Approve(_) | cli::AgentsCommand::Watch(_))
@@ -270,6 +277,7 @@ fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Bench(a) => bench::cmd_bench(app, a).map(|_| 0),
         Command::BenchWorker(a) => bench::cmd_bench_worker(a).map(|_| 0),
         Command::Serve(a) => serve::cmd_serve(app, a).map(|_| 0),
+        Command::Mcp(a) => mcp::cmd_mcp(app, a),
         Command::Remote(c) => remote::cmd_remote(app, c),
         Command::Info => cmd_info(app).map(|_| 0),
         Command::Version => {
@@ -328,6 +336,7 @@ fn command_name(cmd: &Command) -> &'static str {
         Command::Agents(_) => "agents",
         Command::Bench(_) | Command::BenchWorker(_) => "bench",
         Command::Serve(_) => "serve",
+        Command::Mcp(_) => "mcp",
         Command::Remote(_) => "remote",
         Command::Info => "info",
         Command::Version => "version",

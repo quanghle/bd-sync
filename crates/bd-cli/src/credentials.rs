@@ -12,7 +12,7 @@
 //! [workspaces."https://bd.example.com/w/other"]
 //! token = "bdt_..."
 //! ca = "sha256:..."
-//! github = true    # from GitHub sign-in: revoked on its server at logout
+//! signed_in = true # from signing in: revoked on its server at logout
 //! refresh_token = "bdr_..."                 # where the server refreshes sign-ins
 //! refresh_after = "2026-10-02T19:20:00.000Z" # this machine's clock
 //! expires_at = "2026-10-02T19:30:00.000Z"
@@ -69,10 +69,10 @@ struct File {
 struct Entry {
     token: String,
     ca: String,
-    /// From GitHub sign-in (`bd remote login --github`): logging out, or
+    /// From signing in (`bd remote login --provider`): logging out, or
     /// saving another token in its place, revokes it on its server.
     #[serde(default, skip_serializing_if = "is_false")]
-    github: bool,
+    signed_in: bool,
     /// The sign-in's refresh token, where its server refreshes tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refresh_token: Option<String>,
@@ -204,7 +204,7 @@ pub struct Gone {
     /// What the server's certificate was trusted against when it was saved.
     pub ca: String,
     /// It came from GitHub sign-in.
-    pub github: bool,
+    pub signed_in: bool,
     /// How it was renewed, if it was: its refresh token revokes the sign-in
     /// even when a refresh whose answer was lost replaced the access token.
     pub renewal: Option<Renewal>,
@@ -213,13 +213,17 @@ pub struct Gone {
 impl std::fmt::Debug for Gone {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never the secret.
-        f.debug_struct("Gone").field("key", &self.key).field("ca", &self.ca).field("github", &self.github).finish()
+        f.debug_struct("Gone")
+            .field("key", &self.key)
+            .field("ca", &self.ca)
+            .field("signed_in", &self.signed_in)
+            .finish()
     }
 }
 
 impl Gone {
     fn new(key: String, entry: Entry) -> Gone {
-        Gone { key, renewal: entry.renewal(), token: entry.token, ca: entry.ca, github: entry.github }
+        Gone { key, renewal: entry.renewal(), token: entry.token, ca: entry.ca, signed_in: entry.signed_in }
     }
 }
 
@@ -326,21 +330,21 @@ pub fn check_token(token: &str) -> Result<()> {
 
 /// Save `token` for `url`'s server, or for the workspace only, with the
 /// trust it was checked under (`ca`: [`SYSTEM_CA`] or `sha256:<hex>`),
-/// whether it came from GitHub sign-in, and how it is renewed.
+/// whether it came from signing in, and how it is renewed.
 pub fn save(
     path: &Path,
     url: &str,
     token: &str,
     ca: &str,
     scope: Scope,
-    github: bool,
+    signed_in: bool,
     renewal: Option<&Renewal>,
 ) -> Result<SaveReport> {
     check_token(token)?;
     let keys = keys(url)?;
     let _held = lock(path, LOCK_WAIT)?;
     let (mut file, loose_mode) = load(path)?.unwrap_or_default();
-    let mut entry = Entry { token: token.to_string(), ca: ca.to_string(), github, ..Entry::default() };
+    let mut entry = Entry { token: token.to_string(), ca: ca.to_string(), signed_in, ..Entry::default() };
     entry.set_renewal(renewal);
     let report = match scope {
         Scope::Server => {
@@ -561,13 +565,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("credentials.toml");
         save(&path, "https://h/w/a", "bdt_gh", SYSTEM_CA, Scope::Server, true, None).unwrap();
-        assert!(std::fs::read_to_string(&path).unwrap().contains("github = true"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("signed_in = true"));
         let r = save(&path, "https://h/w/a", "bdt_admin", SYSTEM_CA, Scope::Server, false, None).unwrap();
         let replaced = r.replaced.unwrap();
-        assert!(replaced.github && replaced.token == "bdt_gh");
-        assert!(!std::fs::read_to_string(&path).unwrap().contains("github"), "only sign-in tokens say so");
+        assert!(replaced.signed_in && replaced.token == "bdt_gh");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("signed_in"), "only sign-in tokens say so");
         let r = remove(&path, "https://h", false).unwrap();
-        assert!(!r.removed[0].github && r.removed[0].token == "bdt_admin");
+        assert!(!r.removed[0].signed_in && r.removed[0].token == "bdt_admin");
     }
 
     #[test]
@@ -598,7 +602,7 @@ mod tests {
         );
         renewed(&held, &path, "https://h", "bdt_next", None).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("github = true") && !text.contains("refresh"), "{text}");
+        assert!(text.contains("signed_in = true") && !text.contains("refresh"), "{text}");
         renewed(&held, &path, "https://gone", "bdt_x", None).unwrap();
         assert!(lookup_key(&held, &path, "https://gone").unwrap().is_none(), "nothing written for an entry gone");
         drop(held);

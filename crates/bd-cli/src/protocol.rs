@@ -34,10 +34,10 @@
 //! errors. Every answer carries the [`PROTOCOL_HEADER`], which tells bd
 //! serve's own answers apart from a proxy's.
 //!
-//! GitHub sign-in (`bd remote login --github`, see `oauth.rs`) has two
+//! GitHub sign-in (`bd remote login --provider github`, see `oauth/`) has two
 //! endpoints of its own on the server, outside any workspace and without a
-//! token: `POST <server>/v2/auth/github/device` ([`SignInStart`] ->
-//! [`SignInCode`]) and `POST <server>/v2/auth/github/token`, polled
+//! token: `POST <server>/v2/auth/<provider>/device` ([`SignInStart`] ->
+//! [`SignInCode`]) and `POST <server>/v2/auth/<provider>/token`, polled
 //! ([`SignInPoll`] -> [`SignInAnswer`]). Their answers are JSON, and their
 //! failures [`ErrorBody`]s. `POST <server>/v2/auth/revoke`, sent with a
 //! token as its bearer token, revokes that token if it came from GitHub
@@ -89,6 +89,10 @@ pub struct ExecRequest {
     /// How the client names the workspace (its URL), shown by `prime` and `info`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
+    /// A model's tool call (`bd mcp`): it runs with the actor's own rights
+    /// only, never the token's admin or human ones.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tool_call: bool,
 }
 
 /// One line of a 200 answer.
@@ -163,15 +167,15 @@ pub struct ErrorDetail {
     pub exit_code: i32,
 }
 
-/// Body of `POST <server>/v2/auth/github/device`: start a GitHub sign-in.
+/// Body of `POST <server>/v2/auth/<provider>/device`: start a sign-in.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SignInStart {
     /// The workspace the client signs in for: it must exist on the server.
     pub workspace: String,
 }
 
-/// Answer of `POST <server>/v2/auth/github/device`: the code a person
-/// enters at GitHub, and how often to ask whether they did.
+/// Answer of `POST <server>/v2/auth/<provider>/device`: the code a person
+/// enters at the provider, and how often to ask whether they did.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SignInCode {
     /// Sent back with each poll: whoever holds it gets the sign-in's token.
@@ -183,9 +187,11 @@ pub struct SignInCode {
     pub expires_in: u64,
     /// Seconds to wait between polls.
     pub interval: u64,
+    /// The provider, as people know it (`GitHub`, `Acme SSO`).
+    pub provider: String,
 }
 
-/// Body of `POST <server>/v2/auth/github/token`: was the code entered yet?
+/// Body of `POST <server>/v2/auth/<provider>/token`: was the code entered yet?
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SignInPoll {
     pub device_code: String,
@@ -193,7 +199,7 @@ pub struct SignInPoll {
     pub workspace: String,
 }
 
-/// Answer of `POST <server>/v2/auth/github/token`.
+/// Answer of `POST <server>/v2/auth/<provider>/token`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum SignInAnswer {

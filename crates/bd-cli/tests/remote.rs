@@ -18,7 +18,8 @@ mod pty;
 /// `bd` with a clean environment, run in `dir`.
 fn bd(dir: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_bd"));
-    c.current_dir(dir).env("BD_LOG", "error").env("XDG_CONFIG_HOME", dir.join(".xdg"));
+    // Device-flow polls a second apart take 20 ms here (debug builds only).
+    c.current_dir(dir).env("BD_LOG", "error").env("XDG_CONFIG_HOME", dir.join(".xdg")).env("BD_TEST_POLL_MS", "20");
     // Where the harnesses keep user-level hooks, which `bd agents pull` looks at.
     for var in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME"] {
         c.env(var, dir.join(".home").join(var));
@@ -32,6 +33,7 @@ fn bd(dir: &Path) -> Command {
         "BD_CA_CERT",
         "BD_INSECURE_HTTP",
         "BD_SERVE_ROOT",
+        "BD_SERVE_PUBLIC_URL",
         "BD_PLAYBOOK_PATH",
         "BD_GH",
         "BD_TIMING",
@@ -428,8 +430,8 @@ fn tokens_bind_actor_role_and_workspace() {
         "revoke",
     );
     assert_eq!(alice.code(&["list"]), 7);
-    let tokens = std::fs::read_to_string(server.root.path().join("tokens.json")).unwrap();
-    assert!(!tokens.contains("bdt_"), "only hashes are stored");
+    let tokens = Value::from(stored(server.root.path(), "tokens")).to_string();
+    assert!(!tokens.is_empty() && !tokens.contains("bdt_"), "only hashes are stored");
 }
 
 #[test]
@@ -2456,15 +2458,12 @@ fn only_human_tokens_resolve_human_gates() {
 fn tokens_without_a_kind_are_refused() {
     let root = Server::prepare();
     create_token(root.path(), "dana-desk", "dana", &["--kind", "human"]);
-    let path = root.path().join("tokens.json");
-    let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    file["tokens"][0].as_object_mut().unwrap().remove("kind").expect("kind is stored");
-    std::fs::write(&path, file.to_string()).unwrap();
+    edit_tokens(root.path(), |_| true, |t| drop(t.as_object_mut().unwrap().remove("kind").expect("kind is stored")));
 
     let out = bd(root.path()).args(["serve", "token", "list", "--root"]).arg(root.path()).output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(2), "{stderr}");
-    assert!(stderr.contains("tokens.json") && stderr.contains("kind"), "{stderr}");
+    assert!(stderr.contains("server.db") && stderr.contains("kind"), "{stderr}");
 }
 
 #[test]
@@ -2484,11 +2483,10 @@ fn force_takeovers_need_an_admin_token() {
     assert_eq!(out.status.code(), Some(4), "several at once, the same answer: {}", stderr_of(&out));
     assert!(stderr_of(&out).contains("t-1 (held by bob/w1), t-2 (held by bob/w1)"), "{}", stderr_of(&out));
     assert_eq!(alice.code(&["release", "t-1", "t-2", "--take-over"]), 7, "and with --take-over, access denied");
-    // --force no longer means a takeover anywhere: on update and release it is a usage error.
+    // update and release have no --force: a usage error, never a takeover.
     for args in [&["release", "t-1", "--force"][..], &["update", "t-1", "--assignee", "alice", "--force"]] {
         let out = alice.run(args);
         assert_eq!(out.status.code(), Some(2), "bd {args:?}: {}", stderr_of(&out));
-        assert!(stderr_of(&out).contains("--take-over"), "{}", stderr_of(&out));
     }
     assert_eq!(alice.code(&["release", "t-1", "--if-assignee", "bob/w1"]), 4, "a guard is not a takeover");
     assert_eq!(alice.code(&["update", "t-1", "--assignee", "alice"]), 4, "already claimed, as before");
@@ -4050,7 +4048,7 @@ fn agent_sets_are_served_per_harness_to_read_tokens() {
         refused(
             &|| {
                 write(&copilot, "skills/lint/SKILL.md", "x");
-                symlink(server.root.path().join("tokens.json"), copilot.join("skills/lint/tokens.json")).unwrap();
+                symlink(server.root.path().join("server.db"), copilot.join("skills/lint/tokens.json")).unwrap();
             },
             ".bd/agents/copilot/skills/lint/tokens.json: a symlink leading outside .bd/agents",
         );
@@ -4851,9 +4849,11 @@ fn agents_watch_catches_up_on_changes_no_event_announced() {
 
 // ------------------------------------------------------------ GitHub sign-in
 
-/// A stand-in for GitHub: the device flow and the API endpoints GitHub
-/// sign-in uses. A device code is entered by the account `next` names when
-/// the code is given out, after `pending` polls, or cancelled with `deny`.
+/// A stand-in for GitHub: the device and web flows and the API endpoints
+/// GitHub sign-in uses. A device code is entered by the account `next`
+/// names when the code is given out, after `pending` polls, or cancelled
+/// with `deny`; the web flow signs `next` in at once, or is cancelled with
+/// `deny`, and gives its token for the client secret `s3cret` only.
 /// `members` pairs logins with `org` or `org/team`; organizations in
 /// `blocked` answer 403, as one restricting OAuth apps does.
 struct FakeGithub {
@@ -4876,6 +4876,8 @@ struct GithubState {
     codes: std::collections::HashMap<String, (String, usize, bool)>,
     /// Device codes given out, each unique, as GitHub's are.
     minted: usize,
+    /// Web flow code -> the login signed in, the PKCE challenge, and the redirect URI.
+    web_codes: std::collections::HashMap<String, (String, String, String)>,
     /// User ids by login, where not derived from the login: a renamed account keeps its id.
     ids: std::collections::HashMap<String, u64>,
     /// When GitHub created each account, where not long ago (`2015-01-01`).
@@ -4972,6 +4974,31 @@ impl FakeGithub {
     fn leave(&self, login: &str, of: &str) {
         self.state.lock().unwrap().members.retain(|(l, o)| !(l == login && o == of));
     }
+
+    /// Cancel the next sign-ins at GitHub, or not.
+    fn deny(&self, deny: bool) {
+        self.state.lock().unwrap().deny = deny;
+    }
+}
+
+/// The pairs of a query string or form body, percent-decoded.
+fn decode_form(query: &str) -> std::collections::HashMap<String, String> {
+    let unescape = |s: &str| {
+        let (bytes, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
+        while i < bytes.len() {
+            match bytes[i] {
+                b'+' => out.push(b' '),
+                b'%' => {
+                    out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                    i += 2;
+                }
+                b => out.push(b),
+            }
+            i += 1;
+        }
+        String::from_utf8(out).unwrap()
+    };
+    query.split('&').filter_map(|kv| kv.split_once('=')).map(|(k, v)| (unescape(k), unescape(v))).collect()
 }
 
 /// Whether `jwt` is one the GitHub App `Iv1.test` signed, unexpired (the
@@ -5021,6 +5048,26 @@ fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>)
     };
     std::thread::sleep(hold);
     let mut s = state.lock().unwrap();
+    // The web flow's sign-in page: back to the redirect URI at once.
+    if let Some(query) = path.strip_prefix("/login/oauth/authorize?").filter(|_| method == "GET") {
+        let q = decode_form(query);
+        let back = if s.deny {
+            format!("error=access_denied&state={}", q["state"])
+        } else {
+            s.minted += 1;
+            let code = format!("wc{}", s.minted);
+            let entry = (s.next.clone(), q["code_challenge"].clone(), q["redirect_uri"].clone());
+            s.web_codes.insert(code.clone(), entry);
+            assert_eq!(q["code_challenge_method"], "S256");
+            format!("code={code}&state={}", q["state"])
+        };
+        let location = format!("{}?{back}", q["redirect_uri"]);
+        let _ = reader.get_mut().write_all(
+            format!("HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .as_bytes(),
+        );
+        return;
+    }
     let member = |s: &GithubState, login: &str, of: &str| s.members.iter().any(|(l, o)| l == login && o == of);
     let active = json!({ "state": "active", "role": "member" });
     let not_found = (404, json!({ "message": "Not Found" }));
@@ -5039,6 +5086,22 @@ fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>)
                 200,
                 json!({ "device_code": code, "user_code": "WDJB-MJHT", "verification_uri": uri, "expires_in": 900, "interval": 1 }),
             )
+        }
+        ("POST", "/login/oauth/access_token") if form("code").is_some() => {
+            use base64::Engine;
+            use sha2::Digest;
+            let f = decode_form(&body);
+            let s256 = |v: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(v));
+            match s.web_codes.remove(&f["code"]) {
+                Some((login, challenge, redirect))
+                    if f.get("client_secret").is_some_and(|c| c == "s3cret")
+                        && f.get("redirect_uri") == Some(&redirect)
+                        && f.get("code_verifier").is_some_and(|v| s256(v) == challenge) =>
+                {
+                    (200, json!({ "access_token": format!("gho_{login}"), "token_type": "bearer", "scope": "" }))
+                }
+                _ => (200, json!({ "error": "bad_verification_code" })),
+            }
         }
         ("POST", "/login/oauth/access_token") => {
             let code = form("device_code").unwrap_or_default();
@@ -5140,6 +5203,301 @@ fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>)
     let _ = conn.flush();
 }
 
+#[cfg(unix)] // Only the authorizer's tests, which run shell scripts, use it.
+/// A stand-in OpenID Connect provider at a loopback URL, its issuer: discovery, a JWKS of the test
+/// RSA key, a sign-in page that signs the next account in at once, a token endpoint giving ID tokens
+/// signed with that key (to client `bd-client`, secret `oidc-s3cret`, in a Basic header), and the
+/// device flow.
+struct FakeOidc {
+    url: String,
+    state: Arc<std::sync::Mutex<OidcState>>,
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct OidcState {
+    /// Who signs in next: their subject, and claims besides the standard ones.
+    next: (String, Value),
+    /// Code -> subject, claims, nonce, PKCE challenge and redirect URI.
+    codes: std::collections::HashMap<String, (String, Value, String, String, String)>,
+    /// Device code -> subject, claims, and polls before the code is entered.
+    devices: std::collections::HashMap<String, (String, Value, usize)>,
+    minted: usize,
+    /// Polls before the next device code is entered.
+    pending: usize,
+    /// Its ID tokens are for this audience instead (another client's).
+    aud: Option<String>,
+    /// The device flow's polls answer this error instead (`access_denied`, `expired_token`).
+    device_error: Option<String>,
+    /// Its discovery document names no device endpoint.
+    no_device: bool,
+    /// As Apple: client secrets are JWTs signed by this P-256 public key (team `TEAM123`, key `KEY123`), sent in the
+    /// form, and answers asked for as a form post come back as JSON for the test to post.
+    signed_by: Option<Vec<u8>>,
+    /// `METHOD /path` of each request.
+    log: Vec<String>,
+}
+
+#[cfg(unix)]
+impl FakeOidc {
+    fn start() -> FakeOidc {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let state = Arc::new(std::sync::Mutex::new(OidcState::default()));
+        let (shared, issuer) = (state.clone(), url.clone());
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(conn) = conn else { return };
+                let (state, issuer) = (shared.clone(), issuer.clone());
+                std::thread::spawn(move || oidc_answer(conn, &state, &issuer));
+            }
+        });
+        FakeOidc { url, state }
+    }
+
+    /// The next account to sign in: `subject`, with `claims` (preferred_username, email, groups...).
+    fn next(&self, subject: &str, claims: Value) {
+        self.state.lock().unwrap().next = (subject.to_string(), claims);
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.state.lock().unwrap().log.clone()
+    }
+}
+
+#[cfg(unix)]
+/// The test RSA key, which signs the fake provider's ID tokens.
+fn oidc_key() -> ring::signature::RsaKeyPair {
+    let pem = include_str!("fixtures/github-app.pem");
+    let key = ureq::tls::parse_pem(pem.as_bytes())
+        .find_map(|item| match item {
+            Ok(ureq::tls::PemItem::PrivateKey(k)) => Some(k),
+            _ => None,
+        })
+        .unwrap();
+    ring::signature::RsaKeyPair::from_der(key.der())
+        .or_else(|_| ring::signature::RsaKeyPair::from_pkcs8(key.der()))
+        .unwrap()
+}
+
+#[cfg(unix)]
+fn oidc_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<OidcState>, issuer: &str) {
+    use base64::Engine;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let mut reader = BufReader::new(conn.try_clone().unwrap());
+    let mut request = String::new();
+    if reader.read_line(&mut request).unwrap_or(0) == 0 {
+        return;
+    }
+    let (mut length, mut basic) = (0, None::<String>);
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+            break;
+        }
+        let (name, value) = line.split_once(':').unwrap();
+        match name.to_ascii_lowercase().as_str() {
+            "content-length" => length = value.trim().parse().unwrap(),
+            "authorization" => basic = value.trim().strip_prefix("Basic ").map(String::from),
+            _ => {}
+        }
+    }
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    let form = decode_form(&String::from_utf8(body).unwrap());
+    let mut words = request.split_whitespace();
+    let (method, path) = (words.next().unwrap().to_string(), words.next().unwrap().to_string());
+    let mut s = state.lock().unwrap();
+    s.log.push(format!("{method} {path}"));
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let client_ok = match &s.signed_by {
+        None => {
+            basic.as_deref() == Some(base64::engine::general_purpose::STANDARD.encode("bd-client:oidc-s3cret").as_str())
+        }
+        Some(key) => form.get("client_secret").is_some_and(|jwt| {
+            let parts: Vec<&str> = jwt.split('.').collect();
+            let decode = |p: &str| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(p).unwrap_or_default();
+            let head: Value = serde_json::from_slice(&decode(parts[0])).unwrap_or_default();
+            let claims: Value = serde_json::from_slice(&decode(parts[1])).unwrap_or_default();
+            let public = ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_FIXED, key);
+            parts.len() == 3
+                && public.verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &decode(parts[2])).is_ok()
+                && head == json!({ "alg": "ES256", "kid": "KEY123" })
+                && (&claims["iss"], &claims["sub"], &claims["aud"])
+                    == (&json!("TEAM123"), &json!("bd-client"), &json!(issuer))
+                && claims["exp"].as_u64().is_some_and(|exp| exp > now && exp <= now + 600)
+        }),
+    };
+    let id_token = |s: &OidcState, subject: &str, extra: &Value, nonce: Option<&str>| {
+        let mut claims = json!({
+            "iss": issuer, "aud": s.aud.clone().unwrap_or("bd-client".into()), "sub": subject,
+            "iat": now, "exp": now + 300,
+        });
+        for (k, v) in extra.as_object().into_iter().flatten() {
+            claims[k] = v.clone();
+        }
+        if let Some(nonce) = nonce {
+            claims["nonce"] = nonce.into();
+        }
+        let head = json!({ "alg": "RS256", "typ": "JWT", "kid": "fake-1" });
+        let signed = format!("{}.{}", b64(head.to_string().as_bytes()), b64(claims.to_string().as_bytes()));
+        let key = oidc_key();
+        let mut signature = vec![0; key.public().modulus_len()];
+        key.sign(
+            &ring::signature::RSA_PKCS1_SHA256,
+            &ring::rand::SystemRandom::new(),
+            signed.as_bytes(),
+            &mut signature,
+        )
+        .unwrap();
+        format!("{signed}.{}", b64(&signature))
+    };
+    let (status, answer, location): (u16, Value, Option<String>) = match (
+        method.as_str(),
+        path.split('?').next().unwrap(),
+    ) {
+        ("GET", "/.well-known/openid-configuration") => (
+            200,
+            json!({
+                "issuer": issuer, "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"), "jwks_uri": format!("{issuer}/jwks"),
+                "device_authorization_endpoint": if s.no_device { Value::Null } else { format!("{issuer}/device").into() },
+                "token_endpoint_auth_methods_supported":
+                    [if s.signed_by.is_some() { "client_secret_post" } else { "client_secret_basic" }],
+            }),
+            None,
+        ),
+        ("GET", "/jwks") => {
+            let key = oidc_key();
+            let public: ring::rsa::PublicKeyComponents<Vec<u8>> = key.public().into();
+            (
+                200,
+                json!({ "keys": [{ "kty": "RSA", "kid": "fake-1", "alg": "RS256", "use": "sig", "n": b64(&public.n), "e": b64(&public.e) }] }),
+                None,
+            )
+        }
+        // The sign-in page: back to the redirect URI at once, as the next account.
+        ("GET", "/authorize") => {
+            let q = decode_form(path.split_once('?').unwrap().1);
+            s.minted += 1;
+            let code = format!("oc-{}", s.minted);
+            let (subject, claims) = s.next.clone();
+            let entry = (subject, claims, q["nonce"].clone(), q["code_challenge"].clone(), q["redirect_uri"].clone());
+            s.codes.insert(code.clone(), entry);
+            if q.get("response_mode").map(String::as_str) == Some("form_post") {
+                // What the page would post: the code and state, with an ID token and the user's name.
+                let answer = json!({ "code": code, "state": q["state"], "id_token": "a.b.c", "user": "{\"name\":{}}" });
+                (200, answer, None)
+            } else {
+                let back = format!("{}?code={code}&state={}", q["redirect_uri"], url_encode(&q["state"]));
+                (302, json!({}), Some(back))
+            }
+        }
+        ("POST", "/device") if form.get("client_id").map(String::as_str) == Some("bd-client") => {
+            s.minted += 1;
+            let code = format!("dc-{}", s.minted);
+            let (subject, claims) = s.next.clone();
+            let pending = s.pending;
+            s.devices.insert(code.clone(), (subject, claims, pending));
+            let answer = json!({
+                "device_code": code, "user_code": "OIDC-CODE", "verification_uri": format!("{issuer}/activate"),
+                "interval": 1, "expires_in": 600,
+            });
+            (200, answer, None)
+        }
+        ("POST", "/token") if !client_ok => (401, json!({ "error": "invalid_client" }), None),
+        ("POST", "/token") => match form.get("grant_type").map(String::as_str) {
+            Some("authorization_code") => match s.codes.remove(&form["code"]) {
+                Some((subject, claims, nonce, challenge, redirect)) => {
+                    use sha2::Digest;
+                    let verifier = b64(&sha2::Sha256::digest(form["code_verifier"].as_bytes()));
+                    if verifier != challenge || form["redirect_uri"] != redirect {
+                        (400, json!({ "error": "invalid_grant" }), None)
+                    } else {
+                        (
+                            200,
+                            json!({ "access_token": "at", "token_type": "Bearer", "id_token": id_token(&s, &subject, &claims, Some(&nonce)) }),
+                            None,
+                        )
+                    }
+                }
+                None => (400, json!({ "error": "invalid_grant" }), None),
+            },
+            Some("urn:ietf:params:oauth:grant-type:device_code") if s.device_error.is_some() => {
+                (400, json!({ "error": s.device_error.clone() }), None)
+            }
+            Some("urn:ietf:params:oauth:grant-type:device_code") => {
+                let code = form["device_code"].clone();
+                match s.devices.get_mut(&code) {
+                    Some((_, _, pending)) if *pending > 0 => {
+                        *pending -= 1;
+                        (400, json!({ "error": "authorization_pending" }), None)
+                    }
+                    Some(_) => {
+                        let (subject, claims, _) = s.devices.remove(&code).unwrap();
+                        (
+                            200,
+                            json!({ "access_token": "at", "token_type": "Bearer", "id_token": id_token(&s, &subject, &claims, None) }),
+                            None,
+                        )
+                    }
+                    None => (400, json!({ "error": "expired_token" }), None),
+                }
+            }
+            _ => (400, json!({ "error": "unsupported_grant_type" }), None),
+        },
+        _ => (404, json!({ "error": "not_found" }), None),
+    };
+    drop(s);
+    let text = answer.to_string();
+    let location = location.map(|l| format!("location: {l}\r\n")).unwrap_or_default();
+    let head = format!(
+        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n{location}content-length: {}\r\n",
+        text.len()
+    );
+    let _ = conn.write_all(format!("{head}connection: close\r\n\r\n{text}").as_bytes());
+}
+
+/// The login bd gives an OIDC account with no user name (`oidc::pseudonym`).
+fn pseudonym(issuer: &str, subject: &str) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(format!("{issuer}\n{subject}").as_bytes());
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    format!("u-{}", &hex[..12])
+}
+
+/// The records of `table` in `<root>/server.db`, in the order they were added (none if it does not exist).
+fn stored(root: &Path, table: &str) -> Vec<Value> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let Ok(conn) = rusqlite::Connection::open_with_flags(root.join("server.db"), flags) else { return Vec::new() };
+    let mut stmt = conn.prepare(&format!("SELECT data FROM {table} ORDER BY seq")).unwrap();
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+    rows.map(|r| serde_json::from_str(&r.unwrap()).unwrap()).collect()
+}
+
+/// Change the stored records of the tokens `pick` selects with `edit`, as an admin editing the database would.
+fn edit_tokens(root: &Path, pick: impl Fn(&Value) -> bool, edit: impl Fn(&mut Value)) {
+    let conn = rusqlite::Connection::open(root.join("server.db")).unwrap();
+    conn.busy_timeout(Duration::from_secs(10)).unwrap();
+    let rows: Vec<(String, String)> = conn
+        .prepare("SELECT id, data FROM tokens")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let mut edited = 0;
+    for (id, data) in rows {
+        let mut t: Value = serde_json::from_str(&data).unwrap();
+        if pick(&t) {
+            edit(&mut t);
+            conn.execute("UPDATE tokens SET data = ?1 WHERE id = ?2", [t.to_string(), id]).unwrap();
+            edited += 1;
+        }
+    }
+    assert!(edited > 0, "no token was edited");
+}
+
 /// A server whose GitHub sign-in goes to `github`, with these `[[github.allow]]` rules.
 fn sign_in_server(github: &FakeGithub, rules: &str) -> Server {
     let root = Server::prepare();
@@ -5148,9 +5506,9 @@ fn sign_in_server(github: &FakeGithub, rules: &str) -> Server {
     Server::launch(root, "127.0.0.1:0", &[])
 }
 
-/// `bd remote login --github` on the client machine `dir` (its own user config directory).
+/// `bd remote login --provider github` on the client machine `dir` (its own user config directory).
 fn github_login(dir: &Path, url: &str) -> Output {
-    bd(dir).args(["--json", "remote", "login", "--github", url]).stdin(Stdio::null()).output().unwrap()
+    bd(dir).args(["--json", "remote", "login", "--provider", "github", url]).stdin(Stdio::null()).output().unwrap()
 }
 
 /// The token saved on the client machine `dir`, if any.
@@ -5173,8 +5531,8 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let server = sign_in_server(
         &github,
         "[[github.allow]]\nusers = [\"Alice\"]\nrole = \"admin\"\nkind = \"human\"\n\n\
-         [[github.allow]]\nteams = [\"acme/bd\"]\nworkspaces = [\"proj\"]\n\n\
-         [[github.allow]]\norgs = [\"acme\"]\nrole = \"read\"\n",
+         [[github.allow]]\ngroups = [\"acme/bd\"]\nworkspaces = [\"proj\"]\n\n\
+         [[github.allow]]\ngroups = [\"acme\"]\nrole = \"read\"\n",
     );
     let url = server.url();
     let machine = || tempfile::tempdir().unwrap();
@@ -5196,9 +5554,9 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let v: Value = serde_json::from_str(&stdout).unwrap();
     assert_eq!(
         (v["actor"].as_str(), v["scope"].as_str(), v["verified"].as_bool()),
-        (Some("alice"), Some("server"), Some(true))
+        (Some("github:alice"), Some("server"), Some(true))
     );
-    assert_eq!(v["github"], json!({ "login": "alice", "via": "GitHub user alice" }));
+    assert_eq!(v["account"], json!({ "login": "alice", "via": "GitHub user alice" }));
     assert_eq!((v["token"]["role"].as_str(), v["token"]["kind"].as_str()), (Some("admin"), Some("human")));
     assert_eq!(v["token"]["workspaces"], json!(["*"]));
     let name = v["token"]["name"].as_str().unwrap().to_string();
@@ -5213,9 +5571,9 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     assert_eq!(check(signed_in(alice.path(), &url, &["-q", "create", "Signed in"]), "create").trim(), "t-1");
     let shown: Value =
         serde_json::from_str(&check(signed_in(alice.path(), &url, &["--json", "remote", "show"]), "show")).unwrap();
-    assert_eq!(shown["server"]["actor"], "alice");
+    assert_eq!(shown["server"]["actor"], "github:alice");
     let token = &shown["server"]["token"];
-    assert_eq!((token["name"].as_str(), token["github"]["login"].as_str()), (Some(name.as_str()), Some("alice")));
+    assert_eq!((token["name"].as_str(), token["account"]["login"].as_str()), (Some(name.as_str()), Some("alice")));
     assert!(token["expires_at"].as_str().is_some_and(|at| at > "2026"), "{token}");
 
     // By team, then by organization: the first matching rule's permissions.
@@ -5224,7 +5582,7 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let (code, stdout, stderr) = login(bob.path());
     assert_eq!(code, Some(0), "{stderr}");
     let v: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(v["github"]["via"], "member of team acme/bd");
+    assert_eq!(v["account"]["via"], "member of acme/bd");
     assert_eq!((v["token"]["role"].as_str(), v["token"]["kind"].as_str()), (Some("write"), Some("agent")));
     assert_eq!(v["token"]["workspaces"], json!(["proj"]));
     check(signed_in(bob.path(), &url, &["create", "By bob"]), "create as bob");
@@ -5234,7 +5592,7 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let (code, stdout, stderr) = login(carol.path());
     assert_eq!(code, Some(0), "{stderr}");
     let v: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!((v["github"]["via"].as_str(), v["token"]["role"].as_str()), (Some("member of acme"), Some("read")));
+    assert_eq!((v["account"]["via"].as_str(), v["token"]["role"].as_str()), (Some("member of acme"), Some("read")));
     check(signed_in(carol.path(), &url, &["list"]), "read as carol");
     assert_eq!(signed_in(carol.path(), &url, &["create", "x"]).status.code(), Some(7), "a read token");
 
@@ -5257,31 +5615,51 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let tokens = tokens.as_array().unwrap();
     assert_eq!(tokens.len(), 3, "{tokens:?}");
     let alices = tokens.iter().find(|t| t["name"] == name.as_str()).unwrap();
-    assert_eq!((alices["actor"].as_str(), alices["github"]["login"].as_str()), (Some("alice"), Some("alice")));
+    assert_eq!((alices["actor"].as_str(), alices["account"]["login"].as_str()), (Some("github:alice"), Some("alice")));
     assert!(alices["expires_at"].as_str().is_some_and(|at| at > "2026"), "{alices}");
     let out = bd(&root)
-        .args(["--json", "serve", "token", "revoke", "--github", "ALICE", "--root"])
+        .args(["--json", "serve", "token", "revoke", "--account", "ALICE", "--root"])
         .arg(&root)
         .output()
         .unwrap();
     let v: Value = serde_json::from_str(&check(out, "revoke --github")).unwrap();
     assert_eq!(v["revoked"], json!([name]));
     assert_eq!(signed_in(alice.path(), &url, &["list"]).status.code(), Some(7), "revoked at once");
+    // The audit trail tells who signed in, and who revoked what.
     let out =
-        bd(&root).args(["serve", "token", "revoke", "--github", "mallory", "--root"]).arg(&root).output().unwrap();
+        bd(&root).args(["--json", "serve", "token", "events", "--actor", "github:alice", "--root"]).arg(&root).output();
+    let events: Value = serde_json::from_str(&check(out.unwrap(), "token events")).unwrap();
+    let seen: Vec<(String, String)> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["kind"].as_str().unwrap().into(), e["detail"].as_str().unwrap_or_default().into()))
+        .collect();
+    assert_eq!(
+        seen,
+        [("signed_in".into(), String::new()), ("revoked".into(), "an admin revoked the account's tokens".into())]
+    );
+    assert!(!events.to_string().contains("bdt_"), "no secret: {events}");
+    let out =
+        bd(&root).args(["serve", "token", "revoke", "--account", "mallory", "--root"]).arg(&root).output().unwrap();
     assert_eq!(out.status.code(), Some(3), "mallory never got one");
 
-    // An expired token is refused with what to do about it.
-    let path = root.join("tokens.json");
-    let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    for t in file["tokens"].as_array_mut().unwrap().iter_mut().filter(|t| t["github"]["login"] == "bob") {
-        t["expires_at"] = json!("2026-01-01T00:00:00.000Z");
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+    // An expired token that can no longer be refreshed is refused with what to do about it.
+    edit_tokens(
+        &root,
+        |t| t["identity"]["login"] == "bob",
+        |t| {
+            t["expires_at"] = json!("2026-01-01T00:00:00.000Z");
+            t["refresh"]["refreshed_at"] = json!("2026-01-01T00:00:00.000Z");
+        },
+    );
     let out = signed_in(bob.path(), &url, &["list"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(7), "{stderr}");
-    assert!(stderr.contains("expired at 2026-01-01") && stderr.contains("bd remote login --github"), "{stderr}");
+    assert!(
+        stderr.contains("expired at 2026-01-01") && stderr.contains("bd remote login --provider github"),
+        "{stderr}"
+    );
     check(signed_in(carol.path(), &url, &["list"]), "other tokens still work");
 }
 
@@ -5321,6 +5699,719 @@ fn renewal_due(dir: &Path) {
     std::fs::write(path, toml::to_string(&file).unwrap()).unwrap();
 }
 
+/// An authorizer for [`authorizer_server`]: it keeps each request in
+/// `requests.log` and answers with `decision.json`, or fails when that says FAIL.
+#[cfg(unix)]
+const AUTHORIZER: &str = "#!/bin/sh\ncat >> requests.log\necho >> requests.log\nd=$(cat decision.json)\n\
+[ \"$d\" = FAIL ] && exit 1\nprintf '%s' \"$d\"\n";
+
+/// A server whose GitHub sign-ins are decided by [`AUTHORIZER`], with these
+/// `[authorizer]` settings besides its command.
+#[cfg(unix)]
+fn authorizer_server(github: &FakeGithub, settings: &str) -> Server {
+    let root = Server::prepare();
+    std::fs::write(root.path().join("app.pem"), include_str!("fixtures/github-app.pem")).unwrap();
+    let script = root.path().join("authorize");
+    std::fs::write(&script, AUTHORIZER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(root.path().join("auth.toml"), authorizer_config(github, settings)).unwrap();
+    Server::launch(root, "127.0.0.1:0", &[])
+}
+
+#[cfg(unix)]
+fn authorizer_config(github: &FakeGithub, settings: &str) -> String {
+    format!(
+        "[github]\nclient_id = \"Iv1.test\"\nurl = \"{0}\"\napi_url = \"{0}\"\nprivate_key = \"app.pem\"\n\n\
+         [authorizer]\ncommand = [\"./authorize\"]\n{settings}",
+        github.url
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn an_authorizer_decides_sign_ins_and_refreshes_within_its_caps() {
+    let github = FakeGithub::start();
+    github.install("acme");
+    let server = authorizer_server(&github, "refresh_grace = \"4h\"\n");
+    let url = server.url();
+    let root = server.root.path().to_path_buf();
+    let decide = |answer: &str| std::fs::write(root.join("decision.json"), answer).unwrap();
+    let requests = || std::fs::read_to_string(root.join("requests.log")).unwrap_or_default();
+    let tokens = || {
+        let list = bd(&root).args(["--json", "serve", "token", "list", "--root"]).arg(&root).output().unwrap();
+        serde_json::from_str::<Value>(&check(list, "token list")).unwrap()
+    };
+    let login = |who: &str| {
+        github.next(who, 0);
+        let dir = tempfile::tempdir().unwrap();
+        let out = github_login(dir.path(), &url);
+        (dir, out)
+    };
+
+    // Let in, with what it grants: the request names the account by its id and login.
+    decide(r#"{"allow":true,"role":"write","via":"member of bd-users","reason":"listed"}"#);
+    let (alice, out) = login("alice");
+    check(out, "alice's login");
+    let sent = requests();
+    assert!(sent.contains("\"event\":\"sign_in\"") && sent.contains("\"login\":\"alice\""), "{sent}");
+    assert!(sent.contains("\"provider\":\"github\"") && sent.contains("\"subject\":"), "{sent}");
+    let list = tokens();
+    let alice_token =
+        list.as_array().unwrap().iter().find(|t| t["actor"] == "github:alice").expect("alice's token").clone();
+    assert_eq!((alice_token["role"].as_str(), alice_token["kind"].as_str()), (Some("write"), Some("agent")));
+
+    // Kept out: by its answer, by a grant beyond the caps, and when it cannot answer (try again).
+    for (answer, says) in [
+        (r#"{"allow":false,"reason":"not in bd-users"}"#, "may not use workspace"),
+        (r#"{"allow":true,"role":"admin"}"#, "may not use workspace"),
+        (r#"{"allow":true,"kind":"human"}"#, "may not use workspace"),
+        ("FAIL", "sign in again in a moment"),
+        ("not json", "sign in again in a moment"),
+    ] {
+        decide(answer);
+        let (_dir, out) = login("bob");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success(), "{answer}: let in");
+        assert!(stderr.contains(says), "{answer}: {stderr}");
+        assert!(
+            !stderr.contains("not in bd-users") && !stderr.contains("max_role"),
+            "reasons stay in the log: {stderr}"
+        );
+    }
+
+    // A refresh asks again, telling what the sign-in has now.
+    decide(r#"{"allow":true,"role":"write"}"#);
+    renewal_due(alice.path());
+    let before = saved(alice.path(), "refresh_token").unwrap();
+    check(signed_in(alice.path(), &url, &["list"]), "refreshed");
+    let after = saved(alice.path(), "refresh_token").unwrap();
+    assert_ne!(after, before);
+    let sent = requests();
+    assert!(sent.contains("\"event\":\"refresh\"") && sent.contains("\"current\":{\"role\":\"write\""), "{sent}");
+
+    // It cannot answer: within refresh_grace, the refresh keeps what the sign-in had.
+    decide("FAIL");
+    renewal_due(alice.path());
+    check(signed_in(alice.path(), &url, &["list"]), "refreshed within the grace");
+    let kept = saved(alice.path(), "refresh_token").unwrap();
+    assert_ne!(kept, after, "refreshed");
+    // The grace runs from the last decision, which a kept refresh does not move...
+    let refresh_of = |root: &Path| -> Value {
+        stored(root, "tokens").into_iter().find(|t| t["actor"] == "github:alice").unwrap()["refresh"].clone()
+    };
+    let state = refresh_of(&root);
+    assert!(state["decided_at"].as_str().unwrap() < state["refreshed_at"].as_str().unwrap(), "{state}");
+    // ...and past it, a refresh the authorizer cannot answer is not kept.
+    edit_tokens(
+        &root,
+        |t| t["actor"] == "github:alice",
+        |t| t["refresh"]["decided_at"] = "2020-01-01T00:00:00.000Z".into(),
+    );
+    renewal_due(alice.path());
+    let _ = signed_in(alice.path(), &url, &["list"]);
+    assert_eq!(saved(alice.path(), "refresh_token").unwrap(), kept, "past the grace: not refreshed");
+
+    // Without a grace, only this refresh fails: the sign-in stays.
+    std::fs::write(root.join("auth.toml"), authorizer_config(&github, "")).unwrap();
+    renewal_due(alice.path());
+    let _ = signed_in(alice.path(), &url, &["list"]);
+    assert_eq!(saved(alice.path(), "refresh_token").unwrap(), kept, "not refreshed");
+    assert!(tokens().as_array().unwrap().iter().all(|t| t["revoked_at"].is_null()), "not revoked");
+
+    // It refuses at a refresh: the sign-in is revoked.
+    decide(r#"{"allow":false,"reason":"left bd-users"}"#);
+    renewal_due(alice.path());
+    let out = signed_in(alice.path(), &url, &["list"]);
+    assert_eq!(out.status.code(), Some(7), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(tokens().as_array().unwrap().iter().any(|t| t["actor"] == "github:alice" && t["revoked_at"].is_string()));
+}
+
+#[cfg(unix)]
+#[test]
+fn an_authorizer_refreshes_sign_ins_without_a_github_app() {
+    let github = FakeGithub::start();
+    let root = Server::prepare();
+    let script = root.path().join("authorize");
+    std::fs::write(&script, AUTHORIZER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(root.path().join("decision.json"), r#"{"allow":true,"role":"write"}"#).unwrap();
+    let config = format!(
+        "[github]\nclient_id = \"Iv1.test\"\nurl = \"{0}\"\napi_url = \"{0}\"\n\n[authorizer]\ncommand = [\"./authorize\"]\n",
+        github.url
+    );
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    let url = server.url();
+    github.next("alice", 0);
+    let alice = tempfile::tempdir().unwrap();
+    let v: Value = serde_json::from_str(&check(github_login(alice.path(), &url), "login")).unwrap();
+    assert!(v["token"]["refreshable_until"].is_string(), "refreshed, without a GitHub App: {v}");
+    renewal_due(alice.path());
+    let before = saved(alice.path(), "refresh_token").unwrap();
+    check(signed_in(alice.path(), &url, &["list"]), "refreshed");
+    assert_ne!(saved(alice.path(), "refresh_token").unwrap(), before);
+    let sent = std::fs::read_to_string(server.root.path().join("requests.log")).unwrap();
+    assert!(sent.contains("\"event\":\"refresh\"") && sent.contains("\"login\":\"alice\""), "{sent}");
+    assert!(!github.log().iter().any(|l| l.starts_with("POST /app/")), "no GitHub App was asked");
+}
+
+#[cfg(unix)]
+#[test]
+fn people_sign_in_with_an_oidc_provider_from_the_command_line() {
+    let idp = FakeOidc::start();
+    let root = Server::prepare();
+    let script = root.path().join("authorize");
+    std::fs::write(&script, AUTHORIZER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(root.path().join("decision.json"), r#"{"allow":true,"role":"write","via":"member of eng"}"#)
+        .unwrap();
+    std::fs::write(root.path().join("acme-secret"), "oidc-s3cret\n").unwrap();
+    let config = format!(
+        "[oidc.acme]\nissuer = \"{}\"\nclient_id = \"bd-client\"\nclient_secret_file = \"acme-secret\"\nlabel = \"Acme SSO\"\n\n\
+         [authorizer]\ncommand = [\"./authorize\"]\n",
+        idp.url
+    );
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    std::fs::set_permissions(root.path().join("acme-secret"), std::os::unix::fs::PermissionsExt::from_mode(0o644))
+        .unwrap();
+    let log = std::fs::File::create(root.path().join("server.log")).unwrap();
+    let server = Server::launch_with(root, "127.0.0.1:0", &[], |cmd| {
+        cmd.env("BD_LOG", "bd::serve=info").stderr(log);
+    });
+    // At start: the provider (its discovery tried), the authorizer, and a secret file others may read.
+    let started = std::fs::read_to_string(server.root.path().join("server.log")).unwrap();
+    for said in
+        ["OIDC sign-in is on", "device_flow=true", "an authorizer decides who may sign in", "readable by others"]
+    {
+        assert!(started.contains(said), "{said}: {started}");
+    }
+    let url = server.url();
+    let login = |dir: &Path, provider: &str| {
+        bd(dir).args(["--json", "remote", "login", "--provider", provider, &url]).stdin(Stdio::null()).output().unwrap()
+    };
+
+    // A one-time code to enter at the provider, then a token for the account it vouches for.
+    // As Google signs people in: no user name, a verified email.
+    idp.next("248289761001", json!({ "email": "alice@acme.example", "email_verified": true }));
+    idp.state.lock().unwrap().pending = 1;
+    let alice = tempfile::tempdir().unwrap();
+    let out = login(alice.path(), "acme");
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("OIDC-CODE") && stderr.contains("with Acme SSO"), "{stderr}");
+    let v: Value = serde_json::from_str(&check(out, "login")).unwrap();
+    // Never the email: a pseudonym of the account.
+    let alias = pseudonym(&idp.url, "248289761001");
+    let actor = format!("acme:{alias}");
+    assert_eq!((v["actor"].as_str(), v["account"]["via"].as_str()), (Some(actor.as_str()), Some("member of eng")));
+    assert!(v["token"]["refreshable_until"].is_string(), "{v}");
+    check(signed_in(alice.path(), &url, &["list"]), "list as alice");
+    let sent = std::fs::read_to_string(server.root.path().join("requests.log")).unwrap();
+    assert!(sent.contains("\"provider\":\"acme\"") && sent.contains("\"email\":\"alice@acme.example\""), "{sent}");
+    let list = bd(server.root.path())
+        .args(["--json", "serve", "token", "list", "--root"])
+        .arg(server.root.path())
+        .output()
+        .unwrap();
+    let list: Value = serde_json::from_str(&check(list, "token list")).unwrap();
+    let token = list.as_array().unwrap().iter().find(|t| t["actor"] == actor.as_str()).unwrap().clone();
+    assert!(token["name"].as_str().unwrap().starts_with(&format!("acme-{alias}-")), "{token}");
+    let kept = format!("{:?}{:?}", stored(server.root.path(), "tokens"), stored(server.root.path(), "accounts"));
+    assert!(!kept.contains("alice@acme.example") && kept.contains("248289761001"), "no email kept: {kept}");
+    assert_eq!(
+        (token["account"]["provider"].as_str(), token["account"]["subject"].as_str()),
+        (Some("acme"), Some("248289761001"))
+    );
+
+    assert!(idp.log().iter().any(|l| l == "POST /device") && idp.log().iter().any(|l| l == "POST /token"));
+
+    // Refreshed by the authorizer, on the identity of the sign-in.
+    renewal_due(alice.path());
+    let before = saved(alice.path(), "refresh_token").unwrap();
+    check(signed_in(alice.path(), &url, &["list"]), "refreshed");
+    assert_ne!(saved(alice.path(), "refresh_token").unwrap(), before);
+    let sent = std::fs::read_to_string(server.root.path().join("requests.log")).unwrap();
+    assert!(sent.contains("\"event\":\"refresh\""), "{sent}");
+
+    // Its provider pointed at another issuer: its sign-ins refresh no more (nothing revoked).
+    let auth_toml = server.root.path().join("auth.toml");
+    let config = std::fs::read_to_string(&auth_toml).unwrap();
+    std::fs::write(&auth_toml, config.replace(&idp.url, "https://other.example")).unwrap();
+    renewal_due(alice.path());
+    let out = signed_in(alice.path(), &url, &["list"]);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert!(stderr.contains("no longer signs people in with acme"), "{stderr}");
+    assert_eq!(saved(alice.path(), "refresh_token"), None, "refused: the client stops renewing");
+    let list = bd(server.root.path())
+        .args(["--json", "serve", "token", "list", "--root"])
+        .arg(server.root.path())
+        .output()
+        .unwrap();
+    let list: Value = serde_json::from_str(&check(list, "token list")).unwrap();
+    assert!(list.as_array().unwrap().iter().all(|t| t["revoked_at"].is_null()), "nothing revoked: {list}");
+    std::fs::write(&auth_toml, &config).unwrap();
+
+    // Cancelled, or not entered in time, at the provider: said, and nothing issued.
+    for (error, says) in
+        [("access_denied", "cancelled at Acme SSO"), ("expired_token", "expired before it was entered at Acme SSO")]
+    {
+        idp.state.lock().unwrap().device_error = Some(error.into());
+        let out = login(tempfile::tempdir().unwrap().path(), "acme");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success() && stderr.contains(says), "{error}: {stderr}");
+    }
+    idp.state.lock().unwrap().device_error = None;
+
+    // Providers the server does not have.
+    for (provider, says) in
+        [("nope", "no sign-in provider nope; it offers acme"), ("github", "GitHub sign-in is not enabled")]
+    {
+        let out = login(tempfile::tempdir().unwrap().path(), provider);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(!out.status.success() && stderr.contains(says), "{provider}: {stderr}");
+    }
+}
+
+/// `claims` signed by the fake OIDC provider's key, as its ID tokens and notifications are.
+#[cfg(unix)]
+fn fake_oidc_jwt(claims: &Value) -> String {
+    fake_oidc_jwt_kid(claims, "fake-1")
+}
+
+/// [`fake_oidc_jwt`], its header naming the key `kid`.
+#[cfg(unix)]
+fn fake_oidc_jwt_kid(claims: &Value, kid: &str) -> String {
+    use base64::Engine;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let head = json!({ "alg": "RS256", "kid": kid });
+    let signed = format!("{}.{}", b64(head.to_string().as_bytes()), b64(claims.to_string().as_bytes()));
+    let key = oidc_key();
+    let mut signature = vec![0; key.public().modulus_len()];
+    let rng = ring::rand::SystemRandom::new();
+    key.sign(&ring::signature::RSA_PKCS1_SHA256, &rng, signed.as_bytes(), &mut signature).unwrap();
+    format!("{signed}.{}", b64(&signature))
+}
+
+#[cfg(unix)]
+#[test]
+fn accounts_that_revoke_consent_or_are_deleted_at_the_provider_are_signed_out_and_forgotten() {
+    let idp = FakeOidc::start();
+    let root = Server::prepare();
+    let script = root.path().join("authorize");
+    std::fs::write(&script, AUTHORIZER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(root.path().join("decision.json"), r#"{"allow":true,"role":"write"}"#).unwrap();
+    std::fs::write(root.path().join("acme-secret"), "oidc-s3cret\n").unwrap();
+    let config = format!(
+        "[oidc.acme]\nissuer = \"{}\"\nclient_id = \"bd-client\"\nclient_secret_file = \"acme-secret\"\n\
+         account_events = [\"net.example.app\"]\n\n[authorizer]\ncommand = [\"./authorize\"]\n",
+        idp.url
+    );
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+    let login = || {
+        idp.next("001.abc.9", json!({ "email": "x7k2@privaterelay.example", "email_verified": "true" }));
+        let dir = tempfile::tempdir().unwrap();
+        let args = ["--json", "remote", "login", "--provider", "acme", &url];
+        check(bd(dir.path()).args(args).stdin(Stdio::null()).output().unwrap(), "login");
+        dir
+    };
+    let events = format!("{}/oauth/acme/events", server.base);
+    let notify = |kind: &str, at: u64| {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let happened = json!({ "type": kind, "sub": "001.abc.9", "event_time": at }).to_string();
+        let claims = json!({ "iss": idp.url, "aud": "net.example.app", "iat": now, "jti": "j", "events": happened });
+        post_json(&events, &json!({ "payload": fake_oidc_jwt(&claims) }).to_string())
+    };
+    let secs = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+    // Consent revoked: the sign-ins made before it end.
+    let first = login();
+    check(signed_in(first.path(), &url, &["list"]), "signed in");
+    std::thread::sleep(Duration::from_millis(1100));
+    let revoked_at = secs();
+    let (status, _, answer) = notify("consent-revoked", revoked_at);
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(signed_in(first.path(), &url, &["list"]).status.code(), Some(7), "signed out");
+
+    // Consent given again (a new sign-in): the same notice, sent again, ends nothing.
+    std::thread::sleep(Duration::from_millis(1100));
+    let second = login();
+    assert_eq!(notify("consent-revoked", revoked_at).0, 200);
+    check(signed_in(second.path(), &url, &["list"]), "a sign-in after the revocation stays");
+    assert_eq!(notify("email-disabled", secs()).0, 200, "nothing to do: no email is kept");
+    check(signed_in(second.path(), &url, &["list"]), "still");
+
+    // Deleted at the provider: forgotten, account and tokens.
+    assert_eq!(stored(&root, "accounts").len(), 1);
+    assert_eq!(notify("account-deleted", secs()).0, 200);
+    assert!(stored(&root, "accounts").is_empty() && stored(&root, "tokens").is_empty(), "forgotten");
+    assert_eq!(signed_in(second.path(), &url, &["list"]).status.code(), Some(7));
+
+    // Not the provider's, or not one that sends them: refused, and nothing done.
+    let third = login();
+    let forged = json!({ "payload": format!("{}x", fake_oidc_jwt(&json!({ "iss": idp.url }))) }).to_string();
+    assert_eq!(post_json(&events, &forged).0, 400);
+    assert_eq!(post_json(&events, "not json").0, 400);
+    assert_eq!(post_json(&format!("{}/oauth/other/events", server.base), "{}").0, 404);
+    check(signed_in(third.path(), &url, &["list"]), "untouched");
+    // Naming keys the provider does not have costs it no fetch each: the kept set serves, fetched again at most
+    // once a minute.
+    let fetches = || idp.log().iter().filter(|l| l.starts_with("GET /jwks")).count();
+    let before = fetches();
+    for i in 0..10 {
+        let unknown = json!({ "payload": fake_oidc_jwt_kid(&json!({ "iss": idp.url }), &format!("k{i}")) });
+        assert_eq!(post_json(&events, &unknown.to_string()).0, 400);
+    }
+    assert!(fetches() <= before + 1, "{} fetches", fetches() - before);
+}
+
+#[cfg(unix)]
+#[test]
+fn oidc_rules_let_people_in_without_an_authorizer_and_refreshes_keep_to_them() {
+    let idp = FakeOidc::start();
+    let root = Server::prepare();
+    std::fs::write(root.path().join("acme-secret"), "oidc-s3cret\n").unwrap();
+    let config = |domain: &str| {
+        format!(
+            "[oidc.acme]\nissuer = \"{}\"\nclient_id = \"bd-client\"\nclient_secret_file = \"acme-secret\"\n\
+             [[oidc.acme.allow]]\nemail_domains = [\"{domain}\"]\nrole = \"write\"\n",
+            idp.url
+        )
+    };
+    std::fs::write(root.path().join("auth.toml"), config("acme.example")).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+    let login = |subject: &str, email: &str| {
+        idp.next(subject, json!({ "email": email, "email_verified": true }));
+        let dir = tempfile::tempdir().unwrap();
+        let args = ["--json", "remote", "login", "--provider", "acme", &url];
+        let out = bd(dir.path()).args(args).stdin(Stdio::null()).output().unwrap();
+        (dir, out)
+    };
+
+    // By the verified email's domain: in, refreshed while the rule is there.
+    let (alice, out) = login("a1", "alice@acme.example");
+    let v: Value = serde_json::from_str(&check(out, "login")).unwrap();
+    assert_eq!(v["account"]["via"], "an email at acme.example");
+    renewal_due(alice.path());
+    let before = saved(alice.path(), "refresh_token").unwrap();
+    check(signed_in(alice.path(), &url, &["list"]), "refreshed");
+    assert_ne!(saved(alice.path(), "refresh_token").unwrap(), before, "renewed by its rule");
+
+    // Another domain: kept out.
+    let (_eve, out) = login("e1", "eve@evil.example");
+    assert_eq!(out.status.code(), Some(7), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // The rule changed: the sign-in ends at its next refresh (bd keeps no email to decide again).
+    std::fs::write(root.join("auth.toml"), config("acme.example\", \"other.example")).unwrap();
+    renewal_due(alice.path());
+    assert_eq!(signed_in(alice.path(), &url, &["list"]).status.code(), Some(7), "the rule that let it in is gone");
+    let tokens: Vec<Value> = stored(&root, "tokens");
+    assert!(tokens.iter().all(|t| t["revoked_at"].is_string()), "revoked: {tokens:?}");
+    assert!(!format!("{tokens:?}").contains("acme.example"), "no email kept");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_provider_without_a_device_flow_serves_browsers_only() {
+    let idp = FakeOidc::start();
+    idp.state.lock().unwrap().no_device = true;
+    let root = Server::prepare();
+    let script = root.path().join("authorize");
+    std::fs::write(&script, AUTHORIZER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let config = format!(
+        "[oidc.web]\nissuer = \"{}\"\nclient_id = \"bd-client\"\n\n[authorizer]\ncommand = [\"./authorize\"]\n",
+        idp.url
+    );
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let out = bd(dir.path())
+        .args(["remote", "login", "--provider", "web", &server.url()])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(out.status.code(), Some(2), "a limit of the provider, not a refused token: {stderr}");
+    assert!(stderr.contains("does not offer sign-in from the command line"), "{stderr}");
+    assert!(
+        !std::fs::read_to_string(server.root.path().join("requests.log")).is_ok_and(|l| !l.is_empty()),
+        "no one asked"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_clients_sign_people_in_with_a_provider_they_choose() {
+    let github = FakeGithub::start();
+    let idp = FakeOidc::start();
+    let root =
+        oauth_root_at(Some(&github), "[authorizer]\ncommand = [\"./authorize\"]\n", "loopback_redirects = true\n");
+    let script = root.path().join("authorize");
+    std::fs::write(&script, AUTHORIZER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(root.path().join("decision.json"), r#"{"allow":true,"role":"write","via":"member of eng"}"#)
+        .unwrap();
+    std::fs::write(root.path().join("acme-secret"), "oidc-s3cret\n").unwrap();
+    let config = std::fs::read_to_string(root.path().join("auth.toml")).unwrap();
+    let oidc = format!(
+        "\n[oidc.acme]\nissuer = \"{}\"\nclient_id = \"bd-client\"\nclient_secret_file = \"acme-secret\"\nlabel = \"Acme SSO\"\n\
+         scopes = [\"email\", \"groups\"]\n",
+        idp.url
+    );
+    std::fs::write(root.path().join("auth.toml"), config + &oidc).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &["--public-url", "https://bd.example.com/bd"]);
+    let local = |url: &str| url.replacen("https://bd.example.com", &server.base, 1);
+    let request =
+        r#"{"redirect_uris":["http://127.0.0.1/callback"],"client_name":"Desk","token_endpoint_auth_method":"none"}"#;
+    let (status, _, registered) = post_json(&format!("{}/bd/oauth/register", server.base), request);
+    assert_eq!(status, 201, "{registered}");
+    let client_id = registered["client_id"].as_str().unwrap().to_string();
+    let authorize = format!(
+        "{}/bd/oauth/authorize?client_id={client_id}&redirect_uri=http%3A%2F%2F127.0.0.1%3A43117%2Fcallback&\
+         response_type=code&state=s-1&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&\
+         code_challenge_method=S256&resource=https%3A%2F%2Fbd.example.com%2Fbd%2Fw%2Fproj%2Fmcp",
+        server.base
+    );
+    let href = |page: &str, label: &str| {
+        let at = page.find(&format!(">Continue with {label}<")).unwrap_or_else(|| panic!("{label}: {page}"));
+        let start = page[..at].rfind("href=\"").unwrap() + "href=\"".len();
+        page[start..at - 1].replace("&amp;", "&")
+    };
+    let sign_in = |iss: Option<&str>| {
+        // Two providers: a page to choose from, then on to the one chosen.
+        let (status, headers, page) = browse(&authorize, None, None);
+        assert_eq!(status, 200, "{page}");
+        assert!(page.contains("Sign in to connect Desk") && page.contains(">Continue with GitHub<"), "{page}");
+        let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+        let cookie = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
+        let (status, headers, body) = browse(&local(&href(&page, "Acme SSO")), Some(&cookie), None);
+        assert_eq!(status, 302, "{body}");
+        let to_idp = location(&headers);
+        assert!(to_idp.starts_with(&format!("{}/authorize?", idp.url)), "{to_idp}");
+        let q = query_of(&to_idp, &format!("{}/authorize?", idp.url));
+        assert_eq!(q["redirect_uri"], "https://bd.example.com/bd/oauth/acme/callback");
+        assert_eq!((q["scope"].as_str(), q["code_challenge_method"].as_str()), ("openid email groups", "S256"));
+        assert!(!q["nonce"].is_empty());
+        let (_, headers, _) = browse(&to_idp, None, None);
+        let back = location(&headers) + &iss.map(|iss| format!("&iss={}", url_encode(iss))).unwrap_or_default();
+        let (_, headers, page) = browse(&local(&back), Some(&cookie), None);
+        page + "\u{0}" + &renewed(&headers, &cookie)
+    };
+
+    // Signed in with Acme SSO: the authorizer is told the account, its verified email and its claims.
+    idp.next(
+        "248289761001",
+        json!({ "preferred_username": "alice", "email": "alice@acme.example", "email_verified": true, "groups": ["eng"] }),
+    );
+    // A choice is made in the browser that was offered it, among what is offered; another browser's try with the
+    // same link neither goes on nor takes it from that browser.
+    let (_, headers, page) = browse(&authorize, None, None);
+    let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+    let chooser = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
+    let acme = local(&href(&page, "Acme SSO"));
+    assert_eq!(browse(&acme, Some(&"0".repeat(64)), None).0, 400, "another browser");
+    assert_eq!(browse(&acme, Some(&chooser), None).0, 302, "still the offered browser's");
+    let tampered = acme.replacen("flow=", "flow=A", 1);
+    assert_eq!(browse(&tampered, Some(&chooser), None).0, 400, "a flow this server did not seal");
+    let (_, _, page) = browse(&authorize, Some(&chooser), None);
+    let unknown = local(&href(&page, "Acme SSO")).replace("provider=acme", "provider=nope");
+    assert_eq!(browse(&unknown, Some(&chooser), None).0, 400, "not offered");
+
+    let both = sign_in(Some(&idp.url));
+    let (page, cookie) = both.split_once('\u{0}').unwrap();
+    assert!(page.contains("You're signed in to Acme SSO as <b>alice@acme.example</b>"), "its email, shown: {page}");
+    assert!(page.contains("<dt>Allowed as</dt><dd>member of eng</dd>"), "{page}");
+    assert!(page.contains("<dt>Works as</dt><dd>acme:alice</dd>"), "under its provider's name: {page}");
+    let sent = std::fs::read_to_string(server.root.path().join("requests.log")).unwrap();
+    for told in [
+        "\"provider\":\"acme\"".to_string(),
+        format!("\"issuer\":\"{}\"", idp.url),
+        "\"subject\":\"248289761001\"".to_string(),
+        "\"email\":\"alice@acme.example\"".to_string(),
+        "\"groups\":[\"eng\"]".to_string(),
+    ] {
+        assert!(sent.contains(&told), "{told}: {sent}");
+    }
+    let at = page.find("name=\"consent\" value=\"").unwrap() + "name=\"consent\" value=\"".len();
+    let approve = format!("consent={}&decision=approve", &page[at..at + 64]);
+    let (status, headers, _) =
+        browse(&format!("{}/bd/oauth/consent", server.base), Some(cookie), Some(("https://bd.example.com", &approve)));
+    assert_eq!(status, 303);
+    let back = query_of(&location(&headers), "http://127.0.0.1:43117/callback?");
+    let redeem = format!(
+        "grant_type=authorization_code&code={}&code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk&\
+         client_id={client_id}&redirect_uri={}",
+        back["code"],
+        url_encode("http://127.0.0.1:43117/callback")
+    );
+    let (status, _, answer) = browse(&format!("{}/bd/oauth/token", server.base), None, Some(("", &redeem)));
+    assert_eq!(status, 200, "{answer}");
+    let tokens = Value::from(stored(server.root.path(), "tokens")).to_string();
+    assert!(tokens.contains("\"provider\":\"acme\""), "{tokens}");
+
+    // An ID token for another client is refused.
+    // An answer naming another issuer (a mix-up) is refused before its code is used.
+    let both = sign_in(Some("https://evil.example"));
+    let (page, _) = both.split_once('\u{0}').unwrap();
+    assert!(page.contains("came back from another provider"), "{page}");
+
+    idp.state.lock().unwrap().aud = Some("someone-else".into());
+    let both = sign_in(None);
+    let (page, _) = both.split_once('\u{0}').unwrap();
+    assert!(page.contains("Couldn&#39;t reach Acme SSO"), "{page}");
+    assert!(!page.contains("someone-else"), "details stay in the log: {page}");
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_clients_sign_people_in_with_a_provider_that_posts_its_answer_and_takes_signed_secrets() {
+    use base64::Engine;
+    let idp = FakeOidc::start();
+    let rng = ring::rand::SystemRandom::new();
+    let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
+    let pkcs8 = ring::signature::EcdsaKeyPair::generate_pkcs8(alg, &rng).unwrap();
+    let pair = ring::signature::EcdsaKeyPair::from_pkcs8(alg, pkcs8.as_ref(), &rng).unwrap();
+    idp.state.lock().unwrap().signed_by = Some(ring::signature::KeyPair::public_key(&pair).as_ref().to_vec());
+    let b64 = base64::engine::general_purpose::STANDARD.encode(pkcs8.as_ref());
+    let lines: Vec<&str> = b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect();
+    let pem = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", lines.join("\n"));
+
+    let root = Server::prepare();
+    std::fs::write(root.path().join("AuthKey_KEY123.p8"), pem).unwrap();
+    let script = root.path().join("authorize");
+    std::fs::write(&script, AUTHORIZER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(root.path().join("decision.json"), r#"{"allow":true,"role":"write"}"#).unwrap();
+    let config = format!(
+        "[oidc.apple]\nissuer = \"{}\"\nclient_id = \"bd-client\"\nlabel = \"Apple\"\nresponse_mode = \"form_post\"\n\n\
+         [oidc.apple.signed_secret]\nkey_file = \"AuthKey_KEY123.p8\"\nkey_id = \"KEY123\"\nteam_id = \"TEAM123\"\n\n\
+         [authorizer]\ncommand = [\"./authorize\"]\n\n[oauth]\nloopback_redirects = true\n",
+        idp.url
+    );
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &["--public-url", "https://bd.example.com/bd"]);
+    let local = |url: &str| url.replacen("https://bd.example.com", &server.base, 1);
+    let request =
+        r#"{"redirect_uris":["http://127.0.0.1/callback"],"client_name":"Desk","token_endpoint_auth_method":"none"}"#;
+    let (status, _, registered) = post_json(&format!("{}/bd/oauth/register", server.base), request);
+    assert_eq!(status, 201, "{registered}");
+    let client_id = registered["client_id"].as_str().unwrap().to_string();
+    let authorize = format!(
+        "{}/bd/oauth/authorize?client_id={client_id}&redirect_uri=http%3A%2F%2F127.0.0.1%3A43117%2Fcallback&\
+         response_type=code&state=s-1&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&\
+         code_challenge_method=S256&resource=https%3A%2F%2Fbd.example.com%2Fbd%2Fw%2Fproj%2Fmcp",
+        server.base
+    );
+    // Apple's email, verified as a string, of a relay address.
+    idp.next(
+        "001234.0a1b2c3d.0417",
+        json!({ "email": "x7k2@privaterelay.appleid.com", "email_verified": "true", "is_private_email": "true" }),
+    );
+    let (status, headers, body) = browse(&authorize, None, None);
+    assert_eq!(status, 302, "one provider: straight to it: {body}");
+    let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+    let cookie = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
+    let to_idp = location(&headers);
+    let q = query_of(&to_idp, &format!("{}/authorize?", idp.url));
+    assert_eq!(q["response_mode"], "form_post");
+    let (_, _, posted) = browse(&to_idp, None, None);
+    let posted: Value = serde_json::from_str(&posted).unwrap();
+    let form: Vec<(&str, &str)> =
+        ["code", "state", "id_token", "user"].iter().map(|k| (*k, posted[*k].as_str().unwrap())).collect();
+    let form: Vec<String> = form.iter().map(|(k, v)| format!("{k}={}", url_encode(v))).collect();
+
+    // Posted from the provider's page: no cookie of the sign-in's, so on to the GET it goes with.
+    let callback = format!("{}/bd/oauth/apple/callback", server.base);
+    let (status, headers, _) = browse(&callback, None, Some(("https://appleid.apple.com", &form.join("&"))));
+    assert_eq!(status, 303);
+    let on = location(&headers);
+    let q = query_of(&on, "https://bd.example.com/bd/oauth/apple/callback?");
+    assert_eq!(
+        (q["code"].as_str(), q["state"].as_str()),
+        (posted["code"].as_str().unwrap(), posted["state"].as_str().unwrap())
+    );
+    assert!(!q.contains_key("id_token") && !q.contains_key("user"), "only what the callback reads: {on}");
+    let (status, _, page) = browse(&local(&on), Some(&cookie), None);
+    assert_eq!(status, 200, "{page}");
+    let actor = format!("apple:{}", pseudonym(&idp.url, "001234.0a1b2c3d.0417"));
+    assert!(page.contains(&format!("<dt>Works as</dt><dd>{actor}</dd>")), "never the email: {page}");
+    assert!(page.contains("as <b>x7k2@privaterelay.appleid.com</b>"), "which is shown: {page}");
+    let exchange = idp.log().into_iter().filter(|l| l == "POST /token").count();
+    assert_eq!(exchange, 1, "the code was redeemed with a signed client secret");
+
+    // A post without a state goes nowhere, nor one to a provider that does not post its answers.
+    let (status, _, page) = browse(&callback, None, Some(("https://appleid.apple.com", "code=x")));
+    assert_eq!((status, page.contains("expired")), (400, true), "{page}");
+    let github = format!("{}/bd/oauth/github/callback", server.base);
+    let (status, _, page) = browse(&github, None, Some(("https://github.com", "code=x&state=y")));
+    assert_eq!((status, page.contains("came back in a way")), (400, true), "{page}");
+
+    // Cancelled at Apple: the client hears access_denied.
+    let (_, headers, _) = browse(&authorize, None, None);
+    let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+    let cookie = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
+    let state = query_of(&location(&headers), &format!("{}/authorize?", idp.url))["state"].clone();
+    let cancelled = format!("error=user_cancelled_authorize&state={}", url_encode(&state));
+    let (status, headers, _) = browse(&callback, None, Some(("https://appleid.apple.com", &cancelled)));
+    assert_eq!(status, 303);
+    let (status, headers, _) = browse(&local(&location(&headers)), Some(&cookie), None);
+    assert_eq!(status, 302);
+    let back = query_of(&location(&headers), "http://127.0.0.1:43117/callback?");
+    assert_eq!((back["error"].as_str(), back["state"].as_str()), ("access_denied", "s-1"), "{back:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn mcp_clients_sign_people_in_through_the_authorizer() {
+    let github = FakeGithub::start();
+    github.install("acme");
+    let root =
+        oauth_root_at(Some(&github), "[authorizer]\ncommand = [\"./authorize\"]\n", "loopback_redirects = true\n");
+    let script = root.path().join("authorize");
+    std::fs::write(&script, AUTHORIZER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let decide = |root: &Path, answer: &str| std::fs::write(root.join("decision.json"), answer).unwrap();
+    decide(root.path(), r#"{"allow":true,"role":"write","via":"member of bd-users"}"#);
+    let server = Server::launch(root, "127.0.0.1:0", &["--public-url", "https://bd.example.com/bd"]);
+    let request =
+        r#"{"redirect_uris":["http://127.0.0.1/callback"],"client_name":"Desk","token_endpoint_auth_method":"none"}"#;
+    let (status, _, registered) = post_json(&format!("{}/bd/oauth/register", server.base), request);
+    assert_eq!(status, 201, "{registered}");
+    let client_id = registered["client_id"].as_str().unwrap().to_string();
+
+    // Let in: the consent page names what it said let the account in, and it was told the client.
+    let (_, page) = authorized(&server, &github, &client_id, "alice", "http://127.0.0.1:43117/callback");
+    assert!(page.contains("<dt>Allowed as</dt><dd>member of bd-users</dd>"), "{page}");
+    let sent = std::fs::read_to_string(server.root.path().join("requests.log")).unwrap();
+    assert!(sent.contains(&format!("\"client\":\"{client_id}\"")), "{sent}");
+
+    // It cannot answer: a page to try again from, with a way back to the client.
+    decide(server.root.path(), "FAIL");
+    github.next("alice", 0);
+    let authorize = format!(
+        "{}/bd/oauth/authorize?client_id={client_id}&redirect_uri=http%3A%2F%2F127.0.0.1%3A43117%2Fcallback&\
+         response_type=code&state=s-1&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&\
+         code_challenge_method=S256&resource=https%3A%2F%2Fbd.example.com%2Fbd%2Fw%2Fproj%2Fmcp",
+        server.base
+    );
+    let (status, headers, body) = browse(&authorize, None, None);
+    assert_eq!(status, 302, "{body}");
+    let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+    let cookie = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
+    let (_, headers, _) = browse(&location(&headers), None, None);
+    let callback = location(&headers).replacen("https://bd.example.com", &server.base, 1);
+    let (status, headers, page) = browse(&callback, Some(&cookie), None);
+    assert_eq!(status, 503, "{page}");
+    assert!(headers.get("location").is_none());
+    assert!(
+        page.contains("Couldn&#39;t check your access") && page.contains("error=temporarily_unavailable"),
+        "{page}"
+    );
+}
+
 #[test]
 fn github_sign_ins_are_renewed_by_the_rules_through_the_github_app() {
     let github = FakeGithub::start();
@@ -5330,7 +6421,7 @@ fn github_sign_ins_are_renewed_by_the_rules_through_the_github_app() {
     github.member("bob", "acme");
     let server = refresh_server(
         &github,
-        "[[github.allow]]\nusers = [\"alice\"]\nrole = \"admin\"\n\n[[github.allow]]\norgs = [\"acme\"]\n",
+        "[[github.allow]]\nusers = [\"alice\"]\nrole = \"admin\"\n\n[[github.allow]]\ngroups = [\"acme\"]\n",
     );
     let url = server.url();
     let root = server.root.path().to_path_buf();
@@ -5345,7 +6436,7 @@ fn github_sign_ins_are_renewed_by_the_rules_through_the_github_app() {
     assert!(until.as_str() > v["token"]["expires_at"].as_str().unwrap(), "{v}");
     let first = (saved(alice.path(), "token").unwrap(), saved(alice.path(), "refresh_token").unwrap());
     assert!(first.1.starts_with("bdr_") && !stdout.contains(&first.1), "never printed");
-    let tokens = std::fs::read_to_string(root.join("tokens.json")).unwrap();
+    let tokens = Value::from(stored(&root, "tokens")).to_string();
     assert!(!tokens.contains(&first.0) && !tokens.contains(&first.1), "only hashes are stored");
     let shown = check(signed_in(alice.path(), &url, &["remote", "show"]), "show");
     assert!(shown.contains("renewed automatically") && shown.contains("refreshed until"), "{shown}");
@@ -5407,17 +6498,18 @@ fn github_sign_ins_are_renewed_by_the_rules_through_the_github_app() {
     assert_eq!(lookups(), earlier + 1, "one refresh");
     check(signed_in(bob.path(), &url, &["list"]), "still signed in");
     assert_eq!(lookups(), earlier + 1);
-    let path = root.join("tokens.json");
-    let mut file: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    for t in file["tokens"].as_array_mut().unwrap().iter_mut().filter(|t| t["github"]["login"] == "bob") {
-        t["expires_at"] = json!("2026-01-01T00:00:00.000Z");
-    }
-    std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+    edit_tokens(&root, |t| t["identity"]["login"] == "bob", |t| t["expires_at"] = json!("2026-01-01T00:00:00.000Z"));
     let before = saved(bob.path(), "token").unwrap();
     check(signed_in(bob.path(), &url, &["create", "By bob"]), "create after a 401");
     assert_ne!(saved(bob.path(), "token").unwrap(), before);
     let members = github.log().iter().filter(|l| l.starts_with("GET /orgs/acme/memberships/bob")).count();
     assert!(members >= 1, "membership asked with an installation token: {:?}", github.log());
+    // Installation tokens last until shortly before GitHub's expires_at, and an organization's installation is
+    // looked up once: these refreshes minted one token, and listed the installations once.
+    let log = github.log();
+    let count = |prefix: &str| log.iter().filter(|l| l.starts_with(prefix)).count();
+    assert_eq!(count("POST /app/installations/"), 1, "{log:?}");
+    assert_eq!((count("GET /app/installations"), count("GET /orgs/acme/installation")), (1, 1), "{log:?}");
 
     // Out of the organization: the refresh is refused and the sign-in revoked.
     github.leave("bob", "acme");
@@ -5437,7 +6529,7 @@ fn github_sign_ins_stay_while_github_will_not_tell_memberships() {
     let github = FakeGithub::start();
     github.install("acme");
     github.member("carol", "other");
-    let server = refresh_server(&github, "[[github.allow]]\norgs = [\"other\"]\n");
+    let server = refresh_server(&github, "[[github.allow]]\ngroups = [\"other\"]\n");
     let url = server.url();
     // The App is not installed on `other`: the refresh fails for now, and the sign-in stays.
     github.next("carol", 0);
@@ -5553,7 +6645,7 @@ fn github_sign_in_refusals() {
     // Without auth.toml, nobody signs in.
     let plain = Server::start();
     let dir = machine();
-    refused(github_login(dir.path(), &plain.url()), 7, "GitHub sign-in is not enabled");
+    refused(github_login(dir.path(), &plain.url()), 7, "sign-in is not enabled");
     assert_eq!(saved_token(dir.path()), None);
     assert!(github.log().is_empty(), "GitHub is not asked");
 
@@ -5574,7 +6666,7 @@ fn github_sign_in_refusals() {
     github.next("alice", 0);
     refused(github_login(dir.path(), &server.url()), 7, "not use workspace proj (only other)");
     assert_eq!(saved_token(dir.path()), None);
-    assert!(!server.root.path().join("tokens.json").exists(), "nothing issued");
+    assert!(stored(server.root.path(), "tokens").is_empty(), "nothing issued");
     assert!(!github.log().iter().any(|l| l.contains("scope=")), "users alone need no scope: {:?}", github.log());
 
     // An app without device flow: GitHub's answer reaches the person signing in.
@@ -5588,29 +6680,35 @@ fn github_sign_in_refusals() {
     std::fs::write(&config, good.replace("[github]\n", "[github]\nclient_secret = \"s3cret-value\"\n")).unwrap();
     let out = github_login(dir.path(), &server.url());
     assert!(!String::from_utf8_lossy(&out.stderr).contains("s3cret"), "{}", String::from_utf8_lossy(&out.stderr));
-    refused(out, 8, "GitHub sign-in is not working on this bd server");
+    refused(out, 8, "sign-in is not working on this bd server");
     std::fs::write(&config, good).unwrap();
 
-    // A login whose actor an admin's token has: refused, so that neither acts as the other.
+    // An admin's token never takes a sign-in's actor, so no account is kept out by one.
     let github = FakeGithub::start();
     let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"ci-agents\"]\n");
-    server.token("ci", "ci-agents", &[]);
+    let create = |actor: &str| {
+        bd(server.root.path())
+            .args(["serve", "token", "create", "ci", "--as", actor, "--root"])
+            .arg(server.root.path())
+            .output()
+    };
+    refused(create("github:ci-agents").unwrap(), 2, "names a provider's account");
     github.next("ci-agents", 0);
-    refused(github_login(dir.path(), &server.url()), 7, "another access token acts as ci-agents");
-    let out = bd(server.root.path())
-        .args(["serve", "token", "create", "ci-2", "--as", "ci-agents/x", "--root"])
-        .arg(server.root.path())
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "admins' tokens may share actors among themselves");
+    let out = github_login(dir.path(), &server.url());
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 
-    // An organization that will not tell counts as no membership.
+    // An organization that will not tell decides nothing: the sign-in fails, to be tried again, rather than fall
+    // through to rules after it.
     let github = FakeGithub::start();
     github.member("dana", "acme");
     github.state.lock().unwrap().blocked.push("acme".into());
-    let server = sign_in_server(&github, "[[github.allow]]\norgs = [\"acme\"]\n");
+    let server = sign_in_server(&github, "[[github.allow]]\ngroups = [\"acme\"]\n");
     github.next("dana", 0);
-    refused(github_login(dir.path(), &server.url()), 7, "dana may not sign in");
+    refused(
+        github_login(dir.path(), &server.url()),
+        8,
+        "GitHub would not tell this bd server whether GitHub user dana",
+    );
 
     // A broken auth.toml keeps the server from starting.
     let root = Server::prepare();
@@ -5626,7 +6724,6 @@ fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
         &github,
         "[[github.allow]]\nusers = [\"alice\", \"ci-agents\", \"new-name\"]\nkind = \"human\"\n\n[[github.allow]]\nanyone = true\n",
     );
-    server.token("ci", "ci-agents", &[]);
     let url = server.url();
     let sign_in = |login: &str, id: u64| {
         github.next(login, 0);
@@ -5646,31 +6743,32 @@ fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
     };
 
     let v = issued(sign_in("alice", 1).1);
-    assert_eq!((v["github"]["via"].as_str(), v["token"]["kind"].as_str()), (Some("GitHub user alice"), Some("human")));
+    assert_eq!((v["account"]["via"].as_str(), v["token"]["kind"].as_str()), (Some("GitHub user alice"), Some("human")));
 
     let (stranger, out) = sign_in("stranger", 2);
     let v = issued(out);
-    assert_eq!(v["actor"], "stranger", "bound to its own login's actor");
-    assert_eq!(v["github"]["via"], "GitHub user stranger, as anyone");
+    assert_eq!(v["actor"], "github:stranger", "bound to its own login's actor");
+    assert_eq!(v["account"]["via"], "GitHub user stranger, as anyone");
     assert_eq!((v["token"]["role"].as_str(), v["token"]["kind"].as_str()), (Some("read"), Some("agent")));
     check(signed_in(stranger.path(), &url, &["list"]), "read as anyone");
     assert_eq!(signed_in(stranger.path(), &url, &["create", "x"]).status.code(), Some(7), "a read token");
     assert!(!github.log().iter().any(|l| l.contains("scope=")), "no rule reads memberships: {:?}", github.log());
 
     // Renamed to a login a rule names, a bound account does not pass for the principal that had it.
-    refused(sign_in("alice", 2).1, "actor alice belongs to another GitHub account");
-    refused(sign_in("ci-agents", 2).1, "another access token acts as ci-agents");
+    refused(sign_in("alice", 2).1, "actor github:alice belongs to another account");
+    // A login no other account had: the rule names it, and the account signs in as its own actor.
+    assert_eq!(issued(sign_in("ci-agents", 2).1)["actor"], "github:stranger");
     issued(sign_in("stranger", 2).1);
     // Nor for one whose login it was at its latest sign-in, though never its actor.
     issued(sign_in("old-name", 5).1);
     let v = issued(sign_in("new-name", 5).1);
-    assert_eq!((v["actor"].as_str(), v["token"]["kind"].as_str()), (Some("old-name"), Some("human")));
-    refused(sign_in("new-name", 2).1, "login new-name was that of another GitHub account (actor old-name)");
+    assert_eq!((v["actor"].as_str(), v["token"]["kind"].as_str()), (Some("github:old-name"), Some("human")));
+    refused(sign_in("new-name", 2).1, "login new-name was that of another account before");
     // A login no rule names is just anyone's: the account signs in as its own actor.
     let v = issued(sign_in("old-name", 2).1);
     assert_eq!(
-        (v["actor"].as_str(), v["github"]["via"].as_str()),
-        (Some("stranger"), Some("GitHub user old-name, as anyone"))
+        (v["actor"].as_str(), v["account"]["via"].as_str()),
+        (Some("github:stranger"), Some("GitHub user old-name, as anyone"))
     );
 
     // The token step refuses a workspace the server does not have, as the device step does.
@@ -5679,11 +6777,53 @@ fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
 
     // A denied account gets nothing, whatever its login.
     let config = server.root.path().join("auth.toml");
-    let text = std::fs::read_to_string(&config).unwrap().replace("[github]\n", "[github]\ndeny = [2]\n");
+    let text = std::fs::read_to_string(&config).unwrap().replace("[github]\n", "[github]\ndeny = [\"2\"]\n");
     std::fs::write(&config, text).unwrap();
     refused(sign_in("stranger", 2).1, "GitHub user stranger may not sign in");
     refused(sign_in("someone-else", 2).1, "GitHub user someone-else may not sign in");
     issued(sign_in("newcomer", 3).1);
+}
+
+#[test]
+fn admins_name_accounts_and_link_one_persons_accounts() {
+    let github = FakeGithub::start();
+    let server = sign_in_server(&github, "[[github.allow]]\nanyone = true\nrole = \"write\"\n");
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+    let sign_in = |login: &str, id: u64| {
+        github.next(login, 0);
+        github.set_id(login, id);
+        let dir = tempfile::tempdir().unwrap();
+        let v: Value = serde_json::from_str(&check(github_login(dir.path(), &url), "login")).unwrap();
+        (dir, v["actor"].as_str().unwrap().to_string())
+    };
+    let admin = |args: &[&str]| -> Value {
+        let out =
+            bd(&root).arg("--json").args(["serve", "token"]).args(args).arg("--root").arg(&root).output().unwrap();
+        serde_json::from_str(&check(out, &format!("token {args:?}"))).unwrap()
+    };
+    let (_alice, actor) = sign_in("alice", 1);
+    assert_eq!(actor, "github:alice");
+    let (bob, actor) = sign_in("alice-work", 2);
+    assert_eq!(actor, "github:alice-work");
+
+    assert_eq!(admin(&["name", "github:alice", "Alice"])["name"], "Alice");
+    let linked = admin(&["link", "github:alice-work", "--to", "github:alice"]);
+    assert_eq!((linked["was"].as_str(), linked["actor"].as_str()), (Some("github:alice-work"), Some("github:alice")));
+    assert_eq!(signed_in(bob.path(), &url, &["list"]).status.code(), Some(7), "its token acted as its former actor");
+    let (again, actor) = sign_in("alice-work", 2);
+    assert_eq!(actor, "github:alice", "one person, one actor");
+    check(signed_in(again.path(), &url, &["create", "From the other account"]), "works as github:alice");
+    let accounts = admin(&["accounts"]);
+    let bound: Vec<(&str, Option<&str>)> =
+        accounts.as_array().unwrap().iter().map(|a| (a["actor"].as_str().unwrap(), a["name"].as_str())).collect();
+    assert_eq!(bound, [("github:alice", Some("Alice")), ("github:alice", None)]);
+    let kinds: Vec<String> = admin(&["events", "--actor", "github:alice"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert!(kinds.contains(&"named".to_string()) && kinds.contains(&"linked".to_string()), "{kinds:?}");
 }
 
 #[test]
@@ -5709,7 +6849,7 @@ fn github_sign_in_rules_keep_out_new_accounts_and_cap_claims() {
         let out = sign_in(login).1;
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(7), "{stderr}");
-        assert!(stderr.contains("its GitHub account must be at least 30d old"), "{stderr}");
+        assert!(stderr.contains("the account must be at least 30d old"), "{stderr}");
     }
 
     let (dir, out) = sign_in("veteran");
@@ -5722,15 +6862,21 @@ fn github_sign_in_rules_keep_out_new_accounts_and_cap_claims() {
     let ids: Vec<String> = (1..=2)
         .map(|n| check(signed_in(dir.path(), &url, &["-q", "create", &format!("Task {n}")]), "create").trim().into())
         .collect();
-    check(signed_in(dir.path(), &url, &["--actor", "veteran/a1", "claim", &ids[0]]), "first claim");
-    let out = signed_in(dir.path(), &url, &["--actor", "veteran/a2", "claim", &ids[1]]);
+    check(signed_in(dir.path(), &url, &["--actor", "github:veteran/a1", "claim", &ids[0]]), "first claim");
+    let out = signed_in(dir.path(), &url, &["--actor", "github:veteran/a2", "claim", &ids[1]]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(7), "{stderr}");
     assert!(stderr.contains("its access token allows at most 1"), "{stderr}");
-    let out = signed_in(dir.path(), &url, &["update", &ids[1], "--assignee", "veteran"]);
+    let out = signed_in(dir.path(), &url, &["update", &ids[1], "--assignee", "github:veteran"]);
     assert_eq!(out.status.code(), Some(7), "reserving counts too: {}", String::from_utf8_lossy(&out.stderr));
-    check(signed_in(dir.path(), &url, &["--actor", "veteran/a1", "close", &ids[0], "--reason", "done"]), "close");
-    check(signed_in(dir.path(), &url, &["--actor", "veteran/a2", "claim", &ids[1]]), "a claim after closing one");
+    check(
+        signed_in(dir.path(), &url, &["--actor", "github:veteran/a1", "close", &ids[0], "--reason", "done"]),
+        "close",
+    );
+    check(
+        signed_in(dir.path(), &url, &["--actor", "github:veteran/a2", "claim", &ids[1]]),
+        "a claim after closing one",
+    );
 
     // An admin gives a token the same limit.
     let root = server.root.path();
@@ -5774,9 +6920,7 @@ fn github_sign_in_answers_a_retry_with_the_token_it_issued() {
     assert_eq!((status, &again), (200, &first));
     let exchanges = github.log().iter().filter(|l| l.starts_with("POST /login/oauth/access_token")).count();
     assert_eq!(exchanges, 1, "GitHub was asked once");
-    let tokens: Value =
-        serde_json::from_str(&std::fs::read_to_string(server.root.path().join("tokens.json")).unwrap()).unwrap();
-    assert_eq!(tokens["tokens"].as_array().unwrap().len(), 1, "one token issued");
+    assert_eq!(stored(server.root.path(), "tokens").len(), 1, "one token issued");
 
     let (status, other) = sign_in_post(&server, "token", json!({ "device_code": "dc-other", "workspace": "proj" }));
     assert_eq!(status, 400, "another code gets nothing of it: {other}");
@@ -5830,41 +6974,41 @@ fn github_accounts_keep_their_actor_until_an_admin_releases_it() {
     let signed_in_as = |out: Output, what: &str| -> Value { serde_json::from_str(&check(out, what)).unwrap() };
 
     let (alice, out) = sign_in("alice", 1);
-    assert_eq!(signed_in_as(out, "alice signs in")["actor"], "alice");
+    assert_eq!(signed_in_as(out, "alice signs in")["actor"], "github:alice");
     check(signed_in(alice.path(), &url, &["create", "Alice's work"]), "create");
 
     // Renamed at GitHub: the same account, still alice in bd.
     let (renamed, out) = sign_in("alice-smith", 1);
     let v = signed_in_as(out, "renamed alice signs in");
-    assert_eq!((v["actor"].as_str(), v["github"]["login"].as_str()), (Some("alice"), Some("alice-smith")));
+    assert_eq!((v["actor"].as_str(), v["account"]["login"].as_str()), (Some("github:alice"), Some("alice-smith")));
     let accounts = admin(&["accounts"]);
     assert_eq!(accounts.as_array().unwrap().len(), 1, "{accounts}");
     let account = &accounts[0];
-    assert_eq!((account["actor"].as_str(), account["login"].as_str()), (Some("alice"), Some("alice-smith")));
-    assert_eq!((account["id"].as_u64(), account["live_tokens"].as_u64()), (Some(1), Some(2)));
+    assert_eq!((account["actor"].as_str(), account["login"].as_str()), (Some("github:alice"), Some("alice-smith")));
+    assert_eq!((account["subject"].as_str(), account["live_tokens"].as_u64()), (Some("1"), Some(2)));
 
     // Whoever registers the login given up gets nothing while its actor is bound.
     let (_impostor, out) = sign_in("alice", 2);
     let stderr = String::from_utf8_lossy(&out.stderr).to_string();
     assert_eq!(out.status.code(), Some(7), "{stderr}");
-    assert!(stderr.contains("actor alice belongs to another GitHub account"), "{stderr}");
+    assert!(stderr.contains("actor github:alice belongs to another account"), "{stderr}");
     assert_eq!(admin(&["accounts"]).as_array().unwrap().len(), 1, "a refused sign-in binds nothing");
 
     // Revoked, the account keeps the actor; released by an admin, the next sign-in as alice binds it.
-    let v = admin(&["revoke", "--github", "alice"]);
+    let v = admin(&["revoke", "--account", "github:alice"]);
     assert_eq!((v["revoked"].as_array().unwrap().len(), v["forgot"].as_bool()), (2, Some(false)));
     assert_eq!(signed_in(renamed.path(), &url, &["list"]).status.code(), Some(7), "revoked at once");
     assert_eq!(sign_in("alice", 2).1.status.code(), Some(7), "still bound");
-    let v = admin(&["revoke", "--github", "alice-smith", "--forget"]);
-    assert_eq!((v["accounts"][0]["id"].as_u64(), v["forgot"].as_bool()), (Some(1), Some(true)));
+    let v = admin(&["revoke", "--account", "alice-smith", "--forget"]);
+    assert_eq!((v["accounts"][0]["subject"].as_str(), v["forgot"].as_bool()), (Some("1"), Some(true)));
     assert!(admin(&["accounts"]).as_array().unwrap().is_empty());
     let (newcomer, out) = sign_in("alice", 2);
-    assert_eq!(signed_in_as(out, "the newcomer signs in")["actor"], "alice");
-    assert_eq!(admin(&["accounts"])[0]["id"].as_u64(), Some(2));
+    assert_eq!(signed_in_as(out, "the newcomer signs in")["actor"], "github:alice");
+    assert_eq!(admin(&["accounts"])[0]["subject"].as_str(), Some("2"));
     check(signed_in(newcomer.path(), &url, &["list"]), "list as the newcomer");
 
     let out = bd(&root).args(["serve", "token", "revoke", "x", "--forget", "--root"]).arg(&root).output().unwrap();
-    assert_eq!(out.status.code(), Some(2), "--forget goes with --github");
+    assert_eq!(out.status.code(), Some(2), "--forget goes with --account");
 }
 
 #[test]
@@ -5881,7 +7025,7 @@ fn info_and_remote_show_tell_clients_what_their_token_may_do() {
     assert_eq!(
         token,
         json!({ "name": "alice-desk", "actor": "alice", "role": "admin", "kind": "human", "workspaces": ["proj"],
-                "expires_at": null, "refreshable_until": null, "github": null, "max_claims": null }),
+                "expires_at": null, "refreshable_until": null, "account": null, "max_claims": null }),
         "never the token's id or hash"
     );
     let shown = alice.ok(&["remote", "show"]);
@@ -5940,7 +7084,7 @@ fn sign_in_tokens_end_on_the_server_when_logged_out_or_replaced() {
 
     // One the server's admin revoked first is gone there already.
     sign_in("third sign-in");
-    let out = bd(&root).args(["serve", "token", "revoke", "--github", "alice", "--root"]).arg(&root).output().unwrap();
+    let out = bd(&root).args(["serve", "token", "revoke", "--account", "alice", "--root"]).arg(&root).output().unwrap();
     check(out, "revoke --github");
     assert_eq!(logout(&[])["revocations"][0]["outcome"], "gone");
 
@@ -5969,7 +7113,7 @@ fn github_sign_in_trusts_a_private_ca_named_in_auth_toml() {
     assert!(github.url.starts_with("https://"), "{}", github.url);
     github.install("acme");
     github.member("alice", "acme");
-    let server = refresh_server(&github, "[[github.allow]]\norgs = [\"acme\"]\n");
+    let server = refresh_server(&github, "[[github.allow]]\ngroups = [\"acme\"]\n");
     let (url, root) = (server.url(), server.root.path().to_path_buf());
 
     // Without ca_cert, GitHub's certificate is refused before anything reaches it.
@@ -5989,7 +7133,7 @@ fn github_sign_in_trusts_a_private_ca_named_in_auth_toml() {
     let config = config.replacen("[github]\n", "[github]\nca_cert = \"ghes-ca.pem\"\n", 1);
     std::fs::write(root.join("auth.toml"), config).unwrap();
     let v: Value = serde_json::from_str(&check(github_login(alice.path(), &url), "login")).unwrap();
-    assert_eq!(v["github"]["via"], "member of acme");
+    assert_eq!(v["account"]["via"], "member of acme");
     let first = saved_token(alice.path()).unwrap();
     renewal_due(alice.path());
     check(signed_in(alice.path(), &url, &["list"]), "list, renewed first");
@@ -5999,4 +7143,1475 @@ fn github_sign_in_trusts_a_private_ca_named_in_auth_toml() {
     {
         assert!(log.iter().any(|l| l.starts_with(asked)), "{asked}: {log:?}");
     }
+}
+
+#[test]
+fn mcp_forwards_tool_calls_to_the_server() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "Design", "-p", "1"]);
+    alice.ok(&["create", "Build", "--dep", "t-1"]);
+
+    let mut child =
+        alice.cmd(&["mcp"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut call = |tool: &str, arguments: Value| -> Value {
+        let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": tool, "arguments": arguments, "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {} } } });
+        writeln!(stdin, "{request}").unwrap();
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        let answer: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(answer["result"]["isError"], false, "{answer}");
+        serde_json::from_str(answer["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+    };
+
+    let claim = call("claim", json!({ "next": true }));
+    assert_eq!(claim["issue"]["id"], "t-1");
+    let holder = claim["issue"]["assignee"].as_str().unwrap().to_string();
+    assert!(holder.starts_with("alice/mcp-"), "a session of the token's actor: {holder}");
+    let token = claim["lease"]["token"].clone();
+    assert!(call("heartbeat", json!({ "id": "t-1", "token": token }))["expires_at"].is_string());
+    let closed = call("close", json!({ "ids": ["t-1"], "reason": "done", "token": token }));
+    assert_eq!(closed["unblocked"][0]["id"], "t-2", "{closed}");
+    assert_eq!(call("ready", json!({}))["issues"][0]["id"], "t-2");
+    drop(call);
+    drop(stdin);
+    assert!(child.wait().unwrap().success(), "ends with its input");
+
+    let history = alice.json(&["history", "t-1"]);
+    assert!(history.as_array().unwrap().iter().all(|e| e["actor"] == holder || e["op"] == "created"), "{history}");
+}
+
+/// `bd mcp`'s answers to `messages`, sent one per line, then end of input.
+fn mcp_answers(mut cmd: Command, messages: &[Value]) -> Vec<Value> {
+    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for m in messages {
+        writeln!(stdin, "{m}").unwrap();
+    }
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    check(out, "bd mcp").lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+fn mcp_tool_call(tool: &str, arguments: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": tool, "arguments": arguments,
+        "_meta": { "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {} } } })
+}
+
+/// A tool result's error, or `None` if it succeeded.
+fn mcp_tool_error(answer: &Value) -> Option<Value> {
+    let text = answer["result"]["content"][0]["text"].as_str().unwrap_or_else(|| panic!("{answer}"));
+    (answer["result"]["isError"] == true).then(|| serde_json::from_str::<Value>(text).unwrap()["error"].clone())
+}
+
+#[test]
+fn mcp_tool_calls_never_carry_a_persons_rights() {
+    let server = Server::start();
+    let carol = server.client(&server.token("carol-desk", "carol", &["--kind", "human"]));
+    carol.ok(&["create", "Ship"]);
+    let gate = carol.ok(&["-q", "gate", "create", "-t", "human", "--blocks", "t-1"]).trim().to_string();
+
+    let answers = mcp_answers(
+        carol.cmd(&["mcp"]),
+        &[
+            mcp_tool_call("close", json!({ "ids": [gate], "reason": "approved by the model" })),
+            mcp_tool_call("update", json!({ "id": gate, "status": "pinned" })),
+        ],
+    );
+    for answer in &answers {
+        let error = mcp_tool_error(answer).unwrap_or_else(|| panic!("a model opened a human gate: {answer}"));
+        assert_eq!(error["code"], "unauthorized", "{error}");
+    }
+    assert_eq!(carol.json(&["show", &gate])["status"], "open");
+    // The person's own command line still opens it.
+    carol.ok(&["close", &gate, "--reason", "approved"]);
+}
+
+#[test]
+fn mcp_reports_lost_write_answers_as_lost() {
+    let server = FakeServer::start(|_| answer(&[], true, 5));
+    let client = server.client();
+    let mut cmd = client.cmd(&["mcp"]);
+    cmd.env("BD_REMOTE_RETRY_SECS", "1");
+    let answers =
+        mcp_answers(cmd, &[mcp_tool_call("create", json!({ "title": "Lost" })), mcp_tool_call("ready", json!({}))]);
+    let write = mcp_tool_error(&answers[0]).unwrap();
+    assert_eq!(write["exit_code"], 9, "{write}");
+    assert!(write["message"].as_str().unwrap().contains("may have taken effect"), "{write}");
+    let read = mcp_tool_error(&answers[1]).unwrap();
+    assert_eq!(read["exit_code"], 8, "a read is safe to run again: {read}");
+    let bodies = server.bodies.lock().unwrap();
+    assert!(bodies.iter().all(|b| b.contains("\"tool_call\":true")), "{bodies:?}");
+}
+
+#[test]
+fn mcp_never_prints_streamed_answers_on_its_protocol_stream() {
+    // A streamed answer (no Content-Length), as bd serve sends any answer over one chunk.
+    let issue = json!([{ "id": "t-1", "title": "Big", "status": "open", "priority": 2, "issue_type": "task",
+        "description": "x".repeat(100_000) }]);
+    let server =
+        FakeServer::start(move |_| answer(&[stdout_frame(&format!("{issue:#}\n")), exit_frame(0, "")], true, 0));
+    let answers = mcp_answers(server.client().cmd(&["mcp"]), &[mcp_tool_call("ready", json!({}))]);
+    assert_eq!(answers.len(), 1, "only protocol messages on stdout");
+    assert!(mcp_tool_error(&answers[0]).is_none(), "{}", answers[0]);
+    let text: Value = serde_json::from_str(answers[0]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["issues"][0]["id"], "t-1", "{text}");
+}
+
+/// POST `message` to workspace `proj`'s MCP endpoint (`/w/proj/mcp<query>`)
+/// with `headers`, and the `MODERN` headers its body calls for unless
+/// `headers` names them; the status, the response's headers and its JSON
+/// (`Null` when empty).
+fn mcp_post(
+    server: &Server,
+    token: Option<&str>,
+    query: &str,
+    headers: &[(&str, &str)],
+    message: &Value,
+) -> (u16, ureq::http::HeaderMap, Value) {
+    mcp_post_to(&format!("{}/mcp{query}", server.url()), token, headers, message)
+}
+
+/// POST `message` to the MCP endpoint at `url`, mirroring a modern message in its headers.
+fn mcp_post_to(
+    url: &str,
+    token: Option<&str>,
+    headers: &[(&str, &str)],
+    message: &Value,
+) -> (u16, ureq::http::HeaderMap, Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let mut r = agent.post(url).content_type("application/json");
+    if let Some(t) = token {
+        r = r.header("authorization", bearer(t));
+    }
+    let params = &message["params"];
+    let version = params["_meta"]["io.modelcontextprotocol/protocolVersion"].as_str();
+    let named = |h: &str| headers.iter().any(|(k, _)| k.eq_ignore_ascii_case(h));
+    if let (Some(v), false) = (version, named("mcp-protocol-version")) {
+        r = r.header("mcp-protocol-version", v);
+    }
+    if let (Some(_), Some(m), false) = (version, message["method"].as_str(), named("mcp-method")) {
+        r = r.header("mcp-method", m);
+    }
+    if let (Some(_), Some(n), false) = (version, params["name"].as_str(), named("mcp-name")) {
+        r = r.header("mcp-name", n);
+    }
+    for (k, v) in headers {
+        r = r.header(*k, *v);
+    }
+    let mut answer = r.send(message.to_string().as_bytes()).unwrap();
+    let text = answer.body_mut().read_to_string().unwrap();
+    let body = if text.is_empty() { Value::Null } else { serde_json::from_str(&text).unwrap() };
+    (answer.status().as_u16(), answer.headers().clone(), body)
+}
+
+fn mcp_modern(id: u64, method: &str, params: Value) -> Value {
+    let mut params = params;
+    params["_meta"] = json!({ "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {} });
+    json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+}
+
+/// A tool call's result through `/w/proj/mcp<query>`, parsed.
+fn mcp_http_call(server: &Server, token: &str, query: &str, tool: &str, arguments: Value) -> Value {
+    let (status, _, answer) = mcp_post(server, Some(token), query, &[], &mcp_tool_call(tool, arguments));
+    assert_eq!(status, 200, "{answer}");
+    assert!(mcp_tool_error(&answer).is_none(), "{answer}");
+    serde_json::from_str(answer["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
+}
+
+#[test]
+fn mcp_over_http_runs_tool_calls_as_a_session_of_the_tokens_actor() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    alice.ok(&["create", "Design", "-p", "1"]);
+    alice.ok(&["create", "Build", "--dep", "t-1"]);
+    alice.ok(&["create", "Docs", "-p", "3"]);
+
+    let (status, _, d) = mcp_post(&server, Some(&secret), "", &[], &mcp_modern(1, "server/discover", json!({})));
+    assert_eq!(status, 200, "{d}");
+    assert_eq!(d["result"]["supportedVersions"], json!(["2026-07-28", "2025-11-25"]));
+    let (_, _, list) = mcp_post(&server, Some(&secret), "", &[], &mcp_modern(2, "tools/list", json!({})));
+    assert!(list["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "claim"), "{list}");
+
+    let claim = mcp_http_call(&server, &secret, "", "claim", json!({ "next": true }));
+    assert_eq!((&claim["issue"]["id"], &claim["issue"]["assignee"]), (&json!("t-1"), &json!("alice/mcp")));
+    let token = claim["lease"]["token"].clone();
+    let closed =
+        mcp_http_call(&server, &secret, "", "close", json!({ "ids": ["t-1"], "reason": "done", "token": token }));
+    assert_eq!(closed["unblocked"][0]["id"], "t-2", "{closed}");
+    let other = mcp_http_call(&server, &secret, "?session=w2", "claim", json!({ "id": "t-3" }));
+    assert_eq!(other["issue"]["assignee"], "alice/w2");
+    let (status, _, _) = mcp_post(&server, Some(&secret), "?session=a%2Fb", &[], &mcp_tool_call("ready", json!({})));
+    assert_eq!(status, 400, "a session is a label");
+
+    // The headers must match the body; the call does not run otherwise.
+    let call = mcp_tool_call("claim", json!({ "id": "t-2" }));
+    let (status, _, e) = mcp_post(&server, Some(&secret), "", &[("mcp-name", "ready")], &call);
+    assert_eq!((status, &e["error"]["code"], &e["id"]), (400, &json!(-32020), &json!(1)), "{e}");
+    let (status, _, e) = mcp_post(&server, Some(&secret), "", &[("mcp-method", "")], &call);
+    assert_eq!((status, &e["error"]["code"]), (400, &json!(-32020)), "{e}");
+    assert_eq!(alice.json(&["show", "t-2"])["status"], "open");
+
+    let note = json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1 } });
+    let (status, _, body) = mcp_post(&server, Some(&secret), "", &[], &note);
+    assert_eq!((status, body), (202, Value::Null));
+
+    // 2025-11-25: initialize, then requests naming the version in a header.
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } } });
+    let (status, headers, r) = mcp_post(&server, Some(&secret), "", &[], &init);
+    assert_eq!((status, &r["result"]["protocolVersion"]), (200, &json!("2025-11-25")), "{r}");
+    assert!(headers.get("mcp-session-id").is_none(), "no sessions");
+    let legacy = [("mcp-protocol-version", "2025-11-25")];
+    let list = json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" });
+    let (status, _, r) = mcp_post(&server, Some(&secret), "", &legacy, &list);
+    assert_eq!(status, 200);
+    assert!(r["result"]["tools"].is_array() && r["result"].get("ttlMs").is_none(), "{r}");
+    let (status, _, r) = mcp_post(&server, Some(&secret), "", &[("mcp-protocol-version", "2024-11-05")], &list);
+    assert_eq!((status, &r["error"]["code"]), (400, &json!(-32022)), "{r}");
+}
+
+#[test]
+fn mcp_over_http_refuses_what_the_request_may_not_do() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let list = mcp_modern(1, "tools/list", json!({}));
+
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let r = agent.get(format!("{}/mcp", server.url())).header("authorization", bearer(&secret)).call().unwrap();
+    assert_eq!(r.status().as_u16(), 405, "no event streams");
+    assert_eq!(r.headers().get("allow").unwrap(), "POST");
+
+    let (status, headers, _) = mcp_post(&server, None, "", &[], &list);
+    assert_eq!(status, 401);
+    assert!(headers.get("www-authenticate").unwrap().to_str().unwrap().starts_with("Bearer"));
+    let (status, _, _) = mcp_post(&server, Some("bd_nope"), "", &[], &list);
+    assert_eq!(status, 401);
+
+    let host = server.base.trim_start_matches("http://").to_string();
+    let (status, _, e) = mcp_post(&server, Some(&secret), "", &[("origin", "https://evil.example")], &list);
+    assert_eq!((status, &e["error"]["code"]), (403, &json!(-32600)), "{e}");
+    let (status, _, _) = mcp_post(&server, Some(&secret), "", &[("origin", &format!("http://{host}"))], &list);
+    assert_eq!(status, 403, "a page whose name was rebound to the server");
+
+    let agent_post = |content_type: &str| {
+        let r = agent
+            .post(format!("{}/mcp", server.url()))
+            .header("authorization", bearer(&secret))
+            .content_type(content_type)
+            .send(list.to_string().as_bytes())
+            .unwrap();
+        r.status().as_u16()
+    };
+    assert_eq!(agent_post("text/plain"), 415, "a form a page may send without asking");
+    // Refused from its declared size, before its body is read.
+    let mut conn = std::net::TcpStream::connect(&host).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let auth = bearer(&secret);
+    write!(
+        conn,
+        "POST /w/proj/mcp HTTP/1.1\r\nHost: {host}\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n",
+        2 << 20
+    )
+    .unwrap();
+    let mut status = String::new();
+    BufReader::new(&conn).read_line(&mut status).unwrap();
+    assert!(status.starts_with("HTTP/1.1 413"), "{status}");
+
+    let elsewhere = server.token("other-ws", "carol", &["--workspace", "other"]);
+    assert_eq!(mcp_post(&server, Some(&elsewhere), "", &[], &list).0, 403);
+
+    // A read token is offered the read tools, and runs nothing else.
+    let reader = server.token("dashboard", "dash", &["--role", "read"]);
+    let (_, _, r) = mcp_post(&server, Some(&reader), "", &[], &list);
+    let tools: Vec<&str> =
+        r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(tools.contains(&"ready") && !tools.contains(&"create"), "{tools:?}");
+    let (status, _, r) = mcp_post(&server, Some(&reader), "", &[], &mcp_tool_call("create", json!({ "title": "x" })));
+    assert_eq!((status, &r["error"]["code"]), (200, &json!(-32602)), "{r}");
+    let ready = mcp_http_call(&server, &reader, "", "ready", json!({}));
+    assert_eq!(ready, json!({}), "no ready work (empty lists are left out)");
+
+    // A person's token: its tool calls still may not open human gates.
+    let carol = server.token("carol-desk", "carol", &["--kind", "human"]);
+    let person = server.client(&carol);
+    person.ok(&["create", "Ship"]);
+    let gate = person.ok(&["-q", "gate", "create", "-t", "human", "--blocks", "t-1"]).trim().to_string();
+    let close = mcp_tool_call("close", json!({ "ids": [gate], "reason": "approved by the model" }));
+    let (status, _, r) = mcp_post(&server, Some(&carol), "", &[], &close);
+    assert_eq!(status, 200);
+    assert_eq!(mcp_tool_error(&r).unwrap()["code"], "unauthorized", "{r}");
+    assert_eq!(person.json(&["show", &gate])["status"], "open");
+}
+
+fn bearer(secret: &str) -> String {
+    ["Bearer", secret].join(" ")
+}
+
+#[test]
+fn mcp_over_http_keeps_the_tokens_claim_limit_and_other_actors_claims() {
+    let server = Server::start();
+    let secret = server.token("capped", "capped", &["--max-claims", "1"]);
+    let admin = server.token("ops", "ops", &["--role", "admin", "--kind", "human"]);
+    let ops = server.client(&admin);
+    ops.ok(&["create", "One"]);
+    ops.ok(&["create", "Two"]);
+
+    // The limit counts every session of the token's actor.
+    let claim = mcp_http_call(&server, &secret, "?session=a1", "claim", json!({ "id": "t-1" }));
+    assert_eq!(claim["issue"]["assignee"], "capped/a1");
+    let (_, _, r) =
+        mcp_post(&server, Some(&secret), "?session=a2", &[], &mcp_tool_call("claim", json!({ "id": "t-2" })));
+    let error = mcp_tool_error(&r).unwrap_or_else(|| panic!("a second claim: {r}"));
+    assert_eq!(error["exit_code"], 7, "{error}");
+    assert!(error["message"].as_str().unwrap().contains("at most 1"), "{error}");
+
+    // An admin's tool calls cannot end another actor's claim, as its command line can.
+    let close = mcp_tool_call("close", json!({ "ids": ["t-1"], "reason": "mine now" }));
+    let (_, _, r) = mcp_post(&server, Some(&admin), "", &[], &close);
+    assert_eq!(mcp_tool_error(&r).unwrap()["code"], "unauthorized", "{r}");
+    let release = mcp_tool_call("release", json!({ "id": "t-1" }));
+    let (_, _, r) = mcp_post(&server, Some(&admin), "", &[], &release);
+    assert!(mcp_tool_error(&r).is_some(), "{r}");
+    assert_eq!(ops.json(&["show", "t-1"])["assignee"], "capped/a1");
+    ops.ok(&["close", "t-1", "--reason", "taken over by ops", "--take-over"]);
+}
+
+/// GET `<base><path>` without a token: status and JSON body.
+fn get_json(base: &str, path: &str) -> (u16, Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let mut r = agent.get(format!("{base}{path}")).call().unwrap();
+    let text = r.body_mut().read_to_string().unwrap();
+    (r.status().as_u16(), serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+fn challenge_of(headers: &ureq::http::HeaderMap) -> String {
+    headers.get("www-authenticate").unwrap().to_str().unwrap().to_string()
+}
+
+#[test]
+fn mcp_over_http_names_its_resource_and_binds_tokens_to_it() {
+    let server = Server::start();
+    let base = server.base.clone();
+    let resource = format!("{base}/w/proj/mcp");
+    let meta = |prefix: &str, name: &str| {
+        json!({ "resource": format!("{base}{prefix}/w/{name}/mcp"), "bearer_methods_supported": ["header"],
+            "resource_name": format!("bd workspace {name}") })
+    };
+    let well_known = "/.well-known/oauth-protected-resource";
+    assert_eq!(get_json(&base, &format!("{well_known}/w/proj/mcp")), (200, meta("", "proj")));
+    // Under a proxy's path prefix, on either side of the well-known part.
+    assert_eq!(get_json(&base, &format!("/bd{well_known}/w/proj/mcp")), (200, meta("/bd", "proj")));
+    assert_eq!(get_json(&base, &format!("{well_known}/bd/w/proj/mcp")), (200, meta("/bd", "proj")));
+    assert_eq!(get_json(&base, &format!("{well_known}/w/nope/mcp")), (200, meta("", "nope")), "no existence leak");
+    assert_eq!(get_json(&base, &format!("{well_known}/w/-x/mcp")).0, 404);
+
+    // Challenges point at the metadata; only a token sent gets an error code.
+    let metadata = format!("{base}{well_known}/w/proj/mcp");
+    let list = mcp_modern(1, "tools/list", json!({}));
+    let (status, headers, _) = mcp_post(&server, None, "", &[], &list);
+    assert_eq!((status, challenge_of(&headers)), (401, format!("Bearer resource_metadata=\"{metadata}\"")));
+    let (status, headers, _) = mcp_post(&server, Some("bd_nope"), "", &[], &list);
+    let challenge = challenge_of(&headers);
+    assert_eq!(status, 401);
+    assert!(challenge.starts_with("Bearer error=\"invalid_token\", error_description=\""), "{challenge}");
+    assert!(challenge.ends_with(&format!("resource_metadata=\"{metadata}\"")), "{challenge}");
+    let elsewhere = server.token("other-ws", "carol", &["--workspace", "other"]);
+    let (status, headers, _) = mcp_post(&server, Some(&elsewhere), "", &[], &list);
+    assert_eq!(status, 403);
+    assert!(challenge_of(&headers).starts_with("Bearer error=\"insufficient_scope\""), "{headers:?}");
+
+    // A token bound to the endpoint works there and nowhere else.
+    let bound = server.token("assistant", "alice", &["--resource", &resource]);
+    let (status, _, r) = mcp_post(&server, Some(&bound), "", &[], &list);
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(mcp_post(&server, Some(&bound), "?session=w2", &[], &list).0, 200, "under any session");
+    assert_eq!(server.client(&bound).code(&["list"]), 7, "CLI requests");
+    let listed = check(
+        bd(server.root.path())
+            .args(["serve", "token", "list", "--json", "--root"])
+            .arg(server.root.path())
+            .output()
+            .unwrap(),
+        "token list",
+    );
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    let token = listed.as_array().unwrap().iter().find(|t| t["name"] == "assistant").unwrap().clone();
+    assert_eq!((&token["resource"], &token["workspaces"]), (&json!(resource), &json!(["proj"])), "{token}");
+
+    let refused = |extra: &[&str]| {
+        let out = bd(server.root.path())
+            .args(["serve", "token", "create", "x", "--as", "x", "--root"])
+            .arg(server.root.path())
+            .args(extra)
+            .output()
+            .unwrap();
+        out.status.code()
+    };
+    assert_eq!(refused(&["--resource", &format!("{base}/w/proj")]), Some(2), "not an MCP endpoint");
+    assert_eq!(refused(&["--resource", &resource, "--workspace", "other"]), Some(2), "a workspace it may not use");
+
+    let bad = bd(server.root.path())
+        .args(["serve", "--listen", "127.0.0.1:0", "--public-url", "https://bd.example.com/?x", "--root"])
+        .arg(server.root.path())
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2), "{}", String::from_utf8_lossy(&bad.stderr));
+
+    // With --public-url, endpoints are named by it whatever the request's Host.
+    let public = Server::start_with(&["--public-url", "https://BD.example.com/bd/"]);
+    let named = "https://bd.example.com/bd/w/proj/mcp";
+    let (_, body) = get_json(&public.base, &format!("{well_known}/w/proj/mcp"));
+    assert_eq!(body["resource"], named);
+    let (_, headers, _) = mcp_post(&public, None, "", &[], &list);
+    let expected = format!("Bearer resource_metadata=\"https://bd.example.com/bd{well_known}/w/proj/mcp\"");
+    assert_eq!(challenge_of(&headers), expected);
+    let there = public.token("assistant", "alice", &["--resource", named]);
+    assert_eq!(mcp_post(&public, Some(&there), "", &[], &list).0, 200);
+    let local = public.token("local", "alice", &["--resource", &format!("{}/w/proj/mcp", public.base)]);
+    let (status, headers, _) = mcp_post(&public, Some(&local), "", &[], &list);
+    assert_eq!(status, 401, "bound to another URL");
+    assert!(challenge_of(&headers).starts_with("Bearer error=\"invalid_token\""));
+}
+
+#[test]
+fn mcp_over_http_works_under_a_proxy_prefix_and_retries_are_not_deduplicated() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    alice.ok(&["create", "Design"]);
+
+    // A proxy serving bd under /bd without stripping it: the endpoint and its challenge keep the prefix.
+    let endpoint = format!("{}/bd/w/proj/mcp?session=p", server.base);
+    let ready = mcp_tool_call("ready", json!({}));
+    let (status, _, r) = mcp_post_to(&endpoint, Some(&secret), &[], &ready);
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["result"]["content"][0]["text"].as_str().map(|t| t.contains("t-1")), Some(true), "{r}");
+    let (status, headers, _) = mcp_post_to(&endpoint, None, &[], &ready);
+    let metadata = format!("{}/bd/.well-known/oauth-protected-resource/w/proj/mcp", server.base);
+    assert_eq!((status, challenge_of(&headers)), (401, format!("Bearer resource_metadata=\"{metadata}\"")));
+    assert_eq!(get_json(&metadata, "").1["resource"], format!("{}/bd/w/proj/mcp", server.base));
+
+    // MCP carries no request id to deduplicate by: a retried tool call runs again.
+    let twice = || mcp_http_call(&server, &secret, "", "create", json!({ "title": "Twice" }))["id"].clone();
+    assert_eq!((twice(), twice()), (json!("t-2"), json!("t-3")), "a retried create creates again");
+    let claimed = mcp_http_call(&server, &secret, "", "claim", json!({ "id": "t-1" }));
+    let (_, _, again) = mcp_post(&server, Some(&secret), "", &[], &mcp_tool_call("claim", json!({ "id": "t-1" })));
+    let error = mcp_tool_error(&again).unwrap();
+    assert_eq!(
+        (&error["code"], error["message"].as_str().map(|m| m.contains("alice/mcp"))),
+        (&json!("already_claimed"), Some(true))
+    );
+    assert!(claimed["lease"]["token"].is_number());
+    // Its holder still ends the claim without the lost lease token.
+    let released = mcp_http_call(&server, &secret, "", "release", json!({ "id": "t-1" }));
+    assert_eq!(released["status"], "open", "{released}");
+    let reclaimed = mcp_http_call(&server, &secret, "", "claim", json!({ "id": "t-1" }));
+    assert_eq!(reclaimed["issue"]["assignee"], "alice/mcp", "{reclaimed}");
+    let closed = mcp_http_call(&server, &secret, "", "close", json!({ "ids": ["t-1"], "reason": "done" }));
+    assert_eq!(closed["issue"]["status"], "closed", "{closed}");
+    for already in [false, true] {
+        let closed = mcp_http_call(&server, &secret, "", "close", json!({ "ids": ["t-2"], "reason": "duplicate" }));
+        assert_eq!(closed["already_closed"], already, "{closed}");
+    }
+}
+
+/// A server root whose `auth.toml` signs in with the GitHub App `Iv1.test`
+/// and turns on the authorization server with `oauth` (the `[oauth]` body).
+#[test]
+fn a_refused_request_leaves_its_connection_usable() {
+    use std::io::{Read, Write};
+    let server = Server::start();
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let mut conn = std::net::TcpStream::connect(&addr).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    // No token: the challenge, before the body is read; then the next request on the same connection.
+    let headers = format!(
+        "POST /w/proj/mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    // The body after the headers, as clients often send it: the refusal comes before it was read.
+    conn.write_all(headers.as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    conn.write_all(body.as_bytes()).unwrap();
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+        let n = conn.read(&mut buf).unwrap();
+        assert!(n > 0, "closed: {}", String::from_utf8_lossy(&seen));
+        seen.extend_from_slice(&buf[..n]);
+    }
+    let head = String::from_utf8_lossy(&seen).to_string();
+    assert!(head.starts_with("HTTP/1.1 401") && !head.to_lowercase().contains("connection: close"), "{head}");
+    // The rest of the 401's body, then the next answer.
+    let length: usize = head
+        .lines()
+        .find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+        .unwrap();
+    let start = head.find("\r\n\r\n").unwrap() + 4;
+    while seen.len() < start + length {
+        let n = conn.read(&mut buf).unwrap();
+        seen.extend_from_slice(&buf[..n]);
+    }
+    conn.write_all(format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes()).unwrap();
+    let n = conn.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"), "{}", String::from_utf8_lossy(&buf[..n]));
+}
+
+#[test]
+fn a_busy_or_unwritable_server_db_is_answered_as_such() {
+    let (server, log) = {
+        let root = oauth_root("loopback_redirects = true\n");
+        let log = root.path().join("server.log");
+        let file = std::fs::File::create(&log).unwrap();
+        let server = Server::launch_with(root, "127.0.0.1:0", &["--public-url", "http://127.0.0.1:1"], |c| {
+            c.env("BD_LOG", "bd::serve=debug").env("BD_TEST_BUSY_MS", "200").stderr(file);
+        });
+        (server, log)
+    };
+    let register = || {
+        let request = r#"{"redirect_uris":["http://127.0.0.1/cb"],"token_endpoint_auth_method":"none"}"#;
+        post_json(&format!("{}/oauth/register", server.base), request)
+    };
+    let (status, _, registered) = register();
+    assert_eq!(status, 201, "{registered}");
+    // Another process holding server.db's write lock past the wait: try again shortly.
+    let db = server.root.path().join("server.db");
+    let held = rusqlite::Connection::open(&db).unwrap();
+    held.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (status, _, answer) = register();
+    assert_eq!((status, answer["error"].as_str()), (503, Some("temporarily_unavailable")), "{answer}");
+    held.execute_batch("ROLLBACK").unwrap();
+    drop(held);
+    assert_eq!(register().0, 201, "once it is let go");
+    // One it cannot write: a server error, said in its log, not to the client.
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&db, std::os::unix::fs::PermissionsExt::from_mode(0o400)).unwrap();
+        let (status, _, answer) = register();
+        std::fs::set_permissions(&db, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert_eq!((status, answer["error"].as_str()), (500, Some("server_error")), "{answer}");
+        assert!(!answer.to_string().contains("server.db"), "{answer}");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("registering an OAuth client") && logged.contains("server.db"), "{logged}");
+    }
+}
+
+fn oauth_root(oauth: &str) -> TempDir {
+    oauth_root_at(None, "[[github.allow]]\nusers = [\"alice\"]\n", oauth)
+}
+
+/// [`oauth_root`] signing in at `github`, with these `[[github.allow]]` rules.
+fn oauth_root_at(github: Option<&FakeGithub>, rules: &str, oauth: &str) -> TempDir {
+    let root = Server::prepare();
+    std::fs::write(root.path().join("app.pem"), include_str!("fixtures/github-app.pem")).unwrap();
+    std::fs::write(root.path().join("github-secret"), "s3cret\n").unwrap();
+    let urls = github.map(|g| format!("url = \"{0}\"\napi_url = \"{0}\"\n", g.url)).unwrap_or_default();
+    let config = format!(
+        "[github]\nclient_id = \"Iv1.test\"\n{urls}private_key = \"app.pem\"\nclient_secret_file = \"github-secret\"\n\
+         {rules}\n[oauth]\n{oauth}"
+    );
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    root
+}
+
+#[test]
+fn serve_check_reads_auth_toml_as_the_server_would_and_says_what_to_register() {
+    let root = oauth_root("redirect_uris = [\"https://chatgpt.com/connector_platform_oauth_redirect\"]\n");
+    let check = |args: &[&str]| {
+        bd(root.path()).args(["serve", "check", "--root"]).arg(root.path()).args(args).output().unwrap()
+    };
+    let out = check(&["--json", "--public-url", "https://bd.example.com/bd"]);
+    let v: Value = serde_json::from_str(&check_out(out)).unwrap();
+    let register: Vec<&str> = v["register"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+    assert!(
+        register.contains(&"GitHub: callback (redirect) URL https://bd.example.com/bd/oauth/github/callback"),
+        "{register:?}"
+    );
+    assert!(register.contains(&"MCP clients: https://bd.example.com/bd/w/proj/mcp"), "{register:?}");
+    // Without a public URL, [oauth] has no issuer: said, not fatal.
+    let v: Value = serde_json::from_str(&check_out(check(&["--json"]))).unwrap();
+    assert!(v["warnings"].to_string().contains("--public-url"), "{v}");
+    // A mistake: exit 2, with the reason, and no server is started.
+    let config = root.path().join("auth.toml");
+    std::fs::write(&config, std::fs::read_to_string(&config).unwrap().replace("[oauth]", "[oauth]\nbogus = 1"))
+        .unwrap();
+    let out = check(&[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("bogus"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A successful command's stdout.
+fn check_out(out: Output) -> String {
+    check(out, "bd serve check")
+}
+
+#[test]
+fn with_registration_off_clients_come_with_metadata_documents_only() {
+    let oauth = "redirect_uris = [\"https://chatgpt.com/connector_platform_oauth_redirect\"]\nregistration = false\n";
+    let server = Server::launch(oauth_root(oauth), "127.0.0.1:0", &["--public-url", "https://bd.example.com/bd"]);
+    let (status, meta) = get_json(&server.base, "/.well-known/oauth-authorization-server/bd");
+    assert_eq!(status, 200, "{meta}");
+    assert!(meta.get("registration_endpoint").is_none(), "{meta}");
+    let request = r#"{"redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"]}"#;
+    assert_eq!(post_json(&format!("{}/bd/oauth/register", server.base), request).0, 404);
+}
+
+#[test]
+fn the_authorization_server_publishes_its_metadata_at_its_issuer() {
+    let server = Server::launch(
+        oauth_root("redirect_hosts = [\"chatgpt.com\"]\n"),
+        "127.0.0.1:0",
+        &["--public-url", "https://BD.example.com/bd/"],
+    );
+    let issuer = "https://bd.example.com/bd";
+    let (status, meta) = get_json(&server.base, "/.well-known/oauth-authorization-server/bd");
+    assert_eq!(status, 200, "{meta}");
+    assert_eq!(meta["issuer"], issuer);
+    assert_eq!(meta["authorization_endpoint"], format!("{issuer}/oauth/authorize"));
+    assert_eq!(meta["token_endpoint"], format!("{issuer}/oauth/token"));
+    assert_eq!(meta["code_challenge_methods_supported"], json!(["S256"]));
+    assert_eq!(meta["client_id_metadata_document_supported"], true);
+    // A proxy forwarding the path as clients send it, prefix and all.
+    assert_eq!(get_json(&server.base, "/bd/.well-known/oauth-authorization-server/bd").0, 404);
+    for other in ["/.well-known/oauth-authorization-server", "/.well-known/oauth-authorization-server/x"] {
+        assert_eq!(get_json(&server.base, other).0, 404, "{other}");
+    }
+    let (_, resource) = get_json(&server.base, "/.well-known/oauth-protected-resource/w/proj/mcp");
+    assert_eq!(resource["authorization_servers"], json!([issuer]), "{resource}");
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let posted = agent.post(format!("{}/.well-known/oauth-authorization-server/bd", server.base)).send("").unwrap();
+    assert_eq!(posted.status().as_u16(), 405);
+    assert_eq!(posted.headers().get("allow").unwrap(), "GET");
+
+    // auth.toml is read for each request: a broken one shows as a 500 naming nothing.
+    std::fs::write(server.root.path().join("auth.toml"), "[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n").unwrap();
+    for path in ["/.well-known/oauth-authorization-server/bd", "/.well-known/oauth-protected-resource/w/proj/mcp"] {
+        let (status, body) = get_json(&server.base, path);
+        assert_eq!(status, 500, "{path}");
+        let message = body["error"]["message"].as_str().unwrap_or_default().to_string();
+        assert!(message.contains("see the server log") && !message.contains("auth.toml"), "{body}");
+    }
+    // Without [oauth], no authorization server and no authorization_servers.
+    std::fs::remove_file(server.root.path().join("auth.toml")).unwrap();
+    assert_eq!(get_json(&server.base, "/.well-known/oauth-authorization-server/bd").0, 404);
+    let (status, resource) = get_json(&server.base, "/.well-known/oauth-protected-resource/w/proj/mcp");
+    assert_eq!((status, resource.get("authorization_servers")), (200, None), "{resource}");
+}
+
+#[test]
+fn the_authorization_server_needs_a_public_url_it_can_be_named_by() {
+    for (extra, expected) in [
+        (&[][..], "--public-url"),
+        (&["--public-url", "http://bd.example.com"][..], "https"),
+        (&["--public-url", "https://bd.example.com/bd?x=1"][..], "--public-url"),
+    ] {
+        let root = oauth_root("loopback_redirects = true\n");
+        let out = bd(root.path())
+            .args(["serve", "--root"])
+            .arg(root.path())
+            .args(["--listen", "127.0.0.1:0"])
+            .args(extra)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}: {stderr}");
+        assert!(stderr.contains(expected), "{extra:?}: {stderr}");
+    }
+    // Over http on this machine, for trying it out.
+    let server = Server::launch(
+        oauth_root("loopback_redirects = true\n"),
+        "127.0.0.1:0",
+        &["--public-url", "http://127.0.0.1:1"],
+    );
+    assert_eq!(get_json(&server.base, "/.well-known/oauth-authorization-server").1["issuer"], "http://127.0.0.1:1");
+    // There the browser's cookie cannot be Secure, nor so prefixed.
+    let request = r#"{"redirect_uris":["http://127.0.0.1/cb"],"token_endpoint_auth_method":"none"}"#;
+    let (status, _, registered) = post_json(&format!("{}/oauth/register", server.base), request);
+    assert_eq!(status, 201, "{registered}");
+    let authorize = format!(
+        "{}/oauth/authorize?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A9%2Fcb&response_type=code&state=s&\
+         code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&\
+         resource=http%3A%2F%2F127.0.0.1%3A1%2Fw%2Fproj%2Fmcp",
+        server.base,
+        registered["client_id"].as_str().unwrap()
+    );
+    let (status, headers, body) = browse(&authorize, None, None);
+    assert_eq!(status, 302, "{body}");
+    let set = headers.get("set-cookie").unwrap().to_str().unwrap();
+    assert!(set.starts_with("bd_oauth=") && !set.contains("Secure"), "{set}");
+}
+
+/// The browser's cookies after an authorization step: `cookie` (the value of
+/// the `bd_oauth` cookie [`browse`] sends), and the consent's own cookie the
+/// step gave it, if it gave one (signing in does), as `browse` sends them on.
+fn renewed(headers: &ureq::http::HeaderMap, cookie: &str) -> String {
+    let set = headers.get("set-cookie").and_then(|v| v.to_str().ok());
+    match set.and_then(|s| s.split(';').next()) {
+        Some(pair) => format!("{cookie}; {pair}"),
+        None => cookie.to_string(),
+    }
+}
+
+/// POST `body` to `url` as JSON: the status, headers and JSON answer.
+fn post_json(url: &str, body: &str) -> (u16, ureq::http::HeaderMap, Value) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let mut r = agent.post(url).header("content-type", "application/json").send(body).unwrap();
+    let text = r.body_mut().read_to_string().unwrap();
+    (r.status().as_u16(), r.headers().clone(), serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[test]
+fn oauth_clients_register_without_a_token_for_allowed_redirects() {
+    let server = Server::launch(
+        oauth_root("redirect_hosts = [\"claude.ai\"]\n"),
+        "127.0.0.1:0",
+        &["--public-url", "https://bd.example.com/bd"],
+    );
+    let (_, meta) = get_json(&server.base, "/.well-known/oauth-authorization-server/bd");
+    assert_eq!(meta["registration_endpoint"], "https://bd.example.com/bd/oauth/register");
+    // Under the proxy prefix, or with it stripped.
+    for path in ["/bd/oauth/register", "/oauth/register"] {
+        let request = r#"{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"],"client_name":"Claude",
+            "token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}"#;
+        let (status, headers, answer) = post_json(&format!("{}{path}", server.base), request);
+        assert_eq!(status, 201, "{answer}");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert!(answer["client_id"].as_str().unwrap().starts_with("bdc_"), "{answer}");
+        assert_eq!(answer["redirect_uris"], json!(["https://claude.ai/api/mcp/auth_callback"]));
+        assert_eq!(answer["token_endpoint_auth_method"], "none");
+    }
+    assert_eq!(stored(server.root.path(), "oauth_clients").len(), 2);
+    // Nowhere else: not under any other prefix.
+    for path in ["/bd/x/oauth/register", "/w/proj/oauth/register"] {
+        let request = r#"{"redirect_uris":["https://claude.ai/api/mcp/auth_callback"]}"#;
+        assert_eq!(post_json(&format!("{}{path}", server.base), request).0, 404, "{path}");
+    }
+
+    let register = format!("{}/bd/oauth/register", server.base);
+    let (status, _, answer) = post_json(&register, r#"{"redirect_uris":["https://evil.example/cb"]}"#);
+    assert_eq!((status, &answer["error"]), (400, &json!("invalid_redirect_uri")), "{answer}");
+    let (status, _, answer) = post_json(&register, "not json");
+    assert_eq!((status, &answer["error"]), (400, &json!("invalid_client_metadata")), "{answer}");
+    let (status, _, answer) = post_json(&register, &format!("{{\"client_name\":\"{}\"}}", "x".repeat(20 << 10)));
+    assert_eq!((status, &answer["error"]), (413, &json!("invalid_client_metadata")), "{answer}");
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let got = agent.get(&register).call().unwrap();
+    assert_eq!((got.status().as_u16(), got.headers().get("allow").unwrap().to_str().unwrap()), (405, "POST"));
+
+    // Without [oauth], no registration.
+    std::fs::remove_file(server.root.path().join("auth.toml")).unwrap();
+    let (status, _, _) = post_json(&register, r#"{"redirect_uris":["https://claude.ai/cb"]}"#);
+    assert_eq!(status, 404);
+}
+
+thread_local! {
+    /// The flow cookies the test browser was given (`bd_flow_*`), sent back as a browser would.
+    static FLOW_COOKIES: std::cell::RefCell<std::collections::BTreeMap<String, String>> = Default::default();
+}
+
+/// A browser request, following no redirects: the status, headers and body.
+fn browse(url: &str, cookie: Option<&str>, post: Option<(&str, &str)>) -> (u16, ureq::http::HeaderMap, String) {
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).proxy(None).build().into();
+    let mut sent: Vec<String> = Vec::new();
+    if let Some(c) = cookie {
+        sent.push(format!("{}__Secure-bd_oauth={c}", if post.is_some() { "other=1; " } else { "" }));
+    }
+    FLOW_COOKIES.with(|jar| sent.extend(jar.borrow().iter().map(|(name, value)| format!("{name}={value}"))));
+    let cookies = sent.join("; ");
+    let mut r = match post {
+        Some((origin, body)) => {
+            let mut req = agent.post(url).header("content-type", "application/x-www-form-urlencoded");
+            if !origin.is_empty() {
+                req = req.header("origin", origin);
+            }
+            if !cookies.is_empty() {
+                req = req.header("cookie", &cookies);
+            }
+            req.send(body).unwrap()
+        }
+        None => {
+            let mut req = agent.get(url);
+            if !cookies.is_empty() {
+                req = req.header("cookie", &cookies);
+            }
+            req.call().unwrap()
+        }
+    };
+    for set in r.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()) {
+        let Some((name, rest)) = set.split_once('=') else { continue };
+        if name.contains("bd_flow_") {
+            let value = rest.split(';').next().unwrap_or_default().to_string();
+            FLOW_COOKIES.with(|jar| match set.contains("Max-Age=0") {
+                true => jar.borrow_mut().remove(name),
+                false => jar.borrow_mut().insert(name.to_string(), value),
+            });
+        }
+    }
+    let text = r.body_mut().read_to_string().unwrap_or_default();
+    (r.status().as_u16(), r.headers().clone(), text)
+}
+
+fn location(headers: &ureq::http::HeaderMap) -> String {
+    headers.get("location").expect("a redirect").to_str().unwrap().to_string()
+}
+
+/// The pairs of the query of `url`, which starts with `prefix`.
+fn query_of(url: &str, prefix: &str) -> std::collections::HashMap<String, String> {
+    assert!(url.starts_with(prefix), "{url}");
+    decode_form(url.split_once('?').map_or("", |(_, q)| q))
+}
+
+#[test]
+fn people_authorize_mcp_clients_after_signing_in_with_github() {
+    let github = FakeGithub::start();
+    let rules = "[[github.allow]]\nusers = [\"alice\"]\nrole = \"write\"\nworkspaces = [\"proj\"]\n\
+                 [[github.allow]]\nusers = [\"bob\"]\nrole = \"read\"\nworkspaces = [\"*\"]\n";
+    let server = Server::launch(
+        oauth_root_at(Some(&github), rules, "redirect_hosts = [\"app.example\"]\n"),
+        "127.0.0.1:0",
+        &["--public-url", "https://bd.example.com/bd"],
+    );
+    let issuer = "https://bd.example.com/bd";
+    let iss = issuer.to_string();
+    // The browser reaches the server at its public URL: here, its test address with the prefix.
+    let here = |url: &str| url.replacen("https://bd.example.com", &server.base, 1);
+    let (status, _, registered) = post_json(
+        &format!("{}/bd/oauth/register", server.base),
+        r#"{"redirect_uris":["https://app.example/cb"],"client_name":"<b>App</b>"}"#,
+    );
+    assert_eq!(status, 201, "{registered}");
+    let client_id = registered["client_id"].as_str().unwrap().to_string();
+    let challenge = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    let authorize = |extra: &[(&str, &str)]| {
+        let mut q = vec![
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", "https://app.example/cb"),
+            ("state", "st&1"),
+            ("response_type", "code"),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("resource", "https://bd.example.com/bd/w/proj/mcp"),
+        ];
+        for (k, v) in extra {
+            q.retain(|(name, _)| name != k);
+            if !v.is_empty() {
+                q.push((k, v));
+            }
+        }
+        let query: Vec<String> = q
+            .iter()
+            .map(|(k, v)| {
+                format!("{k}={}", v.replace('%', "%25").replace('&', "%26").replace(':', "%3A").replace('/', "%2F"))
+            })
+            .collect();
+        format!("{}/bd/oauth/authorize?{}", server.base, query.join("&"))
+    };
+    // To GitHub with a challenge of the server's own, and a cookie for the browser; back to the callback.
+    let start = |cookie: Option<&str>| -> (String, String) {
+        let (status, headers, body) = browse(&authorize(&[]), cookie, None);
+        assert_eq!(status, 302, "{body}");
+        let to_github = location(&headers);
+        let q = query_of(&to_github, &format!("{}/login/oauth/authorize?", github.url));
+        assert_eq!(q["client_id"], "Iv1.test");
+        assert_eq!(q["redirect_uri"], format!("{issuer}/oauth/github/callback"));
+        assert_ne!(q["code_challenge"], challenge, "not the client's");
+        let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+        assert!(set.starts_with("__Secure-bd_oauth="), "prefixed on an https issuer: {set}");
+        assert!(set.ends_with("; Path=/bd/oauth; Max-Age=1200; HttpOnly; SameSite=Lax; Secure"), "{set}");
+        let cookie = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
+        let (status, headers, _) = browse(&to_github, None, None);
+        assert_eq!(status, 302);
+        (here(&location(&headers)), cookie)
+    };
+    let consent_id = |html: &str| {
+        let at = html.find("name=\"consent\" value=\"").unwrap() + "name=\"consent\" value=\"".len();
+        html[at..at + 64].to_string()
+    };
+    let decide = |cookie: &str, origin: &str, body: &str| {
+        browse(&format!("{}/bd/oauth/consent", server.base), Some(cookie), Some((origin, body)))
+    };
+
+    // Approved: a code for the client, with its state and the issuer.
+    github.next("alice", 0);
+    let (callback, cookie) = start(None);
+    let (status, headers, page) = browse(&callback, Some(&cookie), None);
+    assert_eq!(status, 200, "{page}");
+    for shown in [
+        "alice",
+        "proj",
+        "app.example",
+        "&lt;b&gt;App&lt;/b&gt;",
+        "not verified",
+        "<dt>Access</dt><dd>Read and write</dd>",
+    ] {
+        assert!(page.contains(shown), "{shown}: {page}");
+    }
+    let csp = headers.get("content-security-policy").unwrap().to_str().unwrap();
+    assert!(csp.contains("form-action 'self' https://app.example;"), "{csp}");
+    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    let id = consent_id(&page);
+    let approve = format!("consent={id}&decision=approve");
+    let (status, _, body) = decide(&cookie, "https://evil.example", &approve);
+    assert_eq!(status, 403, "another site's form: {body}");
+    // A post that says neither where it came from (Origin) nor from which site (Sec-Fetch-Site), or says another
+    // site: not the consent page's.
+    let consent_url = format!("{}/bd/oauth/consent", server.base);
+    let post = |headers: &[(&str, &str)]| {
+        let agent: ureq::Agent =
+            ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).proxy(None).build().into();
+        let mut req = agent
+            .post(&consent_url)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("cookie", &format!("__Secure-bd_oauth={cookie}"));
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        req.send(approve.as_str()).unwrap().status().as_u16()
+    };
+    assert_eq!(post(&[]), 403, "no Origin, no Sec-Fetch-Site");
+    assert_eq!(post(&[("sec-fetch-site", "same-site")]), 403, "a sibling site's form");
+    assert_eq!(post(&[("origin", "https://bd.example.com"), ("sec-fetch-site", "cross-site")]), 403);
+    let (status, _, _) = decide(&"0".repeat(64), "https://bd.example.com", &approve);
+    assert_eq!(status, 400, "another browser");
+    // The other browser's attempt ended the consent: approve in a new one.
+    github.next("alice", 0);
+    let (callback, cookie) = start(Some(&cookie));
+    let (_, headers, page) = browse(&callback, Some(&cookie), None);
+    let cookie = renewed(&headers, &cookie);
+    let approve = format!("consent={}&decision=approve", consent_id(&page));
+    let (status, headers, _) = decide(&cookie, "https://bd.example.com", &approve);
+    assert_eq!(status, 303);
+    let back = query_of(&location(&headers), "https://app.example/cb?");
+    assert_eq!(back["code"].len(), 64);
+    assert_eq!((&back["state"], &back["iss"]), (&"st&1".to_string(), &iss));
+    assert_eq!(decide(&cookie, "https://bd.example.com", &approve).0, 400, "a consent is decided once");
+    let log = github.log();
+    let exchange =
+        log.iter().find(|l| l.starts_with("POST /login/oauth/access_token") && l.contains("code=wc")).unwrap();
+    assert!(exchange.contains("client_secret=s3cret") && exchange.contains("code_verifier="), "{exchange}");
+
+    // The redirect URI no longer allowed by the time of the decision: a page, no code.
+    github.next("alice", 0);
+    let (callback, cookie) = start(Some(&cookie));
+    let (_, headers, page) = browse(&callback, Some(&cookie), None);
+    let cookie = renewed(&headers, &cookie);
+    let approve = format!("consent={}&decision=approve", consent_id(&page));
+    let auth_toml = server.root.path().join("auth.toml");
+    let allowed = std::fs::read_to_string(&auth_toml).unwrap();
+    std::fs::write(
+        &auth_toml,
+        allowed.replace("redirect_hosts = [\"app.example\"]", "redirect_hosts = [\"other.example\"]"),
+    )
+    .unwrap();
+    let (status, headers, page) = decide(&cookie, "https://bd.example.com", &approve);
+    std::fs::write(&auth_toml, &allowed).unwrap();
+    assert_eq!(status, 400, "{page}");
+    assert!(headers.get("location").is_none() && !page.contains("code="), "{page}");
+    assert!(page.contains("no longer allows"), "{page}");
+
+    // Denied.
+    github.next("alice", 0);
+    let (callback, cookie) = start(Some(&cookie));
+    let (_, headers, page) = browse(&callback, Some(&cookie), None);
+    let cookie = renewed(&headers, &cookie);
+    let (status, headers, _) =
+        decide(&cookie, "https://bd.example.com", &format!("consent={}&decision=deny", consent_id(&page)));
+    assert_eq!(status, 303);
+    let back = query_of(&location(&headers), "https://app.example/cb?");
+    assert_eq!(
+        (&back["error"], &back["state"], &back["iss"]),
+        (&"access_denied".to_string(), &"st&1".to_string(), &iss)
+    );
+
+    // Signing in gives the browser a new cookie: the one it had before is good for nothing after.
+    github.next("alice", 0);
+    let (callback, before) = start(None);
+    let (_, headers, page) = browse(&callback, Some(&before), None);
+    let after = renewed(&headers, &before);
+    assert_ne!(after, before);
+    let approve = format!("consent={}&decision=approve", consent_id(&page));
+    assert_eq!(decide(&before, "https://bd.example.com", &approve).0, 400, "the cookie from before the sign-in");
+
+    // Two sign-ins under way in one browser (two tabs): each consent has its own cookie, so neither ends the other.
+    github.next("alice", 0);
+    let (first, tab) = start(Some(&before));
+    github.next("alice", 0);
+    let (second, _) = start(Some(&tab));
+    let (_, headers, page) = browse(&first, Some(&tab), None);
+    let (one, approve_one) = (renewed(&headers, &tab), format!("consent={}&decision=approve", consent_id(&page)));
+    let (_, headers, page) = browse(&second, Some(&tab), None);
+    let (two, approve_two) = (renewed(&headers, &tab), format!("consent={}&decision=approve", consent_id(&page)));
+    assert_eq!(decide(&two, "https://bd.example.com", &approve_two).0, 303, "the second tab");
+    assert_eq!(decide(&one, "https://bd.example.com", &approve_one).0, 303, "the first tab");
+
+    // Cancelled at GitHub.
+    github.deny(true);
+    let (callback, cookie) = start(None);
+    github.deny(false);
+    let (status, headers, _) = browse(&callback, Some(&cookie), None);
+    assert_eq!(status, 302);
+    assert_eq!(query_of(&location(&headers), "https://app.example/cb?")["error"], "access_denied");
+
+    // Back from GitHub in another browser, or again: no consent page.
+    github.next("alice", 0);
+    let (callback, _) = start(None);
+    assert_eq!(browse(&callback, Some(&"0".repeat(64)), None).0, 400);
+    assert_eq!(browse(&callback, None, None).0, 400, "the sign-in ended");
+
+    // An account the rules do not let in: a page, with a way back to the client.
+    github.next("mallory", 0);
+    let (callback, cookie) = start(None);
+    let (status, headers, page) = browse(&callback, Some(&cookie), None);
+    assert_eq!(status, 403);
+    assert!(headers.get("location").is_none());
+    assert!(page.contains("account (mallory) doesn&#39;t have access to this workspace"), "{page}");
+    assert!(page.contains("sign in with another account"), "{page}");
+    assert!(page.contains("https://app.example/cb?error=access_denied"), "{page}");
+    assert!(!page.contains("auth.toml"), "the server's setup stays off the page: {page}");
+
+    // A client or redirect URI that cannot be trusted is never redirected to.
+    for extra in
+        [[("client_id", "bdc_unknown")], [("redirect_uri", "https://app.example/other")], [("redirect_uri", "")]]
+    {
+        let (status, headers, page) = browse(&authorize(&extra), None, None);
+        assert_eq!(status, 400, "{extra:?}: {page}");
+        assert!(headers.get("location").is_none(), "{extra:?}");
+        assert!(headers.get("content-security-policy").is_some());
+        for internal in ["auth.toml", "client_id", "redirect_uri", "bytes", "its log", "server&#39;s log"] {
+            assert!(!page.contains(internal), "{extra:?} shows {internal}: {page}");
+        }
+    }
+    // A parameter given twice: a page, naming none of them.
+    let (status, headers, page) = browse(&format!("{}&state=again", authorize(&[])), None, None);
+    assert_eq!(status, 400, "{page}");
+    assert!(headers.get("location").is_none());
+    assert!(page.contains("a request this server can&#39;t use") && !page.contains("state"), "{page}");
+    // Other mistakes go back to the client, with the issuer.
+    for (extra, error) in [
+        ([("resource", "")], "invalid_request"),
+        ([("resource", "https://bd.example.com/w/proj/mcp")], "invalid_target"),
+        ([("code_challenge_method", "plain")], "invalid_request"),
+        ([("response_type", "token")], "unsupported_response_type"),
+    ] {
+        let (status, headers, _) = browse(&authorize(&extra), None, None);
+        assert_eq!(status, 302, "{extra:?}");
+        let back = query_of(&location(&headers), "https://app.example/cb?");
+        assert_eq!((&back["error"], &back["iss"]), (&error.to_string(), &iss), "{extra:?}");
+    }
+    // Whether a workspace exists is told only to an account the rules let in.
+    let nope = [("resource", "https://bd.example.com/bd/w/nope/mcp")];
+    for (login, expected) in [("alice", 403), ("bob", 302)] {
+        github.next(login, 0);
+        let (status, headers, _) = browse(&authorize(&nope), None, None);
+        assert_eq!(status, 302, "{login}: on to GitHub, as for a workspace that exists");
+        let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+        let cookie = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
+        let (_, headers, _) = browse(&location(&headers), None, None);
+        let (status, headers, page) = browse(&here(&location(&headers)), Some(&cookie), None);
+        assert_eq!(status, expected, "{login}: {page}");
+        if login == "bob" {
+            assert_eq!(query_of(&location(&headers), "https://app.example/cb?")["error"], "invalid_target");
+        }
+    }
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let posted = agent.post(format!("{}/bd/oauth/authorize", server.base)).send("").unwrap();
+    assert_eq!((posted.status().as_u16(), posted.headers().get("allow").unwrap().to_str().unwrap()), (405, "GET"));
+    let got = agent.get(format!("{}/bd/oauth/consent", server.base)).call().unwrap();
+    assert_eq!((got.status().as_u16(), got.headers().get("allow").unwrap().to_str().unwrap()), (405, "POST"));
+
+    // Without [oauth], no authorizations.
+    std::fs::remove_file(server.root.path().join("auth.toml")).unwrap();
+    assert_eq!(browse(&authorize(&[]), None, None).0, 404);
+}
+
+/// Approve `client_id` for `login` at `server`'s authorization endpoint
+/// (public URL `https://bd.example.com/bd`, redirect URI
+/// `https://app.example/cb`, workspace `proj`, the RFC 7636 example PKCE
+/// challenge): the code the client gets back.
+fn authorization_code(server: &Server, github: &FakeGithub, client_id: &str, login: &str) -> String {
+    authorized(server, github, client_id, login, "https://app.example/cb").0["code"].clone()
+}
+
+/// [`authorization_code`] sending the browser back to `redirect_uri`: the
+/// query the client gets back there.
+fn authorized(
+    server: &Server,
+    github: &FakeGithub,
+    client_id: &str,
+    login: &str,
+    redirect_uri: &str,
+) -> (std::collections::HashMap<String, String>, String) {
+    github.next(login, 0);
+    let authorize = format!(
+        "{}/bd/oauth/authorize?client_id={client_id}&redirect_uri={}&response_type=code&state=s-1&\
+         code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&\
+         resource=https%3A%2F%2Fbd.example.com%2Fbd%2Fw%2Fproj%2Fmcp",
+        server.base,
+        url_encode(redirect_uri)
+    );
+    let (status, headers, body) = browse(&authorize, None, None);
+    assert_eq!(status, 302, "{body}");
+    let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+    let cookie = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
+    let (_, headers, _) = browse(&location(&headers), None, None);
+    let callback = location(&headers).replacen("https://bd.example.com", &server.base, 1);
+    let (status, headers, page) = browse(&callback, Some(&cookie), None);
+    let cookie = renewed(&headers, &cookie);
+    assert_eq!(status, 200, "{page}");
+    let at = page.find("name=\"consent\" value=\"").unwrap() + "name=\"consent\" value=\"".len();
+    let approve = format!("consent={}&decision=approve", &page[at..at + 64]);
+    let consent = format!("{}/bd/oauth/consent", server.base);
+    let (status, headers, _) = browse(&consent, Some(&cookie), Some(("https://bd.example.com", &approve)));
+    assert_eq!(status, 303);
+    let back = query_of(&location(&headers), &format!("{redirect_uri}?"));
+    assert_eq!(back.get("state").map(String::as_str), Some("s-1"), "{back:?}");
+    (back, page)
+}
+
+/// `text` percent-encoded for a query or form value.
+fn url_encode(text: &str) -> String {
+    text.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+#[test]
+fn an_mcp_client_finds_signs_in_and_works_from_its_first_unauthorized_request() {
+    let github = FakeGithub::start();
+    github.install("acme");
+    let rules = "[[github.allow]]\nusers = [\"alice\"]\nrole = \"write\"\nworkspaces = [\"proj\"]\n";
+    let server = Server::launch(
+        oauth_root_at(Some(&github), rules, "loopback_redirects = true\n"),
+        "127.0.0.1:0",
+        &["--public-url", "https://bd.example.com/bd"],
+    );
+    // The client knows the MCP endpoint's URL only; the proxy forwards the public paths as they are.
+    let endpoint = "https://bd.example.com/bd/w/proj/mcp";
+    let local = |url: &str| {
+        assert!(url.starts_with("https://bd.example.com/"), "{url}");
+        url.replacen("https://bd.example.com", &server.base, 1)
+    };
+    let call = |token: Option<&str>, tool: &str, arguments: Value| {
+        mcp_post_to(&local(endpoint), token, &[], &mcp_tool_call(tool, arguments))
+    };
+    let discover = |token: Option<&str>| {
+        let (status, headers, _) = call(token, "ready", json!({}));
+        assert_eq!(status, 401);
+        let challenge = challenge_of(&headers);
+        let at = challenge.find("resource_metadata=\"").expect("a resource_metadata") + "resource_metadata=\"".len();
+        challenge[at..at + challenge[at..].find('"').unwrap()].to_string()
+    };
+
+    // 401 → protected resource metadata (RFC 9728) → authorization server metadata (RFC 8414).
+    let (status, resource) = get_json(&local(&discover(None)), "");
+    assert_eq!(status, 200, "{resource}");
+    assert_eq!(resource["resource"], endpoint);
+    let issuer = resource["authorization_servers"][0].as_str().expect("an authorization server").to_string();
+    assert_eq!(issuer, "https://bd.example.com/bd");
+    let (scheme_host, path) = issuer.split_at("https://bd.example.com".len());
+    let (status, meta) = get_json(&local(&format!("{scheme_host}/.well-known/oauth-authorization-server{path}")), "");
+    assert_eq!(status, 200, "{meta}");
+    assert_eq!(meta["issuer"], json!(issuer));
+    assert_eq!(meta["authorization_response_iss_parameter_supported"], true);
+    let at = |field: &str| local(meta[field].as_str().unwrap_or_else(|| panic!("{field}: {meta}")));
+
+    // Registration (RFC 7591) as a desktop client: loopback, on whatever port it listens on later.
+    let request = r#"{"redirect_uris":["http://127.0.0.1/callback"],"client_name":"Desk",
+        "token_endpoint_auth_method":"none","grant_types":["authorization_code","refresh_token"]}"#;
+    let (status, _, registered) = post_json(&at("registration_endpoint"), request);
+    assert_eq!(status, 201, "{registered}");
+    let client_id = registered["client_id"].as_str().unwrap().to_string();
+
+    // Authorization: the person signs in with GitHub and approves; the answer names its issuer (RFC 9207).
+    let redirect_uri = "http://127.0.0.1:43117/callback";
+    let (back, page) = authorized(&server, &github, &client_id, "alice", redirect_uri);
+    assert_eq!(back.get("iss"), Some(&issuer), "{back:?}");
+    // The consent page said what it could not vouch for.
+    for shown in [
+        "Connect Desk to proj?",
+        "<b>Unverified application.</b>",
+        "<b>Returns to this computer.</b>",
+        "<code>http://127.0.0.1:43117/callback</code>",
+        "Access lasts at most 30 days, and ends after 7 days unused or when revoked.",
+    ] {
+        assert!(page.contains(shown), "{shown}: {page}");
+    }
+    assert!(!page.contains("Returns to another site"), "{page}");
+    let form = |endpoint: &str, pairs: &[(&str, &str)]| {
+        let body: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={}", url_encode(v))).collect();
+        let (status, _, text) = browse(&at(endpoint), None, Some(("", &body.join("&"))));
+        (status, serde_json::from_str::<Value>(&text).unwrap_or(Value::Null))
+    };
+    let (status, tokens) = form(
+        "token_endpoint",
+        &[
+            ("grant_type", "authorization_code"),
+            ("code", &back["code"]),
+            ("code_verifier", "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            ("client_id", &client_id),
+            ("redirect_uri", redirect_uri),
+            ("resource", endpoint),
+        ],
+    );
+    assert_eq!(status, 200, "{tokens}");
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+
+    // The token works the workspace as the person's actor.
+    let (status, _, created) = call(Some(&access), "create", json!({ "title": "From the assistant" }));
+    assert_eq!(status, 200, "{created}");
+    assert!(mcp_tool_error(&created).is_none(), "{created}");
+    let (_, _, claimed) = call(Some(&access), "claim", json!({ "id": "t-1" }));
+    let claimed: Value = serde_json::from_str(claimed["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(claimed["issue"]["assignee"], "github:alice/mcp", "{claimed}");
+
+    // Refreshed before it ends, then revoked when the person disconnects the client.
+    let (status, renewed) = form(
+        "token_endpoint",
+        &[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+            ("client_id", &client_id),
+            ("resource", endpoint),
+        ],
+    );
+    assert_eq!(status, 200, "{renewed}");
+    let renewed_access = renewed["access_token"].as_str().unwrap();
+    assert_eq!(call(Some(&access), "ready", json!({})).0, 401, "rotated");
+    assert_eq!(call(Some(renewed_access), "ready", json!({})).0, 200);
+    let refresh = renewed["refresh_token"].as_str().unwrap();
+    let (status, _) = form("revocation_endpoint", &[("token", refresh), ("client_id", &client_id)]);
+    assert_eq!(status, 200);
+    // Revoked, the client finds its way back to signing in.
+    assert_eq!(local(&discover(Some(renewed_access))), local(&discover(None)));
+}
+
+#[test]
+fn mcp_clients_redeem_codes_and_refresh_tokens_at_the_token_endpoint() {
+    let github = FakeGithub::start();
+    github.install("acme");
+    let rules = "[[github.allow]]\nusers = [\"alice\"]\nrole = \"write\"\nworkspaces = [\"proj\"]\n";
+    let server = Server::launch(
+        oauth_root_at(Some(&github), rules, "redirect_hosts = [\"app.example\"]\n"),
+        "127.0.0.1:0",
+        &["--public-url", "https://bd.example.com/bd"],
+    );
+    let register = |name: &str| {
+        let request = format!(r#"{{"redirect_uris":["https://app.example/cb"],"client_name":"{name}"}}"#);
+        let (status, _, registered) = post_json(&format!("{}/bd/oauth/register", server.base), &request);
+        assert_eq!(status, 201, "{registered}");
+        registered["client_id"].as_str().unwrap().to_string()
+    };
+    let (client_id, other_client) = (register("App"), register("Other"));
+    let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+    let form = |endpoint: &str, body: &str| {
+        let (status, headers, text) = browse(&format!("{}/bd/oauth/{endpoint}", server.base), None, Some(("", body)));
+        (status, headers, serde_json::from_str::<Value>(&text).unwrap_or(Value::Null))
+    };
+    let exchange = |code: &str, extra: &[(&str, &str)]| {
+        let mut pairs = vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", "https%3A%2F%2Fapp.example%2Fcb"),
+        ];
+        for (k, v) in extra {
+            pairs.retain(|(name, _)| name != k);
+            if !v.is_empty() {
+                pairs.push((k, v));
+            }
+        }
+        let body: Vec<String> = pairs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        form("token", &body.join("&"))
+    };
+    let error = |(status, _, answer): (u16, ureq::http::HeaderMap, Value)| (status, answer["error"].clone());
+    let invalid_grant = (400, json!("invalid_grant"));
+    let list = mcp_modern(1, "tools/list", json!({}));
+    let works = |token: &str| mcp_post(&server, Some(token), "", &[], &list).0;
+
+    // A code is redeemed by its client, with its redirect URI and verifier, for the endpoint authorized.
+    let code = authorization_code(&server, &github, &client_id, "alice");
+    let resource = ("resource", "https%3A%2F%2Fbd.example.com%2Fbd%2Fw%2Fproj%2Fmcp");
+    let (status, headers, tokens) = exchange(&code, &[resource]);
+    assert_eq!(status, 200, "{tokens}");
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    assert_eq!(headers.get("pragma").unwrap(), "no-cache");
+    assert_eq!(tokens["token_type"], "Bearer");
+    let expires_in = tokens["expires_in"].as_u64().unwrap();
+    assert!(expires_in > 0 && expires_in <= 3600, "{tokens}");
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+    assert!(tokens["refresh_token"].as_str().unwrap().starts_with("bdr_"), "{tokens}");
+    assert_eq!(works(&access), 200);
+    assert_eq!(server.client(&access).code(&["list"]), 7, "the MCP endpoint only");
+    let listed = check(
+        bd(server.root.path())
+            .args(["serve", "token", "list", "--json", "--root"])
+            .arg(server.root.path())
+            .output()
+            .unwrap(),
+        "token list",
+    );
+    let listed: Value = serde_json::from_str(&listed).unwrap();
+    let token = listed.as_array().unwrap().iter().find(|t| t["client"] == json!(client_id)).unwrap().clone();
+    assert!(token["name"].as_str().unwrap().starts_with("oauth-bdc_"), "{token}");
+    assert_eq!(token["resource"], "https://bd.example.com/bd/w/proj/mcp");
+    assert_eq!(token["workspaces"], json!(["proj"]));
+    // Sent again, the code revokes what it issued.
+    assert_eq!(error(exchange(&code, &[])), invalid_grant);
+    assert_eq!(works(&access), 401);
+
+    // Anything off ends the code.
+    for (extra, expected) in [
+        (("code_verifier", "x".repeat(43)), invalid_grant.clone()),
+        (("redirect_uri", "https%3A%2F%2Fapp.example%2Fother".into()), invalid_grant.clone()),
+        (("client_id", other_client.clone()), invalid_grant.clone()),
+        (("resource", "https%3A%2F%2Fbd.example.com%2Fbd%2Fw%2Fother%2Fmcp".into()), (400, json!("invalid_target"))),
+    ] {
+        let code = authorization_code(&server, &github, &client_id, "alice");
+        assert_eq!(error(exchange(&code, &[(extra.0, &extra.1)])), expected, "{extra:?}");
+        assert_eq!(error(exchange(&code, &[])), invalid_grant, "{extra:?}: spent");
+    }
+    assert_eq!(error(exchange(&"0".repeat(64), &[])), invalid_grant, "unknown");
+    assert_eq!(error(exchange(&"0".repeat(64), &[("code_verifier", "short")])), (400, json!("invalid_request")));
+    assert_eq!(error(form("token", "grant_type=password")), (400, json!("unsupported_grant_type")));
+
+    // Refreshed by its client only, at the token endpoint only; a refresh token spent revokes.
+    // (Redeemed without redirect_uri, as OAuth 2.1 clients do.)
+    let code = authorization_code(&server, &github, &client_id, "alice");
+    let (status, _, tokens) = exchange(&code, &[("redirect_uri", "")]);
+    assert_eq!(status, 200, "{tokens}");
+    let (access, refresh) = (tokens["access_token"].as_str().unwrap(), tokens["refresh_token"].as_str().unwrap());
+    let refresh_with =
+        |secret: &str, extra: &str| form("token", &format!("grant_type=refresh_token&refresh_token={secret}{extra}"));
+    assert_eq!(error(refresh_with(refresh, &format!("&client_id={other_client}"))), invalid_grant);
+    let resource_other = "&resource=https%3A%2F%2Fbd.example.com%2Fbd%2Fw%2Fother%2Fmcp";
+    assert_eq!(error(refresh_with(refresh, resource_other)), (400, json!("invalid_target")));
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let cli_refresh = agent
+        .post(format!("{}/v2/auth/refresh", server.base))
+        .header("authorization", &format!("Bearer {refresh}"))
+        .content_type("application/json")
+        .send(json!({ "request_id": "r-1" }).to_string())
+        .unwrap();
+    let status = cli_refresh.status().as_u16();
+    assert_eq!(status, 403, "at the CLI's refresh endpoint");
+    assert_eq!(works(access), 200, "refusals spend nothing");
+    let (status, headers, renewed) = refresh_with(refresh, &format!("&client_id={client_id}"));
+    assert_eq!(status, 200, "{renewed}");
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    let renewed_access = renewed["access_token"].as_str().unwrap();
+    let renewed_refresh = renewed["refresh_token"].as_str().unwrap();
+    assert_ne!(renewed_refresh, refresh);
+    assert_eq!((works(access), works(renewed_access)), (401, 200), "rotated");
+    let (status, _, again) = refresh_with(renewed_refresh, "");
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(error(refresh_with(renewed_refresh, "")), invalid_grant, "spent");
+    assert_eq!(works(again["access_token"].as_str().unwrap()), 401, "revoked");
+    assert_eq!(error(refresh_with(again["refresh_token"].as_str().unwrap(), "")), invalid_grant);
+
+    // Revoked by its client (RFC 7009), with either secret; anything else is answered alike and left alone.
+    let cli = server.token("bob-laptop", "bob", &[]);
+    for which in ["access_token", "refresh_token"] {
+        let code = authorization_code(&server, &github, &client_id, "alice");
+        let (_, _, tokens) = exchange(&code, &[]);
+        let access = tokens["access_token"].as_str().unwrap();
+        let secret = tokens[which].as_str().unwrap();
+        let (status, headers, _) = form("revoke", &format!("token={secret}&client_id={other_client}"));
+        assert_eq!((status, works(access)), (200, 200), "{which}: another client's");
+        assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+        assert_eq!(form("revoke", &format!("token={secret}&token_type_hint=refresh_token")).0, 200);
+        assert_eq!(works(access), 401, "{which}");
+    }
+    assert_eq!(form("revoke", &format!("token={cli}")).0, 200);
+    assert_eq!(server.client(&cli).code(&["list"]), 0, "not an OAuth client's token");
+    assert_eq!(form("revoke", "token=bd_unknown").0, 200);
+    assert_eq!(error(form("revoke", "token_type_hint=access_token")), (400, json!("invalid_request")));
+
+    // An admin revokes every token of a client.
+    let code = authorization_code(&server, &github, &client_id, "alice");
+    let access = exchange(&code, &[]).2["access_token"].as_str().unwrap().to_string();
+    let revoke = |client: &str| {
+        bd(server.root.path())
+            .args(["serve", "token", "revoke", "--client", client, "--json", "--root"])
+            .arg(server.root.path())
+            .output()
+            .unwrap()
+    };
+    let out = revoke(&client_id);
+    let answer: Value = serde_json::from_str(&check(out, "revoke --client")).unwrap();
+    assert_eq!(answer["client"], json!(client_id), "{answer}");
+    assert!(!answer["revoked"].as_array().unwrap().is_empty(), "{answer}");
+    assert_eq!(works(&access), 401);
+    assert_eq!(revoke("bdc_none").status.code(), Some(3));
+
+    for endpoint in ["token", "revoke"] {
+        let got = agent.get(format!("{}/bd/oauth/{endpoint}", server.base)).call().unwrap();
+        assert_eq!((got.status().as_u16(), got.headers().get("allow").unwrap().to_str().unwrap()), (405, "POST"));
+    }
+    // Without [oauth], no token endpoint.
+    std::fs::remove_file(server.root.path().join("auth.toml")).unwrap();
+    assert_eq!(exchange(&"0".repeat(64), &[]).0, 404);
+    assert_eq!(form("revoke", "token=x").0, 404);
+}
+
+#[test]
+fn a_flood_of_authorizations_never_drops_sign_ins_under_way() {
+    let github = FakeGithub::start();
+    let rules = "[[github.allow]]\nusers = [\"alice\"]\nrole = \"write\"\nworkspaces = [\"proj\"]\n";
+    let server = Server::launch(
+        oauth_root_at(Some(&github), rules, "redirect_hosts = [\"app.example\"]\n"),
+        "127.0.0.1:0",
+        &["--public-url", "https://bd.example.com/bd"],
+    );
+    let (_, _, registered) =
+        post_json(&format!("{}/bd/oauth/register", server.base), r#"{"redirect_uris":["https://app.example/cb"]}"#);
+    let authorize = format!(
+        "{}/bd/oauth/authorize?client_id={}&redirect_uri=https%3A%2F%2Fapp.example%2Fcb&response_type=code&\
+         code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&\
+         resource=https%3A%2F%2Fbd.example.com%2Fbd%2Fw%2Fproj%2Fmcp",
+        server.base,
+        registered["client_id"].as_str().unwrap()
+    );
+    let (status, headers, _) = browse(&authorize, None, None);
+    assert_eq!(status, 302);
+    let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
+    let cookie = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
+    let to_github = location(&headers);
+    // Anyone may start sign-ins, from as many clients as they register: the server keeps none of them (each is
+    // sealed into its browser's cookie), so none is refused for room, and none under way is dropped.
+    let flooder: ureq::Agent =
+        ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).proxy(None).build().into();
+    let mut clients = Vec::new();
+    for _ in 0..20 {
+        let (_, _, c) =
+            post_json(&format!("{}/bd/oauth/register", server.base), r#"{"redirect_uris":["https://app.example/cb"]}"#);
+        clients.push(c["client_id"].as_str().unwrap().to_string());
+    }
+    for i in 0..2000 {
+        let theirs = authorize.replace(registered["client_id"].as_str().unwrap(), &clients[i % clients.len()]);
+        assert_eq!(flooder.get(&theirs).call().unwrap().status().as_u16(), 302, "sign-in {i}");
+    }
+    // The first sign-in is still under way.
+    github.next("alice", 0);
+    let (_, headers, _) = browse(&to_github, None, None);
+    let callback = location(&headers).replacen("https://bd.example.com", &server.base, 1);
+    let (status, _, page) = browse(&callback, Some(&cookie), None);
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("name=\"consent\""), "{page}");
 }

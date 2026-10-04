@@ -254,8 +254,8 @@ pub fn identity() -> (Option<String>, Option<String>) {
 
 fn missing_token(url: &str, ca: Option<&Path>) -> Error {
     Error::Unauthorized(format!(
-        "no access token for {url}: sign in with `bd remote login --github` (where the server has GitHub sign-in), \
-         save a token from the server's admin with `bd remote login`, or set BD_TOKEN with {}",
+        "no access token for {url}: sign in with `bd remote login --provider <name>` (where the \
+         server offers sign-in), save a token from the server's admin with `bd remote login`, or set BD_TOKEN with {}",
         env_setup(url, ca)
     ))
 }
@@ -1046,6 +1046,13 @@ impl Remote {
         self.exec_into(request, &mut Delivery::collect())
     }
 
+    /// Like [`Remote::exec`]; a `write` whose answer is lost fails with
+    /// [`Error::AnswerLost`], never as safe to run again. Nothing is printed,
+    /// however long the answer.
+    pub fn exec_collected(&self, request: &ExecRequest, write: bool) -> Result<ExecResponse> {
+        self.exec_into(request, &mut Delivery::new(Vec::new(), true, write))
+    }
+
     /// Like [`Remote::exec`], for a request the server may hold until it has
     /// something to say: it is retried for as long after its first failure,
     /// not after it was sent.
@@ -1349,7 +1356,7 @@ impl Remote {
                         (500.., false, _) => format!("HTTP {status}"),
                         (_, false, _) => {
                             return Err(Error::Remote(format!(
-                                "{server}: HTTP {status} to a GitHub sign-in: not a bd server; check the URL"
+                                "{server}: HTTP {status} to a sign-in: not a bd server; check the URL"
                             )));
                         }
                     }
@@ -1713,8 +1720,8 @@ fn set(app: &mut App, a: &RemoteSetArgs) -> Result<()> {
     out = out.line(if token.is_some() {
         "  check the connection: bd remote show"
     } else {
-        "  next: `bd remote login --github` to sign in with GitHub, or `bd remote login` with a token (or set \
-         BD_TOKEN with BD_REMOTE); then `bd remote show` checks the connection"
+        "  next: `bd remote login --provider <name>` to sign in, or `bd remote login` with a token \
+         (or set BD_TOKEN with BD_REMOTE); then `bd remote show` checks the connection"
     });
     if let (Some(trust), Some(token), None) = (trust, token, &app.g.remote) {
         let c = Configured { url: url.clone(), source: Source::File(path.clone()), ca_cert: ca_path };
@@ -1940,10 +1947,10 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
     let keys = credentials::keys(&c.url)?;
     let path = credentials::default_path()?;
     let trust = Trust::load(c.ca_cert.as_deref())?;
-    let (token, signed_in) = if a.github {
+    let (token, signed_in) = if let Some(provider) = a.provider.clone() {
         let workspace = c.url.rsplit_once("/w/").map_or("", |(_, w)| w);
         let remote = Remote::new(c.clone(), trust.clone(), String::new());
-        let issued = crate::oauth::sign_in(&remote, workspace, &keys.server)?;
+        let issued = crate::oauth::sign_in(&remote, workspace, &keys.server, &provider)?;
         credentials::check_token(&issued.token)
             .map_err(|_| Error::Remote(format!("{}: unexpected sign-in answer: not an access token", keys.server)))?;
         (issued.token.clone(), Some(issued))
@@ -1984,7 +1991,7 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
     let saved = credentials::save(&path, &c.url, &token, &trust.anchor, scope, signed_in.is_some(), renewal.as_ref())?;
     // A sign-in token this one takes the place of ends on its server too (unless no server is to be asked).
     let revoke = |gone: &credentials::Gone| {
-        (gone.github && gone.token != token).then(|| match a.no_verify {
+        (gone.signed_in && gone.token != token).then(|| match a.no_verify {
             true => Revocation::NotRevoked("--no-verify asks no server".into()),
             false => revoke_saved(gone, Some(&trust)),
         })
@@ -2013,7 +2020,7 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
         "ca_cert": c.ca_cert,
     });
     if let Some(issued) = &signed_in {
-        view["github"] = json!({ "login": issued.login, "via": issued.via });
+        view["account"] = json!({ "login": issued.login, "via": issued.via });
         view["token"] = json!({
             "name": issued.name,
             "role": issued.role,
@@ -2040,7 +2047,7 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
                 _ => String::new(),
             };
             Out::new(view)
-                .line(format!("✓ Signed in with GitHub as {} ({})", printable(&issued.login), printable(&issued.via)))
+                .line(format!("✓ Signed in as {} ({})", printable(&issued.login), printable(&issued.via)))
                 .line(saved_line)
                 .line(printable(&format!(
                     "  acts as {0} or {0}/<agent>, role {1}, kind {2}, workspaces {workspaces}; expires {3}{renewed}",
@@ -2092,9 +2099,9 @@ fn logout(app: &mut App, a: &RemoteLogoutArgs) -> Result<()> {
     let path = credentials::default_path()?;
     let r = credentials::remove(&path, &url, a.workspace_only)?;
     // A token from GitHub sign-in ends on its server too; one an admin created may serve elsewhere, and stays.
-    let trust = if r.removed.iter().any(|gone| gone.github) { trust_for(app, &url) } else { None };
+    let trust = if r.removed.iter().any(|gone| gone.signed_in) { trust_for(app, &url) } else { None };
     let revocations: Vec<Option<Revocation>> =
-        r.removed.iter().map(|gone| gone.github.then(|| revoke_saved(gone, trust.as_ref()))).collect();
+        r.removed.iter().map(|gone| gone.signed_in.then(|| revoke_saved(gone, trust.as_ref()))).collect();
     let keys: Vec<&str> = r.removed.iter().map(|gone| gone.key.as_str()).collect();
     let views: Vec<Value> = r
         .removed
@@ -2114,7 +2121,7 @@ fn logout(app: &mut App, a: &RemoteLogoutArgs) -> Result<()> {
     if r.file_removed {
         out = out.line(format!("  removed {}, which is empty now", path.display()));
     }
-    if r.removed.iter().any(|gone| !gone.github) {
+    if r.removed.iter().any(|gone| !gone.signed_in) {
         out = out.line(
             "  the server still accepts a token its admin created until it is revoked there (`bd serve token revoke`)",
         );

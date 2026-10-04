@@ -9,12 +9,14 @@
 //!
 //! Layout: `<root>/<name>/.bd/bd.db` is workspace `<name>`, served at
 //! `POST /w/<name>/v2/exec` (the wire format is in `protocol.rs`);
-//! `<root>/tokens.json` holds the access tokens, and `<root>/auth.toml`
-//! turns on GitHub sign-in, served at `POST /v2/auth/github/{device,token}`
-//! without a token (`oauth.rs`); `POST /v2/auth/revoke` revokes the token it
+//! `<root>/server.db` holds the access tokens (`server_db.rs`), and `<root>/auth.toml`
+//! turns on sign-in, served at `POST /v2/auth/<provider>/{device,token}`
+//! without a token (`oauth/`); `POST /v2/auth/revoke` revokes the token it
 //! is sent with, if it came from sign-in, and `POST /v2/auth/refresh` renews
-//! the sign-in whose refresh token it is sent with. `GET /healthz` answers
-//! `ok` without a token.
+//! the sign-in whose refresh token it is sent with. `POST /w/<name>/mcp`
+//! serves the workspace's MCP tools over Streamable HTTP (`mcp/http.rs`; tool
+//! calls run as `run` runs a command line, through `ToolRunner`). `GET
+//! /healthz` answers `ok` without a token.
 //!
 //! Memory and slots: up to `MAX_RUNNING` commands run at once. Requests in
 //! progress share a budget (`MIN_BODY_BUDGET`, or more for one maximum-size
@@ -40,6 +42,12 @@
 //! `--max-followers` requests wait at once, for at most `--max-wait`; others,
 //! and requests too large to hold outside the budget, run at once, and their
 //! clients poll.
+//!
+//! Here: the server's state (`Server`), workspaces, authorizing a request
+//! and its actor, access classes (`access`). Beside it: `listen`
+//! (connections, TLS, shutdown), `routes` (path and method to endpoint),
+//! `exec` (`/v2/exec`), `signin` (`/v2/auth/…`), `authorization` (the OAuth
+//! authorization server's endpoints and pages), `mcp_endpoint` (`/w/<name>/mcp`).
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -72,17 +80,37 @@ use crate::cli::*;
 use crate::follow::{self, Feeds, HeadReader, Subscription};
 use crate::io::{self, Capture};
 use crate::jobs;
-use crate::oauth;
+use crate::mcp::{self, Ran, http as mcp_http};
+use crate::oauth_server::{authorize, cimd, pages, token};
 use crate::protocol::{
     ErrorBody, ErrorDetail, ExecRequest, ExecResponse, Exit, FRAMES_CONTENT_TYPE, PROTOCOL, PROTOCOL_HEADER,
     RefreshRequest, RevokeAnswer, SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
 };
 use crate::stream::{FrameWriter, Limits, ResponseBody, Stalls};
+use crate::{oauth, oauth_server};
+
+mod authorization;
+mod check;
+mod exec;
+mod listen;
+mod mcp_endpoint;
+mod routes;
+mod signin;
+
+use authorization::*;
+use exec::*;
+use listen::*;
+use mcp_endpoint::*;
+use routes::*;
+use signin::*;
 
 /// Commands running at once; further requests wait for a slot.
 const MAX_RUNNING: usize = 32;
 /// Open connections; further ones are closed at once.
 const MAX_CONNECTIONS: usize = 512;
+/// Open connections from one address, unless it is this machine's (a proxy
+/// in front, whose connections are everyone's): one host cannot take them all.
+const MAX_CONNECTIONS_PER_PEER: usize = MAX_CONNECTIONS / 8;
 /// Memory for requests in progress, across all connections: this much, or
 /// enough for one maximum-size request if `--max-body-mib` is larger.
 const MIN_BODY_BUDGET: usize = 256 << 20;
@@ -91,15 +119,24 @@ const BODY_COPIES: usize = 2;
 /// How long a request waits for body budget or a command slot before the
 /// client is asked to retry (503).
 const QUEUE_WAIT: Duration = Duration::from_secs(15);
-const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request's headers may take, counted from when the connection
+/// waits for them: so also how long an idle keep-alive connection is kept
+/// for its next request (hyper times both as one). Long enough that a
+/// client's next tool call reuses its connection (nginx's keep-alive
+/// default); a client trickling headers is bounded by it and by
+/// `MAX_CONNECTIONS_PER_PEER`.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(75);
 /// Matches the client's own limit for a whole request.
 const BODY_TIMEOUT: Duration = Duration::from_secs(120);
-/// Connections close after this long, so a client that stops reading cannot hold a response forever.
+/// Connections close after this long, so a client that stops reading cannot hold a response forever: gracefully,
+/// the answer in progress finished first, within `LIFETIME_GRACE`.
 const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(15 * 60);
+const LIFETIME_GRACE: Duration = Duration::from_secs(2 * 60);
 /// hyper's per-connection read buffer, held before authentication (hyper's default is ~400 KiB).
 const READ_BUFFER: usize = 64 << 10;
-/// Idle database connections kept per workspace.
+/// Idle database connections kept per workspace, each for at most `POOL_IDLE`.
 const MAX_POOLED: usize = 16;
+const POOL_IDLE: Duration = Duration::from_secs(5 * 60);
 /// Stack of the threads that run commands. Playbooks nest at most
 /// `playbook::MAX_DEPTH` levels, far below this; it is address space,
 /// committed only as it is used.
@@ -140,8 +177,24 @@ const FOLLOWERS_GRACE: Duration = Duration::from_secs(5);
 /// GitHub sign-in requests handled at once, each waiting on GitHub; more
 /// are answered 503 at once, which clients retry.
 const MAX_SIGN_INS: usize = 8;
+/// Account notifications handled at once.
+const MAX_NOTIFIED: usize = 2;
+/// OAuth client registrations handled at once, each rewriting the
+/// registry; more are answered 503 at once.
+const MAX_REGISTERING: usize = 2;
 /// The largest body of a sign-in request.
 const MAX_SIGN_IN_BODY: usize = 16 << 10;
+/// The largest body of a consent page's decision.
+const MAX_CONSENT_BODY: usize = 4 << 10;
+/// The largest provider's answer posted to a callback (an ID token and the
+/// user's name with the code, which are not read).
+const MAX_RELAYED_BODY: usize = 32 << 10;
+/// The longest MCP message a client may POST.
+const MAX_MCP_BODY: usize = 1 << 20;
+/// An MCP answer's share of the body budget: its tool's output (up to
+/// `mcp::local::OUTPUT_LIMIT`) is held, escaped into the result's text, and
+/// serialized, and the serialized answer is held until it is sent.
+const MCP_ANSWER_BUDGET: usize = 3 * mcp::local::OUTPUT_LIMIT;
 
 type Body = ResponseBody;
 
@@ -149,203 +202,8 @@ pub fn cmd_serve(app: &mut App, a: &ServeArgs) -> Result<()> {
     io::require_local("bd serve")?;
     match &a.action {
         Some(ServeAction::Token(cmd)) => auth::cmd_token(app, cmd),
+        Some(ServeAction::Check(c)) => check::check(app, c),
         None => run(a),
-    }
-}
-
-fn run(a: &ServeArgs) -> Result<()> {
-    let root = a.root.as_ref().ok_or_else(|| {
-        Error::invalid(
-            "bd serve needs --root DIR (or $BD_SERVE_ROOT): the directory holding <name>/.bd/bd.db workspaces",
-        )
-    })?;
-    let root = crate::app::resolve_dir(root).map_err(|e| Error::invalid(format!("--root {}: {e}", root.display())))?;
-    if !root.is_dir() {
-        return Err(Error::invalid(format!("--root {}: not a directory", root.display())));
-    }
-    let addr = a
-        .listen
-        .to_socket_addrs()
-        .map_err(|e| Error::invalid(format!("--listen {}: {e}", a.listen)))?
-        .next()
-        .ok_or_else(|| Error::invalid(format!("--listen {}: no address", a.listen)))?;
-    let tls = match (&a.tls_cert, &a.tls_key) {
-        (Some(cert), Some(key)) => Some(tls_acceptor(cert, key)?),
-        _ => None,
-    };
-    if tls.is_none() && !addr.ip().is_loopback() && !a.insecure_http {
-        return Err(Error::Refused(format!(
-            "refusing plain HTTP on {addr}: access tokens would cross the network unencrypted. Pass --tls-cert and \
-             --tls-key, or --insecure-http behind a TLS proxy or on an encrypted private network"
-        )));
-    }
-    if !(1..=4096).contains(&a.max_body_mib) {
-        return Err(Error::invalid(format!("--max-body-mib {}: use 1 to 4096", a.max_body_mib)));
-    }
-    let max_body = usize::try_from(a.max_body_mib << 20).unwrap_or(usize::MAX);
-    let waits = Waits::from_args(a)?;
-    let jobs = jobs::Config::from_args(a)?;
-    // Checked now so that a mistake shows at once; each sign-in reads the file again.
-    if let Some(github) = oauth::load(&root)? {
-        let shown = |d: Duration| bd_core::time::format_duration_ms(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-        match &github.app {
-            Some(_) => tracing::info!(
-                target: "bd::serve",
-                github = %github.url,
-                rules = github.rules.len(),
-                token_ttl = %shown(github.token_ttl),
-                refresh_limit = %shown(github.refresh_limit),
-                refresh_idle = %shown(github.refresh_idle),
-                "GitHub sign-in is on, with refreshed tokens"
-            ),
-            None => tracing::warn!(
-                target: "bd::serve",
-                github = %github.url,
-                rules = github.rules.len(),
-                token_ttl = %shown(github.token_ttl),
-                "GitHub sign-in is on; its tokens are not refreshed (auth.toml has no github.private_key), so people \
-                 sign in again each token_ttl"
-            ),
-        }
-    }
-    // Before any request or background job: gate checks in this process use the server's defaults.
-    io::mark_server_process();
-    let server = Arc::new(Server::new(root, max_body, waits));
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_name("bd-serve")
-        .thread_stack_size(THREAD_STACK)
-        .build()?;
-    let served = runtime.block_on(serve(server, addr, tls, jobs));
-    // Commands and jobs still running after their grace period are abandoned:
-    // SQLite rolls back an unfinished transaction.
-    runtime.shutdown_timeout(Duration::from_secs(1));
-    served
-}
-
-fn tls_acceptor(cert: &Path, key: &Path) -> Result<TlsAcceptor> {
-    use rustls::pki_types::pem::PemObject;
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-    let bad =
-        |flag: &str, path: &Path, e: &dyn std::fmt::Display| Error::invalid(format!("{flag} {}: {e}", path.display()));
-    let certs = CertificateDer::pem_file_iter(cert)
-        .map_err(|e| bad("--tls-cert", cert, &e))?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| bad("--tls-cert", cert, &e))?;
-    if certs.is_empty() {
-        return Err(bad("--tls-cert", cert, &"no certificate in the file"));
-    }
-    let key_der = PrivateKeyDer::from_pem_file(key).map_err(|e| bad("--tls-key", key, &e))?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|e| Error::invalid(format!("TLS: {e}")))?
-        .with_no_client_auth()
-        .with_single_cert(certs, key_der)
-        .map_err(|e| Error::invalid(format!("--tls-cert/--tls-key: {e}")))?;
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(TlsAcceptor::from(Arc::new(config)))
-}
-
-async fn serve(server: Arc<Server>, addr: SocketAddr, tls: Option<TlsAcceptor>, jobs: jobs::Config) -> Result<()> {
-    let listener = TcpListener::bind(addr).await.map_err(|e| Error::invalid(format!("--listen {addr}: {e}")))?;
-    let local = listener.local_addr()?;
-    let scheme = if tls.is_some() { "https" } else { "http" };
-    // Tests and scripts read the bound address (with --listen ...:0) from this line.
-    io::outln(format!("bd serve: listening on {scheme}://{local} (workspaces in {})", server.root.display()));
-    tracing::info!(target: "bd::serve", %local, scheme, root = %server.root.display(), "listening");
-    let feeds = server.feeds.clone();
-    let committed = Arc::new(move |workspace: &str| feeds.committed(workspace));
-    let jobs = jobs::start(jobs, server.root.clone(), server.open.clone(), committed);
-    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-    let shutdown = shutdown_signal();
-    tokio::pin!(shutdown);
-    loop {
-        let (stream, peer) = tokio::select! {
-            _ = &mut shutdown => break,
-            accepted = listener.accept() => match accepted {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::warn!(target: "bd::serve", error = %e, "accept failed");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                    continue;
-                }
-            },
-        };
-        let Ok(permit) = connections.clone().try_acquire_owned() else {
-            tracing::warn!(target: "bd::serve", %peer, "too many connections; closing this one");
-            continue;
-        };
-        let server = server.clone();
-        let tls = tls.clone();
-        tokio::spawn(async move {
-            let _permit = permit;
-            if tokio::time::timeout(MAX_CONNECTION_LIFETIME, connection(server, stream, peer, tls)).await.is_err() {
-                tracing::debug!(target: "bd::serve", %peer, "connection closed at its maximum lifetime");
-            }
-        });
-    }
-    tracing::info!(target: "bd::serve", "shutting down after running commands finish");
-    // Clients trying to connect are refused at once, and retry.
-    drop(listener);
-    // Requests waiting for events are answered at once, instead of at the end of their wait.
-    server.stopping.send_replace(true);
-    // GitHub gates are checked again after a restart; no need to wait for gh.
-    crate::gates::cancel_gh_calls();
-    let all = u32::try_from(MAX_RUNNING).unwrap_or(u32::MAX);
-    let commands = tokio::time::timeout(COMMANDS_GRACE, server.running.acquire_many(all));
-    let followers = u32::try_from(server.waits.followers).unwrap_or(u32::MAX);
-    let followers = tokio::time::timeout(FOLLOWERS_GRACE, server.followers.acquire_many(followers));
-    let _ = tokio::join!(commands, followers, jobs.stop(JOBS_GRACE));
-    Ok(())
-}
-
-/// Serve the HTTP requests of one connection.
-async fn connection(server: Arc<Server>, stream: TcpStream, peer: SocketAddr, tls: Option<TlsAcceptor>) {
-    let _ = stream.set_nodelay(true);
-    let stream = Stalls::new(stream, WRITE_STALL);
-    let service = service_fn(move |req| handle(server.clone(), req));
-    let mut http = http1::Builder::new();
-    http.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(READ_BUFFER);
-    let served = match tls {
-        Some(acceptor) => match tokio::time::timeout(Duration::from_secs(15), acceptor.accept(stream)).await {
-            Ok(Ok(stream)) => http.serve_connection(TokioIo::new(stream), service).await,
-            Ok(Err(e)) => {
-                tracing::debug!(target: "bd::serve", %peer, error = %e, "TLS handshake failed");
-                return;
-            }
-            Err(_) => {
-                tracing::debug!(target: "bd::serve", %peer, "TLS handshake timed out");
-                return;
-            }
-        },
-        None => http.serve_connection(TokioIo::new(stream), service).await,
-    };
-    if let Err(e) = served {
-        tracing::debug!(target: "bd::serve", %peer, error = %e, "connection closed");
-    }
-}
-
-async fn shutdown_signal() {
-    let interrupt = async {
-        if tokio::signal::ctrl_c().await.is_err() {
-            std::future::pending::<()>().await;
-        }
-    };
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut s) => {
-                s.recv().await;
-            }
-            Err(_) => std::future::pending::<()>().await,
-        }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-    tokio::select! {
-        _ = interrupt => {}
-        _ = terminate => {}
     }
 }
 
@@ -417,334 +275,62 @@ fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response<B
     response(status, "application/json", Body::whole(serde_json::to_vec(body).unwrap_or_default()))
 }
 
-/// `[/<prefix>]/w/<name>/v2/exec` -> `<name>`: a proxy may serve bd under a
-/// path prefix without stripping it.
-fn exec_path(path: &str) -> Option<&str> {
-    let (rest, version) = path.strip_suffix("/exec")?.rsplit_once("/v")?;
-    let (_, name) = rest.rsplit_once("/w/")?;
-    Some(name).filter(|w| version == PROTOCOL.to_string() && !w.is_empty() && !w.contains('/'))
-}
-
-/// A step of GitHub sign-in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SignIn {
-    /// Get a one-time code.
-    Device,
-    /// Ask whether it was entered, and get the token once it was.
-    Token,
-}
-
-/// `[/<prefix>]/v2/auth/github/<device|token>` -> the step.
-fn sign_in_path(path: &str) -> Option<SignIn> {
-    let (_, step) = path.rsplit_once(&format!("/v{PROTOCOL}/auth/github/"))?;
-    match step {
-        "device" => Some(SignIn::Device),
-        "token" => Some(SignIn::Token),
-        _ => None,
-    }
-}
-
-async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Result<Response<Body>, Infallible> {
-    let path = req.uri().path().to_string();
-    let response = if path == "/healthz" && req.method() == Method::GET {
-        response(StatusCode::OK, "text/plain", Body::whole(Bytes::from_static(b"ok\n")))
-    } else if let Some(workspace) = exec_path(&path) {
-        if req.method() == Method::POST {
-            exec(&server, workspace.to_string(), req).await
-        } else {
-            Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
-        }
-    } else if let Some(step) = sign_in_path(&path) {
-        if req.method() == Method::POST {
-            sign_in(&server, step, req).await
-        } else {
-            Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
-        }
-    } else if path.ends_with(&format!("/v{PROTOCOL}/auth/revoke")) {
-        if req.method() == Method::POST {
-            revoke_own(&server, req).await
-        } else {
-            Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
-        }
-    } else if path.ends_with(&format!("/v{PROTOCOL}/auth/refresh")) {
-        if req.method() == Method::POST {
-            refresh(&server, req).await
-        } else {
-            Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
-        }
-    } else {
-        let msg = format!("no such endpoint; workspaces are at /w/<name>/v{PROTOCOL}/exec");
-        Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response()
-    };
-    Ok(response)
-}
-
-/// A step of GitHub sign-in, for a client without a token yet. Each runs on
-/// a blocking thread, as it waits on GitHub (`oauth.rs`).
-async fn sign_in(server: &Arc<Server>, step: SignIn, req: Request<Incoming>) -> Response<Body> {
-    // The body first, small and time-limited: a slow client holds no slot meanwhile.
-    let body = match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect())
-        .await
-    {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(e)) if e.is::<LengthLimitError>() => {
-            let msg = format!("sign-in request larger than {} KiB", MAX_SIGN_IN_BODY >> 10);
-            return Reject::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid", msg, 2).response();
-        }
-        Ok(Err(e)) => {
-            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
-        }
-        Err(_) => {
-            let msg = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
-            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
-        }
-    };
-    let bad_body =
-        |e: serde_json::Error| Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("bad request body: {e}"), 2);
-    let answer = match step {
-        SignIn::Device => {
-            let start: SignInStart = match serde_json::from_slice(&body) {
-                Ok(s) => s,
-                Err(e) => return bad_body(e).response(),
-            };
-            // Before anyone goes to GitHub for it.
-            if server.workspace(&start.workspace).is_none() {
-                let msg = format!("workspace not found: {}", start.workspace);
-                return Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response();
-            }
-            let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
-                return busy("signing in other accounts");
-            };
-            let root = server.root.clone();
-            // The permit goes with the work: a client that leaves does not end it.
-            blocking(move || {
-                let _permit = permit;
-                Ok(serde_json::to_value(oauth::start(&root)?)?)
-            })
-            .await
-        }
-        SignIn::Token => {
-            let poll: SignInPoll = match serde_json::from_slice(&body) {
-                Ok(p) => p,
-                Err(e) => return bad_body(e).response(),
-            };
-            if server.workspace(&poll.workspace).is_none() {
-                let msg = format!("workspace not found: {}", poll.workspace);
-                return Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response();
-            }
-            let key = auth::hash(&poll.device_code);
-            {
-                let mut issued = lock(&server.issued);
-                let now = Instant::now();
-                issued.answers.retain(|_, (at, _)| now.duration_since(*at) < ISSUED_REPLAY);
-                if let Some((_, answer)) = issued.answers.get(&key) {
-                    return json_response(StatusCode::OK, answer);
-                }
-                // A retry while the first attempt still runs waits for its answer.
-                if !issued.running.insert(key.clone()) {
-                    return busy("completing this sign-in");
-                }
-            }
-            let completing = Completing { server: server.clone(), key: key.clone(), refresh: false };
-            let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
-                return busy("signing in other accounts");
-            };
-            let srv = server.clone();
-            blocking(move || {
-                let _held = (permit, completing);
-                let answer = oauth::poll(&srv.root, &poll)?;
-                let value = serde_json::to_value(&answer)?;
-                // Kept even if this client is gone: its retry gets the token GitHub will not give again.
-                if let SignInAnswer::Issued(_) = answer {
-                    srv.tokens.invalidate();
-                    let mut issued = lock(&srv.issued);
-                    if issued.answers.len() >= MAX_ISSUED {
-                        let oldest = issued.answers.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone());
-                        issued.answers.remove(&oldest.unwrap_or_default());
-                    }
-                    issued.answers.insert(key, (Instant::now(), value.clone()));
-                }
-                Ok(value)
-            })
-            .await
-        }
-    };
-    auth_answer(answer)
-}
-
-/// The answer to a sign-in or refresh step.
-fn auth_answer(answer: Result<serde_json::Value>) -> Response<Body> {
-    match answer {
-        Ok(value) => json_response(StatusCode::OK, &value),
-        Err(e) => {
-            let status = match &e {
-                Error::Unauthorized(_) => StatusCode::FORBIDDEN,
-                Error::Invalid(_) => StatusCode::BAD_REQUEST,
-                Error::Remote(_) => StatusCode::BAD_GATEWAY,
-                Error::Busy(_) | Error::Locked(_) => StatusCode::SERVICE_UNAVAILABLE,
-                _ => return Reject::internal(e).response(),
-            };
-            Reject::new(status, e.code(), e.to_string(), e.exit_code()).response()
-        }
-    }
-}
-
-/// `POST /v2/auth/refresh`: renew the sign-in whose refresh token is the
-/// request's bearer token (`oauth::refresh`), on a blocking thread, as it
-/// waits on GitHub. A retry with the same request id gets the answer that
-/// issued tokens again, for [`ISSUED_REPLAY`]: the refresh token it sent is
-/// spent, and any other request with it revokes the sign-in.
-async fn refresh(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
-    let Some(secret) = bearer(req.headers()).map(str::to_string) else { return denied().response() };
-    let body = match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect())
-        .await
-    {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(e)) => {
-            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
-        }
-        Err(_) => {
-            let msg = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
-            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
-        }
-    };
-    let request: RefreshRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("bad request body: {e}"), 2).response();
-        }
-    };
-    let id = request.request_id.as_str();
-    if id.is_empty() || id.len() > 128 || !id.bytes().all(|b| b.is_ascii_graphic()) {
-        return Reject::new(StatusCode::BAD_REQUEST, "invalid", "a refresh needs a request id", 2).response();
-    }
-    let running = auth::hash(&secret);
-    let key = auth::hash(&format!("{secret} {id}"));
-    {
-        let mut refreshes = lock(&server.refreshes);
-        let now = Instant::now();
-        refreshes.answers.retain(|_, (at, _)| now.duration_since(*at) < ISSUED_REPLAY);
-        if let Some((_, answer)) = refreshes.answers.get(&key) {
-            return json_response(StatusCode::OK, answer);
-        }
-        // A retry while the first attempt still runs waits for its answer.
-        if !refreshes.running.insert(running.clone()) {
-            return busy("refreshing this sign-in");
-        }
-    }
-    let completing = Completing { server: server.clone(), key: running, refresh: true };
-    let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
-        return busy("signing in other accounts");
-    };
-    let (srv, request_id) = (server.clone(), request.request_id.clone());
-    auth_answer(
-        blocking(move || {
-            let _held = (permit, completing);
-            let refreshed = oauth::refresh(&srv.root, &secret, &request_id);
-            // Refreshed, or revoked.
-            srv.tokens.invalidate();
-            let value = serde_json::to_value(refreshed?)?;
-            // Kept even if this client is gone: its retry gets the tokens, as its refresh token is spent.
-            let mut refreshes = lock(&srv.refreshes);
-            if refreshes.answers.len() >= MAX_ISSUED {
-                let oldest = refreshes.answers.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone());
-                refreshes.answers.remove(&oldest.unwrap_or_default());
-            }
-            refreshes.answers.insert(key, (Instant::now(), value.clone()));
-            Ok(value)
-        })
-        .await,
-    )
-}
-
-/// How long the answer of a sign-in that issued a token is kept, for a
-/// retry whose first answer was lost: GitHub gives a sign-in's token once.
-const ISSUED_REPLAY: Duration = Duration::from_secs(5 * 60);
-/// Answers of sign-ins kept at once; the oldest goes first.
-const MAX_ISSUED: usize = 256;
-
-/// Sign-ins completing, and the answers of those that issued a token, by
-/// the SHA-256 of their device code.
-#[derive(Default)]
-struct Issuances {
-    answers: HashMap<String, (Instant, serde_json::Value)>,
-    running: HashSet<String>,
-}
-
-/// A sign-in or refresh completing: no other attempt of it runs until this
-/// is dropped.
-struct Completing {
-    server: Arc<Server>,
-    key: String,
-    /// A refresh, not a sign-in.
-    refresh: bool,
-}
-
-impl Drop for Completing {
-    fn drop(&mut self) {
-        let running = if self.refresh { &self.server.refreshes } else { &self.server.issued };
-        lock(running).running.remove(&self.key);
-    }
-}
-
-/// `POST /v2/auth/revoke`: revoke the request's own token, if it came from
-/// GitHub sign-in (`bd remote logout`). One an admin created is kept: it may
-/// serve elsewhere too, and only the admin revokes it. An expired token may
-/// still be revoked; an unknown one is refused like any request. A
-/// sign-in's refresh secret revokes the sign-in too: its current one, or
-/// the one its latest refresh spent with that refresh's request id (body
-/// `{"request_id"}`), whose answer the client may never have got.
-async fn revoke_own(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
-    let Some(secret) = bearer(req.headers()).map(str::to_string) else { return denied().response() };
-    // Small, so that the connection stays usable.
-    let body = tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await;
-    let token = if auth::refresh_family(&secret).is_some() {
-        let request_id = match body {
-            Ok(Ok(b)) => serde_json::from_slice::<serde_json::Value>(&b.to_bytes())
-                .ok()
-                .and_then(|v| v["request_id"].as_str().map(String::from)),
-            _ => None,
-        };
-        let root = server.root.clone();
-        let found = blocking(move || {
-            Ok(auth::find_refresh(&root, &secret)?.filter(|(t, current)| {
-                *current
-                    || t.refresh.as_ref().zip(request_id.as_deref()).is_some_and(|(r, id)| r.retries_last(&secret, id))
-            }))
-        })
-        .await;
-        match found {
-            Ok(Some((t, _))) => t,
-            Ok(None) => return denied().response(),
-            Err(e) => return Reject::internal(e).response(),
-        }
-    } else {
-        match server.tokens.verify(&secret) {
-            Ok(Verified::Valid(t) | Verified::Expired(t)) => t,
-            Ok(Verified::Unknown) => return denied().response(),
-            Err(e) => return Reject::internal(e).response(),
-        }
-    };
-    if token.github.is_none() {
-        return json_response(StatusCode::OK, &RevokeAnswer { name: token.name, revoked: false });
-    }
-    let (root, srv, id) = (server.root.clone(), server.clone(), token.id.clone());
-    let revoked = blocking(move || {
-        let revoked = auth::revoke_by_id(&root, &id)?;
-        srv.tokens.invalidate();
-        Ok(revoked)
-    })
-    .await;
-    match revoked {
-        Ok(_) => {
-            tracing::info!(target: "bd::serve", token = %token.name, actor = %token.actor, "access token revoked by its holder");
-            json_response(StatusCode::OK, &RevokeAnswer { name: token.name, revoked: true })
-        }
-        Err(e) => Reject::internal(e).response(),
-    }
-}
-
 /// Run `f` on a blocking thread.
+/// Why a request's body could not be had.
+enum BodyError {
+    /// Longer than allowed.
+    TooLarge,
+    Unreadable(String),
+    /// Not all there within the wait.
+    Late(Duration),
+}
+
+/// The whole body of a request, at most `max` bytes, within `wait`.
+async fn read_body(body: Incoming, max: usize, wait: Duration) -> std::result::Result<Bytes, BodyError> {
+    match tokio::time::timeout(wait, Limited::new(body, max).collect()).await {
+        Ok(Ok(b)) => Ok(b.to_bytes()),
+        Ok(Err(e)) if e.is::<LengthLimitError>() => Err(BodyError::TooLarge),
+        Ok(Err(e)) => Err(BodyError::Unreadable(e.to_string())),
+        Err(_) => Err(BodyError::Late(wait)),
+    }
+}
+
+impl BodyError {
+    /// The answer of bd's own endpoints (`what` the request is, at most `max` bytes).
+    fn response(&self, what: &str, max: usize) -> Response<Body> {
+        match self {
+            BodyError::TooLarge => {
+                let msg = format!("{what} larger than {} KiB", max >> 10);
+                Reject::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid", msg, 2).response()
+            }
+            BodyError::Unreadable(e) => {
+                Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response()
+            }
+            BodyError::Late(wait) => {
+                let msg = format!("the request body did not arrive within {}s", wait.as_secs());
+                Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response()
+            }
+        }
+    }
+
+    /// The answer of the OAuth endpoints (RFC 6749 section 5.2), `too_large` the code for a body too large.
+    fn oauth(&self, too_large: &str, max: usize) -> Response<Body> {
+        match self {
+            BodyError::TooLarge => {
+                let why = format!("the request is larger than {} KiB", max >> 10);
+                oauth_error(StatusCode::PAYLOAD_TOO_LARGE, too_large, &why)
+            }
+            BodyError::Unreadable(e) => {
+                oauth_error(StatusCode::BAD_REQUEST, "invalid_request", &format!("reading the request: {e}"))
+            }
+            BodyError::Late(wait) => {
+                let why = format!("the request body did not arrive within {}s", wait.as_secs());
+                oauth_error(StatusCode::REQUEST_TIMEOUT, "invalid_request", &why)
+            }
+        }
+    }
+}
+
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     match tokio::task::spawn_blocking(f).await {
         Ok(result) => result,
@@ -774,129 +360,48 @@ fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Tok
         Ok(Verified::Valid(token)) => Ok(token),
         Ok(Verified::Expired(token)) => {
             let at = token.expires_at.map(|t| t.to_rfc3339()).unwrap_or_default();
-            let renew = match token.github {
-                Some(_) => "sign in again: `bd remote login --github`",
-                None => "the server's admin issues new ones",
+            let renew = match &token.identity {
+                Some(g) => format!("sign in again: `bd remote login --provider {}`", g.provider),
+                None => "the server's admin issues new ones".to_string(),
             };
             let msg = format!("access token {} expired at {at}; {renew}", token.name);
             Err(Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7))
         }
         Ok(Verified::Unknown) => Err(denied()),
+        Err(Error::Busy(_)) => Err(Reject::busy("checking access tokens")),
         Err(e) => Err(Reject::internal(e)),
     }
 }
 
-async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -> Response<Body> {
-    let started = Instant::now();
-    let token = match authenticate(server, req.headers()) {
-        Ok(t) => t,
-        Err(r) => return r.response(),
-    };
-    if !token.allows_workspace(&workspace) {
-        let msg = format!("access token {} may not use workspace {workspace}", token.name);
-        return Reject::new(StatusCode::FORBIDDEN, "unauthorized", msg, 7).response();
-    }
-    let Some(ws) = server.workspace(&workspace) else {
-        return Reject::new(StatusCode::NOT_FOUND, "not_found", format!("workspace not found: {workspace}"), 3)
-            .response();
-    };
-    // Requests share one memory budget: reserve the body's declared size (or
-    // the maximum, when it is sent chunked) before reading it, and the answer's share.
-    let declared = hyper::body::Body::size_hint(req.body()).exact();
-    if declared.is_some_and(|n| n > server.max_body as u64) {
-        return too_large(server.max_body);
-    }
-    let reserve = declared.map_or(server.max_body, |n| usize::try_from(n).unwrap_or(server.max_body));
-    let answer_permits = kib(ANSWER_BUDGET);
-    let permits = kib(reserve.saturating_mul(BODY_COPIES)).saturating_add(answer_permits);
-    let mut budget =
-        match tokio::time::timeout(QUEUE_WAIT, server.body_budget.clone().acquire_many_owned(permits)).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return shutting_down(),
-            Err(_) => return busy("receiving other requests"),
-        };
-    let mut answer_budget = budget.split(answer_permits as usize);
-    let mut budget = Some(budget);
-    let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(req.into_body(), server.max_body).collect()).await
+/// The permission bits of the directory `dir` if its group or others may
+/// do anything in it (Unix; never elsewhere).
+fn dir_open_to_others(dir: &std::path::Path) -> Option<u32> {
+    #[cfg(unix)]
     {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(e)) if e.is::<LengthLimitError>() => return too_large(server.max_body),
-        Ok(Err(e)) => {
-            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
-        }
-        Err(_) => {
-            let msg = format!("the request body did not arrive within {}s", BODY_TIMEOUT.as_secs());
-            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
-        }
-    };
-    let mut request: ExecRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(e) => {
-            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("bad request body: {e}"), 2).response();
-        }
-    };
-    let body_size = body.len();
-    drop(body);
-    let bundled = request.argv.iter().any(|a| a == "--playbook-bundle" || a.starts_with("--playbook-bundle="));
-    let planning = match bundled {
-        false => None,
-        true => match server.planning.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(TryAcquireError::NoPermits) => return busy("planning other playbooks"),
-            Err(TryAcquireError::Closed) => return shutting_down(),
-        },
-    };
-    let mut waited = None;
-    let wait = follow::requested(&request.argv);
-    if wait.is_some() && body_size > MAX_WAITING_BODY {
-        tracing::debug!(target: "bd::serve", workspace = %ws.name, bytes = body_size, "request too large to wait; not waiting");
-    } else if let Some((cli, wait)) = wait {
-        // A waiting request holds no memory budget: its answer comes later,
-        // and its body is parsed, small, and without the inputs `events` never reads.
-        drop((budget.take(), answer_budget.take()));
-        (request.stdin, request.files) = Default::default();
-        // A request its token may not make is refused at once, by `run`.
-        if resolve_actor(cli.global.actor.as_deref(), request.actor.as_deref(), request.session.as_deref(), &token)
-            .is_ok()
-        {
-            match server.wait_for_events(&ws, wait).await {
-                Ok(w) => waited = Some(w),
-                Err(reject) => return reject.response(),
-            }
-        }
-        let permits = server.body_budget.clone().acquire_many_owned(answer_permits);
-        answer_budget = match tokio::time::timeout(QUEUE_WAIT, permits).await {
-            Ok(Ok(permit)) => Some(permit),
-            Ok(Err(_)) => return shutting_down(),
-            Err(_) => return busy("receiving other requests"),
-        };
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir).ok()?.permissions().mode() & 0o777;
+        (mode & 0o077 != 0).then_some(mode)
     }
-    let slot = match tokio::time::timeout(QUEUE_WAIT, server.running.clone().acquire_owned()).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return shutting_down(),
-        Err(_) => return busy("running other commands"),
-    };
-    // The command sends its answer's body when the answer starts: whole once
-    // it finishes, or as soon as its output fills a chunk.
-    let (answer, answered) = tokio::sync::oneshot::channel();
-    let out = FrameWriter::new(answer, Limits::SERVE, answer_budget, Some(server.streams.clone()));
-    let srv = server.clone();
-    let job = tokio::task::spawn_blocking(move || {
-        // Held until the command finishes, even if the client goes away meanwhile.
-        let _held = (slot, budget, planning);
-        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| srv.run(&ws, &token, request, started, waited, out)));
-        ran.unwrap_or_else(|_| {
-            tracing::error!(target: "bd::serve", workspace = %ws.name, "command panicked");
-            Err(Reject::failed())
-        })
-    });
-    match answered.await {
-        Ok(body) => response(StatusCode::OK, FRAMES_CONTENT_TYPE, body),
-        // No answer: refused before the command ran, or it panicked first.
-        Err(_) => match job.await {
-            Ok(Err(reject)) => reject.response(),
-            Ok(Ok(())) | Err(_) => Reject::failed().response(),
-        },
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// The permission bits of `file` if its group or others may read or write
+/// it (Unix; never elsewhere).
+fn open_to_others(file: &std::path::Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(file).ok()?.permissions().mode() & 0o777;
+        (mode & 0o066 != 0).then_some(mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
     }
 }
 
@@ -922,6 +427,30 @@ fn shutting_down() -> Response<Body> {
     Reject::shutting_down().response()
 }
 
+/// The largest body read and dropped before a refusal sent without reading it.
+const DRAIN_MAX: usize = 16 << 10;
+
+/// `response`, once the request's `body` (if it was not read) is read and
+/// dropped, when small: hyper closes a connection whose request body was
+/// left unread, and a client's next request would need a new one (often
+/// right after a refusal: the first, unauthenticated, MCP request).
+async fn drained(body: Option<Incoming>, response: Response<Body>) -> Response<Body> {
+    if let Some(body) = body {
+        let _ = read_body(body, DRAIN_MAX, Duration::from_secs(1)).await;
+    }
+    response
+}
+
+/// Wait up to `QUEUE_WAIT` for `permits` of `slots`; past it the server is
+/// busy `doing` what holds them.
+async fn queue(slots: &Arc<Semaphore>, permits: u32, doing: &str) -> Result<OwnedSemaphorePermit, Reject> {
+    match tokio::time::timeout(QUEUE_WAIT, slots.clone().acquire_many_owned(permits)).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(Reject::shutting_down()),
+        Err(_) => Err(Reject::busy(doing)),
+    }
+}
+
 struct Server {
     root: PathBuf,
     tokens: Verifier,
@@ -941,8 +470,19 @@ struct Server {
     followers: Arc<Semaphore>,
     waits: Waits,
     feeds: Arc<Feeds>,
-    /// GitHub sign-in requests running.
+    /// Sign-in requests running, which anyone may send: device flows, the
+    /// browser's sign-in at a provider, codes redeemed.
     sign_ins: Arc<Semaphore>,
+    /// Refreshes running: of sign-ins, never waiting behind anyone's sign-in.
+    refreshing: Arc<Semaphore>,
+    /// Providers' account notifications being handled.
+    notified: Arc<Semaphore>,
+    /// OAuth client registrations running.
+    registering: Arc<Semaphore>,
+    /// OAuth clients' metadata documents, fetched and kept for a while.
+    documents: cimd::Documents,
+    /// Authorizations under way.
+    flows: Mutex<authorize::Flows>,
     /// Sign-ins completing, and the answers of those that issued tokens.
     issued: Mutex<Issuances>,
     /// Refreshes running, by their refresh token, and the answers of those
@@ -950,6 +490,10 @@ struct Server {
     refreshes: Mutex<Issuances>,
     /// Set when the server shuts down.
     stopping: watch::Sender<bool>,
+    /// `--public-url`, normalized: MCP endpoints name themselves by it.
+    public_url: Option<String>,
+    /// Whether clients connect over TLS, for URLs derived from requests.
+    https: bool,
 }
 
 /// How a request waiting for events ended its wait.
@@ -999,22 +543,30 @@ struct Workspace {
     name: String,
     dir: PathBuf,
     db: PathBuf,
-    pool: Mutex<Vec<Store>>,
+    /// Idle connections, the last given back on top, with when.
+    pool: Mutex<Vec<(Store, Instant)>>,
 }
 
 impl Workspace {
     fn take(&self, open: &OpenOptions) -> Result<Store> {
         match lock(&self.pool).pop() {
-            Some(store) => Ok(store),
+            Some((store, _)) => Ok(store),
             None => Store::open(&self.db, open.clone()),
         }
     }
 
+    /// Give `store` back; connections idle for `POOL_IDLE` (at the bottom,
+    /// as the busiest are taken from the top) are closed, so a burst's
+    /// connections and their caches do not stay.
     fn give(&self, store: Store) {
         let mut pool = lock(&self.pool);
+        let idle = pool.iter().take_while(|(_, at)| at.elapsed() >= POOL_IDLE).count();
+        let closed: Vec<(Store, Instant)> = pool.drain(..idle).collect();
         if pool.len() < MAX_POOLED {
-            pool.push(store);
+            pool.push((store, Instant::now()));
         }
+        drop(pool);
+        drop(closed);
     }
 }
 
@@ -1056,9 +608,14 @@ pub(crate) enum Access {
 pub(crate) fn access(cmd: &Command) -> Access {
     use Command as C;
     match cmd {
-        C::Init(_) | C::Backup(_) | C::Serve(_) | C::Remote(_) | C::Hook(_) | C::Bench(_) | C::BenchWorker(_) => {
-            Access::Local
-        }
+        C::Init(_)
+        | C::Backup(_)
+        | C::Serve(_)
+        | C::Mcp(_)
+        | C::Remote(_)
+        | C::Hook(_)
+        | C::Bench(_)
+        | C::BenchWorker(_) => Access::Local,
         C::Events(a) if a.follow => Access::Local,
         C::Events(a) if a.action.is_none() => Access::Read,
         C::Playbook(PlaybookCommand::Extract(a)) if a.save => Access::Local,
@@ -1097,6 +654,21 @@ pub(crate) fn access(cmd: &Command) -> Access {
         | C::Agents(AgentsCommand::Manifest(_) | AgentsCommand::Fetch(_)) => Access::Read,
         _ => Access::Write,
     }
+}
+
+/// Whether `token` may run `cli`'s command here, and the actor it runs as
+/// (see [`resolve_actor`]).
+fn authorize(cli: &Cli, token: &Token, env: Option<&str>, session: Option<&str>) -> Result<(Access, Resolved)> {
+    let name = crate::command_name(&cli.command);
+    let access = access(&cli.command);
+    if access == Access::Local {
+        return Err(Error::Refused(format!("bd {name} is not available through bd serve")));
+    }
+    if access == Access::Write && token.role == Role::Read {
+        let msg = format!("access token {} is read-only; bd {name} needs a write token", token.name);
+        return Err(Error::Unauthorized(msg));
+    }
+    Ok((access, resolve_actor(cli.global.actor.as_deref(), env, session, token)?))
 }
 
 /// The actor a request runs as: the one it asks for (`--actor`, then the
@@ -1148,29 +720,6 @@ fn resolve_token_actor(
     }
 }
 
-fn parse_failure(e: &clap::Error) -> ExecResponse {
-    let text = e.render().to_string();
-    if e.use_stderr() {
-        ExecResponse { exit_code: e.exit_code(), stderr: text, ..Default::default() }
-    } else {
-        ExecResponse { exit_code: e.exit_code(), stdout: text, ..Default::default() }
-    }
-}
-
-fn failure(e: &Error, json: bool) -> ExecResponse {
-    ExecResponse { exit_code: e.exit_code(), stderr: crate::render_error(e, json, None), ..Default::default() }
-}
-
-/// Answer with a response known before the command runs.
-fn respond(out: &mut FrameWriter, response: &ExecResponse) -> std::result::Result<(), Reject> {
-    out.respond(response);
-    Ok(())
-}
-
-fn lossy(bytes: Vec<u8>) -> String {
-    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
-}
-
 impl Server {
     fn new(root: PathBuf, max_body: usize, waits: Waits) -> Server {
         let budget =
@@ -1190,10 +739,51 @@ impl Server {
             waits,
             feeds: Arc::new(Feeds::new(follow::HEAD_CHECK_EVERY, follow::HEAD_CHECK_GAP)),
             sign_ins: Arc::new(Semaphore::new(MAX_SIGN_INS)),
+            refreshing: Arc::new(Semaphore::new(MAX_SIGN_INS)),
+            notified: Arc::new(Semaphore::new(MAX_NOTIFIED)),
+            registering: Arc::new(Semaphore::new(MAX_REGISTERING)),
+            documents: cimd::Documents::new(),
+            flows: Mutex::default(),
             issued: Mutex::default(),
             refreshes: Mutex::default(),
             stopping: watch::Sender::new(false),
+            public_url: None,
+            https: false,
         }
+    }
+
+    /// The issuer of the server's authorization server, if `auth.toml` turns
+    /// it on (read for each request, as sign-ins do); an error if `auth.toml`
+    /// is not valid or `--public-url` cannot be an issuer.
+    fn issuer(&self) -> std::result::Result<Option<String>, String> {
+        match oauth::load_oauth(&self.root) {
+            Ok(Some(_)) => oauth_server::issuer(self.public_url.as_deref()).map(Some),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Run `f`, a step of an authorization, with what it needs of the server.
+    fn authorizing<T>(&self, issuer: &str, f: impl FnOnce(&authorize::Ctx<'_>) -> T) -> T {
+        let exists = |name: &str| self.workspace(name).is_some();
+        f(&authorize::Ctx {
+            root: &self.root,
+            issuer,
+            documents: &self.documents,
+            flows: &self.flows,
+            workspace_exists: &exists,
+        })
+    }
+
+    /// The server's URL as clients reach it: `--public-url`, else derived
+    /// from the request (`Host`, the path prefix before `/w/`).
+    fn base_url(&self, headers: &HeaderMap, uri: &hyper::Uri, prefix: &str) -> Option<String> {
+        if let Some(url) = &self.public_url {
+            return Some(url.clone());
+        }
+        let host =
+            headers.get(header::HOST).and_then(|h| h.to_str().ok()).or_else(|| uri.authority().map(|a| a.as_str()));
+        mcp_http::request_base(self.https, host, prefix)
     }
 
     /// The workspace `<root>/<name>/.bd/bd.db`, if it exists.
@@ -1201,10 +791,10 @@ impl Server {
         if !valid_workspace_name(name) {
             return None;
         }
-        let mut map = lock(&self.workspaces);
-        if let Some(ws) = map.get(name) {
+        if let Some(ws) = lock(&self.workspaces).get(name) {
             return Some(ws.clone());
         }
+        // The files are looked at without holding the map: other requests' workspaces are found meanwhile.
         let dir = self.root.join(name);
         let db = dir.join(".bd").join("bd.db");
         if !db.is_file() {
@@ -1217,8 +807,7 @@ impl Server {
             return None;
         }
         let ws = Arc::new(Workspace { name: name.to_string(), dir, db, pool: Mutex::default() });
-        map.insert(name.to_string(), ws.clone());
-        Some(ws)
+        Some(lock(&self.workspaces).entry(name.to_string()).or_insert(ws).clone())
     }
 
     /// Hold a request `events --since N --wait D` until an event matching its
@@ -1242,11 +831,7 @@ impl Server {
             if *stopping.borrow() {
                 return Err(Reject::shutting_down());
             }
-            let slot = match tokio::time::timeout(QUEUE_WAIT, self.running.clone().acquire_owned()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => return Err(Reject::shutting_down()),
-                Err(_) => return Err(Reject::busy("running other commands")),
-            };
+            let slot = queue(&self.running, 1, "running other commands").await?;
             let (srv, ws2, args2) = (self.clone(), ws.clone(), args.clone());
             let probed = tokio::task::spawn_blocking(move || {
                 let _slot = slot;
@@ -1315,22 +900,7 @@ impl Server {
         }
         let json = cli.global.json;
         let name = crate::command_name(&cli.command);
-        let access = access(&cli.command);
-        if access == Access::Local {
-            let e = Error::Refused(format!("bd {name} is not available through bd serve"));
-            return respond(&mut out, &failure(&e, json));
-        }
-        if access == Access::Write && token.role == Role::Read {
-            let e =
-                Error::Unauthorized(format!("access token {} is read-only; bd {name} needs a write token", token.name));
-            return respond(&mut out, &failure(&e, json));
-        }
-        let resolved = match resolve_actor(
-            cli.global.actor.as_deref(),
-            request.actor.as_deref(),
-            request.session.as_deref(),
-            token,
-        ) {
+        let (access, resolved) = match authorize(&cli, token, request.actor.as_deref(), request.session.as_deref()) {
             Ok(a) => a,
             Err(e) => return respond(&mut out, &failure(&e, json)),
         };
@@ -1353,24 +923,15 @@ impl Server {
             out.hold(REPLAY_LIMIT);
         }
 
-        let store = ws.take(&self.open).map_err(Reject::internal)?;
-        let read_only = token.role == Role::Read;
-        if read_only {
-            // Belt and braces: read tokens cannot write even through a misclassified command.
-            store.connection().pragma_update(None, "query_only", true).map_err(|e| Reject::internal(e.into()))?;
-        }
-        // The pooled store brings the server's own options (busy timeout, durability).
-        let mut g = cli.global.clone();
-        g.db = Some(ws.db.clone());
-        g.directory = Some(ws.dir.clone());
-        g.remote = None;
-        let mut app = App::new(g).map_err(Reject::internal)?;
-        app.set_actor(resolved);
-        app.set_store(store);
+        let mut app = self.open_app(ws, token, &cli.global, resolved).map_err(Reject::internal)?;
         app.location = request.location;
         app.request = key;
         // What the token may override: admin-only commands, other actors' claims, human gates.
-        let policy = token.policy();
+        let mut policy = token.policy();
+        if request.tool_call {
+            policy.admin = false;
+            policy.human = false;
+        }
         // Output streams to the client as the command writes it.
         let out = Rc::new(RefCell::new(out));
         let capture = Capture {
@@ -1389,11 +950,7 @@ impl Server {
             self.feeds.committed(&ws.name);
         }
         let recorded = app.request.as_ref().filter(|k| k.recorded).map(|k| k.id.clone());
-        if let Some(store) = app.take_store()
-            && (!read_only || store.connection().pragma_update(None, "query_only", false).is_ok())
-        {
-            ws.give(store);
-        }
+        self.close_app(ws, token, &mut app);
         let sent = out.borrow_mut().finish(Exit { exit_code, stderr: lossy(captured.stderr), replayed: false });
         let sent = match sent.held {
             // A write's answer is stored before it is sent, and the request
@@ -1437,6 +994,34 @@ impl Server {
             tracing::debug!(target: "bd::serve", workspace = %ws.name, bytes = sent.bytes, peak = sent.peak, "streamed");
         }
         Ok(())
+    }
+
+    /// An app for a command of `token` in `ws`, acting as `actor`, with a
+    /// pooled store: read-only for a read token.
+    fn open_app(&self, ws: &Workspace, token: &Token, global: &Global, actor: Resolved) -> Result<App> {
+        let store = ws.take(&self.open)?;
+        if token.role == Role::Read {
+            // Belt and braces: read tokens cannot write even through a misclassified command.
+            store.connection().pragma_update(None, "query_only", true)?;
+        }
+        // The pooled store brings the server's own options (busy timeout, durability).
+        let mut g = global.clone();
+        g.db = Some(ws.db.clone());
+        g.directory = Some(ws.dir.clone());
+        g.remote = None;
+        let mut app = App::new(g)?;
+        app.set_actor(actor);
+        app.set_store(store);
+        Ok(app)
+    }
+
+    /// Give the store of an app from [`Server::open_app`] back to the pool.
+    fn close_app(&self, ws: &Workspace, token: &Token, app: &mut App) {
+        if let Some(store) = app.take_store()
+            && (token.role != Role::Read || store.connection().pragma_update(None, "query_only", false).is_ok())
+        {
+            ws.give(store);
+        }
     }
 
     fn start_request(&self, ws: &Workspace, id: &str) -> std::result::Result<InFlight<'_>, Reject> {
@@ -1500,6 +1085,58 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_address_holds_its_share_of_connections_and_loopback_is_not_counted() {
+        let peers: Arc<Mutex<HashMap<std::net::IpAddr, usize>>> = Arc::default();
+        let far: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let mapped: std::net::IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let mut held: Vec<PeerSlot> =
+            (0..MAX_CONNECTIONS_PER_PEER).map(|_| PeerSlot::take(&peers, far).unwrap()).collect();
+        assert!(PeerSlot::take(&peers, far).is_none(), "its share is taken");
+        assert!(PeerSlot::take(&peers, mapped).is_none(), "the same address, written as IPv6");
+        assert!(PeerSlot::take(&peers, "203.0.113.8".parse().unwrap()).is_some(), "another's are not");
+        let local: Vec<PeerSlot> =
+            (0..MAX_CONNECTIONS).map(|_| PeerSlot::take(&peers, "127.0.0.1".parse().unwrap()).unwrap()).collect();
+        assert_eq!(local.len(), MAX_CONNECTIONS, "a proxy on this machine is everyone");
+        held.pop();
+        assert!(PeerSlot::take(&peers, far).is_some(), "given back when a connection ends");
+        drop(held);
+        assert_eq!(lock(&peers).get(&far.to_canonical()), None, "all given back: forgotten");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secret_files_open_to_others_are_told() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret");
+        std::fs::write(&file, "s").unwrap();
+        for (mode, told) in
+            [(0o600, None), (0o400, None), (0o640, Some(0o640)), (0o604, Some(0o604)), (0o620, Some(0o620))]
+        {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(open_to_others(&file), told, "{mode:o}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for (mode, told) in [(0o700, None), (0o500, None), (0o750, Some(0o750)), (0o701, Some(0o701))] {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(dir_open_to_others(dir.path()), told, "{mode:o}");
+        }
+        assert_eq!(open_to_others(&dir.path().join("missing")), None);
+    }
+
+    #[test]
+    fn an_authorization_page_is_never_sent_without_its_policy() {
+        let mut page = pages::refusal(403, "t", "w", None);
+        page.csp.push('\n');
+        let r = html_page(page);
+        assert_eq!(r.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let csp = r.headers().get(header::CONTENT_SECURITY_POLICY).unwrap().to_str().unwrap();
+        assert!(csp.starts_with("default-src 'none';"), "{csp}");
+        let r = html_page(pages::refusal(403, "t", "w", None));
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
     fn exec_paths() {
         assert_eq!(exec_path("/w/bd-sync/v2/exec"), Some("bd-sync"));
         assert_eq!(exec_path("/bd/w/proj/v2/exec"), Some("proj"), "under an unstripped proxy prefix");
@@ -1512,10 +1149,57 @@ mod tests {
     }
 
     #[test]
+    fn oauth_endpoints_are_served_under_the_public_path_or_stripped_only() {
+        let mut server = Server::new(PathBuf::from("."), 1, Waits::default());
+        for public in [None, Some("https://bd.example.com")] {
+            server.public_url = public.map(String::from);
+            assert_eq!(oauth_endpoint(&server, "/oauth/token"), Some(oauth_server::TOKEN), "{public:?}");
+            assert_eq!(oauth_endpoint(&server, "/bd/oauth/token"), None, "{public:?}");
+        }
+        server.public_url = Some("https://bd.example.com/bd".into());
+        assert_eq!(oauth_endpoint(&server, "/bd/oauth/register"), Some(oauth_server::REGISTER));
+        assert_eq!(oauth_endpoint(&server, "/oauth/github/callback"), Some(oauth_server::CALLBACK), "stripped");
+        for elsewhere in ["/bd/x/oauth/token", "/bdx/oauth/token", "/bd/bd/oauth/token", "/w/proj/oauth/authorize"] {
+            assert_eq!(oauth_endpoint(&server, elsewhere), None, "{elsewhere}");
+        }
+        assert_eq!(oauth_endpoint(&server, "/bd/oauth/token/"), None);
+    }
+
+    #[test]
+    fn mcp_paths_and_sessions() {
+        assert_eq!(mcp_path("/w/proj/mcp"), Some(("", "proj")));
+        assert_eq!(mcp_path("/bd/w/proj/mcp"), Some(("/bd", "proj")), "under an unstripped proxy prefix");
+        for bad in ["/w//mcp", "/w/a/b/mcp", "/mcp", "/w/proj/mcp/", "/w/proj/v2/exec", "/w/a\"b/mcp", "/w/-x/mcp"] {
+            assert_eq!(mcp_path(bad), None, "{bad}");
+        }
+        assert_eq!(exec_path("/w/proj/mcp"), None);
+        assert_eq!(mcp_session(None).unwrap(), "mcp");
+        assert_eq!(mcp_session(Some("x=1&session=w-2")).unwrap(), "w-2");
+        for bad in ["session=", "session=a/b", "session=a%20b"] {
+            assert!(mcp_session(Some(bad)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn sign_in_paths() {
-        assert_eq!(sign_in_path("/v2/auth/github/device"), Some(SignIn::Device));
-        assert_eq!(sign_in_path("/bd/v2/auth/github/token"), Some(SignIn::Token), "under a proxy prefix");
-        for bad in ["/v2/auth/github/", "/v2/auth/github/device/", "/v1/auth/github/token", "/v2/auth/gitlab/token"] {
+        assert_eq!(sign_in_path("/v2/auth/github/device"), Some(("github".into(), SignInStep::Device)));
+        assert_eq!(
+            sign_in_path("/bd/v2/auth/github/token"),
+            Some(("github".into(), SignInStep::Token)),
+            "under a proxy prefix"
+        );
+        assert_eq!(
+            sign_in_path("/v2/auth/acme-sso/token"),
+            Some(("acme-sso".into(), SignInStep::Token)),
+            "any provider"
+        );
+        for bad in [
+            "/v2/auth/github/",
+            "/v2/auth/github/device/",
+            "/v1/auth/github/token",
+            "/v2/auth/Acme/token",
+            "/v2/auth/refresh",
+        ] {
             assert_eq!(sign_in_path(bad), None, "{bad}");
         }
         assert_eq!(exec_path("/v2/auth/github/token"), None);
@@ -1593,9 +1277,11 @@ mod tests {
             created_at: String::new(),
             revoked_at: None,
             expires_at: None,
-            github: None,
+            identity: None,
             max_claims: None,
             refresh: None,
+            resource: None,
+            client: None,
         };
         let actor = |flag, env, session| resolve_actor(flag, env, session, &t).map(|r| (r.actor, r.source));
         let code = |flag, env, session| resolve_actor(flag, env, session, &t).unwrap_err().exit_code();

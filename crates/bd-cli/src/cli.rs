@@ -172,6 +172,8 @@ pub enum Command {
     BenchWorker(BenchWorkerArgs),
     /// Serve workspaces to remote bd clients over HTTPS; `bd serve token` manages access
     Serve(ServeArgs),
+    /// Serve this workspace to an AI assistant as MCP tools over stdio (local or remote workspace)
+    Mcp(McpArgs),
     /// Use a workspace on a bd server from this checkout: set, show (with a connection check), unset, login, logout
     #[command(subcommand)]
     Remote(RemoteCommand),
@@ -407,9 +409,6 @@ pub struct UpdateArgs {
     /// event; through bd serve, an admin token unless the token's actor owns the claim)
     #[arg(long)]
     pub take_over: bool,
-    /// No longer accepted: --force never takes over a claim (use --take-over)
-    #[arg(long, hide = true)]
-    pub force: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -543,9 +542,6 @@ pub struct ReleaseArgs {
     /// unless the token's actor owns the claim)
     #[arg(long)]
     pub take_over: bool,
-    /// No longer accepted: --force never takes over a claim (use --take-over)
-    #[arg(long, hide = true)]
-    pub force: bool,
     /// Release only if still held by this actor (compare-and-swap); another actor's live claim also needs --take-over
     #[arg(long, value_name = "ACTOR")]
     pub if_assignee: Option<String>,
@@ -1267,12 +1263,19 @@ pub struct BenchWorkerArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct McpArgs {
+    /// Offer only the tools that read (ready, list, show, memories)
+    #[arg(long)]
+    pub read_only: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 #[command(args_conflicts_with_subcommands = true)]
 pub struct ServeArgs {
     #[command(subcommand)]
     pub action: Option<ServeAction>,
-    /// Directory of workspaces: <root>/<name>/.bd/bd.db is served at /w/<name>; tokens in <root>/tokens.json,
-    /// GitHub sign-in set up in <root>/auth.toml
+    /// Directory of workspaces: <root>/<name>/.bd/bd.db is served at /w/<name>; tokens in <root>/server.db,
+    /// sign-in (GitHub, OIDC providers) set up in <root>/auth.toml
     #[arg(long, env = "BD_SERVE_ROOT", value_name = "DIR")]
     pub root: Option<PathBuf>,
     /// Address and port to listen on
@@ -1318,6 +1321,10 @@ pub struct ServeArgs {
     /// The longest a request waits for new events: keep it below the idle timeout of proxies in front
     #[arg(long, default_value = "25s", value_name = "DURATION")]
     pub max_wait: String,
+    /// The URL clients reach the server at, path prefix included (https://bd.example.com/bd): MCP endpoints name
+    /// themselves by it. Default: the request's Host, its path prefix, and https with --tls-cert
+    #[arg(long, env = "BD_SERVE_PUBLIC_URL", value_name = "URL")]
+    pub public_url: Option<String>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1325,24 +1332,88 @@ pub enum ServeAction {
     /// Manage access tokens (run on the server host)
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Check <root>/auth.toml and its secret files as a running server would read them, and print what to register
+    /// at providers and clients (callback URLs, endpoints); exits 2 on a mistake
+    Check(ServeCheckArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ServeCheckArgs {
+    /// The URL clients reach the server at (as bd serve --public-url): the URLs to register are under it
+    #[arg(long, env = "BD_SERVE_PUBLIC_URL", value_name = "URL")]
+    pub public_url: Option<String>,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
 }
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum TokenCommand {
     /// Create an access token and print its secret once
     Create(TokenCreateArgs),
-    /// List access tokens (never their secrets), including those GitHub sign-in issued
+    /// List access tokens (never their secrets), including those issued by signing in
     #[command(alias = "ls")]
     List(TokenRootArgs),
-    /// List the GitHub accounts that signed in, and the actor each is bound to
+    /// List the accounts that signed in (with any provider), and the actor each is bound to
     Accounts(TokenRootArgs),
-    /// Revoke an access token, or every token a GitHub user got by signing in; it stops working at once
+    /// Revoke an access token, or every token an account got by signing in; it stops working at once
     Revoke(TokenRevokeArgs),
+    /// The audit trail of sign-ins, tokens created, refreshed and revoked, accounts forgotten and clients
+    /// registered (kept 90 days)
+    Events(TokenEventsArgs),
+    /// Bind an account to the actor of another account (one person signing in with several providers); the
+    /// account's tokens are revoked, and its next sign-in acts as that actor
+    Link(TokenLinkArgs),
+    /// Name an account for admins (its actor may be a pseudonym such as apple:u-3f9a2c1e7b04)
+    Name(TokenNameArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TokenNameArgs {
+    /// The account: its actor, or its login
+    pub account: String,
+    /// What to call it (plain text, up to 64 characters)
+    #[arg(required_unless_present = "clear")]
+    pub name: Option<String>,
+    /// Remove its name instead
+    #[arg(long, conflicts_with = "name")]
+    pub clear: bool,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TokenLinkArgs {
+    /// The account to bind: its actor, or its login
+    pub account: String,
+    /// The actor of the account it joins, e.g. github:alice
+    #[arg(long, value_name = "ACTOR")]
+    pub to: String,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TokenEventsArgs {
+    /// Only events this recent (e.g. 1h, 7d; default all kept)
+    #[arg(long, value_name = "DURATION")]
+    pub since: Option<String>,
+    /// Only this actor's, and its sub-actors'
+    #[arg(long, visible_alias = "by", value_name = "ACTOR")]
+    pub actor: Option<String>,
+    /// Only these kinds (signed_in, token_created, refreshed, revoked, forgotten, client_registered, linked,
+    /// named; repeatable or comma separated)
+    #[arg(long = "kind", value_name = "KIND", value_delimiter = ',')]
+    pub kinds: Vec<String>,
+    /// At most this many, the latest
+    #[arg(short = 'n', long, default_value_t = 100)]
+    pub limit: usize,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct TokenRootArgs {
-    /// Server root holding tokens.json
+    /// Server root holding server.db (the access tokens)
     #[arg(long, env = "BD_SERVE_ROOT", value_name = "DIR")]
     pub root: PathBuf,
 }
@@ -1365,6 +1436,10 @@ pub struct TokenCreateArgs {
     /// The most issues its actor and its agents may hold, claimed or reserved (default no limit)
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     pub max_claims: Option<u32>,
+    /// Bind the token to one workspace's MCP endpoint, as clients reach it (https://<host>[/<prefix>]/w/<name>/mcp):
+    /// refused anywhere else, CLI requests included
+    #[arg(long, value_name = "URL")]
+    pub resource: Option<String>,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }
@@ -1372,16 +1447,20 @@ pub struct TokenCreateArgs {
 #[derive(Args, Debug, Clone)]
 pub struct TokenRevokeArgs {
     /// The token's name
-    #[arg(required_unless_present = "github")]
+    #[arg(required_unless_present_any = ["account", "client"])]
     pub name: Option<String>,
-    /// Revoke every token this GitHub user (a login, or the actor an account is bound to) got by signing in,
-    /// instead of a named one
+    /// Revoke every token this account (a login, or the actor it is bound to) got by signing in, with any
+    /// provider, instead of a named one
     #[arg(long, value_name = "LOGIN", conflicts_with = "name")]
-    pub github: Option<String>,
-    /// With --github: also release the account's actor, which another account (or the same one, under its
+    pub account: Option<String>,
+    /// With --account: also release the account's actor, which another account (or the same one, under its
     /// login then) gets at its next sign-in
-    #[arg(long, requires = "github", conflicts_with = "name")]
+    #[arg(long, requires = "account", conflicts_with = "name")]
     pub forget: bool,
+    /// Revoke every token issued to this OAuth client (its client ID, as `bd serve token list` shows it), instead
+    /// of a named one
+    #[arg(long, value_name = "CLIENT_ID", conflicts_with_all = ["name", "account"])]
+    pub client: Option<String>,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }
@@ -1422,12 +1501,12 @@ pub enum RemoteCommand {
     Unset,
     /// Save an access token for a bd server in the user config directory, so BD_TOKEN is not needed
     ///
-    /// With --github, sign in with GitHub instead: the one-time code shown is entered at GitHub
-    /// (github.com/login/device), and the server issues a token if its auth.toml lets the GitHub account in.
+    /// With --provider, sign in instead: the one-time code shown is entered at the provider
+    /// (github.com/login/device for GitHub), and the server issues a token if it lets the account in.
     /// Otherwise the token is read from stdin when it is piped (`printf %s "$TOKEN" | bd remote login`), else
     /// from a prompt that does not echo it; never from the command line. It is checked against the server first.
     Login(RemoteLoginArgs),
-    /// Forget access tokens saved by `bd remote login`, revoking those from GitHub sign-in on their server
+    /// Forget access tokens saved by `bd remote login`, revoking those from signing in on their server
     Logout(RemoteLogoutArgs),
 }
 
@@ -1435,9 +1514,10 @@ pub enum RemoteCommand {
 pub struct RemoteLoginArgs {
     /// Workspace URL, e.g. https://bd.example.com/w/proj (default: this checkout's remote workspace)
     pub url: Option<String>,
-    /// Sign in with GitHub to get a token from the server, instead of entering one
-    #[arg(long, conflicts_with = "no_verify")]
-    pub github: bool,
+    /// Sign in with this provider of the server's (`github`, or the name of one of its OIDC providers) to get a
+    /// token, instead of entering one: a one-time code is shown, to enter at the provider
+    #[arg(long, value_name = "NAME", conflicts_with = "no_verify")]
+    pub provider: Option<String>,
     /// Save the token for this workspace only, instead of for every workspace on its server
     #[arg(long)]
     pub workspace_only: bool,

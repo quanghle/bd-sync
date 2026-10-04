@@ -14,7 +14,7 @@ global options, environment variables, configuration keys and exit codes.
 | Ready work and claims | `ready`, `claim` (`--next`), `heartbeat`, `release`, `reclaim`, `leases` | [Ready-work order](concepts.md#ready-work-order), [Claims](concepts.md#claims-leases-and-recovery) |
 | Comments and memory | `comment add`, `comments`, `memory`, `remember`, `recall`, `memories`, `forget` | [Comments and memory](concepts.md#comments-and-memory) |
 | Events | `events` (`--follow`, `--wait`, `prune`), `history` | [Event history](concepts.md#event-history) |
-| Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `agents status/pull/approve/watch/manifest` | [Actors](concepts.md#actors), [Agent skills](agents.md) |
+| Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `agents status/pull/approve/watch/manifest`, `mcp` (MCP tools over stdio) | [Actors](concepts.md#actors), [Agent skills](agents.md), [MCP server](mcp.md) |
 | Playbooks and gates | `playbook list/show/plan/run/status/runs/compact/discard/extract`, `gate list/show/check/resolve/create`, `purge` | [Playbooks](playbooks.md) |
 | Data | `export`, `import` (bd or beads JSONL, all or nothing), `batch` (many writes in one transaction, `--dry-run` rolls back), `backup --to DIR` (a verified copy of a local workspace's database; the newest `--keep` are kept) | [Migrating](beads.md#migrating-from-go-beads), [Backups](modes.md#backing-up-a-local-workspace) |
 | Operations | `metrics`, `bench` | [Observability](observability.md), [Benchmarks](benchmarks.md) |
@@ -74,9 +74,9 @@ Besides the variables of the global options:
 | 2 | invalid input (including `--force` on `update`/`release`: use `--take-over`), cycle, or policy refusal |
 | 3 | not found or no workspace |
 | 4 | claim conflict: already claimed (a live claim, even your own actor's, without its `--token`), not ready, not the holder of a live claim (`--take-over` takes it over; `--force` does not), or lease lost |
-| 5 | busy: the database write lock or a checkout's agent assets mutex (`.bd/agents.lock.mutex`) stayed held past `--busy-timeout-ms`, or another bd process kept the access tokens (`tokens.lock`) or saved credentials (`credentials.lock`) locked; retry |
+| 5 | busy: the database write lock or a checkout's agent assets mutex (`.bd/agents.lock.mutex`) stayed held past `--busy-timeout-ms`, another bd process kept `bd serve`'s `server.db` busy, or saved credentials (`credentials.lock`) locked; retry |
 | 6 | event cursor truncated |
-| 7 | access denied: missing, invalid or expired token, or its role, kind, workspaces or actor do not allow it; or a GitHub sign-in that was refused |
+| 7 | access denied: missing, invalid or expired token, or its role, kind, workspaces or actor do not allow it; or a sign-in that was refused |
 | 8 | bd server unreachable, its certificate not trusted, or a server failure: the command did not take effect (retrying is safe) |
 | 9 | a write reached the bd server, but its answer was lost: it may have taken effect, so check before running it again |
 | 13 | stale optimistic-concurrency guard |

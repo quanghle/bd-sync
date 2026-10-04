@@ -57,6 +57,20 @@ CREATE TABLE oauth_clients (
     client_id TEXT NOT NULL UNIQUE,
     data TEXT NOT NULL
 );
+CREATE TABLE auth_events (
+    seq INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT,
+    provider TEXT,
+    issuer TEXT,
+    subject TEXT,
+    token TEXT,
+    client TEXT,
+    detail TEXT
+);
+CREATE INDEX auth_events_at ON auth_events (at);
+CREATE INDEX auth_events_account ON auth_events (issuer, subject) WHERE subject IS NOT NULL;
 ";
 
 pub fn path(root: &Path) -> PathBuf {
@@ -186,6 +200,158 @@ pub fn failed(path: &Path, e: rusqlite::Error) -> Error {
         other => other,
     }
 }
+
+/// Write a consistent, compacted copy of `<root>/server.db` to `dest`, which
+/// must not exist, as workspaces' backups are written (`Store::snapshot`):
+/// created 0600 first, `VACUUM INTO` in a read transaction, checked and
+/// flushed; removed if anything failed.
+pub fn snapshot(root: &Path, dest: &Path) -> Result<()> {
+    let Some(conn) = open_existing(root)? else {
+        return Err(Error::invalid(format!("{} does not exist", path(root).display())));
+    };
+    let target = dest.to_str().ok_or_else(|| Error::invalid(format!("{}: not a UTF-8 path", dest.display())))?;
+    let mut create = std::fs::OpenOptions::new();
+    create.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut create, 0o600);
+    create.open(dest).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => Error::invalid(format!("{} already exists", dest.display())),
+        _ => Error::Io(e),
+    })?;
+    let written = conn.execute("VACUUM INTO ?1", [target]).map_err(|e| failed(&path(root), e)).and_then(|_| {
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let copy = Connection::open_with_flags(dest, flags).map_err(|e| failed(dest, e))?;
+        let check: String = copy.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(|e| failed(dest, e))?;
+        if check != "ok" {
+            return Err(Error::Io(std::io::Error::other(format!("{}: the copy is damaged: {check}", dest.display()))));
+        }
+        std::fs::File::open(dest)?.sync_all()?;
+        Ok(())
+    });
+    if written.is_err() {
+        let _ = std::fs::remove_file(dest);
+    }
+    written
+}
+
+/// How long the audit trail keeps an event.
+pub const EVENTS_KEPT: Duration = Duration::from_secs(90 * 24 * 3600);
+
+/// A change of who may call the server, for its audit trail
+/// (`auth_events`): what happened, to which account and token, and why.
+/// Never a secret or an email: an actor, a provider's subject, names.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct AuthEvent {
+    /// `signed_in`, `token_created`, `refreshed`, `revoked`, `forgotten`,
+    /// `client_registered`, `linked`, `named`.
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// The token's name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The OAuth client's ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// Why, or how.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Record `event`, as of now, in the transaction of the change it is of.
+pub fn record(tx: &rusqlite::Transaction, event: &AuthEvent) -> Result<()> {
+    tx.execute(
+        "INSERT INTO auth_events (at, kind, actor, provider, issuer, subject, token, client, detail) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            Timestamp::now().millis(),
+            event.kind,
+            event.actor,
+            event.provider,
+            event.issuer,
+            event.subject,
+            event.token,
+            event.client,
+            event.detail
+        ],
+    )?;
+    Ok(())
+}
+
+/// Delete the events older than [`EVENTS_KEPT`].
+pub fn prune_events(tx: &rusqlite::Transaction) -> Result<()> {
+    let kept = i64::try_from(EVENTS_KEPT.as_millis()).unwrap_or(i64::MAX);
+    tx.execute("DELETE FROM auth_events WHERE at < ?1", [Timestamp::now().millis() - kept])?;
+    Ok(())
+}
+
+/// Delete the events of the account with this issuer and subject (it is
+/// being forgotten).
+pub fn erase_events(tx: &rusqlite::Transaction, issuer: &str, subject: &str) -> Result<()> {
+    tx.execute("DELETE FROM auth_events WHERE issuer = ?1 AND subject = ?2", [issuer, subject])?;
+    Ok(())
+}
+
+/// An event as kept: when, and what.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct KeptEvent {
+    pub at: Timestamp,
+    #[serde(flatten)]
+    pub event: AuthEvent,
+}
+
+/// The latest `limit` events since `since` (milliseconds), of `actor` or its sub-actors if given, oldest first.
+pub fn events(root: &Path, since: i64, actor: Option<&str>, limit: usize) -> Result<Vec<KeptEvent>> {
+    let Some(conn) = open_existing(root)? else { return Ok(Vec::new()) };
+    let mut stmt = conn.prepare(
+        "SELECT at, kind, actor, provider, issuer, subject, token, client, detail FROM auth_events \
+         WHERE at >= ?1 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map([since], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, String>(1)?,
+            AuthEvent {
+                kind: "",
+                actor: r.get(2)?,
+                provider: r.get(3)?,
+                issuer: r.get(4)?,
+                subject: r.get(5)?,
+                token: r.get(6)?,
+                client: r.get(7)?,
+                detail: r.get(8)?,
+            },
+        ))
+    })?;
+    let wanted = actor.map(key);
+    let related = |a: &str| {
+        wanted.as_deref().is_none_or(|w| {
+            let a = key(a);
+            a == w || a.strip_prefix(w).is_some_and(|r| r.starts_with('/'))
+        })
+    };
+    let mut out = Vec::new();
+    for row in rows {
+        let (at, kind, mut event) = row?;
+        if !related(event.actor.as_deref().unwrap_or_default()) {
+            continue;
+        }
+        event.kind = KINDS.iter().copied().find(|k| *k == kind).unwrap_or("other");
+        out.push(KeptEvent { at: Timestamp::from_millis(at), event });
+    }
+    let skip = out.len().saturating_sub(limit);
+    Ok(out.split_off(skip))
+}
+
+/// The kinds of [`AuthEvent`].
+const KINDS: &[&str] =
+    &["signed_in", "token_created", "refreshed", "revoked", "forgotten", "client_registered", "linked", "named"];
 
 /// How actors and logins are compared: regardless of case.
 pub fn key(name: &str) -> String {

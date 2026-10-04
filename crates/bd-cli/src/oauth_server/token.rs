@@ -50,6 +50,12 @@ fn invalid_grant(description: &'static str) -> Refusal {
     refusal(400, "invalid_grant", description)
 }
 
+/// The answer to a refresh token no sign-in has: given before anything is
+/// spent on it.
+pub fn unknown_refresh() -> Refusal {
+    invalid_grant("the refresh token is unknown, or its sign-in ended")
+}
+
 fn server_error(e: &Error, doing: &str) -> Refusal {
     tracing::error!(target: "bd::serve", error = %e, "{doing}");
     refusal(500, "server_error", "the server could not answer; see its log")
@@ -142,7 +148,7 @@ fn same_resource(resource: Option<&str>, bound: Option<&str>) -> Result<(), Refu
 
 /// Revoke the token `id` as `why` says, logging a failure.
 fn revoke(root: &Path, id: &str, why: &str) {
-    match auth::revoke_by_id(root, id) {
+    match auth::revoke_by_id(root, id, why) {
         Ok(_) => tracing::warn!(target: "bd::serve", token = id, "OAuth token revoked: {why}"),
         Err(e) => tracing::error!(target: "bd::serve", token = id, error = %e, "revoking an OAuth token ({why})"),
     }
@@ -162,7 +168,7 @@ pub fn redeem(root: &Path, flows: &Mutex<Flows>, request: Request) -> Result<Val
     let Request::Code { code: secret, verifier, client_id, redirect_uri, resource } = request else {
         return Err(invalid_request("not an authorization code request"));
     };
-    let redeemed = authorize::lock(flows).redeem(&secret);
+    let redeemed = authorize::lock(flows).redeem(&secret, &client_id, &verifier);
     let code = match redeemed {
         Redeemed::Fresh(code) => code,
         Redeemed::Again(token) => {
@@ -198,7 +204,8 @@ pub fn redeem(root: &Path, flows: &Mutex<Flows>, request: Request) -> Result<Val
         return Err(invalid_grant("this server no longer signs people in with that provider"));
     }
     let client = ForClient { id: &code.client_id, resource: &code.resource };
-    let life = github.lifetime(Timestamp::now(), &admitted.user.provider);
+    let life =
+        auth::Lifetime { rule: admitted.rule.clone(), ..github.lifetime(Timestamp::now(), &admitted.user.provider) };
     let issued = match auth::issue_client_token(
         root,
         &admitted.user,
@@ -299,7 +306,7 @@ pub fn revoke_named(root: &Path, body: &str) -> Result<(), Refusal> {
     if client_id.as_ref().is_some_and(|id| id != client) {
         return Ok(());
     }
-    match auth::revoke_by_id(root, &token.id) {
+    match auth::revoke_by_id(root, &token.id, "its OAuth client revoked it") {
         Ok(_) => {
             tracing::info!(target: "bd::serve", %client, token = %token.name, actor = %token.actor, "OAuth token revoked by its client");
             Ok(())

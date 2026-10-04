@@ -1,5 +1,5 @@
 //! `bd serve`'s OAuth authorization server for MCP clients, which `[oauth]`
-//! in `auth.toml` turns on (`oauth.rs`): its metadata (RFC 8414) and
+//! in `auth.toml` turns on (`oauth/`): its metadata (RFC 8414) and
 //! endpoints. Its issuer is the server's `--public-url`, the very string
 //! clients compare with the metadata's `issuer` and with the `iss` of
 //! authorization responses (RFC 9207), and the protected resource metadata
@@ -77,13 +77,13 @@ pub fn metadata_path(issuer: &str) -> String {
 
 /// The authorization server metadata of `issuer`: authorization code with
 /// PKCE (S256) for public clients, identified by a client ID metadata
-/// document or registered (RFC 7591), with rotating refresh tokens.
-pub fn metadata(issuer: &str) -> Value {
-    json!({
+/// document or, with `registration`, registered (RFC 7591), with rotating
+/// refresh tokens.
+pub fn metadata(issuer: &str, registration: bool) -> Value {
+    let mut metadata = json!({
         "issuer": issuer,
         "authorization_endpoint": format!("{issuer}{AUTHORIZE}"),
         "token_endpoint": format!("{issuer}{TOKEN}"),
-        "registration_endpoint": format!("{issuer}{REGISTER}"),
         "revocation_endpoint": format!("{issuer}{REVOKE}"),
         "response_types_supported": ["code"],
         "response_modes_supported": ["query"],
@@ -93,7 +93,12 @@ pub fn metadata(issuer: &str) -> Value {
         "revocation_endpoint_auth_methods_supported": ["none"],
         "client_id_metadata_document_supported": true,
         "authorization_response_iss_parameter_supported": true,
-    })
+    });
+    // Only where `[oauth]` lets clients register: otherwise they come with a metadata document.
+    if registration {
+        metadata["registration_endpoint"] = format!("{issuer}{REGISTER}").into();
+    }
+    metadata
 }
 
 #[cfg(test)]
@@ -114,7 +119,9 @@ mod tests {
         assert_eq!(metadata_path("https://bd.example.com"), "/.well-known/oauth-authorization-server");
         assert_eq!(metadata_path("https://example.com/bd"), "/.well-known/oauth-authorization-server/bd");
         assert_eq!(metadata_path("http://127.0.0.1:7420/a/b"), "/.well-known/oauth-authorization-server/a/b");
-        let m = metadata("https://example.com/bd");
+        assert!(metadata("https://example.com/bd", false).get("registration_endpoint").is_none(), "registration off");
+        let m = metadata("https://example.com/bd", true);
+        assert_eq!(m["registration_endpoint"], "https://example.com/bd/oauth/register");
         assert_eq!(m["issuer"], "https://example.com/bd");
         assert_eq!(m["authorization_endpoint"], "https://example.com/bd/oauth/authorize");
         assert_eq!(m["token_endpoint"], "https://example.com/bd/oauth/token");

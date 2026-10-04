@@ -185,7 +185,12 @@ pub struct Workspace {
     pub db: PathBuf,
 }
 
-/// The workspaces `bd serve` serves from `root`: `<root>/<name>/.bd/bd.db`.
+/// What stands for `<root>/server.db` among the workspaces: only backed up.
+/// No workspace has this name (theirs start with a letter or digit).
+pub const SERVER: &str = "_server";
+
+/// The workspaces `bd serve` serves from `root`: `<root>/<name>/.bd/bd.db`;
+/// and `<root>/server.db` (as [`SERVER`]), which only backups touch.
 fn discover(root: &Path) -> std::io::Result<Vec<Workspace>> {
     let mut found: Vec<Workspace> = std::fs::read_dir(root)?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
@@ -197,6 +202,10 @@ fn discover(root: &Path) -> std::io::Result<Vec<Workspace>> {
         })
         .collect();
     found.sort_by(|a, b| a.name.cmp(&b.name));
+    let server = crate::server_db::path(root);
+    if server.is_file() {
+        found.push(Workspace { name: SERVER.into(), dir: root.to_path_buf(), db: server });
+    }
     Ok(found)
 }
 
@@ -320,7 +329,9 @@ async fn schedule(
                 Ok(Ok(found)) => {
                     workspaces = found.into_iter().map(|w| (w.name.clone(), w)).collect();
                     for name in workspaces.keys() {
-                        for &(job, every) in &jobs {
+                        // server.db has accounts and tokens, no issues: backups are its only job.
+                        let jobs = jobs.iter().filter(|(job, _)| name != SERVER || *job == Job::Backup);
+                        for &(job, every) in jobs {
                             slots.entry((name.clone(), job)).or_insert_with(|| Slot {
                                 due: after(now, every.mul_f64(rng.unit())),
                                 running: false,
@@ -655,7 +666,10 @@ fn backup(ws: &Workspace, open: &OpenOptions, b: &Backups, started: Instant) -> 
     remove_unfinished(&dir, &ws.name);
     let name = format!("{}-{}.db", ws.name, chrono::Utc::now().format(STAMP));
     let (tmp, file) = (dir.join(format!("{name}.tmp")), dir.join(&name));
-    Store::open(&ws.db, open.clone())?.snapshot(&tmp)?;
+    match ws.name == SERVER {
+        true => crate::server_db::snapshot(&ws.dir, &tmp)?,
+        false => Store::open(&ws.db, open.clone())?.snapshot(&tmp)?,
+    }
     std::fs::rename(&tmp, &file).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
@@ -839,7 +853,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join("empty").join(".bd")).unwrap();
         std::fs::write(root.path().join("server.db"), b"").unwrap();
         let names: Vec<String> = discover(root.path()).unwrap().into_iter().map(|w| w.name).collect();
-        assert_eq!(names, ["other.v2", "proj"]);
+        assert_eq!(names, ["other.v2", "proj", SERVER], "server.db too, last");
         assert!(discover(&root.path().join("missing")).is_err());
     }
 
@@ -916,6 +930,28 @@ mod tests {
         let titles: Vec<String> =
             copy.read(|r| r.list(&Default::default())).unwrap().into_iter().map(|i| i.title).collect();
         assert_eq!(titles, ["Backed up"]);
+    }
+
+    #[test]
+    fn the_servers_accounts_and_tokens_are_backed_up_beside_the_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        crate::auth::issue_token(root.path(), "ci", "ci", crate::auth::Role::Write, crate::auth::Kind::Agent, &[])
+            .unwrap();
+        let server = discover(root.path()).unwrap().into_iter().find(|w| w.name == SERVER).expect("server.db");
+        let out = tempfile::tempdir().unwrap();
+        let b = Backups { dir: out.path().to_path_buf(), every: Duration::from_secs(3600), keep: 2 };
+        let file = backup(&server, &OpenOptions::default(), &b, Instant::now()).unwrap();
+        assert_eq!(file.parent().unwrap(), out.path().join(SERVER));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        let restored = tempfile::tempdir().unwrap();
+        std::fs::copy(&file, crate::server_db::path(restored.path())).unwrap();
+        let conn = crate::server_db::open(restored.path()).unwrap();
+        let tokens: i64 = conn.query_row("SELECT count(*) FROM tokens", [], |r| r.get(0)).unwrap();
+        assert_eq!(tokens, 1, "the token is in the copy");
     }
 
     #[test]

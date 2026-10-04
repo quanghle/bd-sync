@@ -5350,6 +5350,21 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let v: Value = serde_json::from_str(&check(out, "revoke --github")).unwrap();
     assert_eq!(v["revoked"], json!([name]));
     assert_eq!(signed_in(alice.path(), &url, &["list"]).status.code(), Some(7), "revoked at once");
+    // The audit trail tells who signed in, and who revoked what.
+    let out =
+        bd(&root).args(["--json", "serve", "token", "events", "--actor", "github:alice", "--root"]).arg(&root).output();
+    let events: Value = serde_json::from_str(&check(out.unwrap(), "token events")).unwrap();
+    let seen: Vec<(String, String)> = events
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| (e["kind"].as_str().unwrap().into(), e["detail"].as_str().unwrap_or_default().into()))
+        .collect();
+    assert_eq!(
+        seen,
+        [("signed_in".into(), String::new()), ("revoked".into(), "an admin revoked the account's tokens".into())]
+    );
+    assert!(!events.to_string().contains("bdt_"), "no secret: {events}");
     let out =
         bd(&root).args(["serve", "token", "revoke", "--account", "mallory", "--root"]).arg(&root).output().unwrap();
     assert_eq!(out.status.code(), Some(3), "mallory never got one");
@@ -5674,9 +5689,15 @@ fn people_sign_in_with_an_oidc_provider_from_the_command_line() {
 /// `claims` signed by the fake OIDC provider's key, as its ID tokens and notifications are.
 #[cfg(unix)]
 fn fake_oidc_jwt(claims: &Value) -> String {
+    fake_oidc_jwt_kid(claims, "fake-1")
+}
+
+/// [`fake_oidc_jwt`], its header naming the key `kid`.
+#[cfg(unix)]
+fn fake_oidc_jwt_kid(claims: &Value, kid: &str) -> String {
     use base64::Engine;
     let b64 = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
-    let head = json!({ "alg": "RS256", "kid": "fake-1" });
+    let head = json!({ "alg": "RS256", "kid": kid });
     let signed = format!("{}.{}", b64(head.to_string().as_bytes()), b64(claims.to_string().as_bytes()));
     let key = oidc_key();
     let mut signature = vec![0; key.public().modulus_len()];
@@ -5749,6 +5770,61 @@ fn accounts_that_revoke_consent_or_are_deleted_at_the_provider_are_signed_out_an
     assert_eq!(post_json(&events, "not json").0, 400);
     assert_eq!(post_json(&format!("{}/oauth/other/events", server.base), "{}").0, 404);
     check(signed_in(third.path(), &url, &["list"]), "untouched");
+    // Naming keys the provider does not have costs it no fetch each: the kept set serves, fetched again at most
+    // once a minute.
+    let fetches = || idp.log().iter().filter(|l| l.starts_with("GET /jwks")).count();
+    let before = fetches();
+    for i in 0..10 {
+        let unknown = json!({ "payload": fake_oidc_jwt_kid(&json!({ "iss": idp.url }), &format!("k{i}")) });
+        assert_eq!(post_json(&events, &unknown.to_string()).0, 400);
+    }
+    assert!(fetches() <= before + 1, "{} fetches", fetches() - before);
+}
+
+#[cfg(unix)]
+#[test]
+fn oidc_rules_let_people_in_without_an_authorizer_and_refreshes_keep_to_them() {
+    let idp = FakeOidc::start();
+    let root = Server::prepare();
+    std::fs::write(root.path().join("acme-secret"), "oidc-s3cret\n").unwrap();
+    let config = |domain: &str| {
+        format!(
+            "[oidc.acme]\nissuer = \"{}\"\nclient_id = \"bd-client\"\nclient_secret_file = \"acme-secret\"\n\
+             [[oidc.acme.allow]]\nemail_domains = [\"{domain}\"]\nrole = \"write\"\n",
+            idp.url
+        )
+    };
+    std::fs::write(root.path().join("auth.toml"), config("acme.example")).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+    let login = |subject: &str, email: &str| {
+        idp.next(subject, json!({ "email": email, "email_verified": true }));
+        let dir = tempfile::tempdir().unwrap();
+        let args = ["--json", "remote", "login", "--provider", "acme", &url];
+        let out = bd(dir.path()).args(args).stdin(Stdio::null()).output().unwrap();
+        (dir, out)
+    };
+
+    // By the verified email's domain: in, refreshed while the rule is there.
+    let (alice, out) = login("a1", "alice@acme.example");
+    let v: Value = serde_json::from_str(&check(out, "login")).unwrap();
+    assert_eq!(v["account"]["via"], "an email at acme.example");
+    renewal_due(alice.path());
+    let before = saved(alice.path(), "refresh_token").unwrap();
+    check(signed_in(alice.path(), &url, &["list"]), "refreshed");
+    assert_ne!(saved(alice.path(), "refresh_token").unwrap(), before, "renewed by its rule");
+
+    // Another domain: kept out.
+    let (_eve, out) = login("e1", "eve@evil.example");
+    assert_eq!(out.status.code(), Some(7), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // The rule changed: the sign-in ends at its next refresh (bd keeps no email to decide again).
+    std::fs::write(root.join("auth.toml"), config("acme.example\", \"other.example")).unwrap();
+    renewal_due(alice.path());
+    assert_eq!(signed_in(alice.path(), &url, &["list"]).status.code(), Some(7), "the rule that let it in is gone");
+    let tokens: Vec<Value> = stored(&root, "tokens");
+    assert!(tokens.iter().all(|t| t["revoked_at"].is_string()), "revoked: {tokens:?}");
+    assert!(!format!("{tokens:?}").contains("acme.example"), "no email kept");
 }
 
 #[cfg(unix)]
@@ -5845,13 +5921,16 @@ fn mcp_clients_sign_people_in_with_a_provider_they_choose() {
         "248289761001",
         json!({ "preferred_username": "alice", "email": "alice@acme.example", "email_verified": true, "groups": ["eng"] }),
     );
-    // A choice is made once, in the browser that was offered it, among what is offered.
+    // A choice is made in the browser that was offered it, among what is offered; another browser's try with the
+    // same link neither goes on nor takes it from that browser.
     let (_, headers, page) = browse(&authorize, None, None);
     let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
     let chooser = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
     let acme = local(&href(&page, "Acme SSO"));
     assert_eq!(browse(&acme, Some(&"0".repeat(64)), None).0, 400, "another browser");
-    assert_eq!(browse(&acme, Some(&chooser), None).0, 400, "spent by the other browser's try");
+    assert_eq!(browse(&acme, Some(&chooser), None).0, 302, "still the offered browser's");
+    let tampered = acme.replacen("flow=", "flow=A", 1);
+    assert_eq!(browse(&tampered, Some(&chooser), None).0, 400, "a flow this server did not seal");
     let (_, _, page) = browse(&authorize, Some(&chooser), None);
     let unknown = local(&href(&page, "Acme SSO")).replace("provider=acme", "provider=nope");
     assert_eq!(browse(&unknown, Some(&chooser), None).0, 400, "not offered");
@@ -6326,13 +6405,18 @@ fn github_sign_in_refusals() {
         .unwrap();
     assert!(out.status.success(), "admins' tokens may share actors among themselves");
 
-    // An organization that will not tell counts as no membership.
+    // An organization that will not tell decides nothing: the sign-in fails, to be tried again, rather than fall
+    // through to rules after it.
     let github = FakeGithub::start();
     github.member("dana", "acme");
     github.state.lock().unwrap().blocked.push("acme".into());
     let server = sign_in_server(&github, "[[github.allow]]\norgs = [\"acme\"]\n");
     github.next("dana", 0);
-    refused(github_login(dir.path(), &server.url()), 7, "dana may not sign in");
+    refused(
+        github_login(dir.path(), &server.url()),
+        8,
+        "GitHub would not tell this bd server whether GitHub user dana",
+    );
 
     // A broken auth.toml keeps the server from starting.
     let root = Server::prepare();
@@ -6406,6 +6490,48 @@ fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
     refused(sign_in("stranger", 2).1, "GitHub user stranger may not sign in");
     refused(sign_in("someone-else", 2).1, "GitHub user someone-else may not sign in");
     issued(sign_in("newcomer", 3).1);
+}
+
+#[test]
+fn admins_name_accounts_and_link_one_persons_accounts() {
+    let github = FakeGithub::start();
+    let server = sign_in_server(&github, "[[github.allow]]\nanyone = true\nrole = \"write\"\n");
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+    let sign_in = |login: &str, id: u64| {
+        github.next(login, 0);
+        github.set_id(login, id);
+        let dir = tempfile::tempdir().unwrap();
+        let v: Value = serde_json::from_str(&check(github_login(dir.path(), &url), "login")).unwrap();
+        (dir, v["actor"].as_str().unwrap().to_string())
+    };
+    let admin = |args: &[&str]| -> Value {
+        let out =
+            bd(&root).arg("--json").args(["serve", "token"]).args(args).arg("--root").arg(&root).output().unwrap();
+        serde_json::from_str(&check(out, &format!("token {args:?}"))).unwrap()
+    };
+    let (_alice, actor) = sign_in("alice", 1);
+    assert_eq!(actor, "github:alice");
+    let (bob, actor) = sign_in("alice-work", 2);
+    assert_eq!(actor, "github:alice-work");
+
+    assert_eq!(admin(&["name", "github:alice", "Alice"])["name"], "Alice");
+    let linked = admin(&["link", "github:alice-work", "--to", "github:alice"]);
+    assert_eq!((linked["was"].as_str(), linked["actor"].as_str()), (Some("github:alice-work"), Some("github:alice")));
+    assert_eq!(signed_in(bob.path(), &url, &["list"]).status.code(), Some(7), "its token acted as its former actor");
+    let (again, actor) = sign_in("alice-work", 2);
+    assert_eq!(actor, "github:alice", "one person, one actor");
+    check(signed_in(again.path(), &url, &["create", "From the other account"]), "works as github:alice");
+    let accounts = admin(&["accounts"]);
+    let bound: Vec<(&str, Option<&str>)> =
+        accounts.as_array().unwrap().iter().map(|a| (a["actor"].as_str().unwrap(), a["name"].as_str())).collect();
+    assert_eq!(bound, [("github:alice", Some("Alice")), ("github:alice", None)]);
+    let kinds: Vec<String> = admin(&["events", "--actor", "github:alice"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap().to_string())
+        .collect();
+    assert!(kinds.contains(&"named".to_string()) && kinds.contains(&"linked".to_string()), "{kinds:?}");
 }
 
 #[test]
@@ -7187,6 +7313,17 @@ fn oauth_root_at(github: Option<&FakeGithub>, rules: &str, oauth: &str) -> TempD
 }
 
 #[test]
+fn with_registration_off_clients_come_with_metadata_documents_only() {
+    let oauth = "redirect_uris = [\"https://chatgpt.com/connector_platform_oauth_redirect\"]\nregistration = false\n";
+    let server = Server::launch(oauth_root(oauth), "127.0.0.1:0", &["--public-url", "https://bd.example.com/bd"]);
+    let (status, meta) = get_json(&server.base, "/.well-known/oauth-authorization-server/bd");
+    assert_eq!(status, 200, "{meta}");
+    assert!(meta.get("registration_endpoint").is_none(), "{meta}");
+    let request = r#"{"redirect_uris":["https://chatgpt.com/connector_platform_oauth_redirect"]}"#;
+    assert_eq!(post_json(&format!("{}/bd/oauth/register", server.base), request).0, 404);
+}
+
+#[test]
 fn the_authorization_server_publishes_its_metadata_at_its_issuer() {
     let server = Server::launch(
         oauth_root("redirect_hosts = [\"chatgpt.com\"]\n"),
@@ -7334,29 +7471,50 @@ fn oauth_clients_register_without_a_token_for_allowed_redirects() {
     assert_eq!(status, 404);
 }
 
+thread_local! {
+    /// The flow cookies the test browser was given (`bd_flow_*`), sent back as a browser would.
+    static FLOW_COOKIES: std::cell::RefCell<std::collections::BTreeMap<String, String>> = Default::default();
+}
+
 /// A browser request, following no redirects: the status, headers and body.
 fn browse(url: &str, cookie: Option<&str>, post: Option<(&str, &str)>) -> (u16, ureq::http::HeaderMap, String) {
     let agent: ureq::Agent =
         ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).proxy(None).build().into();
+    let mut sent: Vec<String> = Vec::new();
+    if let Some(c) = cookie {
+        sent.push(format!("{}__Secure-bd_oauth={c}", if post.is_some() { "other=1; " } else { "" }));
+    }
+    FLOW_COOKIES.with(|jar| sent.extend(jar.borrow().iter().map(|(name, value)| format!("{name}={value}"))));
+    let cookies = sent.join("; ");
     let mut r = match post {
         Some((origin, body)) => {
             let mut req = agent.post(url).header("content-type", "application/x-www-form-urlencoded");
             if !origin.is_empty() {
                 req = req.header("origin", origin);
             }
-            if let Some(c) = cookie {
-                req = req.header("cookie", &format!("other=1; __Secure-bd_oauth={c}"));
+            if !cookies.is_empty() {
+                req = req.header("cookie", &cookies);
             }
             req.send(body).unwrap()
         }
         None => {
             let mut req = agent.get(url);
-            if let Some(c) = cookie {
-                req = req.header("cookie", &format!("__Secure-bd_oauth={c}"));
+            if !cookies.is_empty() {
+                req = req.header("cookie", &cookies);
             }
             req.call().unwrap()
         }
     };
+    for set in r.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()) {
+        let Some((name, rest)) = set.split_once('=') else { continue };
+        if name.contains("bd_flow_") {
+            let value = rest.split(';').next().unwrap_or_default().to_string();
+            FLOW_COOKIES.with(|jar| match set.contains("Max-Age=0") {
+                true => jar.borrow_mut().remove(name),
+                false => jar.borrow_mut().insert(name.to_string(), value),
+            });
+        }
+    }
     let text = r.body_mut().read_to_string().unwrap_or_default();
     (r.status().as_u16(), r.headers().clone(), text)
 }
@@ -7990,16 +8148,20 @@ fn a_flood_of_authorizations_never_drops_sign_ins_under_way() {
     let set = headers.get("set-cookie").unwrap().to_str().unwrap().to_string();
     let cookie = set["__Secure-bd_oauth=".len()..set.find(';').unwrap()].to_string();
     let to_github = location(&headers);
-    // Anyone may start sign-ins; past the limit, new ones wait for room.
-    let refused = (0..1100).map(|_| browse(&authorize, None, None)).find(|(status, _, _)| *status != 302);
-    let (status, headers, page) = refused.expect("refused once full");
-    assert_eq!(status, 503, "{page}");
-    assert!(headers.get("set-cookie").is_none() && headers.get("location").is_none());
-    // Another client's sign-ins still start: one client's flood fills only its share.
-    let (_, _, other) =
-        post_json(&format!("{}/bd/oauth/register", server.base), r#"{"redirect_uris":["https://app.example/cb"]}"#);
-    let theirs = authorize.replace(registered["client_id"].as_str().unwrap(), other["client_id"].as_str().unwrap());
-    assert_eq!(browse(&theirs, None, None).0, 302, "another client");
+    // Anyone may start sign-ins, from as many clients as they register: the server keeps none of them (each is
+    // sealed into its browser's cookie), so none is refused for room, and none under way is dropped.
+    let flooder: ureq::Agent =
+        ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).proxy(None).build().into();
+    let mut clients = Vec::new();
+    for _ in 0..20 {
+        let (_, _, c) =
+            post_json(&format!("{}/bd/oauth/register", server.base), r#"{"redirect_uris":["https://app.example/cb"]}"#);
+        clients.push(c["client_id"].as_str().unwrap().to_string());
+    }
+    for i in 0..2000 {
+        let theirs = authorize.replace(registered["client_id"].as_str().unwrap(), &clients[i % clients.len()]);
+        assert_eq!(flooder.get(&theirs).call().unwrap().status().as_u16(), 302, "sign-in {i}");
+    }
     // The first sign-in is still under way.
     github.next("alice", 0);
     let (_, headers, _) = browse(&to_github, None, None);

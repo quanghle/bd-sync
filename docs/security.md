@@ -100,13 +100,17 @@ admin's authorizer ([Signing in](remote.md#signing-in)).
   always `agent` tokens. `min_account_age` keeps out accounts made on the
   spot; `deny` keeps out an account for good (also revoke its tokens).
 - Each account is bound to its actor for good at its first sign-in, so a
-  renamed or re-registered login cannot pass for the previous holder.
-  Actors carry the provider's name (`github:alice`, `google:alice@acme.com`),
+  renamed or re-registered login cannot pass for the previous holder. Two
+  accounts share an actor only when an admin links them
+  (`bd serve token link`), as one person's.
+  Actors carry the provider's name (`github:alice`, `google:u-3f9a2c1e7b04`),
   so no provider's users can take an admin-created actor or another
   provider's. Only `bd serve token revoke --account <login> --forget`
   releases a binding.
 - Sign-in access tokens expire (`token_ttl`, default 1 hour), and each
-  refresh applies the rules again, so someone who leaves an organization
+  refresh applies the rules again (an OIDC rule by email, domain or group
+  keeps a sign-in while that rule is unchanged, as bd keeps no claims: see
+  [With an OpenID Connect provider](remote.md#with-an-openid-connect-provider)), so someone who leaves an organization
   loses access within `token_ttl`. Refresh tokens rotate at every refresh
   and work once: a copy used after the original (or the original after a
   copy) revokes the sign-in. A sign-in is refreshed for at most
@@ -131,7 +135,8 @@ and the GDPR's data minimization (Art. 5(1)(c)) are the guide.
   last seen; for each token, the SHA-256 of its secrets, its actor, role,
   workspaces and that account; and the OAuth clients that registered. It
   never holds a token's secret, a provider's tokens or ID tokens, an ID
-  token's claims, a name, or an email.
+  token's claims, a name from a provider, or an email: only a name an
+  admin gives an account (`bd serve token name`), erased with it.
 - **Logins are never emails.** A GitHub account's login is its public user
   name. An OIDC account's is its provider's `preferred_username`, unless
   that is an email, else a pseudonym of the account (`u-` and 12 hex digits
@@ -157,6 +162,14 @@ and the GDPR's data minimization (Art. 5(1)(c)) are the guide.
   With `account_events`, an Apple Account deleted at Apple is forgotten the
   same way, and one that revoked its consent is signed out
   ([Sign in with Apple](remote.md#sign-in-with-apple)).
+- **Audit trail.** `server.db` records each sign-in, token created,
+  refresh, revocation (with why: by its holder, an admin, a reused refresh
+  token, the rules, its provider), account forgotten and client registered,
+  in the same transaction as the change, for 90 days; `bd serve token
+  events` shows it. An event names the actor, the provider and subject, the
+  token and the client, never a secret or an email. Forgetting an account
+  erases its events too, leaving one that says an account of that provider
+  was forgotten, and why.
 - **Logs.** `bd serve` logs sign-ins, refreshes, refusals and revocations
   with the provider, the account's subject and login (a user name or a
   pseudonym), its actor and token names, and never a secret, a token's
@@ -169,7 +182,10 @@ and the GDPR's data minimization (Art. 5(1)(c)) are the guide.
   `server.db` is created 0600, and `bd serve` warns if its root is open to
   other users (chmod 700 it), since the workspaces' databases are there
   too. Use disk encryption where the machine or its disks could be taken,
-  and keep backups encrypted and private.
+  and keep backups encrypted and private: `--backup-dir` copies
+  `server.db` too (0600, in 0700 directories), so a copy holds the
+  accounts and the audit trail as they were, including accounts forgotten
+  since; keep only as many copies as needed (`--backup-keep`).
 
 ## OAuth for MCP clients
 
@@ -186,8 +202,11 @@ above.
   secret file, or the `.p8` key that signs Apple's (`signed_secret`), is
   kept the same way; each secret signed from that key lasts a few minutes.
 - **Where people are sent back.** Only to redirect URIs `[oauth]` allows:
-  https on the hosts of `redirect_hosts`, or, with `loopback_redirects`,
-  http to the person's own machine. Any local program can listen on a
+  those of `redirect_uris` exactly, https on the hosts of `redirect_hosts`
+  (any path: anyone who registers a client may name any page there, so
+  prefer `redirect_uris`, and `registration = false` where clients come
+  with metadata documents, as ChatGPT's and Claude's do), or, with
+  `loopback_redirects`, http to the person's own machine. Any local program can listen on a
   loopback port, so turn that on only for desktop clients that need it.
   A client's redirect URI must match one it registered or its metadata
   document names.
@@ -286,19 +305,36 @@ above.
   host has since refused its document or said not to cache it (which
   ends both). A logo is fetched the same way, at most 64 KiB, and kept only
   if its bytes are a PNG, JPEG, GIF or WebP image (no SVG).
-- **Unauthenticated endpoints.** Registration, authorization and the token
-  endpoint need no token. bd bounds what they keep: 500 registered clients
-  (a new one drops the oldest never used), and 1024 sign-ins at a provider
-  under way (64 per client, so one client's flood leaves room for others'),
-  past which new ones are refused rather than old ones dropped; an OIDC
-  provider whose discovery fails is not asked again for 30 seconds;
-  consent pages and codes, which only accounts the rules let in reach, are
-  kept up to 1024 each, the oldest going first. The authorization endpoint
+- **Bearer tokens.** Access and refresh tokens are bearer tokens: whoever
+  holds one may use it. They are not bound to the client holding them
+  (DPoP, RFC 9449; mutual TLS, RFC 8705), which MCP clients do not send.
+  RFC 9700 §4.14.2 accepts rotation instead for public clients' refresh
+  tokens, and bd rotates them, revoking a sign-in whose spent refresh token
+  comes back; access tokens last `token_ttl` (an hour by default) and only
+  at the MCP endpoint they were issued for.
+- **Unauthenticated endpoints.** Registration, authorization, the token
+  endpoint and the device flow need no token. bd bounds what they keep:
+  500 registered clients (a new one drops the oldest never used). A
+  sign-in before anyone signed in keeps nothing on the server: what it
+  needs is sealed (ChaCha20-Poly1305, with a key of the running server's)
+  into the link that chooses a provider and into a cookie of its own
+  while at the provider, so no flood fills a table and none drops a
+  sign-in under way, and another browser that learns a flow's link or
+  state can neither use it nor end it. Consent pages and codes, which only
+  accounts the rules let in reach, are kept up to 1024 each, the oldest
+  going first. Refreshes run in slots of their own, which anonymous
+  sign-ins never take, and a refresh token of no sign-in is refused before
+  any; an OIDC provider whose discovery or keys could not be had is not
+  asked again for 30 seconds, and its keys are fetched one request at a
+  time. One address holds at most 64 connections (a proxy on the same
+  machine is not counted). A code sent again revokes the token it issued
+  only when its client sends it with its PKCE verifier. The authorization endpoint
   does not tell which workspaces exist before the rules let an account in
   (the device flow of `bd remote login --provider github` does, before sending
   anyone to GitHub). It does not
   rate-limit them: do that per address at the proxy ([Behind a
-  proxy](mcp.md#behind-a-proxy)), on every path with `/oauth/` in it:
+  proxy](mcp.md#behind-a-proxy)), on every path with `/oauth/` or
+  `/v2/auth/` in it:
   they answer under the public URL's path (`/bd/oauth/…`) or with it
   stripped (`/oauth/…`), and a proxy that strips the prefix turns
   `/bd/bd/oauth/…` into the former.

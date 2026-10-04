@@ -25,6 +25,7 @@ bd serve token create dashboard --as dash --role read --root /srv/bd
 bd serve token create intern --as intern --max-claims 2 --root /srv/bd   # holds at most 2 issues at once
 bd serve token list --root /srv/bd
 bd serve token revoke ci --root /srv/bd          # takes effect at once, no restart
+bd serve token events --since 7d --root /srv/bd  # the audit trail: sign-ins, tokens created, refreshed, revoked
 # Or let people get their own by signing in, with GitHub or any OIDC provider: <root>/auth.toml (below)
 # MCP clients that sign people in with OAuth (ChatGPT, Claude apps): docs/mcp.md
 
@@ -68,6 +69,67 @@ line per request on stderr; set `BD_LOG` to change that. Ctrl-C or SIGTERM
 lets running commands finish first (up to 30 seconds). The server keeps
 connections to each database open, so restart it after replacing or moving a
 workspace's `bd.db`.
+
+### One server
+
+Run one `bd serve` for a root: two on the same root would each run the
+background jobs, and neither would know the other's sign-ins in progress.
+What lasts is on disk: the workspaces' databases and `<root>/server.db`
+(accounts, tokens, registered OAuth clients). A restart loses what the
+server keeps in memory:
+
+- authorizations in progress: the key that seals a sign-in before anyone
+  signed in is the running server's, so its links and cookies stop
+  working; consent pages waiting for a decision, and codes not yet
+  redeemed. The person starts again from the application.
+- the answer of a `bd remote login` device flow whose client did not get
+  it: GitHub and OIDC providers give a sign-in's token once, so that
+  client signs in again. A refresh whose answer was lost is unaffected: the
+  sign-in's record in `server.db` tells its retry from a reuse.
+- what it fetched and keeps for a while: providers' discovery documents
+  and keys, OAuth clients' metadata documents, which it fetches again.
+
+Tokens, accounts and refreshes go on as before. Put the server under a
+service manager that restarts it, and back up `server.db` with the
+workspaces ([Background jobs and backups](#background-jobs-and-backups)).
+
+With systemd, as an unprivileged user `bd` that owns the root (mode 0700):
+
+```ini
+# /etc/systemd/system/bd-serve.service
+[Unit]
+Description=bd serve
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=bd
+ExecStart=/usr/local/bin/bd serve --root /srv/bd --listen 127.0.0.1:7420 \
+    --public-url https://bd.example.com --backup-dir /var/backups/bd
+Restart=on-failure
+RestartSec=2
+# Ctrl-C lets running commands finish (up to 30 s); give it that long.
+TimeoutStopSec=45
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/srv/bd /var/backups/bd
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`systemctl enable --now bd-serve` starts it now and at boot, and
+`journalctl -u bd-serve` shows its log, kept as long as journald keeps it
+(set `MaxRetentionSec=` to bound how long logins stay in it). An
+authorizer command runs as the same user, within the same limits: give
+`ReadWritePaths` what it writes. A tunnel or proxy in front runs as its own
+service: `cloudflared service install` for a Cloudflare tunnel, or the
+distribution's nginx or Caddy unit. On Windows under WSL, systemd runs once
+`/etc/wsl.conf` has `[boot]` `systemd=true`; on macOS, use a launchd
+agent with `KeepAlive`.
 
 ## Signing in
 
@@ -141,7 +203,8 @@ workspaces = ["proj"]                   # default: every workspace
 # max_claims = 3                        # its tokens' actors hold at most 3 issues at once
 
 # [oauth]                               # MCP clients such as ChatGPT sign people in with OAuth (docs/mcp.md)
-# redirect_hosts = ["chatgpt.com", "claude.ai"]
+# redirect_uris = ["https://chatgpt.com/connector_platform_oauth_redirect"]
+# registration = false
 # loopback_redirects = true
 ```
 
@@ -156,7 +219,8 @@ OAuth](mcp.md#signing-in-with-oauth).
 `bd serve` checks the file when it starts, and refuses to start with a
 mistake in it (an unknown field, a rule that names nobody, an `http` URL to
 another host, an `anyone` rule that is not the last or gives more than a rule
-before it). After that, each sign-in reads it again, so changes need no
+before it). After that, it reads the file again once it, or a secret file
+it names, changes (and at least every 30 seconds), so changes need no
 restart; a mistake made meanwhile fails sign-ins and refreshes, with the
 reason in the server log only. It also says at start whether tokens are
 refreshed.
@@ -203,7 +267,7 @@ refreshed.
   malice.
 - The token acts as the account's actor, or its sub-actors `<actor>/<agent>`:
   `<provider>:<login>` with the account's login when it first signed in
-  (`github:alice`, `google:alice@acme.com`; a `/` in a login becomes `-`),
+  (`github:alice`, `okta:alice`, `google:u-3f9a2c1e7b04`; a `/` in a login becomes `-`),
   which it keeps when its login changes. The token is named `<provider>-<actor>-<random>` and expires
   after `token_ttl`; each sign-in gets a token of its own, so one account may
   sign in on several machines. When tokens are refreshed, the client renews
@@ -229,6 +293,23 @@ refreshed.
   one: it deletes the account and its tokens from `server.db`, leaving no
   trace in its files ([What bd keeps about people](security.md#what-bd-keeps-about-people)),
   and the next account to sign in as that login binds the actor again.
+- One person signing in with several providers gets an actor per account
+  (`github:alice`, `apple:u-3f9a2c1e7b04`): bd cannot tell they are the
+  same person. An admin who knows can link them:
+  `bd serve token link apple:u-3f9a2c1e7b04 --to github:alice --root /srv/bd`
+  binds the Apple account to `github:alice`. Its tokens are revoked (they
+  acted as its former actor, which it gives up), and its next sign-in acts
+  as `github:alice`, its claims and history then one with the GitHub
+  account's. Linked accounts are one principal: neither is refused for the
+  other's tokens, and their actor names them all to `revoke --account` (and
+  `--forget`). Only an existing account's actor may be linked to, so no
+  sign-in can take an admin's actor this way; the audit trail records each
+  link.
+- An actor may be a pseudonym (`apple:u-3f9a2c1e7b04`) that tells admins
+  nothing. `bd serve token name apple:u-3f9a2c1e7b04 "Quang (Apple)" --root
+  /srv/bd` gives the account a name of the admin's, shown by
+  `bd serve token accounts`; `--clear` removes it. bd takes no name from a
+  provider, and forgetting the account erases it.
 - A change to `auth.toml` (`deny` included) applies to the next sign-ins
   and refreshes: tokens already issued keep their permissions until they
   expire, at most `token_ttl`. To cut an account off at once,
@@ -247,9 +328,9 @@ refreshed.
 Register bd as a client (a "web application") at the provider, with the
 redirect URI `<public-url>/oauth/<name>/callback` for MCP clients'
 browser sign-in, and enable its device flow (device authorization grant)
-for `bd remote login`. Then name it in `auth.toml`, with an
-[authorizer](#deciding-with-an-authorizer), which decides who of those it
-vouches for gets in (rules are GitHub's):
+for `bd remote login`. Then name it in `auth.toml`, with rules that decide
+who of those it vouches for gets in, or an
+[authorizer](#deciding-with-an-authorizer) instead:
 
 ```toml
 [oidc.google]                           # <name>: 1-32 lowercase letters, digits and dashes; never github
@@ -258,10 +339,33 @@ client_id = "1234.apps.googleusercontent.com"
 client_secret_file = "google-secret"    # relative to the root; leave out for a public client
 label = "Google"                        # shown on the sign-in page (default: the name; at most 40 characters)
 scopes = ["email", "profile"]           # asked for besides openid (this is the default)
+groups_claim = "groups"                 # the ID token claim listing an account's groups (this is the default)
 
-[authorizer]
-command = ["bin/authorize"]
+[[oidc.google.allow]]                   # the first rule that lets an account in decides, as GitHub's do
+subjects = ["108001234567890123456"]    # accounts by their sub
+role = "admin"
+kind = "human"
+
+[[oidc.google.allow]]
+email_domains = ["acme.com"]            # a verified email at these domains (emails = [...] lists addresses)
+workspaces = ["proj"]
+
+[[oidc.google.allow]]
+groups = ["bd-readers"]                 # a value of groups_claim
+role = "read"
 ```
+
+A rule takes `role`, `kind`, `workspaces` and `max_claims` as GitHub's
+do, and `anyone = true` (last, never admin or human). A refresh decides
+again by what bd keeps of the account: its `sub`. Rules by `subjects` or
+`anyone` are applied again then. Rules by `emails`, `email_domains` or
+`groups` need the ID token, which a refresh does not have (bd keeps no
+email or claim): a refresh keeps such a sign-in while the rule that let it
+in is in `auth.toml`, unchanged. Removing or changing that rule ends the
+sign-ins it let in at their next refresh, and their people sign in again;
+someone a provider no longer lists in a group keeps access until they sign
+in again, at the latest `sign_in.refresh_limit`. Use an authorizer to
+decide by the provider's live data instead (it is asked at every refresh).
 
 `bd remote login --provider google` signs in with it. The account is its
 `sub` claim at its issuer. Its login, which its actor is made of, is never
@@ -339,10 +443,11 @@ sends notifications in Apple's format can use `account_events` too.
 
 bd always proves who signed in (the provider's sign-in, and the account
 bound to its actor). Whether that account may use a workspace, and with
-what access, can be left to the admin's own code instead of
-`[[github.allow]]` rules, for directories, groups or lists bd knows nothing
-about. An `[authorizer]` replaces the rules (a file with both is refused),
-and is needed for OIDC providers:
+what access, can be left to the admin's own code instead of rules
+(`[[github.allow]]`, `[[oidc.<name>.allow]]`), for directories, groups or
+lists bd knows nothing about, or live data of a provider's. An
+`[authorizer]` replaces the rules of every provider (a file with both is
+refused):
 
 ```toml
 [authorizer]
@@ -408,7 +513,7 @@ person is told only that the account may not use the workspace.
   login that once was another account's is refused as it is for a `users`
   rule. `deny` (GitHub user ids) applies before it is asked. It never
   sees a provider's tokens. Every account acts as `<provider>:<login>`
-  (`github:alice`, `google:alice@acme.com`), so no provider's users, who
+  (`github:alice`, `google:u-3f9a2c1e7b04`), so no provider's users, who
   often choose their own names, can take an admin's actor, or each other's; `bd serve token revoke --account` names one by
   its actor where a login is shared by accounts at several providers.
 - **The command** runs in the root, with an environment cleared except
@@ -449,9 +554,11 @@ expired first; so does a long-running one (`bd agents watch`, `bd events
   grants now: role, kind, workspaces and `max_claims` may change at a
   refresh. GitHub is asked as the GitHub App, with installation tokens: the
   server never keeps anyone's own GitHub token. An organization the App is
-  not installed on, or whose members it may not read, does not tell: if
-  that decides, the refresh fails for now (exit 8, nothing revoked), and the
-  server log says why. Account lookups use any installation of the App that
+  not installed on, or whose members it may not read, does not tell: a
+  rule for the workspace that GitHub will not decide stops the rules there
+  (no later rule, which may grant more, is tried), and the refresh fails
+  for now (exit 8, nothing revoked), as does a sign-in; the server log says
+  why. Account lookups use any installation of the App that
   is not suspended.
 - replaces both the access token and the refresh token: the old ones stop
   working at once. A refresh token works once. One used again, as by someone
@@ -516,7 +623,7 @@ workspaces no client has used since it started (it looks for new ones every
 | gate checks | every minute | `--gate-check-every` | `bd gate check --type local`: opens timer and issue gates, escalates failures and timeouts |
 | GitHub gate checks | every 5 minutes | `--gh-check-every` | `bd gate check --type gh` with the server's `gh` (its `BD_GH` and `gh auth`); each armed GitHub gate costs one or two API calls of that account per check |
 | agent sets | every 30 seconds | `--agents-every` | reads each harness's set in `.bd/agents` and appends an `agents_changed` event when its revision changed, which `bd agents watch` clients wait for; a set that cannot be read gets no event and a warning in the log (once per error), and the other sets are still checked ([Agent skills](agents.md#serving-sets)) |
-| backups | off | `--backup-dir DIR`, `--backup-every 1h`, `--backup-keep 24` | a snapshot of each workspace, below |
+| backups | off | `--backup-dir DIR`, `--backup-every 1h`, `--backup-keep 24` | a snapshot of each workspace and of `server.db`, below |
 | request records | every hour | | deletes idempotency records older than a day |
 
 `0` or `off` turns a job off. Jobs run the commands' own code as actor
@@ -546,7 +653,16 @@ logs a warning then. Copies hold everything in a workspace, so on Unix they
 are readable by the user running `bd serve` only: files are created 0600, and
 the directories it creates 0700 (an existing `--backup-dir` keeps its mode).
 Keep the directory on another disk, or ship it elsewhere (rsync, restic,
-object storage). To restore a workspace from a copy:
+object storage).
+
+The server's own database, `<root>/server.db` (accounts and their actors,
+access tokens, registered OAuth clients, the audit trail), is copied the
+same way, every `--backup-every`, to `/backups/_server/_server-<UTC
+time>.db` (no workspace can be named `_server`). To restore it, stop
+`bd serve`, move `server.db` and its `-wal` and `-shm` files aside, copy the
+backup to `<root>/server.db`, and start it again: tokens issued or revoked
+since the copy are as they were then, so revoke again anything revoked
+since. To restore a workspace from a copy:
 
 ```bash
 # Stop bd serve first: it keeps the database open, and could open a half-copied file.

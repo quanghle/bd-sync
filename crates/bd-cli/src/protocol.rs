@@ -30,7 +30,7 @@
 //! errors. Every answer carries the [`PROTOCOL_HEADER`], which tells bd
 //! serve's own answers apart from a proxy's.
 //!
-//! GitHub sign-in (`bd remote login --provider github`, see `oauth.rs`) has two
+//! GitHub sign-in (`bd remote login --provider github`, see `oauth/`) has two
 //! endpoints of its own on the server, outside any workspace and without a
 //! token: `POST <server>/v2/auth/<provider>/device` ([`SignInStart`] ->
 //! [`SignInCode`]) and `POST <server>/v2/auth/<provider>/token`, polled

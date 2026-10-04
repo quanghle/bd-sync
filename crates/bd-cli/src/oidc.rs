@@ -13,7 +13,7 @@
 //!
 //! A provider that sends its answers to the browser as a form it posts
 //! (`response_mode = "form_post"`, which Apple requires when scopes are
-//! asked for) is relayed to the callback by `serve.rs`. A provider whose
+//! asked for) is relayed to the callback by `serve/`. A provider whose
 //! client secret is a JWT signed with a key of the client's (Apple's) gets
 //! one bd signs for each request, from `[oidc.<name>.signed_secret]`. With
 //! `account_events`, the provider's notifications of accounts that revoked
@@ -83,6 +83,187 @@ pub(crate) struct OidcDoc {
     signed_secret: Option<SignedSecretDoc>,
     #[serde(default)]
     account_events: Option<Vec<String>>,
+    #[serde(default)]
+    allow: Vec<RuleDoc>,
+    #[serde(default)]
+    groups_claim: Option<String>,
+}
+
+/// `[[oidc.<name>.allow]]` as written.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RuleDoc {
+    #[serde(default)]
+    anyone: bool,
+    #[serde(default)]
+    subjects: Vec<String>,
+    #[serde(default)]
+    emails: Vec<String>,
+    #[serde(default)]
+    email_domains: Vec<String>,
+    #[serde(default)]
+    groups: Vec<String>,
+    #[serde(default)]
+    role: Option<crate::auth::Role>,
+    #[serde(default = "agent_kind")]
+    kind: crate::auth::Kind,
+    #[serde(default)]
+    workspaces: Vec<String>,
+    #[serde(default)]
+    max_claims: Option<u32>,
+}
+
+fn agent_kind() -> crate::auth::Kind {
+    crate::auth::Kind::Agent
+}
+
+/// One `[[oidc.<name>.allow]]` rule: whom of the provider's accounts it lets
+/// in, and what their token may do. By `subjects` (the accounts' ids, which
+/// bd keeps) or `anyone`, it is decided again at each refresh; by `emails`,
+/// `email_domains` (the verified email) or `groups` (a claim of the ID
+/// token), which bd does not keep, at sign-in only: a refresh keeps a
+/// sign-in while the rule that let it in is still there, unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub anyone: bool,
+    pub subjects: Vec<String>,
+    /// Lowercased.
+    pub emails: Vec<String>,
+    /// Lowercased, without `@`.
+    pub email_domains: Vec<String>,
+    pub groups: Vec<String>,
+    pub grant: crate::auth::Grant,
+}
+
+impl Rule {
+    /// Whether it needs the ID token's claims, which a refresh does not have.
+    fn needs_claims(&self) -> bool {
+        !(self.emails.is_empty() && self.email_domains.is_empty() && self.groups.is_empty())
+    }
+
+    /// What tells this rule from any other, or from itself changed: kept
+    /// with a sign-in it let in.
+    pub fn fingerprint(&self) -> String {
+        crate::auth::hash(&format!("{self:?}"))[..16].to_string()
+    }
+
+    /// What lets the account `subject` in by this rule, if anything: from
+    /// `claims` at sign-in; at a refresh (no claims), a rule that needs them
+    /// only if it is the one `kept` (its fingerprint) let the sign-in in.
+    fn lets_in(
+        &self,
+        subject: &str,
+        claims: Option<&Claims>,
+        groups_claim: &str,
+        kept: Option<&str>,
+    ) -> Option<String> {
+        if self.anyone {
+            return Some("anyone".into());
+        }
+        if self.subjects.iter().any(|s| s == subject) {
+            return Some("a listed account".into());
+        }
+        if !self.needs_claims() {
+            return None;
+        }
+        let Some(claims) = claims else {
+            return (kept == Some(self.fingerprint().as_str())).then(|| "as at sign-in".into());
+        };
+        if let Some(email) = claims.email.as_deref().map(str::to_lowercase) {
+            if self.emails.contains(&email) {
+                return Some("a listed email".into());
+            }
+            let domain = email.rsplit_once('@').map(|(_, d)| d.to_string()).unwrap_or_default();
+            if self.email_domains.contains(&domain) {
+                return Some(format!("an email at {domain}"));
+            }
+        }
+        let groups: Vec<&str> = match &claims.all[groups_claim] {
+            Value::Array(list) => list.iter().filter_map(Value::as_str).collect(),
+            Value::String(one) => vec![one.as_str()],
+            _ => Vec::new(),
+        };
+        self.groups.iter().find(|g| groups.contains(&g.as_str())).map(|g| format!("member of {g}"))
+    }
+}
+
+/// What the first of `rules` that lets the account in decides for
+/// `workspace`, as GitHub's rules do (`oauth::decide`), and the fingerprint
+/// of that rule.
+pub fn decide(
+    rules: &[Rule],
+    subject: &str,
+    claims: Option<&Claims>,
+    groups_claim: &str,
+    kept: Option<&str>,
+    workspace: &str,
+) -> (crate::oauth::Decision, Option<String>) {
+    let mut elsewhere: Vec<String> = Vec::new();
+    for rule in rules {
+        let Some(via) = rule.lets_in(subject, claims, groups_claim, kept) else { continue };
+        if rule.grant.allows_workspace(workspace) {
+            let mut grant = rule.grant.clone();
+            if !elsewhere.is_empty() {
+                grant.workspaces = vec![workspace.to_string()];
+            }
+            return (crate::oauth::Decision::In { grant, via, by_login: true }, Some(rule.fingerprint()));
+        }
+        for w in &rule.grant.workspaces {
+            if !elsewhere.contains(w) {
+                elsewhere.push(w.clone());
+            }
+        }
+    }
+    match elsewhere.is_empty() {
+        true => (crate::oauth::Decision::Out, None),
+        false => (crate::oauth::Decision::Elsewhere(elsewhere), None),
+    }
+}
+
+/// `[[oidc.<name>.allow]]` rule `n`, checked.
+fn rule(at: &str, n: usize, r: RuleDoc) -> std::result::Result<Rule, String> {
+    use crate::auth::{Grant, Kind, Role};
+    let at = format!("[[{at}.allow]] rule {n}");
+    let plain = |field: &str, list: Vec<String>, lower: bool| {
+        list.into_iter()
+            .map(|s| {
+                let v = s.trim();
+                let v = if lower { v.to_lowercase() } else { v.to_string() };
+                match !v.is_empty() && v.len() <= 255 && v.chars().all(|c| !c.is_control() && !c.is_whitespace()) {
+                    true => Ok(v),
+                    false => Err(format!("{at}: {field} {s:?} is not one")),
+                }
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+    };
+    let subjects = plain("subjects", r.subjects, false)?;
+    let emails = plain("emails", r.emails, true)?;
+    let email_domains: Vec<String> =
+        plain("email_domains", r.email_domains, true)?.into_iter().map(|d| d.trim_start_matches('@').into()).collect();
+    if let Some(e) = emails.iter().find(|e| !e.contains('@')) {
+        return Err(format!("{at}: emails {e:?} is not an email"));
+    }
+    let groups = plain("groups", r.groups, false)?;
+    let names_someone = !(subjects.is_empty() && emails.is_empty() && email_domains.is_empty() && groups.is_empty());
+    if r.anyone {
+        if names_someone {
+            return Err(format!("{at} lets anyone in: drop its subjects, emails, email_domains and groups, or anyone"));
+        }
+        if r.role == Some(Role::Admin) || r.kind == Kind::Human {
+            return Err(format!("{at} lets anyone in, so its role may be read or write and its kind agent only"));
+        }
+    } else if !names_someone {
+        return Err(format!(
+            "{at} names no subjects, emails, email_domains or groups, so it lets nobody in (anyone = true lets everyone)"
+        ));
+    }
+    let role = r.role.unwrap_or(if r.anyone { Role::Read } else { Role::Write });
+    let workspaces = crate::auth::workspace_list(&r.workspaces).map_err(|e| format!("{at}: {e}"))?;
+    if r.max_claims == Some(0) {
+        return Err(format!("{at}: max_claims must be at least 1"));
+    }
+    let grant = Grant { role, kind: r.kind, workspaces, max_claims: r.max_claims };
+    Ok(Rule { anyone: r.anyone, subjects, emails, email_domains, groups, grant })
 }
 
 /// `[oidc.<name>.signed_secret]` as written.
@@ -153,6 +334,10 @@ pub struct Oidc {
     /// (Apple names the app by its primary App ID, or the client ID); none:
     /// it takes none.
     pub account_events: Vec<String>,
+    /// `[[oidc.<name>.allow]]`: who of its accounts get in, without an authorizer.
+    pub allow: Vec<Rule>,
+    /// The ID token claim listing an account's groups, for rules' `groups`.
+    pub groups_claim: String,
 }
 
 /// A client secret, never shown.
@@ -241,6 +426,13 @@ pub(crate) fn parse(name: &str, doc: OidcDoc) -> std::result::Result<Oidc, Strin
         form_post,
         signed_secret,
         account_events,
+        allow: doc
+            .allow
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| rule(&at, i + 1, r))
+            .collect::<std::result::Result<_, _>>()?,
+        groups_claim: doc.groups_claim.map(|g| g.trim().to_string()).unwrap_or_else(|| "groups".into()),
     })
 }
 
@@ -328,6 +520,11 @@ static DISCOVERED: LazyLock<Fetched<Metadata>> = LazyLock::new(Default::default)
 static FAILED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
 /// Key sets by JWKS URL.
 static KEYS: LazyLock<Fetched<Vec<Jwk>>> = LazyLock::new(Default::default);
+/// Key sets whose fetch failed, with when: not fetched again for [`FAILED_FOR`].
+static KEYS_FAILED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
+/// Held while a key set is fetched: one fetch at a time, the others then
+/// finding it kept (or its failure), however many requests want keys.
+static FETCHING_KEYS: Mutex<()> = Mutex::new(());
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -610,19 +807,36 @@ impl Oidc {
     /// The provider's signing keys: kept, or fetched again (`fresh`, for a
     /// key not kept, at most once a [`REFETCH`]).
     fn keys(&self, md: &Metadata, fresh: bool) -> Result<Vec<Jwk>> {
-        if let Some((keys, at)) = lock(&KEYS).get(&md.jwks_uri) {
+        let kept = || -> Option<Vec<Jwk>> {
+            let keys = lock(&KEYS);
+            let (keys, at) = keys.get(&md.jwks_uri)?;
             let age = at.elapsed();
-            if age < KEEP && (!fresh || age < REFETCH) {
-                return Ok(keys.clone());
+            (age < KEEP && (!fresh || age < REFETCH)).then(|| keys.clone())
+        };
+        let failed = || lock(&KEYS_FAILED).get(&md.jwks_uri).is_some_and(|at| at.elapsed() < FAILED_FOR);
+        if let Some(keys) = kept() {
+            return Ok(keys);
+        }
+        let _fetching = lock(&FETCHING_KEYS);
+        // Another request may have fetched them, or failed to, while this one waited.
+        if let Some(keys) = kept() {
+            return Ok(keys);
+        }
+        if failed() {
+            return Err(self.unwell("its signing keys could not be had a moment ago".into()));
+        }
+        let fetched = self.get_json(&md.jwks_uri, "its signing keys").and_then(|doc| {
+            let keys = jwks(&doc);
+            match keys.is_empty() {
+                true => Err(self.unwell("its JWKS has no RS256 or ES256 signing key".into())),
+                false => Ok(keys),
             }
+        });
+        match &fetched {
+            Ok(keys) => drop(lock(&KEYS).insert(md.jwks_uri.clone(), (keys.clone(), Instant::now()))),
+            Err(_) => drop(lock(&KEYS_FAILED).insert(md.jwks_uri.clone(), Instant::now())),
         }
-        let doc = self.get_json(&md.jwks_uri, "its signing keys")?;
-        let keys = jwks(&doc);
-        if keys.is_empty() {
-            return Err(self.unwell("its JWKS has no RS256 or ES256 signing key".into()));
-        }
-        lock(&KEYS).insert(md.jwks_uri.clone(), (keys.clone(), Instant::now()));
-        Ok(keys)
+        fetched
     }
 
     fn get_json(&self, url: &str, what: &str) -> Result<Value> {
@@ -870,9 +1084,16 @@ fn id_token_claims(
     let username = claims["preferred_username"]
         .as_str()
         .map(str::trim)
-        .filter(|u| !u.contains('@') && crate::oauth_server::clients::shows_plainly(u, MAX_LOGIN));
+        .filter(|u| !u.contains('@') && !looks_like_pseudonym(u))
+        .filter(|u| crate::oauth_server::clients::shows_plainly(u, MAX_LOGIN));
     let login = username.map_or_else(|| pseudonym(issuer, subject), str::to_string);
     Ok(Claims { subject: subject.to_string(), login, email: email.map(str::to_string), all: claims })
+}
+
+/// Whether `name` has the form of a [`pseudonym`], whatever its case: a user
+/// name chosen to be another account's pseudonym is no login.
+fn looks_like_pseudonym(name: &str) -> bool {
+    name.len() == 14 && name[..2].eq_ignore_ascii_case("u-") && name[2..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 /// The login of an account whose provider gives no user name: `u-` and 12
@@ -976,6 +1197,73 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn rules_let_accounts_in_by_subject_email_domain_or_group_and_refreshes_keep_to_them() {
+        use crate::oauth::Decision;
+        let doc = |text: &str| {
+            let text = format!("issuer = \"https://idp.example\"\nclient_id = \"c\"\ngroups_claim = \"roles\"\n{text}");
+            toml::from_str::<OidcDoc>(&text).map_err(|e| e.to_string()).and_then(|d| parse("corp", d))
+        };
+        let o = doc("[[allow]]\nsubjects = [\"s-admin\"]\nrole = \"admin\"\nkind = \"human\"\n\
+             [[allow]]\nemails = [\"Bob@Acme.example\"]\n\
+             [[allow]]\nemail_domains = [\"@acme.example\"]\nrole = \"read\"\n\
+             [[allow]]\ngroups = [\"eng\"]\nworkspaces = [\"proj\"]\n")
+        .unwrap();
+        assert_eq!((o.allow.len(), o.groups_claim.as_str()), (4, "roles"));
+        let claims = |email: Option<&str>, roles: Value| Claims {
+            subject: "s1".into(),
+            login: "u-x".into(),
+            email: email.map(str::to_string),
+            all: serde_json::json!({ "roles": roles }),
+        };
+        let at_sign_in =
+            |subject: &str, c: &Claims, ws: &str| decide(&o.allow, subject, Some(c), &o.groups_claim, None, ws);
+        let role = |d: &(Decision, Option<String>)| match &d.0 {
+            Decision::In { grant, via, .. } => Some((grant.role, via.clone())),
+            _ => None,
+        };
+        let none = claims(None, Value::Null);
+        assert_eq!(
+            role(&at_sign_in("s-admin", &none, "proj")),
+            Some((crate::auth::Role::Admin, "a listed account".into()))
+        );
+        assert_eq!(
+            role(&at_sign_in("s1", &claims(Some("bob@acme.example"), Value::Null), "x")).unwrap().1,
+            "a listed email"
+        );
+        let domain = at_sign_in("s1", &claims(Some("carol@ACME.example"), Value::Null), "x");
+        assert_eq!(role(&domain), Some((crate::auth::Role::Read, "an email at acme.example".into())));
+        let group = at_sign_in("s1", &claims(None, serde_json::json!(["ops", "eng"])), "proj");
+        assert_eq!(role(&group).unwrap().1, "member of eng");
+        assert!(matches!(at_sign_in("s1", &claims(None, serde_json::json!("eng")), "other").0, Decision::Elsewhere(_)));
+        assert!(matches!(at_sign_in("s1", &claims(Some("eve@evil.example"), Value::Null), "proj").0, Decision::Out));
+
+        // A refresh has no claims: a subject decides again; a claims rule only as the one that let it in, unchanged.
+        let refresh =
+            |subject: &str, kept: Option<&str>| decide(&o.allow, subject, None, &o.groups_claim, kept, "proj");
+        assert!(role(&refresh("s-admin", None)).is_some());
+        let kept = domain.1.clone().unwrap();
+        assert_eq!(role(&refresh("s1", Some(&kept))), Some((crate::auth::Role::Read, "as at sign-in".into())));
+        assert!(matches!(refresh("s1", None).0, Decision::Out), "no claims, no rule kept");
+        let changed = doc("[[allow]]\nsubjects = [\"s-admin\"]\nrole = \"admin\"\nkind = \"human\"\n\
+             [[allow]]\nemail_domains = [\"acme.example\"]\nrole = \"write\"\n")
+        .unwrap();
+        let again = decide(&changed.allow, "s1", None, &changed.groups_claim, Some(&kept), "proj");
+        assert!(matches!(again.0, Decision::Out), "the rule changed: the sign-in is not kept");
+
+        for (bad, says) in [
+            ("[[allow]]\nrole = \"read\"", "lets nobody in"),
+            ("[[allow]]\nanyone = true\nsubjects = [\"x\"]", "drop its"),
+            ("[[allow]]\nanyone = true\nrole = \"admin\"", "anyone in"),
+            ("[[allow]]\nemails = [\"not-an-email\"]", "not an email"),
+            ("[[allow]]\ngroups = [\"a b\"]", "not one"),
+            ("[[allow]]\nsubjects = [\"x\"]\nsecret = 1", "unknown field"),
+        ] {
+            let e = doc(bad).unwrap_err();
+            assert!(e.contains(says), "{bad}: {e}");
+        }
+    }
+
+    #[test]
     fn account_notifications_are_verified_and_read() {
         let now = 1_800_000_000;
         let keys = jwks(&rsa_jwks("k1"));
@@ -1049,6 +1337,10 @@ pub(crate) mod tests {
         assert_eq!(login(&with("preferred_username", "alice@contoso.example".into())), anonymous, "Entra's UPN");
         assert_eq!(login(&with("preferred_username", "al\u{202e}ice".into())), anonymous);
         assert_ne!(pseudonym("https://other.example", "248289761001"), anonymous, "per issuer");
+        // A user name chosen to be another account's pseudonym is not taken: the account gets its own.
+        let squatter = pseudonym("https://idp.example", "someone-else").to_uppercase().replacen("U-", "u-", 1);
+        assert_eq!(login(&with("preferred_username", squatter.into())), anonymous);
+        assert_eq!(login(&with("preferred_username", "u-abc".into())), "u-abc", "not that form");
         let aud = |aud: Value, azp: Option<&str>| {
             let mut c = claims(now);
             c["aud"] = aud;

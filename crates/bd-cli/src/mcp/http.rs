@@ -1,7 +1,7 @@
 //! Streamable HTTP, as `bd serve` serves each workspace at `/w/<name>/mcp`:
 //! one JSON-RPC message per POST, answered with one JSON object (never an
 //! SSE stream), with no session ids. This module checks what HTTP adds to a
-//! message (its headers) and picks each answer's status; `serve.rs`
+//! message (its headers) and picks each answer's status; `serve/`
 //! authenticates the request and runs its tool calls.
 //!
 //! - A `MODERN` request mirrors its version, method and tool name in the

@@ -208,8 +208,11 @@ the client, and the client gets a token bound to the endpoint it asked for.
    # client_secret_file = "google-secret"
 
    [oauth]
-   redirect_hosts = ["chatgpt.com", "claude.ai"]   # https redirect URIs on these hosts, without a port
+   redirect_uris = ["https://chatgpt.com/connector_platform_oauth_redirect",
+                    "https://claude.ai/api/mcp/auth_callback"]  # these https redirect URIs exactly
+   # redirect_hosts = ["chatgpt.com"]              # or any https path on these hosts, without a port
    loopback_redirects = true                       # and http://127.0.0.1, [::1] or localhost, any port
+   # registration = false                          # clients come with metadata documents only (default true)
    ```
 
 3. Run `bd serve` with an https `--public-url` (http only on a loopback
@@ -255,14 +258,16 @@ endpoint's metadata, then to the authorization server's, and then:
      it has the authorization code. The Claude apps and Claude Code
      identify themselves this way, and ChatGPT may.
    - by registering (RFC 7591) at `<public-url>/oauth/register`, without a
-     token: up to 8 redirect URIs of 512 bytes each. Registrations are kept
+     token, unless `registration = false`: up to 8 redirect URIs of 512
+     bytes each. Registrations are kept
      in `<root>/server.db`: one never used is dropped after a day,
      and one unused for 90 days after that. With 500 kept, a new
      registration drops the oldest never used, or is refused (503) if all
      are in use.
 
-   Each redirect URI must be one `[oauth]` allows: https on a host of
-   `redirect_hosts`, without a port, or, with `loopback_redirects`, http to
+   Each redirect URI must be one `[oauth]` allows: one of `redirect_uris`
+   exactly, https on a host of `redirect_hosts` (any path), without a port,
+   or, with `loopback_redirects`, http to
    this machine, whose port is ignored when compared (a desktop client
    listens on whatever port is free). No fragment, no user info. (Browsers
    cannot be redirected to an IPv6 address after a form, so for `[::1]`
@@ -297,12 +302,14 @@ only after the rules let the person's account in, so the authorization
 endpoint does not tell strangers which workspaces exist. An authorization in
 progress is bound to the browser that started it (an `HttpOnly`,
 `SameSite=Lax` cookie, `__Secure-bd_oauth` on an https public URL,
-`bd_oauth` on http), each step must follow within 10 minutes,
-and they are kept in memory only, so a restart ends them. At most 1024
-sign-ins at a provider are under way at once, 64 for one client: past that, new authorizations get
-a 503 page until some finish or expire, and none under way is dropped for
-them. The steps after it, which only accounts the rules let in reach, keep
-up to 1024 consent pages and 1024 codes each, the oldest going first.
+`bd_oauth` on http), and each step must follow within 10 minutes. Until
+someone signs in, the server keeps nothing of it: the request is sealed
+into the link that chooses a provider and, at the provider, into a cookie
+of the flow's own, so no number of authorizations fills anything. The
+steps after it, which only accounts the rules let in reach, keep up to
+1024 consent pages and 1024 codes each in memory, the oldest going first.
+A restart ends every authorization in progress
+([One server](remote.md#one-server)).
 
 The client's tokens:
 
@@ -422,10 +429,15 @@ to that URL. No MCP request waits for events (the server opens no SSE
 streams), so a proxy's idle timeout only needs to exceed a tool call's run.
 
 With `[oauth]`, anyone can call the endpoints under `/bd/oauth/` without a
-token: registering clients, starting sign-ins, sending codes. bd bounds
-what they keep (registered clients, sign-ins in progress), but does not
-limit how often a caller sends requests; the proxy should, per client
-address (nginx `limit_req`, or a Caddy rate-limit plugin). They answer at
+token: registering clients, starting sign-ins, sending codes. So can
+anyone call the sign-in endpoints under `/bd/v2/auth/` (the device flow of
+`bd remote login --provider`). bd bounds what they keep (registered
+clients; a sign-in before anyone signed in keeps nothing on the server),
+how many run at once (refreshes have slots of their own, which no sign-in
+takes), and how many connections one address holds, but does not limit
+how often a caller sends requests; the proxy should, per client address
+(nginx `limit_req`, or a Caddy rate-limit plugin), on `/oauth/` and
+`/v2/auth/` paths. They answer at
 the public URL's path followed by `/oauth/` (`/bd/oauth/…`), or at
 `/oauth/…` for a proxy that strips the prefix, and nowhere else. A proxy
 that strips it forwards `/bd/bd/oauth/…` as `/bd/oauth/…`, so limit every

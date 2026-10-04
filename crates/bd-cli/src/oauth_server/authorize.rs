@@ -9,7 +9,7 @@
 //!    on to GitHub with a PKCE challenge of this server's own.
 //! 2. `GET <issuer>/oauth/github/callback` ([`callback`]): GitHub's code is
 //!    exchanged for the account, and the rules of `auth.toml` decide what it
-//!    may do in the workspace the client asked for (`oauth.rs`). A consent
+//!    may do in the workspace the client asked for (`oauth/`). A consent
 //!    page shows what the client would get.
 //! 3. `POST <issuer>/oauth/consent` ([`decide`]): approved, the client gets
 //!    an authorization code, redeemed at the token endpoint with its PKCE
@@ -46,14 +46,13 @@ const SECURE_COOKIE: &str = "__Secure-bd_oauth";
 const STEP_TTL: Duration = Duration::from_secs(10 * 60);
 /// How long an authorization code may wait to be redeemed.
 const CODE_TTL: Duration = Duration::from_secs(5 * 60);
-/// Authorizations kept at each step. Past it, new sign-ins are refused
-/// (anyone may start one, and none under way should be lost to them); at
-/// later steps, which only people the rules let in reach, the oldest go.
+/// Authorizations kept at the steps the server keeps (consents, codes),
+/// which only people the rules let in reach: past it, the oldest go. The
+/// steps before (choosing a provider, signing in there), which anyone may
+/// start, keep nothing on the server ([`Pending`]).
 const MAX_FLOWS: usize = 1024;
-/// Sign-ins under way for one client: past it, its new ones wait, and
-/// a client flooding sign-ins leaves room for others' (rate limits by
-/// address belong to the proxy, which alone sees them).
-const MAX_FLOWS_PER_CLIENT: usize = MAX_FLOWS / 16;
+/// The longest sealed flow a cookie carries (browsers keep 4096 bytes).
+const MAX_SEALED: usize = 3800;
 /// The longest `state` a client may send, which comes back in redirects.
 const MAX_STATE: usize = 1024;
 
@@ -117,24 +116,75 @@ pub struct Code {
     pub actor: String,
 }
 
-/// Waiting for the person to choose a provider to sign in with.
-struct Choosing {
-    request: Authorization,
+/// An authorization before anyone signed in: choosing a provider, then
+/// signing in there. Anyone may start one, so the server keeps none: it is
+/// sealed ([`Sealer`]) into what the browser brings back, the link it
+/// follows to choose, then a cookie of its own while at the provider, and
+/// the client's request is checked again at each step.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Pending {
+    /// The client's authorization request, as it sent it.
+    query: String,
     /// The hash of the browser's cookie.
     browser: String,
+    /// Until when it may go on (milliseconds since the epoch).
+    until: i64,
+    /// At a provider: its name (`github`, or an `[oidc.<name>]`), the
+    /// `state` it was sent, and this server's PKCE verifier and nonce there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<AtProvider>,
 }
 
-/// Signing in with a provider.
-struct Started {
-    request: Authorization,
-    /// The PKCE verifier of this server's code from the provider.
-    verifier: String,
-    /// The hash of the browser's cookie.
-    browser: String,
-    /// The provider's name: `github`, or an `[oidc.<name>]`.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct AtProvider {
     provider: String,
-    /// The nonce its ID token must carry (OIDC).
+    state: String,
+    verifier: String,
     nonce: String,
+}
+
+/// Seals what the browser carries between steps (ChaCha20-Poly1305, a key
+/// of this process's): what it brings back is what this server gave it,
+/// unread and unchanged, for the step it was given for.
+pub struct Sealer(ring::aead::LessSafeKey);
+
+impl Sealer {
+    fn new() -> Sealer {
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).expect("the system's random number generator");
+        let key = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &key).expect("a 32-byte key");
+        Sealer(ring::aead::LessSafeKey::new(key))
+    }
+
+    /// `value`, sealed for `step`: base64url of a random nonce and the ciphertext.
+    fn seal(&self, step: &str, value: &Pending) -> Result<String, Error> {
+        let mut nonce = [0u8; 12];
+        getrandom::getrandom(&mut nonce).map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+        let mut data = serde_json::to_vec(value)?;
+        let aad = ring::aead::Aad::from(step.as_bytes());
+        self.0
+            .seal_in_place_append_tag(ring::aead::Nonce::assume_unique_for_key(nonce), aad, &mut data)
+            .map_err(|_| Error::Io(std::io::Error::other("sealing a flow failed")))?;
+        Ok(URL_SAFE_NO_PAD.encode([&nonce[..], &data].concat()))
+    }
+
+    /// What [`Sealer::seal`] sealed for `step`, if `sealed` is that.
+    fn open(&self, step: &str, sealed: &str) -> Option<Pending> {
+        let bytes = URL_SAFE_NO_PAD.decode(sealed).ok()?;
+        let (nonce, data) = bytes.split_at_checked(12)?;
+        let nonce = ring::aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
+        let mut data = data.to_vec();
+        let plain = self.0.open_in_place(nonce, ring::aead::Aad::from(step.as_bytes()), &mut data).ok()?;
+        serde_json::from_slice(plain).ok()
+    }
+}
+
+/// The steps a [`Pending`] is sealed for.
+const CHOOSING: &str = "choose";
+const AT_PROVIDER: &str = "provider";
+
+fn now_millis() -> i64 {
+    bd_core::Timestamp::now().millis()
 }
 
 /// Waiting for a decision on the consent page.
@@ -151,8 +201,7 @@ struct Consent {
 /// Authorizations under way, by the hash of their secret at each step
 /// (`state` at GitHub, the consent id, the code); each taken once.
 pub struct Flows {
-    choosing: Kept<Choosing>,
-    started: Kept<Started>,
+    sealer: Sealer,
     consents: Kept<Consent>,
     codes: Kept<Code>,
     /// Codes redeemed, for [`CODE_TTL`] after: one sent again revokes the
@@ -162,6 +211,10 @@ pub struct Flows {
 
 /// A code redeemed.
 struct Spent {
+    /// Its client and PKCE challenge: only a client proving them by sending
+    /// it again has its token revoked.
+    client_id: String,
+    challenge: String,
     /// The id of the token it issued, once issued.
     token: Option<String>,
     /// Whether it was sent again.
@@ -184,8 +237,7 @@ pub enum Redeemed {
 impl Default for Flows {
     fn default() -> Flows {
         Flows {
-            choosing: Kept::new(STEP_TTL),
-            started: Kept::new(STEP_TTL),
+            sealer: Sealer::new(),
             consents: Kept::new(STEP_TTL),
             codes: Kept::new(CODE_TTL),
             spent: Kept::new(CODE_TTL),
@@ -194,28 +246,23 @@ impl Default for Flows {
 }
 
 impl Flows {
-    /// Sign-ins under way for `client`: choosing a provider, or at it.
-    fn under_way(&self, client: &str) -> usize {
-        let now = Instant::now();
-        let live = |until: &Instant| *until > now;
-        let choosing = self.choosing.map.values().filter(|(u, c)| live(u) && c.request.client.id == client).count();
-        let started = self.started.map.values().filter(|(u, s)| live(u) && s.request.client.id == client).count();
-        choosing + started
-    }
-
     /// Redeem `code`: what it stands for the first time, if it has not
     /// expired; after that, the token it issued.
-    pub fn redeem(&mut self, code: &str) -> Redeemed {
+    pub fn redeem(&mut self, code: &str, client_id: &str, verifier: &str) -> Redeemed {
         let key = auth::hash(code);
         if let Some((until, found)) = self.codes.take_entry(&key) {
-            self.spent.put(key, Spent { token: None, again: false, until });
+            let (client_id, challenge) = (found.client_id.clone(), found.challenge.clone());
+            self.spent.put(key, Spent { client_id, challenge, token: None, again: false, until });
             return Redeemed::Fresh(Box::new(found));
         }
         match self.spent.get_mut(&key) {
-            Some(spent) => {
+            // Its own client sending it again (RFC 6749 section 4.1.2): whoever redeemed it first is not to be trusted.
+            Some(spent) if spent.client_id == client_id && s256(verifier) == spent.challenge => {
                 spent.again = true;
                 Redeemed::Again(spent.token.clone())
             }
+            // Anyone else who saw the code may not end the session it started.
+            Some(_) => Redeemed::Again(None),
             None => Redeemed::Unknown,
         }
     }
@@ -275,19 +322,6 @@ impl<T> Kept<T> {
             self.map.remove(&oldest.unwrap_or_default());
         }
         self.map.insert(key, (until, value));
-    }
-
-    /// [`Kept::put`], unless [`MAX_FLOWS`] are kept and none has expired.
-    fn put_new(&mut self, key: String, value: T) -> bool {
-        if self.map.len() >= MAX_FLOWS {
-            let now = Instant::now();
-            self.map.retain(|_, (until, _)| *until > now);
-            if self.map.len() >= MAX_FLOWS {
-                return false;
-            }
-        }
-        self.put(key, value);
-        true
     }
 
     fn take(&mut self, key: &str) -> Option<T> {
@@ -520,111 +554,128 @@ fn valid_challenge(c: &str) -> bool {
     c.len() == 43 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// `GET <issuer>/oauth/authorize?<query>`: check the request, and send the
-/// browser to GitHub to sign in. `browser` is its cookie, if it has one;
-/// the `Set-Cookie` value to answer with comes back with the answer.
-pub fn begin(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Option<String>) {
-    let (sign_in, oauth_config) = match oauth::load(cx.root) {
-        Ok(Some(g)) => match g.oauth.clone() {
-            Some(o) => (g, o),
-            None => return (refused(404, NO_APPS), None),
-        },
-        Ok(None) => return (refused(404, NO_APPS), None),
-        Err(e) => return (internal(&e, "reading auth.toml for an authorization"), None),
-    };
-    let params = match parse(query) {
-        Ok(p) => p,
-        Err(answer) => return (answer, None),
-    };
+/// The authorization request `query`, checked: its client found, its
+/// redirect URI and parameters as `[oauth]` allows. At each step before a
+/// sign-in, as no step keeps it.
+fn request_of(cx: &Ctx<'_>, oauth_config: &OauthConfig, query: &str) -> Result<Authorization, Answer> {
+    let params = parse(query)?;
     let client = match clients::lookup(cx.root, cx.documents, &params.client_id) {
         Ok(c) => c,
         Err(Error::Invalid(why) | Error::Remote(why)) => {
             tracing::info!(target: "bd::serve", client = %params.client_id, error = %why, "OAuth client refused");
-            let why = "This application isn't set up to connect to this server.";
-            return (refused(400, why), None);
+            return Err(refused(400, "This application isn't set up to connect to this server."));
         }
-        Err(Error::Busy(_)) => return (refused(503, "The server is busy. Try again in a moment."), None),
-        Err(e) => return (internal(&e, "looking up an OAuth client"), None),
+        Err(Error::Busy(_)) => return Err(refused(503, "The server is busy. Try again in a moment.")),
+        Err(e) => return Err(internal(&e, "looking up an OAuth client")),
     };
-    let request = match check(params, client, &oauth_config, cx.issuer) {
+    check(params, client, oauth_config, cx.issuer)
+}
+
+/// Sign-in settings with `[oauth]`, or the page to answer with.
+fn oauth_settings(cx: &Ctx<'_>) -> Result<(oauth::SignIn, OauthConfig), Answer> {
+    match oauth::load(cx.root) {
+        Ok(Some(g)) => match g.oauth.clone() {
+            Some(o) => Ok((g, o)),
+            None => Err(refused(404, NO_APPS)),
+        },
+        Ok(None) => Err(refused(404, NO_APPS)),
+        Err(e) => Err(internal(&e, "reading auth.toml for an authorization")),
+    }
+}
+
+/// `GET <issuer>/oauth/authorize?<query>`: check the request, and send the
+/// browser to the provider to sign in, or to a page choosing one. `browser`
+/// is its cookie, if it has one; the `Set-Cookie` values to answer with
+/// come back with the answer.
+pub fn begin(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Vec<String>) {
+    let (sign_in, oauth_config) = match oauth_settings(cx) {
+        Ok(s) => s,
+        Err(answer) => return (answer, Vec::new()),
+    };
+    let request = match request_of(cx, &oauth_config, query) {
         Ok(r) => r,
-        Err(answer) => return (answer, None),
+        Err(answer) => return (answer, Vec::new()),
     };
     let browser = match browser {
         Some(b) => b.to_string(),
         None => match auth::random_hex(32) {
             Ok(b) => b,
-            Err(e) => return (internal(&e, "starting an authorization"), None),
+            Err(e) => return (internal(&e, "starting an authorization"), Vec::new()),
         },
     };
-    if lock(cx.flows).under_way(&request.client.id) >= MAX_FLOWS_PER_CLIENT {
-        tracing::warn!(target: "bd::serve", client = %request.client.id, "OAuth sign-in refused: {MAX_FLOWS_PER_CLIENT} are under way for its client");
-        return (refused(503, "Too many sign-ins are in progress for this application. Try again in a moment."), None);
-    }
     let providers = sign_in.browser_providers();
     match providers.as_slice() {
-        [] => (refused(404, NO_APPS), None),
-        [(provider, _)] => start(cx, &sign_in, request, provider, &browser),
+        [] => (refused(404, NO_APPS), Vec::new()),
+        [(provider, _)] => start(cx, &sign_in, request, query, provider, &browser),
         several => {
-            let id = match auth::random_hex(32) {
-                Ok(id) => id,
-                Err(e) => return (internal(&e, "starting an authorization"), None),
+            let pending = Pending { query: query.to_string(), browser: auth::hash(&browser), until: until(), at: None };
+            let flow = match lock(cx.flows).sealer.seal(CHOOSING, &pending) {
+                Ok(f) => f,
+                Err(e) => return (internal(&e, "starting an authorization"), Vec::new()),
             };
             let client = client_name(&request.client);
             let options: Vec<(String, String)> = several
                 .iter()
                 .map(|(name, label)| {
-                    let query = form::encode(&[("flow", id.as_str()), ("provider", name)]);
+                    let query = form::encode(&[("flow", flow.as_str()), ("provider", name)]);
                     (label.to_string(), format!("{}{CHOOSE}?{query}", cx.issuer))
                 })
                 .collect();
-            let choosing = Choosing { request, browser: auth::hash(&browser) };
-            if !lock(cx.flows).choosing.put_new(auth::hash(&id), choosing) {
-                tracing::warn!(target: "bd::serve", "OAuth sign-in refused: {MAX_FLOWS} are under way");
-                return (refused(503, "Too many sign-ins are in progress. Try again in a moment."), None);
-            }
-            (Answer::Page(pages::choose(&client, &options)), Some(set_cookie(cx.issuer, &browser)))
+            (Answer::Page(pages::choose(&client, &options)), vec![set_cookie(cx.issuer, &browser)])
         }
     }
 }
 
-/// `GET <issuer>/oauth/choose?flow=<id>&provider=<name>`: the person chose
-/// a provider on the page [`begin`] showed; on to it.
-pub fn choose(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Option<String>) {
+/// When a step started now must be done by.
+fn until() -> i64 {
+    now_millis() + i64::try_from(STEP_TTL.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// `GET <issuer>/oauth/choose?flow=<sealed>&provider=<name>`: the person
+/// chose a provider on the page [`begin`] showed; on to it.
+pub fn choose(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Vec<String>) {
     let pairs = form::decode(query).unwrap_or_default();
     let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-    let choosing = get("flow").and_then(|flow| lock(cx.flows).choosing.take(&auth::hash(flow)));
-    let Some(Choosing { request, browser: chose_in }) = choosing else {
-        return (refused(400, "This sign-in has expired. Start again from the application."), None);
+    let pending = get("flow").and_then(|flow| lock(cx.flows).sealer.open(CHOOSING, flow));
+    let Some(pending) = pending.filter(|p| p.until > now_millis()) else {
+        return (refused(400, "This sign-in has expired. Start again from the application."), Vec::new());
     };
-    let Some(browser) = browser.filter(|b| auth::hash(b) == chose_in) else {
-        return (refused(400, "This sign-in started in a different browser. Start again from the application."), None);
+    let Some(browser) = browser.filter(|b| auth::hash(b) == pending.browser) else {
+        return (
+            refused(400, "This sign-in started in a different browser. Start again from the application."),
+            Vec::new(),
+        );
     };
-    let sign_in = match oauth::load(cx.root) {
-        Ok(Some(s)) if s.oauth.is_some() => s,
-        Ok(_) => return (refused(404, NO_APPS), None),
-        Err(e) => return (internal(&e, "reading auth.toml for an authorization"), None),
+    let (sign_in, oauth_config) = match oauth_settings(cx) {
+        Ok(s) => s,
+        Err(answer) => return (answer, Vec::new()),
     };
     let offered = sign_in.browser_providers();
     let Some((provider, _)) = offered.iter().find(|(name, _)| Some(*name) == get("provider")) else {
-        return (refused(400, MALFORMED), None);
+        return (refused(400, MALFORMED), Vec::new());
     };
-    start(cx, &sign_in, request, provider, browser)
+    let request = match request_of(cx, &oauth_config, &pending.query) {
+        Ok(r) => r,
+        Err(answer) => return (answer, Vec::new()),
+    };
+    start(cx, &sign_in, request, &pending.query, provider, browser)
 }
 
-/// Send the browser to `provider` to sign in for `request`, binding the
-/// sign-in to `browser` (the cookie's value).
+/// Send the browser to `provider` to sign in for `request` (`query`, as the
+/// client sent it), binding the sign-in to `browser` (the cookie's value):
+/// what it comes back for is sealed into a cookie of the flow's own.
 fn start(
     cx: &Ctx<'_>,
     sign_in: &oauth::SignIn,
     request: Authorization,
+    query: &str,
     provider: &str,
     browser: &str,
-) -> (Answer, Option<String>) {
-    let secrets = (|| Ok::<_, Error>((auth::random_hex(32)?, auth::random_hex(32)?, auth::random_hex(32)?)))();
+) -> (Answer, Vec<String>) {
+    let secrets = (|| Ok::<_, Error>((auth::random_hex(16)?, auth::random_hex(32)?, auth::random_hex(16)?)))();
     let (state, verifier, nonce) = match secrets {
         Ok(s) => s,
-        Err(e) => return (internal(&e, "starting an authorization"), None),
+        Err(e) => return (internal(&e, "starting an authorization"), Vec::new()),
     };
     let callback = format!("{}{}", cx.issuer, super::callback(provider));
     let url = match (provider, &sign_in.github, sign_in.oidc(provider)) {
@@ -636,17 +687,44 @@ fn start(
                 let link = request.error_url(cx.issuer, "temporarily_unavailable", "the provider could not be reached");
                 let why = "It didn't respond as expected. Try again in a moment.";
                 let title = format!("Couldn't reach {}", oidc.label);
-                return (Answer::Page(pages::refusal(502, &title, why, Some(&link))), None);
+                return (Answer::Page(pages::refusal(502, &title, why, Some(&link))), Vec::new());
             }
         },
-        _ => return (refused(404, NO_APPS), None),
+        _ => return (refused(404, NO_APPS), Vec::new()),
     };
-    let started = Started { request, verifier, browser: auth::hash(browser), provider: provider.to_string(), nonce };
-    if !lock(cx.flows).started.put_new(auth::hash(&state), started) {
-        tracing::warn!(target: "bd::serve", "OAuth sign-in refused: {MAX_FLOWS} are under way");
-        return (refused(503, "Too many sign-ins are in progress. Try again in a moment."), None);
+    let at = AtProvider { provider: provider.to_string(), state: state.clone(), verifier, nonce };
+    let pending = Pending { query: query.to_string(), browser: auth::hash(browser), until: until(), at: Some(at) };
+    let sealed = match lock(cx.flows).sealer.seal(AT_PROVIDER, &pending) {
+        Ok(s) => s,
+        Err(e) => return (internal(&e, "starting an authorization"), Vec::new()),
+    };
+    if sealed.len() > MAX_SEALED {
+        tracing::info!(target: "bd::serve", client = %request.client.id, "OAuth sign-in refused: its request is too long to carry");
+        return (refused(400, MALFORMED), Vec::new());
     }
-    (Answer::Redirect(url), Some(set_cookie(cx.issuer, browser)))
+    let cookies = vec![set_cookie(cx.issuer, browser), set_flow_cookie(cx.issuer, &state, &sealed, STEP_TTL)];
+    (Answer::Redirect(url), cookies)
+}
+
+/// The name of the cookie carrying the flow sent to a provider with `state`.
+fn flow_cookie_name(issuer: &str, state: &str) -> String {
+    let prefix = if issuer.starts_with("https://") { "__Secure-" } else { "" };
+    format!("{prefix}bd_flow_{}", &auth::hash(state)[..16])
+}
+
+/// The `Set-Cookie` value giving the browser the flow `sealed`, sent back to
+/// the provider callbacks for as long as `lasts` (zero: removed).
+fn set_flow_cookie(issuer: &str, state: &str, sealed: &str, lasts: Duration) -> String {
+    let secure = if issuer.starts_with("https://") { "; Secure" } else { "" };
+    let path = format!("{}/oauth", path_of(issuer));
+    let name = flow_cookie_name(issuer, state);
+    format!("{name}={sealed}; Path={path}; Max-Age={}; HttpOnly; SameSite=Lax{secure}", lasts.as_secs())
+}
+
+/// The flow the browser carries for `state` in its `Cookie` headers (joined with `;`).
+fn flow_cookie<'h>(issuer: &str, headers: &'h str, state: &str) -> Option<&'h str> {
+    let wanted = flow_cookie_name(issuer, state);
+    headers.split(';').filter_map(|c| c.trim().split_once('=')).find(|(name, _)| *name == wanted).map(|(_, v)| v)
 }
 
 /// What the pages call a client: its name, else its document's host.
@@ -692,10 +770,19 @@ pub fn relay(cx: &Ctx<'_>, provider: &str, body: &str) -> Answer {
 /// browser back. Find out who signed in and what the rules or the
 /// authorizer let the account do in the workspace, and ask whether the
 /// client may.
-pub fn callback(cx: &Ctx<'_>, provider: &str, query: &str, browser: Option<&str>) -> (Answer, Option<String>) {
+pub fn callback(
+    cx: &Ctx<'_>,
+    provider: &str,
+    query: &str,
+    browser: Option<&str>,
+    cookies: &str,
+) -> (Answer, Vec<String>) {
     let mut fresh = None;
-    let answer = signed_in(cx, provider, query, browser, &mut fresh);
-    (answer, fresh)
+    let answer = signed_in(cx, provider, query, browser, cookies, &mut fresh);
+    // The flow's cookie has served: gone, whatever came of it.
+    let state = form::decode(query).unwrap_or_default().into_iter().find(|(k, _)| k == "state").map(|(_, v)| v);
+    let gone = state.map(|state| set_flow_cookie(cx.issuer, &state, "", Duration::ZERO));
+    (answer, fresh.into_iter().chain(gone).collect())
 }
 
 /// [`callback`]'s answer. Once the person signed in, the browser gets a
@@ -703,23 +790,39 @@ pub fn callback(cx: &Ctx<'_>, provider: &str, query: &str, browser: Option<&str>
 /// consent is bound to: a cookie known or planted before the sign-in is good
 /// for nothing after it, and other sign-ins under way in the same browser
 /// keep theirs.
-fn signed_in(cx: &Ctx<'_>, provider: &str, query: &str, browser: Option<&str>, fresh: &mut Option<String>) -> Answer {
+fn signed_in(
+    cx: &Ctx<'_>,
+    provider: &str,
+    query: &str,
+    browser: Option<&str>,
+    cookies: &str,
+    fresh: &mut Option<String>,
+) -> Answer {
     let pairs = form::decode(query).unwrap_or_default();
     let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-    let started = get("state").and_then(|state| lock(cx.flows).started.take(&auth::hash(state)));
-    let Some(Started { request, verifier, browser: started_in, provider: started_with, nonce }) = started else {
+    // The flow the browser carries for the state the provider sent back; a provider's code is used once, so a
+    // flow brought back twice gets no second account.
+    let state = get("state").unwrap_or_default();
+    let pending =
+        flow_cookie(cx.issuer, cookies, state).and_then(|sealed| lock(cx.flows).sealer.open(AT_PROVIDER, sealed));
+    let pending = pending.filter(|p| p.until > now_millis() && p.at.as_ref().is_some_and(|at| at.state == state));
+    let Some(Pending { query: requested, browser: started_in, at: Some(at), .. }) = pending else {
         return refused(400, "This sign-in has expired. Start again from the application.");
     };
+    let AtProvider { provider: started_with, verifier, nonce, .. } = at;
     if browser.map(auth::hash).as_deref() != Some(started_in.as_str()) {
         return refused(400, "This sign-in started in a different browser. Start again from the application.");
     }
     if started_with != provider {
         return refused(400, "This sign-in came back from another provider. Start again from the application.");
     }
-    let sign_in = match oauth::load(cx.root) {
-        Ok(Some(s)) if s.oauth.is_some() => s,
-        Ok(_) => return refused(404, NO_APPS),
-        Err(e) => return internal(&e, "reading auth.toml for an authorization"),
+    let (sign_in, oauth_config) = match oauth_settings(cx) {
+        Ok(s) => s,
+        Err(answer) => return answer,
+    };
+    let request = match request_of(cx, &oauth_config, &requested) {
+        Ok(r) => r,
+        Err(answer) => return answer,
     };
     let label = match (provider, sign_in.oidc(provider)) {
         ("github", _) => "GitHub".to_string(),
@@ -858,13 +961,24 @@ fn signed_in(cx: &Ctx<'_>, provider: &str, query: &str, browser: Option<&str>, f
 pub fn decide(cx: &Ctx<'_>, body: &str, cookies: &str) -> Answer {
     let pairs = form::decode(body).unwrap_or_default();
     let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
-    let consent = get("consent").and_then(|id| lock(cx.flows).consents.take(&auth::hash(id)));
-    let Some(Consent { request, admitted, actor, browser: started_in, cookie }) = consent else {
+    // Taken only by the browser it is bound to: another one that learned its id must not end it.
+    let key = get("consent").map(auth::hash);
+    let consent = {
+        let mut flows = lock(cx.flows);
+        let bound = |c: &Consent| {
+            consent_cookie(cx.issuer, cookies, &c.cookie).map(auth::hash).as_deref() == Some(c.browser.as_str())
+        };
+        match key.as_ref().and_then(|k| flows.consents.get_mut(k).map(|c| bound(c))) {
+            None => None,
+            Some(false) => {
+                return refused(400, "This request started in a different browser. Start again from the application.");
+            }
+            Some(true) => key.as_ref().and_then(|k| flows.consents.take(k)),
+        }
+    };
+    let Some(Consent { request, admitted, actor, .. }) = consent else {
         return refused(400, "This request has expired. Start again from the application.");
     };
-    if consent_cookie(cx.issuer, cookies, &cookie).map(auth::hash).as_deref() != Some(started_in.as_str()) {
-        return refused(400, "This request started in a different browser. Start again from the application.");
-    }
     // `[oauth]` may have changed since the request was checked: the browser
     // goes back only where it allows now (RFC 9700 section 4.11).
     match oauth::load(cx.root) {
@@ -968,6 +1082,7 @@ pub fn sample_code() -> Code {
             by_login: true,
             unknown: vec![],
             email: None,
+            rule: None,
         },
         actor: "alice".into(),
     }
@@ -987,6 +1102,8 @@ mod tests {
 
     const ISSUER: &str = "https://bd.example.com/bd";
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    /// The verifier of [`CHALLENGE`] (RFC 7636 appendix B).
+    const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
 
     fn client() -> Client {
         Client {
@@ -1000,7 +1117,12 @@ mod tests {
     }
 
     fn oauth() -> OauthConfig {
-        OauthConfig { redirect_hosts: vec!["app.example".into()], loopback_redirects: false }
+        OauthConfig {
+            redirect_hosts: vec!["app.example".into()],
+            redirect_uris: vec![],
+            loopback_redirects: false,
+            registration: true,
+        }
     }
 
     fn query(extra: &[(&str, &str)]) -> String {
@@ -1070,7 +1192,12 @@ mod tests {
         ] {
             assert_eq!(page_status(checked(&q).unwrap_err()), 400, "{q}");
         }
-        let allowed = OauthConfig { redirect_hosts: vec![], loopback_redirects: false };
+        let allowed = OauthConfig {
+            redirect_hosts: vec![],
+            redirect_uris: vec![],
+            loopback_redirects: false,
+            registration: true,
+        };
         let answer = check(parse(&query(&[])).unwrap(), client(), &allowed, ISSUER).unwrap_err();
         assert_eq!(page_status(answer), 400, "registered, but no longer allowed");
     }
@@ -1119,16 +1246,22 @@ mod tests {
         assert_eq!(kept.map.len(), MAX_FLOWS);
         assert_eq!(kept.take("0"), None, "the oldest went first");
         assert_eq!(kept.take(&(MAX_FLOWS + 9).to_string()), Some(MAX_FLOWS + 9));
-        // New sign-ins wait for room instead.
-        assert!(kept.put_new("new".into(), 0));
-        assert!(!kept.put_new("newer".into(), 0));
-        assert_eq!(kept.take("10"), Some(10), "kept, until it expires or is taken");
-        assert!(kept.put_new("newer".into(), 0));
-        let mut expiring = Kept::new(Duration::ZERO);
-        for i in 0..MAX_FLOWS {
-            expiring.put(i.to_string(), i);
-        }
-        assert!(expiring.put_new("new".into(), 0), "the expired make room");
+    }
+
+    #[test]
+    fn flows_before_a_sign_in_are_sealed_for_their_step() {
+        let sealer = Sealer::new();
+        let at = AtProvider { provider: "github".into(), state: "s".into(), verifier: "v".into(), nonce: "n".into() };
+        let pending = Pending { query: "client_id=x".into(), browser: "b".into(), until: 1, at: Some(at) };
+        let sealed = sealer.seal(AT_PROVIDER, &pending).unwrap();
+        assert!(!sealed.contains("client_id") && !sealed.contains("github"), "unread: {sealed}");
+        assert_eq!(sealer.open(AT_PROVIDER, &sealed), Some(pending));
+        assert_eq!(sealer.open(CHOOSING, &sealed), None, "for its own step only");
+        assert_eq!(Sealer::new().open(AT_PROVIDER, &sealed), None, "this process's key only");
+        let mut changed = URL_SAFE_NO_PAD.decode(&sealed).unwrap();
+        *changed.last_mut().unwrap() ^= 1;
+        assert_eq!(sealer.open(AT_PROVIDER, &URL_SAFE_NO_PAD.encode(changed)), None, "unchanged");
+        assert_eq!(sealer.open(AT_PROVIDER, "AAAA"), None);
     }
 
     #[test]
@@ -1183,30 +1316,39 @@ mod tests {
     fn codes_are_redeemed_once_and_a_code_sent_again_names_its_token() {
         let code = sample_code();
         let mut flows = Flows::default();
+        let redeem = |flows: &mut Flows, c: &str| flows.redeem(c, "bdc_1", VERIFIER);
         flows.codes.put(auth::hash("c1"), code.clone());
-        assert!(matches!(flows.redeem("c1"), Redeemed::Fresh(_)));
+        assert!(matches!(redeem(&mut flows, "c1"), Redeemed::Fresh(_)));
         assert!(!flows.issued("c1", "t1"));
-        assert!(matches!(flows.redeem("c1"), Redeemed::Again(Some(t)) if t == "t1"));
-        assert!(matches!(flows.redeem("c2"), Redeemed::Unknown));
+        assert!(matches!(redeem(&mut flows, "c1"), Redeemed::Again(Some(t)) if t == "t1"));
+        assert!(matches!(redeem(&mut flows, "c2"), Redeemed::Unknown));
         // Sent again while its token was being issued: that token must go.
         flows.codes.put(auth::hash("c3"), code.clone());
-        assert!(matches!(flows.redeem("c3"), Redeemed::Fresh(_)));
-        assert!(matches!(flows.redeem("c3"), Redeemed::Again(None)));
+        assert!(matches!(redeem(&mut flows, "c3"), Redeemed::Fresh(_)));
+        assert!(matches!(redeem(&mut flows, "c3"), Redeemed::Again(None)));
         assert!(flows.issued("c3", "t3"));
         // Undone, as no token was issued: good again, until it would have expired.
         flows.codes.put(auth::hash("c4"), code.clone());
         let until = flows.codes.map[&auth::hash("c4")].0;
-        assert!(matches!(flows.redeem("c4"), Redeemed::Fresh(_)));
+        assert!(matches!(redeem(&mut flows, "c4"), Redeemed::Fresh(_)));
         flows.unredeem("c4", code.clone());
         assert_eq!(flows.codes.map[&auth::hash("c4")].0, until);
-        assert!(matches!(flows.redeem("c4"), Redeemed::Fresh(_)));
+        assert!(matches!(redeem(&mut flows, "c4"), Redeemed::Fresh(_)));
         // Not once sent again, nor once it issued a token.
         flows.unredeem("c3", code.clone());
-        assert!(matches!(flows.redeem("c3"), Redeemed::Again(Some(t)) if t == "t3"));
+        assert!(matches!(redeem(&mut flows, "c3"), Redeemed::Again(Some(t)) if t == "t3"));
         flows.codes.put(auth::hash("c5"), code.clone());
-        assert!(matches!(flows.redeem("c5"), Redeemed::Fresh(_)));
-        assert!(matches!(flows.redeem("c5"), Redeemed::Again(None)));
-        flows.unredeem("c5", code);
-        assert!(matches!(flows.redeem("c5"), Redeemed::Again(None)));
+        assert!(matches!(redeem(&mut flows, "c5"), Redeemed::Fresh(_)));
+        assert!(matches!(redeem(&mut flows, "c5"), Redeemed::Again(None)));
+        flows.unredeem("c5", code.clone());
+        assert!(matches!(redeem(&mut flows, "c5"), Redeemed::Again(None)));
+        // Sent again by someone who saw it, without its client's verifier: its token stays.
+        flows.codes.put(auth::hash("c6"), code);
+        assert!(matches!(redeem(&mut flows, "c6"), Redeemed::Fresh(_)));
+        assert!(!flows.issued("c6", "t6"));
+        let other_verifier = "x".repeat(43);
+        assert!(matches!(flows.redeem("c6", "bdc_1", &other_verifier), Redeemed::Again(None)));
+        assert!(matches!(flows.redeem("c6", "bdc_other", VERIFIER), Redeemed::Again(None)));
+        assert!(matches!(redeem(&mut flows, "c6"), Redeemed::Again(Some(t)) if t == "t6"), "its own client: revoked");
     }
 }

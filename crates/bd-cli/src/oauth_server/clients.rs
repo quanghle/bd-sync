@@ -169,7 +169,13 @@ pub fn register(root: &Path, oauth: &OauthConfig, request: &[u8]) -> Result<std:
         issued_at: now,
         used_at: None,
     };
-    change(root, |clients| {
+    let event = server_db::AuthEvent {
+        kind: "client_registered",
+        client: Some(client.client_id.clone()),
+        detail: client.client_name.clone(),
+        ..server_db::AuthEvent::default()
+    };
+    change_noting(root, Some(event), |clients| {
         clients.retain(|c| match c.used_at {
             Some(at) => now.since(at) < millis(IDLE_FOR),
             None => now.since(c.issued_at) < millis(UNUSED_FOR),
@@ -349,8 +355,20 @@ fn load(conn: &rusqlite::Connection) -> Result<Vec<Registered>> {
 /// Change the registered clients with `f`, in one transaction: the rows it
 /// added, changed or dropped are written if it succeeds, nothing if not.
 fn change<T>(root: &Path, f: impl FnOnce(&mut Vec<Registered>) -> Result<T>) -> Result<T> {
+    change_noting(root, None, f)
+}
+
+/// [`change`], recording `event` for the audit trail with it.
+fn change_noting<T>(
+    root: &Path,
+    event: Option<server_db::AuthEvent>,
+    f: impl FnOnce(&mut Vec<Registered>) -> Result<T>,
+) -> Result<T> {
     let mut conn = server_db::open(root)?;
     server_db::write(root, &mut conn, |tx| {
+        if let Some(event) = &event {
+            server_db::record(tx, event)?;
+        }
         let before = load(tx)?;
         let mut clients = before.clone();
         let out = f(&mut clients)?;
@@ -421,7 +439,12 @@ mod tests {
     }
 
     fn oauth() -> OauthConfig {
-        OauthConfig { redirect_hosts: vec!["chatgpt.com".into(), "claude.ai".into()], loopback_redirects: true }
+        OauthConfig {
+            redirect_hosts: vec!["chatgpt.com".into(), "claude.ai".into()],
+            redirect_uris: vec![],
+            loopback_redirects: true,
+            registration: true,
+        }
     }
 
     fn register_json(root: &Path, request: Value) -> std::result::Result<Value, Refusal> {
@@ -459,7 +482,12 @@ mod tests {
         assert!(!client.redirects_to("http://127.0.0.1:51000/cb2", &oauth()), "the path exactly");
         assert!(!client.redirects_to("http://localhost:33418/cb", &oauth()), "the host exactly");
         assert!(!client.redirects_to("https://chatgpt.com/connector_platform_oauth_redirect", &oauth()), "its own");
-        let narrower = OauthConfig { redirect_hosts: vec!["chatgpt.com".into()], loopback_redirects: false };
+        let narrower = OauthConfig {
+            redirect_hosts: vec!["chatgpt.com".into()],
+            redirect_uris: vec![],
+            loopback_redirects: false,
+            registration: true,
+        };
         assert!(!client.redirects_to("https://claude.ai/api/mcp/auth_callback", &narrower), "as auth.toml is now");
         let e = lookup(root.path(), &documents, "bdc_nope").unwrap_err().to_string();
         assert!(e.contains("no such client"), "{e}");

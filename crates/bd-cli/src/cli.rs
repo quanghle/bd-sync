@@ -1324,6 +1324,54 @@ pub enum TokenCommand {
     Accounts(TokenRootArgs),
     /// Revoke an access token, or every token an account got by signing in; it stops working at once
     Revoke(TokenRevokeArgs),
+    /// The audit trail of sign-ins, tokens created, refreshed and revoked, accounts forgotten and clients
+    /// registered (kept 90 days)
+    Events(TokenEventsArgs),
+    /// Bind an account to the actor of another account (one person signing in with several providers); the
+    /// account's tokens are revoked, and its next sign-in acts as that actor
+    Link(TokenLinkArgs),
+    /// Name an account for admins (its actor may be a pseudonym such as apple:u-3f9a2c1e7b04)
+    Name(TokenNameArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TokenNameArgs {
+    /// The account: its actor, or its login
+    pub account: String,
+    /// What to call it (plain text, up to 64 characters)
+    #[arg(required_unless_present = "clear")]
+    pub name: Option<String>,
+    /// Remove its name instead
+    #[arg(long, conflicts_with = "name")]
+    pub clear: bool,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TokenLinkArgs {
+    /// The account to bind: its actor, or its login
+    pub account: String,
+    /// The actor of the account it joins, e.g. github:alice
+    #[arg(long, value_name = "ACTOR")]
+    pub to: String,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct TokenEventsArgs {
+    /// Only events this recent (e.g. 1h, 7d; default all kept)
+    #[arg(long, value_name = "DURATION")]
+    pub since: Option<String>,
+    /// Only this actor's, and its sub-actors'
+    #[arg(long, value_name = "ACTOR")]
+    pub actor: Option<String>,
+    /// At most this many, the latest
+    #[arg(long, default_value_t = 100)]
+    pub limit: usize,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
 }
 
 #[derive(Args, Debug, Clone)]

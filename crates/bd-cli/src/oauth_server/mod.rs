@@ -23,8 +23,35 @@ pub const TOKEN: &str = "/oauth/token";
 pub const REGISTER: &str = "/oauth/register";
 pub const REVOKE: &str = "/oauth/revoke";
 /// Where GitHub sends people back to after its web sign-in: the callback
-/// URL of the GitHub App.
+/// URL of the GitHub App. Each provider has its own: [`callback`].
 pub const CALLBACK: &str = "/oauth/github/callback";
+/// Where the page offering several providers sends the person's choice.
+pub const CHOOSE: &str = "/oauth/choose";
+
+/// Where `provider` sends people back to after signing in, under the
+/// issuer: its client's redirect URI there (`/oauth/github/callback` for
+/// the GitHub App).
+pub fn callback(provider: &str) -> String {
+    format!("/oauth/{provider}/callback")
+}
+
+/// The provider whose callback `path` (under the issuer) is, if it is one.
+pub fn callback_provider(path: &str) -> Option<&str> {
+    let name = path.strip_prefix("/oauth/")?.strip_suffix("/callback")?;
+    let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+    (!name.is_empty() && name.len() <= 32 && name.chars().all(plain)).then_some(name)
+}
+/// Where providers post their account notifications (Apple's server-to-server
+/// notifications): `/oauth/<provider>/events`, all routed here.
+pub const EVENTS: &str = "/oauth/events";
+
+/// The provider whose account notifications `path` (under the issuer) takes, if it does.
+pub fn events_provider(path: &str) -> Option<&str> {
+    let name = path.strip_prefix("/oauth/")?.strip_suffix("/events")?;
+    let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+    (!name.is_empty() && name.len() <= 32 && name.chars().all(plain)).then_some(name)
+}
+
 /// Where the consent page posts its decision.
 pub const CONSENT: &str = "/oauth/consent";
 

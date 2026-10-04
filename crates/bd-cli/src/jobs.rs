@@ -837,7 +837,7 @@ mod tests {
     fn workspaces_are_found_by_their_database() {
         let root = root_with(&["proj", "other.v2", ".hidden"]);
         std::fs::create_dir_all(root.path().join("empty").join(".bd")).unwrap();
-        std::fs::write(root.path().join("tokens.json"), b"[]").unwrap();
+        std::fs::write(root.path().join("server.db"), b"").unwrap();
         let names: Vec<String> = discover(root.path()).unwrap().into_iter().map(|w| w.name).collect();
         assert_eq!(names, ["other.v2", "proj"]);
         assert!(discover(&root.path().join("missing")).is_err());

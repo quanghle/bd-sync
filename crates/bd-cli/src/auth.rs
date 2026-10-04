@@ -1,7 +1,7 @@
 //! Access tokens for `bd serve`: who may call, as which actor, with which
 //! role, and whether a person or an agent holds it.
 //!
-//! Tokens live in `<root>/tokens.json` (mode 0600 on Unix), which stores
+//! Tokens live in `<root>/server.db` (`server_db.rs`), which stores
 //! only the SHA-256 of each secret. `bd serve token create` prints a secret
 //! once; GitHub sign-in (`oauth.rs`) issues tokens that expire, recording
 //! the GitHub account, and with a GitHub App a refresh secret
@@ -10,19 +10,19 @@
 //! sub-actors (one per agent), so claims and leases keep meaning "this
 //! caller". Its role and kind become the request's [`bd_core::Policy`]:
 //! only admins end or take over other actors' claims, and only human tokens
-//! open human gates. Whoever changes the file holds `<root>/tokens.lock`,
+//! open human gates. Each change is one write transaction ([`change`]),
 //! since the server issues tokens while an admin may create or revoke others.
 //!
-//! The file also binds each GitHub account that signed in to its actor, its
-//! login at its first sign-in (`accounts`): the account keeps that actor
-//! when its login changes, and no other principal gets it, even once the
-//! account's tokens are gone, until an admin releases it (`revoke --github
-//! <login> --forget`).
+//! The file also binds each account that signed in (by its provider's
+//! issuer and subject) to its actor, its login at its first sign-in
+//! (`accounts`): the account keeps that actor when its login changes, and
+//! no other principal gets it, even once the account's tokens are gone,
+//! until an admin releases it (`revoke --account <login> --forget`).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 use bd_core::{Error, Result, Timestamp};
 use clap::ValueEnum;
@@ -33,12 +33,11 @@ use sha2::{Digest, Sha256};
 use crate::app::{App, Out};
 use crate::cli::{TokenCommand, TokenCreateArgs, TokenRevokeArgs, TokenRootArgs};
 use crate::protocol::valid_workspace_name;
+use crate::server_db;
 
-/// Expired tokens from GitHub sign-in stay listed this long, then are
-/// dropped from the file when a token is added.
+/// Tokens stay listed this long after they end (revoked, or a sign-in's
+/// expired and no longer refreshed), then are deleted at the next write.
 const PRUNE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
-/// How long a change of `tokens.json` waits for another one to finish.
-const LOCK_WAIT: Duration = Duration::from_secs(10);
 
 /// What a token may do. Each role includes the ones before it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
@@ -81,7 +80,7 @@ impl Kind {
     }
 }
 
-/// One entry of `tokens.json`.
+/// An access token, as `server.db` keeps it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Token {
     /// Stable id, recorded with each request (the principal).
@@ -100,9 +99,9 @@ pub struct Token {
     /// When the token stops working: set on tokens from GitHub sign-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<Timestamp>,
-    /// The GitHub account that signed in for the token.
+    /// The account that signed in for the token.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub github: Option<GithubUser>,
+    pub identity: Option<Identity>,
     /// The most issues its actor and sub-actors may hold, claimed or reserved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_claims: Option<u32>,
@@ -135,6 +134,10 @@ pub struct Refresh {
     /// The workspace the account signed in for: refreshes apply the rules for it.
     pub workspace: String,
     pub refreshed_at: Timestamp,
+    /// When the rules or the authorizer last decided about it (its sign-in,
+    /// or a refresh they allowed): a refresh kept while the authorizer
+    /// cannot answer does not move it.
+    pub decided_at: Timestamp,
     /// Until when it may be refreshed, as of its latest refresh.
     pub until: Timestamp,
     /// The latest refresh, which a client whose answer was lost may send
@@ -173,25 +176,52 @@ fn refresh_secret(family: &str) -> Result<String> {
     Ok(format!("bdr_{family}_{}", random_hex(32)?))
 }
 
-/// A GitHub account, as GitHub names it.
+/// An account that signed in, as its provider names it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GithubUser {
-    /// The GitHub it signed in at (`github.url` of `auth.toml`, lowercase):
-    /// user ids are only unique within one.
-    pub url: String,
+pub struct Identity {
+    /// The provider's name in `auth.toml`: `github`, or that of an
+    /// `[oidc.<name>]` table.
+    pub provider: String,
+    /// Who vouches for the account: the GitHub it signed in at (lowercase),
+    /// or an OIDC issuer. Subjects are unique within one issuer only.
+    pub issuer: String,
+    /// The account's id at its issuer, which stays when its login changes.
+    pub subject: String,
+    /// Its login, user name or verified email now, which may change and may
+    /// once have been another account's.
     pub login: String,
-    /// GitHub's user id, which stays with the account when its login changes.
-    pub id: u64,
 }
 
-/// A GitHub account that signed in, bound to the actor its tokens act as.
+impl Identity {
+    /// Whether `other` is the same account.
+    pub fn same(&self, other: &Identity) -> bool {
+        self.issuer == other.issuer && self.subject == other.subject
+    }
+
+    /// How messages name it: `GitHub user alice`, `google account alice@acme.com`.
+    pub fn who(&self) -> String {
+        who(&self.provider, &self.login)
+    }
+
+    /// The actor an account takes at its first sign-in: its login under its
+    /// provider's name (`github:alice`, `google:alice@acme.com`), so that no
+    /// provider's users, who may choose their own names, can pass for
+    /// another provider's or for an admin's actors. A `/` in it would name a
+    /// sub-actor: it becomes `-`.
+    pub fn actor(&self) -> String {
+        format!("{}:{}", self.provider, self.login.replace('/', "-"))
+    }
+}
+
+/// An account that signed in, bound to the actor its tokens act as.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Account {
-    /// The GitHub it signed in at, as in [`GithubUser::url`].
-    pub url: String,
-    pub id: u64,
+    /// As in [`Identity`].
+    pub provider: String,
+    pub issuer: String,
+    pub subject: String,
     /// The actor of its tokens: its login when it first signed in.
     pub actor: String,
     /// Its login at its latest sign-in.
@@ -202,8 +232,21 @@ pub struct Account {
 
 impl Account {
     /// Whether `user` is this account.
-    fn is(&self, user: &GithubUser) -> bool {
-        self.id == user.id && self.url == user.url
+    fn is(&self, user: &Identity) -> bool {
+        self.subject == user.subject && self.issuer == user.issuer
+    }
+
+    /// How messages name it.
+    fn who(&self) -> String {
+        who(&self.provider, &self.login)
+    }
+}
+
+/// How messages name the account `login` of `provider`.
+pub fn who(provider: &str, login: &str) -> String {
+    match provider {
+        "github" => format!("GitHub user {login}"),
+        provider => format!("{provider} account {login}"),
     }
 }
 
@@ -283,8 +326,8 @@ pub fn access_line(summary: &serde_json::Value) -> String {
     if let Some(at) = summary["refreshable_until"].as_str() {
         line.push_str(&format!(", refreshed until {at}"));
     }
-    if let Some(login) = summary["github"]["login"].as_str() {
-        line.push_str(&format!(", GitHub user {login}"));
+    if let Some(login) = summary["account"]["login"].as_str() {
+        line.push_str(&format!(", {}", who(summary["account"]["provider"].as_str().unwrap_or_default(), login)));
     }
     line
 }
@@ -314,11 +357,6 @@ impl Token {
         self.expires_at.is_some_and(|at| at <= now)
     }
 
-    /// Whether the token expired and can no longer be refreshed either at `now`.
-    fn ended(&self, now: Timestamp) -> bool {
-        self.expired(now) && self.refresh.as_ref().is_none_or(|r| r.until <= now)
-    }
-
     /// Until when a refresh may renew it, if it is refreshed.
     fn refreshable_until(&self) -> Option<Timestamp> {
         self.refresh.as_ref().map(|r| r.until)
@@ -335,7 +373,7 @@ impl Token {
             "workspaces": self.workspaces,
             "expires_at": self.expires_at,
             "refreshable_until": self.refreshable_until(),
-            "github": self.github,
+            "account": self.identity,
             "max_claims": self.max_claims,
         })
     }
@@ -352,7 +390,7 @@ impl Token {
             "revoked_at": self.revoked_at,
             "expires_at": self.expires_at,
             "refreshable_until": self.refreshable_until(),
-            "github": self.github,
+            "account": self.identity,
             "max_claims": self.max_claims,
             "resource": self.resource,
             "client": self.client,
@@ -376,8 +414,8 @@ impl Token {
         if let Some(client) = &self.client {
             text.push_str(&format!(", for OAuth client {client}"));
         }
-        if let Some(user) = &self.github {
-            text.push_str(&format!(", signed in as GitHub user {}", user.login));
+        if let Some(user) = &self.identity {
+            text.push_str(&format!(", signed in as {}", user.who()));
         }
         text
     }
@@ -398,97 +436,218 @@ impl Token {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// The accounts and tokens of `<root>/server.db`, in the order they were added.
+#[derive(Clone, Debug, Default)]
 struct TokenFile {
-    version: u32,
     tokens: Vec<Token>,
-    /// GitHub accounts that signed in: never dropped, so an actor never
-    /// passes from one account to another.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Accounts that signed in: never dropped, so an actor never passes
+    /// from one account to another.
     accounts: Vec<Account>,
 }
 
-pub fn tokens_path(root: &Path) -> PathBuf {
-    root.join("tokens.json")
+/// The records of a table's `data` column, in the order they were added.
+fn records<T: serde::de::DeserializeOwned>(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<T>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let texts = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    texts.iter().map(|t| serde_json::from_str(t).map_err(|e| Error::invalid(format!("server.db: {e}")))).collect()
 }
 
-/// A lock file, held: released when dropped, or when the process ends.
-pub(crate) struct FileLock(std::fs::File);
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        let _ = fs4::FileExt::unlock(&self.0);
-    }
+fn load(conn: &rusqlite::Connection) -> Result<TokenFile> {
+    Ok(TokenFile {
+        tokens: records(conn, "SELECT data FROM tokens ORDER BY seq")?,
+        accounts: records(conn, "SELECT data FROM accounts ORDER BY seq")?,
+    })
 }
 
-/// Take `<root>/tokens.lock` before changing `tokens.json`, waiting up to [`LOCK_WAIT`].
-fn lock_tokens(root: &Path) -> Result<FileLock> {
-    lock_file(&root.join("tokens.lock"), "the access tokens")
+/// All the accounts and tokens, as they are now (none if there is no `server.db`).
+fn read(root: &Path) -> Result<TokenFile> {
+    read_scoped(root, None)
 }
 
-/// Take the lock file `path` before changing the file it guards (`what`,
-/// for the error), waiting up to [`LOCK_WAIT`].
-pub(crate) fn lock_file(path: &Path, what: &str) -> Result<FileLock> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    let io_error = |e: std::io::Error| Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())));
-    let file = opts.open(path).map_err(io_error)?;
-    let deadline = Instant::now() + LOCK_WAIT;
-    let mut delay = Duration::from_millis(5);
-    loop {
-        // Called through the trait: std's own File::try_lock (Rust 1.89) is newer than bd's MSRV.
-        match fs4::FileExt::try_lock(&file) {
-            Ok(()) => return Ok(FileLock(file)),
-            Err(fs4::TryLockError::WouldBlock) => {}
-            Err(fs4::TryLockError::Error(e)) => return Err(io_error(e)),
+/// The accounts and tokens `scope` names (all of them for `None`), read at one moment.
+fn read_scoped(root: &Path, scope: Option<&Scope>) -> Result<TokenFile> {
+    let Some(mut conn) = server_db::open_existing(root)? else { return Ok(TokenFile::default()) };
+    server_db::read(root, &mut conn, |tx| match scope {
+        Some(scope) => load_scope(tx, scope),
+        None => load(tx),
+    })
+}
+
+/// Change all the accounts and tokens with `f`, in one transaction: the
+/// rows it added, changed or dropped are written if it succeeds, nothing if
+/// not. For an admin's changes; the server's go through [`change_scoped`].
+fn change<T>(root: &Path, f: impl FnOnce(&mut TokenFile) -> Result<T>) -> Result<T> {
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| {
+        prune(tx)?;
+        let before = load(tx)?;
+        let mut file = before.clone();
+        let out = f(&mut file)?;
+        save(tx, &before, &file)?;
+        Ok(out)
+    })
+}
+
+/// [`change`], with only the rows `scope` names loaded: all that a sign-in,
+/// a refresh or a revocation by id looks at, so that each costs what its
+/// own rows do, however many others there are. `f` gets the transaction too.
+fn change_scoped<T>(
+    root: &Path,
+    scope: &Scope,
+    f: impl FnOnce(&rusqlite::Transaction, &mut TokenFile) -> Result<T>,
+) -> Result<T> {
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| {
+        prune(tx)?;
+        let before = load_scope(tx, scope)?;
+        let mut file = before.clone();
+        let out = f(tx, &mut file)?;
+        save(tx, &before, &file)?;
+        Ok(out)
+    })
+}
+
+/// Delete the tokens that ended [`PRUNE_AFTER`] ago: revoked, or a
+/// sign-in's that expired and could no longer be refreshed (`ended_at`).
+fn prune(tx: &rusqlite::Transaction) -> Result<()> {
+    tx.execute("DELETE FROM tokens WHERE ended_at <= ?1", [Timestamp::now().minus(PRUNE_AFTER).millis()])?;
+    Ok(())
+}
+
+/// Which rows a change or a read looks at.
+#[derive(Default)]
+struct Scope<'a> {
+    /// Tokens by id; their actors' tokens and accounts too.
+    ids: &'a [&'a str],
+    /// The tokens and accounts of actors related to these.
+    actors: Vec<String>,
+    /// The account of this identity, and every account and token that
+    /// [`bind`] and [`actor_conflict`] would look at for it: those related
+    /// to its actor, to the actor its account is bound to, and to its login.
+    user: Option<&'a Identity>,
+    /// The account with this issuer and subject, and the tokens of its actor.
+    account: Option<(&'a str, &'a str)>,
+}
+
+/// The rows `scope` names, in the order they were added: a superset of
+/// what the checks of a change for it look at, so they decide as they
+/// would over every row.
+fn load_scope(conn: &rusqlite::Connection, scope: &Scope) -> Result<TokenFile> {
+    use std::collections::BTreeMap;
+    let mut tokens: BTreeMap<i64, String> = BTreeMap::new();
+    let mut accounts: BTreeMap<i64, String> = BTreeMap::new();
+    let add = |into: &mut BTreeMap<i64, String>, sql: &str, args: &[&dyn rusqlite::ToSql]| -> Result<()> {
+        let mut stmt = conn.prepare_cached(sql)?;
+        let rows = stmt.query_map(args, |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (seq, data) = row?;
+            into.insert(seq, data);
         }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(Error::Busy(format!(
-                "another bd process is changing {what} ({} is locked); retry",
-                path.display()
-            )));
+        Ok(())
+    };
+    // Every key related to `key` in `column`: itself, its ancestors, its descendants.
+    let related = |into: &mut BTreeMap<i64, String>, table: &str, column: &str, key: &str| -> Result<()> {
+        let (exact, (low, high)) = server_db::related_keys(key);
+        for k in &exact {
+            add(into, &format!("SELECT seq, data FROM {table} WHERE {column} = ?1"), &[k])?;
         }
-        std::thread::sleep(delay.min(left));
-        delay = (delay * 2).min(Duration::from_millis(50));
+        add(into, &format!("SELECT seq, data FROM {table} WHERE {column} > ?1 AND {column} < ?2"), &[&low, &high])
+    };
+    let actor_of = |data: &str| -> Result<String> {
+        let v: serde_json::Value = serde_json::from_str(data)?;
+        Ok(v["actor"].as_str().unwrap_or_default().to_string())
+    };
+    let mut actors = scope.actors.clone();
+    for id in scope.ids {
+        add(&mut tokens, "SELECT seq, data FROM tokens WHERE id = ?1", &[id])?;
     }
-}
-
-fn load_file(path: &Path) -> Result<TokenFile> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display()))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok(TokenFile { version: 1, tokens: Vec::new(), accounts: Vec::new() })
+    for data in tokens.values() {
+        actors.push(actor_of(data)?);
+    }
+    if let Some((issuer, subject)) = scope.account {
+        let sql = "SELECT seq, data FROM accounts WHERE issuer = ?1 AND subject = ?2";
+        add(&mut accounts, sql, &[&issuer, &subject])?;
+        for data in accounts.values() {
+            actors.push(actor_of(data)?);
         }
-        Err(e) => Err(Error::invalid(format!("{}: {e}", path.display()))),
     }
+    if let Some(user) = scope.user {
+        let sql = "SELECT seq, data FROM accounts WHERE issuer = ?1 AND subject = ?2";
+        add(&mut accounts, sql, &[&user.issuer, &user.subject])?;
+        for data in accounts.values() {
+            actors.push(actor_of(data)?);
+        }
+        actors.push(user.actor());
+        related(&mut accounts, "accounts", "login_key", &server_db::key(&user.login))?;
+    }
+    for actor in &actors {
+        let key = server_db::key(actor);
+        related(&mut accounts, "accounts", "actor_key", &key)?;
+        related(&mut tokens, "tokens", "actor_key", &key)?;
+    }
+    fn parse<T: serde::de::DeserializeOwned>(what: &str, data: &str) -> Result<T> {
+        serde_json::from_str(data).map_err(|e| Error::invalid(format!("server.db: {what}: {e}")))
+    }
+    Ok(TokenFile {
+        tokens: tokens.values().map(|d| parse("a token", d)).collect::<Result<_>>()?,
+        accounts: accounts.values().map(|d| parse("an account", d)).collect::<Result<_>>()?,
+    })
 }
 
-fn save_file(path: &Path, file: &TokenFile) -> Result<()> {
-    save_json(path, file)
+/// Write the rows of `after` that are not as in `before`, and drop those it no longer has.
+fn save(tx: &rusqlite::Transaction, before: &TokenFile, after: &TokenFile) -> Result<()> {
+    let was: HashMap<&str, String> =
+        before.tokens.iter().map(|t| Ok((t.id.as_str(), serde_json::to_string(t)?))).collect::<Result<_>>()?;
+    let ids: std::collections::HashSet<&str> = after.tokens.iter().map(|t| t.id.as_str()).collect();
+    for gone in was.keys().filter(|id| !ids.contains(*id)) {
+        tx.execute("DELETE FROM tokens WHERE id = ?1", [gone])?;
+    }
+    for t in &after.tokens {
+        let data = serde_json::to_string(t)?;
+        if was.get(t.id.as_str()) != Some(&data) {
+            let family = t.refresh.as_ref().map(|r| r.family.to_ascii_lowercase());
+            let (actor_key, name, ended_at) = server_db::token_keys(&serde_json::to_value(t)?);
+            tx.execute(
+                "INSERT INTO tokens (id, sha256, family, actor_key, name, ended_at, data) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (id) DO UPDATE SET sha256 = excluded.sha256, \
+                 family = excluded.family, actor_key = excluded.actor_key, name = excluded.name, \
+                 ended_at = excluded.ended_at, data = excluded.data",
+                rusqlite::params![t.id, t.sha256, family, actor_key, name, ended_at, data],
+            )?;
+        }
+    }
+    let key = |a: &Account| (a.issuer.clone(), a.subject.clone());
+    let was: HashMap<(String, String), String> =
+        before.accounts.iter().map(|a| Ok((key(a), serde_json::to_string(a)?))).collect::<Result<_>>()?;
+    let keys: std::collections::HashSet<(String, String)> = after.accounts.iter().map(key).collect();
+    for (issuer, subject) in was.keys().filter(|k| !keys.contains(*k)) {
+        tx.execute("DELETE FROM accounts WHERE issuer = ?1 AND subject = ?2", [issuer, subject])?;
+    }
+    for a in &after.accounts {
+        let data = serde_json::to_string(a)?;
+        if was.get(&key(a)) != Some(&data) {
+            let (actor_key, login_key) = server_db::account_keys(&serde_json::to_value(a)?);
+            tx.execute(
+                "INSERT INTO accounts (issuer, subject, actor_key, login_key, data) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT (issuer, subject) DO UPDATE SET actor_key = excluded.actor_key, \
+                 login_key = excluded.login_key, data = excluded.data",
+                [&a.issuer, &a.subject, &actor_key, &login_key, &data],
+            )?;
+        }
+    }
+    Ok(())
 }
 
-/// Replace the JSON file `path` (mode 0600) with `value`, all or nothing.
-pub(crate) fn save_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    let mut text = serde_json::to_string_pretty(value)?;
-    text.push('\n');
-    // A leftover temp file would keep its permissions; start from a fresh one (mode 0600).
-    let _ = std::fs::remove_file(&tmp);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
-    {
-        use std::io::Write;
-        let mut f = opts.open(&tmp)?;
-        f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-    }
-    crate::io::replace_file(&tmp, path)
-        .map_err(|e| Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display()))))
+/// The tokens that are not revoked whose `column` is `value`.
+fn live_where(conn: &rusqlite::Connection, column: &str, value: &str) -> Result<Vec<Token>> {
+    let sql = format!("SELECT data FROM tokens WHERE {column} = ?1 ORDER BY seq");
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let texts = stmt.query_map([value], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    let tokens = texts
+        .iter()
+        .map(|t| serde_json::from_str::<Token>(t).map_err(|e| Error::invalid(format!("server.db: {e}"))))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(tokens.into_iter().filter(|t| t.revoked_at.is_none()).collect())
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -517,47 +676,43 @@ pub enum Verified {
     Unknown,
 }
 
-/// Checks bearer tokens, rereading `tokens.json` whenever it changes, so
-/// new and revoked tokens take effect without a restart.
+/// Checks bearer tokens against `<root>/server.db`, which it asks each
+/// time, so new and revoked tokens take effect at once, whoever changed them.
 pub struct Verifier {
-    path: PathBuf,
-    cache: Mutex<Cache>,
-}
-
-#[derive(Default)]
-struct Cache {
-    loaded: bool,
-    stamp: Option<(Option<SystemTime>, u64)>,
-    by_hash: HashMap<String, Token>,
+    root: PathBuf,
+    /// Opened at the first check, and again after one that failed or once
+    /// the file is another (removed and created again).
+    conn: Mutex<Option<(rusqlite::Connection, Option<u64>)>>,
 }
 
 impl Verifier {
     pub fn new(root: &Path) -> Verifier {
-        Verifier { path: tokens_path(root), cache: Mutex::new(Cache::default()) }
+        Verifier { root: root.to_path_buf(), conn: Mutex::new(None) }
     }
 
     /// The token that is not revoked with this secret, and whether it expired.
     pub fn verify(&self, secret: &str) -> Result<Verified> {
-        let mut cache = self.cache.lock().unwrap_or_else(|p| p.into_inner());
-        let stamp = std::fs::metadata(&self.path).ok().map(|m| (m.modified().ok(), m.len()));
-        if !cache.loaded || stamp != cache.stamp {
-            let file = load_file(&self.path)?;
-            cache.by_hash =
-                file.tokens.into_iter().filter(|t| t.revoked_at.is_none()).map(|t| (t.sha256.clone(), t)).collect();
-            cache.stamp = stamp;
-            cache.loaded = true;
+        let mut conn = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        let file = server_db::file_id(&self.root);
+        if conn.as_ref().is_none_or(|(_, opened)| *opened != file) {
+            *conn = None;
+            // No database yet: no token.
+            let Some(opened) = server_db::open_existing(&self.root)? else { return Ok(Verified::Unknown) };
+            *conn = Some((opened, server_db::file_id(&self.root)));
         }
-        Ok(match cache.by_hash.get(&hash(secret)) {
-            Some(t) if t.expired(Timestamp::now()) => Verified::Expired(t.clone()),
-            Some(t) => Verified::Valid(t.clone()),
+        let found = live_where(&conn.as_ref().expect("opened").0, "sha256", &hash(secret));
+        let found = match found {
+            Ok(found) => found,
+            Err(e) => {
+                *conn = None;
+                return Err(e);
+            }
+        };
+        Ok(match found.into_iter().next() {
+            Some(t) if t.expired(Timestamp::now()) => Verified::Expired(t),
+            Some(t) => Verified::Valid(t),
             None => Verified::Unknown,
         })
-    }
-
-    /// Reread the file at the next check: this process changed it, maybe
-    /// too quickly for its modification time and size to tell.
-    pub fn invalidate(&self) {
-        self.cache.lock().unwrap_or_else(|p| p.into_inner()).loaded = false;
     }
 }
 
@@ -594,7 +749,7 @@ fn create(app: &mut App, a: &TokenCreateArgs) -> Result<()> {
     Ok(())
 }
 
-/// Add an access token to `<root>/tokens.json`. Returns it with its secret,
+/// Add an access token to `<root>/server.db`. Returns it with its secret,
 /// which is not stored anywhere.
 pub fn issue_token(
     root: &Path,
@@ -634,9 +789,9 @@ pub struct Lifetime {
 /// `github-<actor>-<random>` (the actor cut to 40 characters), and expires
 /// after `life.ttl`; with `life.refresh`, `(limit, idle)`, it may be
 /// refreshed until the earlier of `limit` and `idle` after each refresh.
-pub fn issue_github_token(
+pub fn issue_sign_in_token(
     root: &Path,
-    user: &GithubUser,
+    user: &Identity,
     grant: Grant,
     life: Lifetime,
     workspace: &str,
@@ -645,7 +800,7 @@ pub fn issue_github_token(
     let now = Timestamp::now();
     let refresh = life.refresh.map(|(limit, idle)| (workspace, limit.min(now.plus(idle))));
     let expires_at = now.plus(life.ttl).min(refresh.map_or(Timestamp(i64::MAX), |(_, until)| until));
-    add_token(root, Holder::Github { user, expires_at, by_login, refresh, client: None }, grant)
+    add_token(root, Holder::SignIn { user, expires_at, by_login, refresh, client: None }, grant)
 }
 
 /// The OAuth client a token is issued to, and the MCP endpoint it is bound to.
@@ -655,12 +810,12 @@ pub struct ForClient<'a> {
     pub resource: &'a str,
 }
 
-/// [`issue_github_token`] for an OAuth `client` an account authorized
+/// [`issue_sign_in_token`] for an OAuth `client` an account authorized
 /// (`oauth_server/token.rs`): bound to its MCP endpoint (and so to that
 /// workspace only), and named `oauth-<client>-<actor>-<random>`.
 pub fn issue_client_token(
     root: &Path,
-    user: &GithubUser,
+    user: &Identity,
     grant: Grant,
     life: Lifetime,
     client: ForClient<'_>,
@@ -670,7 +825,14 @@ pub fn issue_client_token(
     let now = Timestamp::now();
     let refresh = life.refresh.map(|(limit, idle)| (workspace.as_str(), limit.min(now.plus(idle))));
     let expires_at = now.plus(life.ttl).min(refresh.map_or(Timestamp(i64::MAX), |(_, until)| until));
-    add_token(root, Holder::Github { user, expires_at, by_login, refresh, client: Some(client) }, grant)
+    add_token(root, Holder::SignIn { user, expires_at, by_login, refresh, client: Some(client) }, grant)
+}
+
+/// `text` as part of a token name: letters, digits, `.`, `_` and `-`
+/// (anything else becomes `-`), at most `max` characters.
+fn name_part(text: &str, max: usize) -> String {
+    let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
+    text.chars().map(|c| if plain(c) { c } else { '-' }).take(max).collect()
 }
 
 /// What names a client in its tokens' names: the host of its metadata
@@ -690,11 +852,8 @@ fn client_label(id: &str) -> String {
 /// whether the secret is its current one (else it is spent, or forged).
 pub fn find_refresh(root: &Path, secret: &str) -> Result<Option<(Token, bool)>> {
     let Some(family) = refresh_family(secret) else { return Ok(None) };
-    let file = load_file(&tokens_path(root))?;
-    let found = file
-        .tokens
-        .into_iter()
-        .find(|t| t.revoked_at.is_none() && t.refresh.as_ref().is_some_and(|r| r.family.eq_ignore_ascii_case(family)));
+    let Some(conn) = server_db::open_existing(root)? else { return Ok(None) };
+    let found = live_where(&conn, "family", &family.to_ascii_lowercase())?.into_iter().next();
     Ok(found.map(|t| {
         let current = t.refresh.as_ref().is_some_and(|r| r.sha256 == hash(secret));
         (t, current)
@@ -708,7 +867,8 @@ pub fn find_by_secret(root: &Path, secret: &str) -> Result<Option<Token>> {
         return Ok(find_refresh(root, secret)?.map(|(t, _)| t));
     }
     let sha = hash(secret);
-    Ok(load_file(&tokens_path(root))?.tokens.into_iter().find(|t| t.revoked_at.is_none() && t.sha256 == sha))
+    let Some(conn) = server_db::open_existing(root)? else { return Ok(None) };
+    Ok(live_where(&conn, "sha256", &sha)?.into_iter().next())
 }
 
 /// Refresh the sign-in `id`, whose current refresh secret hashes to
@@ -723,58 +883,62 @@ pub fn rotate(
     id: &str,
     current: &str,
     last: LastRefresh,
-    user: &GithubUser,
+    user: &Identity,
     grant: Grant,
     by_login: bool,
+    decided: bool,
     expires_at: Timestamp,
     until: Timestamp,
 ) -> Result<Option<Issued>> {
     let workspaces = workspace_list(&grant.workspaces)?;
-    let path = tokens_path(root);
-    let _lock = lock_tokens(root)?;
-    let mut file = load_file(&path)?;
-    let now = Timestamp::now();
-    let live =
-        |t: &Token| t.id == id && t.revoked_at.is_none() && t.refresh.as_ref().is_some_and(|r| r.sha256 == current);
-    let Some(i) = file.tokens.iter().position(live) else { return Ok(None) };
-    // A token bound to an MCP endpoint keeps to its workspace, which the rules were just applied for.
-    let workspaces = match (&file.tokens[i].resource, &file.tokens[i].refresh) {
-        (Some(_), Some(r)) => vec![r.workspace.clone()],
-        _ => workspaces,
-    };
-    let actor = bind(&mut file.accounts, user, now, by_login)?;
-    if actor != file.tokens[i].actor {
-        return Err(Error::Unauthorized(format!(
-            "GitHub user {} now acts as {actor}, not {}: sign in again (`bd remote login --github`)",
-            user.login, file.tokens[i].actor
-        )));
-    }
-    if by_login && !related(&actor, &user.login) {
-        if let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now) {
-            return Err(conflict_error(&user.login, Some(user), other));
+    let scope = Scope { ids: &[id], user: Some(user), ..Scope::default() };
+    change_scoped(root, &scope, |_, file| {
+        let now = Timestamp::now();
+        let live =
+            |t: &Token| t.id == id && t.revoked_at.is_none() && t.refresh.as_ref().is_some_and(|r| r.sha256 == current);
+        let Some(i) = file.tokens.iter().position(live) else { return Ok(None) };
+        // A token bound to an MCP endpoint keeps to its workspace, which the rules were just applied for.
+        let workspaces = match (&file.tokens[i].resource, &file.tokens[i].refresh) {
+            (Some(_), Some(r)) => vec![r.workspace.clone()],
+            _ => workspaces,
+        };
+        let actor = bind(&mut file.accounts, user, now, by_login)?;
+        if actor != file.tokens[i].actor {
+            return Err(Error::Unauthorized(format!(
+                "{} now acts as {actor}, not {}: sign in again (`bd remote login`)",
+                user.who(),
+                file.tokens[i].actor
+            )));
         }
-    }
-    if let Some(other) = actor_conflict(&file.tokens, &actor, Some(user), now) {
-        return Err(conflict_error(&actor, Some(user), other));
-    }
-    let secret = format!("bdt_{}", random_hex(32)?);
-    let t = &mut file.tokens[i];
-    let refresh = t.refresh.as_mut().expect("found by its refresh state");
-    let refresh_secret = refresh_secret(&refresh.family)?;
-    refresh.sha256 = hash(&refresh_secret);
-    refresh.refreshed_at = now;
-    refresh.until = until;
-    refresh.last = Some(last);
-    t.sha256 = hash(&secret);
-    t.expires_at = Some(expires_at.min(until));
-    t.role = grant.role;
-    t.kind = grant.kind;
-    t.workspaces = workspaces;
-    t.max_claims = grant.max_claims;
-    t.github = Some(user.clone());
-    let token = t.clone();
-    save_file(&path, &file)?;
-    Ok(Some(Issued { token, secret, refresh_secret: Some(refresh_secret) }))
+        if by_login && !related(&actor, &user.actor()) {
+            if let Some(other) = actor_conflict(&file.tokens, &user.actor(), Some(user), now) {
+                return Err(conflict_error(&user.actor(), Some(user), other));
+            }
+        }
+        if let Some(other) = actor_conflict(&file.tokens, &actor, Some(user), now) {
+            return Err(conflict_error(&actor, Some(user), other));
+        }
+        let secret = format!("bdt_{}", random_hex(32)?);
+        let t = &mut file.tokens[i];
+        let refresh = t.refresh.as_mut().expect("found by its refresh state");
+        let refresh_secret = refresh_secret(&refresh.family)?;
+        refresh.sha256 = hash(&refresh_secret);
+        refresh.refreshed_at = now;
+        if decided {
+            refresh.decided_at = now;
+        }
+        refresh.until = until;
+        refresh.last = Some(last);
+        t.sha256 = hash(&secret);
+        t.expires_at = Some(expires_at.min(until));
+        t.role = grant.role;
+        t.kind = grant.kind;
+        t.workspaces = workspaces;
+        t.max_claims = grant.max_claims;
+        t.identity = Some(user.clone());
+        let token = t.clone();
+        Ok(Some(Issued { token, secret, refresh_secret: Some(refresh_secret) }))
+    })
 }
 
 /// Whom a new token is for.
@@ -785,8 +949,8 @@ enum Holder<'a> {
     /// its login; `refresh`, the workspace it signed in for and until when
     /// it may be refreshed, if it may; `client`, the OAuth client it
     /// authorized, if it did.
-    Github {
-        user: &'a GithubUser,
+    SignIn {
+        user: &'a Identity,
         expires_at: Timestamp,
         by_login: bool,
         refresh: Option<(&'a str, Timestamp)>,
@@ -823,7 +987,7 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
         Holder::Admin { resource: Some(url), .. } => {
             Some(crate::mcp::http::resource_url(url).map_err(|e| Error::invalid(format!("--resource {e}")))?)
         }
-        Holder::Github { client: Some(client), .. } => {
+        Holder::SignIn { client: Some(client), .. } => {
             Some(crate::mcp::http::resource_url(client.resource).map_err(Error::invalid)?)
         }
         _ => None,
@@ -847,96 +1011,103 @@ fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Issued> {
             )));
         }
     }
-    let path = tokens_path(root);
-    let _lock = lock_tokens(root)?;
-    let mut file = load_file(&path)?;
-    let now = Timestamp::now();
-    // Tokens from GitHub sign-in stay listed for a while after they expire (and can no longer be refreshed), then go.
-    file.tokens.retain(|t| t.github.is_none() || !t.ended(now.minus(PRUNE_AFTER)));
-    let (name, actor, expires_at, github, refresh, client) = match holder {
-        Holder::Admin { name, actor, .. } => {
-            if let Some(account) = file.accounts.iter().find(|a| related(&a.actor, actor)) {
-                return Err(Error::Refused(format!(
-                    "actor {actor} would share actor {} with GitHub user {}, who signed in: pick another actor, or \
-                     release that one first (`bd serve token revoke --github {} --forget`)",
-                    account.actor, account.login, account.login
-                )));
-            }
-            (name.to_string(), actor.to_string(), None, None, None, None)
-        }
-        Holder::Github { user, expires_at, by_login, refresh, client } => {
-            let actor = account_actor(&mut file, user, now, by_login)?;
-            let name = match client {
-                Some(c) => {
-                    let label: String = actor.chars().take(24).collect();
-                    format!("oauth-{}-{label}-{}", client_label(c.id), random_hex(4)?)
+    let scope = match &holder {
+        Holder::Admin { actor, .. } => Scope { actors: vec![actor.to_string()], ..Scope::default() },
+        Holder::SignIn { user, .. } => Scope { user: Some(*user), ..Scope::default() },
+    };
+    change_scoped(root, &scope, |tx, file| {
+        let now = Timestamp::now();
+        let (name, actor, expires_at, identity, refresh, client) = match holder {
+            Holder::Admin { name, actor, .. } => {
+                if let Some(account) = file.accounts.iter().find(|a| related(&a.actor, actor)) {
+                    return Err(Error::Refused(format!(
+                        "actor {actor} would share actor {} with {}, who signed in: pick another actor, or release that \
+                     one first (`bd serve token revoke --account {} --forget`)",
+                        account.actor,
+                        account.who(),
+                        account.actor
+                    )));
                 }
-                None => format!("github-{}-{}", actor.chars().take(40).collect::<String>(), random_hex(4)?),
-            };
-            check_name(&name)?;
-            check_actor(&actor)?;
-            (name, actor, Some(expires_at), Some(user.clone()), refresh, client.map(|c| c.id.to_string()))
+                (name.to_string(), actor.to_string(), None, None, None, None)
+            }
+            Holder::SignIn { user, expires_at, by_login, refresh, client } => {
+                let actor = account_actor(file, user, now, by_login)?;
+                let name = match client {
+                    Some(c) => format!("oauth-{}-{}-{}", client_label(c.id), name_part(&actor, 24), random_hex(4)?),
+                    None => {
+                        // `github-alice-…`, `google-alice-acme.com-…`: the provider once.
+                        let named = match actor.contains(':') {
+                            true => actor.clone(),
+                            false => format!("{}:{actor}", user.provider),
+                        };
+                        format!("{}-{}", name_part(&named, 55), random_hex(4)?)
+                    }
+                };
+                check_name(&name)?;
+                check_actor(&actor)?;
+                (name, actor, Some(expires_at), Some(user.clone()), refresh, client.map(|c| c.id.to_string()))
+            }
+        };
+        if !live_where(tx, "name", &name)?.is_empty() {
+            return Err(Error::Refused(format!("access token {name} already exists; revoke it first")));
         }
-    };
-    if file.tokens.iter().any(|t| t.name == name && t.revoked_at.is_none()) {
-        return Err(Error::Refused(format!("access token {name} already exists; revoke it first")));
-    }
-    if let Some(other) = actor_conflict(&file.tokens, &actor, github.as_ref(), now) {
-        return Err(conflict_error(&actor, github.as_ref(), other));
-    }
-    let secret = format!("bdt_{}", random_hex(32)?);
-    let (refresh, refresh_secret) = match refresh {
-        Some((workspace, until)) => {
-            let family = random_hex(16)?;
-            let secret = refresh_secret(&family)?;
-            let state = Refresh {
-                family,
-                sha256: hash(&secret),
-                workspace: workspace.to_string(),
-                refreshed_at: now,
-                until,
-                last: None,
-            };
-            (Some(state), Some(secret))
+        if let Some(other) = actor_conflict(&file.tokens, &actor, identity.as_ref(), now) {
+            return Err(conflict_error(&actor, identity.as_ref(), other));
         }
-        None => (None, None),
-    };
-    let token = Token {
-        id: random_hex(8)?,
-        name,
-        actor,
-        role: grant.role,
-        kind: grant.kind,
-        workspaces,
-        sha256: hash(&secret),
-        created_at: now.to_rfc3339(),
-        revoked_at: None,
-        expires_at,
-        github,
-        max_claims: grant.max_claims,
-        refresh,
-        resource,
-        client,
-    };
-    file.tokens.push(token.clone());
-    save_file(&path, &file)?;
-    Ok(Issued { token, secret, refresh_secret })
+        let secret = format!("bdt_{}", random_hex(32)?);
+        let (refresh, refresh_secret) = match refresh {
+            Some((workspace, until)) => {
+                let family = random_hex(16)?;
+                let secret = refresh_secret(&family)?;
+                let state = Refresh {
+                    family,
+                    sha256: hash(&secret),
+                    workspace: workspace.to_string(),
+                    refreshed_at: now,
+                    decided_at: now,
+                    until,
+                    last: None,
+                };
+                (Some(state), Some(secret))
+            }
+            None => (None, None),
+        };
+        let token = Token {
+            id: random_hex(8)?,
+            name,
+            actor,
+            role: grant.role,
+            kind: grant.kind,
+            workspaces,
+            sha256: hash(&secret),
+            created_at: now.to_rfc3339(),
+            revoked_at: None,
+            expires_at,
+            identity,
+            max_claims: grant.max_claims,
+            refresh,
+            resource,
+            client,
+        };
+        file.tokens.push(token.clone());
+        Ok(Issued { token, secret, refresh_secret })
+    })
 }
 
 /// The actor a sign-in of `user` gets, bound to its account in `file`, or
 /// why it may not sign in for its actor's sake.
-fn account_actor(file: &mut TokenFile, user: &GithubUser, now: Timestamp, by_login: bool) -> Result<String> {
+fn account_actor(file: &mut TokenFile, user: &Identity, now: Timestamp, by_login: bool) -> Result<String> {
     let actor = bind(&mut file.accounts, user, now, by_login)?;
     if is_reserved_actor(&actor) {
         return Err(Error::Unauthorized(format!(
-            "GitHub user {} may not sign in to this bd server: its actor {actor} is bd serve's own",
-            user.login
+            "{} may not sign in to this bd server: its actor {actor} is bd serve's own",
+            user.who()
         )));
     }
     // A renamed account let in by a login that names another principal's actor must not pass for it.
-    if by_login && !related(&actor, &user.login) {
-        if let Some(other) = actor_conflict(&file.tokens, &user.login, Some(user), now) {
-            return Err(conflict_error(&user.login, Some(user), other));
+    if by_login && !related(&actor, &user.actor()) {
+        if let Some(other) = actor_conflict(&file.tokens, &user.actor(), Some(user), now) {
+            return Err(conflict_error(&user.actor(), Some(user), other));
         }
     }
     if let Some(other) = actor_conflict(&file.tokens, &actor, Some(user), now) {
@@ -946,12 +1117,14 @@ fn account_actor(file: &mut TokenFile, user: &GithubUser, now: Timestamp, by_log
 }
 
 /// The actor a sign-in of `user` would get now, binding nothing: what
-/// [`issue_github_token`] would refuse for its actor's sake is refused
+/// [`issue_sign_in_token`] would refuse for its actor's sake is refused
 /// before anyone is asked to approve a client (`oauth_server/authorize.rs`).
 /// Issuing the token checks again.
-pub fn preview_actor(root: &Path, user: &GithubUser, by_login: bool) -> Result<String> {
-    let mut file = load_file(&tokens_path(root))?;
-    account_actor(&mut file, user, Timestamp::now(), by_login)
+pub fn preview_actor(root: &Path, user: &Identity, by_login: bool) -> Result<String> {
+    let mut file = read_scoped(root, Some(&Scope { user: Some(user), ..Scope::default() }))?;
+    let actor = account_actor(&mut file, user, Timestamp::now(), by_login)?;
+    check_actor(&actor)?;
+    Ok(actor)
 }
 
 /// The actor of `user`'s tokens: the one bound to its account, else its
@@ -960,30 +1133,32 @@ pub fn preview_actor(root: &Path, user: &GithubUser, by_login: bool) -> Result<S
 /// another account's actor or latest login is related to it, even for an
 /// account bound before: one that took a login given up must not pass for
 /// its previous holder, whom rules name by it.
-fn bind(accounts: &mut Vec<Account>, user: &GithubUser, now: Timestamp, by_login: bool) -> Result<String> {
+fn bind(accounts: &mut Vec<Account>, user: &Identity, now: Timestamp, by_login: bool) -> Result<String> {
     let bound = accounts.iter().any(|a| a.is(user));
+    let wanted = user.actor();
     let taken = |a: &Account| {
-        let actor = related(&a.actor, &user.login) && (!bound || by_login);
-        let login = by_login && related(&a.login, &user.login);
+        let actor = related(&a.actor, &wanted) && (!bound || by_login);
+        // A login names an account at its own provider only.
+        let login = by_login && a.provider == user.provider && related(&a.login, &user.login);
         !a.is(user) && (actor || login)
     };
     if let Some(other) = accounts.iter().find(|a| taken(a)) {
         tracing::info!(
             target: "bd::serve",
             login = %user.login,
-            id = user.id,
+            subject = %user.subject,
             actor = %other.actor,
-            bound_to = other.id,
-            "GitHub sign-in refused: the login's actor belongs to another account"
+            bound_to = %other.subject,
+            "sign-in refused: the login's actor belongs to another account"
         );
-        let whose = match related(&other.actor, &user.login) {
-            true => format!("actor {} belongs to another GitHub account, which had that login before", other.actor),
-            false => format!("login {} was that of another GitHub account (actor {}) before", other.login, other.actor),
+        let whose = match related(&other.actor, &wanted) {
+            true => format!("actor {} belongs to another account, which had that login before", other.actor),
+            false => format!("login {} was that of another account (actor {}) before", other.login, other.actor),
         };
         return Err(Error::Unauthorized(format!(
-            "GitHub user {} may not sign in to this bd server: {whose}; the server's admin resolves that (`bd serve \
-             token accounts`)",
-            user.login
+            "{} may not sign in to this bd server: {whose}; the server's admin resolves that (`bd serve token \
+             accounts`)",
+            user.who()
         )));
     }
     if let Some(account) = accounts.iter_mut().find(|a| a.is(user)) {
@@ -992,14 +1167,15 @@ fn bind(accounts: &mut Vec<Account>, user: &GithubUser, now: Timestamp, by_login
         return Ok(account.actor.clone());
     }
     accounts.push(Account {
-        url: user.url.clone(),
-        id: user.id,
-        actor: user.login.clone(),
+        provider: user.provider.clone(),
+        issuer: user.issuer.clone(),
+        subject: user.subject.clone(),
+        actor: wanted.clone(),
         login: user.login.clone(),
         first_seen: now,
         last_seen: now,
     });
-    Ok(user.login.clone())
+    Ok(wanted)
 }
 
 /// A live token of another principal whose actor a new token's would share,
@@ -1009,50 +1185,53 @@ fn bind(accounts: &mut Vec<Account>, user: &GithubUser, now: Timestamp, by_login
 fn actor_conflict<'a>(
     tokens: &'a [Token],
     actor: &str,
-    github: Option<&GithubUser>,
+    identity: Option<&Identity>,
     now: Timestamp,
 ) -> Option<&'a Token> {
-    tokens.iter().filter(|t| t.revoked_at.is_none() && !t.expired(now)).find(|t| match (github, &t.github) {
+    tokens.iter().filter(|t| t.revoked_at.is_none() && !t.expired(now)).find(|t| match (identity, &t.identity) {
         (None, None) => false,
-        (Some(user), Some(other)) => related(actor, &t.actor) && !(other.id == user.id && other.url == user.url),
+        (Some(user), Some(other)) => related(actor, &t.actor) && !(other.same(user)),
         _ => related(actor, &t.actor),
     })
 }
 
-fn conflict_error(actor: &str, github: Option<&GithubUser>, other: &Token) -> Error {
-    match (github, &other.github) {
+fn conflict_error(actor: &str, identity: Option<&Identity>, other: &Token) -> Error {
+    match (identity, &other.identity) {
         (Some(user), _) => {
             tracing::info!(
                 target: "bd::serve",
                 login = %user.login,
-                id = user.id,
+                subject = %user.subject,
                 token = %other.name,
                 actor = %other.actor,
-                "GitHub sign-in refused: another token's actor"
+                "sign-in refused: another token's actor"
             );
             Error::Unauthorized(format!(
-                "GitHub user {} may not sign in to this bd server as actor {actor}: another access token acts as {}; \
-                 the server's admin resolves that (`bd serve token list`)",
-                user.login, other.actor
+                "{} may not sign in to this bd server as actor {actor}: another access token acts as {}; the \
+                 server's admin resolves that (`bd serve token list`)",
+                user.who(),
+                other.actor
             ))
         }
         (None, Some(owner)) => Error::Refused(format!(
-            "actor {actor} would share actor {} with GitHub user {}, who signed in: pick another actor, or release \
-             that one first (`bd serve token revoke --github {} --forget`)",
-            other.actor, owner.login, owner.login
+            "actor {actor} would share actor {} with {}, who signed in: pick another actor, or release that one \
+             first (`bd serve token revoke --account {} --forget`)",
+            other.actor,
+            owner.who(),
+            other.actor
         )),
         (None, None) => Error::Refused(format!("actor {actor} is taken by access token {}", other.name)),
     }
 }
 
 fn list(app: &mut App, a: &TokenRootArgs) -> Result<()> {
-    let file = load_file(&tokens_path(&root_dir(a)?))?;
+    let file = read(&root_dir(a)?)?;
     let now = Timestamp::now();
     let mut out = Out::new(file.tokens.iter().map(Token::view).collect::<Vec<_>>());
     if file.tokens.is_empty() {
         out = out.line(
             "No access tokens. Create one with `bd serve token create <name> --as <actor>`, or let people sign in \
-             with GitHub (auth.toml).",
+             in (auth.toml).",
         );
     }
     for t in &file.tokens {
@@ -1063,11 +1242,11 @@ fn list(app: &mut App, a: &TokenRootArgs) -> Result<()> {
 }
 
 fn accounts(app: &mut App, a: &TokenRootArgs) -> Result<()> {
-    let file = load_file(&tokens_path(&root_dir(a)?))?;
+    let file = read(&root_dir(a)?)?;
     let now = Timestamp::now();
     let live = |account: &Account| {
         let live = |t: &&Token| t.revoked_at.is_none() && !t.expired(now);
-        file.tokens.iter().filter(live).filter(|t| t.github.as_ref().is_some_and(|g| account.is(g))).count()
+        file.tokens.iter().filter(live).filter(|t| t.identity.as_ref().is_some_and(|g| account.is(g))).count()
     };
     let views: Vec<serde_json::Value> = file
         .accounts
@@ -1080,17 +1259,17 @@ fn accounts(app: &mut App, a: &TokenRootArgs) -> Result<()> {
         .collect();
     let mut out = Out::new(views);
     if file.accounts.is_empty() {
-        out = out.line("No GitHub account is bound to an actor.");
+        out = out.line("No account is bound to an actor.");
     }
     for account in &file.accounts {
         let n = live(account);
         out = out
             .line(format!(
-                "{:<20} GitHub user {} (id {} at {}), signed in first {}, last {}; {n} live token{}",
+                "{:<20} {} (subject {} at {}), signed in first {}, last {}; {n} live token{}",
                 account.actor,
-                account.login,
-                account.id,
-                account.url,
+                account.who(),
+                account.subject,
+                account.issuer,
                 account.first_seen,
                 account.last_seen,
                 if n == 1 { "" } else { "s" }
@@ -1119,7 +1298,7 @@ fn revoke(app: &mut App, a: &TokenRevokeArgs) -> Result<()> {
         app.print(revoked.iter().fold(out, |out, name| out.id(name.clone())));
         return Ok(());
     }
-    match (&a.name, a.github.as_deref().map(str::trim)) {
+    match (&a.name, a.account.as_deref().map(str::trim)) {
         (Some(name), None) => {
             let named = |tokens: &[Token]| (0..tokens.len()).filter(|&i| tokens[i].name == *name).collect();
             let (known, revoked) = revoke_where(&root, named)?;
@@ -1133,29 +1312,43 @@ fn revoke(app: &mut App, a: &TokenRevokeArgs) -> Result<()> {
             app.print(Out::new(json!({ "name": name, "revoked": !revoked.is_empty() })).line(text).id(name.clone()));
         }
         (None, Some(login)) => {
-            let done = revoke_github(&root, login, a.forget)?;
-            let view =
-                json!({ "github": login, "revoked": done.revoked, "accounts": done.accounts, "forgot": a.forget });
+            let done = revoke_account(&root, login, a.forget)?;
+            let view = json!({
+                "account": login, "revoked": done.revoked, "accounts": done.accounts, "forgot": a.forget,
+                "erased": done.erased,
+            });
             let mut out = Out::new(view).line(match done.revoked.len() {
-                0 => format!("= GitHub user {login} has no live access tokens"),
-                1 => format!("✓ Revoked the access token of GitHub user {login}: {}", done.revoked[0]),
-                n => format!("✓ Revoked {n} access tokens of GitHub user {login}: {}", done.revoked.join(", ")),
+                0 => format!("= account {login} has no live access tokens"),
+                1 => format!("✓ Revoked the access token of account {login}: {}", done.revoked[0]),
+                n => format!("✓ Revoked {n} access tokens of account {login}: {}", done.revoked.join(", ")),
             });
             for account in &done.accounts {
                 out = out.line(match a.forget {
                     true => format!(
-                        "✓ Released actor {} of GitHub user {} (id {}): the next account to sign in as {} gets it",
-                        account.actor, account.login, account.id, account.actor
+                        "✓ Released actor {} of {} (subject {}) and deleted its records: the next account to sign in \
+                         as {} gets it",
+                        account.actor,
+                        account.who(),
+                        account.subject,
+                        account.actor
                     ),
                     false => format!(
-                        "  actor {} stays bound to GitHub user {} (id {}); --forget releases it",
-                        account.actor, account.login, account.id
+                        "  actor {} stays bound to {} (subject {}); --forget releases it",
+                        account.actor,
+                        account.who(),
+                        account.subject
                     ),
                 });
             }
+            if done.erased == Some(false) {
+                out = out.line(
+                    "  The deleted records stay in server.db's write-ahead log until bd serve's next checkpoint, \
+                     which overwrites them",
+                );
+            }
             app.print(done.revoked.iter().fold(out, |out, name| out.id(name.clone())));
         }
-        _ => return Err(Error::invalid("name the access token to revoke, or a GitHub user with --github")),
+        _ => return Err(Error::invalid("name the access token to revoke, or an account with --account")),
     }
     Ok(())
 }
@@ -1163,89 +1356,175 @@ fn revoke(app: &mut App, a: &TokenRevokeArgs) -> Result<()> {
 /// Revoke the token with this id (not its name, which a later token may
 /// reuse): whether it was revoked now.
 pub fn revoke_by_id(root: &Path, id: &str) -> Result<bool> {
-    let (_, revoked) = revoke_where(root, |tokens| (0..tokens.len()).filter(|&i| tokens[i].id == id).collect())?;
-    Ok(!revoked.is_empty())
+    change_scoped(root, &Scope { ids: &[id], ..Scope::default() }, |_, file| {
+        let now = Timestamp::now().to_rfc3339();
+        let token = file.tokens.iter_mut().find(|t| t.id == id && t.revoked_at.is_none());
+        Ok(token.map(|t| t.revoked_at = Some(now)).is_some())
+    })
 }
 
 /// Revoke the tokens `pick` selects (indexes): how many it selects, and the
 /// names of those revoked now (the others already were).
 fn revoke_where(root: &Path, pick: impl FnOnce(&[Token]) -> Vec<usize>) -> Result<(usize, Vec<String>)> {
-    let path = tokens_path(root);
-    let _lock = lock_tokens(root)?;
-    let mut file = load_file(&path)?;
-    let picked = pick(&file.tokens);
-    let now = Timestamp::now().to_rfc3339();
-    let mut revoked = Vec::new();
-    for &i in &picked {
-        let t = &mut file.tokens[i];
-        if t.revoked_at.is_none() {
-            t.revoked_at = Some(now.clone());
-            revoked.push(t.name.clone());
+    change(root, |file| {
+        let picked = pick(&file.tokens);
+        let now = Timestamp::now().to_rfc3339();
+        let mut revoked = Vec::new();
+        for &i in &picked {
+            let t = &mut file.tokens[i];
+            if t.revoked_at.is_none() {
+                t.revoked_at = Some(now.clone());
+                revoked.push(t.name.clone());
+            }
         }
-    }
-    if !revoked.is_empty() {
-        save_file(&path, &file)?;
-    }
-    Ok((picked.len(), revoked))
+        Ok((picked.len(), revoked))
+    })
 }
 
-/// What `revoke --github` did.
+/// End the sign-ins of the account with this issuer and subject made
+/// before `at`, as its provider says it revoked its consent then: the names
+/// of the tokens revoked. One signed in since is the account's new consent.
+pub fn end_sign_ins_before(root: &Path, issuer: &str, subject: &str, at: Timestamp) -> Result<Vec<String>> {
+    change_scoped(root, &Scope { account: Some((issuer, subject)), ..Scope::default() }, |_, file| {
+        let now = Timestamp::now().to_rfc3339();
+        let mut revoked = Vec::new();
+        for t in &mut file.tokens {
+            let theirs = t.identity.as_ref().is_some_and(|g| g.issuer == issuer && g.subject == subject);
+            let before = Timestamp::parse_rfc3339(&t.created_at).is_ok_and(|created| created < at);
+            if theirs && before && t.revoked_at.is_none() {
+                t.revoked_at = Some(now.clone());
+                revoked.push(t.name.clone());
+            }
+        }
+        Ok(revoked)
+    })
+}
+
+/// Forget the account with this issuer and subject, as its provider says it
+/// was deleted: the account and every token of it, erased as `revoke
+/// --account --forget` does. Whether there was one.
+pub fn forget_account(root: &Path, issuer: &str, subject: &str) -> Result<bool> {
+    let found = change_scoped(root, &Scope { account: Some((issuer, subject)), ..Scope::default() }, |_, file| {
+        let theirs = |g: &Identity| g.issuer == issuer && g.subject == subject;
+        let before = (file.accounts.len(), file.tokens.len());
+        file.accounts.retain(|a| !(a.issuer == issuer && a.subject == subject));
+        file.tokens.retain(|t| !t.identity.as_ref().is_some_and(theirs));
+        Ok(before != (file.accounts.len(), file.tokens.len()))
+    })?;
+    if found {
+        server_db::scrub(root)?;
+    }
+    Ok(found)
+}
+
+/// What `revoke --account` did.
 #[derive(Debug)]
-struct GithubRevoked {
+struct AccountRevoked {
     /// The accounts known by the login: their latest login, or their actor.
     accounts: Vec<Account>,
     /// Names of the tokens revoked now (the others already were).
     revoked: Vec<String>,
+    /// With `--forget`: whether what was deleted is gone from the
+    /// database's files too, or stays in its write-ahead log until the
+    /// server's next checkpoint.
+    erased: Option<bool>,
 }
 
-/// Revoke every token of the GitHub accounts known by `login` (their latest
+/// Revoke every token of the accounts known by `login` (their latest
 /// login, or their actor), and any token that signed in as it, so that the
 /// tokens from before a rename go too; with `forget`, also release those
 /// accounts' actors.
-fn revoke_github(root: &Path, login: &str, forget: bool) -> Result<GithubRevoked> {
-    let path = tokens_path(root);
-    let _lock = lock_tokens(root)?;
-    let mut file = load_file(&path)?;
-    let named = |s: &str| s.eq_ignore_ascii_case(login);
-    let accounts: Vec<Account> = file.accounts.iter().filter(|a| named(&a.login) || named(&a.actor)).cloned().collect();
-    let theirs = |t: &Token| t.github.as_ref().is_some_and(|g| named(&g.login) || accounts.iter().any(|a| a.is(g)));
-    let picked: Vec<usize> = (0..file.tokens.len()).filter(|&i| theirs(&file.tokens[i])).collect();
-    if accounts.is_empty() && picked.is_empty() {
-        return Err(Error::not_found("GitHub user with access tokens", login));
-    }
-    let now = Timestamp::now().to_rfc3339();
-    let mut revoked = Vec::new();
-    for i in picked {
-        let t = &mut file.tokens[i];
-        if t.revoked_at.is_none() {
-            t.revoked_at = Some(now.clone());
-            revoked.push(t.name.clone());
+fn revoke_account(root: &Path, login: &str, forget: bool) -> Result<AccountRevoked> {
+    change(root, |file| {
+        let named = |s: &str| s.eq_ignore_ascii_case(login);
+        // An actor names its account alone; else a login names the accounts it is (or, renamed, was) the login of,
+        // at one provider: at several, their actors tell them apart.
+        let by_actor: Vec<Account> = file.accounts.iter().filter(|a| named(&a.actor)).cloned().collect();
+        let accounts = match by_actor.is_empty() {
+            false => by_actor,
+            true => file.accounts.iter().filter(|a| named(&a.login)).cloned().collect(),
+        };
+        let mut providers: Vec<&str> = accounts.iter().map(|a| a.provider.as_str()).collect();
+        providers.sort_unstable();
+        providers.dedup();
+        if providers.len() > 1 {
+            let actors: Vec<&str> = accounts.iter().map(|a| a.actor.as_str()).collect();
+            return Err(Error::invalid(format!(
+                "{login} is the login of accounts at {}: name the one to revoke by its actor ({})",
+                providers.join(" and "),
+                actors.join(", ")
+            )));
         }
-    }
-    let forgotten = forget && !accounts.is_empty();
-    if forgotten {
-        file.accounts.retain(|a| !accounts.contains(a));
-    }
-    if !revoked.is_empty() || forgotten {
-        save_file(&path, &file)?;
-    }
-    Ok(GithubRevoked { accounts, revoked })
+        // Their tokens, and tokens signed in as the login at the same provider (from before a rename).
+        let theirs = |t: &Token| {
+            t.identity.as_ref().is_some_and(|g| {
+                accounts.iter().any(|a| a.is(g))
+                    || (named(&g.login) && (accounts.is_empty() || providers.contains(&g.provider.as_str())))
+            })
+        };
+        let picked: Vec<usize> = (0..file.tokens.len()).filter(|&i| theirs(&file.tokens[i])).collect();
+        if accounts.is_empty() && picked.is_empty() {
+            return Err(Error::not_found("account with access tokens", login));
+        }
+        let now = Timestamp::now().to_rfc3339();
+        let mut revoked = Vec::new();
+        for i in picked {
+            let t = &mut file.tokens[i];
+            if t.revoked_at.is_none() {
+                t.revoked_at = Some(now.clone());
+                revoked.push(t.name.clone());
+            }
+        }
+        if forget {
+            // Erased, not kept until pruned: the account and every record of its tokens.
+            file.accounts.retain(|a| !accounts.contains(a));
+            file.tokens.retain(|t| !theirs(t));
+        }
+        Ok(AccountRevoked { accounts, revoked, erased: None })
+    })
+    .and_then(|mut done| {
+        if forget {
+            done.erased = Some(server_db::scrub(root)?);
+        }
+        Ok(done)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Exactly these accounts and tokens.
+    fn put(root: &Path, file: TokenFile) {
+        change(root, |all| {
+            *all = file;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// Every token's record, as stored.
+    fn raw(root: &Path) -> String {
+        let conn = server_db::open(root).unwrap();
+        conn.query_row("SELECT group_concat(data, char(10)) FROM tokens", [], |r| r.get(0)).unwrap()
+    }
+
+    /// Replace `from` with `to` in the tokens' stored records.
+    fn edit(root: &Path, from: &str, to: &str) {
+        let conn = server_db::open(root).unwrap();
+        conn.execute("UPDATE tokens SET data = replace(data, ?1, ?2)", [from, to]).unwrap();
+    }
+
     /// A sign-in token lasting `ttl`, not refreshed.
     fn github_token(
         root: &Path,
-        user: &GithubUser,
+        user: &Identity,
         grant: Grant,
         ttl: Duration,
         by_login: bool,
     ) -> Result<(Token, String)> {
         let life = Lifetime { ttl, refresh: None };
-        issue_github_token(root, user, grant, life, "proj", by_login).map(|i| (i.token, i.secret))
+        issue_sign_in_token(root, user, grant, life, "proj", by_login).map(|i| (i.token, i.secret))
     }
 
     fn token(actor: &str, workspaces: &[&str]) -> Token {
@@ -1260,12 +1539,54 @@ mod tests {
             created_at: String::new(),
             revoked_at: None,
             expires_at: None,
-            github: None,
+            identity: None,
             max_claims: None,
             refresh: None,
             resource: None,
             client: None,
         }
+    }
+
+    #[test]
+    fn other_providers_accounts_act_under_their_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant =
+            || Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec!["proj".into()], max_claims: None };
+        let id = |provider: &str, subject: &str, login: &str| Identity {
+            provider: provider.into(),
+            issuer: format!("https://{provider}.example"),
+            subject: subject.into(),
+            login: login.into(),
+        };
+        let sign_in = |user: &Identity| github_token(dir.path(), user, grant(), Duration::from_secs(3600), true);
+        // An email login: an actor under the provider's name, and a token name of plain characters.
+        let (t, _) = sign_in(&id("google", "1", "alice@acme.example")).unwrap();
+        assert_eq!(t.actor, "google:alice@acme.example");
+        assert!(t.name.starts_with("google-alice-acme.example-") && t.name.len() <= 64, "{}", t.name);
+        // The same login at GitHub and at another provider: two accounts, two actors.
+        let github = Identity {
+            provider: "github".into(),
+            issuer: "https://github.com".into(),
+            subject: "7".into(),
+            login: "alice".into(),
+        };
+        let okta = id("okta", "00u1", "alice");
+        assert_eq!(sign_in(&github).unwrap().0.actor, "github:alice");
+        assert_eq!(sign_in(&okta).unwrap().0.actor, "okta:alice");
+        // No sub-actors from a login, and long names stay names.
+        assert_eq!(sign_in(&id("keycloak", "k1", "bob/x")).unwrap().0.actor, "keycloak:bob-x");
+        let (t, _) = sign_in(&id("corporate-single-sign-on", "c1", &"l".repeat(60))).unwrap();
+        assert!(t.name.len() <= 64, "{}", t.name);
+        // An actor names its account alone; a login of accounts at two providers names neither.
+        let done = revoke_account(dir.path(), "github:alice", false).unwrap();
+        assert_eq!((done.accounts.len(), done.accounts[0].provider.as_str()), (1, "github"));
+        assert_eq!(done.revoked.len(), 1, "not okta:alice's: {:?}", done.revoked);
+        assert_eq!(revoke_account(dir.path(), "okta:alice", false).unwrap().accounts.len(), 1);
+        sign_in(&id("okta", "00u2", "carol")).unwrap();
+        sign_in(&id("keycloak", "k2", "carol")).unwrap();
+        let e = revoke_account(dir.path(), "carol", false).unwrap_err().to_string();
+        assert!(e.contains("keycloak and okta") && e.contains("okta:carol"), "{e}");
+        assert!(preview_actor(dir.path(), &id("google", "2", "eve@acme.example"), true).is_ok());
     }
 
     #[test]
@@ -1289,7 +1610,6 @@ mod tests {
     #[test]
     fn verifier_rereads_the_file_and_ignores_revoked_tokens() {
         let dir = tempfile::tempdir().unwrap();
-        let path = tokens_path(dir.path());
         let v = Verifier::new(dir.path());
         let actor = |secret: &str| match v.verify(secret).unwrap() {
             Verified::Valid(t) => Some(t.actor),
@@ -1299,42 +1619,54 @@ mod tests {
         assert_eq!(actor("bdt_x"), None, "no file yet");
         let mut t = token("alice", &["*"]);
         t.sha256 = hash("bdt_secret");
-        save_file(&path, &TokenFile { version: 1, tokens: vec![t.clone()], accounts: Vec::new() }).unwrap();
+        put(dir.path(), TokenFile { tokens: vec![t.clone()], accounts: Vec::new() });
         assert_eq!(actor("bdt_secret"), Some("alice".to_string()));
         assert_eq!(actor("bdt_other"), None);
         t.revoked_at = Some("2026-01-01T00:00:00Z".into());
-        save_file(&path, &TokenFile { version: 1, tokens: vec![t], accounts: Vec::new() }).unwrap();
+        put(dir.path(), TokenFile { tokens: vec![t], accounts: Vec::new() });
         assert_eq!(actor("bdt_secret"), None, "revocation applies without a restart");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_verifier_follows_a_database_made_anew() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, old) = issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
+        let v = Verifier::new(dir.path());
+        assert!(matches!(v.verify(&old).unwrap(), Verified::Valid(_)));
+        for file in ["server.db", "server.db-wal", "server.db-shm"] {
+            let _ = std::fs::remove_file(dir.path().join(file));
+        }
+        let (_, new) = issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
+        assert!(matches!(v.verify(&new).unwrap(), Verified::Valid(_)), "the new database's token");
+        assert!(matches!(v.verify(&old).unwrap(), Verified::Unknown), "not the removed one's");
     }
 
     #[test]
     fn expired_tokens_are_told_apart_and_never_valid() {
         let dir = tempfile::tempdir().unwrap();
-        let path = tokens_path(dir.path());
         let mut t = token("alice", &["*"]);
         t.sha256 = hash("bdt_secret");
         t.expires_at = Some(Timestamp::now().plus(Duration::from_secs(3600)));
-        save_file(&path, &TokenFile { version: 1, tokens: vec![t.clone()], accounts: Vec::new() }).unwrap();
+        put(dir.path(), TokenFile { tokens: vec![t.clone()], accounts: Vec::new() });
         let v = Verifier::new(dir.path());
         assert!(matches!(v.verify("bdt_secret").unwrap(), Verified::Valid(_)));
         t.expires_at = Some(Timestamp::now().minus(Duration::from_secs(1)));
-        save_file(&path, &TokenFile { version: 1, tokens: vec![t.clone()], accounts: Vec::new() }).unwrap();
-        v.invalidate();
+        put(dir.path(), TokenFile { tokens: vec![t.clone()], accounts: Vec::new() });
         assert!(matches!(v.verify("bdt_secret").unwrap(), Verified::Expired(e) if e.name == "n"));
-        let text = std::fs::read_to_string(&path).unwrap();
         let stamp = t.expires_at.unwrap().to_rfc3339();
-        std::fs::write(&path, text.replace(&stamp, "soon")).unwrap();
-        v.invalidate();
+        edit(dir.path(), &stamp, "soon");
         assert!(v.verify("bdt_secret").is_err(), "an expiry that is not a time fails closed");
+        edit(dir.path(), "soon", &stamp);
         t.revoked_at = Some(Timestamp::now().to_rfc3339());
-        save_file(&path, &TokenFile { version: 1, tokens: vec![t], accounts: Vec::new() }).unwrap();
+        put(dir.path(), TokenFile { tokens: vec![t], accounts: Vec::new() });
         assert!(matches!(v.verify("bdt_secret").unwrap(), Verified::Unknown), "revoked, whether expired or not");
     }
 
     const GITHUB: &str = "https://github.com";
 
-    fn gh(login: &str, id: u64) -> GithubUser {
-        GithubUser { url: GITHUB.into(), login: login.into(), id }
+    fn gh(login: &str, id: u64) -> Identity {
+        Identity { provider: "github".into(), issuer: GITHUB.into(), subject: id.to_string(), login: login.into() }
     }
 
     #[test]
@@ -1352,9 +1684,9 @@ mod tests {
         let (t, secret) = github_token(dir.path(), &alice, grant.clone(), ttl, true).unwrap();
         assert!(secret.starts_with("bdt_") && t.sha256 == hash(&secret));
         assert!(t.name.starts_with("github-Alice-GH-") && t.name.len() == "github-Alice-GH-".len() + 8, "{}", t.name);
-        assert_eq!((t.actor.as_str(), t.role, t.kind), ("Alice-GH", Role::Read, Kind::Human));
+        assert_eq!((t.actor.as_str(), t.role, t.kind), ("github:Alice-GH", Role::Read, Kind::Human));
         assert_eq!(t.workspaces, ["proj"]);
-        assert_eq!(t.github.as_ref(), Some(&alice));
+        assert_eq!(t.identity.as_ref(), Some(&alice));
         let expires = t.expires_at.unwrap();
         assert!(expires >= before.plus(ttl) && expires <= Timestamp::now().plus(ttl));
         assert!(t.describe().contains("signed in as GitHub user Alice-GH"), "{}", t.describe());
@@ -1364,22 +1696,21 @@ mod tests {
         assert_ne!(again.name, t.name, "each sign-in gets a token of its own");
         let long = gh(&"a".repeat(60), 7);
         let (t, _) = github_token(dir.path(), &long, grant, ttl, true).unwrap();
-        assert_eq!((t.actor.len(), t.name.len()), (60, "github-".len() + 40 + 9), "the actor keeps the whole login");
+        assert_eq!((t.actor.len(), t.name.len()), (67, 64), "the actor keeps the whole login");
 
         let v = Verifier::new(dir.path());
-        assert!(matches!(v.verify(&secret).unwrap(), Verified::Valid(v) if v.github == Some(alice.clone())));
+        assert!(matches!(v.verify(&secret).unwrap(), Verified::Valid(v) if v.identity == Some(alice.clone())));
     }
 
     #[test]
-    fn long_expired_github_tokens_are_dropped_when_a_token_is_added() {
+    fn tokens_are_deleted_a_week_after_they_end_at_the_next_write() {
         let dir = tempfile::tempdir().unwrap();
-        let path = tokens_path(dir.path());
         let now = Timestamp::now();
         let entry = |name: &str, expired_ago: Option<Duration>, github: bool| {
             let mut t = token("alice", &["*"]);
-            t.name = name.into();
+            (t.id, t.name) = (name.into(), name.into());
             t.expires_at = expired_ago.map(|d| now.minus(d));
-            t.github = github.then(|| gh("alice", 1));
+            t.identity = github.then(|| gh("alice", 1));
             t
         };
         let day = Duration::from_secs(24 * 3600);
@@ -1389,38 +1720,60 @@ mod tests {
             entry("manual", None, false),
             entry("manual-expired", Some(PRUNE_AFTER + day), false),
         ];
-        save_file(&path, &TokenFile { version: 1, tokens, accounts: Vec::new() }).unwrap();
-        issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
-        let names: Vec<String> = load_file(&path).unwrap().tokens.into_iter().map(|t| t.name).collect();
-        assert_eq!(names, ["recent-sign-in", "manual", "manual-expired", "ci"]);
+        let revoked = |name: &str, ago: Duration, github: bool| {
+            let mut t = entry(name, None, github);
+            t.revoked_at = Some(now.minus(ago).to_rfc3339());
+            t
+        };
+        let tokens = [
+            tokens,
+            vec![
+                revoked("revoked-long-ago", PRUNE_AFTER + day, false),
+                revoked("revoked-sign-in-long-ago", PRUNE_AFTER + day, true),
+                revoked("revoked-recently", day, true),
+            ],
+        ]
+        .concat();
+        put(dir.path(), TokenFile { tokens, accounts: Vec::new() });
+        // Any write: here, revoking another token.
+        let (other, _) = issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
+        let names: Vec<String> = read(dir.path()).unwrap().tokens.into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["recent-sign-in", "manual", "manual-expired", "revoked-recently", "ci"]);
+        let old = Timestamp::now().minus(PRUNE_AFTER + day).to_rfc3339();
+        edit(dir.path(), "\"name\":\"manual\"", &format!("\"name\":\"manual\",\"revoked_at\":\"{old}\""));
+        let conn = server_db::open(dir.path()).unwrap();
+        conn.execute("UPDATE tokens SET ended_at = 0 WHERE name = 'manual'", []).unwrap();
+        assert!(revoke_by_id(dir.path(), &other.id).unwrap());
+        let names: Vec<String> = read(dir.path()).unwrap().tokens.into_iter().map(|t| t.name).collect();
+        assert_eq!(names, ["recent-sign-in", "manual-expired", "revoked-recently", "ci"], "pruned by a revocation");
     }
 
     #[test]
     fn refreshable_sign_ins_stay_listed_until_they_can_no_longer_be_refreshed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = tokens_path(dir.path());
         let now = Timestamp::now();
         let day = Duration::from_secs(24 * 3600);
         let entry = |name: &str, until: Timestamp| {
             let mut t = token("alice", &["*"]);
-            t.name = name.into();
+            (t.id, t.name) = (name.into(), name.into());
             t.expires_at = Some(now.minus(PRUNE_AFTER + day));
-            t.github = Some(gh("alice", 1));
+            t.identity = Some(gh("alice", 1));
             let family = "0".repeat(32);
             t.refresh = Some(Refresh {
                 family,
                 sha256: String::new(),
                 workspace: "proj".into(),
                 refreshed_at: now,
+                decided_at: now,
                 until,
                 last: None,
             });
             t
         };
         let tokens = vec![entry("refreshable", now.plus(day)), entry("ended", now.minus(PRUNE_AFTER + day))];
-        save_file(&path, &TokenFile { version: 1, tokens, accounts: Vec::new() }).unwrap();
+        put(dir.path(), TokenFile { tokens, accounts: Vec::new() });
         issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
-        let names: Vec<String> = load_file(&path).unwrap().tokens.into_iter().map(|t| t.name).collect();
+        let names: Vec<String> = read(dir.path()).unwrap().tokens.into_iter().map(|t| t.name).collect();
         assert_eq!(names, ["refreshable", "ci"]);
     }
 
@@ -1432,7 +1785,7 @@ mod tests {
         let (hour, week) = (Duration::from_secs(3600), Duration::from_secs(7 * 24 * 3600));
         let now = Timestamp::now();
         let life = Lifetime { ttl: hour, refresh: Some((now.plus(week * 4), week)) };
-        let issued = issue_github_token(dir.path(), &alice, grant.clone(), life, "proj", true).unwrap();
+        let issued = issue_sign_in_token(dir.path(), &alice, grant.clone(), life, "proj", true).unwrap();
         let first = issued.refresh_secret.expect("refreshed");
         assert!(first.starts_with("bdr_") && refresh_family(&first).is_some(), "{}", first.len());
         let t = issued.token;
@@ -1446,28 +1799,40 @@ mod tests {
 
         let verifier = Verifier::new(dir.path());
         assert!(matches!(verifier.verify(&issued.secret).unwrap(), Verified::Valid(_)));
-        let read = Grant { role: Role::Read, ..grant.clone() };
+        let reader = Grant { role: Role::Read, ..grant.clone() };
         let renamed = gh("alice-new", 1);
         let (expires, until) = (now.plus(hour * 2), now.plus(week));
         let last = |secret: &str, id: &str| LastRefresh { spent: hash(secret), request: hash(id) };
         let rotated =
-            rotate(dir.path(), &t.id, &hash(&first), last(&first, "r1"), &renamed, read, true, expires, until)
+            rotate(dir.path(), &t.id, &hash(&first), last(&first, "r1"), &renamed, reader, true, true, expires, until)
                 .unwrap()
                 .unwrap();
         let second = rotated.refresh_secret.unwrap();
         let r = rotated.token;
-        assert_eq!((r.id.as_str(), r.name.as_str(), r.actor.as_str()), (t.id.as_str(), t.name.as_str(), "alice"));
-        assert_eq!((r.role, r.github.as_ref().unwrap().login.as_str()), (Role::Read, "alice-new"), "the rules now");
+        assert_eq!(
+            (r.id.as_str(), r.name.as_str(), r.actor.as_str()),
+            (t.id.as_str(), t.name.as_str(), "github:alice")
+        );
+        assert_eq!((r.role, r.identity.as_ref().unwrap().login.as_str()), (Role::Read, "alice-new"), "the rules now");
         assert_eq!((r.expires_at, r.refresh.as_ref().unwrap().until), (Some(expires), until));
-        assert_eq!(load_file(&tokens_path(dir.path())).unwrap().tokens.len(), 1, "replaced in place");
-        verifier.invalidate();
+        assert_eq!(read(dir.path()).unwrap().tokens.len(), 1, "replaced in place");
         assert!(matches!(verifier.verify(&issued.secret).unwrap(), Verified::Unknown), "the old secret is gone");
         assert!(matches!(verifier.verify(&rotated.secret).unwrap(), Verified::Valid(_)));
 
         assert!(!find_refresh(dir.path(), &first).unwrap().unwrap().1, "spent");
         assert!(find_refresh(dir.path(), &second).unwrap().unwrap().1);
-        let again =
-            rotate(dir.path(), &t.id, &hash(&first), last(&first, "r2"), &renamed, grant.clone(), true, expires, until);
+        let again = rotate(
+            dir.path(),
+            &t.id,
+            &hash(&first),
+            last(&first, "r2"),
+            &renamed,
+            grant.clone(),
+            true,
+            true,
+            expires,
+            until,
+        );
         assert!(again.unwrap().is_none(), "a spent secret rotates nothing");
         let state = find_refresh(dir.path(), &second).unwrap().unwrap().0.refresh.unwrap();
         assert!(state.retries_last(&first, "r1"), "the latest refresh, sent again");
@@ -1481,59 +1846,66 @@ mod tests {
         assert!(find_refresh(dir.path(), &second).unwrap().is_none(), "revoked");
 
         let once = Lifetime { ttl: hour, refresh: None };
-        let plain = issue_github_token(dir.path(), &alice, grant, once, "proj", true).unwrap();
+        let plain = issue_sign_in_token(dir.path(), &alice, grant, once, "proj", true).unwrap();
         assert!(plain.refresh_secret.is_none() && plain.token.refresh.is_none());
     }
 
     #[test]
     fn github_accounts_keep_their_actor_through_renames_and_after_their_tokens() {
         let dir = tempfile::tempdir().unwrap();
-        let path = tokens_path(dir.path());
         let hour = Duration::from_secs(3600);
         let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
-        let sign_in = |user: &GithubUser| github_token(dir.path(), user, grant.clone(), hour, true);
-        let accounts = || load_file(&path).unwrap().accounts;
+        let sign_in = |user: &Identity| github_token(dir.path(), user, grant.clone(), hour, true);
+        let accounts = || read(dir.path()).unwrap().accounts;
 
         let (first, _) = sign_in(&gh("alice", 1)).unwrap();
-        assert_eq!(first.actor, "alice");
+        assert_eq!(first.actor, "github:alice");
         let bound = accounts();
-        assert_eq!((bound.len(), bound[0].actor.as_str(), bound[0].first_seen), (1, "alice", bound[0].last_seen));
+        assert_eq!(
+            (bound.len(), bound[0].actor.as_str(), bound[0].first_seen),
+            (1, "github:alice", bound[0].last_seen)
+        );
 
         // Renamed at GitHub: the same account, the same actor.
         let (renamed, _) = sign_in(&gh("alice-smith", 1)).unwrap();
-        assert_eq!(renamed.actor, "alice");
+        assert_eq!(renamed.actor, "github:alice");
         assert!(renamed.name.starts_with("github-alice-"), "{}", renamed.name);
-        assert_eq!(renamed.github.as_ref().map(|g| g.login.as_str()), Some("alice-smith"));
+        assert_eq!(renamed.identity.as_ref().map(|g| g.login.as_str()), Some("alice-smith"));
         let bound = accounts();
         assert_eq!((bound.len(), bound[0].login.as_str()), (1, "alice-smith"), "the latest login");
         assert!(bound[0].last_seen >= bound[0].first_seen);
 
         // Another account that took the login is refused, even once the first account's tokens are gone.
         let e = sign_in(&gh("Alice", 2)).unwrap_err();
-        assert!(e.exit_code() == 7 && e.to_string().contains("belongs to another GitHub account"), "{e}");
-        revoke_github(dir.path(), "alice", false).unwrap();
-        let mut file = load_file(&path).unwrap();
+        assert!(e.exit_code() == 7 && e.to_string().contains("belongs to another account"), "{e}");
+        revoke_account(dir.path(), "github:alice", false).unwrap();
+        let mut file = read(dir.path()).unwrap();
         for t in &mut file.tokens {
             t.expires_at = Some(Timestamp::now().minus(PRUNE_AFTER + hour));
         }
-        save_file(&path, &file).unwrap();
+        put(dir.path(), file);
         issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
-        assert_eq!(load_file(&path).unwrap().tokens.len(), 1, "alice's tokens were pruned");
+        assert_eq!(read(dir.path()).unwrap().tokens.len(), 1, "alice's tokens were pruned");
         assert!(sign_in(&gh("alice", 2)).is_err(), "the binding outlives the tokens");
-        let e = issue_token(dir.path(), "x", "alice/ci", Role::Write, Kind::Agent, &[]).unwrap_err();
-        assert!(e.to_string().contains("bd serve token revoke --github alice-smith --forget"), "{e}");
+        let e = issue_token(dir.path(), "x", "github:alice/ci", Role::Write, Kind::Agent, &[]).unwrap_err();
+        assert!(e.to_string().contains("bd serve token revoke --account github:alice --forget"), "{e}");
 
         // An id at another GitHub is another account.
-        let (other, _) =
-            sign_in(&GithubUser { url: "https://ghe.example.com".into(), login: "bob".into(), id: 1 }).unwrap();
-        assert_eq!(other.actor, "bob");
+        let (other, _) = sign_in(&Identity {
+            provider: "github".into(),
+            issuer: "https://ghe.example.com".into(),
+            subject: "1".into(),
+            login: "bob".into(),
+        })
+        .unwrap();
+        assert_eq!(other.actor, "github:bob");
         assert_eq!(accounts().len(), 2);
 
         // Released, the actor goes to the next account signing in as it.
-        let done = revoke_github(dir.path(), "alice-smith", true).unwrap();
+        let done = revoke_account(dir.path(), "alice-smith", true).unwrap();
         assert_eq!((done.accounts.len(), done.revoked.len()), (1, 0), "{done:?}");
         assert_eq!(accounts().len(), 1);
-        assert_eq!(sign_in(&gh("alice", 2)).unwrap().0.actor, "alice");
+        assert_eq!(sign_in(&gh("alice", 2)).unwrap().0.actor, "github:alice");
     }
 
     #[test]
@@ -1545,22 +1917,17 @@ mod tests {
         let (a2, _) = github_token(dir.path(), &gh("alice-new", 1), grant.clone(), ttl, true).unwrap();
         let (b, _) = github_token(dir.path(), &gh("bob", 2), grant, ttl, true).unwrap();
         issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
-        let mut done = revoke_github(dir.path(), "ALICE-NEW", false).unwrap();
+        let mut done = revoke_account(dir.path(), "ALICE-NEW", false).unwrap();
         done.revoked.sort();
         let mut expected = vec![a1.name, a2.name];
         expected.sort();
         assert_eq!(done.revoked, expected, "by account: tokens from before a rename go too");
-        assert_eq!(done.accounts.iter().map(|a| a.actor.as_str()).collect::<Vec<_>>(), ["Alice"]);
-        let again = revoke_github(dir.path(), "alice", false).unwrap();
+        assert_eq!(done.accounts.iter().map(|a| a.actor.as_str()).collect::<Vec<_>>(), ["github:Alice"]);
+        let again = revoke_account(dir.path(), "github:alice", false).unwrap();
         assert!(again.revoked.is_empty() && again.accounts.len() == 1, "known by its actor too: {again:?}");
-        assert_eq!(revoke_github(dir.path(), "nobody", false).unwrap_err().exit_code(), 3);
-        let live: Vec<String> = load_file(&tokens_path(dir.path()))
-            .unwrap()
-            .tokens
-            .into_iter()
-            .filter(|t| t.revoked_at.is_none())
-            .map(|t| t.name)
-            .collect();
+        assert_eq!(revoke_account(dir.path(), "nobody", false).unwrap_err().exit_code(), 3);
+        let live: Vec<String> =
+            read(dir.path()).unwrap().tokens.into_iter().filter(|t| t.revoked_at.is_none()).map(|t| t.name).collect();
         assert_eq!(live, [b.name, "ci".to_string()]);
     }
 
@@ -1570,30 +1937,31 @@ mod tests {
         let ttl = Duration::from_secs(3600);
         let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
         let manual = |name: &str, actor: &str| issue_token(dir.path(), name, actor, Role::Write, Kind::Agent, &[]);
-        manual("ci", "ci-agents").unwrap();
-        manual("carol-ci", "carol/ci").unwrap();
+        manual("ci", "github:ci-agents").unwrap();
+        manual("carol-ci", "github:carol/ci").unwrap();
         for (login, id) in [("ci-agents", 1), ("CI-Agents", 1), ("carol", 2)] {
             let e = github_token(dir.path(), &gh(login, id), grant.clone(), ttl, true).unwrap_err();
             assert_eq!(e.exit_code(), 7, "{login}: {e}");
             assert!(e.to_string().contains("another access token acts as"), "{e}");
         }
-        assert!(load_file(&tokens_path(dir.path())).unwrap().accounts.is_empty(), "a refused sign-in binds nothing");
+        assert!(read(dir.path()).unwrap().accounts.is_empty(), "a refused sign-in binds nothing");
         github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl, true).unwrap();
         github_token(dir.path(), &gh("alice", 3), grant.clone(), ttl, true).unwrap();
         assert!(github_token(dir.path(), &gh("Alice", 4), grant.clone(), ttl, true).is_err(), "another account");
-        for actor in ["alice", "ALICE/ci"] {
+        for actor in ["github:alice", "GitHub:ALICE/ci"] {
             let e = manual("x", actor).unwrap_err();
-            assert!(e.to_string().contains("bd serve token revoke --github alice --forget"), "{e}");
+            assert!(e.to_string().contains("bd serve token revoke --account github:alice --forget"), "{e}");
         }
-        manual("alice2", "alice2").unwrap();
+        manual("alice2", "github:alice2").unwrap();
+        manual("bare", "alice").unwrap();
 
         // Revoked, an account keeps its actor; released, the actor is free again. Admins' tokens may share theirs.
-        revoke_github(dir.path(), "alice", false).unwrap();
+        revoke_account(dir.path(), "alice", false).unwrap();
         assert!(github_token(dir.path(), &gh("alice", 4), grant.clone(), ttl, true).is_err());
-        assert!(manual("x", "alice").is_err());
-        revoke_github(dir.path(), "alice", true).unwrap();
+        assert!(manual("x", "github:alice").is_err());
+        revoke_account(dir.path(), "alice", true).unwrap();
         github_token(dir.path(), &gh("alice", 4), grant, ttl, true).unwrap();
-        manual("ci-2", "ci-agents").unwrap();
+        manual("ci-2", "github:ci-agents").unwrap();
     }
 
     #[test]
@@ -1604,27 +1972,104 @@ mod tests {
         for actor in ["bd-serve", "BD-Serve", "bd-serve/jobs"] {
             let e = issue_token(dir.path(), "x", actor, Role::Admin, Kind::Agent, &[]).unwrap_err();
             assert!(e.exit_code() == 2 && e.to_string().contains("reserved"), "{actor}: {e}");
-            let e = github_token(dir.path(), &gh(actor, 1), grant.clone(), ttl, true).unwrap_err();
-            assert!(e.exit_code() == 7 && e.to_string().contains("bd serve's own"), "{actor}: {e}");
         }
-        let file = load_file(&tokens_path(dir.path())).unwrap();
-        assert!(file.tokens.is_empty() && file.accounts.is_empty(), "nothing issued, nothing bound");
+        assert!(read(dir.path()).unwrap().tokens.is_empty(), "nothing issued");
+        // Sign-ins act under their provider's name, so a login never takes the server's actor.
+        let (t, _) = github_token(dir.path(), &gh("bd-serve", 1), grant, ttl, true).unwrap();
+        assert_eq!(t.actor, "github:bd-serve");
         for (name, actor) in [("a", "bd-server"), ("b", "bd"), ("c", "alice/bd-serve")] {
             issue_token(dir.path(), name, actor, Role::Write, Kind::Agent, &[]).unwrap();
         }
     }
 
     #[test]
-    fn writers_wait_for_the_lock() {
+    fn sign_ins_load_the_rows_their_checks_look_at_and_no_others() {
         let dir = tempfile::tempdir().unwrap();
-        let held = lock_tokens(dir.path()).unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let hour = Duration::from_secs(3600);
+        for actor in ["GitHub:Alice/ci", "github:alice/ci/run-1", "github:alicex", "github:al", "bob"] {
+            issue_token(
+                dir.path(),
+                &format!("t-{}", actor.replace([':', '/'], "-")),
+                actor,
+                Role::Write,
+                Kind::Agent,
+                &[],
+            )
+            .unwrap();
+        }
+        github_token(dir.path(), &gh("carol", 7), grant.clone(), hour, true).unwrap();
+        // Renamed: carol's account is now alice-at-work, bound to github:carol.
+        let renamed = gh("alice-at-work", 7);
+        let names = |file: &TokenFile| {
+            let mut tokens: Vec<String> = file.tokens.iter().map(|t| t.actor.clone()).collect();
+            tokens.sort();
+            let accounts: Vec<String> = file.accounts.iter().map(|a| a.actor.clone()).collect();
+            (tokens, accounts)
+        };
+        let scope = |user: &Identity| read_scoped(dir.path(), Some(&Scope { user: Some(user), ..Scope::default() }));
+        // alice: the tokens of github:alice, its ancestors and descendants, regardless of case; not alicex's or al's.
+        let (tokens, accounts) = names(&scope(&gh("alice", 1)).unwrap());
+        assert_eq!(tokens, ["GitHub:Alice/ci", "github:alice/ci/run-1"]);
+        assert!(accounts.is_empty(), "{accounts:?}");
+        // The renamed account: its own, by issuer and subject, and the actor it is bound to.
+        let (tokens, accounts) = names(&scope(&renamed).unwrap());
+        assert_eq!((tokens, accounts), (vec!["github:carol".to_string()], vec!["github:carol".to_string()]));
+        // Another account taking the login carol's account has now: found by that login alone, as bind looks
+        // at it (its own actor, github:alice-at-work, is unrelated to github:carol).
+        github_token(dir.path(), &renamed, grant, hour, true).unwrap();
+        let (_, accounts) = names(&scope(&gh("Alice-At-Work", 9)).unwrap());
+        assert_eq!(accounts, ["github:carol"]);
+        // An admin's actor: the tokens related to it.
+        let file = read_scoped(dir.path(), Some(&Scope { actors: vec!["github:alice".into()], ..Scope::default() }));
+        assert_eq!(names(&file.unwrap()).0.len(), 2);
+        // A token by id brings its actor's.
+        let all = read(dir.path()).unwrap();
+        let ci = all.tokens.iter().find(|t| t.actor == "GitHub:Alice/ci").unwrap();
+        let file = read_scoped(dir.path(), Some(&Scope { ids: &[ci.id.as_str()], ..Scope::default() })).unwrap();
+        assert_eq!(names(&file).0, ["GitHub:Alice/ci", "github:alice/ci/run-1"]);
+    }
+
+    #[test]
+    fn forgetting_an_account_leaves_nothing_of_it_in_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let hour = Duration::from_secs(3600);
+        let files = || {
+            ["server.db", "server.db-wal"]
+                .iter()
+                .flat_map(|f| std::fs::read(dir.path().join(f)).unwrap_or_default())
+                .collect::<Vec<u8>>()
+        };
+        let has = |bytes: &[u8], what: &str| bytes.windows(what.len()).any(|w| w == what.as_bytes());
+        github_token(dir.path(), &gh("forgettable-login", 41), grant.clone(), hour, true).unwrap();
+        github_token(dir.path(), &gh("forgettable-login", 41), grant.clone(), hour, true).unwrap();
+        github_token(dir.path(), &gh("keeper", 42), grant, hour, true).unwrap();
+        assert!(has(&files(), "forgettable-login"));
+
+        let done = revoke_account(dir.path(), "forgettable-login", false).unwrap();
+        assert_eq!((done.revoked.len(), done.erased), (2, None));
+        assert_eq!(read(dir.path()).unwrap().tokens.len(), 3, "revoked, still listed");
+        let done = revoke_account(dir.path(), "github:forgettable-login", true).unwrap();
+        assert_eq!(done.erased, Some(true));
+        let file = read(dir.path()).unwrap();
+        assert_eq!((file.tokens.len(), file.accounts.len()), (1, 1), "only keeper's");
+        let bytes = files();
+        assert!(!has(&bytes, "forgettable-login") && has(&bytes, "keeper"), "erased from the files themselves");
+    }
+
+    #[test]
+    fn writers_wait_for_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = server_db::open(dir.path()).unwrap();
+        held.execute_batch("BEGIN IMMEDIATE").unwrap();
         let root = dir.path().to_path_buf();
         let writer = std::thread::spawn(move || issue_token(&root, "ci", "ci", Role::Write, Kind::Agent, &[]));
         std::thread::sleep(Duration::from_millis(200));
-        assert!(!tokens_path(dir.path()).exists(), "nothing is written while another holds the lock");
-        drop(held);
+        assert!(read(dir.path()).unwrap().tokens.is_empty(), "nothing is written while another writes");
+        held.execute_batch("COMMIT").unwrap();
         writer.join().unwrap().unwrap();
-        assert_eq!(load_file(&tokens_path(dir.path())).unwrap().tokens.len(), 1);
+        assert_eq!(read(dir.path()).unwrap().tokens.len(), 1);
     }
 
     #[test]
@@ -1639,7 +2084,7 @@ mod tests {
 
         t.workspaces = vec!["*".into()];
         t.expires_at = Some(Timestamp::parse_rfc3339("2026-11-01T00:00:00Z").unwrap());
-        t.github = Some(gh("alice", 1));
+        t.identity = Some(gh("alice", 1));
         assert_eq!(
             access_line(&t.summary()),
             "role write, kind human, workspaces all; token n, expires 2026-11-01T00:00:00.000Z, GitHub user alice"
@@ -1654,8 +2099,7 @@ mod tests {
         revoke_where(dir.path(), |tokens| (0..tokens.len()).collect()).unwrap();
         let (second, _) = issue_token(dir.path(), "ci", "ci", Role::Write, Kind::Agent, &[]).unwrap();
         assert!(!revoke_by_id(dir.path(), &first.id).unwrap(), "already revoked");
-        let live =
-            || load_file(&tokens_path(dir.path())).unwrap().tokens.iter().filter(|t| t.revoked_at.is_none()).count();
+        let live = || read(dir.path()).unwrap().tokens.iter().filter(|t| t.revoked_at.is_none()).count();
         assert_eq!(live(), 1, "the later token of the same name is untouched");
         assert!(revoke_by_id(dir.path(), &second.id).unwrap());
         assert_eq!(live(), 0);
@@ -1672,16 +2116,19 @@ mod tests {
             bd_core::Policy { actor: "alice".into(), admin: true, human: false, max_claims: None }
         );
         assert!(agent.describe().contains("kind agent"), "{}", agent.describe());
-        let text = std::fs::read_to_string(tokens_path(dir.path())).unwrap();
-        assert!(text.contains("\"kind\": \"agent\"") && text.contains("\"kind\": \"human\""), "{text}");
+        let text = raw(dir.path());
+        assert!(text.contains("\"kind\":\"agent\"") && text.contains("\"kind\":\"human\""), "{text}");
         assert!(!text.contains("expires_at") && !text.contains("github"), "only sign-ins have them: {text}");
 
-        let without = json!({ "version": 1, "tokens": [{
+        let without = json!({
             "id": "0123456789abcdef", "name": "n", "actor": "alice", "role": "admin", "workspaces": ["*"],
             "sha256": hash("bdt_x"), "created_at": "2026-01-01T00:00:00Z",
-        }]});
-        std::fs::write(tokens_path(dir.path()), without.to_string()).unwrap();
+        });
+        let conn = server_db::open(dir.path()).unwrap();
+        let sql =
+            "INSERT INTO tokens (id, sha256, actor_key, name, data) VALUES ('0123456789abcdef', ?1, 'alice', 'n', ?2)";
+        conn.execute(sql, [hash("bdt_x"), without.to_string()]).unwrap();
         let err = Verifier::new(dir.path()).verify("bdt_x").unwrap_err().to_string();
-        assert!(err.contains("tokens.json") && err.contains("kind"), "{err}");
+        assert!(err.contains("server.db") && err.contains("kind"), "{err}");
     }
 }

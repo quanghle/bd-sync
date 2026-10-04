@@ -6,10 +6,11 @@
 //! redirect URI must be one `[oauth]` allows, a client never used within
 //! [`UNUSED_FOR`] of registering or unused for [`IDLE_FOR`] is dropped, and
 //! at most [`MAX_CLIENTS`] are kept (a full registry drops its oldest
-//! never-used client). Registered clients live in `<root>/oauth-clients.json`,
-//! changed under `<root>/oauth-clients.lock`.
+//! never-used client). Registered clients live in `<root>/server.db`
+//! (`server_db.rs`), a row each.
 
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::path::Path;
 use std::time::Duration;
 
 use bd_core::{Error, Result, Timestamp};
@@ -19,6 +20,7 @@ use serde_json::{Map, Value, json};
 use super::cimd::{self, Documents};
 use crate::auth;
 use crate::oauth::OauthConfig;
+use crate::server_db;
 
 pub const MAX_CLIENTS: usize = 500;
 pub const UNUSED_FOR: Duration = Duration::from_secs(24 * 3600);
@@ -70,8 +72,11 @@ pub fn lookup(root: &Path, documents: &Documents, id: &str) -> Result<Client> {
     if cimd::is_document_url(id) {
         return documents.client(id);
     }
-    let file = load(&path(root))?;
-    match file.clients.into_iter().find(|c| c.client_id == id) {
+    let found = match server_db::open_existing(root)? {
+        Some(conn) => find(&conn, id)?,
+        None => None,
+    };
+    match found {
         Some(c) => Ok(Client {
             id: c.client_id,
             name: c.client_name,
@@ -91,17 +96,18 @@ pub fn touch(root: &Path, id: &str) -> Result<()> {
         return Ok(());
     }
     let now = Timestamp::now();
-    let path = path(root);
     // Once an hour is enough to keep it, and saves a write per request.
     let recent = |c: &Registered| c.used_at.is_some_and(|at| now.since(at) < 3_600_000);
-    if load(&path)?.clients.iter().any(|c| c.client_id == id && recent(c)) {
+    let Some(conn) = server_db::open_existing(root)? else { return Ok(()) };
+    if find(&conn, id)?.is_none_or(|c| recent(&c)) {
         return Ok(());
     }
-    let _lock = lock(root)?;
-    let mut file = load(&path)?;
-    let Some(client) = file.clients.iter_mut().find(|c| c.client_id == id) else { return Ok(()) };
-    client.used_at = Some(now);
-    auth::save_json(&path, &file)
+    change(root, |clients| {
+        if let Some(client) = clients.iter_mut().find(|c| c.client_id == id) {
+            client.used_at = Some(now);
+        }
+        Ok(())
+    })
 }
 
 /// Whether `uri` sends the browser to this machine (`http` on 127.0.0.1,
@@ -163,34 +169,32 @@ pub fn register(root: &Path, oauth: &OauthConfig, request: &[u8]) -> Result<std:
         issued_at: now,
         used_at: None,
     };
-    let path = path(root);
-    let _lock = lock(root)?;
-    let mut file = load(&path)?;
-    file.clients.retain(|c| match c.used_at {
-        Some(at) => now.since(at) < millis(IDLE_FOR),
-        None => now.since(c.issued_at) < millis(UNUSED_FOR),
-    });
-    if file.clients.len() >= MAX_CLIENTS {
-        let unused = file.clients.iter().enumerate().filter(|(_, c)| c.used_at.is_none());
-        match unused.min_by_key(|(_, c)| c.issued_at).map(|(i, _)| i) {
-            Some(oldest) => drop(file.clients.remove(oldest)),
-            None => return Err(Error::Busy(format!("{MAX_CLIENTS} clients are registered and in use"))),
+    change(root, |clients| {
+        clients.retain(|c| match c.used_at {
+            Some(at) => now.since(at) < millis(IDLE_FOR),
+            None => now.since(c.issued_at) < millis(UNUSED_FOR),
+        });
+        if clients.len() >= MAX_CLIENTS {
+            let unused = clients.iter().enumerate().filter(|(_, c)| c.used_at.is_none());
+            match unused.min_by_key(|(_, c)| c.issued_at).map(|(i, _)| i) {
+                Some(oldest) => drop(clients.remove(oldest)),
+                None => return Err(Error::Busy(format!("{MAX_CLIENTS} clients are registered and in use"))),
+            }
         }
-    }
-    let mut answer = json!({
-        "client_id": client.client_id,
-        "client_id_issued_at": now.millis() / 1000,
-        "redirect_uris": client.redirect_uris,
-        "grant_types": grant_types,
-        "response_types": response_types,
-        "token_endpoint_auth_method": "none",
-    });
-    if let Some(name) = &client.client_name {
-        answer["client_name"] = name.clone().into();
-    }
-    file.clients.push(client);
-    auth::save_json(&path, &file)?;
-    Ok(Ok(answer))
+        let mut answer = json!({
+            "client_id": client.client_id,
+            "client_id_issued_at": now.millis() / 1000,
+            "redirect_uris": client.redirect_uris,
+            "grant_types": grant_types,
+            "response_types": response_types,
+            "token_endpoint_auth_method": "none",
+        });
+        if let Some(name) = &client.client_name {
+            answer["client_name"] = name.clone().into();
+        }
+        clients.push(client);
+        Ok(Ok(answer))
+    })
 }
 
 /// `grant_types` and `response_types`, which may be left out: with
@@ -257,6 +261,13 @@ fn hides_something(name: &str) -> bool {
     })
 }
 
+/// Whether `text` may be shown on a page as given: not empty once trimmed,
+/// at most `max` characters, hiding nothing ([`hides_something`]).
+pub(crate) fn shows_plainly(text: &str, max: usize) -> bool {
+    let text = text.trim();
+    !text.is_empty() && text.chars().count() <= max && !hides_something(text)
+}
+
 /// Whether `c` is never shown in a name: see [`hides_something`].
 fn hidden(c: char) -> bool {
     (c.is_whitespace() && c != ' ')
@@ -306,12 +317,6 @@ pub fn client_name(value: Option<&Value>) -> std::result::Result<Option<String>,
     Ok((!name.is_empty()).then(|| name.to_string()))
 }
 
-#[derive(Serialize, Deserialize)]
-struct ClientFile {
-    version: u32,
-    clients: Vec<Registered>,
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 struct Registered {
     client_id: String,
@@ -323,20 +328,49 @@ struct Registered {
     used_at: Option<Timestamp>,
 }
 
-fn path(root: &Path) -> PathBuf {
-    root.join("oauth-clients.json")
+/// The registered client `id`.
+fn find(conn: &rusqlite::Connection, id: &str) -> Result<Option<Registered>> {
+    let mut stmt = conn.prepare_cached("SELECT data FROM oauth_clients WHERE client_id = ?1")?;
+    let data: Option<String> = stmt.query_map([id], |r| r.get(0))?.next().transpose()?;
+    data.map(|d| parse(&d)).transpose()
 }
 
-fn lock(root: &Path) -> Result<auth::FileLock> {
-    auth::lock_file(&root.join("oauth-clients.lock"), "the registered OAuth clients")
+fn parse(data: &str) -> Result<Registered> {
+    serde_json::from_str(data).map_err(|e| Error::invalid(format!("server.db: an OAuth client: {e}")))
 }
 
-fn load(path: &Path) -> Result<ClientFile> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display()))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ClientFile { version: 1, clients: Vec::new() }),
-        Err(e) => Err(Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))),
-    }
+/// The registered clients, in the order they registered.
+fn load(conn: &rusqlite::Connection) -> Result<Vec<Registered>> {
+    let mut stmt = conn.prepare_cached("SELECT data FROM oauth_clients ORDER BY seq")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    rows.iter().map(|d| parse(d)).collect()
+}
+
+/// Change the registered clients with `f`, in one transaction: the rows it
+/// added, changed or dropped are written if it succeeds, nothing if not.
+fn change<T>(root: &Path, f: impl FnOnce(&mut Vec<Registered>) -> Result<T>) -> Result<T> {
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| {
+        let before = load(tx)?;
+        let mut clients = before.clone();
+        let out = f(&mut clients)?;
+        let was: HashMap<&str, String> =
+            before.iter().map(|c| Ok((c.client_id.as_str(), serde_json::to_string(c)?))).collect::<Result<_>>()?;
+        for gone in was.keys().filter(|id| !clients.iter().any(|c| c.client_id == **id)) {
+            tx.execute("DELETE FROM oauth_clients WHERE client_id = ?1", [gone])?;
+        }
+        for c in &clients {
+            let data = serde_json::to_string(c)?;
+            if was.get(c.client_id.as_str()) != Some(&data) {
+                tx.execute(
+                    "INSERT INTO oauth_clients (client_id, data) VALUES (?1, ?2) ON CONFLICT (client_id) DO UPDATE \
+                     SET data = excluded.data",
+                    [&c.client_id, &data],
+                )?;
+            }
+        }
+        Ok(out)
+    })
 }
 
 fn millis(d: Duration) -> i64 {
@@ -437,8 +471,15 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(path(root.path())).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
+            // While a connection is open, its write-ahead log is there too.
+            let conn = server_db::open(root.path()).unwrap();
+            conn.query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get::<_, i64>(0)).unwrap();
+            let db = server_db::path(root.path());
+            let wal = db.with_extension("db-wal");
+            for file in [&db, &wal] {
+                let mode = std::fs::metadata(file).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{}", file.display());
+            }
         }
     }
 
@@ -511,7 +552,20 @@ mod tests {
         }
         let (code, _) = register(root.path(), &oauth(), b"{").unwrap().unwrap_err();
         assert_eq!(code, "invalid_client_metadata");
-        assert!(!path(root.path()).exists(), "nothing registered");
+        assert!(all(root.path()).is_empty(), "nothing registered");
+    }
+
+    fn all(root: &Path) -> Vec<Registered> {
+        load(&server_db::open(root).unwrap()).unwrap()
+    }
+
+    /// Exactly these clients registered.
+    fn put(root: &Path, clients: Vec<Registered>) {
+        change(root, |all| {
+            *all = clients;
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[test]
@@ -533,9 +587,9 @@ mod tests {
             client("bdc_used", IDLE_FOR * 2, Some(IDLE_FOR - hour)),
             client("bdc_new", hour, None),
         ];
-        auth::save_json(&path(root.path()), &ClientFile { version: 1, clients: clients.clone() }).unwrap();
+        put(root.path(), clients.clone());
         register_json(root.path(), json!({ "redirect_uris": ["https://chatgpt.com/cb"] })).unwrap();
-        let kept: Vec<String> = load(&path(root.path())).unwrap().clients.into_iter().map(|c| c.client_id).collect();
+        let kept: Vec<String> = all(root.path()).into_iter().map(|c| c.client_id).collect();
         assert_eq!(&kept[..2], ["bdc_used", "bdc_new"]);
         assert_eq!(kept.len(), 3);
 
@@ -545,16 +599,16 @@ mod tests {
             let used = (i != 7 && i != 9).then_some(hour);
             clients.push(client(&format!("bdc_{i}"), hour - Duration::from_secs(i as u64), used));
         }
-        auth::save_json(&path(root.path()), &ClientFile { version: 1, clients: clients.clone() }).unwrap();
+        put(root.path(), clients.clone());
         register_json(root.path(), json!({ "redirect_uris": ["https://chatgpt.com/cb"] })).unwrap();
-        let ids: Vec<String> = load(&path(root.path())).unwrap().clients.into_iter().map(|c| c.client_id).collect();
+        let ids: Vec<String> = all(root.path()).into_iter().map(|c| c.client_id).collect();
         assert_eq!(ids.len(), MAX_CLIENTS);
         assert!(!ids.contains(&"bdc_7".to_string()) && ids.contains(&"bdc_9".to_string()), "bdc_7 was older");
 
         for c in &mut clients {
             c.used_at = at(hour);
         }
-        auth::save_json(&path(root.path()), &ClientFile { version: 1, clients }).unwrap();
+        put(root.path(), clients);
         let full = register(root.path(), &oauth(), br#"{"redirect_uris":["https://chatgpt.com/cb"]}"#);
         assert!(matches!(full, Err(Error::Busy(_))));
     }
@@ -567,11 +621,11 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .to_string();
-        assert_eq!(load(&path(root.path())).unwrap().clients[0].used_at, None);
+        assert_eq!(all(root.path())[0].used_at, None);
         touch(root.path(), &id).unwrap();
-        let used = load(&path(root.path())).unwrap().clients[0].used_at.unwrap();
+        let used = all(root.path())[0].used_at.unwrap();
         touch(root.path(), &id).unwrap();
-        assert_eq!(load(&path(root.path())).unwrap().clients[0].used_at, Some(used), "not written again so soon");
+        assert_eq!(all(root.path())[0].used_at, Some(used), "not written again so soon");
         touch(root.path(), "bdc_gone").unwrap();
         touch(root.path(), "https://chatgpt.com/oauth/client.json").unwrap();
     }

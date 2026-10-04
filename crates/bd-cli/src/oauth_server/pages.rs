@@ -31,6 +31,7 @@ body{margin:0 auto;max-width:560px;min-height:100vh;padding:48px 24px;background
 font:15px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
 -webkit-font-smoothing:antialiased}
 @media (max-width:480px){body{padding:32px 20px}}
+.choices{display:grid;gap:10px;margin:8px 0 16px}
 .bar{display:flex;flex-wrap:wrap;align-items:center;gap:12px 24px;margin:8px 0 0}
 .brand{display:flex;align-items:center;gap:8px;margin-left:auto;font-weight:600}
 .brand small{font-size:inherit;font-weight:400;opacity:.55}
@@ -129,6 +130,8 @@ pub struct Consent<'a> {
     /// How long access lasts, as words following "Access lasts".
     pub lasts: &'a str,
     pub workspace: &'a str,
+    /// The provider the person signed in with, as the page names it.
+    pub provider: &'a str,
     pub login: &'a str,
     pub actor: &'a str,
     /// What the access allows, in words.
@@ -199,7 +202,7 @@ this computer, and any program running here could be posing as {client}.</span><
         "<div class=\"link\" aria-hidden=\"true\">{avatar}\
 <div class=\"dots\"><i></i><i></i><i></i></div><div class=\"avatar\">{MARK}</div></div>\n\
 <h1>Connect {client} to {workspace}?</h1>\n\
-<p class=\"lead\">You're signed in to GitHub as <b>{login}</b>. \
+<p class=\"lead\">You're signed in to {provider} as <b>{login}</b>. \
 <b>{client}</b>{from} wants to work in the workspace <b>{workspace}</b> for you.</p>\n\
 <dl class=\"facts\">\n\
 <div><dt>Application</dt><dd>{client}</dd></div>\n\
@@ -212,6 +215,7 @@ this computer, and any program running here could be posing as {client}.</span><
 {warnings}<p class=\"callout\">{SHIELD}<span>Only allow this if you started connecting just now, in this browser. \
 Access lasts {lasts}.</span></p>\n",
         workspace = escape(c.workspace),
+        provider = escape(c.provider),
         login = escape(c.login),
         redirect_uri = escape(c.redirect_uri),
         actor = escape(c.actor),
@@ -239,6 +243,20 @@ Access lasts {lasts}.</span></p>\n",
     let parts =
         Parts { actions: &actions, form_action: &form_action, images, script: Some(ARMING), ..Parts::default() };
     page(200, "Connect to bd", &body, parts)
+}
+
+/// The page asking which provider to sign in with, to connect `client`:
+/// each option a label and the link that starts its sign-in.
+pub fn choose(client: &str, options: &[(String, String)]) -> Page {
+    let mut body = format!(
+        "<h1>Sign in to connect {}</h1>\n<p class=\"lead\">Choose how to sign in.</p>\n<div class=\"choices\">\n",
+        escape(client)
+    );
+    for (label, href) in options {
+        body.push_str(&format!("<a class=\"button\" href=\"{}\">Continue with {}</a>\n", escape(href), escape(label)));
+    }
+    body.push_str("</div>\n");
+    page(200, "Sign in", &body, Parts::default())
 }
 
 /// A page saying why an authorization cannot go on, with a link back to
@@ -347,6 +365,7 @@ mod tests {
             elsewhere: None,
             lasts: "at most 30 days, and ends after 7 days unused or when revoked",
             workspace: evil,
+            provider: evil,
             login: evil,
             actor: evil,
             access: "Read and write",
@@ -385,6 +404,7 @@ mod tests {
                 elsewhere,
                 lasts: "at most 30 days",
                 workspace: "proj",
+                provider: "GitHub",
                 login: "octocat",
                 actor: "octocat",
                 access: "Read only",
@@ -428,6 +448,7 @@ mod tests {
             elsewhere: None,
             lasts: "at most 30 days, and ends after 7 days unused or when revoked",
             workspace: "proj",
+            provider: "GitHub",
             login: "octocat",
             actor: "octocat",
             access: "Read and write",
@@ -490,6 +511,7 @@ mod tests {
                     elsewhere: None,
                     lasts: "at most 30 days, and ends after 7 days unused or when revoked",
                     workspace: "proj",
+                    provider: "GitHub",
                     login: "octocat",
                     actor: "octocat",
                     access: "Read and write",
@@ -511,6 +533,7 @@ mod tests {
                     elsewhere: None,
                     lasts: "at most 30 days, and ends after 7 days unused or when revoked",
                     workspace: "proj",
+                    provider: "GitHub",
                     login: "octocat",
                     actor: "octocat",
                     access: "Read only",
@@ -519,6 +542,23 @@ mod tests {
                     action: "https://bd.example.com/oauth/consent",
                     form_origins: &["'self'"],
                 }),
+            ),
+            (
+                "choose",
+                "Choosing a provider",
+                choose(
+                    "ChatGPT",
+                    &[
+                        (
+                            "GitHub".to_string(),
+                            "https://bd.example.com/oauth/choose?flow=f&provider=github".to_string(),
+                        ),
+                        (
+                            "Acme SSO".to_string(),
+                            "https://bd.example.com/oauth/choose?flow=f&provider=acme".to_string(),
+                        ),
+                    ],
+                ),
             ),
             (
                 "refused",
@@ -571,6 +611,7 @@ mod tests {
             elsewhere: None,
             lasts: "at most 30 days, and ends after 7 days unused or when revoked",
             workspace: "proj",
+            provider: "GitHub",
             login: "octocat",
             actor: "octocat",
             access: "Read only",

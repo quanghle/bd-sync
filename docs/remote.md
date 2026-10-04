@@ -17,7 +17,7 @@ claim the same issue.
 mkdir -p /srv/bd/proj && bd -C /srv/bd/proj init --prefix proj
 # Or move an existing workspace: bd export -o proj.jsonl, then bd -C /srv/bd/proj import proj.jsonl
 
-# Access tokens live in <root>/tokens.json (hashes only); each secret is printed once
+# Access tokens live in <root>/server.db (hashes only); each secret is printed once
 bd serve token create alice-laptop --as alice --root /srv/bd
 bd serve token create alice-desk --as alice --kind human --root /srv/bd   # a person's: approves human gates
 bd serve token create ci --as ci --workspace proj --root /srv/bd
@@ -25,7 +25,7 @@ bd serve token create dashboard --as dash --role read --root /srv/bd
 bd serve token create intern --as intern --max-claims 2 --root /srv/bd   # holds at most 2 issues at once
 bd serve token list --root /srv/bd
 bd serve token revoke ci --root /srv/bd          # takes effect at once, no restart
-# Or let people get their own by signing in with GitHub: <root>/auth.toml (below)
+# Or let people get their own by signing in, with GitHub or any OIDC provider: <root>/auth.toml (below)
 # MCP clients that sign people in with OAuth (ChatGPT, Claude apps): docs/mcp.md
 
 bd serve --root /srv/bd --listen 0.0.0.0:7420 --tls-cert cert.pem --tls-key key.pem
@@ -69,13 +69,35 @@ lets running commands finish first (up to 30 seconds). The server keeps
 connections to each database open, so restart it after replacing or moving a
 workspace's `bd.db`.
 
-## Signing in with GitHub
+## Signing in
 
 Instead of creating each person's token, an admin can let people get their
-own: `bd remote login --github` shows a one-time code to enter at GitHub, and
-the server issues an access token if a rule of `<root>/auth.toml` lets the
-GitHub account in, with that rule's role, kind and workspaces. An account no
-rule lets in gets nothing.
+own by signing in with a provider `<root>/auth.toml` names: GitHub, or any
+OpenID Connect provider (Google, Microsoft Entra, GitLab, Okta, Keycloak, or
+a broker such as Dex in front of others). `bd remote login --provider github` (or
+`--provider <name>`) shows a one-time code to enter at the provider, and the
+server issues an access token if the account may use the workspace: by a
+rule of `auth.toml` (GitHub only), or by the admin's own
+[authorizer](#deciding-with-an-authorizer). An account let in by neither
+gets nothing. MCP clients sign people in the same way in a browser, where a
+page offers the providers to choose from ([docs/mcp.md](mcp.md)).
+
+bd proves who signed in, and binds each account to an actor for good (by
+its provider's issuer and its id there, never its login or email). How long
+tokens last is set once for every provider:
+
+```toml
+[sign_in]
+token_ttl = "1h"                        # access tokens expire (5m to 366d; default 1h)
+refresh_limit = "30d"                   # refreshed for at most this long after the sign-in (default 30d)
+refresh_idle = "7d"                     # and not after this long without one (default 7d)
+```
+
+Tokens are refreshed ([Refreshing](#refreshing-sign-ins)) when someone can
+decide again at each refresh: an authorizer, or GitHub's rules through the
+GitHub App's private key. Otherwise people sign in again each `token_ttl`.
+
+### With GitHub
 
 1. Register a [GitHub App](https://github.com/settings/apps) (any homepage
    URL will do, no webhook), and tick **Enable Device Flow** in its settings.
@@ -84,17 +106,14 @@ rule lets in gets nothing.
    account), and generate a private key: the server keeps signed-in people's
    tokens fresh with it ([Refreshing](#refreshing-sign-ins)). Without a
    private key, sign-in still works, also with a [GitHub OAuth
-   app](https://github.com/settings/developers), but its tokens are not
-   refreshed: people sign in again each `token_ttl`.
+   app](https://github.com/settings/developers), but its tokens are
+   refreshed only with an authorizer deciding.
 2. Write `<root>/auth.toml` on the server:
 
 ```toml
 [github]
 client_id = "Iv23li0123456789abcd"
 private_key = "github-app.pem"          # the GitHub App's private key, relative to the root (mode 0600)
-token_ttl = "1h"                        # access tokens expire (5m to 366d; default 1h)
-refresh_limit = "30d"                   # refreshed for at most this long after the sign-in (default 30d)
-refresh_idle = "7d"                     # and not after this long without one (default 7d)
 # url = "https://ghe.example.com"       # GitHub Enterprise Server; its API defaults to <url>/api/v3 (api_url)
 # deny = [12345]                        # GitHub user ids that may never sign in (`bd serve token accounts`)
 # client_secret_file = "github-secret"  # the GitHub App's client secret, relative to the root: for [oauth]
@@ -126,8 +145,11 @@ workspaces = ["proj"]                   # default: every workspace
 # loopback_redirects = true
 ```
 
-The same rules let people sign in from MCP clients that use OAuth, such as
-ChatGPT and the Claude apps, when `[oauth]` turns on `bd serve`'s
+Instead of rules, the admin's own code may decide who gets in: see
+[Deciding with an authorizer](#deciding-with-an-authorizer).
+
+The same rules (or authorizer) let people sign in from MCP clients that use
+OAuth, such as ChatGPT and the Claude apps, when `[oauth]` turns on `bd serve`'s
 authorization server: see [Signing in with
 OAuth](mcp.md#signing-in-with-oauth).
 
@@ -180,16 +202,19 @@ refreshed.
   change issues in other ways, so the limit is a guard against greed, not
   malice.
 - The token acts as the account's actor, or its sub-actors `<actor>/<agent>`:
-  the account's login when it first signed in, which it keeps when its login
-  changes. The token is named `github-<actor>-<random>` and expires after
-  `token_ttl`; each sign-in gets a token of its own, so one account may sign
-  in on several machines. With a private key, the client renews it before
+  `<provider>:<login>` with the account's login when it first signed in
+  (`github:alice`, `google:alice@acme.com`; a `/` in a login becomes `-`),
+  which it keeps when its login changes. The token is named `<provider>-<actor>-<random>` and expires
+  after `token_ttl`; each sign-in gets a token of its own, so one account may
+  sign in on several machines. When tokens are refreshed, the client renews
+  it before
   it expires ([Refreshing](#refreshing-sign-ins)); once it can no longer be
   renewed and expires, commands fail with exit 7 naming the time, and
-  `bd remote login --github` gets a new one.
+  `bd remote login --provider <name>` gets a new one.
 - An actor belongs to one principal, and to an account for good: the server
-  binds each account (by its GitHub user id) to its actor at its first
-  sign-in, in `tokens.json`, and keeps the binding when the account's tokens
+  binds each account (by its provider's issuer and its id there: a GitHub
+  user id, an OIDC `sub`) to its actor at its first
+  sign-in, in `server.db`, and keeps the binding when the account's tokens
   expire or are revoked. A sign-in is refused while its login's actor belongs
   to another account (one that had the login before), or while a live token
   an admin created acts as it or one of its sub-actors. An account that
@@ -200,32 +225,225 @@ refreshed.
   the previous holder. Under another rule (`orgs`, `teams`, `anyone`), such
   an account signs in as its own actor. `bd serve token create` refuses
   an account's actor in the same way. `bd serve token accounts` lists the
-  bindings, and `bd serve token revoke --github <login> --forget` releases
-  one: it revokes the account's tokens, and the next account to sign in as
-  that login binds the actor again.
+  bindings, and `bd serve token revoke --account <login> --forget` releases
+  one: it deletes the account and its tokens from `server.db`, leaving no
+  trace in its files ([What bd keeps about people](security.md#what-bd-keeps-about-people)),
+  and the next account to sign in as that login binds the actor again.
 - A change to `auth.toml` (`deny` included) applies to the next sign-ins
   and refreshes: tokens already issued keep their permissions until they
   expire, at most `token_ttl`. To cut an account off at once,
-  `bd serve token revoke --github alice --root /srv/bd` revokes every token it
+  `bd serve token revoke --account alice --root /srv/bd` revokes every token it
   got by signing in, including those from before a rename (`alice` may be its
-  latest login or its actor). `bd serve token list` shows each token's
-  GitHub account, expiry, and until when it is refreshed; expired ones leave
-  the list a week after they can no longer be refreshed either. Tokens of
+  latest login, or name its actor `github:alice`). `bd serve token list` shows each token's
+  `account` (provider, issuer, subject, login), expiry, and until when it is
+  refreshed. A token leaves the list a week after it ends (revoked, or
+  expired and no longer refreshed), at the server's next write. Tokens of
   MCP clients that signed someone in with OAuth also show their `client`,
   and `bd serve token revoke --client <client_id>` revokes all of a
   client's.
 
+### With an OpenID Connect provider
+
+Register bd as a client (a "web application") at the provider, with the
+redirect URI `<public-url>/oauth/<name>/callback` for MCP clients'
+browser sign-in, and enable its device flow (device authorization grant)
+for `bd remote login`. Then name it in `auth.toml`, with an
+[authorizer](#deciding-with-an-authorizer), which decides who of those it
+vouches for gets in (rules are GitHub's):
+
+```toml
+[oidc.google]                           # <name>: 1-32 lowercase letters, digits and dashes; never github
+issuer = "https://accounts.google.com"  # its discovery document: <issuer>/.well-known/openid-configuration
+client_id = "1234.apps.googleusercontent.com"
+client_secret_file = "google-secret"    # relative to the root; leave out for a public client
+label = "Google"                        # shown on the sign-in page (default: the name; at most 40 characters)
+scopes = ["email", "profile"]           # asked for besides openid (this is the default)
+
+[authorizer]
+command = ["bin/authorize"]
+```
+
+`bd remote login --provider google` signs in with it. The account is its
+`sub` claim at its issuer. Its login, which its actor is made of, is never
+an email, since actors stay in workspaces' histories for good: it is the
+provider's `preferred_username` unless that is an email (as Microsoft
+Entra's is), else a pseudonym of the account, `u-` and 12 hex digits of a
+hash of its issuer and `sub` (`google:u-3f9a2c1e7b04`). The same account
+always gets the same one. The email, if the provider verified it, is shown
+on the consent page and sent to the authorizer at sign-in, and bd keeps it
+nowhere: an authorizer that should tell admins who `google:u-3f9a2c1e7b04`
+is keeps its own record of it. bd checks each ID token strictly: signed with RS256 or ES256 by a
+key of the provider's published set (fetched over https and cached), from
+the issuer, for this client alone (`aud` exactly its client ID, and `azp`,
+when present, too: a token for several audiences is refused), not
+expired, and, in a browser, carrying the nonce of that sign-in. The
+authorizer gets the verified email and all the token's claims (`groups`,
+a tenant, ...) at sign-in. At a refresh, bd does not ask the provider again:
+the authorizer decides on the account as it signed in, so it is the one to
+notice an account removed at the provider.
+
+A provider without a device flow serves MCP clients' browser sign-in only:
+`bd remote login --provider` with it says so.
+
+#### Sign in with Apple
+
+Apple is an OpenID Connect provider with two differences, which bd
+handles. Its answers come back as a form the browser posts to the
+callback when scopes are asked for (`response_mode = "form_post"`); bd
+sends that answer on to the callback as the GET it would otherwise have
+been, keeping only its code and state. And its client secret is a JWT
+signed with a key of the developer account, good for at most six months;
+bd signs a fresh one for each request from the key:
+
+```toml
+[oidc.apple]
+issuer = "https://appleid.apple.com"
+client_id = "com.example.bd.signin"     # the Services ID
+label = "Apple"
+scopes = ["email"]
+response_mode = "form_post"             # Apple requires it with scopes
+
+account_events = ["com.example.bd"]     # take Apple's account notifications naming these IDs (below)
+
+[oidc.apple.signed_secret]              # instead of client_secret_file
+key_file = "AuthKey_ABC123DEFG.p8"      # the Sign in with Apple key, relative to the root
+key_id = "ABC123DEFG"                   # its key ID
+team_id = "DEF123GHIJ"                  # the developer account's team ID
+```
+
+In the Apple Developer account, create an App ID with Sign in with Apple,
+a Services ID for it (the `client_id`) with the server's domain and the
+return URL `<public-url>/oauth/apple/callback` (https, on a domain that
+does not change), and a key for Sign in with Apple (the `.p8` file, which
+Apple lets you download once). Apple has no device flow, so its accounts
+sign in from MCP clients in a browser only. Apple gives no user name, so
+the actor is a pseudonym like `apple:u-3f9a2c1e7b04`. The authorizer gets
+the `sub` and the email, often an `@privaterelay.appleid.com` address when
+the person chooses to hide theirs (with `is_private_email` among the
+claims), to decide on, and the consent page shows the email.
+
+Apple tells the server when someone stops using Sign in with Apple for
+the app or deletes their Apple Account, if the App ID's Sign in with Apple
+configuration names `<public-url>/oauth/apple/events` as its
+server-to-server notification endpoint. With `account_events` listing the
+IDs Apple names the app by in them (its primary App ID, and the Services
+ID to be sure), bd checks each notification (signed by Apple's keys, for
+one of those IDs, issued within the last week) and acts on it: when consent
+is revoked, the account's sign-ins from before then end (one made since is
+its new consent); when the Apple Account is deleted, bd forgets the account
+and its tokens as `revoke --account --forget` does. Notifications about
+email forwarding need nothing, as bd keeps no email. Any OIDC provider that
+sends notifications in Apple's format can use `account_events` too.
+
+### Deciding with an authorizer
+
+bd always proves who signed in (the provider's sign-in, and the account
+bound to its actor). Whether that account may use a workspace, and with
+what access, can be left to the admin's own code instead of
+`[[github.allow]]` rules, for directories, groups or lists bd knows nothing
+about. An `[authorizer]` replaces the rules (a file with both is refused),
+and is needed for OIDC providers:
+
+```toml
+[authorizer]
+command = ["bin/authorize", "--org", "acme"]   # run as is, no shell; relative to the root if it has a /
+# url = "https://authz.internal/bd"           # or POST to this instead (http only to this machine)
+# token_file = "authz-token"                  # its bearer token, relative to the root
+# timeout = "5s"                              # an answer within this (1s to 60s)
+# env = ["GOOGLE_APPLICATION_CREDENTIALS"]    # passed to the command besides PATH, HOME and LANG
+# refresh_grace = "4h"                        # see below
+# max_role = "write"                          # the most it may grant: read, write (default) or admin
+# human = false                               # whether it may grant kind human (default no)
+# max_claims = 10                             # the most claims its tokens may hold
+# workspaces = ["proj"]                       # the only workspaces it may let anyone into (default all)
+```
+
+At each sign-in, and at each refresh, bd sends it one JSON object, on the
+command's stdin or as the POST body:
+
+```json
+{ "version": 1, "event": "sign_in", "workspace": "proj",
+  "provider": "github", "issuer": "https://github.com",
+  "subject": "583231", "login": "alice", "account_created": "2011-01-25T18:44:36Z",
+  "email": null, "claims": null,
+  "client": "https://chatgpt.com/oauth/client.json", "current": null }
+```
+
+`subject` is the account's id at its `issuer`, which never changes; `login`
+may change, and may once have been another account's, so match on
+`issuer` and `subject` where you can. For an OIDC provider, `email` is the
+account's email if the provider verified it, and `claims` all of its ID
+token's claims, at sign-in (not at refreshes). `account_created` is
+GitHub's. `client` names the MCP client signing the account
+in (null for `bd remote login`). At a refresh, `event` is `refresh` and
+`current` holds the access the sign-in has (`role`, `kind`, `max_claims`,
+`signed_in_at`). It answers with one JSON object, on stdout or as a 200
+response:
+
+```json
+{ "allow": true, "role": "write", "kind": "agent", "max_claims": 5,
+  "via": "member of bd-users", "reason": "in the bd-users group" }
+```
+
+`role` defaults to read and `kind` to agent; the token covers the
+workspace asked about. `via` is shown on the consent page as what let the
+account in (plain text, 100 characters at most); `reason`, for a refusal
+too (`{"allow": false, "reason": "..."}`), goes to the server log only: the
+person is told only that the account may not use the workspace.
+
+- **Fail closed.** No answer within `timeout`, a command that exits
+  non-zero, an HTTP status other than 200, a redirect, or an answer that is
+  not one JSON object of these fields (64 KiB at most) lets no one in. A
+  sign-in then fails (`bd remote login` says to sign in again in a moment;
+  an MCP client's browser gets a page to try again from), and the server log
+  says why, with the command's stderr. At most 8 are asked at once.
+- **Caps.** It can grant no more than `auth.toml` allows: a role above
+  `max_role`, kind `human` without `human = true`, or more `max_claims` than
+  the cap refuses the account, and the log says so. A cap of `max_claims`
+  also applies to answers that name none. It is not asked about workspaces
+  outside `workspaces`. So a broken or compromised authorizer cannot hand
+  out admin tokens or open human gates unless the admin chose to allow it.
+- **Identity stays with bd.** It decides access only: it cannot choose or
+  change the actor (the account's binding decides, as with rules), and a
+  login that once was another account's is refused as it is for a `users`
+  rule. `deny` (GitHub user ids) applies before it is asked. It never
+  sees a provider's tokens. Every account acts as `<provider>:<login>`
+  (`github:alice`, `google:alice@acme.com`), so no provider's users, who
+  often choose their own names, can take an admin's actor, or each other's; `bd serve token revoke --account` names one by
+  its actor where a login is shared by accounts at several providers.
+- **The command** runs in the root, with an environment cleared except
+  `PATH`, `HOME`, `LANG` (and Windows' basics) and the variables `env`
+  names, so the server's own secrets never reach it. On Unix it runs in a
+  process group of its own, killed once it has answered or its time is up:
+  whatever it starts in the background does not outlive it, and output a
+  background process keeps open does not hold bd past `timeout`. It runs as
+  the user `bd serve` runs as, so run that as an unprivileged user. Read the
+  request as data: it carries names chosen by whoever signs in.
+- **The URL** gets `Authorization: Bearer <token_file>`, with no proxy and
+  no redirects followed.
+- **Refreshes** ask it again (`event` `refresh`), which is how a membership
+  ended elsewhere takes effect. An answer that refuses revokes the sign-in.
+  When it cannot answer, only that refresh fails, and the client tries again
+  later; with `refresh_grace` (at least `token_ttl`, at most
+  `refresh_idle`), a refresh within that long of the sign-in's last decision
+  instead keeps the access it had, so a short outage of the authorizer does
+  not end sign-ins.
+
 ### Refreshing sign-ins
 
-With `private_key`, each sign-in also gets a refresh token, saved with its
+When someone can decide again at each refresh (an authorizer, or GitHub's
+rules with `private_key`), each sign-in also gets a refresh token, saved with its
 access token on the client and sent only to `POST /v2/auth/refresh`. The
 client renews the access token by itself, before a command, once a fifth of
 its lifetime is left (10 minutes at most), or when the server finds it
 expired first; so does a long-running one (`bd agents watch`, `bd events
 --follow`) between its requests. Each refresh:
 
-- applies `auth.toml` again, as a sign-in does, by the workspace the sign-in
-  was for: `deny`, the rules in order (`users` by the account's current
+- asks the authorizer again (above), or applies GitHub's rules again, by
+  the workspace the sign-in was for. With the GitHub App, a GitHub account
+  is first looked up by its id (a deleted one is revoked, a renamed one
+  goes by its new login); without it, and for OIDC providers, the account
+  is taken as it signed in. GitHub's rules: `deny`, the rules in order (`users` by the account's current
   login, which the server reads by its GitHub user id; `orgs` and `teams` by
   active membership; `min_account_age`), and what the first matching rule
   grants now: role, kind, workspaces and `max_claims` may change at a
@@ -249,7 +467,7 @@ expired first; so does a long-running one (`bd agents watch`, `bd events
 - is refused, and the sign-in revoked, when the rules no longer let the
   account in, the account is in `deny`, or GitHub no longer has it. The
   client then keeps the access token until it expires, says why on stderr,
-  and stops trying; `bd remote login --github` signs in again.
+  and stops trying; `bd remote login --provider <name>` signs in again.
 - works until `refresh_limit` after the sign-in, and while no more than
   `refresh_idle` passed since the last one (a machine off for longer signs
   in again). `token_ttl`, `refresh_idle` and `refresh_limit` must each be at
@@ -272,9 +490,10 @@ logged. A few things to keep in mind:
   machine, agents included, so a rule's `kind = "human"` lets those agents
   resolve human gates too. `agent` is the default.
 - Whoever started a sign-in gets its token: enter only codes shown by one's
-  own `bd remote login --github`.
-- The sign-in endpoints, `POST /v2/auth/github/device` and
-  `POST /v2/auth/github/token`, need no token, and `POST /v2/auth/refresh`
+  own `bd remote login --provider <name>`, never one someone sent
+  (RFC 8628 section 5.4).
+- The sign-in endpoints, `POST /v2/auth/<provider>/device` and
+  `POST /v2/auth/<provider>/token` (`github`, or an OIDC provider's name), need no token, and `POST /v2/auth/refresh`
   takes a refresh token. `POST /v2/auth/revoke`, sent
   with a token, revokes it if it came from sign-in: `bd remote logout` and a
   new sign-in on the same machine use it, so a token people no longer use
@@ -359,7 +578,7 @@ commit the result, so every checkout and agent uses the shared workspace:
 
 ```bash
 bd remote set https://bd.example.com/w/proj   # writes .bd/remote.toml (--ca-cert ca.pem for a private CA)
-bd remote login --github                      # signs in with GitHub, where the server allows it; the server issues the token
+bd remote login --provider github             # signs in with GitHub (or another provider), where the server allows it
 bd remote login                               # or: prompts for a token from the server's admin, checks it, saves it
 bd remote show                                # checks the URL, certificate, token and actor; shows what the token may do
 bd ready                                      # every command now runs on the server
@@ -387,22 +606,24 @@ private CA: a checkout's `ca_cert` is not read then) and take `BD_TOKEN` from a
 secret; people log in once per machine:
 
 ```bash
-bd remote login --github               # sign in with GitHub; or: bd remote login --github https://bd.example.com/w/proj
+bd remote login --provider github      # sign in with GitHub; or: bd remote login --provider github https://bd.example.com/w/proj
+bd remote login --provider google      # sign in with one of the server's OIDC providers
 bd remote login                        # the checkout's server; or: bd remote login https://bd.example.com/w/proj
 printf %s "$TOKEN" | bd remote login   # a piped token is read from stdin, not from a prompt
 bd remote login --workspace-only       # this workspace only, e.g. for a token limited to it
-bd remote logout                       # forget it, and revoke it on the server if it came from GitHub sign-in
+bd remote logout                       # forget it, and revoke it on the server if it came from signing in
 ```
 
-With `--github`, `login` gets the token from the server instead of reading
-one: it shows a one-time code to enter at GitHub
-(`https://github.com/login/device`), waits until it is entered (Ctrl-C
-cancels; the code lasts 15 minutes), and saves the token the server issues,
-with its refresh token where the server refreshes sign-ins, reporting its
-actor, role, kind, workspaces, expiry, and until when it is renewed. The
-server must have
-GitHub sign-in on, and must let the account in
-([Signing in with GitHub](#signing-in-with-github)).
+With `--provider <name>` (`github`, or an OIDC provider of the server's), `login` gets the token from the
+server instead of reading one: it shows a one-time code to enter at the
+provider (`https://github.com/login/device` for GitHub), waits until it is
+entered (Ctrl-C cancels; GitHub's code lasts 15 minutes), and saves the
+token the server issues, with its refresh token where the server refreshes
+sign-ins, reporting its actor, role, kind, workspaces, expiry, and until
+when it is renewed (with `--json`: `actor`, `account` with the `login` and
+what let it in as `via`, and `token`). The server must offer that provider,
+and must let the account in ([Signing in](#signing-in)); a provider it does
+not have, or one without a device flow, is refused with exit 2.
 
 Otherwise the token is never taken from the command line, so it stays out of shell
 history and process lists, and it is never printed. `login` reads it from
@@ -430,7 +651,7 @@ directory created 0700, and bd refuses to use it if other users can read it. On 
 protected by the per-user permissions of `%APPDATA%`. `bd remote logout`
 forgets the token saved for a workspace URL and for its server (`--workspace-only`
 keeps the server's), or for a server URL and all its workspaces. A token from
-GitHub sign-in is revoked on its server too (with its refresh token, where
+signing in is revoked on its server too (with its refresh token, where
 it has one, so also after a refresh whose answer was lost), and so is one
 that signing in again replaces: within a few seconds, and only trusting the server as when
 the token was saved. If that fails (the server cannot be reached, say), the
@@ -448,7 +669,7 @@ revoked on the server (`bd serve token revoke`).
 | `BD_REMOTE_RETRY_SECS` | how long to retry an unreachable server (default 30; 0 = once) |
 | `BD_INSECURE_HTTP=1` | allow plain `http://` to a non-loopback host |
 
-A token acts as one actor (`--as`; for a token from GitHub sign-in, the actor
+A token acts as one actor (`--as`; for a token from signing in, the actor
 its account is bound to), or as that actor's sub-actors `<actor>/<name>`, so
 leases keep naming who holds them. Roles:
 
@@ -462,7 +683,7 @@ A token's kind, independent of its role, says who holds it: `agent` (the
 default) or `human` (`--kind human`, or `kind = "human"` in an `auth.toml`
 rule). Keep human tokens out of agents' environments, since they
 can approve. A client sees its own token's name, role, kind, workspaces,
-expiry and GitHub account in `bd remote show` (its `access` line) and in
+expiry and account in `bd remote show` (its `access` line) and in
 `bd info` (`token` in its JSON), never the secret: that tells a refusal
 (exit 7) by role or kind apart from one by actor or workspace. The server
 enforces roles and kinds in the engine, so a `bd batch`

@@ -76,7 +76,7 @@ Besides the variables of the global options:
 | 4 | claim conflict: already claimed (a live claim, even your own actor's, without its `--token`), not ready, not the holder of a live claim (`--take-over` takes it over; `--force` does not), or lease lost |
 | 5 | database busy, or another bd process kept a checkout's agent assets mutex (`.bd/agents.lock.mutex`) past `--busy-timeout-ms` |
 | 6 | event cursor truncated |
-| 7 | access denied: missing, invalid or expired token, or its role, kind, workspaces or actor do not allow it; or a GitHub sign-in that was refused |
+| 7 | access denied: missing, invalid or expired token, or its role, kind, workspaces or actor do not allow it; or a sign-in that was refused |
 | 8 | bd server unreachable, its certificate not trusted, or a server failure: the command did not take effect (retrying is safe) |
 | 9 | a write reached the bd server, but its answer was lost: it may have taken effect, so check before running it again |
 | 13 | stale optimistic-concurrency guard |

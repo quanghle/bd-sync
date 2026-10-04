@@ -9,7 +9,7 @@
 //!
 //! Layout: `<root>/<name>/.bd/bd.db` is workspace `<name>`, served at
 //! `POST /w/<name>/v2/exec` (the wire format is in `protocol.rs`);
-//! `<root>/tokens.json` holds the access tokens, and `<root>/auth.toml`
+//! `<root>/server.db` holds the access tokens (`server_db.rs`), and `<root>/auth.toml`
 //! turns on GitHub sign-in, served at `POST /v2/auth/github/{device,token}`
 //! without a token (`oauth.rs`); `POST /v2/auth/revoke` revokes the token it
 //! is sent with, if it came from sign-in, and `POST /v2/auth/refresh` renews
@@ -151,6 +151,9 @@ const MAX_REGISTERING: usize = 2;
 const MAX_SIGN_IN_BODY: usize = 16 << 10;
 /// The largest body of a consent page's decision.
 const MAX_CONSENT_BODY: usize = 4 << 10;
+/// The largest provider's answer posted to a callback (an ID token and the
+/// user's name with the code, which are not read).
+const MAX_RELAYED_BODY: usize = 32 << 10;
 /// The longest MCP message a client may POST.
 const MAX_MCP_BODY: usize = 1 << 20;
 /// An MCP answer's share of the body budget: its tool's output (up to
@@ -206,9 +209,20 @@ fn run(a: &ServeArgs) -> Result<()> {
         .map(mcp_http::public_url)
         .transpose()
         .map_err(|e| Error::invalid(format!("--public-url {e}")))?;
+    // Opened now (created if new) so that an unwritable root or another bd's schema shows at once.
+    crate::server_db::open(&root)?;
+    // The workspaces' databases hold actors and their histories, readable by whoever may enter the root.
+    if let Some(mode) = dir_open_to_others(&root) {
+        tracing::warn!(
+            target: "bd::serve",
+            root = %root.display(),
+            mode = format!("{mode:o}"),
+            "the root is open to others than its owner, and the workspaces' databases with it: chmod 700 it"
+        );
+    }
     // Checked now so that a mistake shows at once; each sign-in reads the file again.
-    if let Some(github) = oauth::load(&root)? {
-        if let Some(o) = &github.oauth {
+    if let Some(sign_in) = oauth::load(&root)? {
+        if let Some(o) = &sign_in.oauth {
             let issuer = oauth_server::issuer(public_url.as_deref()).map_err(Error::invalid)?;
             tracing::info!(
                 target: "bd::serve",
@@ -219,24 +233,74 @@ fn run(a: &ServeArgs) -> Result<()> {
             );
         }
         let shown = |d: Duration| bd_core::time::format_duration_ms(i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-        match &github.app {
-            Some(_) => tracing::info!(
+        for file in sign_in.secret_files(&root) {
+            if let Some(mode) = open_to_others(&file) {
+                tracing::warn!(
+                    target: "bd::serve",
+                    file = %file.display(),
+                    mode = format!("{mode:o}"),
+                    "a sign-in secret file is readable by others than its owner: chmod 600 it"
+                );
+            }
+        }
+        let decider = if sign_in.authorizer.is_some() { "the authorizer" } else { "rules" };
+        if let Some(github) = &sign_in.github {
+            match sign_in.refreshes("github") {
+                true => tracing::info!(
+                    target: "bd::serve",
+                    github = %github.url,
+                    decider,
+                    token_ttl = %shown(sign_in.token_ttl),
+                    refresh_limit = %shown(sign_in.refresh_limit),
+                    refresh_idle = %shown(sign_in.refresh_idle),
+                    "GitHub sign-in is on, with refreshed tokens"
+                ),
+                false => tracing::warn!(
+                    target: "bd::serve",
+                    github = %github.url,
+                    decider,
+                    token_ttl = %shown(sign_in.token_ttl),
+                    "GitHub sign-in is on; its tokens are not refreshed (rules need github.private_key to be applied \
+                     again), so people sign in again each token_ttl"
+                ),
+            }
+        }
+        // Each OIDC provider's discovery, tried once now, so that a wrong issuer shows before anyone signs in.
+        for oidc in &sign_in.oidc {
+            match oidc.metadata() {
+                Ok(md) => tracing::info!(
+                    target: "bd::serve",
+                    provider = %oidc.name,
+                    issuer = %oidc.issuer,
+                    device_flow = md.device_authorization_endpoint.is_some(),
+                    token_ttl = %shown(sign_in.token_ttl),
+                    "OIDC sign-in is on, with refreshed tokens"
+                ),
+                Err(e) => tracing::warn!(
+                    target: "bd::serve",
+                    provider = %oidc.name,
+                    issuer = %oidc.issuer,
+                    error = %e,
+                    "OIDC sign-in is on, but its provider's discovery document cannot be had now: sign-ins fail until it can"
+                ),
+            }
+        }
+        if let Some(a) = &sign_in.authorizer {
+            let by = match &a.how {
+                crate::authorizer::How::Command { argv, .. } => format!("command {}", argv[0]),
+                crate::authorizer::How::Https { url, .. } => format!("url {url}"),
+            };
+            tracing::info!(
                 target: "bd::serve",
-                github = %github.url,
-                rules = github.rules.len(),
-                token_ttl = %shown(github.token_ttl),
-                refresh_limit = %shown(github.refresh_limit),
-                refresh_idle = %shown(github.refresh_idle),
-                "GitHub sign-in is on, with refreshed tokens"
-            ),
-            None => tracing::warn!(
-                target: "bd::serve",
-                github = %github.url,
-                rules = github.rules.len(),
-                token_ttl = %shown(github.token_ttl),
-                "GitHub sign-in is on; its tokens are not refreshed (auth.toml has no github.private_key), so people \
-                 sign in again each token_ttl"
-            ),
+                by = %by,
+                timeout = %shown(a.timeout),
+                max_role = a.caps.max_role.as_str(),
+                human = a.caps.human,
+                max_claims = ?a.caps.max_claims,
+                workspaces = %a.caps.workspaces.join(","),
+                refresh_grace = %a.refresh_grace.map(shown).unwrap_or_else(|| "none".into()),
+                "an authorizer decides who may sign in"
+            );
         }
     }
     // Before any request or background job: gate checks in this process use the server's defaults.
@@ -475,25 +539,41 @@ enum SignIn {
     Token,
 }
 
-/// `[/<prefix>]/v2/auth/github/<device|token>` -> the step.
-fn sign_in_path(path: &str) -> Option<SignIn> {
-    let (_, step) = path.rsplit_once(&format!("/v{PROTOCOL}/auth/github/"))?;
-    match step {
-        "device" => Some(SignIn::Device),
-        "token" => Some(SignIn::Token),
-        _ => None,
+/// `[/<prefix>]/v2/auth/<provider>/<device|token>` -> the provider and the step.
+fn sign_in_path(path: &str) -> Option<(String, SignIn)> {
+    let (_, rest) = path.rsplit_once(&format!("/v{PROTOCOL}/auth/"))?;
+    let (provider, step) = rest.split_once('/')?;
+    let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+    if provider.is_empty() || provider.len() > 32 || !provider.chars().all(plain) {
+        return None;
     }
+    let step = match step {
+        "device" => SignIn::Device,
+        "token" => SignIn::Token,
+        _ => return None,
+    };
+    Some((provider.to_string(), step))
 }
 
 /// The authorization server's endpoint at `path`: under the public URL's
 /// path, or with it stripped by a proxy, and nowhere else, so that a proxy
 /// limiting requests to these paths sees them all.
 fn oauth_endpoint(server: &Server, path: &str) -> Option<&'static str> {
+    let rest = under_issuer(server, path);
+    use oauth_server::{AUTHORIZE, CALLBACK, CHOOSE, CONSENT, EVENTS, REGISTER, REVOKE, TOKEN};
+    let fixed = [REGISTER, TOKEN, REVOKE, AUTHORIZE, CHOOSE, CONSENT].into_iter().find(|e| *e == rest);
+    // Every provider's callback is the callback endpoint; the step reads which from the path. Notifications alike.
+    fixed
+        .or_else(|| oauth_server::callback_provider(rest).map(|_| CALLBACK))
+        .or_else(|| oauth_server::events_provider(rest).map(|_| EVENTS))
+}
+
+/// `path` without the public URL's path, as the authorization server's
+/// endpoints are named.
+fn under_issuer<'p>(server: &Server, path: &'p str) -> &'p str {
     let public = server.public_url.as_deref().and_then(|u| u.split_once("://")).map_or("", |(_, rest)| rest);
     let prefix = public.find('/').map_or("", |i| &public[i..]);
-    let rest = path.strip_prefix(prefix).filter(|r| r.starts_with('/')).unwrap_or(path);
-    use oauth_server::{AUTHORIZE, CALLBACK, CONSENT, REGISTER, REVOKE, TOKEN};
-    [REGISTER, TOKEN, REVOKE, AUTHORIZE, CALLBACK, CONSENT].into_iter().find(|e| *e == rest)
+    path.strip_prefix(prefix).filter(|r| r.starts_with('/')).unwrap_or(path)
 }
 
 async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Result<Response<Body>, Infallible> {
@@ -550,12 +630,30 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
             r
         }
-    } else if oauth == Some(oauth_server::CALLBACK) {
+    } else if oauth == Some(oauth_server::CHOOSE) {
         if req.method() == Method::GET {
-            authorizing(&server, Authorizing::Callback, req).await
+            authorizing(&server, Authorizing::Choose, req).await
         } else {
             let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET", 2).response();
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
+            r
+        }
+    } else if oauth == Some(oauth_server::CALLBACK) {
+        if req.method() == Method::GET {
+            authorizing(&server, Authorizing::Callback, req).await
+        } else if req.method() == Method::POST {
+            authorizing(&server, Authorizing::Relay, req).await
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET or POST", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
+            r
+        }
+    } else if oauth == Some(oauth_server::EVENTS) {
+        if req.method() == Method::POST {
+            account_events(&server, req).await
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
             r
         }
     } else if oauth == Some(oauth_server::CONSENT) {
@@ -577,9 +675,9 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
             r
         }
-    } else if let Some(step) = sign_in_path(&path) {
+    } else if let Some((provider, step)) = sign_in_path(&path) {
         if req.method() == Method::POST {
-            sign_in(&server, step, req).await
+            sign_in(&server, provider, step, req).await
         } else {
             Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response()
         }
@@ -604,7 +702,7 @@ async fn handle(server: Arc<Server>, req: Request<Incoming>) -> std::result::Res
 
 /// A step of GitHub sign-in, for a client without a token yet. Each runs on
 /// a blocking thread, as it waits on GitHub (`oauth.rs`).
-async fn sign_in(server: &Arc<Server>, step: SignIn, req: Request<Incoming>) -> Response<Body> {
+async fn sign_in(server: &Arc<Server>, provider: String, step: SignIn, req: Request<Incoming>) -> Response<Body> {
     // The body first, small and time-limited: a slow client holds no slot meanwhile.
     let body = match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect())
         .await
@@ -642,7 +740,7 @@ async fn sign_in(server: &Arc<Server>, step: SignIn, req: Request<Incoming>) -> 
             // The permit goes with the work: a client that leaves does not end it.
             blocking(move || {
                 let _permit = permit;
-                Ok(serde_json::to_value(oauth::start(&root)?)?)
+                Ok(serde_json::to_value(oauth::start(&root, &provider)?)?)
             })
             .await
         }
@@ -675,11 +773,10 @@ async fn sign_in(server: &Arc<Server>, step: SignIn, req: Request<Incoming>) -> 
             let srv = server.clone();
             blocking(move || {
                 let _held = (permit, completing);
-                let answer = oauth::poll(&srv.root, &poll)?;
+                let answer = oauth::poll(&srv.root, &provider, &poll)?;
                 let value = serde_json::to_value(&answer)?;
                 // Kept even if this client is gone: its retry gets the token GitHub will not give again.
                 if let SignInAnswer::Issued(_) = answer {
-                    srv.tokens.invalidate();
                     let mut issued = lock(&srv.issued);
                     if issued.answers.len() >= MAX_ISSUED {
                         let oldest = issued.answers.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| k.clone());
@@ -764,8 +861,6 @@ async fn refresh(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body>
         blocking(move || {
             let _held = (permit, completing);
             let refreshed = oauth::refresh(&srv.root, &secret, &request_id, None);
-            // Refreshed, or revoked.
-            srv.tokens.invalidate();
             let value = serde_json::to_value(refreshed?)?;
             // Kept even if this client is gone: its retry gets the tokens, as its refresh token is spent.
             let mut refreshes = lock(&srv.refreshes);
@@ -848,13 +943,12 @@ async fn revoke_own(server: &Arc<Server>, req: Request<Incoming>) -> Response<Bo
             Err(e) => return Reject::internal(e).response(),
         }
     };
-    if token.github.is_none() {
+    if token.identity.is_none() {
         return json_response(StatusCode::OK, &RevokeAnswer { name: token.name, revoked: false });
     }
-    let (root, srv, id) = (server.root.clone(), server.clone(), token.id.clone());
+    let (root, id) = (server.root.clone(), token.id.clone());
     let revoked = blocking(move || {
         let revoked = auth::revoke_by_id(&root, &id)?;
-        srv.tokens.invalidate();
         Ok(revoked)
     })
     .await;
@@ -897,8 +991,8 @@ fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Tok
         Ok(Verified::Valid(token)) => Ok(token),
         Ok(Verified::Expired(token)) => {
             let at = token.expires_at.map(|t| t.to_rfc3339()).unwrap_or_default();
-            let renew = match token.github {
-                Some(_) => "sign in again: `bd remote login --github`",
+            let renew = match token.identity {
+                Some(_) => "sign in again: `bd remote login`",
                 None => "the server's admin issues new ones",
             };
             let msg = format!("access token {} expired at {at}; {renew}", token.name);
@@ -1194,8 +1288,6 @@ async fn oauth_tokens(server: &Arc<Server>, revoking: bool, req: Request<Incomin
             Some(request @ token::Request::Code { .. }) => token::redeem(&srv.root, &srv.flows, request).map(Some),
             Some(request @ token::Request::Refresh { .. }) => token::refresh(&srv.root, request).map(Some),
         };
-        // Tokens issued, rotated or revoked, refused or not: a refusal may revoke too.
-        srv.tokens.invalidate();
         Ok(answer)
     })
     .await;
@@ -1215,6 +1307,44 @@ async fn oauth_tokens(server: &Arc<Server>, revoking: bool, req: Request<Incomin
     r
 }
 
+/// `POST <issuer>/oauth/<provider>/events`: a provider's account
+/// notification (`oauth::account_event`). Answered 200 once handled (or
+/// needing nothing), so the provider stops sending it; why one is refused
+/// goes to the log only.
+async fn account_events(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
+    let provider =
+        oauth_server::events_provider(under_issuer(server, req.uri().path())).unwrap_or_default().to_string();
+    let body =
+        match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await {
+            Ok(Ok(b)) => b.to_bytes(),
+            _ => {
+                return Reject::new(StatusCode::BAD_REQUEST, "invalid", "the notification did not arrive whole", 2)
+                    .response();
+            }
+        };
+    let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
+        return Reject::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "the server is busy; retry", 5).response();
+    };
+    let root = server.root.clone();
+    let handled = blocking(move || {
+        let _permit = permit;
+        oauth::account_event(&root, &provider, &body)
+    })
+    .await;
+    match handled {
+        Ok(()) => json_response(StatusCode::OK, &serde_json::json!({})),
+        Err(Error::NotFound { .. }) => {
+            Reject::new(StatusCode::NOT_FOUND, "not_found", "no such endpoint", 3).response()
+        }
+        Err(Error::Invalid(why)) => Reject::new(StatusCode::BAD_REQUEST, "invalid", &why, 2).response(),
+        Err(e @ (Error::Remote(_) | Error::Busy(_))) => {
+            tracing::warn!(target: "bd::serve", error = %e, "an account notification could not be handled now");
+            Reject::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "try again later", 5).response()
+        }
+        Err(e) => Reject::internal(e).response(),
+    }
+}
+
 /// The OAuth error answer of a token or revocation request refused.
 fn refused(refusal: &token::Refusal) -> Response<Body> {
     let status = StatusCode::from_u16(refusal.status).unwrap_or(StatusCode::BAD_REQUEST);
@@ -1226,10 +1356,14 @@ fn refused(refusal: &token::Refusal) -> Response<Body> {
 /// A step of an authorization (`oauth_server/authorize.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Authorizing {
-    /// `GET <issuer>/oauth/authorize`: on to GitHub.
+    /// `GET <issuer>/oauth/authorize`: on to the provider, or to a page choosing one.
     Begin,
-    /// `GET <issuer>/oauth/github/callback`: back from GitHub, to the consent page.
+    /// `GET <issuer>/oauth/choose`: on to the provider chosen.
+    Choose,
+    /// `GET <issuer>/oauth/<provider>/callback`: back from the provider, to the consent page.
     Callback,
+    /// `POST <issuer>/oauth/<provider>/callback`: the provider's answer posted, on to the GET.
+    Relay,
     /// `POST <issuer>/oauth/consent`: back to the client.
     Decide,
 }
@@ -1253,11 +1387,18 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
         .iter()
         .filter_map(|v| v.to_str().ok())
         .find_map(|h| authorize::cookie(&issuer, h).map(str::to_string));
+    let cookies: String =
+        req.headers().get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join("; ");
     let query = req.uri().query().unwrap_or_default().to_string();
+    let provider =
+        oauth_server::callback_provider(under_issuer(server, req.uri().path())).unwrap_or_default().to_string();
     let srv = server.clone();
     let answered = match step {
         Authorizing::Begin => {
             blocking(move || Ok(srv.authorizing(&issuer, |cx| authorize::begin(cx, &query, browser.as_deref())))).await
+        }
+        Authorizing::Choose => {
+            blocking(move || Ok(srv.authorizing(&issuer, |cx| authorize::choose(cx, &query, browser.as_deref())))).await
         }
         Authorizing::Callback => {
             let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
@@ -1266,15 +1407,29 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
             };
             blocking(move || {
                 let _permit = permit;
-                Ok((srv.authorizing(&issuer, |cx| authorize::callback(cx, &query, browser.as_deref())), None))
+                Ok(srv.authorizing(&issuer, |cx| authorize::callback(cx, &provider, &query, browser.as_deref())))
             })
             .await
         }
+        Authorizing::Relay => {
+            let body = tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_RELAYED_BODY).collect());
+            let Ok(Ok(body)) = body.await else {
+                let why = "The sign-in didn't come back complete. Start again from the application.";
+                return html_page(pages::refusal(400, "Couldn't connect the application", why, None));
+            };
+            let body = String::from_utf8_lossy(&body.to_bytes()).into_owned();
+            Ok((server.authorizing(&issuer, |cx| authorize::relay(cx, &provider, &body)), None))
+        }
         Authorizing::Decide => {
             // Only the consent page posts here: SameSite keeps the cookie from other sites' forms, and this their
-            // requests.
+            // requests. Browsers say where a form came from (Origin, Sec-Fetch-Site); a post that says neither
+            // is no browser's, or a very old one's.
             let origin = req.headers().get(header::ORIGIN);
-            if origin.is_some_and(|o| o.as_bytes() != authorize::origin(&issuer).as_bytes()) {
+            let site = req.headers().get("sec-fetch-site");
+            let foreign = origin.is_some_and(|o| o.as_bytes() != authorize::origin(&issuer).as_bytes())
+                || site.is_some_and(|s| s.as_bytes() != b"same-origin")
+                || (origin.is_none() && site.is_none());
+            if foreign {
                 let why = "The decision came from another site. Start again from the application.";
                 return html_page(pages::refusal(403, "Couldn't connect the application", why, None));
             }
@@ -1289,7 +1444,7 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
                     }
                 };
             let body = String::from_utf8_lossy(&body);
-            Ok((server.authorizing(&issuer, |cx| authorize::decide(cx, &body, browser.as_deref())), None))
+            Ok((server.authorizing(&issuer, |cx| authorize::decide(cx, &body, &cookies)), None))
         }
     };
     let (answer, cookie) = match answered {
@@ -1304,8 +1459,9 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
                 let why = "The server ran into a problem. Try again later.";
                 return html_page(pages::refusal(500, "Something went wrong", why, None));
             };
-            // After the consent page's POST, the browser must GET the client's redirect URI.
-            let status = if step == Authorizing::Decide { StatusCode::SEE_OTHER } else { StatusCode::FOUND };
+            // After a POST, the browser must GET where it is sent.
+            let posted = matches!(step, Authorizing::Decide | Authorizing::Relay);
+            let status = if posted { StatusCode::SEE_OTHER } else { StatusCode::FOUND };
             let mut r = response(status, "text/plain", Body::whole(Bytes::new()));
             let headers = r.headers_mut();
             headers.insert(header::LOCATION, location);
@@ -1318,6 +1474,38 @@ async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incom
         r.headers_mut().insert(header::SET_COOKIE, cookie);
     }
     r
+}
+
+/// The permission bits of the directory `dir` if its group or others may
+/// do anything in it (Unix; never elsewhere).
+fn dir_open_to_others(dir: &std::path::Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir).ok()?.permissions().mode() & 0o777;
+        (mode & 0o077 != 0).then_some(mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// The permission bits of `file` if its group or others may read or write
+/// it (Unix; never elsewhere).
+fn open_to_others(file: &std::path::Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(file).ok()?.permissions().mode() & 0o777;
+        (mode & 0o066 != 0).then_some(mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        None
+    }
 }
 
 /// An authorization page for a browser, which no other site may frame,
@@ -1336,6 +1524,9 @@ fn html_page(page: pages::Page) -> Response<Body> {
     let headers = r.headers_mut();
     headers.insert(header::CONTENT_SECURITY_POLICY, csp);
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    // The page may be at a provider's callback URL, whose query holds its code and state: no other site gets it as
+    // a referrer (RFC 9700 section 4.2.4). Not no-referrer: browsers then send `Origin: null` with the consent
+    // form, which the consent POST's check needs to be this server's origin.
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("same-origin"));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
@@ -2183,6 +2374,27 @@ impl Server {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn secret_files_open_to_others_are_told() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret");
+        std::fs::write(&file, "s").unwrap();
+        for (mode, told) in
+            [(0o600, None), (0o400, None), (0o640, Some(0o640)), (0o604, Some(0o604)), (0o620, Some(0o620))]
+        {
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(open_to_others(&file), told, "{mode:o}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        for (mode, told) in [(0o700, None), (0o500, None), (0o750, Some(0o750)), (0o701, Some(0o701))] {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+            assert_eq!(dir_open_to_others(dir.path()), told, "{mode:o}");
+        }
+        assert_eq!(open_to_others(&dir.path().join("missing")), None);
+    }
+
     #[test]
     fn an_authorization_page_is_never_sent_without_its_policy() {
         let mut page = pages::refusal(403, "t", "w", None);
@@ -2241,9 +2453,20 @@ mod tests {
 
     #[test]
     fn sign_in_paths() {
-        assert_eq!(sign_in_path("/v2/auth/github/device"), Some(SignIn::Device));
-        assert_eq!(sign_in_path("/bd/v2/auth/github/token"), Some(SignIn::Token), "under a proxy prefix");
-        for bad in ["/v2/auth/github/", "/v2/auth/github/device/", "/v1/auth/github/token", "/v2/auth/gitlab/token"] {
+        assert_eq!(sign_in_path("/v2/auth/github/device"), Some(("github".into(), SignIn::Device)));
+        assert_eq!(
+            sign_in_path("/bd/v2/auth/github/token"),
+            Some(("github".into(), SignIn::Token)),
+            "under a proxy prefix"
+        );
+        assert_eq!(sign_in_path("/v2/auth/acme-sso/token"), Some(("acme-sso".into(), SignIn::Token)), "any provider");
+        for bad in [
+            "/v2/auth/github/",
+            "/v2/auth/github/device/",
+            "/v1/auth/github/token",
+            "/v2/auth/Acme/token",
+            "/v2/auth/refresh",
+        ] {
             assert_eq!(sign_in_path(bad), None, "{bad}");
         }
         assert_eq!(exec_path("/v2/auth/github/token"), None);
@@ -2319,7 +2542,7 @@ mod tests {
             created_at: String::new(),
             revoked_at: None,
             expires_at: None,
-            github: None,
+            identity: None,
             max_claims: None,
             refresh: None,
             resource: None,

@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 use super::cimd::Documents;
 use super::clients::{self, Client};
 use super::pages::{self, Page};
-use super::{CALLBACK, CONSENT, form};
+use super::{CHOOSE, CONSENT, form};
 use crate::auth;
 use crate::mcp::http as mcp_http;
 use crate::oauth::{self, Admitted, OauthConfig};
@@ -50,6 +50,10 @@ const CODE_TTL: Duration = Duration::from_secs(5 * 60);
 /// (anyone may start one, and none under way should be lost to them); at
 /// later steps, which only people the rules let in reach, the oldest go.
 const MAX_FLOWS: usize = 1024;
+/// Sign-ins under way for one client: past it, its new ones wait, and
+/// a client flooding sign-ins leaves room for others' (rate limits by
+/// address belong to the proxy, which alone sees them).
+const MAX_FLOWS_PER_CLIENT: usize = MAX_FLOWS / 16;
 /// The longest `state` a client may send, which comes back in redirects.
 const MAX_STATE: usize = 1024;
 
@@ -113,13 +117,24 @@ pub struct Code {
     pub actor: String,
 }
 
-/// Signing in at GitHub.
+/// Waiting for the person to choose a provider to sign in with.
+struct Choosing {
+    request: Authorization,
+    /// The hash of the browser's cookie.
+    browser: String,
+}
+
+/// Signing in with a provider.
 struct Started {
     request: Authorization,
-    /// The PKCE verifier of this server's code from GitHub.
+    /// The PKCE verifier of this server's code from the provider.
     verifier: String,
     /// The hash of the browser's cookie.
     browser: String,
+    /// The provider's name: `github`, or an `[oidc.<name>]`.
+    provider: String,
+    /// The nonce its ID token must carry (OIDC).
+    nonce: String,
 }
 
 /// Waiting for a decision on the consent page.
@@ -127,12 +142,16 @@ struct Consent {
     request: Authorization,
     admitted: Admitted,
     actor: String,
+    /// The hash of the value of its own cookie ([`consent_cookie`]).
     browser: String,
+    /// What names its cookie.
+    cookie: String,
 }
 
 /// Authorizations under way, by the hash of their secret at each step
 /// (`state` at GitHub, the consent id, the code); each taken once.
 pub struct Flows {
+    choosing: Kept<Choosing>,
     started: Kept<Started>,
     consents: Kept<Consent>,
     codes: Kept<Code>,
@@ -165,6 +184,7 @@ pub enum Redeemed {
 impl Default for Flows {
     fn default() -> Flows {
         Flows {
+            choosing: Kept::new(STEP_TTL),
             started: Kept::new(STEP_TTL),
             consents: Kept::new(STEP_TTL),
             codes: Kept::new(CODE_TTL),
@@ -174,6 +194,15 @@ impl Default for Flows {
 }
 
 impl Flows {
+    /// Sign-ins under way for `client`: choosing a provider, or at it.
+    fn under_way(&self, client: &str) -> usize {
+        let now = Instant::now();
+        let live = |until: &Instant| *until > now;
+        let choosing = self.choosing.map.values().filter(|(u, c)| live(u) && c.request.client.id == client).count();
+        let started = self.started.map.values().filter(|(u, s)| live(u) && s.request.client.id == client).count();
+        choosing + started
+    }
+
     /// Redeem `code`: what it stands for the first time, if it has not
     /// expired; after that, the token it issued.
     pub fn redeem(&mut self, code: &str) -> Redeemed {
@@ -306,6 +335,34 @@ pub fn cookie<'h>(issuer: &str, header: &'h str) -> Option<&'h str> {
 /// The `Set-Cookie` value giving the browser `value`, sent back to the
 /// authorization server's endpoints only, and with top-level navigations
 /// from GitHub. It lasts both steps: signing in at GitHub, then deciding.
+/// The name of the cookie that binds one consent to the browser that signed
+/// in for it: its own, so that sign-ins under way in other tabs keep theirs.
+fn consent_cookie_name(issuer: &str, suffix: &str) -> String {
+    let prefix = if issuer.starts_with("https://") { "__Secure-" } else { "" };
+    format!("{prefix}bd_consent_{suffix}")
+}
+
+/// The value of consent cookie `suffix` in the browser's `Cookie` headers
+/// (joined with `;`), if well-formed.
+pub fn consent_cookie<'h>(issuer: &str, headers: &'h str, suffix: &str) -> Option<&'h str> {
+    let wanted = consent_cookie_name(issuer, suffix);
+    headers
+        .split(';')
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(name, _)| *name == wanted)
+        .map(|(_, value)| value)
+        .filter(|v| v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// The `Set-Cookie` value binding a consent to this browser: sent back to
+/// the consent endpoint only, and for as long as the consent waits.
+fn set_consent_cookie(issuer: &str, suffix: &str, value: &str) -> String {
+    let secure = if issuer.starts_with("https://") { "; Secure" } else { "" };
+    let path = format!("{}{CONSENT}", path_of(issuer));
+    let name = consent_cookie_name(issuer, suffix);
+    format!("{name}={value}; Path={path}; Max-Age={}; HttpOnly; SameSite=Lax{secure}", STEP_TTL.as_secs())
+}
+
 pub fn set_cookie(issuer: &str, value: &str) -> String {
     let secure = if issuer.starts_with("https://") { "; Secure" } else { "" };
     let path = format!("{}/oauth", path_of(issuer));
@@ -467,7 +524,7 @@ fn valid_challenge(c: &str) -> bool {
 /// browser to GitHub to sign in. `browser` is its cookie, if it has one;
 /// the `Set-Cookie` value to answer with comes back with the answer.
 pub fn begin(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Option<String>) {
-    let (github, oauth_config) = match oauth::load(cx.root) {
+    let (sign_in, oauth_config) = match oauth::load(cx.root) {
         Ok(Some(g)) => match g.oauth.clone() {
             Some(o) => (g, o),
             None => return (refused(404, NO_APPS), None),
@@ -493,74 +550,249 @@ pub fn begin(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Optio
         Ok(r) => r,
         Err(answer) => return (answer, None),
     };
+    let browser = match browser {
+        Some(b) => b.to_string(),
+        None => match auth::random_hex(32) {
+            Ok(b) => b,
+            Err(e) => return (internal(&e, "starting an authorization"), None),
+        },
+    };
+    if lock(cx.flows).under_way(&request.client.id) >= MAX_FLOWS_PER_CLIENT {
+        tracing::warn!(target: "bd::serve", client = %request.client.id, "OAuth sign-in refused: {MAX_FLOWS_PER_CLIENT} are under way for its client");
+        return (refused(503, "Too many sign-ins are in progress for this application. Try again in a moment."), None);
+    }
+    let providers = sign_in.browser_providers();
+    match providers.as_slice() {
+        [] => (refused(404, NO_APPS), None),
+        [(provider, _)] => start(cx, &sign_in, request, provider, &browser),
+        several => {
+            let id = match auth::random_hex(32) {
+                Ok(id) => id,
+                Err(e) => return (internal(&e, "starting an authorization"), None),
+            };
+            let client = client_name(&request.client);
+            let options: Vec<(String, String)> = several
+                .iter()
+                .map(|(name, label)| {
+                    let query = form::encode(&[("flow", id.as_str()), ("provider", name)]);
+                    (label.to_string(), format!("{}{CHOOSE}?{query}", cx.issuer))
+                })
+                .collect();
+            let choosing = Choosing { request, browser: auth::hash(&browser) };
+            if !lock(cx.flows).choosing.put_new(auth::hash(&id), choosing) {
+                tracing::warn!(target: "bd::serve", "OAuth sign-in refused: {MAX_FLOWS} are under way");
+                return (refused(503, "Too many sign-ins are in progress. Try again in a moment."), None);
+            }
+            (Answer::Page(pages::choose(&client, &options)), Some(set_cookie(cx.issuer, &browser)))
+        }
+    }
+}
+
+/// `GET <issuer>/oauth/choose?flow=<id>&provider=<name>`: the person chose
+/// a provider on the page [`begin`] showed; on to it.
+pub fn choose(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Option<String>) {
+    let pairs = form::decode(query).unwrap_or_default();
+    let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
+    let choosing = get("flow").and_then(|flow| lock(cx.flows).choosing.take(&auth::hash(flow)));
+    let Some(Choosing { request, browser: chose_in }) = choosing else {
+        return (refused(400, "This sign-in has expired. Start again from the application."), None);
+    };
+    let Some(browser) = browser.filter(|b| auth::hash(b) == chose_in) else {
+        return (refused(400, "This sign-in started in a different browser. Start again from the application."), None);
+    };
+    let sign_in = match oauth::load(cx.root) {
+        Ok(Some(s)) if s.oauth.is_some() => s,
+        Ok(_) => return (refused(404, NO_APPS), None),
+        Err(e) => return (internal(&e, "reading auth.toml for an authorization"), None),
+    };
+    let offered = sign_in.browser_providers();
+    let Some((provider, _)) = offered.iter().find(|(name, _)| Some(*name) == get("provider")) else {
+        return (refused(400, MALFORMED), None);
+    };
+    start(cx, &sign_in, request, provider, browser)
+}
+
+/// Send the browser to `provider` to sign in for `request`, binding the
+/// sign-in to `browser` (the cookie's value).
+fn start(
+    cx: &Ctx<'_>,
+    sign_in: &oauth::SignIn,
+    request: Authorization,
+    provider: &str,
+    browser: &str,
+) -> (Answer, Option<String>) {
     let secrets = (|| Ok::<_, Error>((auth::random_hex(32)?, auth::random_hex(32)?, auth::random_hex(32)?)))();
-    let (state, verifier, new_cookie) = match secrets {
+    let (state, verifier, nonce) = match secrets {
         Ok(s) => s,
         Err(e) => return (internal(&e, "starting an authorization"), None),
     };
-    let browser = browser.map_or(new_cookie, str::to_string);
-    let url = oauth::web_sign_in_url(&github, &format!("{}{CALLBACK}", cx.issuer), &state, &s256(&verifier));
-    let started = Started { request, verifier, browser: auth::hash(&browser) };
+    let callback = format!("{}{}", cx.issuer, super::callback(provider));
+    let url = match (provider, &sign_in.github, sign_in.oidc(provider)) {
+        ("github", Some(github), _) => oauth::web_sign_in_url(github, &callback, &state, &s256(&verifier)),
+        (_, _, Some(oidc)) => match oidc.metadata() {
+            Ok(md) => oidc.authorization_url(&md, &callback, &state, &nonce, &s256(&verifier)),
+            Err(e) => {
+                tracing::warn!(target: "bd::serve", %provider, error = %e, "OAuth sign-in could not start");
+                let link = request.error_url(cx.issuer, "temporarily_unavailable", "the provider could not be reached");
+                let why = "It didn't respond as expected. Try again in a moment.";
+                let title = format!("Couldn't reach {}", oidc.label);
+                return (Answer::Page(pages::refusal(502, &title, why, Some(&link))), None);
+            }
+        },
+        _ => return (refused(404, NO_APPS), None),
+    };
+    let started = Started { request, verifier, browser: auth::hash(browser), provider: provider.to_string(), nonce };
     if !lock(cx.flows).started.put_new(auth::hash(&state), started) {
         tracing::warn!(target: "bd::serve", "OAuth sign-in refused: {MAX_FLOWS} are under way");
         return (refused(503, "Too many sign-ins are in progress. Try again in a moment."), None);
     }
-    (Answer::Redirect(url), Some(set_cookie(cx.issuer, &browser)))
+    (Answer::Redirect(url), Some(set_cookie(cx.issuer, browser)))
 }
 
-/// `GET <issuer>/oauth/github/callback?<query>`: GitHub sent the browser
-/// back. Find out who signed in and what the rules let the account do in
-/// the workspace, and ask whether the client may.
-pub fn callback(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> Answer {
+/// What the pages call a client: its name, else its document's host.
+fn client_name(client: &Client) -> String {
+    match (&client.name, client.document) {
+        (Some(name), _) => name.clone(),
+        (None, true) => host_of(&client.id).to_string(),
+        (None, false) => "Unnamed application".into(),
+    }
+}
+
+/// `POST <issuer>/oauth/<provider>/callback`: the provider's answer as a
+/// form the browser posted (`response_mode=form_post`). Another site's POST
+/// carries no `SameSite=Lax` cookie, so the step cannot tell the browser
+/// here: the answer goes on to [`callback`] as the GET it would otherwise
+/// have been, a top-level navigation the cookie goes with. Only what the
+/// callback reads goes on (not an ID token or the user's name). Only a
+/// provider configured to post its answers is relayed.
+pub fn relay(cx: &Ctx<'_>, provider: &str, body: &str) -> Answer {
+    let posts = match oauth::load(cx.root) {
+        Ok(Some(s)) => s.oauth.is_some() && s.oidc(provider).is_some_and(|o| o.form_post),
+        Ok(None) => false,
+        Err(e) => return internal(&e, "reading auth.toml for a posted sign-in answer"),
+    };
+    if !posts {
+        return refused(400, "This sign-in came back in a way it shouldn't. Start again from the application.");
+    }
+    let Some(pairs) = form::decode(body) else {
+        return refused(400, "The sign-in came back unreadable. Start again from the application.");
+    };
+    let kept: Vec<(&str, &str)> = pairs
+        .iter()
+        .filter(|(k, _)| matches!(k.as_str(), "state" | "code" | "error" | "iss"))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    if !kept.iter().any(|(k, _)| *k == "state") {
+        return refused(400, "This sign-in has expired. Start again from the application.");
+    }
+    Answer::Redirect(format!("{}{}?{}", cx.issuer, super::callback(provider), form::encode(&kept)))
+}
+
+/// `GET <issuer>/oauth/<provider>/callback?<query>`: the provider sent the
+/// browser back. Find out who signed in and what the rules or the
+/// authorizer let the account do in the workspace, and ask whether the
+/// client may.
+pub fn callback(cx: &Ctx<'_>, provider: &str, query: &str, browser: Option<&str>) -> (Answer, Option<String>) {
+    let mut fresh = None;
+    let answer = signed_in(cx, provider, query, browser, &mut fresh);
+    (answer, fresh)
+}
+
+/// [`callback`]'s answer. Once the person signed in, the browser gets a
+/// cookie of the consent's own (`fresh`, its `Set-Cookie`), which the
+/// consent is bound to: a cookie known or planted before the sign-in is good
+/// for nothing after it, and other sign-ins under way in the same browser
+/// keep theirs.
+fn signed_in(cx: &Ctx<'_>, provider: &str, query: &str, browser: Option<&str>, fresh: &mut Option<String>) -> Answer {
     let pairs = form::decode(query).unwrap_or_default();
     let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
     let started = get("state").and_then(|state| lock(cx.flows).started.take(&auth::hash(state)));
-    let Some(Started { request, verifier, browser: started_in }) = started else {
+    let Some(Started { request, verifier, browser: started_in, provider: started_with, nonce }) = started else {
         return refused(400, "This sign-in has expired. Start again from the application.");
     };
     if browser.map(auth::hash).as_deref() != Some(started_in.as_str()) {
         return refused(400, "This sign-in started in a different browser. Start again from the application.");
     }
+    if started_with != provider {
+        return refused(400, "This sign-in came back from another provider. Start again from the application.");
+    }
+    let sign_in = match oauth::load(cx.root) {
+        Ok(Some(s)) if s.oauth.is_some() => s,
+        Ok(_) => return refused(404, NO_APPS),
+        Err(e) => return internal(&e, "reading auth.toml for an authorization"),
+    };
+    let label = match (provider, sign_in.oidc(provider)) {
+        ("github", _) => "GitHub".to_string(),
+        (_, Some(oidc)) => oidc.label.clone(),
+        _ => return refused(404, NO_APPS),
+    };
+    // Mix-up: an OIDC provider's answer names it (RFC 9207), where it says it does, and never another one.
+    if let Some(oidc) = sign_in.oidc(provider) {
+        let required = oidc.metadata().is_ok_and(|md| md.iss_parameter);
+        let ok = match get("iss") {
+            Some(iss) => iss == oidc.issuer,
+            None => !required,
+        };
+        if !ok {
+            tracing::warn!(target: "bd::serve", %provider, iss = ?get("iss"), "a sign-in came back naming another issuer");
+            return refused(400, "This sign-in came back from another provider. Start again from the application.");
+        }
+    }
     let back = |error: &str, description: &str| request.error_url(cx.issuer, error, description);
     if let Some(error) = get("error") {
         let (error, description) = match error {
-            "access_denied" => ("access_denied", "the sign-in was cancelled at GitHub"),
-            _ => ("server_error", "GitHub did not complete the sign-in"),
+            // Apple says `user_cancelled_authorize`.
+            "access_denied" | "user_cancelled_authorize" => {
+                ("access_denied", "the sign-in was cancelled at the provider")
+            }
+            _ => ("server_error", "the provider did not complete the sign-in"),
         };
         return Answer::Redirect(back(error, description));
     }
     let Some(code) = get("code").filter(|c| !c.is_empty()) else {
-        return refused(400, "GitHub didn't return a sign-in code. Start again from the application.");
+        let why = format!("{label} didn't return a sign-in code. Start again from the application.");
+        return refused(400, &why);
     };
-    let github = match oauth::load(cx.root) {
-        Ok(Some(g)) if g.oauth.is_some() => g,
-        Ok(_) => return refused(404, NO_APPS),
-        Err(e) => return internal(&e, "reading auth.toml for an authorization"),
+    let callback_url = format!("{}{}", cx.issuer, super::callback(provider));
+    let workspace = &request.workspace;
+    let client = &request.client.id;
+    let admitted = match sign_in.oidc(provider) {
+        None => oauth::web_sign_in(cx.root, &sign_in, code, &callback_url, &verifier, workspace, client),
+        Some(oidc) => oidc
+            .metadata()
+            .and_then(|md| oidc.sign_in(&md, code, &callback_url, &verifier, &nonce))
+            .and_then(|claims| oauth::admit_oidc(cx.root, &sign_in, oidc, &claims, workspace, Some(client))),
     };
-    let callback_url = format!("{}{CALLBACK}", cx.issuer);
-    let found = oauth::web_sign_in(&github, code, &callback_url, &verifier, &request.workspace)
-        .and_then(|admitted| Ok((auth::preview_actor(cx.root, &admitted.user, admitted.by_login)?, admitted)));
+    let found = admitted.and_then(|a| Ok((auth::preview_actor(cx.root, &a.user, a.by_login)?, a)));
     let (actor, admitted) = match found {
         Ok(found) => found,
         Err(Error::Unauthorized(why)) => {
-            tracing::info!(target: "bd::serve", workspace = %request.workspace, error = %why, "GitHub web sign-in refused");
+            tracing::info!(target: "bd::serve", %provider, %workspace, error = %why, "web sign-in refused");
             let link = back("access_denied", "the account may not use this workspace");
-            let why = "Your GitHub account doesn't have access to this workspace. Ask the server's admin for access.";
-            return Answer::Page(pages::refusal(403, "Access denied", why, Some(&link)));
+            let why = format!(
+                "Your {label} account doesn't have access to this workspace. Ask the server's admin for access."
+            );
+            return Answer::Page(pages::refusal(403, "Access denied", &why, Some(&link)));
         }
         Err(Error::Invalid(why)) => {
-            tracing::info!(target: "bd::serve", error = %why, "GitHub web sign-in did not complete");
+            tracing::info!(target: "bd::serve", %provider, error = %why, "web sign-in did not complete");
             let link = back("access_denied", "the sign-in did not complete");
-            let why = "GitHub didn't finish signing you in. Start again from the application.";
-            return Answer::Page(pages::refusal(400, "Sign-in didn't finish", why, Some(&link)));
+            let why = format!("{label} didn't finish signing you in. Start again from the application.");
+            return Answer::Page(pages::refusal(400, "Sign-in didn't finish", &why, Some(&link)));
         }
         Err(Error::Remote(why)) => {
-            tracing::warn!(target: "bd::serve", error = %why, "GitHub web sign-in failed");
-            let link = back("temporarily_unavailable", "GitHub could not be reached");
-            let why = "GitHub didn't respond as expected. Try again in a moment.";
-            return Answer::Page(pages::refusal(502, "Couldn't reach GitHub", why, Some(&link)));
+            tracing::warn!(target: "bd::serve", %provider, error = %why, "web sign-in failed");
+            let link = back("temporarily_unavailable", "the provider could not be reached");
+            let why = format!("{label} didn't respond as expected. Try again in a moment.");
+            return Answer::Page(pages::refusal(502, &format!("Couldn't reach {label}"), &why, Some(&link)));
         }
-        Err(e) => return internal(&e, "finishing a GitHub web sign-in"),
+        Err(Error::Busy(why)) => {
+            tracing::warn!(target: "bd::serve", %provider, error = %why, "web sign-in could not be decided");
+            let link = back("temporarily_unavailable", "the server could not check access");
+            let why = "The server couldn't check your access just now. Try again in a moment.";
+            return Answer::Page(pages::refusal(503, "Couldn't check your access", why, Some(&link)));
+        }
+        Err(e) => return internal(&e, "finishing a web sign-in"),
     };
     if !(cx.workspace_exists)(&request.workspace) {
         return Answer::Redirect(back("invalid_target", "resource is not an MCP endpoint of this bd server"));
@@ -570,11 +802,7 @@ pub fn callback(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> Answer {
         Err(e) => return internal(&e, "asking for consent"),
     };
     let client = &request.client;
-    let name = match (&client.name, client.document) {
-        (Some(name), _) => name.clone(),
-        (None, true) => host_of(&client.id).to_string(),
-        (None, false) => "Unnamed application".into(),
-    };
+    let name = client_name(client);
     let identity = if client.document {
         pages::Identity::Document { url: &client.id, host: host_of(&client.id) }
     } else {
@@ -583,11 +811,14 @@ pub fn callback(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> Answer {
     let loopback = clients::is_loopback(&request.redirect_uri);
     let returns_to = host_of(&request.redirect_uri);
     let elsewhere = (client.document && !loopback && returns_to != host_of(&client.id)).then_some(returns_to);
-    let lasts = format!(
-        "at most {}, and ends after {} unused or when revoked",
-        in_words(github.refresh_limit),
-        in_words(github.refresh_idle)
-    );
+    let lasts = match sign_in.refreshes(&admitted.user.provider) {
+        true => format!(
+            "at most {}, and ends after {} unused or when revoked",
+            in_words(sign_in.refresh_limit),
+            in_words(sign_in.refresh_idle)
+        ),
+        false => format!("{}, or until revoked", in_words(sign_in.token_ttl)),
+    };
     let action = format!("{}{CONSENT}", cx.issuer);
     let page = pages::consent(&pages::Consent {
         client: &name,
@@ -598,7 +829,9 @@ pub fn callback(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> Answer {
         elsewhere,
         lasts: &lasts,
         workspace: &request.workspace,
-        login: &admitted.user.login,
+        provider: &label,
+        // The email the person knows the account by, where the provider gave one: on this page only.
+        login: admitted.email.as_deref().unwrap_or(&admitted.user.login),
         actor: &actor,
         access: match admitted.grant.role {
             auth::Role::Read => "Read only",
@@ -610,21 +843,26 @@ pub fn callback(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> Answer {
         action: &action,
         form_origins: &form_origins(&request.redirect_uri),
     });
-    let consent = Consent { request, admitted, actor, browser: started_in };
+    let (value, suffix) = match (auth::random_hex(32), auth::random_hex(4)) {
+        (Ok(v), Ok(s)) => (v, s),
+        (Err(e), _) | (_, Err(e)) => return internal(&e, "asking for consent"),
+    };
+    *fresh = Some(set_consent_cookie(cx.issuer, &suffix, &value));
+    let consent = Consent { request, admitted, actor, browser: auth::hash(&value), cookie: suffix };
     lock(cx.flows).consents.put(auth::hash(&id), consent);
     Answer::Page(page)
 }
 
 /// `POST <issuer>/oauth/consent` with `consent=<id>&decision=approve|deny`:
 /// send the browser back to the client with a code, or `access_denied`.
-pub fn decide(cx: &Ctx<'_>, body: &str, browser: Option<&str>) -> Answer {
+pub fn decide(cx: &Ctx<'_>, body: &str, cookies: &str) -> Answer {
     let pairs = form::decode(body).unwrap_or_default();
     let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
     let consent = get("consent").and_then(|id| lock(cx.flows).consents.take(&auth::hash(id)));
-    let Some(Consent { request, admitted, actor, browser: started_in }) = consent else {
+    let Some(Consent { request, admitted, actor, browser: started_in, cookie }) = consent else {
         return refused(400, "This request has expired. Start again from the application.");
     };
-    if browser.map(auth::hash).as_deref() != Some(started_in.as_str()) {
+    if consent_cookie(cx.issuer, cookies, &cookie).map(auth::hash).as_deref() != Some(started_in.as_str()) {
         return refused(400, "This request started in a different browser. Start again from the application.");
     }
     // `[oauth]` may have changed since the request was checked: the browser
@@ -647,7 +885,7 @@ pub fn decide(cx: &Ctx<'_>, body: &str, browser: Option<&str>) -> Answer {
             target: "bd::serve",
             client = %request.client.id,
             login = %admitted.user.login,
-            id = admitted.user.id,
+            subject = %admitted.user.subject,
             %actor,
             workspace = %request.workspace,
             "OAuth authorization {decision}"
@@ -714,7 +952,12 @@ pub fn sample_code() -> Code {
         challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".into(),
         resource: "https://bd.example.com/bd/w/proj/mcp".into(),
         admitted: Admitted {
-            user: auth::GithubUser { url: "https://github.com".into(), login: "alice".into(), id: 1 },
+            user: auth::Identity {
+                provider: "github".into(),
+                issuer: "https://github.com".into(),
+                subject: "1".into(),
+                login: "alice".into(),
+            },
             grant: auth::Grant {
                 role: auth::Role::Write,
                 kind: auth::Kind::Agent,
@@ -724,6 +967,7 @@ pub fn sample_code() -> Code {
             via: "GitHub user alice".into(),
             by_login: true,
             unknown: vec![],
+            email: None,
         },
         actor: "alice".into(),
     }

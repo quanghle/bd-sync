@@ -35,7 +35,7 @@ a checkout with `.bd/remote.toml` (written by `bd remote set <url>`) sends
 every command to the server, with an access token from `bd remote login` or
 `$BD_TOKEN`. The server also reclaims dead workers' leases, checks gates and
 takes backups on its own. See [Remote server](remote.md) for running a
-server, tokens, GitHub sign-in and clients, and [Security](security.md) for
+server, tokens, sign-in (GitHub or OIDC) and clients, and [Security](security.md) for
 what the tokens allow.
 
 A `.bd/remote.toml` takes precedence over a `.bd/bd.db` in the same

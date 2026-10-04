@@ -194,8 +194,11 @@ pub fn redeem(root: &Path, flows: &Mutex<Flows>, request: Request) -> Result<Val
         Err(e) => return keep(&code, server_error(&e, "redeeming an authorization code: auth.toml")),
     };
     let admitted = &code.admitted;
+    if !github.provides(&admitted.user) {
+        return Err(invalid_grant("this server no longer signs people in with that provider"));
+    }
     let client = ForClient { id: &code.client_id, resource: &code.resource };
-    let life = github.lifetime(Timestamp::now());
+    let life = github.lifetime(Timestamp::now(), &admitted.user.provider);
     let issued = match auth::issue_client_token(
         root,
         &admitted.user,

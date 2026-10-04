@@ -180,24 +180,32 @@ Some MCP clients sign people in rather than send a token they were given:
 ChatGPT, the Claude apps, and Claude Code or another client configured
 without an `Authorization` header. For them, `bd serve` runs an OAuth 2.1
 authorization server when `<root>/auth.toml` has an `[oauth]` table. People
-sign in with GitHub in their browser, under the same rules as `bd remote
-login --github` ([Signing in with GitHub](remote.md#signing-in-with-github)),
-approve the client, and the client gets a token bound to the endpoint it
-asked for.
+sign in in their browser with GitHub or one of the server's OpenID Connect
+providers (a page offers them when there are several), under the same rules
+(or [authorizer](remote.md#deciding-with-an-authorizer), which is told the
+client) as `bd remote login` ([Signing in](remote.md#signing-in)), approve
+the client, and the client gets a token bound to the endpoint it asked for.
 
-1. Set up GitHub sign-in with a GitHub App and its private key
-   ([remote workspaces](remote.md#signing-in-with-github)): OAuth clients'
-   tokens are refreshed through the App. In the App's settings, set the
+1. Set up sign-in ([remote workspaces](remote.md#signing-in)) so that
+   tokens are refreshed: an authorizer, or GitHub's rules with the GitHub
+   App's private key. Each provider sends people back to
+   `<public-url>/oauth/<provider>/callback`: for GitHub, set the App's
    **Callback URL** to the server's public URL followed by
-   `/oauth/github/callback` (`https://bd.example.com/bd/oauth/github/callback`),
-   and generate a client secret. Save the secret alone in a file under the
-   root, with mode 0600.
+   `/oauth/github/callback` (`https://bd.example.com/bd/oauth/github/callback`)
+   and generate a client secret (saved alone in a file under the root, mode
+   0600, named by `github.client_secret_file`); for an OIDC provider
+   `[oidc.<name>]`, register `/oauth/<name>/callback` as its redirect URI.
 2. Add to `<root>/auth.toml`:
 
    ```toml
    [github]
-   # client_id, private_key, token lifetimes and rules as for bd remote login --github
+   # client_id, private_key and rules (or an [authorizer]) as for bd remote login --provider github
    client_secret_file = "github-secret"   # the GitHub App's client secret, relative to the root
+
+   # [oidc.google]                         # and any OIDC providers, decided by an [authorizer]
+   # issuer = "https://accounts.google.com"
+   # client_id = "..."
+   # client_secret_file = "google-secret"
 
    [oauth]
    redirect_hosts = ["chatgpt.com", "claude.ai"]   # https redirect URIs on these hosts, without a port
@@ -207,9 +215,11 @@ asked for.
 3. Run `bd serve` with an https `--public-url` (http only on a loopback
    address, for trying it out): it is the issuer, which clients check.
 
-`bd serve` refuses to start with `[oauth]` but no `private_key`, no
-`client_secret_file`, no such `--public-url`, or no redirect allowed; and
-with `client_secret_file` but no `[oauth]`. Like the rest of `auth.toml`,
+`bd serve` refuses to start with `[oauth]` but tokens that are not
+refreshed (no authorizer, and GitHub's rules without `private_key`), no
+provider for a browser (GitHub without `client_secret_file`, and no OIDC
+provider), no such `--public-url`, or no redirect allowed; and with
+`client_secret_file` but no `[oauth]`. Like the rest of `auth.toml`,
 `[oauth]` is read again for each request, so it can be changed without a
 restart, or removed together with `client_secret_file` to turn the
 authorization server off: a `client_secret_file` left without `[oauth]` is
@@ -246,7 +256,7 @@ endpoint's metadata, then to the authorization server's, and then:
      identify themselves this way, and ChatGPT may.
    - by registering (RFC 7591) at `<public-url>/oauth/register`, without a
      token: up to 8 redirect URIs of 512 bytes each. Registrations are kept
-     in `<root>/oauth-clients.json`: one never used is dropped after a day,
+     in `<root>/server.db`: one never used is dropped after a day,
      and one unused for 90 days after that. With 500 kept, a new
      registration drops the oldest never used, or is refused (503) if all
      are in use.
@@ -260,15 +270,16 @@ endpoint's metadata, then to the authorization server's, and then:
 2. **Sends the person to `<public-url>/oauth/authorize`**, for an
    authorization code with PKCE (`S256` only), naming as `resource`
    (RFC 8707, required) the endpoint it wants, one of this server's. The browser signs
-   in at GitHub, which sends it back to the callback. If a rule lets the
-   account into the workspace, a consent page shows what the client will
+   in with GitHub or an OIDC provider (chosen on a page when the server
+   offers several), which sends it back to that provider's callback. If a
+   rule or the authorizer lets the account into the workspace, a consent page shows what the client will
    get: the client's name and where its details come from (its metadata
    document's full URL, with the logo the document names, or, for a
    registered client, the client itself, with a warning that its name is
    not verified), the full redirect URI the browser goes back to (with a
    warning when it is this machine, or a site other than the document's),
-   the workspace, the GitHub login, the actor, the access its role gives,
-   the rule that let the account in, and how long access lasts
+   the workspace, the provider and login signed in with, the actor, the access its role gives,
+   what let the account in, and how long access lasts
    (`refresh_limit`, `refresh_idle`). A small script keeps the form from
    being sent until the page has had focus for 600 ms, against
    double-click tricks; the buttons stay enabled, so screen readers and
@@ -288,21 +299,20 @@ progress is bound to the browser that started it (an `HttpOnly`,
 `SameSite=Lax` cookie, `__Secure-bd_oauth` on an https public URL,
 `bd_oauth` on http), each step must follow within 10 minutes,
 and they are kept in memory only, so a restart ends them. At most 1024
-sign-ins at GitHub are under way at once: past that, new authorizations get
+sign-ins at a provider are under way at once, 64 for one client: past that, new authorizations get
 a 503 page until some finish or expire, and none under way is dropped for
 them. The steps after it, which only accounts the rules let in reach, keep
 up to 1024 consent pages and 1024 codes each, the oldest going first.
 
 The client's tokens:
 
-- act as the account's actor, as a sign-in by `bd remote login --github`
-  does, and tool calls as `<actor>/mcp` (see [Actors](#actors)), with what
+- act as the account's actor, as a sign-in by `bd remote login` does, and tool calls as `<actor>/mcp` (see [Actors](#actors)), with what
   the rule grants: role, kind, `max_claims`. They are bound to the endpoint
   ([Tokens bound to an endpoint](#tokens-bound-to-an-endpoint)), so they
   work there only, for that workspace, and never for CLI requests.
 - expire after `token_ttl`, and are refreshed at the token endpoint by the
-  client they were issued to, with the rules applied again as for any
-  sign-in ([Refreshing](remote.md#refreshing-sign-ins)), until
+  client they were issued to, with the rules or the authorizer deciding
+  again as for any sign-in ([Refreshing](remote.md#refreshing-sign-ins)), until
   `refresh_limit` or `refresh_idle`. Each refresh replaces both tokens.
 - are protected against replay: a code works once, and any request naming
   it ends it; a code sent again revokes the tokens it issued. A refresh
@@ -316,7 +326,7 @@ The client's tokens:
 Admins see each such token in `bd serve token list`, named
 `oauth-<client>-<actor>-<random>` with its `client`.
 `bd serve token revoke --client <client_id>` revokes every token of a
-client, and `bd serve token revoke --github <login>` every token of an
+client, and `bd serve token revoke --account <login>` every token of an
 account, OAuth clients' included. The endpoints under `/oauth/` need no
 token, so rate-limit them per address at the proxy (see [Behind a
 proxy](#behind-a-proxy)).

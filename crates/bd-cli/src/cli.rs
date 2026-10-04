@@ -404,9 +404,6 @@ pub struct UpdateArgs {
     /// event; through bd serve, an admin token unless the token's actor owns the claim)
     #[arg(long)]
     pub take_over: bool,
-    /// No longer accepted: --force never takes over a claim (use --take-over)
-    #[arg(long, hide = true)]
-    pub force: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -540,9 +537,6 @@ pub struct ReleaseArgs {
     /// unless the token's actor owns the claim)
     #[arg(long)]
     pub take_over: bool,
-    /// No longer accepted: --force never takes over a claim (use --take-over)
-    #[arg(long, hide = true)]
-    pub force: bool,
     /// Release only if still held by this actor (compare-and-swap); another actor's live claim also needs --take-over
     #[arg(long, value_name = "ACTOR")]
     pub if_assignee: Option<String>,
@@ -1259,7 +1253,7 @@ pub struct McpArgs {
 pub struct ServeArgs {
     #[command(subcommand)]
     pub action: Option<ServeAction>,
-    /// Directory of workspaces: <root>/<name>/.bd/bd.db is served at /w/<name>; tokens in <root>/tokens.json,
+    /// Directory of workspaces: <root>/<name>/.bd/bd.db is served at /w/<name>; tokens in <root>/server.db,
     /// GitHub sign-in set up in <root>/auth.toml
     #[arg(long, env = "BD_SERVE_ROOT", value_name = "DIR")]
     pub root: Option<PathBuf>,
@@ -1323,18 +1317,18 @@ pub enum ServeAction {
 pub enum TokenCommand {
     /// Create an access token and print its secret once
     Create(TokenCreateArgs),
-    /// List access tokens (never their secrets), including those GitHub sign-in issued
+    /// List access tokens (never their secrets), including those issued by signing in
     #[command(alias = "ls")]
     List(TokenRootArgs),
-    /// List the GitHub accounts that signed in, and the actor each is bound to
+    /// List the accounts that signed in (with any provider), and the actor each is bound to
     Accounts(TokenRootArgs),
-    /// Revoke an access token, or every token a GitHub user got by signing in; it stops working at once
+    /// Revoke an access token, or every token an account got by signing in; it stops working at once
     Revoke(TokenRevokeArgs),
 }
 
 #[derive(Args, Debug, Clone)]
 pub struct TokenRootArgs {
-    /// Server root holding tokens.json
+    /// Server root holding server.db (the access tokens)
     #[arg(long, env = "BD_SERVE_ROOT", value_name = "DIR")]
     pub root: PathBuf,
 }
@@ -1368,19 +1362,19 @@ pub struct TokenCreateArgs {
 #[derive(Args, Debug, Clone)]
 pub struct TokenRevokeArgs {
     /// The token's name
-    #[arg(required_unless_present_any = ["github", "client"])]
+    #[arg(required_unless_present_any = ["account", "client"])]
     pub name: Option<String>,
-    /// Revoke every token this GitHub user (a login, or the actor an account is bound to) got by signing in,
-    /// instead of a named one
+    /// Revoke every token this account (a login, or the actor it is bound to) got by signing in, with any
+    /// provider, instead of a named one
     #[arg(long, value_name = "LOGIN", conflicts_with = "name")]
-    pub github: Option<String>,
-    /// With --github: also release the account's actor, which another account (or the same one, under its
+    pub account: Option<String>,
+    /// With --account: also release the account's actor, which another account (or the same one, under its
     /// login then) gets at its next sign-in
-    #[arg(long, requires = "github", conflicts_with = "name")]
+    #[arg(long, requires = "account", conflicts_with = "name")]
     pub forget: bool,
     /// Revoke every token issued to this OAuth client (its client ID, as `bd serve token list` shows it), instead
     /// of a named one
-    #[arg(long, value_name = "CLIENT_ID", conflicts_with_all = ["name", "github"])]
+    #[arg(long, value_name = "CLIENT_ID", conflicts_with_all = ["name", "account"])]
     pub client: Option<String>,
     #[command(flatten)]
     pub root: TokenRootArgs,
@@ -1422,12 +1416,12 @@ pub enum RemoteCommand {
     Unset,
     /// Save an access token for a bd server in the user config directory, so BD_TOKEN is not needed
     ///
-    /// With --github, sign in with GitHub instead: the one-time code shown is entered at GitHub
-    /// (github.com/login/device), and the server issues a token if its auth.toml lets the GitHub account in.
+    /// With --provider, sign in instead: the one-time code shown is entered at the provider
+    /// (github.com/login/device for GitHub), and the server issues a token if it lets the account in.
     /// Otherwise the token is read from stdin when it is piped (`printf %s "$TOKEN" | bd remote login`), else
     /// from a prompt that does not echo it; never from the command line. It is checked against the server first.
     Login(RemoteLoginArgs),
-    /// Forget access tokens saved by `bd remote login`, revoking those from GitHub sign-in on their server
+    /// Forget access tokens saved by `bd remote login`, revoking those from signing in on their server
     Logout(RemoteLogoutArgs),
 }
 
@@ -1435,9 +1429,10 @@ pub enum RemoteCommand {
 pub struct RemoteLoginArgs {
     /// Workspace URL, e.g. https://bd.example.com/w/proj (default: this checkout's remote workspace)
     pub url: Option<String>,
-    /// Sign in with GitHub to get a token from the server, instead of entering one
-    #[arg(long, conflicts_with = "no_verify")]
-    pub github: bool,
+    /// Sign in with this provider of the server's (`github`, or the name of one of its OIDC providers) to get a
+    /// token, instead of entering one: a one-time code is shown, to enter at the provider
+    #[arg(long, value_name = "NAME", conflicts_with = "no_verify")]
+    pub provider: Option<String>,
     /// Save the token for this workspace only, instead of for every workspace on its server
     #[arg(long)]
     pub workspace_only: bool,

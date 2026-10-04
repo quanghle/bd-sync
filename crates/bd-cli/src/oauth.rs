@@ -1,5 +1,5 @@
 //! GitHub sign-in: people get a `bd serve` access token by signing in with
-//! GitHub (`bd remote login --github`), instead of an admin creating one.
+//! GitHub (`bd remote login --provider github`), instead of an admin creating one.
 //!
 //! `<root>/auth.toml` turns it on and decides who may sign in, and what
 //! their token may do:
@@ -70,6 +70,10 @@
 //! back to `<issuer>/oauth/github/callback` (the GitHub App's callback URL)
 //! and gives a token only with a client secret of the App
 //! (`client_secret_file`); the same rules then apply ([`admit`]).
+//!
+//! `[authorizer]` (`authorizer.rs`) replaces the rules: the admin's own
+//! command or HTTPS endpoint decides, at every sign-in and refresh, within
+//! caps `auth.toml` sets; the account is still proved and bound here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -80,7 +84,7 @@ use bd_core::{Error, Result, Timestamp};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::auth::{self, GithubUser, Grant, Kind, Role};
+use crate::auth::{self, Grant, Identity, Kind, Role};
 use crate::io;
 use crate::protocol::{Issued, SignInAnswer, SignInCode, SignInPoll, SignInStart};
 use crate::remote::Remote;
@@ -112,9 +116,27 @@ const MAX_CODE_LIFE: u64 = 3600;
 #[serde(deny_unknown_fields)]
 struct Doc {
     #[serde(default)]
+    sign_in: Option<SignInDoc>,
+    #[serde(default)]
     github: Option<GithubDoc>,
     #[serde(default)]
+    oidc: std::collections::BTreeMap<String, crate::oidc::OidcDoc>,
+    #[serde(default)]
     oauth: Option<OauthDoc>,
+    #[serde(default)]
+    authorizer: Option<crate::authorizer::AuthorizerDoc>,
+}
+
+/// `[sign_in]`: how long the tokens of any provider's sign-ins last.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SignInDoc {
+    #[serde(default)]
+    token_ttl: Option<String>,
+    #[serde(default)]
+    refresh_limit: Option<String>,
+    #[serde(default)]
+    refresh_idle: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -138,12 +160,6 @@ struct GithubDoc {
     private_key: Option<PathBuf>,
     #[serde(default)]
     client_secret_file: Option<PathBuf>,
-    #[serde(default)]
-    token_ttl: Option<String>,
-    #[serde(default)]
-    refresh_limit: Option<String>,
-    #[serde(default)]
-    refresh_idle: Option<String>,
     #[serde(default)]
     deny: Vec<u64>,
     #[serde(default)]
@@ -177,7 +193,92 @@ fn agent_kind() -> Kind {
     Kind::Agent
 }
 
-/// GitHub sign-in, as `auth.toml` configures it.
+/// Sign-in, as `auth.toml` configures it: the providers people sign in
+/// with, how long their tokens last, who decides, and the authorization
+/// server for MCP clients.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignIn {
+    /// `[github]`, if people sign in with GitHub.
+    pub github: Option<Github>,
+    /// `[oidc.<name>]`: OpenID Connect providers (`oidc.rs`), by name.
+    pub oidc: Vec<crate::oidc::Oidc>,
+    /// How long issued tokens work (`[sign_in]`).
+    pub token_ttl: Duration,
+    /// How long after its sign-in a token may be refreshed.
+    pub refresh_limit: Duration,
+    /// How long a sign-in may go without a refresh.
+    pub refresh_idle: Duration,
+    /// The admin's own code deciding who may sign in (`[authorizer]`,
+    /// `authorizer.rs`), instead of `[[github.allow]]` rules.
+    pub authorizer: Option<crate::authorizer::Authorizer>,
+    /// The authorization server for MCP clients, if `[oauth]` turns it on.
+    pub oauth: Option<OauthConfig>,
+}
+
+impl SignIn {
+    /// Whether sign-ins with `provider` get refresh tokens: only when
+    /// someone decides again at each refresh, the authorizer, or GitHub's
+    /// rules through the GitHub App.
+    pub fn refreshes(&self, provider: &str) -> bool {
+        self.authorizer.is_some()
+            || (provider == "github" && self.github.as_ref().is_some_and(|g| g.private_key.is_some()))
+    }
+
+    /// The files holding secrets of sign-in, as written (relative to `root`
+    /// unless absolute): the GitHub App's key and client secret, OIDC
+    /// client secrets or the keys signing them, and the authorizer's token.
+    pub fn secret_files(&self, root: &Path) -> Vec<PathBuf> {
+        let mut files: Vec<&PathBuf> = Vec::new();
+        if let Some(g) = &self.github {
+            files.extend(g.private_key.iter().chain(&g.client_secret_file));
+        }
+        files.extend(self.oidc.iter().flat_map(|o| o.secret_files()));
+        if let Some(crate::authorizer::How::Https { token_file: Some(f), .. }) =
+            self.authorizer.as_ref().map(|a| &a.how)
+        {
+            files.push(f);
+        }
+        files.into_iter().map(|f| if f.is_relative() { root.join(f) } else { f.clone() }).collect()
+    }
+
+    /// What the server offers, for a message: `it offers github and okta
+    /// (bd remote login --provider <name>)`.
+    pub fn offered(&self) -> String {
+        let names: Vec<&str> =
+            self.github.iter().map(|_| "github").chain(self.oidc.iter().map(|o| o.name.as_str())).collect();
+        format!("it offers {} (`bd remote login --provider <name>`)", names.join(", "))
+    }
+
+    /// Whether `user` signed in with a provider this configuration still
+    /// has, at the same issuer: a provider removed, or pointed elsewhere,
+    /// vouches for its sign-ins no more.
+    pub fn provides(&self, user: &Identity) -> bool {
+        match user.provider.as_str() {
+            "github" => self.github.as_ref().is_some_and(|g| g.url.to_ascii_lowercase() == user.issuer),
+            name => self.oidc(name).is_some_and(|o| o.issuer == user.issuer),
+        }
+    }
+
+    /// The OIDC provider named `name`, if there is one.
+    pub fn oidc(&self, name: &str) -> Option<&crate::oidc::Oidc> {
+        self.oidc.iter().find(|o| o.name == name)
+    }
+
+    /// The providers people may sign in with in a browser, as the sign-in
+    /// page offers them: name and label. GitHub only with its client secret.
+    pub fn browser_providers(&self) -> Vec<(&str, &str)> {
+        let github = self.github.as_ref().filter(|g| g.client_secret_file.is_some()).map(|_| ("github", "GitHub"));
+        github.into_iter().chain(self.oidc.iter().map(|o| (o.name.as_str(), o.label.as_str()))).collect()
+    }
+
+    /// How long the tokens of a sign-in with `provider` at `now` last.
+    pub fn lifetime(&self, now: Timestamp, provider: &str) -> auth::Lifetime {
+        let refresh = self.refreshes(provider).then(|| (now.plus(self.refresh_limit), self.refresh_idle));
+        auth::Lifetime { ttl: self.token_ttl, refresh }
+    }
+}
+
+/// GitHub sign-in, as `[github]` configures it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Github {
     pub client_id: String,
@@ -186,25 +287,19 @@ pub struct Github {
     pub url: String,
     /// GitHub's REST API.
     pub api_url: String,
-    /// How long issued tokens work.
-    pub token_ttl: Duration,
     /// The GitHub App's private key file, as written (relative to the root).
     pub private_key: Option<PathBuf>,
-    /// The key itself, read by [`load`]: tokens are refreshed only with it.
+    /// The key itself, read by [`load`]: it reads accounts and memberships
+    /// at refreshes, for the rules.
     pub app: Option<AppKey>,
     /// The GitHub App's client secret file, as written (relative to the root).
     pub client_secret_file: Option<PathBuf>,
     /// The secret itself, read by [`load`]: the web flow needs it.
     pub client_secret: Option<ClientSecret>,
-    /// How long after its sign-in a token may be refreshed.
-    pub refresh_limit: Duration,
-    /// How long a sign-in may go without a refresh.
-    pub refresh_idle: Duration,
-    /// GitHub user ids that may never sign in, whatever the rules say.
+    /// GitHub user ids that may never sign in, whatever decides.
     pub deny: Vec<u64>,
+    /// `[[github.allow]]`: who may sign in, unless an authorizer decides.
     pub rules: Vec<Rule>,
-    /// The authorization server for MCP clients, if `[oauth]` turns it on.
-    pub oauth: Option<OauthConfig>,
 }
 
 /// `[oauth]`: where the authorization server may send people back to.
@@ -304,13 +399,6 @@ impl Github {
     fn reads_orgs(&self) -> bool {
         self.rules.iter().any(|r| !r.orgs.is_empty() || !r.teams.is_empty())
     }
-
-    /// How long the tokens of a sign-in at `now` last: refreshed only with
-    /// the GitHub App's key.
-    pub fn lifetime(&self, now: Timestamp) -> auth::Lifetime {
-        let refresh = self.app.as_ref().map(|_| (now.plus(self.refresh_limit), self.refresh_idle));
-        auth::Lifetime { ttl: self.token_ttl, refresh }
-    }
 }
 
 /// A GitHub App's private key (`github.private_key`), which signs the JWTs
@@ -403,26 +491,34 @@ static INSTALLATION_TOKENS: LazyLock<Mutex<HashMap<String, (String, Instant)>>> 
 
 /// GitHub sign-in as `<root>/auth.toml` configures it: `None` without the
 /// file, or without its `[github]` table.
-pub fn load(root: &Path) -> Result<Option<Github>> {
+pub fn load(root: &Path) -> Result<Option<SignIn>> {
     let path = root.join(FILE);
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Error::invalid(format!("{}: {e}", path.display()))),
     };
-    let Some(mut github) = parse(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))? else {
+    let Some(mut sign_in) = parse(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))? else {
         return Ok(None);
     };
-    if let Some(key) = &github.private_key {
-        let key = if key.is_relative() { root.join(key) } else { key.clone() };
-        github.app = Some(AppKey::load(&key).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?);
+    if let Some(github) = &mut sign_in.github {
+        if let Some(key) = &github.private_key {
+            let key = if key.is_relative() { root.join(key) } else { key.clone() };
+            github.app = Some(AppKey::load(&key).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?);
+        }
+        if let Some(file) = &github.client_secret_file {
+            let file = if file.is_relative() { root.join(file) } else { file.clone() };
+            let secret = ClientSecret::load(&file).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
+            github.client_secret = Some(secret);
+        }
     }
-    if let Some(file) = &github.client_secret_file {
-        let file = if file.is_relative() { root.join(file) } else { file.clone() };
-        let secret = ClientSecret::load(&file).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
-        github.client_secret = Some(secret);
+    for oidc in &mut sign_in.oidc {
+        oidc.load_secret(root).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
     }
-    Ok(Some(github))
+    if let Some(authorizer) = &mut sign_in.authorizer {
+        authorizer.load_token(root).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
+    }
+    Ok(Some(sign_in))
 }
 
 /// The authorization server's settings in `<root>/auth.toml` (`[oauth]`),
@@ -435,22 +531,87 @@ pub fn load_oauth(root: &Path) -> Result<Option<OauthConfig>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(Error::invalid(format!("{}: {e}", path.display()))),
     };
-    let github = parse(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
-    Ok(github.and_then(|g| g.oauth))
+    let sign_in = parse(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
+    Ok(sign_in.and_then(|g| g.oauth))
 }
 
-fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
+fn parse(text: &str) -> std::result::Result<Option<SignIn>, String> {
     let doc: Doc = toml::from_str(text).map_err(|e| {
         // The parser's own text quotes the file, which may hold what should not be shown: name the line only.
         let line = e.span().map(|s| text.as_bytes()[..s.start.min(text.len())].iter().filter(|&&b| b == b'\n').count());
-        format!("{}{}", line.map(|n| format!("line {}: ", n + 1)).unwrap_or_default(), e.message().trim_end())
+        let message = e.message().trim_end();
+        let moved = ["token_ttl", "refresh_limit", "refresh_idle"]
+            .iter()
+            .any(|f| message.contains(&format!("unknown field `{f}`")));
+        let hint = if moved { " (token_ttl, refresh_limit and refresh_idle are in [sign_in] now)" } else { "" };
+        format!("{}{message}{hint}", line.map(|n| format!("line {}: ", n + 1)).unwrap_or_default())
     })?;
-    let Some(g) = doc.github else {
-        return match doc.oauth {
-            Some(_) => Err("[oauth] signs people in with GitHub, so it needs [github]".into()),
-            None => Ok(None),
+    if doc.github.is_none() && doc.oidc.is_empty() {
+        return match doc.oauth.is_some() || doc.authorizer.is_some() || doc.sign_in.is_some() {
+            true => {
+                Err("[sign_in], [authorizer] and [oauth] need a provider to sign in with: [github] or [oidc.<name>]"
+                    .into())
+            }
+            false => Ok(None),
         };
+    }
+    let times = doc.sign_in.unwrap_or_default();
+    let duration = |field: &str, raw: &Option<String>, default: Duration| {
+        let Some(raw) = raw else { return Ok(default) };
+        let d = bd_core::time::parse_duration(raw).map_err(|e| format!("sign_in.{field}: {e}"))?;
+        match (TTL_RANGE.0..=TTL_RANGE.1).contains(&d) {
+            true => Ok(d),
+            false => Err(format!("sign_in.{field} {raw:?}: use 5m to 366d")),
+        }
     };
+    let token_ttl = duration("token_ttl", &times.token_ttl, DEFAULT_TTL)?;
+    let refresh_limit = duration("refresh_limit", &times.refresh_limit, DEFAULT_REFRESH_LIMIT)?;
+    let refresh_idle = duration("refresh_idle", &times.refresh_idle, DEFAULT_REFRESH_IDLE)?;
+    if !(token_ttl <= refresh_idle && refresh_idle <= refresh_limit) {
+        return Err("sign_in.token_ttl, refresh_idle and refresh_limit must each be at most the next (by default \
+                    1h, 7d and 30d)"
+            .into());
+    }
+    let authorizer = doc.authorizer.map(crate::authorizer::parse).transpose()?;
+    if let Some(grace) = authorizer.as_ref().and_then(|a| a.refresh_grace) {
+        if !(token_ttl <= grace && grace <= refresh_idle) {
+            return Err("authorizer.refresh_grace must be at least sign_in.token_ttl (or no refresh is ever within \
+                        it) and at most sign_in.refresh_idle"
+                .into());
+        }
+    }
+    let github = doc.github.map(|g| github(g, authorizer.is_some())).transpose()?;
+    let mut oidc = Vec::new();
+    for (name, o) in doc.oidc {
+        oidc.push(crate::oidc::parse(&name, o)?);
+    }
+    if let (Some(first), None) = (oidc.first(), &authorizer) {
+        return Err(format!(
+            "[oidc.{}] needs an [authorizer] to decide who may sign in ([[github.allow]] rules are GitHub's)",
+            first.name
+        ));
+    }
+    let oauth = doc.oauth.map(oauth_config).transpose()?;
+    let sign_in = SignIn { github, oidc, token_ttl, refresh_limit, refresh_idle, authorizer, oauth };
+    let secret = sign_in.github.as_ref().is_some_and(|g| g.client_secret_file.is_some());
+    if sign_in.oauth.is_some() && sign_in.browser_providers().is_empty() {
+        return Err("[oauth] needs a provider people sign in with in a browser: github.client_secret_file (GitHub's \
+                    web flow gives tokens only with a client secret of the GitHub App), or an [oidc.<name>]"
+            .into());
+    }
+    if sign_in.oauth.is_none() && secret {
+        return Err("github.client_secret_file serves [oauth]'s web sign-in only: add [oauth], or leave it out".into());
+    }
+    if sign_in.oauth.is_some() && secret && !sign_in.refreshes("github") {
+        return Err("[oauth] needs refreshed tokens, or people would sign in again each token_ttl: an [authorizer], \
+                    or github.private_key for [[github.allow]] rules"
+            .into());
+    }
+    Ok(Some(sign_in))
+}
+
+/// `[github]`, decided by its rules unless `authorized` (an `[authorizer]`).
+fn github(g: GithubDoc, authorized: bool) -> std::result::Result<Github, String> {
     let client_id = g.client_id.trim().to_string();
     if client_id.is_empty() || client_id.len() > 100 || !client_id.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(format!(
@@ -464,17 +625,6 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
         None if url.eq_ignore_ascii_case("https://github.com") => "https://api.github.com".to_string(),
         None => format!("{url}/api/v3"),
     };
-    let duration = |field: &str, raw: &Option<String>, default: Duration| {
-        let Some(raw) = raw else { return Ok(default) };
-        let d = bd_core::time::parse_duration(raw).map_err(|e| format!("github.{field}: {e}"))?;
-        match (TTL_RANGE.0..=TTL_RANGE.1).contains(&d) {
-            true => Ok(d),
-            false => Err(format!("github.{field} {raw:?}: use 5m to 366d")),
-        }
-    };
-    let token_ttl = duration("token_ttl", &g.token_ttl, DEFAULT_TTL)?;
-    let refresh_limit = duration("refresh_limit", &g.refresh_limit, DEFAULT_REFRESH_LIMIT)?;
-    let refresh_idle = duration("refresh_idle", &g.refresh_idle, DEFAULT_REFRESH_IDLE)?;
     if g.private_key.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
         return Err("github.private_key is empty: name the GitHub App's private key file, or leave it out".into());
     }
@@ -485,20 +635,18 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
                     or leave it out"
             .into());
     }
-    if private_key.is_none() && (g.refresh_limit.is_some() || g.refresh_idle.is_some()) {
-        return Err("github.refresh_limit and refresh_idle need github.private_key: only a GitHub App refreshes \
-                    tokens"
-            .into());
-    }
-    if private_key.is_some() && !(token_ttl <= refresh_idle && refresh_idle <= refresh_limit) {
-        return Err("github.token_ttl, refresh_idle and refresh_limit must each be at most the next (by default \
-                    1h, 7d and 30d)"
-            .into());
-    }
-    if g.allow.is_empty() {
-        return Err("[github] has no [[github.allow]] rules, so no GitHub account may sign in: add rules, or remove \
-                    [github]"
-            .into());
+    match (g.allow.is_empty(), authorized) {
+        (true, false) => {
+            return Err("[github] has no [[github.allow]] rules, so no GitHub account may sign in: add rules, or an \
+                        [authorizer], or remove [github]"
+                .into());
+        }
+        (false, true) => {
+            return Err(
+                "[authorizer] decides who may sign in instead of [[github.allow]] rules: keep one of them".into()
+            );
+        }
+        _ => {}
     }
     let rules: Vec<Rule> =
         g.allow.into_iter().enumerate().map(|(i, r)| rule(i + 1, r)).collect::<std::result::Result<_, _>>()?;
@@ -534,40 +682,17 @@ fn parse(text: &str) -> std::result::Result<Option<Github>, String> {
             ));
         }
     }
-    let oauth = doc.oauth.map(oauth_config).transpose()?;
-    if oauth.is_some() && private_key.is_none() {
-        return Err("[oauth] needs github.private_key: MCP clients' tokens are refreshed through the GitHub App, or \
-                    people would sign in again each token_ttl"
-            .into());
-    }
-    match (&oauth, &client_secret_file) {
-        (Some(_), None) => {
-            return Err("[oauth] needs github.client_secret_file: people sign in through GitHub's web flow, which \
-                        gives tokens only with a client secret of the GitHub App"
-                .into());
-        }
-        (None, Some(_)) => {
-            return Err(
-                "github.client_secret_file serves [oauth]'s web sign-in only: add [oauth], or leave it out".into()
-            );
-        }
-        _ => {}
-    }
-    Ok(Some(Github {
+    Ok(Github {
         client_id,
         url,
         api_url,
-        token_ttl,
         private_key,
         app: None,
         client_secret_file,
         client_secret: None,
-        refresh_limit,
-        refresh_idle,
         deny: g.deny,
         rules,
-        oauth,
-    }))
+    })
 }
 
 /// Whether two grants share a workspace.
@@ -777,8 +902,10 @@ struct Api {
 
 impl Api {
     fn new(github: &Github) -> Api {
+        // Its requests carry the account's or the App's token: never on to wherever a redirect points.
         let config = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .max_redirects(0)
             .timeout_global(Some(GITHUB_TIMEOUT))
             .user_agent(format!("bd/{}", env!("CARGO_PKG_VERSION")))
             .build();
@@ -924,7 +1051,7 @@ impl AppApi<'_> {
 
     /// The account with this user id as GitHub names it now, and when
     /// GitHub created it; `None` when it no longer exists.
-    fn user(&self, id: u64) -> Result<Option<(GithubUser, Option<Timestamp>)>> {
+    fn user(&self, id: u64) -> Result<Option<(Identity, Option<Timestamp>)>> {
         let Some((status, body)) = self.get(None, &format!("/user/{id}"))? else {
             tracing::warn!(target: "bd::serve", github = %self.github.url, client_id = %self.github.client_id, "GitHub sign-ins cannot be refreshed: the GitHub App is not installed anywhere, or only suspended");
             return Err(Error::Remote(
@@ -937,7 +1064,7 @@ impl AppApi<'_> {
         match (status, login, body["id"].as_u64()) {
             (200, Some(login), Some(got)) if got == id => {
                 let created = body["created_at"].as_str().and_then(|at| Timestamp::parse_rfc3339(at).ok());
-                let user = GithubUser { url: self.github.url.to_ascii_lowercase(), login: login.to_string(), id };
+                let user = github_identity(&self.github.url, login, id);
                 Ok(Some((user, created)))
             }
             (404, _, _) => Ok(None),
@@ -1001,21 +1128,30 @@ impl Memberships for Installed<'_> {
 /// GitHub sign-in as `auth.toml` sets it up now, for a sign-in request. A
 /// mistake in the file is the admin's to see, in the log: the client gets
 /// no detail of it.
-fn enabled(root: &Path) -> Result<Github> {
+fn enabled(root: &Path) -> Result<SignIn> {
     match load(root) {
-        Ok(Some(github)) => Ok(github),
-        Ok(None) => Err(Error::Unauthorized(
-            "GitHub sign-in is not enabled on this bd server: its admin turns it on in auth.toml, or creates access \
-             tokens (`bd serve token create`)"
-                .into(),
-        )),
+        Ok(Some(sign_in)) => Ok(sign_in),
+        Ok(None) => Err(not_enabled()),
         Err(e) => {
-            tracing::warn!(target: "bd::serve", error = %e, "GitHub sign-in refused: auth.toml cannot be used");
-            Err(Error::Remote(
-                "GitHub sign-in is not working on this bd server: its admin finds why in the server log".into(),
-            ))
+            tracing::warn!(target: "bd::serve", error = %e, "sign-in refused: auth.toml cannot be used");
+            Err(Error::Remote("sign-in is not working on this bd server: its admin finds why in the server log".into()))
         }
     }
+}
+
+fn not_enabled() -> Error {
+    Error::Unauthorized(
+        "sign-in is not enabled on this bd server: its admin turns it on in auth.toml, or creates access tokens \
+         (`bd serve token create`)"
+            .into(),
+    )
+}
+
+/// `[github]` of `sign_in`, or why people cannot sign in with GitHub.
+fn github_of(sign_in: &SignIn) -> Result<&Github> {
+    sign_in.github.as_ref().ok_or_else(|| {
+        Error::invalid(format!("GitHub sign-in is not enabled on this bd server; {}", sign_in.offered()))
+    })
 }
 
 /// GitHub refused a step of the device flow: for a reason of the server's
@@ -1040,9 +1176,13 @@ fn refused(github: &Github, doing: &str, status: u16, body: &Value) -> Error {
 }
 
 /// Start a sign-in: the one-time code GitHub gives for it.
-pub fn start(root: &Path) -> Result<SignInCode> {
-    let github = enabled(root)?;
-    let api = Api::new(&github);
+pub fn start(root: &Path, provider: &str) -> Result<SignInCode> {
+    let sign_in = enabled(root)?;
+    if provider != "github" {
+        return start_oidc(&sign_in, provider);
+    }
+    let github = github_of(&sign_in)?;
+    let api = Api::new(github);
     let mut form = vec![("client_id", github.client_id.as_str())];
     if github.reads_orgs() {
         form.push(("scope", "read:org"));
@@ -1057,24 +1197,108 @@ pub fn start(root: &Path) -> Result<SignInCode> {
                 verification_uri,
                 expires_in: body["expires_in"].as_u64().unwrap_or(900),
                 interval: body["interval"].as_u64().unwrap_or(5),
+                provider: "GitHub".into(),
             })
         }
-        _ => Err(refused(&github, "start a sign-in", status, &body)),
+        _ => Err(refused(github, "start a sign-in", status, &body)),
     }
+}
+
+/// The OIDC provider `name` of `sign_in`, or why people cannot sign in with it.
+fn oidc_of<'s>(sign_in: &'s SignIn, name: &str) -> Result<&'s crate::oidc::Oidc> {
+    sign_in
+        .oidc(name)
+        .ok_or_else(|| Error::invalid(format!("this bd server has no sign-in provider {name}; {}", sign_in.offered())))
+}
+
+/// [`start`] with an OIDC provider's device flow.
+fn start_oidc(sign_in: &SignIn, provider: &str) -> Result<SignInCode> {
+    let oidc = oidc_of(sign_in, provider)?;
+    let md = oidc.metadata()?;
+    let body = oidc.device(&md)?;
+    let text = |k: &str| body[k].as_str().map(str::to_string);
+    // Google names it verification_url.
+    let uri = text("verification_uri").or_else(|| text("verification_url"));
+    match (text("device_code"), text("user_code"), uri) {
+        (Some(device_code), Some(user_code), Some(verification_uri)) => Ok(SignInCode {
+            device_code,
+            user_code,
+            verification_uri,
+            expires_in: body["expires_in"].as_u64().unwrap_or(600),
+            interval: body["interval"].as_u64().unwrap_or(5),
+            provider: oidc.label.clone(),
+        }),
+        _ => Err(Error::Remote(format!("{} did not start a sign-in as expected; try again later", oidc.label))),
+    }
+}
+
+/// [`poll`] with an OIDC provider's device flow.
+fn poll_oidc(root: &Path, sign_in: &SignIn, provider: &str, poll: &SignInPoll) -> Result<SignInAnswer> {
+    let oidc = oidc_of(sign_in, provider)?;
+    let md = oidc.metadata()?;
+    let form = [("grant_type", DEVICE_GRANT), ("device_code", poll.device_code.as_str())];
+    let body = oidc.token(&md, &form)?;
+    match body["error"].as_str() {
+        Some("authorization_pending") => return Ok(SignInAnswer::Pending),
+        Some("slow_down") => return Ok(SignInAnswer::SlowDown { interval: 0 }),
+        Some("expired_token") => {
+            return Err(Error::Unauthorized(format!(
+                "the one-time code expired before it was entered at {}: sign in again",
+                oidc.label
+            )));
+        }
+        Some("access_denied") => {
+            return Err(Error::Unauthorized(format!("the sign-in was cancelled at {}", oidc.label)));
+        }
+        Some(error) => {
+            let error = crate::oidc::error_code(error);
+            return Err(Error::invalid(format!("{} ended the sign-in ({error}): sign in again", oidc.label)));
+        }
+        None => {}
+    }
+    let Some(id_token) = body["id_token"].as_str() else {
+        return Err(Error::Remote(format!("{} gave no ID token; the server's admin finds why in its log", oidc.label)));
+    };
+    // The device flow sends no nonce: the token comes straight from the provider, to this server.
+    let claims = oidc.verify(&md, id_token, None)?;
+    // The provider gives a code's token once, so a poll sent again would find it gone: not busy, ended.
+    let admitted = admit_oidc(root, sign_in, oidc, &claims, &poll.workspace, None).map_err(|e| match e {
+        Error::Busy(why) => Error::Remote(why),
+        e => e,
+    })?;
+    let Admitted { user, grant, via, by_login, .. } = admitted;
+    let life = sign_in.lifetime(Timestamp::now(), &user.provider);
+    let issued = auth::issue_sign_in_token(root, &user, grant, life, &poll.workspace, by_login)?;
+    tracing::info!(
+        target: "bd::serve",
+        %provider,
+        login = %user.login,
+        subject = %user.subject,
+        actor = %issued.token.actor,
+        token = %issued.token.name,
+        %via,
+        "sign-in issued an access token"
+    );
+    Ok(SignInAnswer::Issued(Box::new(answer_of(issued, user.login, via))))
 }
 
 /// What became of a sign-in: still waiting for its code, or the access
 /// token issued to the account that signed in.
-pub fn poll(root: &Path, poll: &SignInPoll) -> Result<SignInAnswer> {
+pub fn poll(root: &Path, provider: &str, poll: &SignInPoll) -> Result<SignInAnswer> {
     let code = poll.device_code.as_str();
-    if code.is_empty() || code.len() > 256 || !code.bytes().all(|b| b.is_ascii_graphic()) {
+    // Some providers' device codes are long, JWT-like.
+    if code.is_empty() || code.len() > 2048 || !code.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(Error::invalid("not a sign-in's device code"));
     }
     if !crate::protocol::valid_workspace_name(&poll.workspace) {
         return Err(Error::invalid(format!("invalid workspace name {:?}", poll.workspace)));
     }
-    let github = enabled(root)?;
-    let api = Api::new(&github);
+    let sign_in = enabled(root)?;
+    if provider != "github" {
+        return poll_oidc(root, &sign_in, provider, poll);
+    }
+    let github = github_of(&sign_in)?;
+    let api = Api::new(github);
     let form = [("client_id", github.client_id.as_str()), ("device_code", code), ("grant_type", DEVICE_GRANT)];
     let (status, body) = api.form("/login/oauth/access_token", &form)?;
     match body["error"].as_str() {
@@ -1091,20 +1315,25 @@ pub fn poll(root: &Path, poll: &SignInPoll) -> Result<SignInAnswer> {
                 "GitHub does not know this sign-in (it ended, or never started): sign in again",
             ));
         }
-        Some(_) => return Err(refused(&github, "finish a sign-in", status, &body)),
+        Some(_) => return Err(refused(github, "finish a sign-in", status, &body)),
         None => {}
     }
     let Some(access) = body["access_token"].as_str().filter(|t| !t.is_empty()) else {
-        return Err(refused(&github, "finish a sign-in", status, &body));
+        return Err(refused(github, "finish a sign-in", status, &body));
     };
-    let Admitted { user, grant, via, by_login, unknown } = admit(&github, &api, access, &poll.workspace)?;
-    let life = github.lifetime(Timestamp::now());
-    let issued = auth::issue_github_token(root, &user, grant, life, &poll.workspace, by_login)?;
+    // GitHub gave the code's token once, so a poll sent again would find the sign-in gone: not busy, ended.
+    let admitted = admit(root, &sign_in, github, &api, access, &poll.workspace, None).map_err(|e| match e {
+        Error::Busy(why) => Error::Remote(why),
+        e => e,
+    });
+    let Admitted { user, grant, via, by_login, unknown, .. } = admitted?;
+    let life = sign_in.lifetime(Timestamp::now(), &user.provider);
+    let issued = auth::issue_sign_in_token(root, &user, grant, life, &poll.workspace, by_login)?;
     let token = &issued.token;
     tracing::info!(
         target: "bd::serve",
         login = %user.login,
-        id = user.id,
+        subject = %user.subject,
         actor = %token.actor,
         token = %token.name,
         role = token.role.as_str(),
@@ -1120,7 +1349,7 @@ pub fn poll(root: &Path, poll: &SignInPoll) -> Result<SignInAnswer> {
 /// An account the rules let into a workspace, and what they grant it there.
 #[derive(Clone, Debug)]
 pub struct Admitted {
-    pub user: GithubUser,
+    pub user: Identity,
     pub grant: Grant,
     /// What let it in (`GitHub user alice`, `member of acme`).
     pub via: String,
@@ -1128,24 +1357,75 @@ pub struct Admitted {
     pub by_login: bool,
     /// Memberships GitHub would not tell, for the log.
     pub unknown: Vec<String>,
+    /// Its email, if its OIDC provider verified it: shown on the consent
+    /// page, never kept.
+    pub email: Option<String>,
 }
 
-/// What the rules let the account whose GitHub token `access` is do in
-/// `workspace`, asking GitHub with that token; `Error::Unauthorized` (said
-/// to the person signing in) if they do not let it in.
-fn admit(github: &Github, api: &Api, access: &str, workspace: &str) -> Result<Admitted> {
+/// An account notification `provider` posted (`body`, at
+/// `<issuer>/oauth/<provider>/events`): an account that revoked its consent
+/// has its sign-ins from before ended, and a deleted one is forgotten. A
+/// provider without `account_events` takes none (`NotFound`).
+pub fn account_event(root: &Path, provider: &str, body: &[u8]) -> Result<()> {
+    let sign_in = load(root)?;
+    let oidc = sign_in.as_ref().and_then(|s| s.oidc(provider)).filter(|o| !o.account_events.is_empty());
+    let Some(oidc) = oidc else { return Err(Error::not_found("provider taking account notifications", provider)) };
+    let md = oidc.metadata()?;
+    let event = oidc.account_event(&md, body)?;
+    let subject = event.subject.as_str();
+    match &event.kind {
+        crate::oidc::AccountChange::ConsentRevoked => {
+            let revoked = auth::end_sign_ins_before(root, &oidc.issuer, subject, event.at)?;
+            tracing::info!(target: "bd::serve", %provider, %subject, revoked = revoked.len(), "an account revoked its consent: its sign-ins ended");
+        }
+        crate::oidc::AccountChange::Deleted => {
+            let known = auth::forget_account(root, &oidc.issuer, subject)?;
+            tracing::info!(target: "bd::serve", %provider, %subject, known, "an account was deleted at its provider: forgotten");
+        }
+        crate::oidc::AccountChange::Other(kind) => {
+            tracing::debug!(target: "bd::serve", %provider, %subject, %kind, "an account notification needs nothing done");
+        }
+    }
+    Ok(())
+}
+
+/// What the rules, or the authorizer, let the account whose GitHub token
+/// `access` is do in `workspace` (for OAuth `client`, if any), asking GitHub
+/// with that token; `Error::Unauthorized` (said to the person signing in) if
+/// they do not let it in, `Error::Busy` if the authorizer could not say.
+#[allow(clippy::too_many_arguments)]
+fn admit(
+    root: &Path,
+    sign_in: &SignIn,
+    github: &Github,
+    api: &Api,
+    access: &str,
+    workspace: &str,
+    client: Option<&str>,
+) -> Result<Admitted> {
     let (user, created) = account(api, access)?;
     let age = created.map(|at| Duration::from_millis(Timestamp::now().since(at).max(0) as u64));
-    if github.deny.contains(&user.id) {
-        tracing::info!(target: "bd::serve", login = %user.login, id = user.id, "GitHub sign-in refused: the account is denied");
+    if github_id(&user).is_some_and(|id| github.deny.contains(&id)) {
+        tracing::info!(target: "bd::serve", login = %user.login, subject = %user.subject, "GitHub sign-in refused: the account is denied");
         return Err(Error::Unauthorized(format!("GitHub user {} may not sign in to this bd server", user.login)));
+    }
+    if let Some(authorizer) = &sign_in.authorizer {
+        let request = crate::authorizer::request("sign_in", workspace, &user, created, client, None, None);
+        return ask(root, authorizer, &request).map(|(grant, via)| Admitted {
+            user,
+            grant,
+            via,
+            by_login: true,
+            unknown: Vec::new(),
+            email: None,
+        });
     }
     let mut asked = Asked { api, token: access, login: &user.login, seen: HashMap::new() };
     let mut unknown = Vec::new();
     let (grant, via, by_login) = match decide(github, &user.login, age, workspace, &mut asked, &mut unknown)? {
         Decision::In { grant, via, by_login } => (grant, via, by_login),
         Decision::TooNew(min) => {
-            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, %workspace, ?age, "GitHub sign-in refused: the account is too new");
+            tracing::info!(target: "bd::serve", login = %user.login, subject = %user.subject, %workspace, ?age, "GitHub sign-in refused: the account is too new");
             return Err(Error::Unauthorized(format!(
                 "GitHub user {} may not sign in to this bd server yet: its GitHub account must be at least {} old",
                 user.login,
@@ -1153,7 +1433,7 @@ fn admit(github: &Github, api: &Api, access: &str, workspace: &str) -> Result<Ad
             )));
         }
         Decision::Elsewhere(workspaces) => {
-            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, %workspace, ?unknown, "GitHub sign-in refused: workspace not allowed");
+            tracing::info!(target: "bd::serve", login = %user.login, subject = %user.subject, %workspace, ?unknown, "GitHub sign-in refused: workspace not allowed");
             return Err(Error::Unauthorized(format!(
                 "GitHub user {} may sign in to this bd server, but not use workspace {} (only {})",
                 user.login,
@@ -1162,14 +1442,56 @@ fn admit(github: &Github, api: &Api, access: &str, workspace: &str) -> Result<Ad
             )));
         }
         Decision::Out => {
-            tracing::info!(target: "bd::serve", login = %user.login, id = user.id, ?unknown, "GitHub sign-in refused: no rule lets the account in");
+            tracing::info!(target: "bd::serve", login = %user.login, subject = %user.subject, ?unknown, "GitHub sign-in refused: no rule lets the account in");
             return Err(Error::Unauthorized(format!(
                 "GitHub user {} may not sign in to this bd server: no rule of its auth.toml lets the account in",
                 user.login
             )));
         }
     };
-    Ok(Admitted { user, grant, via, by_login, unknown })
+    Ok(Admitted { user, grant, via, by_login, unknown, email: None })
+}
+
+/// What `authorizer` grants the account `request` is about, or why not:
+/// `Unauthorized` (for the person) when it refuses, `Busy` when it cannot
+/// say. Its reasons go to the log only.
+fn ask(
+    root: &Path,
+    authorizer: &crate::authorizer::Authorizer,
+    request: &crate::authorizer::Request<'_>,
+) -> Result<(Grant, String)> {
+    let (provider, login, subject, workspace) = (request.provider, request.login, &request.subject, request.workspace);
+    match authorizer.ask(root, request) {
+        // The authorizer may match logins, so the login is held to its own account as a rule's would be (by_login).
+        crate::authorizer::Outcome::Allow { grant, via } => Ok((grant, via)),
+        crate::authorizer::Outcome::Deny { reason } => {
+            tracing::info!(target: "bd::serve", %provider, %login, %subject, %workspace, %reason, "sign-in refused by the authorizer");
+            Err(crate::authorizer::refused(&auth::who(provider, login), workspace))
+        }
+        crate::authorizer::Outcome::Unavailable { why } => {
+            tracing::warn!(target: "bd::serve", %provider, %login, %subject, %workspace, %why, "sign-in failed: the authorizer did not decide");
+            Err(crate::authorizer::unavailable())
+        }
+    }
+}
+
+/// What the authorizer lets the account an OIDC provider vouched for
+/// (`claims`, verified) do in `workspace`, for OAuth `client` if any.
+pub fn admit_oidc(
+    root: &Path,
+    sign_in: &SignIn,
+    oidc: &crate::oidc::Oidc,
+    claims: &crate::oidc::Claims,
+    workspace: &str,
+    client: Option<&str>,
+) -> Result<Admitted> {
+    let user = oidc.identity(claims);
+    let Some(authorizer) = &sign_in.authorizer else {
+        return Err(Error::Unauthorized("this bd server has no authorizer for its OIDC providers".into()));
+    };
+    let request = crate::authorizer::request("sign_in", workspace, &user, None, client, None, Some(claims));
+    let (grant, via) = ask(root, authorizer, &request)?;
+    Ok(Admitted { user, grant, via, by_login: true, unknown: Vec::new(), email: claims.email.clone() })
 }
 
 /// GitHub's page where a person signs in for the web flow, coming back to
@@ -1193,7 +1515,16 @@ pub fn web_sign_in_url(github: &Github, callback: &str, state: &str, challenge: 
 /// back to `callback`; `verifier` is its PKCE verifier), and see what the
 /// rules let its account do in `workspace` ([`admit`]). The GitHub token
 /// serves for this only: it is never stored, logged or sent on.
-pub fn web_sign_in(github: &Github, code: &str, callback: &str, verifier: &str, workspace: &str) -> Result<Admitted> {
+pub fn web_sign_in(
+    root: &Path,
+    sign_in: &SignIn,
+    code: &str,
+    callback: &str,
+    verifier: &str,
+    workspace: &str,
+    client: &str,
+) -> Result<Admitted> {
+    let github = github_of(sign_in)?;
     let Some(secret) = &github.client_secret else {
         return Err(Error::Remote("this bd server has no GitHub client secret for web sign-in".into()));
     };
@@ -1216,7 +1547,7 @@ pub fn web_sign_in(github: &Github, code: &str, callback: &str, verifier: &str, 
     let Some(access) = body["access_token"].as_str().filter(|t| !t.is_empty()) else {
         return Err(refused(github, "finish a sign-in", status, &body));
     };
-    admit(github, &api, access, workspace)
+    admit(root, sign_in, github, &api, access, workspace, Some(client))
 }
 
 /// What the client gets of a token issued or refreshed.
@@ -1253,12 +1584,12 @@ fn answer_of(issued: auth::Issued, login: String, via: String) -> Issued {
 /// tokens issued to it, as `/v2/auth/refresh` only refreshes those issued
 /// to no client.
 pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>) -> Result<Issued> {
-    let refused = |why: String| Error::Unauthorized(format!("{why}; sign in again: `bd remote login --github`"));
-    let github = enabled(root)?;
+    let refused = |why: String| Error::Unauthorized(format!("{why}; sign in again: `bd remote login`"));
+    let sign_in = enabled(root)?;
     let Some((token, current)) = auth::find_refresh(root, secret)? else {
         return Err(refused("this bd server does not know the sign-in (it was revoked, or has ended)".into()));
     };
-    let (Some(user), Some(state)) = (token.github.clone(), token.refresh.clone()) else {
+    let (Some(user), Some(state)) = (token.identity.clone(), token.refresh.clone()) else {
         return Err(refused("not a sign-in's refresh token".into()));
     };
     if token.client.as_deref() != client {
@@ -1271,7 +1602,7 @@ pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>
     }
     let revoke = |why: &str| -> Result<()> {
         auth::revoke_by_id(root, &token.id)?;
-        tracing::warn!(target: "bd::serve", login = %user.login, id = user.id, token = %token.name, "GitHub sign-in revoked at refresh: {why}");
+        tracing::warn!(target: "bd::serve", provider = %user.provider, login = %user.login, subject = %user.subject, token = %token.name, "sign-in revoked at refresh: {why}");
         Ok(())
     };
     if !current && !state.retries_last(secret, request_id) {
@@ -1281,63 +1612,132 @@ pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>
                 .into(),
         ));
     }
-    let Some(key) = &github.app else {
-        return Err(refused(
-            "this bd server no longer refreshes tokens (its auth.toml has no github.private_key)".into(),
-        ));
-    };
+    if !sign_in.provides(&user) {
+        tracing::warn!(target: "bd::serve", provider = %user.provider, issuer = %user.issuer, login = %user.login, "sign-in not refreshed: its provider is no longer configured");
+        return Err(refused(format!("this bd server no longer signs people in with {}", user.provider)));
+    }
+    if !sign_in.refreshes(&user.provider) {
+        return Err(refused("this bd server no longer refreshes these sign-ins".into()));
+    }
     let now = Timestamp::now();
     let signed_in = Timestamp::parse_rfc3339(&token.created_at)?;
-    let limit = signed_in.plus(github.refresh_limit);
-    if now >= limit.min(state.refreshed_at.plus(github.refresh_idle)) {
+    let limit = signed_in.plus(sign_in.refresh_limit);
+    if now >= limit.min(state.refreshed_at.plus(sign_in.refresh_idle)) {
         let why = match now >= limit {
             true => format!("the sign-in of {signed_in} is older than the server lets it be refreshed"),
             false => format!("the sign-in was last refreshed at {}, too long ago", state.refreshed_at),
         };
         return Err(refused(why));
     }
-    if github.deny.contains(&user.id) {
-        revoke("the account is denied")?;
-        return Err(refused(format!("GitHub user {} may not use this bd server", user.login)));
-    }
-    let api = Api::new(&github);
-    let app = AppApi { api: &api, github: &github, key };
-    let Some((now_user, created)) = app.user(user.id)? else {
-        revoke("the GitHub account no longer exists")?;
-        return Err(refused(format!("GitHub has no account {} any more", user.login)));
-    };
-    if now_user.url != user.url {
-        return Err(refused(format!("GitHub user {} signed in at another GitHub than the server's now", user.login)));
-    }
-    let age = created.map(|at| Duration::from_millis(now.since(at).max(0) as u64));
-    let mut asked = Installed { app: &app, login: &now_user.login, seen: HashMap::new() };
-    let mut unknown = Vec::new();
-    let decision = decide(&github, &now_user.login, age, &state.workspace, &mut asked, &mut unknown)?;
-    let (grant, via, by_login) = match decision {
-        Decision::In { grant, via, by_login } => (grant, via, by_login),
-        out => {
-            let why = match out {
-                Decision::TooNew(_) => "its GitHub account is too new for the rules".to_string(),
-                Decision::Elsewhere(_) => format!("the rules no longer let it into workspace {}", state.workspace),
-                _ => "no rule of the server's auth.toml lets the account in any more".to_string(),
+    // A GitHub account is never one denied, and, with the GitHub App, is taken as GitHub names it now. Without
+    // the App (and for other providers), the authorizer decides on the identity of the sign-in.
+    let (mut now_user, mut created) = (user.clone(), None);
+    if user.provider == "github" {
+        let github =
+            github_of(&sign_in).map_err(|_| refused("this bd server no longer signs people in with GitHub".into()))?;
+        if github_id(&user).is_some_and(|id| github.deny.contains(&id)) {
+            revoke("the account is denied")?;
+            return Err(refused(format!("{} may not use this bd server", user.who())));
+        }
+        if let Some(key) = &github.app {
+            let api = Api::new(github);
+            let app = AppApi { api: &api, github, key };
+            let Some(id) = github_id(&user) else {
+                return Err(refused("not a GitHub sign-in".into()));
             };
-            // Memberships GitHub would not tell may come back: the sign-in stays, and only this refresh fails.
-            if !unknown.is_empty() {
-                tracing::warn!(target: "bd::serve", login = %now_user.login, ?unknown, "GitHub sign-in not refreshed: memberships unknown");
-                return Err(Error::Remote(format!(
-                    "GitHub would not tell this bd server the memberships of GitHub user {} ({}); try again later",
-                    now_user.login,
-                    unknown.join("; ")
-                )));
+            let Some((named, made)) = app.user(id)? else {
+                revoke("the GitHub account no longer exists")?;
+                return Err(refused(format!("GitHub has no account {} any more", user.login)));
+            };
+            if named.issuer != user.issuer {
+                return Err(refused(format!("{} signed in at another GitHub than the server's now", user.who())));
             }
-            revoke(&why)?;
-            return Err(refused(format!("GitHub user {}: {why}", now_user.login)));
+            (now_user, created) = (named, made);
+        }
+    }
+    let mut unknown = Vec::new();
+    let (grant, via, by_login, decided) = match &sign_in.authorizer {
+        Some(authorizer) => {
+            let current = crate::authorizer::Current {
+                role: token.role,
+                kind: token.kind,
+                max_claims: token.max_claims,
+                signed_in_at: signed_in.to_string(),
+            };
+            let request = crate::authorizer::request(
+                "refresh",
+                &state.workspace,
+                &now_user,
+                created,
+                token.client.as_deref(),
+                Some(current),
+                None,
+            );
+            match authorizer.ask(root, &request) {
+                crate::authorizer::Outcome::Allow { grant, via } => (grant, via, true, true),
+                crate::authorizer::Outcome::Deny { reason } => {
+                    revoke(&format!("the authorizer refused it: {reason}"))?;
+                    return Err(refused(format!(
+                        "{} may no longer use workspace {} on this bd server",
+                        now_user.who(),
+                        state.workspace
+                    )));
+                }
+                // The sign-in stays: within the grace, this refresh keeps its access; past it, only this refresh fails.
+                crate::authorizer::Outcome::Unavailable { why } => {
+                    // Since the last decision, not the last refresh: refreshes kept meanwhile do not extend it.
+                    let within = authorizer.refresh_grace.is_some_and(|grace| now < state.decided_at.plus(grace));
+                    if !within {
+                        tracing::warn!(target: "bd::serve", login = %now_user.login, %why, "sign-in not refreshed: the authorizer did not decide");
+                        return Err(Error::Remote(
+                            "this bd server could not check the account's access just now; try again later".into(),
+                        ));
+                    }
+                    tracing::warn!(target: "bd::serve", login = %now_user.login, %why, "sign-in refreshed with its last access: the authorizer did not decide");
+                    (authorizer.kept(&token), "the server's last decision".to_string(), true, false)
+                }
+            }
+        }
+        // [[github.allow]] rules, through the GitHub App, which refreshes() found.
+        None => {
+            let github = github_of(&sign_in)?;
+            let Some(key) = &github.app else {
+                return Err(refused("this bd server no longer refreshes these sign-ins".into()));
+            };
+            let api = Api::new(github);
+            let app = AppApi { api: &api, github, key };
+            let age = created.map(|at| Duration::from_millis(now.since(at).max(0) as u64));
+            let mut asked = Installed { app: &app, login: &now_user.login, seen: HashMap::new() };
+            match decide(github, &now_user.login, age, &state.workspace, &mut asked, &mut unknown)? {
+                Decision::In { grant, via, by_login } => (grant, via, by_login, true),
+                out => {
+                    let why = match out {
+                        Decision::TooNew(_) => "its GitHub account is too new for the rules".to_string(),
+                        Decision::Elsewhere(_) => {
+                            format!("the rules no longer let it into workspace {}", state.workspace)
+                        }
+                        _ => "no rule of the server's auth.toml lets the account in any more".to_string(),
+                    };
+                    // Memberships GitHub would not tell may come back: the sign-in stays, and only this refresh fails.
+                    if !unknown.is_empty() {
+                        tracing::warn!(target: "bd::serve", login = %now_user.login, ?unknown, "GitHub sign-in not refreshed: memberships unknown");
+                        return Err(Error::Remote(format!(
+                            "GitHub would not tell this bd server the memberships of GitHub user {} ({}); try again later",
+                            now_user.login,
+                            unknown.join("; ")
+                        )));
+                    }
+                    revoke(&why)?;
+                    return Err(refused(format!("GitHub user {}: {why}", now_user.login)));
+                }
+            }
         }
     };
-    let until = limit.min(now.plus(github.refresh_idle));
-    let expires_at = now.plus(github.token_ttl);
+    let until = limit.min(now.plus(sign_in.refresh_idle));
+    let expires_at = now.plus(sign_in.token_ttl);
     let last = auth::LastRefresh { spent: auth::hash(secret), request: auth::hash(request_id) };
-    let rotated = auth::rotate(root, &token.id, &state.sha256, last, &now_user, grant, by_login, expires_at, until)?;
+    let rotated =
+        auth::rotate(root, &token.id, &state.sha256, last, &now_user, grant, by_login, decided, expires_at, until)?;
     let Some(issued) = rotated else {
         revoke("its refresh token was used twice")?;
         return Err(refused(
@@ -1348,27 +1748,43 @@ pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>
     tracing::info!(
         target: "bd::serve",
         login = %now_user.login,
-        id = now_user.id,
+        subject = %now_user.subject,
         actor = %issued.token.actor,
         token = %issued.token.name,
         role = issued.token.role.as_str(),
         kind = issued.token.kind.as_str(),
+        provider = %now_user.provider,
         %via,
         ?unknown,
-        "GitHub sign-in refreshed"
+        "sign-in refreshed"
     );
     Ok(answer_of(issued, now_user.login, via))
 }
 
+/// The identity of GitHub account `id`, now `login`, at the GitHub at `url`.
+fn github_identity(url: &str, login: &str, id: u64) -> Identity {
+    Identity {
+        provider: "github".into(),
+        issuer: url.to_ascii_lowercase(),
+        subject: id.to_string(),
+        login: login.to_string(),
+    }
+}
+
+/// The GitHub user id of a GitHub sign-in's identity.
+fn github_id(user: &Identity) -> Option<u64> {
+    (user.provider == "github").then(|| user.subject.parse().ok()).flatten()
+}
+
 /// The account a GitHub token belongs to, at the GitHub `api` talks to,
 /// and when GitHub created it (if it says).
-fn account(api: &Api, token: &str) -> Result<(GithubUser, Option<Timestamp>)> {
+fn account(api: &Api, token: &str) -> Result<(Identity, Option<Timestamp>)> {
     let (status, body) = api.get(token, "/user")?;
     let login = body["login"].as_str().filter(|l| github_name(l));
     match (status, login, body["id"].as_u64()) {
         (200, Some(login), Some(id)) => {
             let created = body["created_at"].as_str().and_then(|at| Timestamp::parse_rfc3339(at).ok());
-            Ok((GithubUser { url: api.url.to_ascii_lowercase(), login: login.to_string(), id }, created))
+            Ok((github_identity(&api.url, login, id), created))
         }
         _ => Err(Error::Remote(format!("GitHub answered {status}{} for the account that signed in", message(&body)))),
     }
@@ -1433,36 +1849,41 @@ fn plain_url(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_graphic())
 }
 
-/// `bd remote login --github`: sign in at GitHub through `remote`'s server
+/// `bd remote login --provider github`: sign in at GitHub through `remote`'s server
 /// (`server`, its URL), for `workspace`. Shows the one-time code on stderr
 /// and waits until it was entered, or expired; the token issued.
-pub fn sign_in(remote: &Remote, workspace: &str, server: &str) -> Result<Issued> {
+pub fn sign_in(remote: &Remote, workspace: &str, server: &str, provider: &str) -> Result<Issued> {
+    let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
+    if provider.is_empty() || provider.len() > 32 || !provider.chars().all(plain) {
+        return Err(Error::invalid(format!("--provider {provider:?} is not a provider's name, such as github")));
+    }
     let start = SignInStart { workspace: workspace.to_string() };
-    let code: SignInCode = remote.auth_request("github/device", &start, Duration::ZERO)?;
+    let code: SignInCode = remote.auth_request(&format!("{provider}/device"), &start, Duration::ZERO)?;
+    let label = crate::agents::show::printable(&code.provider);
     if !plain_code(&code.user_code) || !plain_url(&code.verification_uri) || code.device_code.is_empty() {
-        return Err(Error::Remote(format!("{server}: unexpected sign-in answer: not a GitHub code and address")));
+        return Err(Error::Remote(format!("{server}: unexpected sign-in answer: not a one-time code and address")));
     }
     let lasts = Duration::from_secs(code.expires_in.clamp(1, MAX_CODE_LIFE));
     io::errln(format!("! One-time code: {}", code.user_code));
     io::errln(format!(
-        "  Enter it at {} within {} minutes to sign in to {server} with GitHub",
+        "  Enter it at {} within {} minutes to sign in to {server} with {label}",
         code.verification_uri,
         lasts.as_secs().div_ceil(60)
     ));
-    io::errln("  Waiting for GitHub (Ctrl-C cancels)...");
+    io::errln(format!("  Waiting for {label} (Ctrl-C cancels)..."));
     let deadline = Instant::now() + lasts;
     // GitHub's least time between polls, which only grows; past the deadline, the code is gone anyway.
     let mut interval = Duration::from_secs(code.interval.clamp(1, MAX_CODE_LIFE));
     let poll = SignInPoll { device_code: code.device_code, workspace: workspace.to_string() };
     loop {
         if Instant::now() + interval > deadline {
-            return Err(Error::Unauthorized(
-                "the one-time code expired before it was entered at GitHub: run `bd remote login --github` again"
-                    .into(),
-            ));
+            return Err(Error::Unauthorized(format!(
+                "the one-time code expired before it was entered at {label}: run `bd remote login --provider \
+                 {provider}` again"
+            )));
         }
         std::thread::sleep(interval);
-        match remote.auth_request("github/token", &poll, interval)? {
+        match remote.auth_request(&format!("{provider}/token"), &poll, interval)? {
             SignInAnswer::Pending => {}
             SignInAnswer::SlowDown { interval: asked } => {
                 let asked = Duration::from_secs(asked.min(MAX_CODE_LIFE));
@@ -1477,8 +1898,12 @@ pub fn sign_in(remote: &Remote, workspace: &str, server: &str) -> Result<Issued>
 mod tests {
     use super::*;
 
-    fn github(text: &str) -> Github {
+    fn sign_in(text: &str) -> SignIn {
         parse(text).unwrap().unwrap()
+    }
+
+    fn github(text: &str) -> Github {
+        sign_in(text).github.unwrap()
     }
 
     fn error(text: &str) -> String {
@@ -1491,7 +1916,6 @@ mod tests {
         let g = github("[github]\nclient_id = \" Ov23liX \"\n[[github.allow]]\nusers = [\"alice\"]\n");
         assert_eq!(g.client_id, "Ov23liX");
         assert_eq!((g.url.as_str(), g.api_url.as_str()), ("https://github.com", "https://api.github.com"));
-        assert_eq!(g.token_ttl, DEFAULT_TTL);
         let rule = &g.rules[0];
         assert_eq!(
             rule.grant,
@@ -1499,13 +1923,14 @@ mod tests {
         );
         assert!(!g.reads_orgs(), "users alone need no scope");
 
-        let g = github(
-            "[github]\nclient_id = \"x\"\nurl = \"https://ghe.example.com/\"\ntoken_ttl = \"12h\"\n\
+        let all = sign_in(
+            "[sign_in]\ntoken_ttl = \"12h\"\n[github]\nclient_id = \"x\"\nurl = \"https://ghe.example.com/\"\n\
              [[github.allow]]\nteams = [\"acme/bd-admins\"]\nrole = \"admin\"\nkind = \"human\"\n\
              workspaces = [\"proj\", \"other\"]\n[[github.allow]]\norgs = [\"acme\"]\nrole = \"read\"\n",
         );
+        assert_eq!(all.token_ttl, Duration::from_secs(12 * 3600));
+        let g = all.github.unwrap();
         assert_eq!(g.api_url, "https://ghe.example.com/api/v3", "GitHub Enterprise Server's API");
-        assert_eq!(g.token_ttl, Duration::from_secs(12 * 3600));
         assert_eq!(g.rules[0].teams, [("acme".to_string(), "bd-admins".to_string())]);
         assert_eq!(g.rules[0].grant.workspaces, ["other", "proj"]);
         assert_eq!((g.rules[0].grant.role, g.rules[0].grant.kind), (Role::Admin, Kind::Human));
@@ -1548,9 +1973,10 @@ mod tests {
         let o = parse(&format!("{github}[oauth]\nloopback_redirects = true\n")).unwrap().unwrap().oauth.unwrap();
         assert!(o.redirect_hosts.is_empty() && o.loopback_redirects);
 
-        assert!(error("[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n").contains("needs [github]"));
-        let no_key = "[github]\nclient_id = \"x\"\n[[github.allow]]\nusers = [\"a\"]\n";
-        assert!(error(&format!("{no_key}[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n")).contains("private_key"));
+        assert!(error("[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n").contains("need a provider"));
+        let no_key = "[github]\nclient_id = \"x\"\nclient_secret_file = \"s\"\n[[github.allow]]\nusers = [\"a\"]\n";
+        let e = error(&format!("{no_key}[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n"));
+        assert!(e.contains("needs refreshed tokens") && e.contains("private_key"), "{e}");
         assert!(error(&format!("{github}[oauth]\n")).contains("allows no redirect URIs"));
         for bad in
             ["localhost", "127.0.0.1", "*.example.com", "chatgpt.com:443", "-a.com", "a..com", "https://a.com", ""]
@@ -1560,11 +1986,11 @@ mod tests {
         }
         assert!(error(&format!("{github}[oauth]\nissuer = \"https://x\"\n")).contains("unknown field"));
         let hosts = "[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n";
-        assert!(error(&format!("{no_secret}{hosts}")).contains("needs github.client_secret_file"));
+        assert!(error(&format!("{no_secret}{hosts}")).contains("github.client_secret_file"));
         assert!(error(github).contains("serves [oauth]'s web sign-in only"));
         let empty = no_secret.replace("private_key", "client_secret_file = \"\"\nprivate_key");
         assert!(error(&format!("{empty}{hosts}")).contains("client_secret_file is empty"));
-        assert_eq!(parse(&format!("{github}{hosts}")).unwrap().unwrap().client_secret_file, Some("secret".into()));
+        assert_eq!(sign_in(&format!("{github}{hosts}")).github.unwrap().client_secret_file, Some("secret".into()));
     }
 
     #[test]
@@ -1614,26 +2040,71 @@ mod tests {
     const TEST_KEY: &str = include_str!("../tests/fixtures/github-app.pem");
 
     #[test]
+    fn auth_toml_hands_decisions_to_an_authorizer() {
+        let base = "[github]\nclient_id = \"Iv1.x\"\n";
+        let authorizer = "\n[authorizer]\ncommand = [\"bin/authorize\"]\n";
+        let all = sign_in(&format!("{base}{authorizer}"));
+        assert!(all.github.as_ref().unwrap().rules.is_empty());
+        assert!(all.refreshes("github"), "the authorizer decides again at refreshes: no GitHub App needed");
+        let a = all.authorizer.expect("an authorizer");
+        assert_eq!(a.caps.max_role, Role::Write);
+        assert_eq!(
+            sign_in(&format!("{base}{authorizer}refresh_grace = \"4h\"\n")).authorizer.unwrap().refresh_grace,
+            Some(Duration::from_secs(4 * 3600))
+        );
+        for (text, says) in [
+            (format!("{base}{authorizer}\n[[github.allow]]\nusers = [\"a\"]\n"), "keep one of them"),
+            (authorizer.to_string(), "need a provider"),
+            (format!("{base}{authorizer}refresh_grace = \"10m\"\n"), "at least sign_in.token_ttl"),
+            (format!("{base}{authorizer}refresh_grace = \"8d\"\n"), "at most sign_in.refresh_idle"),
+            (format!("{base}\n[authorizer]\nurl = \"http://authz.example\"\n"), "not an https URL"),
+        ] {
+            let e = error(&text);
+            assert!(e.contains(says), "{text}: {e}");
+        }
+
+        // load() reads an HTTPS authorizer's token, relative to the root, and never shows it.
+        let dir = tempfile::tempdir().unwrap();
+        let https = "\n[authorizer]\nurl = \"https://authz.example/bd\"\ntoken_file = \"authz-token\"\n";
+        std::fs::write(dir.path().join(FILE), format!("{base}{https}")).unwrap();
+        let e = load(dir.path()).unwrap_err().to_string();
+        assert!(e.contains("authz-token"), "{e}");
+        std::fs::write(dir.path().join("authz-token"), "s3cret\n").unwrap();
+        let all = load(dir.path()).unwrap().unwrap();
+        let debug = format!("{:?}", all.authorizer.unwrap());
+        assert!(!debug.contains("s3cret"), "{debug}");
+    }
+
+    #[test]
     fn auth_toml_sets_up_refreshes_with_a_github_app() {
         let base = "[github]\nclient_id = \"Iv1.x\"\n";
         let rule = "\n[[github.allow]]\nusers = [\"a\"]\n";
-        let g = github(&format!("{base}{rule}"));
-        assert_eq!((g.token_ttl, g.private_key.as_ref(), g.app.as_ref()), (DEFAULT_TTL, None, None));
-        assert!(g.lifetime(Timestamp::now()).refresh.is_none(), "no App, no refresh");
-        let g =
-            github(&format!("{base}private_key = \"app.pem\"\nrefresh_limit = \"14d\"\nrefresh_idle = \"1d\"{rule}"));
-        assert_eq!(g.private_key.as_deref(), Some(Path::new("app.pem")));
-        assert_eq!((g.refresh_limit, g.refresh_idle), (Duration::from_secs(14 * 86400), Duration::from_secs(86400)));
+        let all = sign_in(&format!("{base}{rule}"));
+        let g = all.github.as_ref().unwrap();
+        assert_eq!((all.token_ttl, g.private_key.as_ref(), g.app.as_ref()), (DEFAULT_TTL, None, None));
+        assert!(all.lifetime(Timestamp::now(), "github").refresh.is_none(), "rules without the App: no refresh");
+        let all = sign_in(&format!(
+            "[sign_in]\nrefresh_limit = \"14d\"\nrefresh_idle = \"1d\"\n{base}private_key = \"app.pem\"{rule}"
+        ));
+        assert_eq!(all.github.as_ref().unwrap().private_key.as_deref(), Some(Path::new("app.pem")));
+        assert_eq!(
+            (all.refresh_limit, all.refresh_idle),
+            (Duration::from_secs(14 * 86400), Duration::from_secs(86400))
+        );
+        assert!(all.refreshes("github") && !all.refreshes("google"), "the App applies GitHub's rules only");
         for (settings, says) in [
-            ("refresh_limit = \"14d\"", "need github.private_key"),
-            ("private_key = \"\"", "private_key is empty"),
-            ("private_key = \"k\"\ntoken_ttl = \"10d\"", "at most the next"),
-            ("private_key = \"k\"\nrefresh_idle = \"60d\"", "at most the next"),
-            ("private_key = \"k\"\nrefresh_limit = \"400d\"", "use 5m to 366d"),
+            ("[sign_in]\ntoken_ttl = \"10d\"\n", "at most the next"),
+            ("[sign_in]\nrefresh_idle = \"60d\"\n", "at most the next"),
+            ("[sign_in]\nrefresh_limit = \"400d\"\n", "use 5m to 366d"),
+            ("[sign_in]\nttl = \"1h\"\n", "unknown field"),
         ] {
-            let e = error(&format!("{base}{settings}{rule}"));
+            let e = error(&format!("{settings}{base}{rule}"));
             assert!(e.contains(says), "{settings}: {e}");
         }
+        assert!(error(&format!("{base}private_key = \"\"{rule}")).contains("private_key is empty"));
+        let e = error(&format!("{base}token_ttl = \"1h\"{rule}"));
+        assert!(e.contains("unknown field") && e.contains("are in [sign_in] now"), "{e}");
+        assert!(error("[sign_in]\ntoken_ttl = \"1h\"\n").contains("need a provider"));
 
         // load() reads the key, relative to the root.
         let dir = tempfile::tempdir().unwrap();
@@ -1643,11 +2114,11 @@ mod tests {
         std::fs::write(dir.path().join("app.pem"), "not a key").unwrap();
         assert!(load(dir.path()).unwrap_err().to_string().contains("no private key in the file"));
         std::fs::write(dir.path().join("app.pem"), TEST_KEY).unwrap();
-        let g = load(dir.path()).unwrap().unwrap();
-        let key = g.app.as_ref().expect("loaded");
+        let all = load(dir.path()).unwrap().unwrap();
+        let key = all.github.as_ref().unwrap().app.as_ref().expect("loaded");
         assert!(!format!("{key:?}").contains("BEGIN"), "never the key");
         let now = Timestamp::now();
-        let life = g.lifetime(now).refresh.unwrap();
+        let life = all.lifetime(now, "github").refresh.unwrap();
         assert_eq!(life, (now.plus(DEFAULT_REFRESH_LIMIT), DEFAULT_REFRESH_IDLE));
 
         // ... and the client secret.
@@ -1658,9 +2129,9 @@ mod tests {
         std::fs::write(dir.path().join("secret"), "two words\n").unwrap();
         assert!(load(dir.path()).unwrap_err().to_string().contains("not a client secret"));
         std::fs::write(dir.path().join("secret"), " s3cret \n").unwrap();
-        let g = load(dir.path()).unwrap().unwrap();
-        assert_eq!(g.client_secret.as_ref().map(|s| s.0.as_str()), Some("s3cret"));
-        assert!(!format!("{g:?}").contains("s3cret"), "never the secret");
+        let all = load(dir.path()).unwrap().unwrap();
+        assert_eq!(all.github.as_ref().unwrap().client_secret.as_ref().map(|s| s.0.as_str()), Some("s3cret"));
+        assert!(!format!("{all:?}").contains("s3cret"), "never the secret");
     }
 
     #[test]
@@ -1730,9 +2201,9 @@ mod tests {
             (with("url = \"http://github.com\"", "users = [\"a\"]"), "must use https"),
             (with("api_url = \"https://u:p@h\"", "users = [\"a\"]"), "no credentials"),
             (with("url = \"github.com\"", "users = [\"a\"]"), "no scheme"),
-            (with("token_ttl = \"1m\"", "users = [\"a\"]"), "use 5m to 366d"),
-            (with("token_ttl = \"400d\"", "users = [\"a\"]"), "use 5m to 366d"),
-            (with("token_ttl = \"soon\"", "users = [\"a\"]"), "token_ttl"),
+            (format!("[sign_in]\ntoken_ttl = \"1m\"\n{}", with("", "users = [\"a\"]")), "use 5m to 366d"),
+            (format!("[sign_in]\ntoken_ttl = \"400d\"\n{}", with("", "users = [\"a\"]")), "use 5m to 366d"),
+            (format!("[sign_in]\ntoken_ttl = \"soon\"\n{}", with("", "users = [\"a\"]")), "token_ttl"),
             (with("", "anyone = true\nmin_account_age = \"a while\""), "rule 1: min_account_age"),
             (with("", "anyone = true\nmax_claims = 0"), "max_claims must be at least 1"),
             (with("", "anyone = true\nmax_claims = -1"), "line 6: invalid value"),

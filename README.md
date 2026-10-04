@@ -12,7 +12,7 @@ coordination engine:
   concurrency guards
 - **Playbooks and gates** for repeatable multi-step work
 - **Remote server**: `bd serve` shares workspaces over HTTPS with access
-  tokens and GitHub sign-in
+  tokens and sign-in with GitHub or any OpenID Connect provider
 - **Agent assets**: skills and MCP definitions served per harness (Claude
   Code, Codex, Copilot CLI)
 
@@ -63,7 +63,7 @@ sharing its own, so each agent session acts as its own actor
 | [Concepts](docs/concepts.md) | statuses, dependency types, ready-work order, claims and leases, optimistic concurrency, events, memory, actors |
 | [Modes of operation](docs/modes.md) | local workspaces, remote workspaces, the embedded library |
 | [Playbooks and gates](docs/playbooks.md) | repeatable multi-step work, runs, human/timer/issue/GitHub gates |
-| [Remote server](docs/remote.md) | `bd serve`, access tokens, GitHub sign-in, background jobs and backups, clients, followers |
+| [Remote server](docs/remote.md) | `bd serve`, access tokens, sign-in with GitHub or OIDC, background jobs and backups, clients, followers |
 | [Agent skills and MCP definitions](docs/agents.md) | serving, pulling and approving agent assets; session-start hooks |
 | [MCP server](docs/mcp.md) | bd's tools over MCP: `bd mcp` (stdio) and `bd serve`'s `/w/<name>/mcp` (Streamable HTTP) setup, actors, tool catalog, results and errors (MCP `2026-07-28` and `2025-11-25`) |
 | [Command reference](docs/commands.md) | commands, global options, environment variables, configuration, exit codes |

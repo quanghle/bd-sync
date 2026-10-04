@@ -31,7 +31,8 @@ playbook run gets the same answer as a single command
   loopback behind a TLS-terminating proxy. Clients refuse plain `http://` to
   a non-loopback host unless `BD_INSECURE_HTTP=1`
   ([Server](remote.md#server)).
-- **Access tokens.** `<root>/tokens.json` holds token hashes only; each
+- **Access tokens.** `<root>/server.db` (SQLite, mode 0600) holds token
+  hashes only, with the accounts and OAuth clients; each
   secret is printed once, at creation. `bd serve token revoke` takes effect
   at once, with no restart.
 - **Roles and kinds.** A token's role (`read`, `write`, `admin`) limits the
@@ -63,26 +64,46 @@ playbook run gets the same answer as a single command
   directories bd creates 0700; keep them on another disk or ship them
   elsewhere ([Background jobs and backups](remote.md#background-jobs-and-backups)).
 
-## GitHub sign-in
+## Signing in
 
-Sign-in lets people get their own tokens, under rules in `<root>/auth.toml`
-([Signing in with GitHub](remote.md#signing-in-with-github)).
+Sign-in lets people get their own tokens, with GitHub or OpenID Connect
+providers that `<root>/auth.toml` names, under GitHub's rules or the
+admin's authorizer ([Signing in](remote.md#signing-in)).
+
+- bd proves who signed in itself, and binds each account to its actor by
+  its provider's issuer and its id there (a GitHub user id, an OIDC `sub`),
+  never by its login or email, which can change or pass to someone else.
+- OIDC ID tokens are checked strictly: RS256 or ES256 only (never `none`
+  or a shared secret), signed by a key of the provider's published set
+  fetched over https, from its issuer, for bd's client alone (`aud` exactly
+  its client ID, `azp` when present), not expired, and with the browser
+  sign-in's nonce. A browser sign-in's answer that names another issuer
+  (RFC 9207 `iss`), or lacks it where the provider says it sends it, is
+  refused before its code is used; each provider also has a callback of its
+  own. An email counts only if the provider verified it, and providers'
+  error codes reach messages and the log only when they are plain text. OIDC providers' client secrets are files under
+  the root, read by `bd serve` only.
+- At refreshes, OIDC providers are not asked again: the authorizer decides
+  on the account as it signed in, so removing someone at the provider takes
+  effect when the authorizer refuses them (or at `refresh_limit`).
 
 - The server runs GitHub's device flow with an OAuth or GitHub App client ID,
   no secret. The account's GitHub token reads its account and memberships
   during the sign-in and is never stored or logged.
-- Refreshes ask GitHub as the GitHub App, with installation tokens minted
-  from its private key (`private_key`): the one secret the server holds for
-  sign-in. Keep the key file mode 0600, readable by `bd serve` only; whoever
+- With GitHub's rules, refreshes ask GitHub as the GitHub App, with installation tokens minted
+  from its private key (`private_key`). Keep the key file, like every
+  sign-in secret (client secrets, the authorizer's token), mode 0600, readable by `bd serve` only; whoever
   has it can read what the App may (organization members). Give the App
   nothing but **Members** (read).
 - An account no rule lets in gets nothing. An `anyone = true` rule must be
   the last, and its tokens read by default, may write at most, and are
   always `agent` tokens. `min_account_age` keeps out accounts made on the
   spot; `deny` keeps out an account for good (also revoke its tokens).
-- Each GitHub account is bound to its actor for good, by user id, at its
-  first sign-in, so a renamed or re-registered login cannot pass for the
-  previous holder. Only `bd serve token revoke --github <login> --forget`
+- Each account is bound to its actor for good at its first sign-in, so a
+  renamed or re-registered login cannot pass for the previous holder.
+  Actors carry the provider's name (`github:alice`, `google:alice@acme.com`),
+  so no provider's users can take an admin-created actor or another
+  provider's. Only `bd serve token revoke --account <login> --forget`
   releases a binding.
 - Sign-in access tokens expire (`token_ttl`, default 1 hour), and each
   refresh applies the rules again, so someone who leaves an organization
@@ -90,26 +111,80 @@ Sign-in lets people get their own tokens, under rules in `<root>/auth.toml`
   and work once: a copy used after the original (or the original after a
   copy) revokes the sign-in. A sign-in is refreshed for at most
   `refresh_limit` (30 days), and not after `refresh_idle` (7 days) unused.
-  `tokens.json` keeps only hashes of both. `bd remote logout` and a
+  `server.db` keeps only hashes of both. `bd remote logout` and a
   replacing sign-in revoke them on the server; `bd serve token revoke` ends
   refreshes too.
 - Whoever started a sign-in gets its token: enter only codes shown by one's
-  own `bd remote login --github`.
+  own `bd remote login --provider <name>`.
 - Tokens saved by `bd remote login` serve every process of that user on that
   machine, agents included: a rule's `kind = "human"` lets those agents
   resolve human gates too.
+
+## What bd keeps about people
+
+bd keeps what it needs to tell who may call it, and no more: OIDC Core §17.1
+and the GDPR's data minimization (Art. 5(1)(c)) are the guide.
+
+- **`<root>/server.db`** (SQLite, mode 0600) holds, for each account that
+  signed in, its provider, issuer and subject (the provider's stable id:
+  OIDC Core §5.7), its actor, its latest login and when it was first and
+  last seen; for each token, the SHA-256 of its secrets, its actor, role,
+  workspaces and that account; and the OAuth clients that registered. It
+  never holds a token's secret, a provider's tokens or ID tokens, an ID
+  token's claims, a name, or an email.
+- **Logins are never emails.** A GitHub account's login is its public user
+  name. An OIDC account's is its provider's `preferred_username`, unless
+  that is an email, else a pseudonym of the account (`u-` and 12 hex digits
+  of a hash of its issuer and subject), so that no email becomes an actor:
+  actors are written into workspaces' histories (events, assignees,
+  comments), which keep them for good. The email an OIDC provider verified
+  is shown on the consent page and sent to the authorizer at sign-in, and
+  kept by neither bd nor its log.
+- **Retention.** A token is deleted a week after it ends (revoked, or
+  expired and no longer refreshed), at the server's next write. An account
+  stays until an admin releases it, so that a login given up and taken by
+  someone else never passes for its previous holder: that binding is a
+  security record, and its login and dates are all it holds. A registered
+  OAuth client never used a day after registering, or unused for 90 days,
+  is deleted at the next registration.
+- **Erasure.** `bd serve token revoke --account <login> --forget` deletes
+  the account and every token of it. Deleted rows are overwritten
+  (`PRAGMA secure_delete`) and the write-ahead log is emptied after the
+  erasure, so nothing of them stays in the database's files (if `bd serve`
+  is reading at that moment, its next checkpoint does it, and the command
+  says so). Workspaces' histories keep the actor, which is not an email, and
+  copies outside `server.db` (logs, backups) are the admin's to expire.
+  With `account_events`, an Apple Account deleted at Apple is forgotten the
+  same way, and one that revoked its consent is signed out
+  ([Sign in with Apple](remote.md#sign-in-with-apple)).
+- **Logs.** `bd serve` logs sign-ins, refreshes, refusals and revocations
+  with the provider, the account's subject and login (a user name or a
+  pseudonym), its actor and token names, and never a secret, a token's
+  hash, or an email. An authorizer's refusal reasons and stderr go to the
+  log as it wrote them, so an authorizer should not write emails there
+  either. Keep logs only as long as needed (OWASP Logging Cheat Sheet,
+  ASVS 16.1.1), readable by the admin only.
+- **At rest.** Encryption at rest is a choice for the threat model (GDPR
+  Art. 32; OWASP Cryptographic Storage). bd relies on file permissions:
+  `server.db` is created 0600, and `bd serve` warns if its root is open to
+  other users (chmod 700 it), since the workspaces' databases are there
+  too. Use disk encryption where the machine or its disks could be taken,
+  and keep backups encrypted and private.
 
 ## OAuth for MCP clients
 
 With `[oauth]`, `bd serve` is an OAuth 2.1 authorization server for MCP
 clients that sign people in, such as ChatGPT
 ([Signing in with OAuth](mcp.md#signing-in-with-oauth)). People sign in with
-GitHub under the same rules as above.
+GitHub or an OIDC provider, under GitHub's rules or the authorizer, as
+above.
 
 - **Secrets.** GitHub's web flow needs a client secret of the GitHub App
   (`client_secret_file`); keep it, like the private key, mode 0600 and
   readable by `bd serve` only. The account's GitHub token is used during
-  the sign-in only, as for the device flow.
+  the sign-in only, as for the device flow. An OIDC provider's client
+  secret file, or the `.p8` key that signs Apple's (`signed_secret`), is
+  kept the same way; each secret signed from that key lasts a few minutes.
 - **Where people are sent back.** Only to redirect URIs `[oauth]` allows:
   https on the hosts of `redirect_hosts`, or, with `loopback_redirects`,
   http to the person's own machine. Any local program can listen on a
@@ -137,11 +212,21 @@ GitHub under the same rules as above.
   (`auth.toml`, other workspaces, limits, what its log says) stays off the
   pages; the consent page names only the rule that let the person in. The pages are served with
   a strict Content Security Policy (styles and the one script by hash,
-  images only inside the page) and may not be framed. The consent form
-  refuses posts from other sites and from any browser but the one that
-  started the authorization (a `SameSite=Lax`, `HttpOnly` cookie, named
-  `__Secure-bd_oauth` on https so a sibling host on plain http cannot plant
-  it). The prefix is `__Secure-` rather than `__Host-` because the cookie is
+  images only inside the page) and may not be framed. Their referrer
+  policy is `same-origin`, so the provider's code and state in a callback
+  URL reach no other site (not `no-referrer`, under which browsers would
+  send the consent form with `Origin: null`). A provider's answer posted
+  to a callback (`form_post`, Apple's; refused for providers not
+  configured with it) arrives without the sign-in's
+  `SameSite=Lax` cookie, so bd sends only its code, state, error and
+  issuer on to the callback as a GET, where the cookie and state are
+  checked as for any other provider. The consent form refuses a
+  post unless it says it came from the page (an `Origin` of the server,
+  `Sec-Fetch-Site: same-origin`, and at least one of them), and from any
+  browser but the one that started the authorization (a `SameSite=Lax`,
+  `HttpOnly` cookie, named `__Secure-bd_oauth` on https so a sibling host
+  on plain http cannot plant it, and given a new value once the person
+  signed in, so a value known before is good for nothing). The prefix is `__Secure-` rather than `__Host-` because the cookie is
   scoped to the issuer's path, which `__Host-` forbids; a sibling https
   host could still set one for the parent domain, which gains it nothing
   over sending the person the authorization URL itself. Before a code is
@@ -151,11 +236,31 @@ GitHub under the same rules as above.
   under the second), so the consent form is not sent until the page has
   had focus for 600 ms; the buttons stay enabled, for screen readers and
   voice control.
-- **Consent comes after GitHub sign-in.** The MCP specification asks a
+- **An authorizer decides access, not identity.** With `[authorizer]`, the
+  admin's command or HTTPS endpoint decides who may use which workspace at
+  every sign-in and refresh. bd still proves who signed in and binds the
+  actor; the authorizer gets identity data only (never a GitHub token), its
+  answer is parsed strictly and fails closed, and what it may grant is
+  capped by `auth.toml` (`max_role` write, no `human`, unless allowed), so a
+  broken or compromised authorizer cannot hand out admin tokens or open
+  human gates. Its refusal reasons stay in the server log. A command runs
+  with a cleared environment, on Unix in a process group of its own that is killed
+  once it answers or runs out of time (nothing it starts outlives it or holds
+  bd past its timeout); run `bd serve`, and so it, as an unprivileged user; a URL needs https (http only to loopback),
+  gets a bearer token, and redirects are not followed.
+- **The device flow can be phished.** `bd remote login` gets the token of
+  whoever enters its one-time code at the provider (RFC 8628 section 5.4):
+  someone who sends you a code and a link to enter it at gets your access.
+  Enter only codes your own `bd remote login` just showed you; the provider's
+  page names the application asking.
+- **Secret files.** The GitHub App key, client secrets and the authorizer's
+  token are files under the root; `bd serve` warns at start about any its
+  group or others may read. Keep them mode 0600.
+- **Consent comes after signing in.** The MCP specification asks a
   proxy in front of a third-party authorization server to get consent for
   each client before sending the person on to it. bd sends the person to
-  GitHub first, because it uses GitHub only to learn who they are: GitHub
-  grants the client nothing, and bd's consent page, shown every time and
+  the provider first, because it uses the provider only to learn who they
+  are: the provider grants the client nothing, and bd's consent page, shown every time and
   never skipped, comes before any code reaches the client.
 - **Codes and tokens.** Codes need PKCE (`S256`), last 5 minutes and work
   once; a code sent again revokes the tokens it issued. Tokens are bound to
@@ -163,7 +268,7 @@ GitHub under the same rules as above.
   only, which never carry admin or human rights. Refresh tokens rotate at
   every refresh with no grace period: one used twice revokes the sign-in.
   `bd serve token revoke --client <client_id>` revokes every token of a
-  client, and `--github <login>` every token of an account.
+  client, and `--account <login>` every token of an account.
 - **Client metadata documents.** bd fetches a client's metadata document
   over https from public addresses only (no loopback, private, link-local
   or other reserved address, checked as it connects, so a name cannot
@@ -183,12 +288,14 @@ GitHub under the same rules as above.
   if its bytes are a PNG, JPEG, GIF or WebP image (no SVG).
 - **Unauthenticated endpoints.** Registration, authorization and the token
   endpoint need no token. bd bounds what they keep: 500 registered clients
-  (a new one drops the oldest never used), and 1024 sign-ins at GitHub
-  under way, past which new ones are refused rather than old ones dropped;
+  (a new one drops the oldest never used), and 1024 sign-ins at a provider
+  under way (64 per client, so one client's flood leaves room for others'),
+  past which new ones are refused rather than old ones dropped; an OIDC
+  provider whose discovery fails is not asked again for 30 seconds;
   consent pages and codes, which only accounts the rules let in reach, are
   kept up to 1024 each, the oldest going first. The authorization endpoint
   does not tell which workspaces exist before the rules let an account in
-  (the device flow of `bd remote login --github` does, before sending
+  (the device flow of `bd remote login --provider github` does, before sending
   anyone to GitHub). It does not
   rate-limit them: do that per address at the proxy ([Behind a
   proxy](mcp.md#behind-a-proxy)), on every path with `/oauth/` in it:

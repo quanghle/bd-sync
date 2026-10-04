@@ -4,7 +4,7 @@
 
 use super::*;
 
-/// Start a sign-in: the one-time code GitHub gives for it.
+/// Start a sign-in: the one-time code the provider gives for it.
 pub fn start(root: &Path, provider: &str) -> Result<SignInCode> {
     let sign_in = enabled(root)?;
     if provider != "github" {
@@ -34,7 +34,7 @@ pub fn start(root: &Path, provider: &str) -> Result<SignInCode> {
 }
 
 /// [`start`] with an OIDC provider's device flow.
-pub(super) fn start_oidc(sign_in: &SignIn, provider: &str) -> Result<SignInCode> {
+fn start_oidc(sign_in: &SignIn, provider: &str) -> Result<SignInCode> {
     let oidc = oidc_of(sign_in, provider)?;
     let md = oidc.metadata()?;
     let body = oidc.device(&md)?;
@@ -55,7 +55,7 @@ pub(super) fn start_oidc(sign_in: &SignIn, provider: &str) -> Result<SignInCode>
 }
 
 /// [`poll`] with an OIDC provider's device flow.
-pub(super) fn poll_oidc(root: &Path, sign_in: &SignIn, provider: &str, poll: &SignInPoll) -> Result<SignInAnswer> {
+fn poll_oidc(root: &Path, sign_in: &SignIn, provider: &str, poll: &SignInPoll) -> Result<SignInAnswer> {
     let oidc = oidc_of(sign_in, provider)?;
     let md = oidc.metadata()?;
     let form = [("grant_type", DEVICE_GRANT), ("device_code", poll.device_code.as_str())];
@@ -149,7 +149,7 @@ pub fn poll(root: &Path, provider: &str, poll: &SignInPoll) -> Result<SignInAnsw
         return Err(refused(github, "finish a sign-in", status, &body));
     };
     // GitHub gave the code's token once, so a poll sent again would find the sign-in gone: not busy, ended.
-    let admitted = admit(root, &sign_in, github, &api, access, &poll.workspace, None).map_err(|e| match e {
+    let admitted = admit(root, &sign_in, github, &api, access, &poll.workspace, None, &mut None).map_err(|e| match e {
         Error::Busy(why) => Error::Remote(why),
         e => e,
     });
@@ -204,6 +204,7 @@ pub fn account_event(root: &Path, provider: &str, body: &[u8]) -> Result<()> {
 /// `access` is do in `workspace` (for OAuth `client`, if any), asking GitHub
 /// with that token; `Error::Unauthorized` (said to the person signing in) if
 /// they do not let it in, `Error::Busy` if the authorizer could not say.
+/// `signed_in_as` gets the account's login once GitHub named it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn admit(
     root: &Path,
@@ -213,8 +214,10 @@ pub(super) fn admit(
     access: &str,
     workspace: &str,
     client: Option<&str>,
+    signed_in_as: &mut Option<String>,
 ) -> Result<Admitted> {
     let (user, created) = account(api, access)?;
+    *signed_in_as = Some(user.login.clone());
     let age = created.map(|at| Duration::from_millis(Timestamp::now().since(at).max(0) as u64));
     if github_id(&user).is_some_and(|id| github.deny.contains(&id)) {
         tracing::info!(target: "bd::serve", login = %user.login, subject = %user.subject, "GitHub sign-in refused: the account is denied");
@@ -307,6 +310,10 @@ pub fn admit_oidc(
 ) -> Result<Admitted> {
     let user = oidc.identity(claims);
     let email = claims.email.clone();
+    if oidc.deny.contains(&user.subject) {
+        tracing::info!(target: "bd::serve", provider = %user.provider, subject = %user.subject, "sign-in refused: the account is denied");
+        return Err(Error::Unauthorized(format!("{} may not sign in to this bd server", user.who())));
+    }
     let Some(authorizer) = &sign_in.authorizer else {
         // Its [[oidc.<name>.allow]] rules decide.
         let (decided, rule) =

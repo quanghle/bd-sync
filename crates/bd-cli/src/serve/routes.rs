@@ -17,9 +17,9 @@ pub(super) fn mcp_path(path: &str) -> Option<(&str, &str)> {
     Some((prefix, name)).filter(|(_, w)| valid_workspace_name(w))
 }
 
-/// A step of GitHub sign-in.
+/// A step of sign-in from the command line (the device flow).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SignIn {
+pub(super) enum SignInStep {
     /// Get a one-time code.
     Device,
     /// Ask whether it was entered, and get the token once it was.
@@ -27,7 +27,7 @@ pub(super) enum SignIn {
 }
 
 /// `[/<prefix>]/v2/auth/<provider>/<device|token>` -> the provider and the step.
-pub(super) fn sign_in_path(path: &str) -> Option<(String, SignIn)> {
+pub(super) fn sign_in_path(path: &str) -> Option<(String, SignInStep)> {
     let (_, rest) = path.rsplit_once(&format!("/v{PROTOCOL}/auth/"))?;
     let (provider, step) = rest.split_once('/')?;
     let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
@@ -35,8 +35,8 @@ pub(super) fn sign_in_path(path: &str) -> Option<(String, SignIn)> {
         return None;
     }
     let step = match step {
-        "device" => SignIn::Device,
-        "token" => SignIn::Token,
+        "device" => SignInStep::Device,
+        "token" => SignInStep::Token,
         _ => return None,
     };
     Some((provider.to_string(), step))

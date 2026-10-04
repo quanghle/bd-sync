@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
@@ -87,6 +87,8 @@ pub(crate) struct OidcDoc {
     allow: Vec<RuleDoc>,
     #[serde(default)]
     groups_claim: Option<String>,
+    #[serde(default)]
+    deny: Vec<String>,
 }
 
 /// `[[oidc.<name>.allow]]` as written.
@@ -105,16 +107,12 @@ pub(crate) struct RuleDoc {
     groups: Vec<String>,
     #[serde(default)]
     role: Option<crate::auth::Role>,
-    #[serde(default = "agent_kind")]
+    #[serde(default = "crate::oauth::agent_kind")]
     kind: crate::auth::Kind,
     #[serde(default)]
     workspaces: Vec<String>,
     #[serde(default)]
     max_claims: Option<u32>,
-}
-
-fn agent_kind() -> crate::auth::Kind {
-    crate::auth::Kind::Agent
 }
 
 /// One `[[oidc.<name>.allow]]` rule: whom of the provider's accounts it lets
@@ -198,31 +196,20 @@ pub fn decide(
     kept: Option<&str>,
     workspace: &str,
 ) -> (crate::oauth::Decision, Option<String>) {
-    let mut elsewhere: Vec<String> = Vec::new();
+    let mut elsewhere = crate::oauth::Elsewhere::default();
     for rule in rules {
         let Some(via) = rule.lets_in(subject, claims, groups_claim, kept) else { continue };
         if rule.grant.allows_workspace(workspace) {
-            let mut grant = rule.grant.clone();
-            if !elsewhere.is_empty() {
-                grant.workspaces = vec![workspace.to_string()];
-            }
+            let grant = elsewhere.grant(&rule.grant, workspace);
             return (crate::oauth::Decision::In { grant, via, by_login: true }, Some(rule.fingerprint()));
         }
-        for w in &rule.grant.workspaces {
-            if !elsewhere.contains(w) {
-                elsewhere.push(w.clone());
-            }
-        }
+        elsewhere.note(&rule.grant);
     }
-    match elsewhere.is_empty() {
-        true => (crate::oauth::Decision::Out, None),
-        false => (crate::oauth::Decision::Elsewhere(elsewhere), None),
-    }
+    (elsewhere.decision(), None)
 }
 
 /// `[[oidc.<name>.allow]]` rule `n`, checked.
 fn rule(at: &str, n: usize, r: RuleDoc) -> std::result::Result<Rule, String> {
-    use crate::auth::{Grant, Kind, Role};
     let at = format!("[[{at}.allow]] rule {n}");
     let plain = |field: &str, list: Vec<String>, lower: bool| {
         list.into_iter()
@@ -249,20 +236,12 @@ fn rule(at: &str, n: usize, r: RuleDoc) -> std::result::Result<Rule, String> {
         if names_someone {
             return Err(format!("{at} lets anyone in: drop its subjects, emails, email_domains and groups, or anyone"));
         }
-        if r.role == Some(Role::Admin) || r.kind == Kind::Human {
-            return Err(format!("{at} lets anyone in, so its role may be read or write and its kind agent only"));
-        }
     } else if !names_someone {
         return Err(format!(
             "{at} names no subjects, emails, email_domains or groups, so it lets nobody in (anyone = true lets everyone)"
         ));
     }
-    let role = r.role.unwrap_or(if r.anyone { Role::Read } else { Role::Write });
-    let workspaces = crate::auth::workspace_list(&r.workspaces).map_err(|e| format!("{at}: {e}"))?;
-    if r.max_claims == Some(0) {
-        return Err(format!("{at}: max_claims must be at least 1"));
-    }
-    let grant = Grant { role, kind: r.kind, workspaces, max_claims: r.max_claims };
+    let grant = crate::oauth::rule_grant(&at, r.anyone, r.role, r.kind, &r.workspaces, r.max_claims)?;
     Ok(Rule { anyone: r.anyone, subjects, emails, email_domains, groups, grant })
 }
 
@@ -338,6 +317,9 @@ pub struct Oidc {
     pub allow: Vec<Rule>,
     /// The ID token claim listing an account's groups, for rules' `groups`.
     pub groups_claim: String,
+    /// Subjects (`sub`) of accounts that may never sign in, whatever the
+    /// rules or the authorizer say.
+    pub deny: Vec<String>,
 }
 
 /// A client secret, never shown.
@@ -402,6 +384,10 @@ pub(crate) fn parse(name: &str, doc: OidcDoc) -> std::result::Result<Oidc, Strin
     if account_events.iter().any(|a| a.is_empty() || a.len() > 255 || !a.bytes().all(|b| b.is_ascii_graphic())) {
         return Err(format!("{at}.account_events lists the IDs the provider names the app by: not empty, plain"));
     }
+    let deny: Vec<String> = doc.deny.iter().map(|s| s.trim().to_string()).collect();
+    if deny.iter().any(|s| s.is_empty() || s.len() > 255) {
+        return Err(format!("{at}.deny lists accounts' subjects (their sub claims): not empty"));
+    }
     let label = doc.label.map(|l| l.trim().to_string()).unwrap_or_else(|| name.to_string());
     if !crate::oauth_server::clients::shows_plainly(&label, 40) {
         return Err(format!("{at}.label is empty, longer than 40 characters, or not plain text"));
@@ -433,6 +419,7 @@ pub(crate) fn parse(name: &str, doc: OidcDoc) -> std::result::Result<Oidc, Strin
             .map(|(i, r)| rule(&at, i + 1, r))
             .collect::<std::result::Result<_, _>>()?,
         groups_claim: doc.groups_claim.map(|g| g.trim().to_string()).unwrap_or_else(|| "groups".into()),
+        deny,
     })
 }
 
@@ -522,9 +509,10 @@ static FAILED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default
 static KEYS: LazyLock<Fetched<Vec<Jwk>>> = LazyLock::new(Default::default);
 /// Key sets whose fetch failed, with when: not fetched again for [`FAILED_FOR`].
 static KEYS_FAILED: LazyLock<Mutex<HashMap<String, Instant>>> = LazyLock::new(Default::default);
-/// Held while a key set is fetched: one fetch at a time, the others then
-/// finding it kept (or its failure), however many requests want keys.
-static FETCHING_KEYS: Mutex<()> = Mutex::new(());
+/// Held while a key set is fetched, one per JWKS URL: one fetch of each at
+/// a time, the others then finding it kept (or its failure), however many
+/// requests want keys; a slow provider holds up no other's.
+static FETCHING_KEYS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = LazyLock::new(Default::default);
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -817,7 +805,8 @@ impl Oidc {
         if let Some(keys) = kept() {
             return Ok(keys);
         }
-        let _fetching = lock(&FETCHING_KEYS);
+        let fetching = lock(&FETCHING_KEYS).entry(md.jwks_uri.clone()).or_default().clone();
+        let _fetching = lock(&fetching);
         // Another request may have fetched them, or failed to, while this one waited.
         if let Some(keys) = kept() {
             return Ok(keys);

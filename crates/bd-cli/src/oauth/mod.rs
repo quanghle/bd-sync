@@ -236,14 +236,8 @@ fn load_files(root: &Path) -> Result<Option<SignIn>> {
 /// if it is on: `[github]` checked too, but not its private key, which
 /// sign-ins and refreshes read.
 pub fn load_oauth(root: &Path) -> Result<Option<OauthConfig>> {
-    let path = root.join(FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::invalid(format!("{}: {e}", path.display()))),
-    };
-    let sign_in = parse(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
-    Ok(sign_in.and_then(|g| g.oauth))
+    // From the cached load: requests anyone may send (metadata) cost a stat or two, not a read and a parse.
+    Ok(load(root)?.and_then(|g| g.oauth))
 }
 
 /// GitHub sign-in as `auth.toml` sets it up now, for a sign-in request. A

@@ -3,40 +3,28 @@
 
 use super::*;
 
-/// A step of GitHub sign-in, for a client without a token yet. Each runs on
-/// a blocking thread, as it waits on GitHub (`oauth/`).
+/// A step of sign-in, for a client without a token yet. Each runs on a
+/// blocking thread, as it waits on the provider (`oauth/`).
 pub(super) async fn sign_in(
     server: &Arc<Server>,
     provider: String,
-    step: SignIn,
+    step: SignInStep,
     req: Request<Incoming>,
 ) -> Response<Body> {
     // The body first, small and time-limited: a slow client holds no slot meanwhile.
-    let body = match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect())
-        .await
-    {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(e)) if e.is::<LengthLimitError>() => {
-            let msg = format!("sign-in request larger than {} KiB", MAX_SIGN_IN_BODY >> 10);
-            return Reject::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid", msg, 2).response();
-        }
-        Ok(Err(e)) => {
-            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
-        }
-        Err(_) => {
-            let msg = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
-            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
-        }
+    let body = match read_body(req.into_body(), MAX_SIGN_IN_BODY, HEADER_TIMEOUT).await {
+        Ok(b) => b,
+        Err(e) => return e.response("sign-in request", MAX_SIGN_IN_BODY),
     };
     let bad_body =
         |e: serde_json::Error| Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("bad request body: {e}"), 2);
     let answer = match step {
-        SignIn::Device => {
+        SignInStep::Device => {
             let start: SignInStart = match serde_json::from_slice(&body) {
                 Ok(s) => s,
                 Err(e) => return bad_body(e).response(),
             };
-            // Before anyone goes to GitHub for it.
+            // Before anyone goes to the provider for it.
             if server.workspace(&start.workspace).is_none() {
                 let msg = format!("workspace not found: {}", start.workspace);
                 return Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response();
@@ -52,7 +40,7 @@ pub(super) async fn sign_in(
             })
             .await
         }
-        SignIn::Token => {
+        SignInStep::Token => {
             let poll: SignInPoll = match serde_json::from_slice(&body) {
                 Ok(p) => p,
                 Err(e) => return bad_body(e).response(),
@@ -104,7 +92,7 @@ pub(super) async fn sign_in(
 }
 
 /// The answer to a sign-in or refresh step.
-pub(super) fn auth_answer(answer: Result<serde_json::Value>) -> Response<Body> {
+fn auth_answer(answer: Result<serde_json::Value>) -> Response<Body> {
     match answer {
         Ok(value) => json_response(StatusCode::OK, &value),
         Err(e) => {
@@ -127,17 +115,9 @@ pub(super) fn auth_answer(answer: Result<serde_json::Value>) -> Response<Body> {
 /// spent, and any other request with it revokes the sign-in.
 pub(super) async fn refresh(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
     let Some(secret) = bearer(req.headers()).map(str::to_string) else { return denied().response() };
-    let body = match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect())
-        .await
-    {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(e)) => {
-            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
-        }
-        Err(_) => {
-            let msg = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
-            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
-        }
+    let body = match read_body(req.into_body(), MAX_SIGN_IN_BODY, HEADER_TIMEOUT).await {
+        Ok(b) => b,
+        Err(e) => return e.response("refresh request", MAX_SIGN_IN_BODY),
     };
     let request: RefreshRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -165,12 +145,11 @@ pub(super) async fn refresh(server: &Arc<Server>, req: Request<Incoming>) -> Res
     }
     let completing = Completing { server: server.clone(), key: running, refresh: true };
     // A secret of no sign-in costs a lookup, never a slot of refreshes.
-    let (root, presented) = (server.root.clone(), secret.clone());
-    match blocking(move || auth::find_refresh(&root, &presented)).await {
-        Ok(Some(_)) => {}
-        Ok(None) => {
+    match server.tokens.knows_refresh(&secret) {
+        Ok(true) => {}
+        Ok(false) => {
             let why = "this bd server does not know the sign-in (it was revoked, or has ended); sign in again: \
-                       `bd remote login`";
+                       `bd remote login --provider <name>`";
             return auth_answer(Err(Error::Unauthorized(why.into())));
         }
         Err(e) => return auth_answer(Err(e)),
@@ -199,9 +178,9 @@ pub(super) async fn refresh(server: &Arc<Server>, req: Request<Incoming>) -> Res
 
 /// How long the answer of a sign-in that issued a token is kept, for a
 /// retry whose first answer was lost: GitHub gives a sign-in's token once.
-pub(super) const ISSUED_REPLAY: Duration = Duration::from_secs(5 * 60);
+const ISSUED_REPLAY: Duration = Duration::from_secs(5 * 60);
 /// Answers of sign-ins kept at once; the oldest goes first.
-pub(super) const MAX_ISSUED: usize = 256;
+const MAX_ISSUED: usize = 256;
 
 /// Sign-ins completing, and the answers of those that issued a token, by
 /// the SHA-256 of their device code.
@@ -228,7 +207,7 @@ impl Drop for Completing {
 }
 
 /// `POST /v2/auth/revoke`: revoke the request's own token, if it came from
-/// GitHub sign-in (`bd remote logout`). One an admin created is kept: it may
+/// sign-in (`bd remote logout`). One an admin created is kept: it may
 /// serve elsewhere too, and only the admin revokes it. An expired token may
 /// still be revoked; an unknown one is refused like any request. A
 /// sign-in's refresh secret revokes the sign-in too: its current one, or
@@ -246,12 +225,12 @@ pub(super) async fn revoke_own(server: &Arc<Server>, req: Request<Incoming>) -> 
         },
     };
     // Small, so that the connection stays usable.
-    let body = tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await;
+    let body = read_body(req.into_body(), MAX_SIGN_IN_BODY, HEADER_TIMEOUT).await;
     let token = if let Some(t) = checked {
         t
     } else {
         let request_id = match body {
-            Ok(Ok(b)) => serde_json::from_slice::<serde_json::Value>(&b.to_bytes())
+            Ok(b) => serde_json::from_slice::<serde_json::Value>(&b)
                 .ok()
                 .and_then(|v| v["request_id"].as_str().map(String::from)),
             _ => None,

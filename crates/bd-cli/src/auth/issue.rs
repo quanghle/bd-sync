@@ -27,20 +27,20 @@ pub struct Issued {
     pub refresh_secret: Option<String>,
 }
 
-/// How long a GitHub sign-in's tokens last.
+/// How long a sign-in's tokens last.
 #[derive(Clone, Debug)]
 pub struct Lifetime {
     /// How long each access token works.
     pub ttl: Duration,
-    /// Until when its refreshes may renew it, if it is refreshed: they ask
-    /// GitHub again, by the workspace it signed in for.
+    /// Until when its refreshes may renew it, if it is refreshed: they
+    /// decide again, by the workspace it signed in for.
     pub refresh: Option<(Timestamp, Duration)>,
     /// The fingerprint of the `[[oidc.<name>.allow]]` rule that let it in,
     /// kept for its refreshes (`oidc::decide`).
     pub rule: Option<String>,
 }
 
-/// Add an access token for a GitHub account that signed in for
+/// Add an access token for an account that signed in for
 /// `workspace`. It acts as the account's actor: the one bound to it at an
 /// earlier sign-in, else its login, bound to it now. It is named
 /// `github-<actor>-<random>` (the actor cut to 40 characters), and expires
@@ -89,14 +89,14 @@ pub fn issue_client_token(
 
 /// `text` as part of a token name: letters, digits, `.`, `_` and `-`
 /// (anything else becomes `-`), at most `max` characters.
-pub(super) fn name_part(text: &str, max: usize) -> String {
+fn name_part(text: &str, max: usize) -> String {
     let plain = |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-');
     text.chars().map(|c| if plain(c) { c } else { '-' }).take(max).collect()
 }
 
 /// What names a client in its tokens' names: the host of its metadata
 /// document, or its registered ID; letters, digits, `.`, `_` and `-` only.
-pub(super) fn client_label(id: &str) -> String {
+fn client_label(id: &str) -> String {
     let id = id.strip_prefix("https://").map_or(id, |rest| rest.split(['/', ':', '?', '#']).next().unwrap_or_default());
     let label: String = id
         .chars()
@@ -136,21 +136,8 @@ pub fn find_by_secret(root: &Path, secret: &str) -> Result<Option<Token>> {
 /// it now when `fresh`, else as it signed in), what the rules grant it now,
 /// expiring at `expires_at` and refreshed until `until`. `None` when `current` is no longer the sign-in's (another
 /// refresh changed it meanwhile), or the sign-in was revoked.
-#[allow(clippy::too_many_arguments)]
-pub fn rotate(
-    root: &Path,
-    id: &str,
-    current: &str,
-    last: LastRefresh,
-    user: &Identity,
-    fresh: bool,
-    grant: Grant,
-    by_login: bool,
-    decided: bool,
-    rule: Option<String>,
-    expires_at: Timestamp,
-    until: Timestamp,
-) -> Result<Option<Issued>> {
+pub fn rotate(root: &Path, id: &str, current: &str, rotation: Rotation<'_>) -> Result<Option<Issued>> {
+    let Rotation { last, user, fresh, grant, by_login, decided, rule, expires_at, until } = rotation;
     let workspaces = workspace_list(&grant.workspaces)?;
     let scope = Scope { ids: &[id], user: Some(user), ..Scope::default() };
     change_scoped(root, &scope, |_, file| {
@@ -166,9 +153,10 @@ pub fn rotate(
         let actor = bind(&mut file.accounts, user, now, by_login, fresh)?;
         if actor != file.tokens[i].actor {
             return Err(Error::Unauthorized(format!(
-                "{} now acts as {actor}, not {}: sign in again (`bd remote login`)",
+                "{} now acts as {actor}, not {}: sign in again (`bd remote login --provider {}`)",
                 user.who(),
-                file.tokens[i].actor
+                file.tokens[i].actor,
+                user.provider
             )));
         }
         if by_login && !related(&actor, &user.actor()) {
@@ -204,11 +192,31 @@ pub fn rotate(
     })
 }
 
+/// What a refresh renews a sign-in with ([`rotate`]).
+pub struct Rotation<'a> {
+    /// The refresh it answers: the secret spent and its request id, hashed.
+    pub last: LastRefresh,
+    /// The account as its provider names it now (`fresh`), or as it signed in.
+    pub user: &'a Identity,
+    pub fresh: bool,
+    /// What the rules or the authorizer grant it now, and whether a rule let
+    /// it in by its login.
+    pub grant: Grant,
+    pub by_login: bool,
+    /// Whether they decided now (not a grant kept while the authorizer could not answer).
+    pub decided: bool,
+    /// The OIDC rule that let it in (its fingerprint), if one did.
+    pub rule: Option<String>,
+    /// When the new access token expires, and until when it may be refreshed.
+    pub expires_at: Timestamp,
+    pub until: Timestamp,
+}
+
 /// Whom a new token is for.
 pub(super) enum Holder<'a> {
     /// An admin names it, its actor, and maybe the MCP endpoint it is bound to.
     Admin { name: &'a str, actor: &'a str, resource: Option<&'a str> },
-    /// A GitHub account that signed in; `by_login` when a rule let it in by
+    /// An account that signed in; `by_login` when a rule let it in by
     /// its login; `refresh`, the workspace it signed in for and until when
     /// it may be refreshed, if it may; `client`, the OAuth client it
     /// authorized, if it did.
@@ -223,7 +231,7 @@ pub(super) enum Holder<'a> {
     },
 }
 
-pub(super) fn check_name(name: &str) -> Result<()> {
+fn check_name(name: &str) -> Result<()> {
     let ok = name.len() <= 64
         && name.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
@@ -273,6 +281,13 @@ pub(super) fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Iss
         if is_reserved_actor(actor) {
             return Err(Error::invalid(format!(
                 "actor {actor} is reserved for bd serve's background writes: pick another actor"
+            )));
+        }
+        // `<provider>:<login>` is the accounts' who sign in: an admin's token there would keep that account out.
+        if actor.split('/').next().is_some_and(|root| root.contains(':')) {
+            return Err(Error::invalid(format!(
+                "actor {actor} names a provider's account (<provider>:<login>), which signs in for its own tokens: \
+                 pick an actor without ':'"
             )));
         }
     }
@@ -360,6 +375,22 @@ pub(super) fn add_token(root: &Path, holder: Holder, grant: Grant) -> Result<Iss
         file.tokens.push(token.clone());
         let kind = if token.identity.is_some() { "signed_in" } else { "token_created" };
         file.events.push(token.event(kind, None));
+        if let Some(user) = &token.identity {
+            // Newest first (tokens are in the order they were added): this account's live sign-ins at this
+            // client past the first MAX_SIGN_INS.
+            let older: Vec<String> = file
+                .tokens
+                .iter()
+                .rev()
+                .filter(|t| !t.ended(now) && t.client == token.client)
+                .filter(|t| t.identity.as_ref().is_some_and(|other| other.same(user)))
+                .skip(MAX_SIGN_INS)
+                .map(|t| t.id.clone())
+                .collect();
+            if !older.is_empty() {
+                file.revoke("superseded by newer sign-ins of the account", |t| older.contains(&t.id));
+            }
+        }
         Ok(Issued { token, secret, refresh_secret })
     })
 }

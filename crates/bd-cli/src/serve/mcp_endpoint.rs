@@ -79,27 +79,19 @@ pub(super) async fn mcp(server: &Arc<Server>, endpoint: Endpoint, req: Request<I
         return mcp_too_large();
     }
     let permits = kib(MAX_MCP_BODY * BODY_COPIES + MCP_ANSWER_BUDGET);
-    let budget = match tokio::time::timeout(QUEUE_WAIT, server.body_budget.clone().acquire_many_owned(permits)).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return shutting_down(),
-        Err(_) => return busy("receiving other requests"),
+    let budget = match queue(&server.body_budget, permits, "receiving other requests").await {
+        Ok(permit) => permit,
+        Err(reject) => return reject.response(),
     };
     let (parts, body) = req.into_parts();
-    let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(body, MAX_MCP_BODY).collect()).await {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(e)) if e.is::<LengthLimitError>() => return mcp_too_large(),
-        Ok(Err(e)) => {
-            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
-        }
-        Err(_) => {
-            let msg = format!("the request body did not arrive within {}s", BODY_TIMEOUT.as_secs());
-            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
-        }
+    let body = match read_body(body, MAX_MCP_BODY, BODY_TIMEOUT).await {
+        Ok(b) => b,
+        Err(BodyError::TooLarge) => return mcp_too_large(),
+        Err(e) => return e.response("MCP request", MAX_MCP_BODY),
     };
-    let slot = match tokio::time::timeout(QUEUE_WAIT, server.running.clone().acquire_owned()).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return shutting_down(),
-        Err(_) => return busy("running other commands"),
+    let slot = match queue(&server.running, 1, "running other commands").await {
+        Ok(permit) => permit,
+        Err(reject) => return reject.response(),
     };
     let srv = server.clone();
     let job = tokio::task::spawn_blocking(move || {
@@ -136,7 +128,7 @@ pub(super) fn mcp_session(query: Option<&str>) -> Result<String> {
 }
 
 /// The response to an MCP message, its body holding `budget` until sent.
-pub(super) fn mcp_response(answer: mcp_http::Answer, budget: Option<OwnedSemaphorePermit>) -> Response<Body> {
+fn mcp_response(answer: mcp_http::Answer, budget: Option<OwnedSemaphorePermit>) -> Response<Body> {
     match answer {
         mcp_http::Answer::Accepted => response(StatusCode::ACCEPTED, "application/json", Body::whole(Bytes::new())),
         mcp_http::Answer::Message(status, message) => {
@@ -146,7 +138,7 @@ pub(super) fn mcp_response(answer: mcp_http::Answer, budget: Option<OwnedSemapho
     }
 }
 
-pub(super) fn mcp_too_large() -> Response<Body> {
+fn mcp_too_large() -> Response<Body> {
     let msg = format!("an MCP message is larger than {} MiB", MAX_MCP_BODY >> 20);
     Reject::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid", msg, 2).response()
 }

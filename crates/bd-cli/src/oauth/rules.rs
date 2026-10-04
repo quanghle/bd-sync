@@ -59,6 +59,41 @@ pub enum Decision {
 /// A rule whose `min_account_age` the account's `age` falls short of (or
 /// whose age GitHub did not tell) does not let it in. Memberships GitHub
 /// would not tell are noted in `unknown`.
+/// The workspaces rules before the one that decides let an account into:
+/// that rule's grant then covers the workspace asked for alone, and, with
+/// none deciding, they are where it may go instead.
+#[derive(Default)]
+pub(crate) struct Elsewhere(Vec<String>);
+
+impl Elsewhere {
+    /// A rule let the account in, into `grant`'s workspaces but not the one asked for.
+    pub(crate) fn note(&mut self, grant: &Grant) {
+        for w in &grant.workspaces {
+            if !self.0.contains(w) {
+                self.0.push(w.clone());
+            }
+        }
+    }
+
+    /// The deciding rule's `grant`, for `workspace`: that workspace alone
+    /// once earlier rules let the account elsewhere.
+    pub(crate) fn grant(&self, grant: &Grant, workspace: &str) -> Grant {
+        let mut grant = grant.clone();
+        if !self.0.is_empty() {
+            grant.workspaces = vec![workspace.to_string()];
+        }
+        grant
+    }
+
+    /// No rule let the account into the workspace: in others, or nowhere.
+    pub(crate) fn decision(self) -> Decision {
+        match self.0.is_empty() {
+            true => Decision::Out,
+            false => Decision::Elsewhere(self.0),
+        }
+    }
+}
+
 pub fn decide(
     github: &Github,
     login: &str,
@@ -67,7 +102,7 @@ pub fn decide(
     m: &mut dyn Memberships,
     unknown: &mut Vec<String>,
 ) -> Result<Decision> {
-    let mut elsewhere: Vec<String> = Vec::new();
+    let mut elsewhere = Elsewhere::default();
     let mut too_new: Option<Duration> = None;
     for rule in &github.rules {
         let before = unknown.len();
@@ -85,27 +120,18 @@ pub fn decide(
             continue;
         }
         if rule.grant.allows_workspace(workspace) {
-            let mut grant = rule.grant.clone();
-            if !elsewhere.is_empty() {
-                grant.workspaces = vec![workspace.to_string()];
-            }
-            return Ok(Decision::In { grant, via, by_login });
+            return Ok(Decision::In { grant: elsewhere.grant(&rule.grant, workspace), via, by_login });
         }
-        for w in &rule.grant.workspaces {
-            if !elsewhere.contains(w) {
-                elsewhere.push(w.clone());
-            }
-        }
+        elsewhere.note(&rule.grant);
     }
     Ok(match too_new {
         Some(min) => Decision::TooNew(min),
-        None if elsewhere.is_empty() => Decision::Out,
-        None => Decision::Elsewhere(elsewhere),
+        None => elsewhere.decision(),
     })
 }
 
 /// What lets `login` in by `rule`, if anything, and whether it is the login.
-pub(super) fn lets_in(
+fn lets_in(
     rule: &Rule,
     login: &str,
     m: &mut dyn Memberships,

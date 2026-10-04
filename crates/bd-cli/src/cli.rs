@@ -1254,7 +1254,7 @@ pub struct ServeArgs {
     #[command(subcommand)]
     pub action: Option<ServeAction>,
     /// Directory of workspaces: <root>/<name>/.bd/bd.db is served at /w/<name>; tokens in <root>/server.db,
-    /// GitHub sign-in set up in <root>/auth.toml
+    /// sign-in (GitHub, OIDC providers) set up in <root>/auth.toml
     #[arg(long, env = "BD_SERVE_ROOT", value_name = "DIR")]
     pub root: Option<PathBuf>,
     /// Address and port to listen on
@@ -1311,6 +1311,18 @@ pub enum ServeAction {
     /// Manage access tokens (run on the server host)
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Check <root>/auth.toml and its secret files as a running server would read them, and print what to register
+    /// at providers and clients (callback URLs, endpoints); exits 2 on a mistake
+    Check(ServeCheckArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub struct ServeCheckArgs {
+    /// The URL clients reach the server at (as bd serve --public-url): the URLs to register are under it
+    #[arg(long, env = "BD_SERVE_PUBLIC_URL", value_name = "URL")]
+    pub public_url: Option<String>,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -1365,10 +1377,14 @@ pub struct TokenEventsArgs {
     #[arg(long, value_name = "DURATION")]
     pub since: Option<String>,
     /// Only this actor's, and its sub-actors'
-    #[arg(long, value_name = "ACTOR")]
+    #[arg(long, visible_alias = "by", value_name = "ACTOR")]
     pub actor: Option<String>,
+    /// Only these kinds (signed_in, token_created, refreshed, revoked, forgotten, client_registered, linked,
+    /// named; repeatable or comma separated)
+    #[arg(long = "kind", value_name = "KIND", value_delimiter = ',')]
+    pub kinds: Vec<String>,
     /// At most this many, the latest
-    #[arg(long, default_value_t = 100)]
+    #[arg(short = 'n', long, default_value_t = 100)]
     pub limit: usize,
     #[command(flatten)]
     pub root: TokenRootArgs,

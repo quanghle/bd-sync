@@ -147,8 +147,8 @@ It answers the same whether the workspace exists or not. With `[oauth]` in
 `<root>/auth.toml`, it also names the server's own authorization server
 (`"authorization_servers": ["https://bd.example.com/bd"]`), where clients
 sign people in ([Signing in with OAuth](#signing-in-with-oauth)); without
-it, it names none, and tokens come from the server's admin or from GitHub
-sign-in ([remote workspaces](remote.md)).
+it, it names none, and tokens come from the server's admin or from signing
+in with `bd remote login` ([remote workspaces](remote.md)).
 
 Refusals point clients at it, as RFC 6750 challenges:
 
@@ -187,8 +187,7 @@ client) as `bd remote login` ([Signing in](remote.md#signing-in)), approve
 the client, and the client gets a token bound to the endpoint it asked for.
 
 1. Set up sign-in ([remote workspaces](remote.md#signing-in)) so that
-   tokens are refreshed: an authorizer, or GitHub's rules with the GitHub
-   App's private key. Each provider sends people back to
+   tokens are refreshed: an authorizer, GitHub's rules with the GitHub App's private key, or an OIDC provider's rules. Each provider sends people back to
    `<public-url>/oauth/<provider>/callback`: for GitHub, set the App's
    **Callback URL** to the server's public URL followed by
    `/oauth/github/callback` (`https://bd.example.com/bd/oauth/github/callback`)
@@ -202,7 +201,7 @@ the client, and the client gets a token bound to the endpoint it asked for.
    # client_id, private_key and rules (or an [authorizer]) as for bd remote login --provider github
    client_secret_file = "github-secret"   # the GitHub App's client secret, relative to the root
 
-   # [oidc.google]                         # and any OIDC providers, decided by an [authorizer]
+   # [oidc.google]                         # and any OIDC providers, with their rules (or the [authorizer])
    # issuer = "https://accounts.google.com"
    # client_id = "..."
    # client_secret_file = "google-secret"
@@ -218,8 +217,11 @@ the client, and the client gets a token bound to the endpoint it asked for.
 3. Run `bd serve` with an https `--public-url` (http only on a loopback
    address, for trying it out): it is the issuer, which clients check.
 
-`bd serve` refuses to start with `[oauth]` but tokens that are not
-refreshed (no authorizer, and GitHub's rules without `private_key`), no
+`bd serve check --root /srv/bd --public-url https://bd.example.com/bd`
+prints the callback URLs to register at each provider and the MCP
+endpoints to give clients, and checks `auth.toml` without starting a
+server. `bd serve` refuses to start with `[oauth]` but tokens that are not
+refreshed (GitHub's rules without `private_key`, and no authorizer), no
 provider for a browser (GitHub without `client_secret_file`, and no OIDC
 provider), no such `--public-url`, or no redirect allowed; and with
 `client_secret_file` but no `[oauth]`. Like the rest of `auth.toml`,
@@ -378,8 +380,8 @@ to sign in and approve:
 
 - Claude apps (claude.ai, Claude Desktop, Claude mobile): add a custom
   connector with the endpoint's URL. They come back to
-  `https://claude.ai/api/mcp/auth_callback`, so `redirect_hosts` needs
-  `claude.ai`. Organizations in Anthropic's beta of request headers may
+  `https://claude.ai/api/mcp/auth_callback`, so `[oauth]` allows that URI
+  (`redirect_uris`, or `claude.ai` in `redirect_hosts`). Organizations in Anthropic's beta of request headers may
   instead have an Owner enter an `Authorization` header once; that header is
   the whole organization's, so give it a token of a shared actor
   (`--as team-claude`), with `--max-claims` if the organization should hold
@@ -387,8 +389,8 @@ to sign in and approve:
 - ChatGPT (developer mode): create an app for the endpoint's URL, with OAuth
   authentication. ChatGPT comes back to
   `https://chatgpt.com/connector_platform_oauth_redirect` (bd names its
-  issuer in every answer, RFC 9207), so `redirect_hosts` needs
-  `chatgpt.com`.
+  issuer in every answer, RFC 9207), so `[oauth]` allows that URI
+  (`redirect_uris`, or `chatgpt.com` in `redirect_hosts`).
 - Claude Code without the header: `claude mcp add --transport http bd
   https://bd.example.com/w/proj/mcp`, then `/mcp` to sign in. It comes back
   to this machine on a port of its choosing, so it needs

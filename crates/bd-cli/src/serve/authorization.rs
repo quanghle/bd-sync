@@ -34,21 +34,10 @@ pub(super) fn authorization_server_metadata(server: &Server, path: &str) -> Resp
 /// 7591, `oauth_server/clients.rs`), without a token, if `[oauth]` is on.
 /// Served at the public URL's path, or with it stripped ([`oauth_endpoint`]).
 pub(super) async fn register_client(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
-    let body =
-        match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await {
-            Ok(Ok(b)) => b.to_bytes(),
-            Ok(Err(e)) if e.is::<LengthLimitError>() => {
-                let why = format!("the request is larger than {} KiB", MAX_SIGN_IN_BODY >> 10);
-                return oauth_error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_client_metadata", &why);
-            }
-            Ok(Err(e)) => {
-                return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", &format!("reading the request: {e}"));
-            }
-            Err(_) => {
-                let why = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
-                return oauth_error(StatusCode::REQUEST_TIMEOUT, "invalid_request", &why);
-            }
-        };
+    let body = match read_body(req.into_body(), MAX_SIGN_IN_BODY, HEADER_TIMEOUT).await {
+        Ok(b) => b,
+        Err(e) => return e.oauth("invalid_client_metadata", MAX_SIGN_IN_BODY),
+    };
     if let Err(e) = server.issuer() {
         return sign_in_misconfigured(&e);
     }
@@ -89,21 +78,10 @@ pub(super) async fn register_client(server: &Arc<Server>, req: Request<Incoming>
 /// blocking thread with a sign-in slot; a refresh token is refreshed once
 /// at a time, so that a duplicate gets a retry, not its tokens revoked.
 pub(super) async fn oauth_tokens(server: &Arc<Server>, revoking: bool, req: Request<Incoming>) -> Response<Body> {
-    let body =
-        match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await {
-            Ok(Ok(b)) => b.to_bytes(),
-            Ok(Err(e)) if e.is::<LengthLimitError>() => {
-                let why = format!("the request is larger than {} KiB", MAX_SIGN_IN_BODY >> 10);
-                return oauth_error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request", &why);
-            }
-            Ok(Err(e)) => {
-                return oauth_error(StatusCode::BAD_REQUEST, "invalid_request", &format!("reading the request: {e}"));
-            }
-            Err(_) => {
-                let why = format!("the request body did not arrive within {}s", HEADER_TIMEOUT.as_secs());
-                return oauth_error(StatusCode::REQUEST_TIMEOUT, "invalid_request", &why);
-            }
-        };
+    let body = match read_body(req.into_body(), MAX_SIGN_IN_BODY, HEADER_TIMEOUT).await {
+        Ok(b) => b,
+        Err(e) => return e.oauth("invalid_request", MAX_SIGN_IN_BODY),
+    };
     match server.issuer() {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -136,10 +114,9 @@ pub(super) async fn oauth_tokens(server: &Arc<Server>, revoking: bool, req: Requ
     // Refreshes have slots of their own, and a refresh token of no sign-in costs a lookup, never a slot.
     let slots = match &request {
         Some(token::Request::Refresh { secret, .. }) => {
-            let (root, presented) = (server.root.clone(), secret.clone());
-            match blocking(move || auth::find_refresh(&root, &presented)).await {
-                Ok(Some(_)) => {}
-                Ok(None) => return refused(&token::unknown_refresh()),
+            match server.tokens.knows_refresh(secret) {
+                Ok(true) => {}
+                Ok(false) => return refused(&token::unknown_refresh()),
                 Err(e) => {
                     tracing::error!(target: "bd::serve", error = %e, "looking up a refresh token");
                     return busy();
@@ -184,14 +161,9 @@ pub(super) async fn oauth_tokens(server: &Arc<Server>, revoking: bool, req: Requ
 pub(super) async fn account_events(server: &Arc<Server>, req: Request<Incoming>) -> Response<Body> {
     let provider =
         oauth_server::events_provider(under_issuer(server, req.uri().path())).unwrap_or_default().to_string();
-    let body =
-        match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_SIGN_IN_BODY).collect()).await {
-            Ok(Ok(b)) => b.to_bytes(),
-            _ => {
-                return Reject::new(StatusCode::BAD_REQUEST, "invalid", "the notification did not arrive whole", 2)
-                    .response();
-            }
-        };
+    let Ok(body) = read_body(req.into_body(), MAX_SIGN_IN_BODY, HEADER_TIMEOUT).await else {
+        return Reject::new(StatusCode::BAD_REQUEST, "invalid", "the notification did not arrive whole", 2).response();
+    };
     let Ok(permit) = server.notified.clone().try_acquire_owned() else {
         return Reject::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "the server is busy; retry", 5).response();
     };
@@ -284,12 +256,11 @@ pub(super) async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Re
             .await
         }
         Authorizing::Relay => {
-            let body = tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_RELAYED_BODY).collect());
-            let Ok(Ok(body)) = body.await else {
+            let Ok(body) = read_body(req.into_body(), MAX_RELAYED_BODY, HEADER_TIMEOUT).await else {
                 let why = "The sign-in didn't come back complete. Start again from the application.";
                 return html_page(pages::refusal(400, "Couldn't connect the application", why, None));
             };
-            let body = String::from_utf8_lossy(&body.to_bytes()).into_owned();
+            let body = String::from_utf8_lossy(&body).into_owned();
             Ok((server.authorizing(&issuer, |cx| authorize::relay(cx, &provider, &body)), Vec::new()))
         }
         Authorizing::Decide => {
@@ -305,16 +276,10 @@ pub(super) async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Re
                 let why = "The decision came from another site. Start again from the application.";
                 return html_page(pages::refusal(403, "Couldn't connect the application", why, None));
             }
-            let body =
-                match tokio::time::timeout(HEADER_TIMEOUT, Limited::new(req.into_body(), MAX_CONSENT_BODY).collect())
-                    .await
-                {
-                    Ok(Ok(b)) => b.to_bytes(),
-                    _ => {
-                        let why = "The decision didn't arrive complete. Start again from the application.";
-                        return html_page(pages::refusal(400, "Couldn't connect the application", why, None));
-                    }
-                };
+            let Ok(body) = read_body(req.into_body(), MAX_CONSENT_BODY, HEADER_TIMEOUT).await else {
+                let why = "The decision didn't arrive complete. Start again from the application.";
+                return html_page(pages::refusal(400, "Couldn't connect the application", why, None));
+            };
             let body = String::from_utf8_lossy(&body);
             Ok((server.authorizing(&issuer, |cx| authorize::decide(cx, &body, &cookies)), Vec::new()))
         }
@@ -382,7 +347,7 @@ pub(super) fn oauth_error(status: StatusCode, error: &str, description: &str) ->
 
 /// `auth.toml` or `--public-url` do not let sign-in work: the details go
 /// to the log, not to whoever asked.
-pub(super) fn sign_in_misconfigured(e: &str) -> Response<Body> {
+fn sign_in_misconfigured(e: &str) -> Response<Body> {
     tracing::error!(target: "bd::serve", error = %e, "sign-in is misconfigured");
     let msg = "the server's sign-in settings are not valid; see the server log";
     Reject::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg, 1).response()

@@ -72,7 +72,8 @@ pub(super) fn bind(
         );
         let whose = match related(&other.actor, &wanted) {
             true => format!("actor {} belongs to another account, which had that login before", other.actor),
-            false => format!("login {} was that of another account (actor {}) before", other.login, other.actor),
+            // That account's actor is its own business (it is in the log).
+            false => format!("login {} was that of another account before", other.login),
         };
         return Err(Error::Unauthorized(format!(
             "{} may not sign in to this bd server: {whose}; the server's admin resolves that (`bd serve token \
@@ -103,7 +104,7 @@ pub(super) fn bind(
 }
 
 /// A live token of another principal whose actor a new token's would share,
-/// or cover with sub-actors: a GitHub account's against an admin's or
+/// or cover with sub-actors: an account's against an admin's or
 /// another account's, and the other way round. Tokens an admin creates may
 /// share actors among themselves.
 pub(super) fn actor_conflict<'a>(
@@ -134,11 +135,11 @@ pub(super) fn conflict_error(actor: &str, identity: Option<&Identity>, other: &T
                 actor = %other.actor,
                 "sign-in refused: another token's actor"
             );
+            // Another account's actor stays in the log: the person signing in learns only that theirs is taken.
             Error::Unauthorized(format!(
-                "{} may not sign in to this bd server as actor {actor}: another access token acts as {}; the \
-                 server's admin resolves that (`bd serve token list`)",
-                user.who(),
-                other.actor
+                "{} may not sign in to this bd server as actor {actor}: another access token acts as it, or as an \
+                 actor related to it; the server's admin resolves that (`bd serve token list`)",
+                user.who()
             ))
         }
         (None, Some(owner)) => Error::Refused(format!(
@@ -156,36 +157,16 @@ pub(super) fn conflict_error(actor: &str, identity: Option<&Identity>, other: &T
 /// reuse): whether it was revoked now.
 pub fn revoke_by_id(root: &Path, id: &str, why: &str) -> Result<bool> {
     change_scoped(root, &Scope { ids: &[id], ..Scope::default() }, |_, file| {
-        let now = Timestamp::now().to_rfc3339();
-        let Some(t) = file.tokens.iter_mut().find(|t| t.id == id && t.revoked_at.is_none()) else { return Ok(false) };
-        t.revoked_at = Some(now);
-        let event = t.event("revoked", Some(why));
-        file.events.push(event);
-        Ok(true)
+        Ok(!file.revoke(why, |t| t.id == id).is_empty())
     })
 }
 
-/// Revoke the tokens `pick` selects (indexes): how many it selects, and the
-/// names of those revoked now (the others already were).
-pub(super) fn revoke_where(
-    root: &Path,
-    why: &str,
-    pick: impl FnOnce(&[Token]) -> Vec<usize>,
-) -> Result<(usize, Vec<String>)> {
+/// Revoke the tokens `pick` selects: how many it selects, and the names of
+/// those revoked now (the others already were).
+pub(super) fn revoke_where(root: &Path, why: &str, pick: impl Fn(&Token) -> bool) -> Result<(usize, Vec<String>)> {
     change(root, |file| {
-        let picked = pick(&file.tokens);
-        let now = Timestamp::now().to_rfc3339();
-        let mut revoked = Vec::new();
-        for &i in &picked {
-            let t = &mut file.tokens[i];
-            if t.revoked_at.is_none() {
-                t.revoked_at = Some(now.clone());
-                revoked.push(t.name.clone());
-                let event = t.event("revoked", Some(why));
-                file.events.push(event);
-            }
-        }
-        Ok((picked.len(), revoked))
+        let known = file.tokens.iter().filter(|t| pick(t)).count();
+        Ok((known, file.revoke(why, pick)))
     })
 }
 
@@ -194,19 +175,10 @@ pub(super) fn revoke_where(
 /// of the tokens revoked. One signed in since is the account's new consent.
 pub fn end_sign_ins_before(root: &Path, issuer: &str, subject: &str, at: Timestamp) -> Result<Vec<String>> {
     change_scoped(root, &Scope { account: Some((issuer, subject)), ..Scope::default() }, |_, file| {
-        let now = Timestamp::now().to_rfc3339();
-        let (mut revoked, mut events) = (Vec::new(), Vec::new());
-        for t in &mut file.tokens {
+        Ok(file.revoke("its consent was revoked at its provider", |t| {
             let theirs = t.identity.as_ref().is_some_and(|g| g.issuer == issuer && g.subject == subject);
-            let before = Timestamp::parse_rfc3339(&t.created_at).is_ok_and(|created| created < at);
-            if theirs && before && t.revoked_at.is_none() {
-                t.revoked_at = Some(now.clone());
-                revoked.push(t.name.clone());
-                events.push(t.event("revoked", Some("its consent was revoked at its provider")));
-            }
-        }
-        file.events.extend(events);
-        Ok(revoked)
+            theirs && Timestamp::parse_rfc3339(&t.created_at).is_ok_and(|created| created < at)
+        }))
     })
 }
 
@@ -236,7 +208,7 @@ pub fn forget_account(root: &Path, issuer: &str, subject: &str) -> Result<bool> 
 
 /// The one account `name` names: its actor (unless linked accounts share
 /// it), else its latest login at one provider.
-pub(super) fn one_account<'a>(accounts: &'a [Account], name: &str) -> Result<&'a Account> {
+fn one_account<'a>(accounts: &'a [Account], name: &str) -> Result<&'a Account> {
     let named = |s: &str| s.eq_ignore_ascii_case(name);
     let by_actor: Vec<&Account> = accounts.iter().filter(|a| named(&a.actor)).collect();
     let found = match by_actor.is_empty() {
@@ -310,17 +282,8 @@ pub(super) fn link(root: &Path, name: &str, to: &str) -> Result<Linked> {
         if account.actor == target {
             return Err(Error::invalid(format!("{} acts as {target} already", account.who())));
         }
-        let now = Timestamp::now().to_rfc3339();
-        let (mut revoked, mut events) = (Vec::new(), Vec::new());
-        for t in &mut file.tokens {
-            let theirs = t.identity.as_ref().is_some_and(|g| account.is(g));
-            if theirs && t.revoked_at.is_none() {
-                t.revoked_at = Some(now.clone());
-                revoked.push(t.name.clone());
-                events.push(t.event("revoked", Some(&format!("an admin linked its account to {target}"))));
-            }
-        }
-        file.events.extend(events);
+        let why = format!("an admin linked its account to {target}");
+        let revoked = file.revoke(&why, |t| t.identity.as_ref().is_some_and(|g| account.is(g)));
         let bound = file.accounts.iter_mut().find(|a| a.is_same(&account)).expect("found above");
         bound.actor = target.clone();
         let now_bound = bound.clone();
@@ -390,21 +353,10 @@ pub(super) fn revoke_account(root: &Path, login: &str, forget: bool) -> Result<A
                     || (named(&g.login) && (accounts.is_empty() || providers.contains(&g.provider.as_str())))
             })
         };
-        let picked: Vec<usize> = (0..file.tokens.len()).filter(|&i| theirs(&file.tokens[i])).collect();
-        if accounts.is_empty() && picked.is_empty() {
+        if accounts.is_empty() && !file.tokens.iter().any(&theirs) {
             return Err(Error::not_found("account with access tokens", login));
         }
-        let now = Timestamp::now().to_rfc3339();
-        let mut revoked = Vec::new();
-        for i in picked {
-            let t = &mut file.tokens[i];
-            if t.revoked_at.is_none() {
-                t.revoked_at = Some(now.clone());
-                revoked.push(t.name.clone());
-                let event = t.event("revoked", Some("an admin revoked the account's tokens"));
-                file.events.push(event);
-            }
-        }
+        let revoked = file.revoke("an admin revoked the account's tokens", theirs);
         if forget {
             // Erased, not kept until pruned: the account and every record of its tokens.
             file.accounts.retain(|a| !accounts.contains(a));

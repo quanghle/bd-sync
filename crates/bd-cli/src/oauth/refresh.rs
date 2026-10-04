@@ -5,7 +5,7 @@ use super::*;
 
 /// Refresh the sign-in whose refresh secret this is (`POST
 /// /v2/auth/refresh`, request `request_id`): new secrets, with what the
-/// rules grant its account now, asked of GitHub as the App. The secret
+/// rules or the authorizer grant its account now (GitHub asked as the App). The secret
 /// spent by the latest refresh, sent again with its request id (a client
 /// whose answer was lost), refreshes again. A refusal is
 /// `Error::Unauthorized`, and revokes the sign-in when the rules no longer
@@ -16,13 +16,19 @@ use super::*;
 /// tokens issued to it, as `/v2/auth/refresh` only refreshes those issued
 /// to no client.
 pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>) -> Result<Issued> {
-    let refused = |why: String| Error::Unauthorized(format!("{why}; sign in again: `bd remote login`"));
+    let refused =
+        |why: String| Error::Unauthorized(format!("{why}; sign in again: `bd remote login --provider <name>`"));
     let sign_in = enabled(root)?;
     let Some((token, current)) = auth::find_refresh(root, secret)? else {
         return Err(refused("this bd server does not know the sign-in (it was revoked, or has ended)".into()));
     };
     let (Some(user), Some(state)) = (token.identity.clone(), token.refresh.clone()) else {
         return Err(refused("not a sign-in's refresh token".into()));
+    };
+    // Its provider known, the way back is exact.
+    let provider = user.provider.clone();
+    let refused = move |why: String| {
+        Error::Unauthorized(format!("{why}; sign in again: `bd remote login --provider {provider}`"))
     };
     if token.client.as_deref() != client {
         return Err(refused(match &token.client {
@@ -60,6 +66,10 @@ pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>
             false => format!("the sign-in was last refreshed at {}, too long ago", state.refreshed_at),
         };
         return Err(refused(why));
+    }
+    if sign_in.oidc(&user.provider).is_some_and(|o| o.deny.contains(&user.subject)) {
+        revoke("the account is denied")?;
+        return Err(refused(format!("{} may not use this bd server", user.who())));
     }
     // A GitHub account is never one denied, and, with the GitHub App, is taken as GitHub names it now. Without
     // the App (and for other providers), the authorizer decides on the identity of the sign-in.
@@ -187,20 +197,8 @@ pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>
     let until = limit.min(now.plus(sign_in.refresh_idle));
     let expires_at = now.plus(sign_in.token_ttl);
     let last = auth::LastRefresh { spent: auth::hash(secret), request: auth::hash(request_id) };
-    let rotated = auth::rotate(
-        root,
-        &token.id,
-        &state.sha256,
-        last,
-        &now_user,
-        fresh,
-        grant,
-        by_login,
-        decided,
-        rule,
-        expires_at,
-        until,
-    )?;
+    let rotation = auth::Rotation { last, user: &now_user, fresh, grant, by_login, decided, rule, expires_at, until };
+    let rotated = auth::rotate(root, &token.id, &state.sha256, rotation)?;
     let Some(issued) = rotated else {
         revoke("its refresh token was used twice")?;
         return Err(refused(
@@ -222,4 +220,125 @@ pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>
         "sign-in refreshed"
     );
     Ok(answer_of(issued, now_user.login, via))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACME: &str =
+        "[oidc.acme]\nissuer = \"https://idp.example\"\nclient_id = \"c\"\nclient_secret_file = \"secret\"\n";
+
+    /// Write `auth.toml` with `rules`, as a change the next load sees.
+    fn configure(root: &Path, rules: &str) {
+        let file = root.join(FILE);
+        let stamp = std::fs::metadata(&file).ok().and_then(|m| m.modified().ok());
+        std::fs::write(&file, format!("{ACME}{rules}")).unwrap();
+        if let Some(before) = stamp {
+            let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+            f.set_modified(before + Duration::from_secs(1)).unwrap();
+        }
+    }
+
+    fn root(rules: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("secret"), "s3cret").unwrap();
+        configure(dir.path(), rules);
+        dir
+    }
+
+    /// Sign `subject` in to `workspace` as poll_oidc does; the refresh secret.
+    fn sign_in(root: &Path, subject: &str, workspace: &str) -> Result<String> {
+        let s = load(root)?.unwrap();
+        let oidc = s.oidc("acme").unwrap();
+        let claims = crate::oidc::Claims {
+            subject: subject.into(),
+            login: format!("user-{subject}"),
+            email: None,
+            all: serde_json::json!({}),
+        };
+        let Admitted { user, grant, by_login, rule, .. } = admit_oidc(root, &s, oidc, &claims, workspace, None)?;
+        let life = auth::Lifetime { rule, ..s.lifetime(Timestamp::now(), &user.provider) };
+        let issued = auth::issue_sign_in_token(root, &user, grant, life, workspace, by_login)?;
+        Ok(issued.refresh_secret.unwrap())
+    }
+
+    fn live(root: &Path) -> usize {
+        let conn = crate::server_db::open(root).unwrap();
+        let sql = "SELECT count(*) FROM tokens WHERE json_extract(data, '$.revoked_at') IS NULL";
+        conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap() as usize
+    }
+
+    #[test]
+    fn rules_admit_by_subject_and_workspace() {
+        let dir = root("[[oidc.acme.allow]]\nsubjects = [\"s-1\"]\nworkspaces = [\"proj\"]\n");
+        assert!(sign_in(dir.path(), "s-1", "proj").is_ok());
+        for (subject, workspace) in [("s-1", "ops"), ("s-2", "proj")] {
+            let e = sign_in(dir.path(), subject, workspace).unwrap_err();
+            assert!(matches!(e, Error::Unauthorized(_)), "{subject} {workspace}: {e}");
+            assert!(e.to_string().contains(&format!("may not use workspace {workspace}")), "{e}");
+        }
+    }
+
+    #[test]
+    fn denied_subjects_never_sign_in_and_their_sign_ins_end_at_refresh() {
+        let dir = root("[[oidc.acme.allow]]\nanyone = true\n");
+        let secret = sign_in(dir.path(), "s-1", "proj").unwrap();
+        configure(dir.path(), "deny = [\"s-1\"]\n[[oidc.acme.allow]]\nanyone = true\n");
+        let e = sign_in(dir.path(), "s-1", "proj").unwrap_err();
+        assert!(matches!(e, Error::Unauthorized(_)) && e.to_string().contains("may not sign in"), "{e}");
+        assert!(sign_in(dir.path(), "s-2", "proj").is_ok(), "others still do");
+        let e = refresh(dir.path(), &secret, "r-1", None).unwrap_err();
+        assert!(e.to_string().contains("may not use this bd server"), "{e}");
+        assert_eq!(live(dir.path()), 1, "s-1's sign-in was revoked");
+    }
+
+    #[test]
+    fn refreshes_rotate_once_and_a_spent_secret_revokes_the_sign_in() {
+        let dir = root("[[oidc.acme.allow]]\nsubjects = [\"s-1\"]\n");
+        let first = sign_in(dir.path(), "s-1", "proj").unwrap();
+        let second = refresh(dir.path(), &first, "r-1", None).unwrap();
+        // The answer was lost: the same secret and request again refreshes again.
+        let again = refresh(dir.path(), &first, "r-1", None).unwrap();
+        assert_ne!(second.refresh_token, again.refresh_token);
+        // Under another request it is a copy's: the sign-in ends.
+        let e = refresh(dir.path(), &first, "r-2", None).unwrap_err();
+        assert!(e.to_string().contains("used already") && e.to_string().contains("--provider acme"), "{e}");
+        assert_eq!(live(dir.path()), 0);
+        assert!(refresh(dir.path(), again.refresh_token.as_deref().unwrap(), "r-3", None).is_err(), "revoked");
+    }
+
+    #[test]
+    fn refreshes_are_refused_to_other_clients_and_after_the_rules_change() {
+        let dir = root("[[oidc.acme.allow]]\nsubjects = [\"s-1\"]\n");
+        let secret = sign_in(dir.path(), "s-1", "proj").unwrap();
+        let e = refresh(dir.path(), &secret, "r-1", Some("https://client.example")).unwrap_err();
+        assert!(e.to_string().contains("issued to another client"), "{e}");
+        assert_eq!(live(dir.path()), 1, "a client's mistake ends nothing");
+        let unknown = refresh(dir.path(), "bdr_x", "r-1", None).unwrap_err();
+        assert!(unknown.to_string().contains("--provider <name>"), "{unknown}");
+        // The rule that let it in is gone: refused, and revoked.
+        configure(dir.path(), "[[oidc.acme.allow]]\nsubjects = [\"s-2\"]\n");
+        let e = refresh(dir.path(), &secret, "r-1", None).unwrap_err();
+        assert!(matches!(e, Error::Unauthorized(_)) && e.to_string().contains("no longer let it into"), "{e}");
+        assert_eq!(live(dir.path()), 0);
+    }
+
+    #[test]
+    fn sign_ins_unused_too_long_or_too_old_are_not_refreshed() {
+        let dir = root("[[oidc.acme.allow]]\nsubjects = [\"s-1\"]\n");
+        let age = |path: &str| {
+            let conn = crate::server_db::open(dir.path()).unwrap();
+            let sql = format!("UPDATE tokens SET data = json_set(data, '{path}', '2020-01-01T00:00:00.000Z')");
+            conn.execute(&sql, []).unwrap();
+        };
+        let secret = sign_in(dir.path(), "s-1", "proj").unwrap();
+        age("$.refresh.refreshed_at");
+        let e = refresh(dir.path(), &secret, "r-1", None).unwrap_err();
+        assert!(e.to_string().contains("too long ago"), "{e}");
+        let secret = sign_in(dir.path(), "s-1", "proj").unwrap();
+        age("$.created_at");
+        let e = refresh(dir.path(), &secret, "r-1", None).unwrap_err();
+        assert!(e.to_string().contains("older than the server lets it be refreshed"), "{e}");
+    }
 }

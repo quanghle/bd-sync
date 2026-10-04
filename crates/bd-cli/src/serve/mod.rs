@@ -10,7 +10,7 @@
 //! Layout: `<root>/<name>/.bd/bd.db` is workspace `<name>`, served at
 //! `POST /w/<name>/v2/exec` (the wire format is in `protocol.rs`);
 //! `<root>/server.db` holds the access tokens (`server_db.rs`), and `<root>/auth.toml`
-//! turns on GitHub sign-in, served at `POST /v2/auth/github/{device,token}`
+//! turns on sign-in, served at `POST /v2/auth/<provider>/{device,token}`
 //! without a token (`oauth/`); `POST /v2/auth/revoke` revokes the token it
 //! is sent with, if it came from sign-in, and `POST /v2/auth/refresh` renews
 //! the sign-in whose refresh token it is sent with. `POST /w/<name>/mcp`
@@ -90,6 +90,7 @@ use crate::stream::{FrameWriter, Limits, ResponseBody, Stalls};
 use crate::{oauth, oauth_server};
 
 mod authorization;
+mod check;
 mod exec;
 mod listen;
 mod mcp_endpoint;
@@ -192,6 +193,7 @@ pub fn cmd_serve(app: &mut App, a: &ServeArgs) -> Result<()> {
     io::require_local("bd serve")?;
     match &a.action {
         Some(ServeAction::Token(cmd)) => auth::cmd_token(app, cmd),
+        Some(ServeAction::Check(c)) => check::check(app, c),
         None => run(a),
     }
 }
@@ -265,6 +267,61 @@ fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response<B
 }
 
 /// Run `f` on a blocking thread.
+/// Why a request's body could not be had.
+enum BodyError {
+    /// Longer than allowed.
+    TooLarge,
+    Unreadable(String),
+    /// Not all there within the wait.
+    Late(Duration),
+}
+
+/// The whole body of a request, at most `max` bytes, within `wait`.
+async fn read_body(body: Incoming, max: usize, wait: Duration) -> std::result::Result<Bytes, BodyError> {
+    match tokio::time::timeout(wait, Limited::new(body, max).collect()).await {
+        Ok(Ok(b)) => Ok(b.to_bytes()),
+        Ok(Err(e)) if e.is::<LengthLimitError>() => Err(BodyError::TooLarge),
+        Ok(Err(e)) => Err(BodyError::Unreadable(e.to_string())),
+        Err(_) => Err(BodyError::Late(wait)),
+    }
+}
+
+impl BodyError {
+    /// The answer of bd's own endpoints (`what` the request is, at most `max` bytes).
+    fn response(&self, what: &str, max: usize) -> Response<Body> {
+        match self {
+            BodyError::TooLarge => {
+                let msg = format!("{what} larger than {} KiB", max >> 10);
+                Reject::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid", msg, 2).response()
+            }
+            BodyError::Unreadable(e) => {
+                Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response()
+            }
+            BodyError::Late(wait) => {
+                let msg = format!("the request body did not arrive within {}s", wait.as_secs());
+                Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response()
+            }
+        }
+    }
+
+    /// The answer of the OAuth endpoints (RFC 6749 section 5.2), `too_large` the code for a body too large.
+    fn oauth(&self, too_large: &str, max: usize) -> Response<Body> {
+        match self {
+            BodyError::TooLarge => {
+                let why = format!("the request is larger than {} KiB", max >> 10);
+                oauth_error(StatusCode::PAYLOAD_TOO_LARGE, too_large, &why)
+            }
+            BodyError::Unreadable(e) => {
+                oauth_error(StatusCode::BAD_REQUEST, "invalid_request", &format!("reading the request: {e}"))
+            }
+            BodyError::Late(wait) => {
+                let why = format!("the request body did not arrive within {}s", wait.as_secs());
+                oauth_error(StatusCode::REQUEST_TIMEOUT, "invalid_request", &why)
+            }
+        }
+    }
+}
+
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
     match tokio::task::spawn_blocking(f).await {
         Ok(result) => result,
@@ -294,9 +351,9 @@ fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Tok
         Ok(Verified::Valid(token)) => Ok(token),
         Ok(Verified::Expired(token)) => {
             let at = token.expires_at.map(|t| t.to_rfc3339()).unwrap_or_default();
-            let renew = match token.identity {
-                Some(_) => "sign in again: `bd remote login`",
-                None => "the server's admin issues new ones",
+            let renew = match &token.identity {
+                Some(g) => format!("sign in again: `bd remote login --provider {}`", g.provider),
+                None => "the server's admin issues new ones".to_string(),
             };
             let msg = format!("access token {} expired at {at}; {renew}", token.name);
             Err(Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7))
@@ -358,6 +415,16 @@ fn busy(doing: &str) -> Response<Body> {
 
 fn shutting_down() -> Response<Body> {
     Reject::shutting_down().response()
+}
+
+/// Wait up to `QUEUE_WAIT` for `permits` of `slots`; past it the server is
+/// busy `doing` what holds them.
+async fn queue(slots: &Arc<Semaphore>, permits: u32, doing: &str) -> Result<OwnedSemaphorePermit, Reject> {
+    match tokio::time::timeout(QUEUE_WAIT, slots.clone().acquire_many_owned(permits)).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(Reject::shutting_down()),
+        Err(_) => Err(Reject::busy(doing)),
+    }
 }
 
 struct Server {
@@ -728,11 +795,7 @@ impl Server {
             if *stopping.borrow() {
                 return Err(Reject::shutting_down());
             }
-            let slot = match tokio::time::timeout(QUEUE_WAIT, self.running.clone().acquire_owned()).await {
-                Ok(Ok(permit)) => permit,
-                Ok(Err(_)) => return Err(Reject::shutting_down()),
-                Err(_) => return Err(Reject::busy("running other commands")),
-            };
+            let slot = queue(&self.running, 1, "running other commands").await?;
             let (srv, ws2, args2) = (self.clone(), ws.clone(), args.clone());
             let probed = tokio::task::spawn_blocking(move || {
                 let _slot = slot;
@@ -1083,13 +1146,17 @@ mod tests {
 
     #[test]
     fn sign_in_paths() {
-        assert_eq!(sign_in_path("/v2/auth/github/device"), Some(("github".into(), SignIn::Device)));
+        assert_eq!(sign_in_path("/v2/auth/github/device"), Some(("github".into(), SignInStep::Device)));
         assert_eq!(
             sign_in_path("/bd/v2/auth/github/token"),
-            Some(("github".into(), SignIn::Token)),
+            Some(("github".into(), SignInStep::Token)),
             "under a proxy prefix"
         );
-        assert_eq!(sign_in_path("/v2/auth/acme-sso/token"), Some(("acme-sso".into(), SignIn::Token)), "any provider");
+        assert_eq!(
+            sign_in_path("/v2/auth/acme-sso/token"),
+            Some(("acme-sso".into(), SignInStep::Token)),
+            "any provider"
+        );
         for bad in [
             "/v2/auth/github/",
             "/v2/auth/github/device/",

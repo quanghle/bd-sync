@@ -156,7 +156,7 @@ pub(super) fn run(a: &ServeArgs) -> Result<()> {
     served
 }
 
-pub(super) fn tls_acceptor(cert: &Path, key: &Path) -> Result<TlsAcceptor> {
+fn tls_acceptor(cert: &Path, key: &Path) -> Result<TlsAcceptor> {
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
     let bad =
@@ -305,7 +305,7 @@ pub(super) async fn connection(server: Arc<Server>, stream: TcpStream, peer: Soc
     }
 }
 
-pub(super) async fn shutdown_signal() {
+async fn shutdown_signal() {
     let interrupt = async {
         if tokio::signal::ctrl_c().await.is_err() {
             std::future::pending::<()>().await;

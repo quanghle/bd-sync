@@ -2,12 +2,18 @@
 
 use super::*;
 
-pub(super) fn root_dir(a: &TokenRootArgs) -> Result<PathBuf> {
-    if a.root.is_dir() {
-        Ok(a.root.clone())
-    } else {
-        Err(Error::invalid(format!("--root {}: not a directory", a.root.display())))
+fn root_dir(a: &TokenRootArgs) -> Result<PathBuf> {
+    if !a.root.is_dir() {
+        return Err(Error::invalid(format!("--root {}: not a directory", a.root.display())));
     }
+    // A workspace's own directory is a likely slip: its tokens would be in a server.db no server reads.
+    if a.root.join(".bd").is_dir() {
+        return Err(Error::invalid(format!(
+            "--root {}: that is a workspace (it has .bd/); --root names the directory holding the workspaces",
+            a.root.display()
+        )));
+    }
+    Ok(a.root.clone())
 }
 
 pub fn cmd_token(app: &mut App, cmd: &TokenCommand) -> Result<()> {
@@ -27,12 +33,27 @@ pub(super) fn create(app: &mut App, a: &TokenCreateArgs) -> Result<()> {
     let grant = Grant { role: a.role, kind: a.kind, workspaces: a.workspaces.clone(), max_claims: a.max_claims };
     let holder = Holder::Admin { name: a.name.trim(), actor: a.act_as.trim(), resource: a.resource.as_deref() };
     let (token, secret) = add_token(&root, holder, grant).map(|issued| (issued.token, issued.secret))?;
+    // Workspaces are named before they exist, which may be on purpose; a typo is not, so say so.
+    for w in token.workspaces.iter().filter(|w| *w != "*") {
+        if !root.join(w).join(".bd").join("bd.db").is_file() {
+            crate::io::errln(format!(
+                "warning: no workspace {w} under {}: the token works there once it exists",
+                root.display()
+            ));
+        }
+    }
     let mut view = token.view();
     view["token"] = json!(secret);
     let out = Out::new(view)
         .line(format!("✓ Created access token {}: {}", token.name, token.describe()))
         .line(secret.clone())
-        .line("Shown only once. On the client, save it with `bd remote login`, or set it as BD_TOKEN.")
+        .line(match &token.resource {
+            Some(url) => format!(
+                "Shown only once. It works at {url} only: give it to the MCP client as its bearer token \
+                 (docs/mcp.md, Connecting clients)."
+            ),
+            None => "Shown only once. On the client, save it with `bd remote login`, or set it as BD_TOKEN.".into(),
+        })
         .id(secret);
     app.print(out);
     Ok(())
@@ -45,7 +66,7 @@ pub(super) fn list(app: &mut App, a: &TokenRootArgs) -> Result<()> {
     if file.tokens.is_empty() {
         out = out.line(
             "No access tokens. Create one with `bd serve token create <name> --as <actor>`, or let people sign in \
-             in (auth.toml).",
+             (auth.toml).",
         );
     }
     for t in &file.tokens {
@@ -55,7 +76,7 @@ pub(super) fn list(app: &mut App, a: &TokenRootArgs) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn name_command(app: &mut App, a: &TokenNameArgs) -> Result<()> {
+fn name_command(app: &mut App, a: &TokenNameArgs) -> Result<()> {
     let name = a.name.as_deref().map(str::trim);
     let account = set_name(&root_dir(&a.root)?, a.account.trim(), name)?;
     let line = match &account.name {
@@ -66,7 +87,7 @@ pub(super) fn name_command(app: &mut App, a: &TokenNameArgs) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn link_command(app: &mut App, a: &TokenLinkArgs) -> Result<()> {
+fn link_command(app: &mut App, a: &TokenLinkArgs) -> Result<()> {
     let done = link(&root_dir(&a.root)?, a.account.trim(), a.to.trim())?;
     let to = &done.account.actor;
     let mut out = Out::new(json!({
@@ -91,7 +112,10 @@ pub(super) fn events(app: &mut App, a: &TokenEventsArgs) -> Result<()> {
         Some(d) => Timestamp::now().millis() - bd_core::time::parse_duration(d)?.as_millis() as i64,
         None => 0,
     };
-    let events = server_db::events(&root, since, a.actor.as_deref(), a.limit)?;
+    if let Some(kind) = a.kinds.iter().find(|k| !server_db::KINDS.contains(&k.as_str())) {
+        return Err(Error::invalid(format!("--kind {kind:?} is not one of {}", server_db::KINDS.join(", "))));
+    }
+    let events = server_db::events(&root, since, a.actor.as_deref(), &a.kinds, a.limit)?;
     let mut out = Out::new(json!(events));
     if events.is_empty() {
         out = out.line("No events.");
@@ -123,8 +147,12 @@ pub(super) fn accounts(app: &mut App, a: &TokenRootArgs) -> Result<()> {
     let file = read(&root_dir(a)?)?;
     let now = Timestamp::now();
     let live = |account: &Account| {
-        let live = |t: &&Token| t.revoked_at.is_none() && !t.expired(now);
-        file.tokens.iter().filter(live).filter(|t| t.identity.as_ref().is_some_and(|g| account.is(g))).count()
+        // Expired sign-ins that may still be refreshed count: their clients carry on.
+        file.tokens
+            .iter()
+            .filter(|t| !t.ended(now))
+            .filter(|t| t.identity.as_ref().is_some_and(|g| account.is(g)))
+            .count()
     };
     let views: Vec<serde_json::Value> = file
         .accounts
@@ -162,8 +190,7 @@ pub(super) fn accounts(app: &mut App, a: &TokenRootArgs) -> Result<()> {
 pub(super) fn revoke(app: &mut App, a: &TokenRevokeArgs) -> Result<()> {
     let root = root_dir(&a.root)?;
     if let Some(client) = a.client.as_deref().map(str::trim) {
-        let theirs =
-            |tokens: &[Token]| (0..tokens.len()).filter(|&i| tokens[i].client.as_deref() == Some(client)).collect();
+        let theirs = |t: &Token| t.client.as_deref() == Some(client);
         let (known, revoked) = revoke_where(&root, "an admin revoked the client's tokens", theirs)?;
         if known == 0 {
             return Err(Error::not_found("OAuth client with access tokens", client));
@@ -179,7 +206,7 @@ pub(super) fn revoke(app: &mut App, a: &TokenRevokeArgs) -> Result<()> {
     }
     match (&a.name, a.account.as_deref().map(str::trim)) {
         (Some(name), None) => {
-            let named = |tokens: &[Token]| (0..tokens.len()).filter(|&i| tokens[i].name == *name).collect();
+            let named = |t: &Token| t.name == *name;
             let (known, revoked) = revoke_where(&root, "an admin revoked it", named)?;
             if known == 0 {
                 return Err(Error::not_found("access token", name.as_str()));
@@ -188,7 +215,7 @@ pub(super) fn revoke(app: &mut App, a: &TokenRevokeArgs) -> Result<()> {
                 true => format!("= {name} was already revoked"),
                 false => format!("✓ Revoked access token {name}"),
             };
-            app.print(Out::new(json!({ "name": name, "revoked": !revoked.is_empty() })).line(text).id(name.clone()));
+            app.print(Out::new(json!({ "name": name, "revoked": revoked })).line(text).id(name.clone()));
         }
         (None, Some(login)) => {
             let done = revoke_account(&root, login, a.forget)?;

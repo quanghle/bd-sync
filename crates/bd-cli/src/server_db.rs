@@ -19,11 +19,18 @@ use bd_core::{Error, Result, Timestamp};
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use serde_json::Value;
 
-/// How long a change waits for another one to finish.
-const BUSY_WAIT: Duration = Duration::from_secs(10);
+/// How long a change waits for another one to finish. Debug builds take
+/// `BD_TEST_BUSY_MS` instead, so tests need not wait it out.
+fn busy_wait() -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = std::env::var("BD_TEST_BUSY_MS").ok().and_then(|v| v.parse().ok()) {
+        return Duration::from_millis(ms);
+    }
+    Duration::from_secs(10)
+}
 
 /// The schema this bd writes (`PRAGMA user_version`).
-const VERSION: i64 = 1;
+const VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE accounts (
@@ -62,6 +69,7 @@ CREATE TABLE auth_events (
     at INTEGER NOT NULL,
     kind TEXT NOT NULL,
     actor TEXT,
+    actor_key TEXT,
     provider TEXT,
     issuer TEXT,
     subject TEXT,
@@ -70,6 +78,7 @@ CREATE TABLE auth_events (
     detail TEXT
 );
 CREATE INDEX auth_events_at ON auth_events (at);
+CREATE INDEX auth_events_actor ON auth_events (actor_key) WHERE actor_key IS NOT NULL;
 CREATE INDEX auth_events_account ON auth_events (issuer, subject) WHERE subject IS NOT NULL;
 ";
 
@@ -120,7 +129,7 @@ pub fn open_existing(root: &Path) -> Result<Option<Connection>> {
 fn connect(path: &Path) -> Result<Connection> {
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let conn = Connection::open_with_flags(path, flags).map_err(|e| failed(path, e))?;
-    conn.busy_timeout(BUSY_WAIT).map_err(|e| failed(path, e))?;
+    conn.busy_timeout(busy_wait()).map_err(|e| failed(path, e))?;
     conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| failed(path, e))?;
     conn.pragma_update(None, "synchronous", "FULL").map_err(|e| failed(path, e))?;
     // What is deleted is overwritten, not left in free pages (an erased account must be gone); the write-ahead log is
@@ -202,36 +211,42 @@ pub fn failed(path: &Path, e: rusqlite::Error) -> Error {
 }
 
 /// Write a consistent, compacted copy of `<root>/server.db` to `dest`, which
-/// must not exist, as workspaces' backups are written (`Store::snapshot`):
+/// must not exist, as workspaces' backups are written (`bd_core::store::snapshot`):
 /// created 0600 first, `VACUUM INTO` in a read transaction, checked and
 /// flushed; removed if anything failed.
 pub fn snapshot(root: &Path, dest: &Path) -> Result<()> {
     let Some(conn) = open_existing(root)? else {
         return Err(Error::invalid(format!("{} does not exist", path(root).display())));
     };
-    let target = dest.to_str().ok_or_else(|| Error::invalid(format!("{}: not a UTF-8 path", dest.display())))?;
-    let mut create = std::fs::OpenOptions::new();
-    create.write(true).create_new(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut create, 0o600);
-    create.open(dest).map_err(|e| match e.kind() {
-        std::io::ErrorKind::AlreadyExists => Error::invalid(format!("{} already exists", dest.display())),
-        _ => Error::Io(e),
-    })?;
-    let written = conn.execute("VACUUM INTO ?1", [target]).map_err(|e| failed(&path(root), e)).and_then(|_| {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        let copy = Connection::open_with_flags(dest, flags).map_err(|e| failed(dest, e))?;
-        let check: String = copy.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(|e| failed(dest, e))?;
-        if check != "ok" {
-            return Err(Error::Io(std::io::Error::other(format!("{}: the copy is damaged: {check}", dest.display()))));
-        }
-        std::fs::File::open(dest)?.sync_all()?;
-        Ok(())
-    });
-    if written.is_err() {
-        let _ = std::fs::remove_file(dest);
+    bd_core::store::snapshot(&conn, dest).map_err(|e| match e {
+        Error::Sqlite(e) => failed(&path(root), e),
+        other => other,
+    })
+}
+
+/// Write a table's rows back after a change: `upsert` those of `after`
+/// whose record (as JSON, given it) is not as in `before`, and `delete`
+/// (by `key`) those it no longer has. Rows unchanged are not written.
+pub fn sync_rows<T: serde::Serialize, K: Eq + std::hash::Hash>(
+    before: &[T],
+    after: &[T],
+    key: impl Fn(&T) -> K,
+    mut delete: impl FnMut(&K) -> Result<()>,
+    mut upsert: impl FnMut(&T, &str) -> Result<()>,
+) -> Result<()> {
+    let was: std::collections::HashMap<K, String> =
+        before.iter().map(|r| Ok((key(r), serde_json::to_string(r)?))).collect::<Result<_>>()?;
+    let kept: std::collections::HashSet<K> = after.iter().map(&key).collect();
+    for gone in was.keys().filter(|k| !kept.contains(*k)) {
+        delete(gone)?;
     }
-    written
+    for row in after {
+        let data = serde_json::to_string(row)?;
+        if was.get(&key(row)) != Some(&data) {
+            upsert(row, &data)?;
+        }
+    }
+    Ok(())
 }
 
 /// How long the audit trail keeps an event.
@@ -267,12 +282,13 @@ pub struct AuthEvent {
 /// Record `event`, as of now, in the transaction of the change it is of.
 pub fn record(tx: &rusqlite::Transaction, event: &AuthEvent) -> Result<()> {
     tx.execute(
-        "INSERT INTO auth_events (at, kind, actor, provider, issuer, subject, token, client, detail) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO auth_events (at, kind, actor, actor_key, provider, issuer, subject, token, client, detail) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         rusqlite::params![
             Timestamp::now().millis(),
             event.kind,
             event.actor,
+            event.actor.as_deref().map(key),
             event.provider,
             event.issuer,
             event.subject,
@@ -306,51 +322,52 @@ pub struct KeptEvent {
     pub event: AuthEvent,
 }
 
-/// The latest `limit` events since `since` (milliseconds), of `actor` or its sub-actors if given, oldest first.
-pub fn events(root: &Path, since: i64, actor: Option<&str>, limit: usize) -> Result<Vec<KeptEvent>> {
+/// The latest `limit` events since `since` (milliseconds), of `actor` or its sub-actors if given, of `kinds` if any,
+/// oldest first.
+pub fn events(root: &Path, since: i64, actor: Option<&str>, kinds: &[String], limit: usize) -> Result<Vec<KeptEvent>> {
     let Some(conn) = open_existing(root)? else { return Ok(Vec::new()) };
-    let mut stmt = conn.prepare(
-        "SELECT at, kind, actor, provider, issuer, subject, token, client, detail FROM auth_events \
-         WHERE at >= ?1 ORDER BY seq",
-    )?;
-    let rows = stmt.query_map([since], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            AuthEvent {
-                kind: "",
-                actor: r.get(2)?,
-                provider: r.get(3)?,
-                issuer: r.get(4)?,
-                subject: r.get(5)?,
-                token: r.get(6)?,
-                client: r.get(7)?,
-                detail: r.get(8)?,
-            },
-        ))
-    })?;
-    let wanted = actor.map(key);
-    let related = |a: &str| {
-        wanted.as_deref().is_none_or(|w| {
-            let a = key(a);
-            a == w || a.strip_prefix(w).is_some_and(|r| r.starts_with('/'))
-        })
-    };
-    let mut out = Vec::new();
-    for row in rows {
-        let (at, kind, mut event) = row?;
-        if !related(event.actor.as_deref().unwrap_or_default()) {
-            continue;
-        }
-        event.kind = KINDS.iter().copied().find(|k| *k == kind).unwrap_or("other");
-        out.push(KeptEvent { at: Timestamp::from_millis(at), event });
+    let mut sql = String::from(
+        "SELECT at, kind, actor, provider, issuer, subject, token, client, detail FROM auth_events WHERE at >= ?",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(since)];
+    if let Some(actor) = actor {
+        // The actor itself, and its sub-actors by key range ('0' follows '/').
+        let key = key(actor);
+        sql.push_str(" AND (actor_key = ? OR (actor_key > ? AND actor_key < ?))");
+        let (low, high) = (format!("{key}/"), format!("{key}0"));
+        args.push(Box::new(key));
+        args.push(Box::new(low));
+        args.push(Box::new(high));
     }
-    let skip = out.len().saturating_sub(limit);
-    Ok(out.split_off(skip))
+    if !kinds.is_empty() {
+        sql.push_str(&format!(" AND kind IN ({})", vec!["?"; kinds.len()].join(", ")));
+        args.extend(kinds.iter().map(|k| Box::new(k.clone()) as Box<dyn rusqlite::ToSql>));
+    }
+    // The latest `limit`, given oldest first.
+    sql.push_str(" ORDER BY seq DESC LIMIT ?");
+    args.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(args.iter().map(|a| a.as_ref())), |r| {
+        let kind: String = r.get(1)?;
+        let event = AuthEvent {
+            kind: KINDS.iter().copied().find(|k| *k == kind).unwrap_or("other"),
+            actor: r.get(2)?,
+            provider: r.get(3)?,
+            issuer: r.get(4)?,
+            subject: r.get(5)?,
+            token: r.get(6)?,
+            client: r.get(7)?,
+            detail: r.get(8)?,
+        };
+        Ok(KeptEvent { at: Timestamp::from_millis(r.get(0)?), event })
+    })?;
+    let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    out.reverse();
+    Ok(out)
 }
 
 /// The kinds of [`AuthEvent`].
-const KINDS: &[&str] =
+pub const KINDS: &[&str] =
     &["signed_in", "token_created", "refreshed", "revoked", "forgotten", "client_registered", "linked", "named"];
 
 /// How actors and logins are compared: regardless of case.
@@ -393,6 +410,45 @@ pub fn account_keys(a: &Value) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every lookup server.db's code prepares uses an index: none reads a
+    /// whole table but those that read every row by design.
+    #[test]
+    fn lookups_use_their_indexes() {
+        const INDEXED: &[&str] = &[
+            "SELECT seq, data FROM tokens WHERE id = ?1",
+            "SELECT data FROM tokens WHERE sha256 = ?1 ORDER BY seq",
+            "SELECT data FROM tokens WHERE family = ?1 ORDER BY seq",
+            "SELECT data FROM tokens WHERE name = ?1 ORDER BY seq",
+            "SELECT seq, data FROM tokens WHERE actor_key = ?1",
+            "SELECT seq, data FROM tokens WHERE actor_key > ?1 AND actor_key < ?2",
+            "DELETE FROM tokens WHERE id = ?1",
+            "DELETE FROM tokens WHERE ended_at <= ?1",
+            "SELECT seq, data FROM accounts WHERE issuer = ?1 AND subject = ?2",
+            "SELECT seq, data FROM accounts WHERE actor_key = ?1",
+            "SELECT seq, data FROM accounts WHERE actor_key > ?1 AND actor_key < ?2",
+            "SELECT seq, data FROM accounts WHERE login_key = ?1",
+            "SELECT seq, data FROM accounts WHERE login_key > ?1 AND login_key < ?2",
+            "DELETE FROM accounts WHERE issuer = ?1 AND subject = ?2",
+            "SELECT data FROM oauth_clients WHERE client_id = ?1",
+            "DELETE FROM oauth_clients WHERE client_id = ?1",
+            "DELETE FROM auth_events WHERE at < ?1",
+            "DELETE FROM auth_events WHERE issuer = ?1 AND subject = ?2",
+            "SELECT at FROM auth_events WHERE at >= ?1 AND (actor_key = ?2 OR (actor_key > ?3 AND actor_key < ?4)) \
+             ORDER BY seq DESC LIMIT ?5",
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path()).unwrap();
+        for sql in INDEXED {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let n = stmt.parameter_count();
+            let args: Vec<&dyn rusqlite::ToSql> = (0..n).map(|_| &"x" as &dyn rusqlite::ToSql).collect();
+            let plan: Vec<String> =
+                stmt.query_map(args.as_slice(), |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect();
+            assert!(plan.iter().all(|step| !step.starts_with("SCAN")), "{sql}: {plan:?}");
+            assert!(plan.iter().any(|step| step.starts_with("SEARCH")), "{sql}: {plan:?}");
+        }
+    }
 
     #[test]
     fn related_keys_are_ancestors_self_and_descendants() {

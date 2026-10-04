@@ -50,7 +50,7 @@ playbook run gets the same answer as a single command
   sub-actors `<actor>/<name>`; `--actor` and `$BD_ACTOR` may name nothing
   else. The server's own actor, `bd-serve`, which runs its background jobs,
   is reserved: no token may act as it.
-- **Claim limits.** `max_claims` (per token, or per GitHub sign-in rule)
+- **Claim limits.** `max_claims` (per token, or per sign-in rule)
   caps the open issues a token's actors hold, so that no one takes the whole
   ready queue. It guards against greed, not malice.
 - **Resource limits.** Request bodies (`--max-body-mib`, default 64), a
@@ -67,7 +67,7 @@ playbook run gets the same answer as a single command
 ## Signing in
 
 Sign-in lets people get their own tokens, with GitHub or OpenID Connect
-providers that `<root>/auth.toml` names, under GitHub's rules or the
+providers that `<root>/auth.toml` names, under its rules or the
 admin's authorizer ([Signing in](remote.md#signing-in)).
 
 - bd proves who signed in itself, and binds each account to its actor by
@@ -84,8 +84,11 @@ admin's authorizer ([Signing in](remote.md#signing-in)).
   error codes reach messages and the log only when they are plain text. OIDC providers' client secrets are files under
   the root, read by `bd serve` only.
 - At refreshes, OIDC providers are not asked again: the authorizer decides
-  on the account as it signed in, so removing someone at the provider takes
-  effect when the authorizer refuses them (or at `refresh_limit`).
+  on the account as it signed in, and rules by subject are applied again,
+  but a rule by email, domain or group keeps the sign-in while it is
+  unchanged, so removing someone at the provider takes effect when the
+  authorizer refuses them, or at their next sign-in (at the latest
+  `refresh_limit`).
 
 - The server runs GitHub's device flow with an OAuth or GitHub App client ID,
   no secret. The account's GitHub token reads its account and memberships
@@ -98,23 +101,31 @@ admin's authorizer ([Signing in](remote.md#signing-in)).
 - An account no rule lets in gets nothing. An `anyone = true` rule must be
   the last, and its tokens read by default, may write at most, and are
   always `agent` tokens. `min_account_age` keeps out accounts made on the
-  spot; `deny` keeps out an account for good (also revoke its tokens).
+  spot; `deny` (GitHub user ids, or an OIDC provider's subjects) keeps out
+  an account for good, its sign-ins ending at their next refresh (revoke
+  its tokens to end them at once).
 - Each account is bound to its actor for good at its first sign-in, so a
   renamed or re-registered login cannot pass for the previous holder. Two
   accounts share an actor only when an admin links them
   (`bd serve token link`), as one person's.
   Actors carry the provider's name (`github:alice`, `google:u-3f9a2c1e7b04`),
   so no provider's users can take an admin-created actor or another
-  provider's. Only `bd serve token revoke --account <login> --forget`
+  provider's, and `bd serve token create` refuses actors with a `:` in
+  their first segment, so no admin's token keeps an account out. Only `bd serve token revoke --account <login> --forget`
   releases a binding.
 - Sign-in access tokens expire (`token_ttl`, default 1 hour), and each
   refresh applies the rules again (an OIDC rule by email, domain or group
   keeps a sign-in while that rule is unchanged, as bd keeps no claims: see
-  [With an OpenID Connect provider](remote.md#with-an-openid-connect-provider)), so someone who leaves an organization
-  loses access within `token_ttl`. Refresh tokens rotate at every refresh
+  [With an OpenID Connect provider](remote.md#with-an-openid-connect-provider)), so someone
+  who leaves a GitHub organization, or whom an authorizer or a subject rule
+  no longer lets in, loses access within `token_ttl`; someone an OIDC
+  provider stops listing under an email, domain or group rule keeps it
+  until their next sign-in, at the latest `refresh_limit`. Refresh tokens rotate at every refresh
   and work once: a copy used after the original (or the original after a
   copy) revokes the sign-in. A sign-in is refreshed for at most
   `refresh_limit` (30 days), and not after `refresh_idle` (7 days) unused.
+  An account keeps at most 20 live sign-ins at each client (and 20 of
+  `bd remote login`); signing in again revokes the oldest.
   `server.db` keeps only hashes of both. `bd remote logout` and a
   replacing sign-in revoke them on the server; `bd serve token revoke` ends
   refreshes too.
@@ -192,7 +203,7 @@ and the GDPR's data minimization (Art. 5(1)(c)) are the guide.
 With `[oauth]`, `bd serve` is an OAuth 2.1 authorization server for MCP
 clients that sign people in, such as ChatGPT
 ([Signing in with OAuth](mcp.md#signing-in-with-oauth)). People sign in with
-GitHub or an OIDC provider, under GitHub's rules or the authorizer, as
+GitHub or an OIDC provider, under the rules or the authorizer, as
 above.
 
 - **Secrets.** GitHub's web flow needs a client secret of the GitHub App

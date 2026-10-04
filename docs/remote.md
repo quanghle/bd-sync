@@ -26,6 +26,7 @@ bd serve token create intern --as intern --max-claims 2 --root /srv/bd   # holds
 bd serve token list --root /srv/bd
 bd serve token revoke ci --root /srv/bd          # takes effect at once, no restart
 bd serve token events --since 7d --root /srv/bd  # the audit trail: sign-ins, tokens created, refreshed, revoked
+bd serve token events --by github:alice --kind signed_in,revoked -n 20 --root /srv/bd   # one account's, of these kinds
 # Or let people get their own by signing in, with GitHub or any OIDC provider: <root>/auth.toml (below)
 # MCP clients that sign people in with OAuth (ChatGPT, Claude apps): docs/mcp.md
 
@@ -139,7 +140,7 @@ OpenID Connect provider (Google, Microsoft Entra, GitLab, Okta, Keycloak, or
 a broker such as Dex in front of others). `bd remote login --provider github` (or
 `--provider <name>`) shows a one-time code to enter at the provider, and the
 server issues an access token if the account may use the workspace: by a
-rule of `auth.toml` (GitHub only), or by the admin's own
+rule of `auth.toml` (`[[github.allow]]`, `[[oidc.<name>.allow]]`), or by the admin's own
 [authorizer](#deciding-with-an-authorizer). An account let in by neither
 gets nothing. MCP clients sign people in the same way in a browser, where a
 page offers the providers to choose from ([docs/mcp.md](mcp.md)).
@@ -155,9 +156,11 @@ refresh_limit = "30d"                   # refreshed for at most this long after 
 refresh_idle = "7d"                     # and not after this long without one (default 7d)
 ```
 
-Tokens are refreshed ([Refreshing](#refreshing-sign-ins)) when someone can
-decide again at each refresh: an authorizer, or GitHub's rules through the
-GitHub App's private key. Otherwise people sign in again each `token_ttl`.
+Tokens are refreshed ([Refreshing](#refreshing-sign-ins)) when access can
+be decided again at each refresh: an authorizer, GitHub's rules through the
+GitHub App's private key, or an OIDC provider's rules (see
+[With an OpenID Connect provider](#with-an-openid-connect-provider) for what
+those decide again). Otherwise people sign in again each `token_ttl`.
 
 ### With GitHub
 
@@ -204,7 +207,7 @@ workspaces = ["proj"]                   # default: every workspace
 
 # [oauth]                               # MCP clients such as ChatGPT sign people in with OAuth (docs/mcp.md)
 # redirect_uris = ["https://chatgpt.com/connector_platform_oauth_redirect"]
-# registration = false
+# registration = false                 # ChatGPT and Claude identify themselves with metadata documents
 # loopback_redirects = true
 ```
 
@@ -216,7 +219,11 @@ OAuth, such as ChatGPT and the Claude apps, when `[oauth]` turns on `bd serve`'s
 authorization server: see [Signing in with
 OAuth](mcp.md#signing-in-with-oauth).
 
-`bd serve` checks the file when it starts, and refuses to start with a
+`bd serve check --root /srv/bd --public-url https://bd.example.com` reads
+the file and its secret files as the server would, without starting one,
+exits 2 on a mistake, and prints what to register: each provider's
+callback URL, account notification endpoints, the MCP endpoints. Run it
+after each change. `bd serve` checks the file when it starts, and refuses to start with a
 mistake in it (an unknown field, a rule that names nobody, an `http` URL to
 another host, an `anyone` rule that is not the last or gives more than a rule
 before it). After that, it reads the file again once it, or a secret file
@@ -340,6 +347,7 @@ client_secret_file = "google-secret"    # relative to the root; leave out for a 
 label = "Google"                        # shown on the sign-in page (default: the name; at most 40 characters)
 scopes = ["email", "profile"]           # asked for besides openid (this is the default)
 groups_claim = "groups"                 # the ID token claim listing an account's groups (this is the default)
+# deny = ["1092834756"]                 # subjects (sub claims) that may never sign in (`bd serve token accounts`)
 
 [[oidc.google.allow]]                   # the first rule that lets an account in decides, as GitHub's do
 subjects = ["108001234567890123456"]    # accounts by their sub
@@ -351,8 +359,8 @@ email_domains = ["acme.com"]            # a verified email at these domains (ema
 workspaces = ["proj"]
 
 [[oidc.google.allow]]
-groups = ["bd-readers"]                 # a value of groups_claim
-role = "read"
+groups = ["bd-readers"]                 # a value of groups_claim, where the provider sends one
+role = "read"                           # (Entra, Okta, Keycloak can; Google's ID tokens carry no groups)
 ```
 
 A rule takes `role`, `kind`, `workspaces` and `max_claims` as GitHub's
@@ -511,7 +519,8 @@ person is told only that the account may not use the workspace.
 - **Identity stays with bd.** It decides access only: it cannot choose or
   change the actor (the account's binding decides, as with rules), and a
   login that once was another account's is refused as it is for a `users`
-  rule. `deny` (GitHub user ids) applies before it is asked. It never
+  rule. `deny` (GitHub user ids, or an OIDC provider's subjects) applies
+  before it is asked, and at every refresh. It never
   sees a provider's tokens. Every account acts as `<provider>:<login>`
   (`github:alice`, `google:u-3f9a2c1e7b04`), so no provider's users, who
   often choose their own names, can take an admin's actor, or each other's; `bd serve token revoke --account` names one by
@@ -536,8 +545,8 @@ person is told only that the account may not use the workspace.
 
 ### Refreshing sign-ins
 
-When someone can decide again at each refresh (an authorizer, or GitHub's
-rules with `private_key`), each sign-in also gets a refresh token, saved with its
+When access can be decided again at each refresh (an authorizer, GitHub's rules with the GitHub App's private key, or an OIDC provider's rules),
+each sign-in also gets a refresh token, saved with its
 access token on the client and sent only to `POST /v2/auth/refresh`. The
 client renews the access token by itself, before a command, once a fifth of
 its lifetime is left (10 minutes at most), or when the server finds it
@@ -579,6 +588,9 @@ expired first; so does a long-running one (`bd agents watch`, `bd events
   `refresh_idle` passed since the last one (a machine off for longer signs
   in again). `token_ttl`, `refresh_idle` and `refresh_limit` must each be at
   most the next.
+- is revoked when the account has signed in 20 more times since at the
+  same client (or with `bd remote login`) while it still worked: an account
+  keeps at most 20 live sign-ins at each.
 - fails as a sign-in does when GitHub or the server cannot be reached (exit
   8): nothing changes, and the client tries again a minute later (at its
   next command) while its access token works, then fails with it.

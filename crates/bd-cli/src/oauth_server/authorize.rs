@@ -477,24 +477,29 @@ struct Params {
 /// The parameters of `query`; refused on a page when the client cannot be
 /// told (no client or redirect URI, or an unusable `state`).
 fn parse(query: &str) -> Result<Params, Answer> {
+    // The page tells the person nothing of it: the log tells the admin what the client got wrong.
+    let malformed = |why: &str| {
+        tracing::info!(target: "bd::serve", "OAuth authorization refused: {why}");
+        Err(refused(400, MALFORMED))
+    };
     let Some(pairs) = form::decode(query) else {
-        return Err(refused(400, MALFORMED));
+        return malformed("its query is not a valid form");
     };
     let mut rest = HashMap::new();
     let mut repeated = None;
     let seen = |name: &str| pairs.iter().filter(|(k, _)| k == name).count();
     for name in ["client_id", "redirect_uri", "state"] {
         if seen(name) > 1 {
-            return Err(refused(400, MALFORMED));
+            return malformed(&format!("{name} is given more than once"));
         }
     }
     let one = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.clone());
     let (Some(client_id), Some(redirect_uri)) = (one("client_id"), one("redirect_uri")) else {
-        return Err(refused(400, MALFORMED));
+        return malformed("it names no client_id or redirect_uri");
     };
     let state = one("state");
     if state.as_ref().is_some_and(|s| s.len() > MAX_STATE) {
-        return Err(refused(400, MALFORMED));
+        return malformed(&format!("its state is longer than {MAX_STATE} bytes"));
     }
     for (k, v) in &pairs {
         if matches!(k.as_str(), "client_id" | "redirect_uri" | "state") {
@@ -511,6 +516,18 @@ fn parse(query: &str) -> Result<Params, Answer> {
 /// it may not be sent back to the redirect URI, else with an error at it.
 fn check(params: Params, client: Client, oauth: &OauthConfig, issuer: &str) -> Result<Authorization, Answer> {
     if !client.redirects_to(&params.redirect_uri, oauth) {
+        // The likeliest mistake setting up a client: the log names the URI and what to change.
+        let registered = client.redirect_uris.iter().any(|u| u == &params.redirect_uri);
+        tracing::info!(
+            target: "bd::serve",
+            client = %client.id,
+            redirect_uri = %params.redirect_uri,
+            "OAuth authorization refused: {}",
+            match registered {
+                true => "auth.toml's [oauth] does not allow this redirect URI (add it to redirect_uris)",
+                false => "the client did not register this redirect URI, nor name it in its metadata document",
+            }
+        );
         let why = "The application asked to send you somewhere it isn't allowed to.";
         return Err(refused(400, why));
     }
@@ -859,12 +876,20 @@ fn signed_in(
     let callback_url = format!("{}{}", cx.issuer, super::callback(provider));
     let workspace = &request.workspace;
     let client = &request.client.id;
+    // Who signed in, once the provider said: named on the page if the account is refused.
+    let mut signed_in_as = None;
     let admitted = match sign_in.oidc(provider) {
-        None => oauth::web_sign_in(cx.root, &sign_in, code, &callback_url, &verifier, workspace, client),
+        None => {
+            let as_who = &mut signed_in_as;
+            oauth::web_sign_in(cx.root, &sign_in, code, &callback_url, &verifier, workspace, client, as_who)
+        }
         Some(oidc) => oidc
             .metadata()
             .and_then(|md| oidc.sign_in(&md, code, &callback_url, &verifier, &nonce))
-            .and_then(|claims| oauth::admit_oidc(cx.root, &sign_in, oidc, &claims, workspace, Some(client))),
+            .and_then(|claims| {
+                signed_in_as = Some(claims.login.clone());
+                oauth::admit_oidc(cx.root, &sign_in, oidc, &claims, workspace, Some(client))
+            }),
     };
     let found = admitted.and_then(|a| Ok((auth::preview_actor(cx.root, &a.user, a.by_login)?, a)));
     let (actor, admitted) = match found {
@@ -872,8 +897,10 @@ fn signed_in(
         Err(Error::Unauthorized(why)) => {
             tracing::info!(target: "bd::serve", %provider, %workspace, error = %why, "web sign-in refused");
             let link = back("access_denied", "the account may not use this workspace");
+            let account = signed_in_as.map_or(String::new(), |login| format!(" ({login})"));
             let why = format!(
-                "Your {label} account doesn't have access to this workspace. Ask the server's admin for access."
+                "Your {label} account{account} doesn't have access to this workspace. Ask the server's admin for \
+                 access, or sign in with another account."
             );
             return Answer::Page(pages::refusal(403, "Access denied", &why, Some(&link)));
         }

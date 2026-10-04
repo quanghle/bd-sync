@@ -18,7 +18,8 @@ mod pty;
 /// `bd` with a clean environment, run in `dir`.
 fn bd(dir: &Path) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_bd"));
-    c.current_dir(dir).env("BD_LOG", "error").env("XDG_CONFIG_HOME", dir.join(".xdg"));
+    // Device-flow polls a second apart take 20 ms here (debug builds only).
+    c.current_dir(dir).env("BD_LOG", "error").env("XDG_CONFIG_HOME", dir.join(".xdg")).env("BD_TEST_POLL_MS", "20");
     // Where the harnesses keep user-level hooks, which `bd agents pull` looks at.
     for var in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME"] {
         c.env(var, dir.join(".home").join(var));
@@ -5374,7 +5375,10 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let out = signed_in(bob.path(), &url, &["list"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(7), "{stderr}");
-    assert!(stderr.contains("expired at 2026-01-01") && stderr.contains("bd remote login"), "{stderr}");
+    assert!(
+        stderr.contains("expired at 2026-01-01") && stderr.contains("bd remote login --provider github"),
+        "{stderr}"
+    );
     check(signed_in(carol.path(), &url, &["list"]), "other tokens still work");
 }
 
@@ -6392,18 +6396,19 @@ fn github_sign_in_refusals() {
     refused(out, 8, "sign-in is not working on this bd server");
     std::fs::write(&config, good).unwrap();
 
-    // A login whose actor an admin's token has: refused, so that neither acts as the other.
+    // An admin's token never takes a sign-in's actor, so no account is kept out by one.
     let github = FakeGithub::start();
     let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"ci-agents\"]\n");
-    server.token("ci", "github:ci-agents", &[]);
+    let create = |actor: &str| {
+        bd(server.root.path())
+            .args(["serve", "token", "create", "ci", "--as", actor, "--root"])
+            .arg(server.root.path())
+            .output()
+    };
+    refused(create("github:ci-agents").unwrap(), 2, "names a provider's account");
     github.next("ci-agents", 0);
-    refused(github_login(dir.path(), &server.url()), 7, "another access token acts as github:ci-agents");
-    let out = bd(server.root.path())
-        .args(["serve", "token", "create", "ci-2", "--as", "github:ci-agents/x", "--root"])
-        .arg(server.root.path())
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "admins' tokens may share actors among themselves");
+    let out = github_login(dir.path(), &server.url());
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 
     // An organization that will not tell decides nothing: the sign-in fails, to be tried again, rather than fall
     // through to rules after it.
@@ -6432,7 +6437,6 @@ fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
         &github,
         "[[github.allow]]\nusers = [\"alice\", \"ci-agents\", \"new-name\"]\nkind = \"human\"\n\n[[github.allow]]\nanyone = true\n",
     );
-    server.token("ci", "github:ci-agents", &[]);
     let url = server.url();
     let sign_in = |login: &str, id: u64| {
         github.next(login, 0);
@@ -6465,13 +6469,14 @@ fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
 
     // Renamed to a login a rule names, a bound account does not pass for the principal that had it.
     refused(sign_in("alice", 2).1, "actor github:alice belongs to another account");
-    refused(sign_in("ci-agents", 2).1, "another access token acts as github:ci-agents");
+    // A login no other account had: the rule names it, and the account signs in as its own actor.
+    assert_eq!(issued(sign_in("ci-agents", 2).1)["actor"], "github:stranger");
     issued(sign_in("stranger", 2).1);
     // Nor for one whose login it was at its latest sign-in, though never its actor.
     issued(sign_in("old-name", 5).1);
     let v = issued(sign_in("new-name", 5).1);
     assert_eq!((v["actor"].as_str(), v["token"]["kind"].as_str()), (Some("github:old-name"), Some("human")));
-    refused(sign_in("new-name", 2).1, "login new-name was that of another account (actor github:old-name)");
+    refused(sign_in("new-name", 2).1, "login new-name was that of another account before");
     // A login no rule names is just anyone's: the account signs in as its own actor.
     let v = issued(sign_in("old-name", 2).1);
     assert_eq!(
@@ -7294,6 +7299,45 @@ fn mcp_over_http_works_under_a_proxy_prefix_and_retries_are_not_deduplicated() {
 
 /// A server root whose `auth.toml` signs in with the GitHub App `Iv1.test`
 /// and turns on the authorization server with `oauth` (the `[oauth]` body).
+#[test]
+fn a_busy_or_unwritable_server_db_is_answered_as_such() {
+    let (server, log) = {
+        let root = oauth_root("loopback_redirects = true\n");
+        let log = root.path().join("server.log");
+        let file = std::fs::File::create(&log).unwrap();
+        let server = Server::launch_with(root, "127.0.0.1:0", &["--public-url", "http://127.0.0.1:1"], |c| {
+            c.env("BD_LOG", "bd::serve=debug").env("BD_TEST_BUSY_MS", "200").stderr(file);
+        });
+        (server, log)
+    };
+    let register = || {
+        let request = r#"{"redirect_uris":["http://127.0.0.1/cb"],"token_endpoint_auth_method":"none"}"#;
+        post_json(&format!("{}/oauth/register", server.base), request)
+    };
+    let (status, _, registered) = register();
+    assert_eq!(status, 201, "{registered}");
+    // Another process holding server.db's write lock past the wait: try again shortly.
+    let db = server.root.path().join("server.db");
+    let held = rusqlite::Connection::open(&db).unwrap();
+    held.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let (status, _, answer) = register();
+    assert_eq!((status, answer["error"].as_str()), (503, Some("temporarily_unavailable")), "{answer}");
+    held.execute_batch("ROLLBACK").unwrap();
+    drop(held);
+    assert_eq!(register().0, 201, "once it is let go");
+    // One it cannot write: a server error, said in its log, not to the client.
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&db, std::os::unix::fs::PermissionsExt::from_mode(0o400)).unwrap();
+        let (status, _, answer) = register();
+        std::fs::set_permissions(&db, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        assert_eq!((status, answer["error"].as_str()), (500, Some("server_error")), "{answer}");
+        assert!(!answer.to_string().contains("server.db"), "{answer}");
+        let logged = std::fs::read_to_string(&log).unwrap();
+        assert!(logged.contains("registering an OAuth client") && logged.contains("server.db"), "{logged}");
+    }
+}
+
 fn oauth_root(oauth: &str) -> TempDir {
     oauth_root_at(None, "[[github.allow]]\nusers = [\"alice\"]\n", oauth)
 }
@@ -7310,6 +7354,37 @@ fn oauth_root_at(github: Option<&FakeGithub>, rules: &str, oauth: &str) -> TempD
     );
     std::fs::write(root.path().join("auth.toml"), config).unwrap();
     root
+}
+
+#[test]
+fn serve_check_reads_auth_toml_as_the_server_would_and_says_what_to_register() {
+    let root = oauth_root("redirect_uris = [\"https://chatgpt.com/connector_platform_oauth_redirect\"]\n");
+    let check = |args: &[&str]| {
+        bd(root.path()).args(["serve", "check", "--root"]).arg(root.path()).args(args).output().unwrap()
+    };
+    let out = check(&["--json", "--public-url", "https://bd.example.com/bd"]);
+    let v: Value = serde_json::from_str(&check_out(out)).unwrap();
+    let register: Vec<&str> = v["register"].as_array().unwrap().iter().map(|r| r.as_str().unwrap()).collect();
+    assert!(
+        register.contains(&"GitHub: callback (redirect) URL https://bd.example.com/bd/oauth/github/callback"),
+        "{register:?}"
+    );
+    assert!(register.contains(&"MCP clients: https://bd.example.com/bd/w/proj/mcp"), "{register:?}");
+    // Without a public URL, [oauth] has no issuer: said, not fatal.
+    let v: Value = serde_json::from_str(&check_out(check(&["--json"]))).unwrap();
+    assert!(v["warnings"].to_string().contains("--public-url"), "{v}");
+    // A mistake: exit 2, with the reason, and no server is started.
+    let config = root.path().join("auth.toml");
+    std::fs::write(&config, std::fs::read_to_string(&config).unwrap().replace("[oauth]", "[oauth]\nbogus = 1"))
+        .unwrap();
+    let out = check(&[]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("bogus"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A successful command's stdout.
+fn check_out(out: Output) -> String {
+    check(out, "bd serve check")
 }
 
 #[test]
@@ -7733,7 +7808,8 @@ fn people_authorize_mcp_clients_after_signing_in_with_github() {
     let (status, headers, page) = browse(&callback, Some(&cookie), None);
     assert_eq!(status, 403);
     assert!(headers.get("location").is_none());
-    assert!(page.contains("doesn&#39;t have access to this workspace"), "{page}");
+    assert!(page.contains("account (mallory) doesn&#39;t have access to this workspace"), "{page}");
+    assert!(page.contains("sign in with another account"), "{page}");
     assert!(page.contains("https://app.example/cb?error=access_denied"), "{page}");
     assert!(!page.contains("auth.toml"), "the server's setup stays off the page: {page}");
 

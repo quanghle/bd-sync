@@ -9,7 +9,6 @@
 //! never-used client). Registered clients live in `<root>/server.db`
 //! (`server_db.rs`), a row each.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -372,21 +371,23 @@ fn change_noting<T>(
         let before = load(tx)?;
         let mut clients = before.clone();
         let out = f(&mut clients)?;
-        let was: HashMap<&str, String> =
-            before.iter().map(|c| Ok((c.client_id.as_str(), serde_json::to_string(c)?))).collect::<Result<_>>()?;
-        for gone in was.keys().filter(|id| !clients.iter().any(|c| c.client_id == **id)) {
-            tx.execute("DELETE FROM oauth_clients WHERE client_id = ?1", [gone])?;
-        }
-        for c in &clients {
-            let data = serde_json::to_string(c)?;
-            if was.get(c.client_id.as_str()) != Some(&data) {
+        server_db::sync_rows(
+            &before,
+            &clients,
+            |c| c.client_id.clone(),
+            |id| {
+                tx.execute("DELETE FROM oauth_clients WHERE client_id = ?1", [id])?;
+                Ok(())
+            },
+            |c, data| {
                 tx.execute(
                     "INSERT INTO oauth_clients (client_id, data) VALUES (?1, ?2) ON CONFLICT (client_id) DO UPDATE \
                      SET data = excluded.data",
-                    [&c.client_id, &data],
+                    [c.client_id.as_str(), data],
                 )?;
-            }
-        }
+                Ok(())
+            },
+        )?;
         Ok(out)
     })
 }

@@ -373,27 +373,32 @@ impl Store {
     /// owner may read it (mode 0600). It is checked (`quick_check`) and
     /// flushed to disk before this returns; on failure it is removed.
     pub fn snapshot(&self, dest: &Path) -> Result<()> {
-        let target = dest.to_str().ok_or_else(|| Error::invalid(format!("{}: not a UTF-8 path", dest.display())))?;
-        // Created empty first (VACUUM INTO accepts that): private from the
-        // start, and a file that already exists is never touched.
-        let mut create = std::fs::OpenOptions::new();
-        create.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut create, 0o600);
-        create.open(dest).map_err(|e| match e.kind() {
-            std::io::ErrorKind::AlreadyExists => Error::invalid(format!("{} already exists", dest.display())),
-            _ => Error::Io(e),
-        })?;
-        let written =
-            self.conn.execute("VACUUM INTO ?1", [target]).map_err(Error::from).and_then(|_| verify_copy(dest));
-        if written.is_err() {
-            let mut journal = dest.as_os_str().to_owned();
-            journal.push("-journal");
-            let _ = std::fs::remove_file(journal);
-            let _ = std::fs::remove_file(dest);
-        }
-        written
+        snapshot(&self.conn, dest)
     }
+}
+
+/// [`Store::snapshot`] of any database `conn` has open (bd serve's
+/// `server.db` too).
+pub fn snapshot(conn: &Connection, dest: &Path) -> Result<()> {
+    let target = dest.to_str().ok_or_else(|| Error::invalid(format!("{}: not a UTF-8 path", dest.display())))?;
+    // Created empty first (VACUUM INTO accepts that): private from the
+    // start, and a file that already exists is never touched.
+    let mut create = std::fs::OpenOptions::new();
+    create.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut create, 0o600);
+    create.open(dest).map_err(|e| match e.kind() {
+        std::io::ErrorKind::AlreadyExists => Error::invalid(format!("{} already exists", dest.display())),
+        _ => Error::Io(e),
+    })?;
+    let written = conn.execute("VACUUM INTO ?1", [target]).map_err(Error::from).and_then(|_| verify_copy(dest));
+    if written.is_err() {
+        let mut journal = dest.as_os_str().to_owned();
+        journal.push("-journal");
+        let _ = std::fs::remove_file(journal);
+        let _ = std::fs::remove_file(dest);
+    }
+    written
 }
 
 fn verify_copy(path: &Path) -> Result<()> {

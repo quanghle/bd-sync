@@ -194,18 +194,18 @@ pub fn redeem(root: &Path, flows: &Mutex<Flows>, request: Request) -> Result<Val
         authorize::lock(flows).unredeem(&secret, code.clone());
         Err(refused)
     };
-    let github = match oauth::load(root) {
-        Ok(Some(github)) => github,
+    let sign_in = match oauth::load(root) {
+        Ok(Some(sign_in)) => sign_in,
         Ok(None) => return Err(invalid_grant("this server no longer signs people in")),
         Err(e) => return keep(&code, server_error(&e, "redeeming an authorization code: auth.toml")),
     };
     let admitted = &code.admitted;
-    if !github.provides(&admitted.user) {
+    if !sign_in.provides(&admitted.user) {
         return Err(invalid_grant("this server no longer signs people in with that provider"));
     }
     let client = ForClient { id: &code.client_id, resource: &code.resource };
     let life =
-        auth::Lifetime { rule: admitted.rule.clone(), ..github.lifetime(Timestamp::now(), &admitted.user.provider) };
+        auth::Lifetime { rule: admitted.rule.clone(), ..sign_in.lifetime(Timestamp::now(), &admitted.user.provider) };
     let issued = match auth::issue_client_token(
         root,
         &admitted.user,

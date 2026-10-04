@@ -18,17 +18,42 @@ pub(super) struct TokenFile {
     pub(super) erased: Vec<(String, String)>,
 }
 
-/// The records of a table's `data` column, in the order they were added.
-pub(super) fn records<T: serde::de::DeserializeOwned>(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<T>> {
-    let mut stmt = conn.prepare_cached(sql)?;
-    let texts = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
-    texts.iter().map(|t| serde_json::from_str(t).map_err(|e| Error::invalid(format!("server.db: {e}")))).collect()
+impl TokenFile {
+    /// Revoke the tokens `pick` selects that are not revoked yet, with
+    /// `why` for the audit trail: the names of those revoked now.
+    pub(super) fn revoke(&mut self, why: &str, pick: impl Fn(&Token) -> bool) -> Vec<String> {
+        let now = Timestamp::now().to_rfc3339();
+        let mut revoked = Vec::new();
+        for t in self.tokens.iter_mut().filter(|t| t.revoked_at.is_none() && pick(t)) {
+            t.revoked_at = Some(now.clone());
+            revoked.push(t.name.clone());
+            self.events.push(t.event("revoked", Some(why)));
+        }
+        revoked
+    }
 }
 
-pub(super) fn load(conn: &rusqlite::Connection) -> Result<TokenFile> {
+/// A record as `server.db` keeps it (`what` it is, for the error).
+fn parse<T: serde::de::DeserializeOwned>(what: &str, data: &str) -> Result<T> {
+    serde_json::from_str(data).map_err(|e| Error::invalid(format!("server.db: {what}: {e}")))
+}
+
+/// The records (`what` they are) of the `data` column `sql` selects, with `args`.
+fn records<T: serde::de::DeserializeOwned>(
+    conn: &rusqlite::Connection,
+    what: &str,
+    sql: &str,
+    args: &[&dyn rusqlite::ToSql],
+) -> Result<Vec<T>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let texts = stmt.query_map(args, |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
+    texts.iter().map(|t| parse(what, t)).collect()
+}
+
+fn load(conn: &rusqlite::Connection) -> Result<TokenFile> {
     Ok(TokenFile {
-        tokens: records(conn, "SELECT data FROM tokens ORDER BY seq")?,
-        accounts: records(conn, "SELECT data FROM accounts ORDER BY seq")?,
+        tokens: records(conn, "a token", "SELECT data FROM tokens ORDER BY seq", &[])?,
+        accounts: records(conn, "an account", "SELECT data FROM accounts ORDER BY seq", &[])?,
         events: Vec::new(),
         erased: Vec::new(),
     })
@@ -116,7 +141,7 @@ pub(super) fn scoped(conn: &rusqlite::Connection, scope: &Scope) -> Result<Token
 /// The rows `scope` names, in the order they were added: a superset of
 /// what the checks of a change for it look at, so they decide as they
 /// would over every row.
-pub(super) fn load_scope(conn: &rusqlite::Connection, scope: &Scope) -> Result<TokenFile> {
+fn load_scope(conn: &rusqlite::Connection, scope: &Scope) -> Result<TokenFile> {
     use std::collections::BTreeMap;
     let mut tokens: BTreeMap<i64, String> = BTreeMap::new();
     let mut accounts: BTreeMap<i64, String> = BTreeMap::new();
@@ -148,19 +173,15 @@ pub(super) fn load_scope(conn: &rusqlite::Connection, scope: &Scope) -> Result<T
     for data in tokens.values() {
         actors.push(actor_of(data)?);
     }
-    if let Some((issuer, subject)) = scope.account {
-        let sql = "SELECT seq, data FROM accounts WHERE issuer = ?1 AND subject = ?2";
-        add(&mut accounts, sql, &[&issuer, &subject])?;
-        for data in accounts.values() {
-            actors.push(actor_of(data)?);
-        }
+    // The accounts named by issuer and subject, and the actors they are bound to.
+    let named = scope.account.into_iter().chain(scope.user.map(|u| (u.issuer.as_str(), u.subject.as_str())));
+    for (issuer, subject) in named {
+        add(&mut accounts, "SELECT seq, data FROM accounts WHERE issuer = ?1 AND subject = ?2", &[&issuer, &subject])?;
+    }
+    for data in accounts.values() {
+        actors.push(actor_of(data)?);
     }
     if let Some(user) = scope.user {
-        let sql = "SELECT seq, data FROM accounts WHERE issuer = ?1 AND subject = ?2";
-        add(&mut accounts, sql, &[&user.issuer, &user.subject])?;
-        for data in accounts.values() {
-            actors.push(actor_of(data)?);
-        }
         actors.push(user.actor());
         related(&mut accounts, "accounts", "login_key", &server_db::key(&user.login))?;
     }
@@ -168,9 +189,6 @@ pub(super) fn load_scope(conn: &rusqlite::Connection, scope: &Scope) -> Result<T
         let key = server_db::key(actor);
         related(&mut accounts, "accounts", "actor_key", &key)?;
         related(&mut tokens, "tokens", "actor_key", &key)?;
-    }
-    pub(super) fn parse<T: serde::de::DeserializeOwned>(what: &str, data: &str) -> Result<T> {
-        serde_json::from_str(data).map_err(|e| Error::invalid(format!("server.db: {what}: {e}")))
     }
     Ok(TokenFile {
         tokens: tokens.values().map(|d| parse("a token", d)).collect::<Result<_>>()?,
@@ -189,15 +207,15 @@ pub(super) fn save(tx: &rusqlite::Transaction, before: &TokenFile, after: &Token
     for (issuer, subject) in &after.erased {
         server_db::erase_events(tx, issuer, subject)?;
     }
-    let was: HashMap<&str, String> =
-        before.tokens.iter().map(|t| Ok((t.id.as_str(), serde_json::to_string(t)?))).collect::<Result<_>>()?;
-    let ids: std::collections::HashSet<&str> = after.tokens.iter().map(|t| t.id.as_str()).collect();
-    for gone in was.keys().filter(|id| !ids.contains(*id)) {
-        tx.execute("DELETE FROM tokens WHERE id = ?1", [gone])?;
-    }
-    for t in &after.tokens {
-        let data = serde_json::to_string(t)?;
-        if was.get(t.id.as_str()) != Some(&data) {
+    server_db::sync_rows(
+        &before.tokens,
+        &after.tokens,
+        |t| t.id.clone(),
+        |id| {
+            tx.execute("DELETE FROM tokens WHERE id = ?1", [id])?;
+            Ok(())
+        },
+        |t, data| {
             let family = t.refresh.as_ref().map(|r| r.family.to_ascii_lowercase());
             let (actor_key, name, ended_at) = server_db::token_keys(&serde_json::to_value(t)?);
             tx.execute(
@@ -207,38 +225,33 @@ pub(super) fn save(tx: &rusqlite::Transaction, before: &TokenFile, after: &Token
                  ended_at = excluded.ended_at, data = excluded.data",
                 rusqlite::params![t.id, t.sha256, family, actor_key, name, ended_at, data],
             )?;
-        }
-    }
-    let key = |a: &Account| (a.issuer.clone(), a.subject.clone());
-    let was: HashMap<(String, String), String> =
-        before.accounts.iter().map(|a| Ok((key(a), serde_json::to_string(a)?))).collect::<Result<_>>()?;
-    let keys: std::collections::HashSet<(String, String)> = after.accounts.iter().map(key).collect();
-    for (issuer, subject) in was.keys().filter(|k| !keys.contains(*k)) {
-        tx.execute("DELETE FROM accounts WHERE issuer = ?1 AND subject = ?2", [issuer, subject])?;
-    }
-    for a in &after.accounts {
-        let data = serde_json::to_string(a)?;
-        if was.get(&key(a)) != Some(&data) {
+            Ok(())
+        },
+    )?;
+    server_db::sync_rows(
+        &before.accounts,
+        &after.accounts,
+        |a| (a.issuer.clone(), a.subject.clone()),
+        |(issuer, subject)| {
+            tx.execute("DELETE FROM accounts WHERE issuer = ?1 AND subject = ?2", [issuer, subject])?;
+            Ok(())
+        },
+        |a, data| {
             let (actor_key, login_key) = server_db::account_keys(&serde_json::to_value(a)?);
             tx.execute(
                 "INSERT INTO accounts (issuer, subject, actor_key, login_key, data) VALUES (?1, ?2, ?3, ?4, ?5) \
                  ON CONFLICT (issuer, subject) DO UPDATE SET actor_key = excluded.actor_key, \
                  login_key = excluded.login_key, data = excluded.data",
-                [&a.issuer, &a.subject, &actor_key, &login_key, &data],
+                [&a.issuer, &a.subject, &actor_key, &login_key, data],
             )?;
-        }
-    }
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 /// The tokens that are not revoked whose `column` is `value`.
 pub(super) fn live_where(conn: &rusqlite::Connection, column: &str, value: &str) -> Result<Vec<Token>> {
     let sql = format!("SELECT data FROM tokens WHERE {column} = ?1 ORDER BY seq");
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let texts = stmt.query_map([value], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
-    let tokens = texts
-        .iter()
-        .map(|t| serde_json::from_str::<Token>(t).map_err(|e| Error::invalid(format!("server.db: {e}"))))
-        .collect::<Result<Vec<_>>>()?;
+    let tokens: Vec<Token> = records(conn, "a token", &sql, &[&value])?;
     Ok(tokens.into_iter().filter(|t| t.revoked_at.is_none()).collect())
 }

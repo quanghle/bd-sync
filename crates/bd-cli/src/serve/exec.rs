@@ -30,25 +30,16 @@ pub(super) async fn exec(server: &Arc<Server>, workspace: String, req: Request<I
     let reserve = declared.map_or(server.max_body, |n| usize::try_from(n).unwrap_or(server.max_body));
     let answer_permits = kib(ANSWER_BUDGET);
     let permits = kib(reserve.saturating_mul(BODY_COPIES)).saturating_add(answer_permits);
-    let mut budget =
-        match tokio::time::timeout(QUEUE_WAIT, server.body_budget.clone().acquire_many_owned(permits)).await {
-            Ok(Ok(permit)) => permit,
-            Ok(Err(_)) => return shutting_down(),
-            Err(_) => return busy("receiving other requests"),
-        };
+    let mut budget = match queue(&server.body_budget, permits, "receiving other requests").await {
+        Ok(permit) => permit,
+        Err(reject) => return reject.response(),
+    };
     let mut answer_budget = budget.split(answer_permits as usize);
     let mut budget = Some(budget);
-    let body = match tokio::time::timeout(BODY_TIMEOUT, Limited::new(req.into_body(), server.max_body).collect()).await
-    {
-        Ok(Ok(b)) => b.to_bytes(),
-        Ok(Err(e)) if e.is::<LengthLimitError>() => return too_large(server.max_body),
-        Ok(Err(e)) => {
-            return Reject::new(StatusCode::BAD_REQUEST, "invalid", format!("reading the request: {e}"), 2).response();
-        }
-        Err(_) => {
-            let msg = format!("the request body did not arrive within {}s", BODY_TIMEOUT.as_secs());
-            return Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response();
-        }
+    let body = match read_body(req.into_body(), server.max_body, BODY_TIMEOUT).await {
+        Ok(b) => b,
+        Err(BodyError::TooLarge) => return too_large(server.max_body),
+        Err(e) => return e.response("request", server.max_body),
     };
     let mut request: ExecRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
@@ -85,17 +76,14 @@ pub(super) async fn exec(server: &Arc<Server>, workspace: String, req: Request<I
                 Err(reject) => return reject.response(),
             }
         }
-        let permits = server.body_budget.clone().acquire_many_owned(answer_permits);
-        answer_budget = match tokio::time::timeout(QUEUE_WAIT, permits).await {
-            Ok(Ok(permit)) => Some(permit),
-            Ok(Err(_)) => return shutting_down(),
-            Err(_) => return busy("receiving other requests"),
+        answer_budget = match queue(&server.body_budget, answer_permits, "receiving other requests").await {
+            Ok(permit) => Some(permit),
+            Err(reject) => return reject.response(),
         };
     }
-    let slot = match tokio::time::timeout(QUEUE_WAIT, server.running.clone().acquire_owned()).await {
-        Ok(Ok(permit)) => permit,
-        Ok(Err(_)) => return shutting_down(),
-        Err(_) => return busy("running other commands"),
+    let slot = match queue(&server.running, 1, "running other commands").await {
+        Ok(permit) => permit,
+        Err(reject) => return reject.response(),
     };
     // The command sends its answer's body when the answer starts: whole once
     // it finishes, or as soon as its output fills a chunk.

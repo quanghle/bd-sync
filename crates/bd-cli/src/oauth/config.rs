@@ -5,7 +5,7 @@ use super::*;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Doc {
+struct Doc {
     #[serde(default)]
     pub(super) sign_in: Option<SignInDoc>,
     #[serde(default)]
@@ -21,7 +21,7 @@ pub(super) struct Doc {
 /// `[sign_in]`: how long the tokens of any provider's sign-ins last.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct SignInDoc {
+struct SignInDoc {
     #[serde(default)]
     pub(super) token_ttl: Option<String>,
     #[serde(default)]
@@ -32,7 +32,7 @@ pub(super) struct SignInDoc {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct OauthDoc {
+struct OauthDoc {
     #[serde(default)]
     pub(super) redirect_hosts: Vec<String>,
     #[serde(default)]
@@ -84,7 +84,32 @@ pub(super) struct RuleDoc {
     pub(super) max_claims: Option<u32>,
 }
 
-pub(super) fn agent_kind() -> Kind {
+/// What a rule grants, as written, checked (`at` names the rule): an
+/// `anyone` rule lets in any account of its provider, and its throwaway
+/// ones, so never as an admin nor a person who may open human gates.
+pub(crate) fn rule_grant(
+    at: &str,
+    anyone: bool,
+    role: Option<Role>,
+    kind: Kind,
+    workspaces: &[String],
+    max_claims: Option<u32>,
+) -> std::result::Result<Grant, String> {
+    if anyone && role == Some(Role::Admin) {
+        return Err(format!("{at} lets anyone in, so its role may be read or write, not admin"));
+    }
+    if anyone && kind == Kind::Human {
+        return Err(format!("{at} lets anyone in, so its kind may be agent only: human tokens open human gates"));
+    }
+    let role = role.unwrap_or(if anyone { Role::Read } else { Role::Write });
+    let workspaces = auth::workspace_list(workspaces).map_err(|e| format!("{at}: {e}"))?;
+    if max_claims == Some(0) {
+        return Err(format!("{at}: max_claims must be at least 1 (role read lets its accounts claim nothing)"));
+    }
+    Ok(Grant { role, kind, workspaces, max_claims })
+}
+
+pub(crate) fn agent_kind() -> Kind {
     Kind::Agent
 }
 
@@ -149,7 +174,7 @@ pub(crate) fn dns_name(raw: &str) -> Option<String> {
     (host.len() <= 253 && labels.len() >= 2 && labels.iter().all(label) && !numeric).then_some(host)
 }
 
-pub(super) fn oauth_config(o: OauthDoc) -> std::result::Result<OauthConfig, String> {
+fn oauth_config(o: OauthDoc) -> std::result::Result<OauthConfig, String> {
     let mut redirect_hosts = Vec::new();
     for raw in &o.redirect_hosts {
         let Some(host) = dns_name(raw) else {
@@ -346,7 +371,7 @@ pub(super) fn github(g: GithubDoc, authorized: bool) -> std::result::Result<Gith
 /// The `[[<table>.allow]]` rules (whether each lets anyone in, and what it
 /// grants), checked as a list: an `anyone` rule is the last, and gives no
 /// more in a workspace than a rule before it would.
-pub(super) fn check_anyone(table: &str, rules: &[(bool, &Grant)]) -> std::result::Result<(), String> {
+fn check_anyone(table: &str, rules: &[(bool, &Grant)]) -> std::result::Result<(), String> {
     let Some(i) = rules.iter().position(|(anyone, _)| *anyone) else { return Ok(()) };
     if i + 1 < rules.len() {
         return Err(format!(
@@ -381,14 +406,14 @@ pub(super) fn check_anyone(table: &str, rules: &[(bool, &Grant)]) -> std::result
 }
 
 /// Whether two grants share a workspace.
-pub(super) fn overlap(a: &Grant, b: &Grant) -> bool {
+fn overlap(a: &Grant, b: &Grant) -> bool {
     let all = |g: &Grant| g.workspaces.iter().any(|w| w == "*");
     all(a) || all(b) || a.workspaces.iter().any(|w| b.workspaces.contains(w))
 }
 
 /// `https://host[:port][/path]`, without a trailing slash; `http` only to
 /// this machine (a stand-in for GitHub).
-pub(super) fn base_url(field: &str, raw: &str) -> std::result::Result<String, String> {
+fn base_url(field: &str, raw: &str) -> std::result::Result<String, String> {
     let url = raw.trim().trim_end_matches('/');
     // A URL with credentials in it is not repeated.
     let shown = if raw.contains('@') { String::new() } else { format!(" {raw:?}") };
@@ -445,25 +470,13 @@ pub(super) fn rule(n: usize, r: RuleDoc) -> std::result::Result<Rule, String> {
         if names_someone {
             return Err(format!("{at} lets anyone in: drop its users, orgs and teams, or anyone"));
         }
-        // Any GitHub account, and its throwaway accounts: never an admin, nor a person who may open human gates.
-        if r.role == Some(Role::Admin) {
-            return Err(format!("{at} lets anyone in, so its role may be read or write, not admin"));
-        }
-        if r.kind == Kind::Human {
-            return Err(format!("{at} lets anyone in, so its kind may be agent only: human tokens open human gates"));
-        }
     } else if !names_someone {
         return Err(format!("{at} names no users, orgs or teams, so it lets nobody in (anyone = true lets everyone)"));
     }
-    let role = r.role.unwrap_or(if r.anyone { Role::Read } else { Role::Write });
-    let workspaces = auth::workspace_list(&r.workspaces).map_err(|e| format!("{at}: {e}"))?;
     let min_account_age = match &r.min_account_age {
         None => None,
         Some(raw) => Some(bd_core::time::parse_duration(raw).map_err(|e| format!("{at}: min_account_age: {e}"))?),
     };
-    if r.max_claims == Some(0) {
-        return Err(format!("{at}: max_claims must be at least 1 (role read lets its accounts claim nothing)"));
-    }
-    let grant = Grant { role, kind: r.kind, workspaces, max_claims: r.max_claims };
+    let grant = rule_grant(&at, r.anyone, r.role, r.kind, &r.workspaces, r.max_claims)?;
     Ok(Rule { anyone: r.anyone, users, orgs, teams, min_account_age, grant })
 }

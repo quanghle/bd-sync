@@ -186,8 +186,8 @@ providers (a page offers them when there are several), under the same rules
 client) as `bd remote login` ([Signing in](remote.md#signing-in)), approve
 the client, and the client gets a token bound to the endpoint it asked for.
 
-1. Set up sign-in ([remote workspaces](remote.md#signing-in)) so that
-   tokens are refreshed: an authorizer, GitHub's rules with the GitHub App's private key, or an OIDC provider's rules. Each provider sends people back to
+1. Set up sign-in ([remote workspaces](remote.md#signing-in)): a
+   provider's rules or an authorizer, which decide again at each refresh. Each provider sends people back to
    `<public-url>/oauth/<provider>/callback`: for GitHub, set the App's
    **Callback URL** to the server's public URL followed by
    `/oauth/github/callback` (`https://bd.example.com/bd/oauth/github/callback`)
@@ -220,8 +220,7 @@ the client, and the client gets a token bound to the endpoint it asked for.
 `bd serve check --root /srv/bd --public-url https://bd.example.com/bd`
 prints the callback URLs to register at each provider and the MCP
 endpoints to give clients, and checks `auth.toml` without starting a
-server. `bd serve` refuses to start with `[oauth]` but tokens that are not
-refreshed (GitHub's rules without `private_key`, and no authorizer), no
+server. `bd serve` refuses to start with `[oauth]` but no
 provider for a browser (GitHub without `client_secret_file`, and no OIDC
 provider), no such `--public-url`, or no redirect allowed; and with
 `client_secret_file` but no `[oauth]`. Like the rest of `auth.toml`,

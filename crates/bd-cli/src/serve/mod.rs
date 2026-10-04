@@ -119,15 +119,24 @@ const BODY_COPIES: usize = 2;
 /// How long a request waits for body budget or a command slot before the
 /// client is asked to retry (503).
 const QUEUE_WAIT: Duration = Duration::from_secs(15);
-const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request's headers may take, counted from when the connection
+/// waits for them: so also how long an idle keep-alive connection is kept
+/// for its next request (hyper times both as one). Long enough that a
+/// client's next tool call reuses its connection (nginx's keep-alive
+/// default); a client trickling headers is bounded by it and by
+/// `MAX_CONNECTIONS_PER_PEER`.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(75);
 /// Matches the client's own limit for a whole request.
 const BODY_TIMEOUT: Duration = Duration::from_secs(120);
-/// Connections close after this long, so a client that stops reading cannot hold a response forever.
+/// Connections close after this long, so a client that stops reading cannot hold a response forever: gracefully,
+/// the answer in progress finished first, within `LIFETIME_GRACE`.
 const MAX_CONNECTION_LIFETIME: Duration = Duration::from_secs(15 * 60);
+const LIFETIME_GRACE: Duration = Duration::from_secs(2 * 60);
 /// hyper's per-connection read buffer, held before authentication (hyper's default is ~400 KiB).
 const READ_BUFFER: usize = 64 << 10;
-/// Idle database connections kept per workspace.
+/// Idle database connections kept per workspace, each for at most `POOL_IDLE`.
 const MAX_POOLED: usize = 16;
+const POOL_IDLE: Duration = Duration::from_secs(5 * 60);
 /// Stack of the threads that run commands. Playbooks nest at most
 /// `playbook::MAX_DEPTH` levels, far below this; it is address space,
 /// committed only as it is used.
@@ -359,6 +368,7 @@ fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Tok
             Err(Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7))
         }
         Ok(Verified::Unknown) => Err(denied()),
+        Err(Error::Busy(_)) => Err(Reject::busy("checking access tokens")),
         Err(e) => Err(Reject::internal(e)),
     }
 }
@@ -415,6 +425,20 @@ fn busy(doing: &str) -> Response<Body> {
 
 fn shutting_down() -> Response<Body> {
     Reject::shutting_down().response()
+}
+
+/// The largest body read and dropped before a refusal sent without reading it.
+const DRAIN_MAX: usize = 16 << 10;
+
+/// `response`, once the request's `body` (if it was not read) is read and
+/// dropped, when small: hyper closes a connection whose request body was
+/// left unread, and a client's next request would need a new one (often
+/// right after a refusal: the first, unauthenticated, MCP request).
+async fn drained(body: Option<Incoming>, response: Response<Body>) -> Response<Body> {
+    if let Some(body) = body {
+        let _ = read_body(body, DRAIN_MAX, Duration::from_secs(1)).await;
+    }
+    response
 }
 
 /// Wait up to `QUEUE_WAIT` for `permits` of `slots`; past it the server is
@@ -519,22 +543,30 @@ struct Workspace {
     name: String,
     dir: PathBuf,
     db: PathBuf,
-    pool: Mutex<Vec<Store>>,
+    /// Idle connections, the last given back on top, with when.
+    pool: Mutex<Vec<(Store, Instant)>>,
 }
 
 impl Workspace {
     fn take(&self, open: &OpenOptions) -> Result<Store> {
         match lock(&self.pool).pop() {
-            Some(store) => Ok(store),
+            Some((store, _)) => Ok(store),
             None => Store::open(&self.db, open.clone()),
         }
     }
 
+    /// Give `store` back; connections idle for `POOL_IDLE` (at the bottom,
+    /// as the busiest are taken from the top) are closed, so a burst's
+    /// connections and their caches do not stay.
     fn give(&self, store: Store) {
         let mut pool = lock(&self.pool);
+        let idle = pool.iter().take_while(|(_, at)| at.elapsed() >= POOL_IDLE).count();
+        let closed: Vec<(Store, Instant)> = pool.drain(..idle).collect();
         if pool.len() < MAX_POOLED {
-            pool.push(store);
+            pool.push((store, Instant::now()));
         }
+        drop(pool);
+        drop(closed);
     }
 }
 
@@ -754,10 +786,10 @@ impl Server {
         if !valid_workspace_name(name) {
             return None;
         }
-        let mut map = lock(&self.workspaces);
-        if let Some(ws) = map.get(name) {
+        if let Some(ws) = lock(&self.workspaces).get(name) {
             return Some(ws.clone());
         }
+        // The files are looked at without holding the map: other requests' workspaces are found meanwhile.
         let dir = self.root.join(name);
         let db = dir.join(".bd").join("bd.db");
         if !db.is_file() {
@@ -770,8 +802,7 @@ impl Server {
             return None;
         }
         let ws = Arc::new(Workspace { name: name.to_string(), dir, db, pool: Mutex::default() });
-        map.insert(name.to_string(), ws.clone());
-        Some(ws)
+        Some(lock(&self.workspaces).entry(name.to_string()).or_insert(ws).clone())
     }
 
     /// Hold a request `events --since N --wait D` until an event matching its

@@ -7,14 +7,15 @@
 //!
 //! - `config`: `auth.toml` as written and checked (`parse`), loaded here
 //!   with its secret files and cached until one of them changes (`load`).
-//! - `rules`: `[[github.allow]]` rules (`decide`); OIDC providers' rules are
-//!   in `oidc.rs`. `[authorizer]` (`authorizer.rs`) replaces the rules: the
-//!   admin's own code decides, within caps; the account is still proved and
-//!   bound here.
-//! - `github`: GitHub's API as the App and as the person, the App's key and
-//!   client secret, memberships, its web sign-in.
-//! - `admit`: the device flow at the server, admitting an account
-//!   (`admit`, `admit_oidc`), providers' account notifications.
+//! - `rules`: `[[<provider>.allow]]` rules, one engine for every provider
+//!   (`decide`), over what the provider proves of an account (`Facts`).
+//!   `[authorizer]` (`authorizer.rs`) replaces the rules: the admin's own
+//!   code decides, within caps; the account is still proved and bound here.
+//! - `github`: GitHub as a provider: its API as the App and as the person,
+//!   the App's key and client secret, what it proves (`GithubFacts`:
+//!   memberships as groups), its web sign-in.
+//! - `admit`: the device flow at the server, admitting an account by its
+//!   provider's facts (`judge`), providers' account notifications.
 //! - `refresh`: refreshing a sign-in: deciding again, then rotating its
 //!   secrets (`auth::rotate`); a refresh secret used twice revokes it.
 //! - `client`: `bd remote login --provider` on the client.
@@ -57,10 +58,13 @@ const TTL_RANGE: (Duration, Duration) = (Duration::from_secs(5 * 60), Duration::
 const DEFAULT_REFRESH_LIMIT: Duration = Duration::from_secs(30 * 24 * 3600);
 /// How long a sign-in may go without a refresh, unless `refresh_idle` says otherwise.
 const DEFAULT_REFRESH_IDLE: Duration = Duration::from_secs(7 * 24 * 3600);
-/// How long an installation token is used: GitHub's last an hour.
+/// How long an installation token is used when GitHub does not say when it
+/// expires: GitHub's last an hour.
 const INSTALLATION_TOKEN_LIFE: Duration = Duration::from_secs(50 * 60);
 /// Each request to GitHub ends within this.
 const GITHUB_TIMEOUT: Duration = Duration::from_secs(20);
+/// All of a refresh's requests to GitHub end within this.
+const REFRESH_BUDGET: Duration = Duration::from_secs(10);
 /// The largest GitHub answer read.
 const MAX_ANSWER: u64 = 1 << 20;
 const DEVICE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
@@ -86,20 +90,42 @@ pub struct SignIn {
     /// How long a sign-in may go without a refresh.
     pub refresh_idle: Duration,
     /// The admin's own code deciding who may sign in (`[authorizer]`,
-    /// `authorizer.rs`), instead of `[[github.allow]]` rules.
+    /// `authorizer.rs`), instead of `[[<provider>.allow]]` rules.
     pub authorizer: Option<crate::authorizer::Authorizer>,
     /// The authorization server for MCP clients, if `[oauth]` turns it on.
     pub oauth: Option<OauthConfig>,
 }
 
 impl SignIn {
-    /// Whether sign-ins with `provider` get refresh tokens: only when
-    /// someone decides again at each refresh, the authorizer, or GitHub's
-    /// rules through the GitHub App.
+    /// Whether sign-ins with `provider` get refresh tokens: when someone
+    /// decides again at each refresh, the authorizer or the provider's rules.
     pub fn refreshes(&self, provider: &str) -> bool {
-        self.authorizer.is_some()
-            || (provider == "github" && self.github.as_ref().is_some_and(|g| g.private_key.is_some()))
-            || self.oidc(provider).is_some_and(|o| !o.allow.is_empty())
+        self.authorizer.is_some() || !self.allow(provider).is_empty()
+    }
+
+    /// The `[[<provider>.allow]]` rules of `provider` (none for one it lacks).
+    pub fn allow(&self, provider: &str) -> &[Rule] {
+        match provider {
+            "github" => self.github.as_ref().map_or(&[], |g| &g.allow),
+            name => self.oidc(name).map_or(&[], |o| &o.allow),
+        }
+    }
+
+    /// Whether `user`'s provider's `deny` names the account.
+    pub fn denies(&self, user: &Identity) -> bool {
+        let deny = match user.provider.as_str() {
+            "github" => self.github.as_ref().map(|g| &g.deny),
+            name => self.oidc(name).map(|o| &o.deny),
+        };
+        deny.is_some_and(|d| d.contains(&user.subject))
+    }
+
+    /// How messages name `provider`: `GitHub`, or its `label`.
+    pub fn label<'s>(&'s self, provider: &'s str) -> &'s str {
+        match provider {
+            "github" => "GitHub",
+            name => self.oidc(name).map_or(name, |o| o.label.as_str()),
+        }
     }
 
     /// The files holding secrets of sign-in, as written (relative to `root`
@@ -304,15 +330,16 @@ pub struct Admitted {
     pub grant: Grant,
     /// What let it in (`GitHub user alice`, `member of acme`).
     pub via: String,
-    /// Whether that was its login in a rule's `users`.
+    /// Whether that may pass between accounts (a login, an email).
     pub by_login: bool,
-    /// Memberships GitHub would not tell, for the log.
+    /// Memberships the provider would not tell, for the log.
     pub unknown: Vec<String>,
     /// Its email, if its OIDC provider verified it: shown on the consent
     /// page, never kept.
     pub email: Option<String>,
-    /// The fingerprint of the `[[oidc.<name>.allow]]` rule that let it in,
-    /// kept with its sign-in: its refreshes go on while that rule is there.
+    /// The fingerprint of the `[[<provider>.allow]]` rule that let it in,
+    /// kept with its sign-in: a refresh that cannot ask the provider again
+    /// goes on while that rule is there.
     pub rule: Option<String>,
 }
 
@@ -403,7 +430,7 @@ mod tests {
         let g = github("[github]\nclient_id = \" Ov23liX \"\n[[github.allow]]\nusers = [\"alice\"]\n");
         assert_eq!(g.client_id, "Ov23liX");
         assert_eq!((g.url.as_str(), g.api_url.as_str()), ("https://github.com", "https://api.github.com"));
-        let rule = &g.rules[0];
+        let rule = &g.allow[0];
         assert_eq!(
             rule.grant,
             Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec!["*".into()], max_claims: None }
@@ -412,16 +439,16 @@ mod tests {
 
         let all = sign_in(
             "[sign_in]\ntoken_ttl = \"12h\"\n[github]\nclient_id = \"x\"\nurl = \"https://ghe.example.com/\"\n\
-             [[github.allow]]\nteams = [\"acme/bd-admins\"]\nrole = \"admin\"\nkind = \"human\"\n\
-             workspaces = [\"proj\", \"other\"]\n[[github.allow]]\norgs = [\"acme\"]\nrole = \"read\"\n",
+             [[github.allow]]\ngroups = [\"Acme/bd-admins\"]\nrole = \"admin\"\nkind = \"human\"\n\
+             workspaces = [\"proj\", \"other\"]\n[[github.allow]]\ngroups = [\"acme\"]\nrole = \"read\"\n",
         );
         assert_eq!(all.token_ttl, Duration::from_secs(12 * 3600));
         let g = all.github.unwrap();
         assert_eq!(g.api_url, "https://ghe.example.com/api/v3", "GitHub Enterprise Server's API");
-        assert_eq!(g.rules[0].teams, [("acme".to_string(), "bd-admins".to_string())]);
-        assert_eq!(g.rules[0].grant.workspaces, ["other", "proj"]);
-        assert_eq!((g.rules[0].grant.role, g.rules[0].grant.kind), (Role::Admin, Kind::Human));
-        assert_eq!(g.rules[1].grant.role, Role::Read);
+        assert_eq!(g.allow[0].groups, ["acme/bd-admins"], "GitHub's names whatever their case");
+        assert_eq!(g.allow[0].grant.workspaces, ["other", "proj"]);
+        assert_eq!((g.allow[0].grant.role, g.allow[0].grant.kind), (Role::Admin, Kind::Human));
+        assert_eq!(g.allow[1].grant.role, Role::Read);
         assert!(g.reads_orgs());
         let g = github(
             "[github]\nclient_id = \"x\"\nurl = \"http://127.0.0.1:9\"\napi_url = \"http://[::1]:9/api\"\n\
@@ -433,15 +460,15 @@ mod tests {
             "[github]\nclient_id = \"x\"\n[[github.allow]]\nusers = [\"a\"]\n\
              [[github.allow]]\nanyone = true\nworkspaces = [\"oss\"]\n",
         );
-        assert!(g.rules[1].anyone && !g.reads_orgs());
+        assert!(g.allow[1].anyone && !g.reads_orgs());
         let read = Grant { role: Role::Read, kind: Kind::Agent, workspaces: vec!["oss".into()], max_claims: None };
-        assert_eq!(g.rules[1].grant, read, "anyone reads unless the rule says write");
+        assert_eq!(g.allow[1].grant, read, "anyone reads unless the rule says write");
         let g = github("[github]\nclient_id = \"x\"\n[[github.allow]]\nanyone = true\nrole = \"write\"\n");
-        assert_eq!(g.rules[0].grant.role, Role::Write);
+        assert_eq!(g.allow[0].grant.role, Role::Write);
         let g = github(
-            "[github]\nclient_id = \"x\"\n[[github.allow]]\norgs = [\"acme\"]\nmax_claims = 2\n[[github.allow]]\nanyone = true\n",
+            "[github]\nclient_id = \"x\"\n[[github.allow]]\ngroups = [\"acme\"]\nmax_claims = 2\n[[github.allow]]\nanyone = true\n",
         );
-        assert_eq!(g.rules[0].grant.max_claims, Some(2), "strangers who only read hold nothing to compare with");
+        assert_eq!(g.allow[0].grant.max_claims, Some(2), "strangers who only read hold nothing to compare with");
     }
 
     #[test]
@@ -462,8 +489,8 @@ mod tests {
 
         assert!(error("[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n").contains("need a provider"));
         let no_key = "[github]\nclient_id = \"x\"\nclient_secret_file = \"s\"\n[[github.allow]]\nusers = [\"a\"]\n";
-        let e = error(&format!("{no_key}[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n"));
-        assert!(e.contains("needs refreshed tokens") && e.contains("private_key"), "{e}");
+        let rules_alone = sign_in(&format!("{no_key}[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n"));
+        assert!(rules_alone.refreshes("github"), "rules decide again at refreshes, with the GitHub App or without");
         assert!(error(&format!("{github}[oauth]\n")).contains("allows no redirect URIs"));
         for bad in
             ["localhost", "127.0.0.1", "*.example.com", "chatgpt.com:443", "-a.com", "a..com", "https://a.com", ""]
@@ -568,7 +595,7 @@ mod tests {
         let base = "[github]\nclient_id = \"Iv1.x\"\n";
         let authorizer = "\n[authorizer]\ncommand = [\"bin/authorize\"]\n";
         let all = sign_in(&format!("{base}{authorizer}"));
-        assert!(all.github.as_ref().unwrap().rules.is_empty());
+        assert!(all.github.as_ref().unwrap().allow.is_empty());
         assert!(all.refreshes("github"), "the authorizer decides again at refreshes: no GitHub App needed");
         let a = all.authorizer.expect("an authorizer");
         assert_eq!(a.caps.max_role, Role::Write);
@@ -606,7 +633,7 @@ mod tests {
         let all = sign_in(&format!("{base}{rule}"));
         let g = all.github.as_ref().unwrap();
         assert_eq!((all.token_ttl, g.private_key.as_ref(), g.app.as_ref()), (DEFAULT_TTL, None, None));
-        assert!(all.lifetime(Timestamp::now(), "github").refresh.is_none(), "rules without the App: no refresh");
+        assert!(all.lifetime(Timestamp::now(), "github").refresh.is_some(), "rules without the App refresh too");
         let all = sign_in(&format!(
             "[sign_in]\nrefresh_limit = \"14d\"\nrefresh_idle = \"1d\"\n{base}private_key = \"app.pem\"{rule}"
         ));
@@ -615,7 +642,7 @@ mod tests {
             (all.refresh_limit, all.refresh_idle),
             (Duration::from_secs(14 * 86400), Duration::from_secs(86400))
         );
-        assert!(all.refreshes("github") && !all.refreshes("google"), "the App applies GitHub's rules only");
+        assert!(all.refreshes("github") && !all.refreshes("google"), "GitHub's rules are GitHub's only");
         for (settings, says) in [
             ("[sign_in]\ntoken_ttl = \"10d\"\n", "at most the next"),
             ("[sign_in]\nrefresh_idle = \"60d\"\n", "at most the next"),
@@ -697,8 +724,10 @@ mod tests {
             (with("secret = \"s\"", "users = [\"a\"]"), "unknown field"),
             (with("", "role = \"read\""), "lets nobody in"),
             (with("", "anyone = false"), "lets nobody in"),
-            (with("", "anyone = true\nusers = [\"a\"]"), "drop its users, orgs and teams"),
-            (with("", "anyone = true\norgs = [\"acme\"]"), "drop its users, orgs and teams"),
+            (with("", "anyone = true\nusers = [\"a\"]"), "drop whom it names"),
+            (with("", "anyone = true\ngroups = [\"acme\"]"), "drop whom it names"),
+            (with("", "orgs = [\"acme\"]"), "unknown field"),
+            (with("", "emails = [\"a@acme.example\"]"), "GitHub proves no email"),
             (with("", "anyone = true\nrole = \"admin\""), "not admin"),
             (with("", "anyone = true\nkind = \"human\""), "agent only"),
             (
@@ -706,7 +735,7 @@ mod tests {
                 "rule 1 lets anyone in, so the rules after it",
             ),
             (
-                with("", "orgs = [\"o\"]\nrole = \"read\"\n[[github.allow]]\nanyone = true\nrole = \"write\""),
+                with("", "groups = [\"o\"]\nrole = \"read\"\n[[github.allow]]\nanyone = true\nrole = \"write\""),
                 "rule 1 gives",
             ),
             (
@@ -716,11 +745,12 @@ mod tests {
                 ),
                 "raise its role, or keep their workspaces apart",
             ),
-            (with("deny = [\"alice\"]", "users = [\"a\"]"), "line 3: invalid type"),
-            (with("", "users = [\"../admin\"]"), "not a GitHub name"),
-            (with("", "orgs = [\"acme/x\"]"), "not a GitHub name"),
-            (with("", "teams = [\"acme\"]"), "not <organization>/<team slug>"),
-            (with("", "teams = [\"acme/x/y\"]"), "not <organization>/<team slug>"),
+            (with("deny = [\"alice\"]", "users = [\"a\"]"), "github.deny \"alice\" is not a GitHub user id"),
+            (with("deny = [7]", "users = [\"a\"]"), "line 3: invalid type"),
+            (with("", "users = [\"../admin\"]"), "users \"../admin\" is not one"),
+            (with("", "groups = [\"acme/x/y\"]"), "groups \"acme/x/y\" is not one"),
+            (with("", "groups = [\"acme/\"]"), "is not one"),
+            (with("", "subjects = [\"alice\"]"), "subjects \"alice\" is not one"),
             (with("", "users = [\"a\"]\nworkspaces = [\"../x\"]"), "invalid workspace name"),
             (with("url = \"http://github.com\"", "users = [\"a\"]"), "must use https"),
             (with("api_url = \"https://u:p@h\"", "users = [\"a\"]"), "no credentials"),
@@ -734,14 +764,14 @@ mod tests {
             (
                 with(
                     "",
-                    "orgs = [\"acme\"]\nmax_claims = 2\n[[github.allow]]\nanyone = true\nrole = \"write\"\nmax_claims = 5",
+                    "groups = [\"acme\"]\nmax_claims = 2\n[[github.allow]]\nanyone = true\nrole = \"write\"\nmax_claims = 5",
                 ),
                 "rule 1 lets its accounts hold fewer claims than rule 2",
             ),
             (
                 with(
                     "",
-                    "orgs = [\"acme\"]\nmax_claims = 2\nworkspaces = [\"p\"]\n[[github.allow]]\nanyone = true\nrole = \"write\"",
+                    "groups = [\"acme\"]\nmax_claims = 2\nworkspaces = [\"p\"]\n[[github.allow]]\nanyone = true\nrole = \"write\"",
                 ),
                 "raise its max_claims, or keep their workspaces apart",
             ),
@@ -757,29 +787,52 @@ mod tests {
         assert!(e.to_string().contains(FILE) && e.exit_code() == 2, "{e}");
     }
 
-    /// Memberships from a list (`acme`, `acme/team`); `blocked` organizations
-    /// will not tell. Records each question.
+    /// What a GitHub account proves: memberships from a list (`acme`,
+    /// `acme/team`); `blocked` organizations will not tell. Records each
+    /// question.
     struct Known {
+        user: Identity,
+        age: Option<Duration>,
         member_of: Vec<&'static str>,
         blocked: Vec<&'static str>,
         asked: Vec<String>,
     }
 
-    impl Memberships for Known {
-        fn org(&mut self, org: &str) -> Result<Member> {
-            self.asked.push(org.to_string());
-            Ok(match (self.blocked.contains(&org), self.member_of.contains(&org)) {
+    fn known(login: &str, age: Option<Duration>, member_of: Vec<&'static str>, blocked: Vec<&'static str>) -> Known {
+        let user = Identity {
+            provider: "github".into(),
+            issuer: "https://github.com".into(),
+            subject: "7".into(),
+            login: login.into(),
+        };
+        Known { user, age, member_of, blocked, asked: Vec::new() }
+    }
+
+    impl Facts for Known {
+        fn identity(&self) -> &Identity {
+            &self.user
+        }
+
+        fn fresh(&self) -> bool {
+            true
+        }
+
+        fn age(&self) -> Option<Duration> {
+            self.age
+        }
+
+        fn member(&mut self, group: &str) -> Result<Member> {
+            self.asked.push(group.to_string());
+            Ok(match (self.blocked.contains(&group), self.member_of.contains(&group)) {
                 (true, _) => Member::Unknown("GitHub answered 403".into()),
                 (_, true) => Member::Yes,
                 _ => Member::No,
             })
         }
+    }
 
-        fn team(&mut self, org: &str, team: &str) -> Result<Member> {
-            let name = format!("{org}/{team}");
-            self.asked.push(name.clone());
-            Ok(if self.member_of.contains(&name.as_str()) { Member::Yes } else { Member::No })
-        }
+    fn decide_in(g: &Github, k: &mut Known, workspace: &str) -> Decided {
+        decide(&g.allow, k, None, workspace).unwrap()
     }
 
     #[test]
@@ -787,22 +840,21 @@ mod tests {
         let g = github(
             "[github]\nclient_id = \"x\"\n\
              [[github.allow]]\nusers = [\"Alice\"]\nrole = \"admin\"\n\
-             [[github.allow]]\nteams = [\"acme/bd\"]\norgs = [\"partner\"]\nkind = \"human\"\n\
-             [[github.allow]]\norgs = [\"acme\"]\nrole = \"read\"\n",
+             [[github.allow]]\ngroups = [\"partner\", \"acme/bd\"]\nkind = \"human\"\n\
+             [[github.allow]]\ngroups = [\"acme\"]\nrole = \"read\"\n",
         );
         let decide_for = |login: &str, member_of: Vec<&'static str>, blocked: Vec<&'static str>| {
-            let mut known = Known { member_of, blocked, asked: Vec::new() };
-            let mut unknown = Vec::new();
-            let decided = role_via(decide(&g, login, None, "proj", &mut known, &mut unknown).unwrap());
-            (decided, known.asked, unknown)
+            let mut k = known(login, None, member_of, blocked);
+            let decided = decide_in(&g, &mut k, "proj");
+            (role_via(decided.decision), k.asked, decided.unknown)
         };
         let (decided, asked, _) = decide_for("alice", vec!["acme"], vec![]);
         assert_eq!(decided, Some((Role::Admin, "GitHub user alice".into())), "logins match whatever their case");
         assert!(asked.is_empty(), "no membership is asked once a login matches");
 
         let (decided, asked, _) = decide_for("bob", vec!["acme", "acme/bd"], vec![]);
-        assert_eq!(decided, Some((Role::Write, "member of team acme/bd".into())), "the team's rule comes first");
-        assert_eq!(asked, ["partner", "acme/bd"], "organizations, then teams, of each rule in order");
+        assert_eq!(decided, Some((Role::Write, "member of acme/bd".into())), "the team's rule comes first");
+        assert_eq!(asked, ["partner", "acme/bd"], "the groups of each rule in order");
 
         let (decided, asked, _) = decide_for("carol", vec!["acme"], vec![]);
         assert_eq!(decided, Some((Role::Read, "member of acme".into())));
@@ -818,24 +870,21 @@ mod tests {
         // Eve is in both; GitHub will not say for vendor. Were that "no", acme's rule would make her an admin.
         let g = github(
             "[github]\nclient_id = \"x\"\n\
-             [[github.allow]]\norgs = [\"vendor\"]\nrole = \"read\"\n\
-             [[github.allow]]\norgs = [\"acme\"]\nrole = \"admin\"\n\
-             [[github.allow]]\norgs = [\"vendor\"]\nworkspaces = [\"other\"]\n",
+             [[github.allow]]\ngroups = [\"vendor\"]\nrole = \"read\"\n\
+             [[github.allow]]\ngroups = [\"acme\"]\nrole = \"admin\"\n\
+             [[github.allow]]\ngroups = [\"vendor\"]\nworkspaces = [\"other\"]\n",
         );
-        let mut known = Known { member_of: vec!["vendor", "acme"], blocked: vec!["vendor"], asked: Vec::new() };
-        let mut unknown = Vec::new();
-        let decided = decide(&g, "eve", None, "proj", &mut known, &mut unknown).unwrap();
-        assert!(matches!(decided, Decision::Unknown), "not admin by the next rule");
-        assert_eq!(known.asked, ["vendor"]);
+        let mut k = known("eve", None, vec!["vendor", "acme"], vec!["vendor"]);
+        assert!(matches!(decide_in(&g, &mut k, "proj").decision, Decision::Unknown), "not admin by the next rule");
+        assert_eq!(k.asked, ["vendor"]);
         // A rule for other workspaces does not stop it, known or not.
         let g = github(
             "[github]\nclient_id = \"x\"\n\
-             [[github.allow]]\norgs = [\"vendor\"]\nworkspaces = [\"other\"]\n\
-             [[github.allow]]\norgs = [\"acme\"]\n",
+             [[github.allow]]\ngroups = [\"vendor\"]\nworkspaces = [\"other\"]\n\
+             [[github.allow]]\ngroups = [\"acme\"]\n",
         );
-        let mut known = Known { member_of: vec!["acme"], blocked: vec!["vendor"], asked: Vec::new() };
-        let decided = decide(&g, "eve", None, "proj", &mut known, &mut Vec::new()).unwrap();
-        assert_eq!(role_via(decided), Some((Role::Write, "member of acme".into())));
+        let mut k = known("eve", None, vec!["acme"], vec!["vendor"]);
+        assert_eq!(role_via(decide_in(&g, &mut k, "proj").decision), Some((Role::Write, "member of acme".into())));
     }
 
     fn role_via(d: Decision) -> Option<(Role, String)> {
@@ -849,69 +898,66 @@ mod tests {
     fn a_rule_for_other_workspaces_leaves_the_account_to_the_rules_after_it() {
         let g = github(
             "[github]\nclient_id = \"x\"\n\
-             [[github.allow]]\norgs = [\"acme\"]\nrole = \"admin\"\nworkspaces = [\"internal\"]\n\
+             [[github.allow]]\ngroups = [\"acme\"]\nrole = \"admin\"\nworkspaces = [\"internal\"]\n\
              [[github.allow]]\nusers = [\"bob\"]\nworkspaces = [\"docs\", \"internal\"]\n\
              [[github.allow]]\nanyone = true\nworkspaces = [\"oss\"]\n",
         );
-        let decide_for = |login: &str, workspace: &str| {
-            let mut known = Known { member_of: vec!["acme"], blocked: vec![], asked: Vec::new() };
-            decide(&g, login, None, workspace, &mut known, &mut Vec::new()).unwrap()
-        };
-        assert_eq!(role_via(decide_for("bob", "internal")), Some((Role::Admin, "member of acme".into())));
-        assert_eq!(role_via(decide_for("bob", "docs")), Some((Role::Write, "GitHub user bob".into())));
-        assert_eq!(role_via(decide_for("bob", "oss")), Some((Role::Read, "GitHub user bob, as anyone".into())));
-        let Decision::In { grant, .. } = decide_for("bob", "docs") else { panic!() };
+        let decide_for =
+            |login: &str, workspace: &str| decide_in(&g, &mut known(login, None, vec!["acme"], vec![]), workspace);
+        assert_eq!(role_via(decide_for("bob", "internal").decision), Some((Role::Admin, "member of acme".into())));
+        assert_eq!(role_via(decide_for("bob", "docs").decision), Some((Role::Write, "GitHub user bob".into())));
+        assert_eq!(
+            role_via(decide_for("bob", "oss").decision),
+            Some((Role::Read, "GitHub user bob, as anyone".into()))
+        );
+        let Decision::In { grant, .. } = decide_for("bob", "docs").decision else { panic!() };
         assert_eq!(grant.workspaces, ["docs"], "never internal, where the first rule decides");
 
         let g = github(
             "[github]\nclient_id = \"x\"\n[[github.allow]]\nusers = [\"bob\"]\nworkspaces = [\"docs\", \"internal\"]\n",
         );
-        let mut known = Known { member_of: vec![], blocked: vec![], asked: Vec::new() };
-        let Decision::In { grant, .. } = decide(&g, "bob", None, "docs", &mut known, &mut Vec::new()).unwrap() else {
+        let Decision::In { grant, .. } = decide_in(&g, &mut known("bob", None, vec![], vec![]), "docs").decision else {
             panic!()
         };
         assert_eq!(grant.workspaces, ["docs", "internal"], "the first rule that lets bob in decides: all of it");
-        match decide_for("bob", "secret") {
+        match decide_for("bob", "secret").decision {
             Decision::Elsewhere(w) => assert_eq!(w, ["internal", "docs", "oss"]),
             other => panic!("{other:?}"),
         }
 
         let g = github("[github]\nclient_id = \"x\"\n[[github.allow]]\nusers = [\"a\"]\nworkspaces = [\"p\"]\n");
-        let mut known = Known { member_of: vec![], blocked: vec![], asked: Vec::new() };
-        assert!(matches!(decide(&g, "z", None, "p", &mut known, &mut Vec::new()).unwrap(), Decision::Out));
+        assert!(matches!(decide_in(&g, &mut known("z", None, vec![], vec![]), "p").decision, Decision::Out));
     }
 
     #[test]
     fn an_anyone_rule_lets_in_whom_the_rules_before_it_do_not() {
         let g = github(
-            "[github]\nclient_id = \"x\"\ndeny = [7]\n\
-             [[github.allow]]\norgs = [\"acme\"]\nrole = \"write\"\n\
+            "[github]\nclient_id = \"x\"\ndeny = [\"7\"]\n\
+             [[github.allow]]\ngroups = [\"acme\"]\nrole = \"write\"\n\
              [[github.allow]]\nanyone = true\n",
         );
-        assert_eq!(g.deny, [7]);
-        let mut known = Known { member_of: vec!["acme"], blocked: vec![], asked: Vec::new() };
-        let decided = role_via(decide(&g, "bob", None, "proj", &mut known, &mut Vec::new()).unwrap());
+        assert_eq!(g.deny, ["7"]);
+        let decided = role_via(decide_in(&g, &mut known("bob", None, vec!["acme"], vec![]), "proj").decision);
         assert_eq!(decided, Some((Role::Write, "member of acme".into())));
-        let mut known = Known { member_of: vec![], blocked: vec![], asked: Vec::new() };
-        let decided = role_via(decide(&g, "Mallory", None, "proj", &mut known, &mut Vec::new()).unwrap());
+        let mut k = known("Mallory", None, vec![], vec![]);
+        let decided = role_via(decide_in(&g, &mut k, "proj").decision);
         assert_eq!(decided, Some((Role::Read, "GitHub user Mallory, as anyone".into())));
-        assert_eq!(known.asked, ["acme"], "the anyone rule asks GitHub nothing");
+        assert_eq!(k.asked, ["acme"], "the anyone rule asks GitHub nothing");
     }
 
     #[test]
     fn young_accounts_are_left_to_the_rules_without_a_min_account_age() {
         let g = github(
             "[github]\nclient_id = \"x\"\n\
-             [[github.allow]]\norgs = [\"acme\"]\nworkspaces = [\"proj\"]\nmin_account_age = \"7d\"\n\
+             [[github.allow]]\ngroups = [\"acme\"]\nworkspaces = [\"proj\"]\nmin_account_age = \"7d\"\n\
              [[github.allow]]\nanyone = true\nworkspaces = [\"proj\", \"oss\"]\nmin_account_age = \"30d\"\nmax_claims = 2\n",
         );
-        assert_eq!(g.rules[1].min_account_age, Some(Duration::from_secs(30 * 86400)));
-        assert_eq!(g.rules[1].grant.max_claims, Some(2));
-        assert_eq!(g.rules[0].grant.max_claims, None);
+        assert_eq!(g.allow[1].min_account_age, Some(Duration::from_secs(30 * 86400)));
+        assert_eq!(g.allow[1].grant.max_claims, Some(2));
+        assert_eq!(g.allow[0].grant.max_claims, None);
         let days = |n: u64| Some(Duration::from_secs(n * 86400));
         let decide_for = |login: &str, age: Option<Duration>, workspace: &str| {
-            let mut known = Known { member_of: vec!["acme"], blocked: vec![], asked: Vec::new() };
-            decide(&g, login, age, workspace, &mut known, &mut Vec::new()).unwrap()
+            decide_in(&g, &mut known(login, age, vec!["acme"], vec![]), workspace).decision
         };
         assert_eq!(role_via(decide_for("bob", days(8), "proj")), Some((Role::Write, "member of acme".into())));
         let Decision::In { grant, .. } = decide_for("eve", days(31), "oss") else { panic!() };
@@ -921,8 +967,38 @@ mod tests {
         assert!(matches!(decide_for("bob", days(6), "oss"), Decision::TooNew(d) if d == days(30).unwrap()));
         assert!(matches!(decide_for("bob", None, "proj"), Decision::TooNew(_)), "no age from GitHub: too new");
         // Too new for a rule elsewhere only: the rules for this workspace decide.
-        let mut known = Known { member_of: vec![], blocked: vec![], asked: Vec::new() };
-        assert!(matches!(decide(&g, "eve", days(1), "secret", &mut known, &mut Vec::new()).unwrap(), Decision::Out));
+        let out = decide_in(&g, &mut known("eve", days(1), vec![], vec![]), "secret").decision;
+        assert!(matches!(out, Decision::Out));
+    }
+
+    #[test]
+    fn refreshes_without_fresh_facts_keep_to_the_rule_that_let_the_account_in() {
+        // GitHub without its App, as OIDC providers: a subject decides again, other rules only as the one kept.
+        let g = github(
+            "[github]\nclient_id = \"x\"\n\
+             [[github.allow]]\nsubjects = [\"42\"]\nrole = \"admin\"\n\
+             [[github.allow]]\ngroups = [\"acme\"]\n",
+        );
+        let signed_in = decide_in(&g, &mut known("bob", None, vec!["acme"], vec![]), "proj");
+        let kept = signed_in.rule.clone().unwrap();
+        let bob = known("bob", None, vec![], vec![]).user;
+        let again = decide(&g.allow, &mut Listed::kept(&bob), Some(&kept), "proj").unwrap();
+        assert_eq!(role_via(again.decision), Some((Role::Write, "GitHub user bob, as at sign-in".into())));
+        assert!(matches!(decide(&g.allow, &mut Listed::kept(&bob), None, "proj").unwrap().decision, Decision::Out));
+        let admin = Identity { subject: "42".into(), ..bob.clone() };
+        let again = decide(&g.allow, &mut Listed::kept(&admin), None, "proj").unwrap();
+        assert_eq!(role_via(again.decision), Some((Role::Admin, "GitHub user bob".into())));
+    }
+
+    #[test]
+    fn requests_to_github_end_by_their_deadline() {
+        // Nothing listens there: a request sent would fail otherwise. One past its deadline is never sent.
+        let g =
+            github("[github]\nclient_id = \"x\"\nurl = \"http://127.0.0.1:9\"\n[[github.allow]]\nusers = [\"a\"]\n");
+        let e = Api::within(&g, Duration::ZERO).get("t", "/user").unwrap_err();
+        assert!(matches!(e, Error::Remote(_)) && e.to_string().contains("took too long"), "{e}");
+        let e = Api::within(&g, Duration::from_secs(5)).get("t", "/user").unwrap_err();
+        assert!(!e.to_string().contains("took too long"), "{e}");
     }
 
     #[test]

@@ -60,6 +60,11 @@ use store::*;
 /// that clients authorizing anew each time do not pile up live tokens.
 const MAX_SIGN_INS: usize = 20;
 
+/// How long a token check waits while `server.db` is busy (a reader rarely
+/// is, as when its write-ahead log is reset), before the request is told to
+/// retry (503).
+const VERIFY_WAIT: Duration = Duration::from_millis(250);
+
 const PRUNE_AFTER: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// What a token may do. Each role includes the ones before it.
@@ -566,6 +571,8 @@ impl Verifier {
         if conn.as_ref().is_none_or(|(_, opened)| *opened != file) {
             *conn = None;
             let Some(opened) = server_db::open_existing(&self.root)? else { return Ok(Vec::new()) };
+            // Checked on the server's async threads, under this lock: never a long wait for a writer.
+            opened.busy_timeout(VERIFY_WAIT)?;
             *conn = Some((opened, server_db::file_id(&self.root)));
         }
         let found = live_where(&conn.as_ref().expect("opened").0, column, value);

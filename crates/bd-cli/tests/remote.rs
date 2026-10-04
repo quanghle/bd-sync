@@ -5257,8 +5257,8 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let server = sign_in_server(
         &github,
         "[[github.allow]]\nusers = [\"Alice\"]\nrole = \"admin\"\nkind = \"human\"\n\n\
-         [[github.allow]]\nteams = [\"acme/bd\"]\nworkspaces = [\"proj\"]\n\n\
-         [[github.allow]]\norgs = [\"acme\"]\nrole = \"read\"\n",
+         [[github.allow]]\ngroups = [\"acme/bd\"]\nworkspaces = [\"proj\"]\n\n\
+         [[github.allow]]\ngroups = [\"acme\"]\nrole = \"read\"\n",
     );
     let url = server.url();
     let machine = || tempfile::tempdir().unwrap();
@@ -5308,7 +5308,7 @@ fn github_sign_in_issues_tokens_by_the_rules() {
     let (code, stdout, stderr) = login(bob.path());
     assert_eq!(code, Some(0), "{stderr}");
     let v: Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(v["account"]["via"], "member of team acme/bd");
+    assert_eq!(v["account"]["via"], "member of acme/bd");
     assert_eq!((v["token"]["role"].as_str(), v["token"]["kind"].as_str()), (Some("write"), Some("agent")));
     assert_eq!(v["token"]["workspaces"], json!(["proj"]));
     check(signed_in(bob.path(), &url, &["create", "By bob"]), "create as bob");
@@ -5370,8 +5370,15 @@ fn github_sign_in_issues_tokens_by_the_rules() {
         bd(&root).args(["serve", "token", "revoke", "--account", "mallory", "--root"]).arg(&root).output().unwrap();
     assert_eq!(out.status.code(), Some(3), "mallory never got one");
 
-    // An expired token is refused with what to do about it.
-    edit_tokens(&root, |t| t["identity"]["login"] == "bob", |t| t["expires_at"] = json!("2026-01-01T00:00:00.000Z"));
+    // An expired token that can no longer be refreshed is refused with what to do about it.
+    edit_tokens(
+        &root,
+        |t| t["identity"]["login"] == "bob",
+        |t| {
+            t["expires_at"] = json!("2026-01-01T00:00:00.000Z");
+            t["refresh"]["refreshed_at"] = json!("2026-01-01T00:00:00.000Z");
+        },
+    );
     let out = signed_in(bob.path(), &url, &["list"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(7), "{stderr}");
@@ -6140,7 +6147,7 @@ fn github_sign_ins_are_renewed_by_the_rules_through_the_github_app() {
     github.member("bob", "acme");
     let server = refresh_server(
         &github,
-        "[[github.allow]]\nusers = [\"alice\"]\nrole = \"admin\"\n\n[[github.allow]]\norgs = [\"acme\"]\n",
+        "[[github.allow]]\nusers = [\"alice\"]\nrole = \"admin\"\n\n[[github.allow]]\ngroups = [\"acme\"]\n",
     );
     let url = server.url();
     let root = server.root.path().to_path_buf();
@@ -6223,6 +6230,12 @@ fn github_sign_ins_are_renewed_by_the_rules_through_the_github_app() {
     assert_ne!(saved(bob.path(), "token").unwrap(), before);
     let members = github.log().iter().filter(|l| l.starts_with("GET /orgs/acme/memberships/bob")).count();
     assert!(members >= 1, "membership asked with an installation token: {:?}", github.log());
+    // Installation tokens last until shortly before GitHub's expires_at, and an organization's installation is
+    // looked up once: these refreshes minted one token, and listed the installations once.
+    let log = github.log();
+    let count = |prefix: &str| log.iter().filter(|l| l.starts_with(prefix)).count();
+    assert_eq!(count("POST /app/installations/"), 1, "{log:?}");
+    assert_eq!((count("GET /app/installations"), count("GET /orgs/acme/installation")), (1, 1), "{log:?}");
 
     // Out of the organization: the refresh is refused and the sign-in revoked.
     github.leave("bob", "acme");
@@ -6242,7 +6255,7 @@ fn github_sign_ins_stay_while_github_will_not_tell_memberships() {
     let github = FakeGithub::start();
     github.install("acme");
     github.member("carol", "other");
-    let server = refresh_server(&github, "[[github.allow]]\norgs = [\"other\"]\n");
+    let server = refresh_server(&github, "[[github.allow]]\ngroups = [\"other\"]\n");
     let url = server.url();
     // The App is not installed on `other`: the refresh fails for now, and the sign-in stays.
     github.next("carol", 0);
@@ -6415,7 +6428,7 @@ fn github_sign_in_refusals() {
     let github = FakeGithub::start();
     github.member("dana", "acme");
     github.state.lock().unwrap().blocked.push("acme".into());
-    let server = sign_in_server(&github, "[[github.allow]]\norgs = [\"acme\"]\n");
+    let server = sign_in_server(&github, "[[github.allow]]\ngroups = [\"acme\"]\n");
     github.next("dana", 0);
     refused(
         github_login(dir.path(), &server.url()),
@@ -6490,7 +6503,7 @@ fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
 
     // A denied account gets nothing, whatever its login.
     let config = server.root.path().join("auth.toml");
-    let text = std::fs::read_to_string(&config).unwrap().replace("[github]\n", "[github]\ndeny = [2]\n");
+    let text = std::fs::read_to_string(&config).unwrap().replace("[github]\n", "[github]\ndeny = [\"2\"]\n");
     std::fs::write(&config, text).unwrap();
     refused(sign_in("stranger", 2).1, "GitHub user stranger may not sign in");
     refused(sign_in("someone-else", 2).1, "GitHub user someone-else may not sign in");
@@ -6562,7 +6575,7 @@ fn github_sign_in_rules_keep_out_new_accounts_and_cap_claims() {
         let out = sign_in(login).1;
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(7), "{stderr}");
-        assert!(stderr.contains("its GitHub account must be at least 30d old"), "{stderr}");
+        assert!(stderr.contains("the account must be at least 30d old"), "{stderr}");
     }
 
     let (dir, out) = sign_in("veteran");
@@ -7299,6 +7312,48 @@ fn mcp_over_http_works_under_a_proxy_prefix_and_retries_are_not_deduplicated() {
 
 /// A server root whose `auth.toml` signs in with the GitHub App `Iv1.test`
 /// and turns on the authorization server with `oauth` (the `[oauth]` body).
+#[test]
+fn a_refused_request_leaves_its_connection_usable() {
+    use std::io::{Read, Write};
+    let server = Server::start();
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let mut conn = std::net::TcpStream::connect(&addr).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+    // No token: the challenge, before the body is read; then the next request on the same connection.
+    let headers = format!(
+        "POST /w/proj/mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    // The body after the headers, as clients often send it: the refusal comes before it was read.
+    conn.write_all(headers.as_bytes()).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    conn.write_all(body.as_bytes()).unwrap();
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !String::from_utf8_lossy(&seen).contains("\r\n\r\n") {
+        let n = conn.read(&mut buf).unwrap();
+        assert!(n > 0, "closed: {}", String::from_utf8_lossy(&seen));
+        seen.extend_from_slice(&buf[..n]);
+    }
+    let head = String::from_utf8_lossy(&seen).to_string();
+    assert!(head.starts_with("HTTP/1.1 401") && !head.to_lowercase().contains("connection: close"), "{head}");
+    // The rest of the 401's body, then the next answer.
+    let length: usize = head
+        .lines()
+        .find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse().unwrap()))
+        .unwrap();
+    let start = head.find("\r\n\r\n").unwrap() + 4;
+    while seen.len() < start + length {
+        let n = conn.read(&mut buf).unwrap();
+        seen.extend_from_slice(&buf[..n]);
+    }
+    conn.write_all(format!("GET /healthz HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes()).unwrap();
+    let n = conn.read(&mut buf).unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 200"), "{}", String::from_utf8_lossy(&buf[..n]));
+}
+
 #[test]
 fn a_busy_or_unwritable_server_db_is_answered_as_such() {
     let (server, log) = {

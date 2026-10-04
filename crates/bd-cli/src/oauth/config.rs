@@ -56,61 +56,9 @@ pub(super) struct GithubDoc {
     #[serde(default)]
     pub(super) client_secret_file: Option<PathBuf>,
     #[serde(default)]
-    pub(super) deny: Vec<u64>,
+    pub(super) deny: Vec<String>,
     #[serde(default)]
     pub(super) allow: Vec<RuleDoc>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct RuleDoc {
-    #[serde(default)]
-    pub(super) anyone: bool,
-    #[serde(default)]
-    pub(super) users: Vec<String>,
-    #[serde(default)]
-    pub(super) orgs: Vec<String>,
-    #[serde(default)]
-    pub(super) teams: Vec<String>,
-    #[serde(default)]
-    pub(super) role: Option<Role>,
-    #[serde(default = "agent_kind")]
-    pub(super) kind: Kind,
-    #[serde(default)]
-    pub(super) workspaces: Vec<String>,
-    #[serde(default)]
-    pub(super) min_account_age: Option<String>,
-    #[serde(default)]
-    pub(super) max_claims: Option<u32>,
-}
-
-/// What a rule grants, as written, checked (`at` names the rule): an
-/// `anyone` rule lets in any account of its provider, and its throwaway
-/// ones, so never as an admin nor a person who may open human gates.
-pub(crate) fn rule_grant(
-    at: &str,
-    anyone: bool,
-    role: Option<Role>,
-    kind: Kind,
-    workspaces: &[String],
-    max_claims: Option<u32>,
-) -> std::result::Result<Grant, String> {
-    if anyone && role == Some(Role::Admin) {
-        return Err(format!("{at} lets anyone in, so its role may be read or write, not admin"));
-    }
-    if anyone && kind == Kind::Human {
-        return Err(format!("{at} lets anyone in, so its kind may be agent only: human tokens open human gates"));
-    }
-    let role = role.unwrap_or(if anyone { Role::Read } else { Role::Write });
-    let workspaces = auth::workspace_list(workspaces).map_err(|e| format!("{at}: {e}"))?;
-    if max_claims == Some(0) {
-        return Err(format!("{at}: max_claims must be at least 1 (role read lets its accounts claim nothing)"));
-    }
-    Ok(Grant { role, kind, workspaces, max_claims })
-}
-
-pub(crate) fn agent_kind() -> Kind {
-    Kind::Agent
 }
 
 /// `[oauth]`: where the authorization server may send people back to.
@@ -292,8 +240,6 @@ pub(super) fn parse(text: &str) -> std::result::Result<Option<SignIn>, String> {
             }
             _ => {}
         }
-        let grants: Vec<(bool, &Grant)> = o.allow.iter().map(|r| (r.anyone, &r.grant)).collect();
-        check_anyone(&format!("oidc.{}", o.name), &grants)?;
     }
     let oauth = doc.oauth.map(oauth_config).transpose()?;
     let sign_in = SignIn { github, oidc, token_ttl, refresh_limit, refresh_idle, authorizer, oauth };
@@ -305,11 +251,6 @@ pub(super) fn parse(text: &str) -> std::result::Result<Option<SignIn>, String> {
     }
     if sign_in.oauth.is_none() && secret {
         return Err("github.client_secret_file serves [oauth]'s web sign-in only: add [oauth], or leave it out".into());
-    }
-    if sign_in.oauth.is_some() && secret && !sign_in.refreshes("github") {
-        return Err("[oauth] needs refreshed tokens, or people would sign in again each token_ttl: an [authorizer], \
-                    or github.private_key for [[github.allow]] rules"
-            .into());
     }
     Ok(Some(sign_in))
 }
@@ -352,63 +293,9 @@ pub(super) fn github(g: GithubDoc, authorized: bool) -> std::result::Result<Gith
         }
         _ => {}
     }
-    let rules: Vec<Rule> =
-        g.allow.into_iter().enumerate().map(|(i, r)| rule(i + 1, r)).collect::<std::result::Result<_, _>>()?;
-    check_anyone("github", &rules.iter().map(|r| (r.anyone, &r.grant)).collect::<Vec<_>>())?;
-    Ok(Github {
-        client_id,
-        url,
-        api_url,
-        private_key,
-        app: None,
-        client_secret_file,
-        client_secret: None,
-        deny: g.deny,
-        rules,
-    })
-}
-
-/// The `[[<table>.allow]]` rules (whether each lets anyone in, and what it
-/// grants), checked as a list: an `anyone` rule is the last, and gives no
-/// more in a workspace than a rule before it would.
-fn check_anyone(table: &str, rules: &[(bool, &Grant)]) -> std::result::Result<(), String> {
-    let Some(i) = rules.iter().position(|(anyone, _)| *anyone) else { return Ok(()) };
-    if i + 1 < rules.len() {
-        return Err(format!(
-            "[[{table}.allow]] rule {} lets anyone in, so the rules after it never match: make it the last",
-            i + 1
-        ));
-    }
-    // An account an earlier rule lets into a workspace gets that rule's token there, never the anyone rule's.
-    let anyone = rules[i].1;
-    if let Some(n) = rules[..i].iter().position(|(_, g)| g.role < anyone.role && overlap(g, anyone)) {
-        return Err(format!(
-            "[[{table}.allow]] rule {} gives its accounts role {} where rule {} gives anyone role {}: raise its \
-             role, or keep their workspaces apart",
-            n + 1,
-            rules[n].1.role.as_str(),
-            i + 1,
-            anyone.role.as_str()
-        ));
-    }
-    // Read tokens hold nothing, so only a writing `anyone` rule sets a floor.
-    let fewer =
-        |g: &Grant| anyone.role != Role::Read && g.max_claims.is_some_and(|n| anyone.max_claims.is_none_or(|a| n < a));
-    if let Some(n) = rules[..i].iter().position(|(_, g)| fewer(g) && overlap(g, anyone)) {
-        return Err(format!(
-            "[[{table}.allow]] rule {} lets its accounts hold fewer claims than rule {} lets anyone hold: raise its \
-             max_claims, or keep their workspaces apart",
-            n + 1,
-            i + 1
-        ));
-    }
-    Ok(())
-}
-
-/// Whether two grants share a workspace.
-fn overlap(a: &Grant, b: &Grant) -> bool {
-    let all = |g: &Grant| g.workspaces.iter().any(|w| w == "*");
-    all(a) || all(b) || a.workspaces.iter().any(|w| b.workspaces.contains(w))
+    let allow = rules("github", g.allow, Proves::Github)?;
+    let deny = deny_list("github", g.deny, Proves::Github)?;
+    Ok(Github { client_id, url, api_url, private_key, app: None, client_secret_file, client_secret: None, deny, allow })
 }
 
 /// `https://host[:port][/path]`, without a trailing slash; `http` only to
@@ -440,43 +327,4 @@ pub(super) fn github_name(s: &str) -> bool {
     s.len() <= 100
         && s.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-}
-
-pub(super) fn rule(n: usize, r: RuleDoc) -> std::result::Result<Rule, String> {
-    let at = format!("[[github.allow]] rule {n}");
-    let names = |field: &str, list: Vec<String>| {
-        list.into_iter()
-            .map(|s| {
-                let name = s.trim();
-                match github_name(name) {
-                    true => Ok(name.to_string()),
-                    false => Err(format!("{at}: {field} {s:?} is not a GitHub name")),
-                }
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-    };
-    let users = names("users", r.users)?;
-    let orgs = names("orgs", r.orgs)?;
-    let teams = r
-        .teams
-        .into_iter()
-        .map(|t| match t.trim().split_once('/') {
-            Some((org, team)) if github_name(org) && github_name(team) => Ok((org.to_string(), team.to_string())),
-            _ => Err(format!("{at}: teams {t:?} is not <organization>/<team slug>")),
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    let names_someone = !(users.is_empty() && orgs.is_empty() && teams.is_empty());
-    if r.anyone {
-        if names_someone {
-            return Err(format!("{at} lets anyone in: drop its users, orgs and teams, or anyone"));
-        }
-    } else if !names_someone {
-        return Err(format!("{at} names no users, orgs or teams, so it lets nobody in (anyone = true lets everyone)"));
-    }
-    let min_account_age = match &r.min_account_age {
-        None => None,
-        Some(raw) => Some(bd_core::time::parse_duration(raw).map_err(|e| format!("{at}: min_account_age: {e}"))?),
-    };
-    let grant = rule_grant(&at, r.anyone, r.role, r.kind, &r.workspaces, r.max_claims)?;
-    Ok(Rule { anyone: r.anyone, users, orgs, teams, min_account_age, grant })
 }

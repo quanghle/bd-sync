@@ -16,10 +16,22 @@ use super::*;
 /// tokens issued to it, as `/v2/auth/refresh` only refreshes those issued
 /// to no client.
 pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>) -> Result<Issued> {
+    refresh_found(root, auth::find_refresh(root, secret)?, secret, request_id, client)
+}
+
+/// [`refresh`] of the sign-in `found` (`auth::find_refresh` of `secret`)
+/// by a caller that looked it up already.
+pub fn refresh_found(
+    root: &Path,
+    found: Option<(auth::Token, bool)>,
+    secret: &str,
+    request_id: &str,
+    client: Option<&str>,
+) -> Result<Issued> {
     let refused =
         |why: String| Error::Unauthorized(format!("{why}; sign in again: `bd remote login --provider <name>`"));
     let sign_in = enabled(root)?;
-    let Some((token, current)) = auth::find_refresh(root, secret)? else {
+    let Some((token, current)) = found else {
         return Err(refused("this bd server does not know the sign-in (it was revoked, or has ended)".into()));
     };
     let (Some(user), Some(state)) = (token.identity.clone(), token.refresh.clone()) else {
@@ -67,35 +79,33 @@ pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>
         };
         return Err(refused(why));
     }
-    if sign_in.oidc(&user.provider).is_some_and(|o| o.deny.contains(&user.subject)) {
+    if sign_in.denies(&user) {
         revoke("the account is denied")?;
         return Err(refused(format!("{} may not use this bd server", user.who())));
     }
-    // A GitHub account is never one denied, and, with the GitHub App, is taken as GitHub names it now. Without
-    // the App (and for other providers), the authorizer decides on the identity of the sign-in.
+    // A provider that can be asked again (GitHub, through its App) proves the account afresh: as it is named now,
+    // and with the memberships rules ask. Otherwise the sign-in is decided on what bd kept of it.
+    let github = match user.provider.as_str() {
+        "github" => github_of(&sign_in).ok().and_then(|g| g.app.as_ref().map(|key| (g, key))),
+        _ => None,
+    };
+    // All of a refresh's calls to GitHub end within one budget, as it holds a refresh slot meanwhile and its client
+    // waits: one that gives up and sends its refresh token again would find it spent.
+    let api = github.map(|(g, _)| Api::within(g, REFRESH_BUDGET));
+    let app = github.zip(api.as_ref()).map(|((github, key), api)| AppApi { api, github, key });
     let (mut now_user, mut created, mut fresh) = (user.clone(), None, false);
-    if user.provider == "github" {
-        let github =
-            github_of(&sign_in).map_err(|_| refused("this bd server no longer signs people in with GitHub".into()))?;
-        if github_id(&user).is_some_and(|id| github.deny.contains(&id)) {
-            revoke("the account is denied")?;
-            return Err(refused(format!("{} may not use this bd server", user.who())));
+    if let Some(app) = &app {
+        let Some(id) = github_id(&user) else {
+            return Err(refused("not a GitHub sign-in".into()));
+        };
+        let Some((named, made)) = app.user(id)? else {
+            revoke("the GitHub account no longer exists")?;
+            return Err(refused(format!("GitHub has no account {} any more", user.login)));
+        };
+        if named.issuer != user.issuer {
+            return Err(refused(format!("{} signed in at another GitHub than the server's now", user.who())));
         }
-        if let Some(key) = &github.app {
-            let api = Api::new(github);
-            let app = AppApi { api: &api, github, key };
-            let Some(id) = github_id(&user) else {
-                return Err(refused("not a GitHub sign-in".into()));
-            };
-            let Some((named, made)) = app.user(id)? else {
-                revoke("the GitHub account no longer exists")?;
-                return Err(refused(format!("GitHub has no account {} any more", user.login)));
-            };
-            if named.issuer != user.issuer {
-                return Err(refused(format!("{} signed in at another GitHub than the server's now", user.who())));
-            }
-            (now_user, created, fresh) = (named, made, true);
-        }
+        (now_user, created, fresh) = (named, made, true);
     }
     let mut unknown = Vec::new();
     let mut rule = None;
@@ -141,55 +151,41 @@ pub fn refresh(root: &Path, secret: &str, request_id: &str, client: Option<&str>
                 }
             }
         }
-        // [[oidc.<name>.allow]] rules: by what bd keeps of the account, and the rule it signed in by.
-        None if user.provider != "github" => {
-            let oidc = sign_in.oidc(&user.provider).ok_or_else(|| refused("not a sign-in of this server's".into()))?;
-            let kept = state.rule.as_deref();
-            let (decided, matched) =
-                crate::oidc::decide(&oidc.allow, &user.subject, None, &oidc.groups_claim, kept, &state.workspace);
-            match decided {
+        // The provider's rules: on facts asked afresh, or else as the rule that let the sign-in in (`state.rule`).
+        None => {
+            let (rules, kept, workspace) = (sign_in.allow(&user.provider), state.rule.as_deref(), &state.workspace);
+            let d = match &app {
+                Some(app) => {
+                    let asked = Installed { app, login: &now_user.login, seen: HashMap::new() };
+                    decide(rules, &mut GithubFacts { user: &now_user, created, asked }, kept, workspace)?
+                }
+                None => decide(rules, &mut Listed::kept(&now_user), kept, workspace)?,
+            };
+            unknown = d.unknown;
+            match d.decision {
                 Decision::In { grant, via, by_login } => {
-                    rule = matched;
+                    rule = d.rule;
                     (grant, via, by_login, true)
                 }
-                _ => {
-                    let why = format!("the rules no longer let it into workspace {}", state.workspace);
-                    revoke(&why)?;
-                    return Err(refused(format!("{}: {why}", user.who())));
-                }
-            }
-        }
-        // [[github.allow]] rules, through the GitHub App, which refreshes() found.
-        None => {
-            let github = github_of(&sign_in)?;
-            let Some(key) = &github.app else {
-                return Err(refused("this bd server no longer refreshes these sign-ins".into()));
-            };
-            let api = Api::new(github);
-            let app = AppApi { api: &api, github, key };
-            let age = created.map(|at| Duration::from_millis(now.since(at).max(0) as u64));
-            let mut asked = Installed { app: &app, login: &now_user.login, seen: HashMap::new() };
-            match decide(github, &now_user.login, age, &state.workspace, &mut asked, &mut unknown)? {
-                Decision::In { grant, via, by_login } => (grant, via, by_login, true),
                 out => {
-                    let why = match out {
-                        Decision::TooNew(_) => "its GitHub account is too new for the rules".to_string(),
-                        Decision::Elsewhere(_) => {
-                            format!("the rules no longer let it into workspace {}", state.workspace)
-                        }
-                        _ => "no rule of the server's auth.toml lets the account in any more".to_string(),
-                    };
-                    // Memberships GitHub would not tell may come back: the sign-in stays, and only this refresh fails.
+                    // Memberships the provider would not tell may come back: the sign-in stays, and only this
+                    // refresh fails.
                     if matches!(out, Decision::Unknown) || !unknown.is_empty() {
-                        tracing::warn!(target: "bd::serve", login = %now_user.login, ?unknown, "GitHub sign-in not refreshed: memberships unknown");
+                        tracing::warn!(target: "bd::serve", provider = %now_user.provider, login = %now_user.login, ?unknown, "sign-in not refreshed: memberships unknown");
                         return Err(Error::Remote(format!(
-                            "GitHub would not tell this bd server the memberships of GitHub user {} ({}); try again later",
-                            now_user.login,
+                            "{} would not tell this bd server the memberships of {} ({}); try again later",
+                            sign_in.label(&now_user.provider),
+                            now_user.who(),
                             unknown.join("; ")
                         )));
                     }
+                    let why = match out {
+                        Decision::TooNew(_) => "the account is too new for the rules".to_string(),
+                        Decision::Elsewhere(_) => format!("the rules no longer let it into workspace {workspace}"),
+                        _ => "no rule of the server's auth.toml lets the account in any more".to_string(),
+                    };
                     revoke(&why)?;
-                    return Err(refused(format!("GitHub user {}: {why}", now_user.login)));
+                    return Err(refused(format!("{}: {why}", now_user.who())));
                 }
             }
         }
@@ -276,7 +272,11 @@ mod tests {
         for (subject, workspace) in [("s-1", "ops"), ("s-2", "proj")] {
             let e = sign_in(dir.path(), subject, workspace).unwrap_err();
             assert!(matches!(e, Error::Unauthorized(_)), "{subject} {workspace}: {e}");
-            assert!(e.to_string().contains(&format!("may not use workspace {workspace}")), "{e}");
+            let says = match subject {
+                "s-1" => format!("but not use workspace {workspace} (only proj)"),
+                _ => "no rule of its auth.toml lets the account in".into(),
+            };
+            assert!(e.to_string().contains(&says), "{e}");
         }
     }
 
@@ -320,7 +320,7 @@ mod tests {
         // The rule that let it in is gone: refused, and revoked.
         configure(dir.path(), "[[oidc.acme.allow]]\nsubjects = [\"s-2\"]\n");
         let e = refresh(dir.path(), &secret, "r-1", None).unwrap_err();
-        assert!(matches!(e, Error::Unauthorized(_)) && e.to_string().contains("no longer let it into"), "{e}");
+        assert!(matches!(e, Error::Unauthorized(_)) && e.to_string().contains("lets the account in any more"), "{e}");
         assert_eq!(live(dir.path()), 0);
     }
 

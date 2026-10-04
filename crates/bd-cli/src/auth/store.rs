@@ -109,8 +109,13 @@ pub(super) fn change_scoped<T>(
 
 /// Delete the tokens that ended [`PRUNE_AFTER`] ago: revoked, or a
 /// sign-in's that expired and could no longer be refreshed (`ended_at`).
+/// At most [`server_db::PRUNE_BATCH`] each write, so that one write never
+/// pays for a long backlog while others wait; the next writes go on.
 pub(super) fn prune(tx: &rusqlite::Transaction) -> Result<()> {
-    tx.execute("DELETE FROM tokens WHERE ended_at <= ?1", [Timestamp::now().minus(PRUNE_AFTER).millis()])?;
+    tx.execute(
+        "DELETE FROM tokens WHERE id IN (SELECT id FROM tokens WHERE ended_at <= ?1 LIMIT ?2)",
+        rusqlite::params![Timestamp::now().minus(PRUNE_AFTER).millis(), server_db::PRUNE_BATCH],
+    )?;
     server_db::prune_events(tx)
 }
 
@@ -166,12 +171,13 @@ fn load_scope(conn: &rusqlite::Connection, scope: &Scope) -> Result<TokenFile> {
         let v: serde_json::Value = serde_json::from_str(data)?;
         Ok(v["actor"].as_str().unwrap_or_default().to_string())
     };
-    let mut actors = scope.actors.clone();
+    // By key, each once: the actor of the tokens, the account and the user are usually one and the same.
+    let mut actors: std::collections::BTreeSet<String> = scope.actors.iter().map(|a| server_db::key(a)).collect();
     for id in scope.ids {
         add(&mut tokens, "SELECT seq, data FROM tokens WHERE id = ?1", &[id])?;
     }
     for data in tokens.values() {
-        actors.push(actor_of(data)?);
+        actors.insert(server_db::key(&actor_of(data)?));
     }
     // The accounts named by issuer and subject, and the actors they are bound to.
     let named = scope.account.into_iter().chain(scope.user.map(|u| (u.issuer.as_str(), u.subject.as_str())));
@@ -179,16 +185,26 @@ fn load_scope(conn: &rusqlite::Connection, scope: &Scope) -> Result<TokenFile> {
         add(&mut accounts, "SELECT seq, data FROM accounts WHERE issuer = ?1 AND subject = ?2", &[&issuer, &subject])?;
     }
     for data in accounts.values() {
-        actors.push(actor_of(data)?);
+        actors.insert(server_db::key(&actor_of(data)?));
     }
     if let Some(user) = scope.user {
-        actors.push(user.actor());
+        actors.insert(server_db::key(&user.actor()));
         related(&mut accounts, "accounts", "login_key", &server_db::key(&user.login))?;
     }
-    for actor in &actors {
-        let key = server_db::key(actor);
-        related(&mut accounts, "accounts", "actor_key", &key)?;
-        related(&mut tokens, "tokens", "actor_key", &key)?;
+    // Every key related to one of them, and every range of descendants, asked once.
+    let (mut exact, mut ranges) = (std::collections::BTreeSet::new(), std::collections::BTreeSet::new());
+    for key in &actors {
+        let (keys, range) = server_db::related_keys(key);
+        exact.extend(keys);
+        ranges.insert(range);
+    }
+    for (table, into) in [("accounts", &mut accounts), ("tokens", &mut tokens)] {
+        for k in &exact {
+            add(into, &format!("SELECT seq, data FROM {table} WHERE actor_key = ?1"), &[k])?;
+        }
+        for (low, high) in &ranges {
+            add(into, &format!("SELECT seq, data FROM {table} WHERE actor_key > ?1 AND actor_key < ?2"), &[low, high])?;
+        }
     }
     Ok(TokenFile {
         tokens: tokens.values().map(|d| parse("a token", d)).collect::<Result<_>>()?,
@@ -215,17 +231,24 @@ pub(super) fn save(tx: &rusqlite::Transaction, before: &TokenFile, after: &Token
             tx.execute("DELETE FROM tokens WHERE id = ?1", [id])?;
             Ok(())
         },
-        |t, data| {
-            let family = t.refresh.as_ref().map(|r| r.family.to_ascii_lowercase());
-            let (actor_key, name, ended_at) = server_db::token_keys(&serde_json::to_value(t)?);
-            tx.execute(
-                "INSERT INTO tokens (id, sha256, family, actor_key, name, ended_at, data) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) ON CONFLICT (id) DO UPDATE SET sha256 = excluded.sha256, \
-                 family = excluded.family, actor_key = excluded.actor_key, name = excluded.name, \
-                 ended_at = excluded.ended_at, data = excluded.data",
-                rusqlite::params![t.id, t.sha256, family, actor_key, name, ended_at, data],
-            )?;
-            Ok(())
+        |was, t, data| {
+            let columns = |t: &Token, data: Option<&str>| -> Result<server_db::Columns> {
+                use rusqlite::types::Value as V;
+                let family = t.refresh.as_ref().map(|r| r.family.to_ascii_lowercase());
+                let (actor_key, name, ended_at) = server_db::token_keys(&serde_json::to_value(t)?);
+                let mut c: server_db::Columns = vec![
+                    ("sha256", V::Text(t.sha256.clone())),
+                    ("family", family.map_or(V::Null, V::Text)),
+                    ("actor_key", V::Text(actor_key)),
+                    ("name", V::Text(name)),
+                    ("ended_at", ended_at.map_or(V::Null, V::Integer)),
+                ];
+                c.extend(data.map(|d| ("data", V::Text(d.to_string()))));
+                Ok(c)
+            };
+            let was = was.map(|w| columns(w, None)).transpose()?;
+            let keys = vec![("id", rusqlite::types::Value::Text(t.id.clone()))];
+            server_db::put_row(tx, "tokens", &keys, &columns(t, Some(data))?, was.as_ref())
         },
     )?;
     server_db::sync_rows(
@@ -236,15 +259,21 @@ pub(super) fn save(tx: &rusqlite::Transaction, before: &TokenFile, after: &Token
             tx.execute("DELETE FROM accounts WHERE issuer = ?1 AND subject = ?2", [issuer, subject])?;
             Ok(())
         },
-        |a, data| {
-            let (actor_key, login_key) = server_db::account_keys(&serde_json::to_value(a)?);
-            tx.execute(
-                "INSERT INTO accounts (issuer, subject, actor_key, login_key, data) VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT (issuer, subject) DO UPDATE SET actor_key = excluded.actor_key, \
-                 login_key = excluded.login_key, data = excluded.data",
-                [&a.issuer, &a.subject, &actor_key, &login_key, data],
-            )?;
-            Ok(())
+        |was, a, data| {
+            let columns = |a: &Account, data: Option<&str>| -> Result<server_db::Columns> {
+                use rusqlite::types::Value as V;
+                let (actor_key, login_key) = server_db::account_keys(&serde_json::to_value(a)?);
+                let mut c: server_db::Columns =
+                    vec![("actor_key", V::Text(actor_key)), ("login_key", V::Text(login_key))];
+                c.extend(data.map(|d| ("data", V::Text(d.to_string()))));
+                Ok(c)
+            };
+            let was = was.map(|w| columns(w, None)).transpose()?;
+            let keys = vec![
+                ("issuer", rusqlite::types::Value::Text(a.issuer.clone())),
+                ("subject", rusqlite::types::Value::Text(a.subject.clone())),
+            ];
+            server_db::put_row(tx, "accounts", &keys, &columns(a, Some(data))?, was.as_ref())
         },
     )
 }

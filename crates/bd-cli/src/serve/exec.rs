@@ -4,8 +4,21 @@
 use super::*;
 
 pub(super) async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -> Response<Body> {
+    let (parts, body) = req.into_parts();
+    let mut body = Some(body);
+    let response = command(server, workspace, &parts.headers, &mut body).await;
+    drained(body, response).await
+}
+
+/// [`exec`], taking `body` once it reads it.
+async fn command(
+    server: &Arc<Server>,
+    workspace: String,
+    headers: &hyper::HeaderMap,
+    body: &mut Option<Incoming>,
+) -> Response<Body> {
     let started = Instant::now();
-    let token = match authenticate(server, req.headers()) {
+    let token = match authenticate(server, headers) {
         Ok(t) => t,
         Err(r) => return r.response(),
     };
@@ -23,7 +36,7 @@ pub(super) async fn exec(server: &Arc<Server>, workspace: String, req: Request<I
     };
     // Requests share one memory budget: reserve the body's declared size (or
     // the maximum, when it is sent chunked) before reading it, and the answer's share.
-    let declared = hyper::body::Body::size_hint(req.body()).exact();
+    let declared = body.as_ref().and_then(|b| hyper::body::Body::size_hint(b).exact());
     if declared.is_some_and(|n| n > server.max_body as u64) {
         return too_large(server.max_body);
     }
@@ -36,7 +49,7 @@ pub(super) async fn exec(server: &Arc<Server>, workspace: String, req: Request<I
     };
     let mut answer_budget = budget.split(answer_permits as usize);
     let mut budget = Some(budget);
-    let body = match read_body(req.into_body(), server.max_body, BODY_TIMEOUT).await {
+    let body = match read_body(body.take().expect("not read yet"), server.max_body, BODY_TIMEOUT).await {
         Ok(b) => b,
         Err(BodyError::TooLarge) => return too_large(server.max_body),
         Err(e) => return e.response("request", server.max_body),

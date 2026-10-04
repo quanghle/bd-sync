@@ -259,9 +259,7 @@ pub(super) async fn serve(
         let tls = tls.clone();
         tokio::spawn(async move {
             let _permit = (permit, from_peer);
-            if tokio::time::timeout(MAX_CONNECTION_LIFETIME, connection(server, stream, peer, tls)).await.is_err() {
-                tracing::debug!(target: "bd::serve", %peer, "connection closed at its maximum lifetime");
-            }
+            connection(server, stream, peer, tls).await;
         });
     }
     tracing::info!(target: "bd::serve", "shutting down after running commands finish");
@@ -288,7 +286,7 @@ pub(super) async fn connection(server: Arc<Server>, stream: TcpStream, peer: Soc
     http.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(READ_BUFFER);
     let served = match tls {
         Some(acceptor) => match tokio::time::timeout(Duration::from_secs(15), acceptor.accept(stream)).await {
-            Ok(Ok(stream)) => http.serve_connection(TokioIo::new(stream), service).await,
+            Ok(Ok(stream)) => serve_until_lifetime(&http, TokioIo::new(stream), service, peer).await,
             Ok(Err(e)) => {
                 tracing::debug!(target: "bd::serve", %peer, error = %e, "TLS handshake failed");
                 return;
@@ -298,10 +296,36 @@ pub(super) async fn connection(server: Arc<Server>, stream: TcpStream, peer: Soc
                 return;
             }
         },
-        None => http.serve_connection(TokioIo::new(stream), service).await,
+        None => serve_until_lifetime(&http, TokioIo::new(stream), service, peer).await,
     };
     if let Err(e) = served {
         tracing::debug!(target: "bd::serve", %peer, error = %e, "connection closed");
+    }
+}
+
+/// Serve `io` until the client closes it, or until `MAX_CONNECTION_LIFETIME`
+/// has passed: then gracefully, the answer in progress (if any) finished and
+/// the connection closed after it, or cut at `LIFETIME_GRACE`.
+async fn serve_until_lifetime<I, S>(http: &http1::Builder, io: I, service: S, peer: SocketAddr) -> hyper::Result<()>
+where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    S: hyper::service::HttpService<Incoming, ResBody = Body>,
+    S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let conn = http.serve_connection(io, service);
+    tokio::pin!(conn);
+    tokio::select! {
+        served = conn.as_mut() => return served,
+        () = tokio::time::sleep(MAX_CONNECTION_LIFETIME) => {}
+    }
+    tracing::debug!(target: "bd::serve", %peer, "connection at its maximum lifetime: closing after its answer");
+    conn.as_mut().graceful_shutdown();
+    match tokio::time::timeout(LIFETIME_GRACE, conn).await {
+        Ok(served) => served,
+        Err(_) => {
+            tracing::debug!(target: "bd::serve", %peer, "connection cut: its answer did not finish in time");
+            Ok(())
+        }
     }
 }
 

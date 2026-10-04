@@ -257,8 +257,8 @@ pub fn refresh(root: &Path, request: Request) -> Result<Value, Refusal> {
         return Err(invalid_request("not a refresh request"));
     };
     let unknown = || invalid_grant("the refresh token is not valid");
-    let token = match auth::find_refresh(root, &secret) {
-        Ok(Some((token, _))) => token,
+    let (token, current) = match auth::find_refresh(root, &secret) {
+        Ok(Some(found)) => found,
         Ok(None) => return Err(unknown()),
         Err(e) => return Err(server_error(&e, "refreshing an OAuth token")),
     };
@@ -272,7 +272,7 @@ pub fn refresh(root: &Path, request: Request) -> Result<Value, Refusal> {
         Ok(id) => id,
         Err(e) => return Err(server_error(&e, "refreshing an OAuth token")),
     };
-    match oauth::refresh(root, &secret, &request_id, Some(&client)) {
+    match oauth::refresh_found(root, Some((token.clone(), current)), &secret, &request_id, Some(&client)) {
         Ok(issued) => {
             touch(root, &client);
             Ok(answer(&issued.token, issued.refresh_token.as_deref(), issued.expires_in))

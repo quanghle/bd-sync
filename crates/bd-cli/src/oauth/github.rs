@@ -22,16 +22,53 @@ pub struct Github {
     /// The secret itself, read by [`load`]: the web flow needs it.
     pub client_secret: Option<ClientSecret>,
     /// GitHub user ids that may never sign in, whatever decides.
-    pub deny: Vec<u64>,
+    pub deny: Vec<String>,
     /// `[[github.allow]]`: who may sign in, unless an authorizer decides.
-    pub rules: Vec<Rule>,
+    pub allow: Vec<Rule>,
 }
 
 impl Github {
     /// Whether a rule names organizations or teams, whose memberships an
     /// OAuth app reads with the `read:org` scope.
     pub(super) fn reads_orgs(&self) -> bool {
-        self.rules.iter().any(|r| !r.orgs.is_empty() || !r.teams.is_empty())
+        self.allow.iter().any(|r| !r.groups.is_empty())
+    }
+}
+
+/// Memberships GitHub tells: asked as the person signing in ([`Asked`]), or
+/// as the App at a refresh ([`Installed`]).
+pub(super) trait Memberships {
+    fn org(&mut self, org: &str) -> Result<Member>;
+    fn team(&mut self, org: &str, team: &str) -> Result<Member>;
+}
+
+/// What GitHub proves of an account, for the rules: its id and login as
+/// GitHub names it now, when GitHub made it, and its memberships (groups
+/// `acme`, `acme/eng`) as rules ask.
+pub(super) struct GithubFacts<'a, M: Memberships> {
+    pub(super) user: &'a Identity,
+    pub(super) created: Option<Timestamp>,
+    pub(super) asked: M,
+}
+
+impl<M: Memberships> Facts for GithubFacts<'_, M> {
+    fn identity(&self) -> &Identity {
+        self.user
+    }
+
+    fn fresh(&self) -> bool {
+        true
+    }
+
+    fn age(&self) -> Option<Duration> {
+        self.created.map(|at| Duration::from_millis(Timestamp::now().since(at).max(0) as u64))
+    }
+
+    fn member(&mut self, group: &str) -> Result<Member> {
+        match group.split_once('/') {
+            Some((org, team)) => self.asked.team(org, team),
+            None => self.asked.org(group),
+        }
     }
 }
 
@@ -119,59 +156,103 @@ impl ClientSecret {
     }
 }
 
-/// Installation tokens of GitHub Apps, by `<api_url> <client_id> <org or *>`,
-/// with when to stop using them: shared by every refresh.
-static INSTALLATION_TOKENS: LazyLock<Mutex<HashMap<String, (String, Instant)>>> = LazyLock::new(Default::default);
+/// What GitHub Apps were given, shared by every refresh: installation
+/// tokens by installation (`<api_url> <client_id> <id>`), used until
+/// [`TOKEN_MARGIN`] before GitHub's `expires_at`; and the installation that
+/// serves an organization (`... org:<org>`), or any account (`... *`), kept
+/// until GitHub no longer takes it.
+#[derive(Default)]
+struct Installations {
+    tokens: HashMap<String, (String, Instant)>,
+    ids: HashMap<String, u64>,
+}
 
-/// The GitHub endpoints sign-in uses.
+static INSTALLATIONS: LazyLock<Mutex<Installations>> = LazyLock::new(Default::default);
+
+fn installations() -> std::sync::MutexGuard<'static, Installations> {
+    INSTALLATIONS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// An installation token is no longer used this long before GitHub says it
+/// expires, so no request starts with one about to end.
+const TOKEN_MARGIN: Duration = Duration::from_secs(5 * 60);
+
+/// The one HTTP client of every GitHub request: its connections (and their
+/// TLS sessions) serve the next request to the same host. Its requests carry
+/// the account's or the App's token: never on to wherever a redirect points.
+static GITHUB_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .timeout_global(Some(GITHUB_TIMEOUT))
+        .user_agent(format!("bd/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into()
+});
+
+/// The GitHub endpoints sign-in uses, each request ending within
+/// [`GITHUB_TIMEOUT`], and all of them by `deadline` if there is one.
 pub(super) struct Api {
     pub(super) url: String,
     pub(super) api_url: String,
-    pub(super) agent: ureq::Agent,
+    deadline: Option<Instant>,
 }
 
 impl Api {
     pub(super) fn new(github: &Github) -> Api {
-        // Its requests carry the account's or the App's token: never on to wherever a redirect points.
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .max_redirects(0)
-            .timeout_global(Some(GITHUB_TIMEOUT))
-            .user_agent(format!("bd/{}", env!("CARGO_PKG_VERSION")))
-            .build();
-        Api { url: github.url.clone(), api_url: github.api_url.clone(), agent: config.into() }
+        Api { url: github.url.clone(), api_url: github.api_url.clone(), deadline: None }
+    }
+
+    /// [`Api::new`], every request of it ending within `budget` from now.
+    pub(super) fn within(github: &Github, budget: Duration) -> Api {
+        Api { deadline: Some(Instant::now() + budget), ..Api::new(github) }
+    }
+
+    /// The time a request to `url` has, or why it has none left.
+    fn time(&self, url: &str) -> Result<Duration> {
+        let Some(deadline) = self.deadline else { return Ok(GITHUB_TIMEOUT) };
+        match deadline.saturating_duration_since(Instant::now()) {
+            left if left.is_zero() => {
+                Err(Error::Remote(format!("GitHub ({url}) took too long to answer; try again later")))
+            }
+            left => Ok(left.min(GITHUB_TIMEOUT)),
+        }
+    }
+
+    /// `request` to `url`, given the time left, with `token` if any.
+    fn timed<B>(
+        &self,
+        request: ureq::RequestBuilder<B>,
+        url: &str,
+        token: Option<&str>,
+    ) -> Result<ureq::RequestBuilder<B>> {
+        let request = request.config().timeout_global(Some(self.time(url)?)).build();
+        Ok(match token {
+            Some(token) => request
+                .header("accept", "application/vnd.github+json")
+                .header("authorization", &format!("Bearer {token}")),
+            None => request.header("accept", "application/json"),
+        })
     }
 
     /// POST a form to a device flow endpoint (`/login/...`): GitHub's answer.
     pub(super) fn form(&self, path: &str, form: &[(&str, &str)]) -> Result<(u16, Value)> {
         let url = format!("{}{path}", self.url);
-        let sent = self.agent.post(&url).header("accept", "application/json").send_form(form.iter().copied());
+        let sent = self.timed(GITHUB_AGENT.post(&url), &url, None)?.send_form(form.iter().copied());
         answer(&url, sent)
     }
 
-    /// GET an API endpoint as the account that signed in: GitHub's answer.
+    /// GET an API endpoint with `token`: GitHub's answer.
     pub(super) fn get(&self, token: &str, path: &str) -> Result<(u16, Value)> {
         let url = format!("{}{path}", self.api_url);
-        let sent = self
-            .agent
-            .get(&url)
-            .header("accept", "application/vnd.github+json")
-            .header("authorization", &format!("Bearer {token}"))
-            .call();
+        let sent = self.timed(GITHUB_AGENT.get(&url), &url, Some(token))?.call();
         answer(&url, sent)
     }
-}
 
-impl Api {
     /// POST to an API endpoint, without a body, with `token`: GitHub's answer.
     pub(super) fn post(&self, token: &str, path: &str) -> Result<(u16, Value)> {
         let url = format!("{}{path}", self.api_url);
-        let sent = self
-            .agent
-            .post(&url)
-            .header("accept", "application/vnd.github+json")
-            .header("authorization", &format!("Bearer {token}"))
-            .send_empty();
+        let sent = self.timed(GITHUB_AGENT.post(&url), &url, Some(token))?.send_empty();
         answer(&url, sent)
     }
 }
@@ -211,29 +292,61 @@ pub(super) struct AppApi<'a> {
 }
 
 impl AppApi<'_> {
-    pub(super) fn cache_key(&self, org: Option<&str>) -> String {
-        let org = org.map_or_else(|| "*".to_string(), str::to_ascii_lowercase);
-        format!("{} {} {org}", self.github.api_url, self.github.client_id)
+    /// What tells this App's installations and tokens from another's.
+    fn app(&self) -> String {
+        format!("{} {}", self.github.api_url, self.github.client_id)
     }
 
-    /// An installation token of the App: of its installation on `org`, or of
-    /// any for `None`. `None` when it is not installed there.
-    pub(super) fn token(&self, org: Option<&str>) -> Result<Option<String>> {
-        let key = self.cache_key(org);
-        {
-            let mut cache = INSTALLATION_TOKENS.lock().unwrap_or_else(|p| p.into_inner());
+    /// The token kept for `installation`, if it is not about to expire.
+    fn kept(&self, installation: u64) -> Option<String> {
+        let mut all = installations();
+        let now = Instant::now();
+        all.tokens.retain(|_, (_, until)| now < *until);
+        all.tokens.get(&format!("{} {installation}", self.app())).map(|(token, _)| token.clone())
+    }
+
+    /// An installation token of the App, and its installation: of its
+    /// installation on `org`, or of any for `None` (any kept one will do).
+    /// `None` when it is not installed there. Which installation serves an
+    /// organization is asked once, and asked again only when GitHub no
+    /// longer gives it tokens.
+    pub(super) fn token(&self, org: Option<&str>) -> Result<Option<(u64, String)>> {
+        let app = self.app();
+        let which = match org {
+            Some(org) => format!("{app} org:{}", org.to_ascii_lowercase()),
+            None => format!("{app} *"),
+        };
+        let known = installations().ids.get(&which).copied();
+        if let Some(token) = known.and_then(|id| self.kept(id).map(|t| (id, t))) {
+            return Ok(Some(token));
+        }
+        if org.is_none() {
             let now = Instant::now();
-            cache.retain(|_, (_, until)| now < *until);
-            if let Some((token, _)) = cache.get(&key) {
-                return Ok(Some(token.clone()));
+            let all = installations();
+            let any = all.tokens.iter().find(|(k, (_, until))| now < *until && k.starts_with(&format!("{app} ")));
+            if let Some((id, token)) =
+                any.and_then(|(k, (t, _))| Some((k.rsplit(' ').next()?.parse().ok()?, t.clone())))
+            {
+                return Ok(Some((id, token)));
             }
         }
         let jwt = self.key.jwt(&self.github.client_id)?;
-        let installation = match org {
+        if let Some(id) = known {
+            match self.mint(&jwt, id) {
+                Ok(token) => return Ok(Some((id, token))),
+                // Uninstalled or suspended since: found again below.
+                Err(_) => drop(installations().ids.remove(&which)),
+            }
+        }
+        let candidates = match org {
             Some(org) => {
                 let (status, body) = self.api.get(&jwt, &format!("/orgs/{org}/installation"))?;
                 match status {
-                    200 => body["id"].as_u64(),
+                    200 => vec![
+                        body["id"]
+                            .as_u64()
+                            .ok_or_else(|| Error::Remote("GitHub answered an installation without its id".into()))?,
+                    ],
                     404 => return Ok(None),
                     _ => return Err(self.failed(&format!("find its installation on {org}"), status, &body)),
                 }
@@ -244,40 +357,51 @@ impl AppApi<'_> {
                 let Some(all) = body.as_array().filter(|_| status == 200) else {
                     return Err(self.failed("list its installations", status, &body));
                 };
-                let mut failure = None;
-                for id in all.iter().filter(|i| i["suspended_at"].is_null()).filter_map(|i| i["id"].as_u64()) {
-                    match self.mint(&jwt, id, key.clone()) {
-                        Ok(token) => return Ok(Some(token)),
-                        Err(e) => failure = Some(e),
-                    }
-                }
-                return failure.map_or(Ok(None), Err);
+                all.iter().filter(|i| i["suspended_at"].is_null()).filter_map(|i| i["id"].as_u64()).collect()
             }
         };
-        let Some(installation) = installation else {
-            return Err(Error::Remote("GitHub answered an installation without its id".into()));
-        };
-        self.mint(&jwt, installation, key).map(Some)
+        let mut failure = None;
+        for id in candidates {
+            // An installation found again may already have a token (another organization's, the same one).
+            if let Some(token) = self.kept(id) {
+                installations().ids.insert(which, id);
+                return Ok(Some((id, token)));
+            }
+            match self.mint(&jwt, id) {
+                Ok(token) => {
+                    installations().ids.insert(which, id);
+                    return Ok(Some((id, token)));
+                }
+                Err(e) => failure = Some(e),
+            }
+        }
+        failure.map_or(Ok(None), Err)
     }
 
-    /// An installation token of `installation`, cached under `key`.
-    pub(super) fn mint(&self, jwt: &str, installation: u64, key: String) -> Result<String> {
+    /// A new installation token of `installation`, kept until shortly
+    /// before GitHub says it expires.
+    fn mint(&self, jwt: &str, installation: u64) -> Result<String> {
         let (status, body) = self.api.post(jwt, &format!("/app/installations/{installation}/access_tokens"))?;
         let Some(token) = body["token"].as_str().filter(|t| status == 201 && !t.is_empty()) else {
             return Err(self.failed("get an installation token", status, &body));
         };
-        let mut cache = INSTALLATION_TOKENS.lock().unwrap_or_else(|p| p.into_inner());
-        cache.insert(key, (token.to_string(), Instant::now() + INSTALLATION_TOKEN_LIFE));
+        let left = body["expires_at"]
+            .as_str()
+            .and_then(|at| Timestamp::parse_rfc3339(at).ok())
+            .map(|at| Duration::from_millis(at.since(Timestamp::now()).max(0) as u64))
+            .unwrap_or(INSTALLATION_TOKEN_LIFE + TOKEN_MARGIN);
+        let until = Instant::now() + left.saturating_sub(TOKEN_MARGIN);
+        installations().tokens.insert(format!("{} {installation}", self.app()), (token.to_string(), until));
         Ok(token.to_string())
     }
 
     /// GET `path` with an installation token (`org`'s, or any): `None` when
     /// the App is not installed there. A token GitHub refuses is not used again.
     pub(super) fn get(&self, org: Option<&str>, path: &str) -> Result<Option<(u16, Value)>> {
-        let Some(token) = self.token(org)? else { return Ok(None) };
+        let Some((installation, token)) = self.token(org)? else { return Ok(None) };
         let (status, body) = self.api.get(&token, path)?;
         if status == 401 {
-            INSTALLATION_TOKENS.lock().unwrap_or_else(|p| p.into_inner()).remove(&self.cache_key(org));
+            installations().tokens.remove(&format!("{} {installation}", self.app()));
         }
         Ok(Some((status, body)))
     }
@@ -414,7 +538,7 @@ pub fn web_sign_in(
     let Some(access) = body["access_token"].as_str().filter(|t| !t.is_empty()) else {
         return Err(refused(github, "finish a sign-in", status, &body));
     };
-    admit(root, sign_in, github, &api, access, workspace, Some(client), signed_in_as)
+    admit(root, sign_in, &api, access, workspace, Some(client), signed_in_as)
 }
 
 /// The identity of GitHub account `id`, now `login`, at the GitHub at `url`.

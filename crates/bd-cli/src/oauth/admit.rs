@@ -149,12 +149,12 @@ pub fn poll(root: &Path, provider: &str, poll: &SignInPoll) -> Result<SignInAnsw
         return Err(refused(github, "finish a sign-in", status, &body));
     };
     // GitHub gave the code's token once, so a poll sent again would find the sign-in gone: not busy, ended.
-    let admitted = admit(root, &sign_in, github, &api, access, &poll.workspace, None, &mut None).map_err(|e| match e {
+    let admitted = admit(root, &sign_in, &api, access, &poll.workspace, None, &mut None).map_err(|e| match e {
         Error::Busy(why) => Error::Remote(why),
         e => e,
     });
-    let Admitted { user, grant, via, by_login, unknown, .. } = admitted?;
-    let life = sign_in.lifetime(Timestamp::now(), &user.provider);
+    let Admitted { user, grant, via, by_login, unknown, rule, .. } = admitted?;
+    let life = auth::Lifetime { rule, ..sign_in.lifetime(Timestamp::now(), &user.provider) };
     let issued = auth::issue_sign_in_token(root, &user, grant, life, &poll.workspace, by_login)?;
     let token = &issued.token;
     tracing::info!(
@@ -202,14 +202,11 @@ pub fn account_event(root: &Path, provider: &str, body: &[u8]) -> Result<()> {
 
 /// What the rules, or the authorizer, let the account whose GitHub token
 /// `access` is do in `workspace` (for OAuth `client`, if any), asking GitHub
-/// with that token; `Error::Unauthorized` (said to the person signing in) if
-/// they do not let it in, `Error::Busy` if the authorizer could not say.
-/// `signed_in_as` gets the account's login once GitHub named it.
-#[allow(clippy::too_many_arguments)]
+/// with that token ([`judge`]). `signed_in_as` gets the account's login
+/// once GitHub named it.
 pub(super) fn admit(
     root: &Path,
     sign_in: &SignIn,
-    github: &Github,
     api: &Api,
     access: &str,
     workspace: &str,
@@ -218,61 +215,72 @@ pub(super) fn admit(
 ) -> Result<Admitted> {
     let (user, created) = account(api, access)?;
     *signed_in_as = Some(user.login.clone());
-    let age = created.map(|at| Duration::from_millis(Timestamp::now().since(at).max(0) as u64));
-    if github_id(&user).is_some_and(|id| github.deny.contains(&id)) {
-        tracing::info!(target: "bd::serve", login = %user.login, subject = %user.subject, "GitHub sign-in refused: the account is denied");
-        return Err(Error::Unauthorized(format!("GitHub user {} may not sign in to this bd server", user.login)));
+    let asked = Asked { api, token: access, login: &user.login, seen: HashMap::new() };
+    let mut facts = GithubFacts { user: &user, created, asked };
+    judge(root, sign_in, &mut facts, created, None, workspace, client)
+}
+
+/// What the account `facts` tell of may do in `workspace` (for OAuth
+/// `client`, if any), for any provider: never if its provider's `deny`
+/// names it; else as the authorizer decides, or the provider's rules.
+/// `Error::Unauthorized` (said to the person signing in) if they do not let
+/// it in, `Error::Busy` if the authorizer could not say, `Error::Remote` if
+/// the provider would not tell what a rule needs.
+pub(super) fn judge(
+    root: &Path,
+    sign_in: &SignIn,
+    facts: &mut dyn Facts,
+    created: Option<Timestamp>,
+    claims: Option<&crate::oidc::Claims>,
+    workspace: &str,
+    client: Option<&str>,
+) -> Result<Admitted> {
+    let user = facts.identity().clone();
+    let email = facts.email().map(str::to_string);
+    let (provider, login, subject) = (&user.provider, &user.login, &user.subject);
+    if sign_in.denies(&user) {
+        tracing::info!(target: "bd::serve", %provider, %login, %subject, "sign-in refused: the account is denied");
+        return Err(Error::Unauthorized(format!("{} may not sign in to this bd server", user.who())));
     }
     if let Some(authorizer) = &sign_in.authorizer {
-        let request = crate::authorizer::request("sign_in", workspace, &user, created, client, None, None);
-        return ask(root, authorizer, &request).map(|(grant, via)| Admitted {
-            user,
-            grant,
-            via,
-            by_login: true,
-            unknown: Vec::new(),
-            email: None,
-            rule: None,
-        });
+        let request = crate::authorizer::request("sign_in", workspace, &user, created, client, None, claims);
+        let (grant, via) = ask(root, authorizer, &request)?;
+        // The authorizer may match logins, so the login is held to its own account as a rule's would be.
+        return Ok(Admitted { user, grant, via, by_login: true, unknown: Vec::new(), email, rule: None });
     }
-    let mut asked = Asked { api, token: access, login: &user.login, seen: HashMap::new() };
-    let mut unknown = Vec::new();
-    let (grant, via, by_login) = match decide(github, &user.login, age, workspace, &mut asked, &mut unknown)? {
-        Decision::In { grant, via, by_login } => (grant, via, by_login),
+    let Decided { decision, rule, unknown } = decide(sign_in.allow(provider), facts, None, workspace)?;
+    let who = user.who();
+    match decision {
+        Decision::In { grant, via, by_login } => Ok(Admitted { user, grant, via, by_login, unknown, email, rule }),
         Decision::TooNew(min) => {
-            tracing::info!(target: "bd::serve", login = %user.login, subject = %user.subject, %workspace, ?age, "GitHub sign-in refused: the account is too new");
-            return Err(Error::Unauthorized(format!(
-                "GitHub user {} may not sign in to this bd server yet: its GitHub account must be at least {} old",
-                user.login,
+            tracing::info!(target: "bd::serve", %provider, %login, %subject, %workspace, "sign-in refused: the account is too new");
+            Err(Error::Unauthorized(format!(
+                "{who} may not sign in to this bd server yet: the account must be at least {} old",
                 bd_core::time::format_duration_ms(i64::try_from(min.as_millis()).unwrap_or(i64::MAX))
-            )));
+            )))
         }
         Decision::Elsewhere(workspaces) => {
-            tracing::info!(target: "bd::serve", login = %user.login, subject = %user.subject, %workspace, ?unknown, "GitHub sign-in refused: workspace not allowed");
-            return Err(Error::Unauthorized(format!(
-                "GitHub user {} may sign in to this bd server, but not use workspace {} (only {})",
-                user.login,
-                workspace,
+            tracing::info!(target: "bd::serve", %provider, %login, %subject, %workspace, ?unknown, "sign-in refused: workspace not allowed");
+            Err(Error::Unauthorized(format!(
+                "{who} may sign in to this bd server, but not use workspace {workspace} (only {})",
                 workspaces.join(", ")
-            )));
+            )))
         }
         Decision::Unknown => {
-            tracing::warn!(target: "bd::serve", login = %user.login, subject = %user.subject, %workspace, ?unknown, "GitHub sign-in not decided: memberships unknown");
-            return Err(Error::Remote(format!(
-                "GitHub would not tell this bd server whether GitHub user {} may use workspace {workspace}; try again \
-                 later, or ask the server's admin",
-                user.login
-            )));
+            tracing::warn!(target: "bd::serve", %provider, %login, %subject, %workspace, ?unknown, "sign-in not decided: memberships unknown");
+            Err(Error::Remote(format!(
+                "{} would not tell this bd server whether {who} may use workspace {workspace}; try again later, or \
+                 ask the server's admin",
+                sign_in.label(provider)
+            )))
         }
         Decision::Out => {
-            tracing::info!(target: "bd::serve", login = %user.login, subject = %user.subject, ?unknown, "GitHub sign-in refused: no rule lets the account in");
-            return Err(Error::Unauthorized(format!(
-                "GitHub user {} may not sign in to this bd server: no rule of its auth.toml lets the account in",
-                user.login
-            )));
+            tracing::info!(target: "bd::serve", %provider, %login, %subject, ?unknown, "sign-in refused: no rule lets the account in");
+            Err(Error::Unauthorized(format!(
+                "{who} may not sign in to this bd server: no rule of its auth.toml lets the account in"
+            )))
         }
-    };
-    Ok(Admitted { user, grant, via, by_login, unknown, email: None, rule: None })
+    }
 }
 
 /// What `authorizer` grants the account `request` is about, or why not:
@@ -298,8 +306,9 @@ pub(super) fn ask(
     }
 }
 
-/// What the authorizer lets the account an OIDC provider vouched for
-/// (`claims`, verified) do in `workspace`, for OAuth `client` if any.
+/// What the rules, or the authorizer, let the account an OIDC provider
+/// vouched for (`claims`, verified) do in `workspace`, for OAuth `client`
+/// if any ([`judge`]).
 pub fn admit_oidc(
     root: &Path,
     sign_in: &SignIn,
@@ -309,30 +318,8 @@ pub fn admit_oidc(
     client: Option<&str>,
 ) -> Result<Admitted> {
     let user = oidc.identity(claims);
-    let email = claims.email.clone();
-    if oidc.deny.contains(&user.subject) {
-        tracing::info!(target: "bd::serve", provider = %user.provider, subject = %user.subject, "sign-in refused: the account is denied");
-        return Err(Error::Unauthorized(format!("{} may not sign in to this bd server", user.who())));
-    }
-    let Some(authorizer) = &sign_in.authorizer else {
-        // Its [[oidc.<name>.allow]] rules decide.
-        let (decided, rule) =
-            crate::oidc::decide(&oidc.allow, &user.subject, Some(claims), &oidc.groups_claim, None, workspace);
-        let refused = |why: String| {
-            tracing::info!(target: "bd::serve", provider = %user.provider, subject = %user.subject, %workspace, "sign-in refused: {why}");
-            Err(Error::Unauthorized(format!("{} may not use workspace {workspace} on this bd server", user.who())))
-        };
-        return match decided {
-            Decision::In { grant, via, by_login } => {
-                Ok(Admitted { user, grant, via, by_login, unknown: Vec::new(), email, rule })
-            }
-            Decision::Elsewhere(_) => refused("its rules let it into other workspaces only".into()),
-            _ => refused("no rule lets it in".into()),
-        };
-    };
-    let request = crate::authorizer::request("sign_in", workspace, &user, None, client, None, Some(claims));
-    let (grant, via) = ask(root, authorizer, &request)?;
-    Ok(Admitted { user, grant, via, by_login: true, unknown: Vec::new(), email, rule: None })
+    let mut facts = oidc.facts(&user, claims);
+    judge(root, sign_in, &mut facts, None, Some(claims), workspace, client)
 }
 
 /// What the client gets of a token issued or refreshed.

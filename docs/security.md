@@ -83,17 +83,17 @@ admin's authorizer ([Signing in](remote.md#signing-in)).
   own. An email counts only if the provider verified it, and providers'
   error codes reach messages and the log only when they are plain text. OIDC providers' client secrets are files under
   the root, read by `bd serve` only.
-- At refreshes, OIDC providers are not asked again: the authorizer decides
-  on the account as it signed in, and rules by subject are applied again,
-  but a rule by email, domain or group keeps the sign-in while it is
-  unchanged, so removing someone at the provider takes effect when the
+- At refreshes, OIDC providers (and GitHub without its App) are not asked
+  again: the authorizer decides on the account as it signed in, and rules by
+  subject are applied again, but any other rule keeps the sign-in while it
+  is unchanged, so removing someone at the provider takes effect when the
   authorizer refuses them, or at their next sign-in (at the latest
   `refresh_limit`).
 
 - The server runs GitHub's device flow with an OAuth or GitHub App client ID,
   no secret. The account's GitHub token reads its account and memberships
   during the sign-in and is never stored or logged.
-- With GitHub's rules, refreshes ask GitHub as the GitHub App, with installation tokens minted
+- With the GitHub App's key, refreshes ask GitHub afresh as the App, with installation tokens minted
   from its private key (`private_key`). Keep the key file, like every
   sign-in secret (client secrets, the authorizer's token), mode 0600, readable by `bd serve` only; whoever
   has it can read what the App may (organization members). Give the App
@@ -114,13 +114,14 @@ admin's authorizer ([Signing in](remote.md#signing-in)).
   their first segment, so no admin's token keeps an account out. Only `bd serve token revoke --account <login> --forget`
   releases a binding.
 - Sign-in access tokens expire (`token_ttl`, default 1 hour), and each
-  refresh applies the rules again (an OIDC rule by email, domain or group
-  keeps a sign-in while that rule is unchanged, as bd keeps no claims: see
-  [With an OpenID Connect provider](remote.md#with-an-openid-connect-provider)), so someone
-  who leaves a GitHub organization, or whom an authorizer or a subject rule
-  no longer lets in, loses access within `token_ttl`; someone an OIDC
-  provider stops listing under an email, domain or group rule keeps it
-  until their next sign-in, at the latest `refresh_limit`. Refresh tokens rotate at every refresh
+  refresh applies the rules again (where the provider is not asked again, a
+  rule other than by subject keeps a sign-in while that rule is unchanged,
+  as bd keeps no claims: see
+  [Refreshing](remote.md#refreshing-sign-ins)), so someone who leaves a
+  GitHub organization (with the App), or whom an authorizer or a subject
+  rule no longer lets in, loses access within `token_ttl`; someone a
+  provider stops listing under any other rule keeps it until their next
+  sign-in, at the latest `refresh_limit`. Refresh tokens rotate at every refresh
   and work once: a copy used after the original (or the original after a
   copy) revokes the sign-in. A sign-in is refreshed for at most
   `refresh_limit` (30 days), and not after `refresh_idle` (7 days) unused.
@@ -176,8 +177,9 @@ and the GDPR's data minimization (Art. 5(1)(c)) are the guide.
 - **Audit trail.** `server.db` records each sign-in, token created,
   refresh, revocation (with why: by its holder, an admin, a reused refresh
   token, the rules, its provider), account forgotten and client registered,
-  in the same transaction as the change, for 90 days; `bd serve token
-  events` shows it. An event names the actor, the provider and subject, the
+  in the same transaction as the change, for 90 days (client registrations,
+  which anyone may make, the latest 5000 only); `bd serve token events`
+  shows it. An event names the actor, the provider and subject, the
   token and the client, never a secret or an email. Forgetting an account
   erases its events too, leaving one that says an account of that provider
   was forgotten, and why.

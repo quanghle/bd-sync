@@ -101,10 +101,14 @@ pub fn touch(root: &Path, id: &str) -> Result<()> {
     if find(&conn, id)?.is_none_or(|c| recent(&c)) {
         return Ok(());
     }
-    change(root, |clients| {
-        if let Some(client) = clients.iter_mut().find(|c| c.client_id == id) {
-            client.used_at = Some(now);
-        }
+    drop(conn);
+    // Its row alone, read again in the write transaction.
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| {
+        let Some(mut client) = find(tx, id)? else { return Ok(()) };
+        client.used_at = Some(now);
+        let data = serde_json::to_string(&client)?;
+        tx.execute("UPDATE oauth_clients SET data = ?1 WHERE client_id = ?2", [data.as_str(), id])?;
         Ok(())
     })
 }
@@ -174,18 +178,31 @@ pub fn register(root: &Path, oauth: &OauthConfig, request: &[u8]) -> Result<std:
         detail: client.client_name.clone(),
         ..server_db::AuthEvent::default()
     };
-    change_noting(root, Some(event), |clients| {
-        clients.retain(|c| match c.used_at {
-            Some(at) => now.since(at) < millis(IDLE_FOR),
-            None => now.since(c.issued_at) < millis(UNUSED_FOR),
-        });
-        if clients.len() >= MAX_CLIENTS {
-            let unused = clients.iter().enumerate().filter(|(_, c)| c.used_at.is_none());
-            match unused.min_by_key(|(_, c)| c.issued_at).map(|(i, _)| i) {
-                Some(oldest) => drop(clients.remove(oldest)),
-                None => return Err(Error::Busy(format!("{MAX_CLIENTS} clients are registered and in use"))),
+    // Rows of their own, in SQL: no other client is read or written (timestamps are RFC 3339 in UTC, ordered
+    // as text).
+    let at = |d: Duration| now.minus(d).to_rfc3339();
+    let (idle_since, unused_since) = (at(IDLE_FOR), at(UNUSED_FOR));
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| {
+        tx.execute(
+            "DELETE FROM oauth_clients WHERE CASE WHEN json_extract(data, '$.used_at') IS NULL \
+             THEN json_extract(data, '$.issued_at') < ?2 ELSE json_extract(data, '$.used_at') < ?1 END",
+            [idle_since.as_str(), unused_since.as_str()],
+        )?;
+        let count: i64 = tx.query_row("SELECT count(*) FROM oauth_clients", [], |r| r.get(0))?;
+        if count >= MAX_CLIENTS as i64 {
+            // The oldest registration never used makes room.
+            let dropped = tx.execute(
+                "DELETE FROM oauth_clients WHERE seq = (SELECT seq FROM oauth_clients \
+                 WHERE json_extract(data, '$.used_at') IS NULL ORDER BY json_extract(data, '$.issued_at') LIMIT 1)",
+                [],
+            )?;
+            if dropped == 0 {
+                return Err(Error::Busy(format!("{MAX_CLIENTS} clients are registered and in use")));
             }
         }
+        server_db::record(tx, &event)?;
+        server_db::prune_registrations(tx)?;
         let mut answer = json!({
             "client_id": client.client_id,
             "client_id_issued_at": now.millis() / 1000,
@@ -197,7 +214,8 @@ pub fn register(root: &Path, oauth: &OauthConfig, request: &[u8]) -> Result<std:
         if let Some(name) = &client.client_name {
             answer["client_name"] = name.clone().into();
         }
-        clients.push(client);
+        let data = serde_json::to_string(&client)?;
+        tx.execute("INSERT INTO oauth_clients (client_id, data) VALUES (?1, ?2)", [client.client_id.as_str(), &data])?;
         Ok(Ok(answer))
     })
 }
@@ -345,6 +363,7 @@ fn parse(data: &str) -> Result<Registered> {
 }
 
 /// The registered clients, in the order they registered.
+#[cfg(test)]
 fn load(conn: &rusqlite::Connection) -> Result<Vec<Registered>> {
     let mut stmt = conn.prepare_cached("SELECT data FROM oauth_clients ORDER BY seq")?;
     let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<String>>>()?;
@@ -353,21 +372,10 @@ fn load(conn: &rusqlite::Connection) -> Result<Vec<Registered>> {
 
 /// Change the registered clients with `f`, in one transaction: the rows it
 /// added, changed or dropped are written if it succeeds, nothing if not.
+#[cfg(test)]
 fn change<T>(root: &Path, f: impl FnOnce(&mut Vec<Registered>) -> Result<T>) -> Result<T> {
-    change_noting(root, None, f)
-}
-
-/// [`change`], recording `event` for the audit trail with it.
-fn change_noting<T>(
-    root: &Path,
-    event: Option<server_db::AuthEvent>,
-    f: impl FnOnce(&mut Vec<Registered>) -> Result<T>,
-) -> Result<T> {
     let mut conn = server_db::open(root)?;
     server_db::write(root, &mut conn, |tx| {
-        if let Some(event) = &event {
-            server_db::record(tx, event)?;
-        }
         let before = load(tx)?;
         let mut clients = before.clone();
         let out = f(&mut clients)?;
@@ -379,7 +387,7 @@ fn change_noting<T>(
                 tx.execute("DELETE FROM oauth_clients WHERE client_id = ?1", [id])?;
                 Ok(())
             },
-            |c, data| {
+            |_, c, data| {
                 tx.execute(
                     "INSERT INTO oauth_clients (client_id, data) VALUES (?1, ?2) ON CONFLICT (client_id) DO UPDATE \
                      SET data = excluded.data",
@@ -390,10 +398,6 @@ fn change_noting<T>(
         )?;
         Ok(out)
     })
-}
-
-fn millis(d: Duration) -> i64 {
-    i64::try_from(d.as_millis()).unwrap_or(i64::MAX)
 }
 
 #[cfg(test)]

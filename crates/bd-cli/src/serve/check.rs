@@ -34,35 +34,24 @@ pub(super) fn check(app: &mut App, c: &ServeCheckArgs) -> Result<()> {
         Some(_) => "the authorizer".to_string(),
         None => "rules".to_string(),
     };
+    // Every provider alike: GitHub's issuer is where its accounts sign in.
+    let github = sign_in.github.iter().map(|g| ("github", "GitHub", g.url.as_str()));
+    let listed: Vec<(&str, &str, &str)> =
+        github.chain(sign_in.oidc.iter().map(|o| (o.name.as_str(), o.label.as_str(), o.issuer.as_str()))).collect();
     let mut providers = Vec::new();
-    if let Some(g) = &sign_in.github {
-        providers.push(json!({ "name": "github", "label": "GitHub", "refreshed": sign_in.refreshes("github") }));
+    for (name, label, issuer) in listed {
+        let refreshed = sign_in.refreshes(name);
+        providers.push(json!({ "name": name, "label": label, "issuer": issuer, "refreshed": refreshed }));
         lines.push(format!(
-            "  github: GitHub at {}, decided by {decides}; tokens {}refreshed",
-            g.url,
-            if sign_in.refreshes("github") { "" } else { "not " }
-        ));
-        for r in &g.rules {
-            note_workspaces(&r.grant.workspaces, &workspaces, "a [[github.allow]] rule", &mut warnings);
-        }
-    }
-    for o in &sign_in.oidc {
-        let refreshed = sign_in.refreshes(&o.name);
-        providers.push(json!({ "name": o.name, "label": o.label, "issuer": o.issuer, "refreshed": refreshed }));
-        lines.push(format!(
-            "  {}: {} at {}, decided by {decides}; tokens {}refreshed",
-            o.name,
-            o.label,
-            o.issuer,
+            "  {name}: {label} at {issuer}, decided by {decides}; tokens {}refreshed",
             if refreshed { "" } else { "not " }
         ));
-        for r in &o.allow {
-            note_workspaces(
-                &r.grant.workspaces,
-                &workspaces,
-                &format!("an [[oidc.{}.allow]] rule", o.name),
-                &mut warnings,
+        for r in sign_in.allow(name) {
+            let rule = format!(
+                "an [[{}.allow]] rule",
+                if name == "github" { name.to_string() } else { format!("oidc.{name}") }
             );
+            note_workspaces(&r.grant.workspaces, &workspaces, &rule, &mut warnings);
         }
     }
     for file in sign_in.secret_files(root) {

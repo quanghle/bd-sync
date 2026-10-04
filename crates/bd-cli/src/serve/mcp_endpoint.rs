@@ -40,15 +40,28 @@ impl Endpoint {
 /// `/<session>` with `?session=<session>`), without the token's rights over
 /// other actors' claims and human gates.
 pub(super) async fn mcp(server: &Arc<Server>, endpoint: Endpoint, req: Request<Incoming>) -> Response<Body> {
+    let (parts, body) = req.into_parts();
+    let mut body = Some(body);
+    let response = message(server, endpoint, parts, &mut body).await;
+    drained(body, response).await
+}
+
+/// [`mcp`], taking `body` once it reads it.
+async fn message(
+    server: &Arc<Server>,
+    endpoint: Endpoint,
+    parts: hyper::http::request::Parts,
+    body: &mut Option<Incoming>,
+) -> Response<Body> {
     let started = Instant::now();
-    if let Err(a) = mcp_http::check_origin(req.headers()) {
+    if let Err(a) = mcp_http::check_origin(&parts.headers) {
         return mcp_response(a, None);
     }
-    let token = match authenticate(server, req.headers()) {
+    let token = match authenticate(server, &parts.headers) {
         Ok(t) => t,
         Err(r) if r.status == StatusCode::UNAUTHORIZED => {
             // A request without a token learns where to get one, with no error (RFC 6750).
-            let error = bearer(req.headers()).is_some().then_some("invalid_token");
+            let error = bearer(&parts.headers).is_some().then_some("invalid_token");
             return endpoint.challenge(r, error);
         }
         Err(r) => return r.response(),
@@ -68,36 +81,46 @@ pub(super) async fn mcp(server: &Arc<Server>, endpoint: Endpoint, req: Request<I
         return Reject::new(StatusCode::NOT_FOUND, "not_found", format!("workspace not found: {workspace}"), 3)
             .response();
     };
-    let session = match mcp_session(req.uri().query()) {
+    let session = match mcp_session(parts.uri.query()) {
         Ok(s) => s,
         Err(e) => return Reject::new(StatusCode::BAD_REQUEST, "invalid", e.to_string(), 2).response(),
     };
-    if let Err(a) = mcp_http::check_content_type(req.headers()) {
+    if let Err(a) = mcp_http::check_content_type(&parts.headers) {
         return mcp_response(a, None);
     }
-    if hyper::body::Body::size_hint(req.body()).exact().is_some_and(|n| n > MAX_MCP_BODY as u64) {
+    let declared = body.as_ref().and_then(|b| hyper::body::Body::size_hint(b).exact());
+    if declared.is_some_and(|n| n > MAX_MCP_BODY as u64) {
         return mcp_too_large();
     }
-    let permits = kib(MAX_MCP_BODY * BODY_COPIES + MCP_ANSWER_BUDGET);
-    let budget = match queue(&server.body_budget, permits, "receiving other requests").await {
+    // The body as large as it says it is (or may be).
+    let reserve = declared.map_or(MAX_MCP_BODY, |n| usize::try_from(n).unwrap_or(MAX_MCP_BODY));
+    let budget = match queue(&server.body_budget, kib(reserve * BODY_COPIES), "receiving other requests").await {
         Ok(permit) => permit,
         Err(reject) => return reject.response(),
     };
-    let (parts, body) = req.into_parts();
-    let body = match read_body(body, MAX_MCP_BODY, BODY_TIMEOUT).await {
+    let body = match read_body(body.take().expect("not read yet"), MAX_MCP_BODY, BODY_TIMEOUT).await {
         Ok(b) => b,
         Err(BodyError::TooLarge) => return mcp_too_large(),
         Err(e) => return e.response("MCP request", MAX_MCP_BODY),
     };
-    let slot = match queue(&server.running, 1, "running other commands").await {
-        Ok(permit) => permit,
-        Err(reject) => return reject.response(),
+    // A tool call runs a command: a slot, and memory for its output. Any other message (initialize, ping, tools/list,
+    // a notification) needs neither.
+    let (answer_budget, slot) = match mcp_http::runs_tools(&body) {
+        false => (None, None),
+        true => {
+            let answer = match queue(&server.body_budget, kib(MCP_ANSWER_BUDGET), "receiving other requests").await {
+                Ok(permit) => permit,
+                Err(reject) => return reject.response(),
+            };
+            match queue(&server.running, 1, "running other commands").await {
+                Ok(slot) => (Some(answer), Some(slot)),
+                Err(reject) => return reject.response(),
+            }
+        }
     };
     let srv = server.clone();
     let job = tokio::task::spawn_blocking(move || {
         // The answer's share is held until it is sent; the body's, and the slot, until the message is answered.
-        let mut budget = budget;
-        let answer_budget = budget.split(kib(MCP_ANSWER_BUDGET) as usize);
         let _held = (slot, budget);
         let runner = ToolRunner { server: &srv, ws: &ws, token: &token, session: &session };
         let mut mcp = mcp::Server::for_request(runner, token.role == Role::Read);

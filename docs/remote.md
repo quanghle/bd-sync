@@ -156,11 +156,27 @@ refresh_limit = "30d"                   # refreshed for at most this long after 
 refresh_idle = "7d"                     # and not after this long without one (default 7d)
 ```
 
-Tokens are refreshed ([Refreshing](#refreshing-sign-ins)) when access can
-be decided again at each refresh: an authorizer, GitHub's rules through the
-GitHub App's private key, or an OIDC provider's rules (see
-[With an OpenID Connect provider](#with-an-openid-connect-provider) for what
-those decide again). Otherwise people sign in again each `token_ttl`.
+Tokens are refreshed ([Refreshing](#refreshing-sign-ins)): each refresh
+decides again, by the authorizer or by the provider's rules.
+
+Every provider's rules work alike: `[[<provider>.allow]]` (`[[github.allow]]`,
+`[[oidc.<name>.allow]]`), in order, the first that lets an account into the
+workspace deciding its token. A rule names accounts by what their provider
+proves:
+
+| Field | Matches | Providers |
+|---|---|---|
+| `subjects` | the account's id at its provider (a GitHub user id, an OIDC `sub`), which never changes | all |
+| `groups` | membership: a GitHub organization (`acme`) or team (`acme/eng`), or a value of an OIDC provider's `groups_claim` | all |
+| `anyone = true` | any account (the last rule; see below) | all |
+| `users` | the account's login | GitHub |
+| `min_account_age` | accounts made at least this long ago (with any of the above) | GitHub |
+| `emails`, `email_domains` | a verified email, or one at these domains | OIDC |
+
+and grants `role`, `kind`, `workspaces` and `max_claims`. GitHub proves no
+email, and an OIDC provider no login (people often choose their own), so
+those fields are refused where they mean nothing. `deny` lists subjects that
+may never sign in, whatever decides.
 
 ### With GitHub
 
@@ -168,11 +184,12 @@ those decide again). Otherwise people sign in again each `token_ttl`.
    URL will do, no webhook), and tick **Enable Device Flow** in its settings.
    Give it the **Members** organization permission (read), install it on
    each organization the rules name (with rules that name none, on any
-   account), and generate a private key: the server keeps signed-in people's
-   tokens fresh with it ([Refreshing](#refreshing-sign-ins)). Without a
-   private key, sign-in still works, also with a [GitHub OAuth
-   app](https://github.com/settings/developers), but its tokens are
-   refreshed only with an authorizer deciding.
+   account), and generate a private key: with it, each refresh asks GitHub
+   afresh (a renamed account goes by its new login, a deleted one is
+   revoked, memberships are read again; [Refreshing](#refreshing-sign-ins)).
+   Without one, sign-in works the same, also with a [GitHub OAuth
+   app](https://github.com/settings/developers), and refreshes keep to the
+   rule that let the account in, as an OIDC provider's do.
 2. Write `<root>/auth.toml` on the server:
 
 ```toml
@@ -180,7 +197,7 @@ those decide again). Otherwise people sign in again each `token_ttl`.
 client_id = "Iv23li0123456789abcd"
 private_key = "github-app.pem"          # the GitHub App's private key, relative to the root (mode 0600)
 # url = "https://ghe.example.com"       # GitHub Enterprise Server; its API defaults to <url>/api/v3 (api_url)
-# deny = [12345]                        # GitHub user ids that may never sign in (`bd serve token accounts`)
+# deny = ["12345"]                      # GitHub user ids that may never sign in (`bd serve token accounts`)
 # client_secret_file = "github-secret"  # the GitHub App's client secret, relative to the root: for [oauth]
 
 # Rules, in order: the first that lets an account into the workspace decides its token.
@@ -190,11 +207,11 @@ role = "admin"                          # read, write (default) or admin
 kind = "human"                          # agent (default) or human
 
 [[github.allow]]
-teams = ["acme/bd-maintainers"]         # <organization>/<team slug>
+groups = ["acme/bd-maintainers"]        # a team: <organization>/<team slug>
 kind = "human"
 
 [[github.allow]]
-orgs = ["acme"]
+groups = ["acme"]                       # an organization
 role = "read"
 workspaces = ["proj"]                   # default: every workspace
 
@@ -232,10 +249,10 @@ restart; a mistake made meanwhile fails sign-ins and refreshes, with the
 reason in the server log only. It also says at start whether tokens are
 refreshed.
 
-- A rule lets an account in if `users` lists its login, or if it is an active
-  member (not just invited) of one of its `orgs` or `teams`. Memberships are
-  read with the account's own GitHub token, so the sign-in asks for the
-  `read:org` scope when a rule names organizations or teams. An organization
+- A GitHub rule lets an account in if `users` lists its login, `subjects` its
+  user id, or if it is an active member (not just invited) of one of its
+  `groups`. Memberships are read with the account's own GitHub token, so the
+  sign-in asks for the `read:org` scope when a rule names groups. An organization
   that restricts OAuth apps only answers once an owner approves the app
   (organization settings, Third-party access), and one with SAML single
   sign-on only for a GitHub token authorized for it (GitHub offers that on its
@@ -247,7 +264,7 @@ refreshed.
   account no rule lets into that workspace is refused, and so is a workspace the server does not have:
   nothing is issued.
 - A rule with `anyone = true` lets in every GitHub account the rules before
-  it do not, so it names no users, orgs or teams and must be the last rule.
+  it do not, so it names nobody and must be the last rule.
   Since anyone can create GitHub accounts, its tokens read by default, may
   write at most (never `admin`), and are always `agent` tokens, which cannot
   open human gates. A rule before it may not give a lower role in a workspace
@@ -293,7 +310,7 @@ refreshed.
   refused too, even if bound before under another login, while the login
   names another account's actor, that account's login at its latest
   sign-in, or a live admin-created token's actor: so it does not pass for
-  the previous holder. Under another rule (`orgs`, `teams`, `anyone`), such
+  the previous holder. Under another rule (`subjects`, `groups`, `anyone`), such
   an account signs in as its own actor. `bd serve token create` refuses
   an account's actor in the same way. `bd serve token accounts` lists the
   bindings, and `bd serve token revoke --account <login> --forget` releases
@@ -363,13 +380,12 @@ groups = ["bd-readers"]                 # a value of groups_claim, where the pro
 role = "read"                           # (Entra, Okta, Keycloak can; Google's ID tokens carry no groups)
 ```
 
-A rule takes `role`, `kind`, `workspaces` and `max_claims` as GitHub's
-do, and `anyone = true` (last, never admin or human). A refresh decides
-again by what bd keeps of the account: its `sub`. Rules by `subjects` or
-`anyone` are applied again then. Rules by `emails`, `email_domains` or
-`groups` need the ID token, which a refresh does not have (bd keeps no
-email or claim): a refresh keeps such a sign-in while the rule that let it
-in is in `auth.toml`, unchanged. Removing or changing that rule ends the
+Its rules are those of every provider (above). A refresh decides again by
+what bd keeps of the account: its `sub`. Rules by `subjects` or `anyone`
+are applied again then. Rules by `emails`, `email_domains` or `groups`
+need the ID token, which a refresh does not have (bd keeps no email or
+claim): a refresh keeps such a sign-in while the rule that let it in is in
+`auth.toml`, unchanged. Removing or changing that rule ends the
 sign-ins it let in at their next refresh, and their people sign in again;
 someone a provider no longer lists in a group keeps access until they sign
 in again, at the latest `sign_in.refresh_limit`. Use an authorizer to
@@ -545,23 +561,24 @@ person is told only that the account may not use the workspace.
 
 ### Refreshing sign-ins
 
-When access can be decided again at each refresh (an authorizer, GitHub's rules with the GitHub App's private key, or an OIDC provider's rules),
-each sign-in also gets a refresh token, saved with its
+Each sign-in also gets a refresh token, saved with its
 access token on the client and sent only to `POST /v2/auth/refresh`. The
 client renews the access token by itself, before a command, once a fifth of
 its lifetime is left (10 minutes at most), or when the server finds it
 expired first; so does a long-running one (`bd agents watch`, `bd events
 --follow`) between its requests. Each refresh:
 
-- asks the authorizer again (above), or applies GitHub's rules again, by
-  the workspace the sign-in was for. With the GitHub App, a GitHub account
-  is first looked up by its id (a deleted one is revoked, a renamed one
-  goes by its new login); without it, and for OIDC providers, the account
-  is taken as it signed in. GitHub's rules: `deny`, the rules in order (`users` by the account's current
-  login, which the server reads by its GitHub user id; `orgs` and `teams` by
-  active membership; `min_account_age`), and what the first matching rule
-  grants now: role, kind, workspaces and `max_claims` may change at a
-  refresh. GitHub is asked as the GitHub App, with installation tokens: the
+- asks the authorizer again (above), or applies the provider's rules again,
+  by the workspace the sign-in was for, after `deny`. A provider that can be
+  asked again proves the account afresh: with the GitHub App, a GitHub
+  account is looked up by its id (a deleted one is revoked, a renamed one
+  goes by its new login), and rules apply in order (`users` by its current
+  login, `groups` by active membership, `min_account_age`). Otherwise (an
+  OIDC provider, or GitHub without the App) the account is taken as it
+  signed in: rules by `subjects` or `anyone` apply again, and any other rule
+  keeps the sign-in only if it is the one that let it in, unchanged. What
+  the first matching rule grants now applies: role, kind, workspaces and
+  `max_claims` may change at a refresh. GitHub is asked as the GitHub App, with installation tokens: the
   server never keeps anyone's own GitHub token. An organization the App is
   not installed on, or whose members it may not read, does not tell: a
   rule for the workspace that GitHub will not decide stops the rules there

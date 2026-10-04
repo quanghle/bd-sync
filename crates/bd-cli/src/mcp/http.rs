@@ -75,6 +75,17 @@ pub fn check_content_type(headers: &HeaderMap) -> Result<(), Answer> {
 }
 
 /// Answer the message POSTed as `body` with `headers`.
+/// Whether the message in `body` calls a tool, the one kind that runs a
+/// command: read without building the message, as the server sizes what it
+/// holds for it before answering.
+pub fn runs_tools(body: &[u8]) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Peek {
+        method: Option<String>,
+    }
+    serde_json::from_slice::<Peek>(body).is_ok_and(|p| p.method.as_deref() == Some("tools/call"))
+}
+
 pub fn answer<R: Runner>(server: &mut Server<R>, headers: &HeaderMap, body: &[u8]) -> Answer {
     let message: Value = match serde_json::from_slice(body) {
         Ok(m) => m,
@@ -377,6 +388,19 @@ mod tests {
 
     const CALL: [(&str, &str); 3] =
         [("mcp-protocol-version", MODERN), ("mcp-method", "tools/call"), ("mcp-name", "ready")];
+
+    #[test]
+    fn only_tool_calls_are_sized_as_commands() {
+        assert!(runs_tools(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ready"}}"#));
+        for light in [
+            &br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#[..],
+            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"method":"tools/call"}}"#,
+            b"not json",
+        ] {
+            assert!(!runs_tools(light), "{}", String::from_utf8_lossy(light));
+        }
+    }
 
     #[test]
     fn modern_requests_mirror_their_body_in_headers() {

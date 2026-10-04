@@ -84,165 +84,11 @@ pub(crate) struct OidcDoc {
     #[serde(default)]
     account_events: Option<Vec<String>>,
     #[serde(default)]
-    allow: Vec<RuleDoc>,
+    allow: Vec<crate::oauth::RuleDoc>,
     #[serde(default)]
     groups_claim: Option<String>,
     #[serde(default)]
     deny: Vec<String>,
-}
-
-/// `[[oidc.<name>.allow]]` as written.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RuleDoc {
-    #[serde(default)]
-    anyone: bool,
-    #[serde(default)]
-    subjects: Vec<String>,
-    #[serde(default)]
-    emails: Vec<String>,
-    #[serde(default)]
-    email_domains: Vec<String>,
-    #[serde(default)]
-    groups: Vec<String>,
-    #[serde(default)]
-    role: Option<crate::auth::Role>,
-    #[serde(default = "crate::oauth::agent_kind")]
-    kind: crate::auth::Kind,
-    #[serde(default)]
-    workspaces: Vec<String>,
-    #[serde(default)]
-    max_claims: Option<u32>,
-}
-
-/// One `[[oidc.<name>.allow]]` rule: whom of the provider's accounts it lets
-/// in, and what their token may do. By `subjects` (the accounts' ids, which
-/// bd keeps) or `anyone`, it is decided again at each refresh; by `emails`,
-/// `email_domains` (the verified email) or `groups` (a claim of the ID
-/// token), which bd does not keep, at sign-in only: a refresh keeps a
-/// sign-in while the rule that let it in is still there, unchanged.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Rule {
-    pub anyone: bool,
-    pub subjects: Vec<String>,
-    /// Lowercased.
-    pub emails: Vec<String>,
-    /// Lowercased, without `@`.
-    pub email_domains: Vec<String>,
-    pub groups: Vec<String>,
-    pub grant: crate::auth::Grant,
-}
-
-impl Rule {
-    /// Whether it needs the ID token's claims, which a refresh does not have.
-    fn needs_claims(&self) -> bool {
-        !(self.emails.is_empty() && self.email_domains.is_empty() && self.groups.is_empty())
-    }
-
-    /// What tells this rule from any other, or from itself changed: kept
-    /// with a sign-in it let in.
-    pub fn fingerprint(&self) -> String {
-        crate::auth::hash(&format!("{self:?}"))[..16].to_string()
-    }
-
-    /// What lets the account `subject` in by this rule, if anything: from
-    /// `claims` at sign-in; at a refresh (no claims), a rule that needs them
-    /// only if it is the one `kept` (its fingerprint) let the sign-in in.
-    fn lets_in(
-        &self,
-        subject: &str,
-        claims: Option<&Claims>,
-        groups_claim: &str,
-        kept: Option<&str>,
-    ) -> Option<String> {
-        if self.anyone {
-            return Some("anyone".into());
-        }
-        if self.subjects.iter().any(|s| s == subject) {
-            return Some("a listed account".into());
-        }
-        if !self.needs_claims() {
-            return None;
-        }
-        let Some(claims) = claims else {
-            return (kept == Some(self.fingerprint().as_str())).then(|| "as at sign-in".into());
-        };
-        if let Some(email) = claims.email.as_deref().map(str::to_lowercase) {
-            if self.emails.contains(&email) {
-                return Some("a listed email".into());
-            }
-            let domain = email.rsplit_once('@').map(|(_, d)| d.to_string()).unwrap_or_default();
-            if self.email_domains.contains(&domain) {
-                return Some(format!("an email at {domain}"));
-            }
-        }
-        let groups: Vec<&str> = match &claims.all[groups_claim] {
-            Value::Array(list) => list.iter().filter_map(Value::as_str).collect(),
-            Value::String(one) => vec![one.as_str()],
-            _ => Vec::new(),
-        };
-        self.groups.iter().find(|g| groups.contains(&g.as_str())).map(|g| format!("member of {g}"))
-    }
-}
-
-/// What the first of `rules` that lets the account in decides for
-/// `workspace`, as GitHub's rules do (`oauth::decide`), and the fingerprint
-/// of that rule.
-pub fn decide(
-    rules: &[Rule],
-    subject: &str,
-    claims: Option<&Claims>,
-    groups_claim: &str,
-    kept: Option<&str>,
-    workspace: &str,
-) -> (crate::oauth::Decision, Option<String>) {
-    let mut elsewhere = crate::oauth::Elsewhere::default();
-    for rule in rules {
-        let Some(via) = rule.lets_in(subject, claims, groups_claim, kept) else { continue };
-        if rule.grant.allows_workspace(workspace) {
-            let grant = elsewhere.grant(&rule.grant, workspace);
-            return (crate::oauth::Decision::In { grant, via, by_login: true }, Some(rule.fingerprint()));
-        }
-        elsewhere.note(&rule.grant);
-    }
-    (elsewhere.decision(), None)
-}
-
-/// `[[oidc.<name>.allow]]` rule `n`, checked.
-fn rule(at: &str, n: usize, r: RuleDoc) -> std::result::Result<Rule, String> {
-    let at = format!("[[{at}.allow]] rule {n}");
-    let plain = |field: &str, list: Vec<String>, lower: bool| {
-        list.into_iter()
-            .map(|s| {
-                let v = s.trim();
-                let v = if lower { v.to_lowercase() } else { v.to_string() };
-                match !v.is_empty() && v.len() <= 255 && v.chars().all(|c| !c.is_control() && !c.is_whitespace()) {
-                    true => Ok(v),
-                    false => Err(format!("{at}: {field} {s:?} is not one")),
-                }
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()
-    };
-    let subjects = plain("subjects", r.subjects, false)?;
-    let emails = plain("emails", r.emails, true)?;
-    let email_domains: Vec<String> =
-        plain("email_domains", r.email_domains, true)?.into_iter().map(|d| d.trim_start_matches('@').into()).collect();
-    if let Some(e) = emails.iter().find(|e| !e.contains('@')) {
-        return Err(format!("{at}: emails {e:?} is not an email"));
-    }
-    let groups = plain("groups", r.groups, false)?;
-    let names_someone = !(subjects.is_empty() && emails.is_empty() && email_domains.is_empty() && groups.is_empty());
-    if r.anyone {
-        if names_someone {
-            return Err(format!("{at} lets anyone in: drop its subjects, emails, email_domains and groups, or anyone"));
-        }
-    } else if !names_someone {
-        return Err(format!(
-            "{at} names no subjects, emails, email_domains or groups, so it lets nobody in (anyone = true lets everyone)"
-        ));
-    }
-    let grant = crate::oauth::rule_grant(&at, r.anyone, r.role, r.kind, &r.workspaces, r.max_claims)?;
-    Ok(Rule { anyone: r.anyone, subjects, emails, email_domains, groups, grant })
 }
 
 /// `[oidc.<name>.signed_secret]` as written.
@@ -314,7 +160,7 @@ pub struct Oidc {
     /// it takes none.
     pub account_events: Vec<String>,
     /// `[[oidc.<name>.allow]]`: who of its accounts get in, without an authorizer.
-    pub allow: Vec<Rule>,
+    pub allow: Vec<crate::oauth::Rule>,
     /// The ID token claim listing an account's groups, for rules' `groups`.
     pub groups_claim: String,
     /// Subjects (`sub`) of accounts that may never sign in, whatever the
@@ -384,10 +230,7 @@ pub(crate) fn parse(name: &str, doc: OidcDoc) -> std::result::Result<Oidc, Strin
     if account_events.iter().any(|a| a.is_empty() || a.len() > 255 || !a.bytes().all(|b| b.is_ascii_graphic())) {
         return Err(format!("{at}.account_events lists the IDs the provider names the app by: not empty, plain"));
     }
-    let deny: Vec<String> = doc.deny.iter().map(|s| s.trim().to_string()).collect();
-    if deny.iter().any(|s| s.is_empty() || s.len() > 255) {
-        return Err(format!("{at}.deny lists accounts' subjects (their sub claims): not empty"));
-    }
+    let deny = crate::oauth::deny_list(&at, doc.deny, crate::oauth::Proves::Oidc)?;
     let label = doc.label.map(|l| l.trim().to_string()).unwrap_or_else(|| name.to_string());
     if !crate::oauth_server::clients::shows_plainly(&label, 40) {
         return Err(format!("{at}.label is empty, longer than 40 characters, or not plain text"));
@@ -412,12 +255,7 @@ pub(crate) fn parse(name: &str, doc: OidcDoc) -> std::result::Result<Oidc, Strin
         form_post,
         signed_secret,
         account_events,
-        allow: doc
-            .allow
-            .into_iter()
-            .enumerate()
-            .map(|(i, r)| rule(&at, i + 1, r))
-            .collect::<std::result::Result<_, _>>()?,
+        allow: crate::oauth::rules(&at, doc.allow, crate::oauth::Proves::Oidc)?,
         groups_claim: doc.groups_claim.map(|g| g.trim().to_string()).unwrap_or_else(|| "groups".into()),
         deny,
     })
@@ -578,6 +416,16 @@ impl Oidc {
     }
 
     /// The account an ID token's verified claims name.
+    /// What an ID token's `claims` prove of the account `user`, for the rules.
+    pub fn facts<'a>(&self, user: &'a Identity, claims: &Claims) -> crate::oauth::Listed<'a> {
+        let groups = match &claims.all[&self.groups_claim] {
+            Value::Array(list) => list.iter().filter_map(Value::as_str).map(str::to_string).collect(),
+            Value::String(one) => vec![one.clone()],
+            _ => Vec::new(),
+        };
+        crate::oauth::Listed { user, email: claims.email.clone(), groups, fresh: true }
+    }
+
     pub fn identity(&self, claims: &Claims) -> Identity {
         Identity {
             provider: self.name.clone(),
@@ -865,15 +713,20 @@ pub fn error_code(code: &str) -> &str {
     }
 }
 
+/// The one HTTP client of every provider's requests: its connections (and
+/// their TLS sessions) serve the next request to the same host.
 fn agent() -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .max_redirects(0)
-        .proxy(None)
-        .timeout_global(Some(TIMEOUT))
-        .user_agent(format!("bd/{}", env!("CARGO_PKG_VERSION")))
-        .build()
-        .into()
+    static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .proxy(None)
+            .timeout_global(Some(TIMEOUT))
+            .user_agent(format!("bd/{}", env!("CARGO_PKG_VERSION")))
+            .build()
+            .into()
+    });
+    AGENT.clone()
 }
 
 /// `s` as `application/x-www-form-urlencoded`, as a Basic header's parts are (RFC 6749 section 2.3.1).
@@ -1204,16 +1057,28 @@ pub(crate) mod tests {
             email: email.map(str::to_string),
             all: serde_json::json!({ "roles": roles }),
         };
-        let at_sign_in =
-            |subject: &str, c: &Claims, ws: &str| decide(&o.allow, subject, Some(c), &o.groups_claim, None, ws);
-        let role = |d: &(Decision, Option<String>)| match &d.0 {
+        let user = |subject: &str| crate::auth::Identity {
+            provider: "corp".into(),
+            issuer: "https://idp.example".into(),
+            subject: subject.into(),
+            login: "u-x".into(),
+        };
+        let decide = |rules: &[crate::oauth::Rule],
+                      facts: &mut dyn crate::oauth::Facts,
+                      kept: Option<&str>,
+                      ws: &str| { crate::oauth::decide(rules, facts, kept, ws).unwrap() };
+        let at_sign_in = |subject: &str, c: &Claims, ws: &str| {
+            let u = user(subject);
+            decide(&o.allow, &mut o.facts(&u, c), None, ws)
+        };
+        let role = |d: &crate::oauth::Decided| match &d.decision {
             Decision::In { grant, via, .. } => Some((grant.role, via.clone())),
             _ => None,
         };
         let none = claims(None, Value::Null);
         assert_eq!(
             role(&at_sign_in("s-admin", &none, "proj")),
-            Some((crate::auth::Role::Admin, "a listed account".into()))
+            Some((crate::auth::Role::Admin, "corp account u-x".into()))
         );
         assert_eq!(
             role(&at_sign_in("s1", &claims(Some("bob@acme.example"), Value::Null), "x")).unwrap().1,
@@ -1223,27 +1088,36 @@ pub(crate) mod tests {
         assert_eq!(role(&domain), Some((crate::auth::Role::Read, "an email at acme.example".into())));
         let group = at_sign_in("s1", &claims(None, serde_json::json!(["ops", "eng"])), "proj");
         assert_eq!(role(&group).unwrap().1, "member of eng");
-        assert!(matches!(at_sign_in("s1", &claims(None, serde_json::json!("eng")), "other").0, Decision::Elsewhere(_)));
-        assert!(matches!(at_sign_in("s1", &claims(Some("eve@evil.example"), Value::Null), "proj").0, Decision::Out));
+        let elsewhere = at_sign_in("s1", &claims(None, serde_json::json!("eng")), "other");
+        assert!(matches!(elsewhere.decision, Decision::Elsewhere(_)));
+        let out = at_sign_in("s1", &claims(Some("eve@evil.example"), Value::Null), "proj");
+        assert!(matches!(out.decision, Decision::Out));
 
         // A refresh has no claims: a subject decides again; a claims rule only as the one that let it in, unchanged.
-        let refresh =
-            |subject: &str, kept: Option<&str>| decide(&o.allow, subject, None, &o.groups_claim, kept, "proj");
-        assert!(role(&refresh("s-admin", None)).is_some());
-        let kept = domain.1.clone().unwrap();
-        assert_eq!(role(&refresh("s1", Some(&kept))), Some((crate::auth::Role::Read, "as at sign-in".into())));
-        assert!(matches!(refresh("s1", None).0, Decision::Out), "no claims, no rule kept");
+        let refresh = |rules: &[crate::oauth::Rule], subject: &str, kept: Option<&str>| {
+            let u = user(subject);
+            decide(rules, &mut crate::oauth::Listed::kept(&u), kept, "proj")
+        };
+        assert!(role(&refresh(&o.allow, "s-admin", None)).is_some());
+        let kept = domain.rule.clone().unwrap();
+        assert_eq!(
+            role(&refresh(&o.allow, "s1", Some(&kept))),
+            Some((crate::auth::Role::Read, "corp account u-x, as at sign-in".into()))
+        );
+        assert!(matches!(refresh(&o.allow, "s1", None).decision, Decision::Out), "no claims, no rule kept");
         let changed = doc("[[allow]]\nsubjects = [\"s-admin\"]\nrole = \"admin\"\nkind = \"human\"\n\
              [[allow]]\nemail_domains = [\"acme.example\"]\nrole = \"write\"\n")
         .unwrap();
-        let again = decide(&changed.allow, "s1", None, &changed.groups_claim, Some(&kept), "proj");
-        assert!(matches!(again.0, Decision::Out), "the rule changed: the sign-in is not kept");
+        let again = refresh(&changed.allow, "s1", Some(&kept));
+        assert!(matches!(again.decision, Decision::Out), "the rule changed: the sign-in is not kept");
 
         for (bad, says) in [
             ("[[allow]]\nrole = \"read\"", "lets nobody in"),
-            ("[[allow]]\nanyone = true\nsubjects = [\"x\"]", "drop its"),
+            ("[[allow]]\nanyone = true\nsubjects = [\"x\"]", "drop whom it names"),
             ("[[allow]]\nanyone = true\nrole = \"admin\"", "anyone in"),
-            ("[[allow]]\nemails = [\"not-an-email\"]", "not an email"),
+            ("[[allow]]\nemails = [\"not-an-email\"]", "is not one"),
+            ("[[allow]]\nusers = [\"alice\"]", "logins are not proved names"),
+            ("[[allow]]\ngroups = [\"eng\"]\nmin_account_age = \"30d\"", "min_account_age is GitHub's"),
             ("[[allow]]\ngroups = [\"a b\"]", "not one"),
             ("[[allow]]\nsubjects = [\"x\"]\nsecret = 1", "unknown field"),
         ] {

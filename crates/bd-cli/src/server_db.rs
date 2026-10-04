@@ -225,27 +225,62 @@ pub fn snapshot(root: &Path, dest: &Path) -> Result<()> {
 }
 
 /// Write a table's rows back after a change: `upsert` those of `after`
-/// whose record (as JSON, given it) is not as in `before`, and `delete`
-/// (by `key`) those it no longer has. Rows unchanged are not written.
+/// whose record (as JSON, given it) is not as in `before` (given the row as
+/// it was, if it was there), and `delete` (by `key`) those it no longer
+/// has. Rows unchanged are not written.
 pub fn sync_rows<T: serde::Serialize, K: Eq + std::hash::Hash>(
     before: &[T],
     after: &[T],
     key: impl Fn(&T) -> K,
     mut delete: impl FnMut(&K) -> Result<()>,
-    mut upsert: impl FnMut(&T, &str) -> Result<()>,
+    mut upsert: impl FnMut(Option<&T>, &T, &str) -> Result<()>,
 ) -> Result<()> {
-    let was: std::collections::HashMap<K, String> =
-        before.iter().map(|r| Ok((key(r), serde_json::to_string(r)?))).collect::<Result<_>>()?;
+    let was: std::collections::HashMap<K, (&T, String)> =
+        before.iter().map(|r| Ok((key(r), (r, serde_json::to_string(r)?)))).collect::<Result<_>>()?;
     let kept: std::collections::HashSet<K> = after.iter().map(&key).collect();
     for gone in was.keys().filter(|k| !kept.contains(*k)) {
         delete(gone)?;
     }
     for row in after {
         let data = serde_json::to_string(row)?;
-        if was.get(&key(row)) != Some(&data) {
-            upsert(row, &data)?;
+        let old = was.get(&key(row));
+        if old.map(|(_, d)| d) != Some(&data) {
+            upsert(old.map(|(r, _)| *r), row, &data)?;
         }
     }
+    Ok(())
+}
+
+/// A row's lookup columns and their values.
+pub type Columns = Vec<(&'static str, rusqlite::types::Value)>;
+
+/// Write a row of `table` named by `keys`: inserted with `columns`, or, if it
+/// was there with the columns `was`, updated in those that changed only (each
+/// column set is an index entry rewritten).
+pub fn put_row(
+    tx: &rusqlite::Transaction,
+    table: &str,
+    keys: &Columns,
+    columns: &Columns,
+    was: Option<&Columns>,
+) -> Result<()> {
+    let Some(was) = was else {
+        let all: Vec<&(&str, rusqlite::types::Value)> = keys.iter().chain(columns).collect();
+        let names: Vec<&str> = all.iter().map(|(n, _)| *n).collect();
+        let marks = vec!["?"; all.len()].join(", ");
+        let sql = format!("INSERT INTO {table} ({}) VALUES ({marks})", names.join(", "));
+        tx.execute(&sql, rusqlite::params_from_iter(all.iter().map(|(_, v)| v)))?;
+        return Ok(());
+    };
+    let changed: Vec<&(&str, rusqlite::types::Value)> =
+        columns.iter().filter(|(n, v)| !was.iter().any(|(m, w)| m == n && w == v)).collect();
+    if changed.is_empty() {
+        return Ok(());
+    }
+    let set: Vec<String> = changed.iter().map(|(n, _)| format!("{n} = ?")).collect();
+    let at: Vec<String> = keys.iter().map(|(n, _)| format!("{n} = ?")).collect();
+    let sql = format!("UPDATE {table} SET {} WHERE {}", set.join(", "), at.join(" AND "));
+    tx.execute(&sql, rusqlite::params_from_iter(changed.iter().map(|(_, v)| v).chain(keys.iter().map(|(_, v)| v))))?;
     Ok(())
 }
 
@@ -300,10 +335,31 @@ pub fn record(tx: &rusqlite::Transaction, event: &AuthEvent) -> Result<()> {
     Ok(())
 }
 
-/// Delete the events older than [`EVENTS_KEPT`].
+/// Delete the events older than [`EVENTS_KEPT`], at most [`PRUNE_BATCH`].
 pub fn prune_events(tx: &rusqlite::Transaction) -> Result<()> {
     let kept = i64::try_from(EVENTS_KEPT.as_millis()).unwrap_or(i64::MAX);
-    tx.execute("DELETE FROM auth_events WHERE at < ?1", [Timestamp::now().millis() - kept])?;
+    tx.execute(
+        "DELETE FROM auth_events WHERE seq IN (SELECT seq FROM auth_events WHERE at < ?1 ORDER BY at LIMIT ?2)",
+        rusqlite::params![Timestamp::now().millis() - kept, PRUNE_BATCH],
+    )?;
+    Ok(())
+}
+
+/// The most rows of a kind one write prunes.
+pub const PRUNE_BATCH: i64 = 500;
+
+/// The registrations of OAuth clients the audit trail keeps, the latest:
+/// anyone may register, so their events are bounded by count as well as age.
+const KEPT_REGISTRATIONS: i64 = 5000;
+
+/// Delete the events of client registrations past the latest
+/// [`KEPT_REGISTRATIONS`].
+pub fn prune_registrations(tx: &rusqlite::Transaction) -> Result<()> {
+    tx.execute(
+        "DELETE FROM auth_events WHERE kind = 'client_registered' AND seq <= (SELECT seq FROM auth_events \
+         WHERE kind = 'client_registered' ORDER BY seq DESC LIMIT 1 OFFSET ?1)",
+        [KEPT_REGISTRATIONS],
+    )?;
     Ok(())
 }
 
@@ -411,6 +467,32 @@ pub fn account_keys(a: &Value) -> (String, String) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn registrations_kept_are_the_latest_and_pruning_goes_in_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open(dir.path()).unwrap();
+        let count = |conn: &Connection, kind: &str| -> i64 {
+            conn.query_row("SELECT count(*) FROM auth_events WHERE kind = ?1", [kind], |r| r.get(0)).unwrap()
+        };
+        write(dir.path(), &mut conn, |tx| {
+            let event = |kind| AuthEvent { kind, ..AuthEvent::default() };
+            for _ in 0..KEPT_REGISTRATIONS + 3 {
+                record(tx, &event("client_registered"))?;
+            }
+            record(tx, &event("signed_in"))?;
+            prune_registrations(tx)
+        })
+        .unwrap();
+        assert_eq!((count(&conn, "client_registered"), count(&conn, "signed_in")), (KEPT_REGISTRATIONS, 1));
+        let first: i64 = conn.query_row("SELECT min(seq) FROM auth_events", [], |r| r.get(0)).unwrap();
+        assert_eq!(first, 4, "the oldest went");
+        // Events past their time go a batch a write.
+        conn.execute("UPDATE auth_events SET at = 0", []).unwrap();
+        write(dir.path(), &mut conn, prune_events).unwrap();
+        let left: i64 = conn.query_row("SELECT count(*) FROM auth_events", [], |r| r.get(0)).unwrap();
+        assert_eq!(left, KEPT_REGISTRATIONS + 1 - PRUNE_BATCH);
+    }
+
     /// Every lookup server.db's code prepares uses an index: none reads a
     /// whole table but those that read every row by design.
     #[test]
@@ -423,7 +505,10 @@ mod tests {
             "SELECT seq, data FROM tokens WHERE actor_key = ?1",
             "SELECT seq, data FROM tokens WHERE actor_key > ?1 AND actor_key < ?2",
             "DELETE FROM tokens WHERE id = ?1",
-            "DELETE FROM tokens WHERE ended_at <= ?1",
+            "UPDATE tokens SET sha256 = ?, data = ? WHERE id = ?",
+            "UPDATE accounts SET login_key = ?, data = ? WHERE issuer = ? AND subject = ?",
+            "UPDATE oauth_clients SET data = ?1 WHERE client_id = ?2",
+            "DELETE FROM tokens WHERE id IN (SELECT id FROM tokens WHERE ended_at <= ?1 LIMIT ?2)",
             "SELECT seq, data FROM accounts WHERE issuer = ?1 AND subject = ?2",
             "SELECT seq, data FROM accounts WHERE actor_key = ?1",
             "SELECT seq, data FROM accounts WHERE actor_key > ?1 AND actor_key < ?2",
@@ -432,7 +517,7 @@ mod tests {
             "DELETE FROM accounts WHERE issuer = ?1 AND subject = ?2",
             "SELECT data FROM oauth_clients WHERE client_id = ?1",
             "DELETE FROM oauth_clients WHERE client_id = ?1",
-            "DELETE FROM auth_events WHERE at < ?1",
+            "DELETE FROM auth_events WHERE seq IN (SELECT seq FROM auth_events WHERE at < ?1 ORDER BY at LIMIT ?2)",
             "DELETE FROM auth_events WHERE issuer = ?1 AND subject = ?2",
             "SELECT at FROM auth_events WHERE at >= ?1 AND (actor_key = ?2 OR (actor_key > ?3 AND actor_key < ?4)) \
              ORDER BY seq DESC LIMIT ?5",

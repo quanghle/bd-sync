@@ -7380,7 +7380,6 @@ fn mcp_forwards_tool_calls_to_the_server() {
     let closed = call("close", json!({ "ids": ["t-1"], "reason": "done", "token": token }));
     assert_eq!(closed["unblocked"][0]["id"], "t-2", "{closed}");
     assert_eq!(call("ready", json!({}))["issues"][0]["id"], "t-2");
-    drop(call);
     drop(stdin);
     assert!(child.wait().unwrap().success(), "ends with its input");
 

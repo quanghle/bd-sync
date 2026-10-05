@@ -197,7 +197,7 @@ pub(super) fn refused(refusal: &token::Refusal) -> Response<Body> {
     r
 }
 
-/// A step of an authorization (`oauth_server/authorize.rs`).
+/// A step of an authorization (`oauth_server/authorize/`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Authorizing {
     /// `GET <issuer>/oauth/authorize`: on to the provider, or to a page choosing one.

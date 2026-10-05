@@ -29,7 +29,7 @@ pub(super) fn account_actor(file: &mut TokenFile, user: &Identity, now: Timestam
 
 /// The actor a sign-in of `user` would get now, binding nothing: what
 /// [`issue_sign_in_token`] would refuse for its actor's sake is refused
-/// before anyone is asked to approve a client (`oauth_server/authorize.rs`).
+/// before anyone is asked to approve a client (`oauth_server/authorize/`).
 /// Issuing the token checks again.
 pub fn preview_actor(root: &Path, user: &Identity, by_login: bool) -> Result<String> {
     let mut file = read_scoped(root, Some(&Scope { user: Some(user), ..Scope::default() }))?;

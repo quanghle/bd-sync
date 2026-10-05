@@ -1,5 +1,5 @@
 //! Sign-in: people get a `bd serve` access token by signing in with a
-//! provider (GitHub, or an OpenID Connect provider: `oidc.rs`), from the
+//! provider (GitHub, or an OpenID Connect provider: `oidc/`), from the
 //! command line (`bd remote login --provider <name>`, the device flow) or in
 //! a browser through an MCP client (`oauth_server/`), instead of an admin
 //! creating one. `<root>/auth.toml` turns it on and decides who may sign in
@@ -81,7 +81,7 @@ const MAX_CODE_LIFE: u64 = 3600;
 pub struct SignIn {
     /// `[github]`, if people sign in with GitHub.
     pub github: Option<Github>,
-    /// `[oidc.<name>]`: OpenID Connect providers (`oidc.rs`), by name.
+    /// `[oidc.<name>]`: OpenID Connect providers (`oidc/`), by name.
     pub oidc: Vec<crate::oidc::Oidc>,
     /// How long issued tokens work (`[sign_in]`).
     pub token_ttl: Duration,

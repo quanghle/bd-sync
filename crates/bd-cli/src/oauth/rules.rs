@@ -1,7 +1,7 @@
 //! `[[<provider>.allow]]` rules, one engine for every provider: whom they
 //! let in, by what the provider proves of an account (`Facts`), and what
 //! they grant (`decide`). A provider only proves: GitHub's adapter
-//! (`github.rs`) asks GitHub, an OIDC provider's ID token says (`oidc.rs`).
+//! (`github.rs`) asks GitHub, an OIDC provider's ID token says (`oidc/`).
 
 use super::*;
 

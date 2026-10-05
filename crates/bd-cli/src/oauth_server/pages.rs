@@ -1,4 +1,4 @@
-//! The pages people see during an authorization (`authorize.rs`): the
+//! The pages people see during an authorization (`authorize/`): the
 //! consent page, refusals, and the page sending the browser on. Every value
 //! shown is escaped, and each page comes with the Content-Security-Policy it
 //! needs: its inline style, and forms posting only where the consent goes.

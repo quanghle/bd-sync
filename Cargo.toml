@@ -4,7 +4,7 @@ members = ["crates/bd-core", "crates/bd-cli", "crates/bd-server", "crates/bd"]
 
 [workspace.package]
 edition = "2024"
-version = "0.2.0"
+version = "0.3.0"
 license = "MIT"
 rust-version = "1.88"
 

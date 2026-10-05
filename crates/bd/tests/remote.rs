@@ -6739,12 +6739,12 @@ fn github_sign_ins_stay_while_github_will_not_tell_memberships() {
     github.install("other");
     renewal_due(carol.path());
     let lock = std::fs::File::create(carol.path().join(".xdg/bd/credentials.lock")).unwrap();
-    fs4::FileExt::try_lock(&lock).unwrap();
+    lock.try_lock().unwrap();
     let started = Instant::now();
     check(signed_in(carol.path(), &url, &["list"]), "not held up");
     assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
     assert_eq!(saved(carol.path(), "token").unwrap(), before, "left to the other process");
-    fs4::FileExt::unlock(&lock).unwrap();
+    lock.unlock().unwrap();
 
     // Once the App is installed there, the same refresh goes through.
     renewal_due(carol.path());

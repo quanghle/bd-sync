@@ -68,7 +68,7 @@ pub struct Mutex(File);
 
 impl Drop for Mutex {
     fn drop(&mut self) {
-        let _ = fs4::FileExt::unlock(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -354,12 +354,11 @@ fn take(file: File, path: &Path, wait: Duration, exclusive: bool) -> Result<Mute
     let deadline = Instant::now() + wait;
     let mut delay = Duration::from_millis(5);
     loop {
-        // Called through the trait: std's own File::try_lock (Rust 1.89) is newer than bd's MSRV.
-        let tried = if exclusive { fs4::FileExt::try_lock(&file) } else { fs4::FileExt::try_lock_shared(&file) };
+        let tried = if exclusive { file.try_lock() } else { file.try_lock_shared() };
         match tried {
             Ok(()) => return Ok(Mutex(file)),
-            Err(fs4::TryLockError::WouldBlock) => {}
-            Err(fs4::TryLockError::Error(e)) => return Err(path_error(path, e)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(path_error(path, e)),
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {

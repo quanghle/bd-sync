@@ -6,7 +6,7 @@ members = ["crates/bd-core", "crates/bd-cli", "crates/bd-server", "crates/bd"]
 edition = "2024"
 version = "0.3.0"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.99"
 
 [profile.release]
 lto = "thin"

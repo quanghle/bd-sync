@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bd_core::Error;
+use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
 use crate::auth;
@@ -54,7 +55,7 @@ pub struct Sealer(ring::aead::LessSafeKey);
 impl Sealer {
     pub(super) fn new() -> Sealer {
         let mut key = [0u8; 32];
-        getrandom::getrandom(&mut key).expect("the system's random number generator");
+        SecureRandom::fill(&SystemRandom::new(), &mut key).expect("the system's random number generator");
         let key = ring::aead::UnboundKey::new(&ring::aead::CHACHA20_POLY1305, &key).expect("a 32-byte key");
         Sealer(ring::aead::LessSafeKey::new(key))
     }
@@ -62,7 +63,8 @@ impl Sealer {
     /// `value`, sealed for `step`: base64url of a random nonce and the ciphertext.
     pub(super) fn seal(&self, step: &str, value: &Pending) -> Result<String, Error> {
         let mut nonce = [0u8; 12];
-        getrandom::getrandom(&mut nonce).map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+        SecureRandom::fill(&SystemRandom::new(), &mut nonce)
+            .map_err(|_| Error::Io(std::io::Error::other("the system's random number generator failed")))?;
         let mut data = serde_json::to_vec(value)?;
         let aad = ring::aead::Aad::from(step.as_bytes());
         self.0

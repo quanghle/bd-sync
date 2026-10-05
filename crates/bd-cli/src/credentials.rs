@@ -416,7 +416,7 @@ pub struct Lock(std::fs::File);
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = fs4::FileExt::unlock(&self.0);
+        let _ = self.0.unlock();
     }
 }
 
@@ -437,11 +437,10 @@ pub fn lock(path: &Path, wait: Duration) -> Result<Lock> {
     let deadline = Instant::now() + wait;
     let mut delay = Duration::from_millis(5);
     loop {
-        // Called through the trait: std's own File::try_lock (Rust 1.89) is newer than bd's MSRV.
-        match fs4::FileExt::try_lock(&file) {
+        match file.try_lock() {
             Ok(()) => return Ok(Lock(file)),
-            Err(fs4::TryLockError::WouldBlock) => {}
-            Err(fs4::TryLockError::Error(e)) => return Err(io_error(&lock_path, e)),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(io_error(&lock_path, e)),
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {

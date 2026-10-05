@@ -4,95 +4,168 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Every failure the engine can report. Each variant maps to a stable
 /// machine-readable [`Error::code`] and a process [`Error::exit_code`].
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("{0}")]
     Invalid(String),
 
-    #[error("{kind} not found: {id}")]
-    NotFound { kind: &'static str, id: String },
+    NotFound {
+        kind: &'static str,
+        id: String,
+    },
 
-    #[error("{id} is already claimed by {holder}")]
-    AlreadyClaimed { id: String, holder: String },
+    AlreadyClaimed {
+        id: String,
+        holder: String,
+    },
 
-    #[error("{id} is not claimable (status {status})")]
-    NotClaimable { id: String, status: Status },
+    NotClaimable {
+        id: String,
+        status: Status,
+    },
 
-    #[error("{id} is not ready: {}", reasons.join("; "))]
-    NotReady { id: String, reasons: Vec<String> },
+    NotReady {
+        id: String,
+        reasons: Vec<String>,
+    },
 
-    #[error("{id} is held by {}, not {actor}", holder.as_deref().unwrap_or("nobody"))]
-    NotOwner { id: String, holder: Option<String>, actor: String },
+    NotOwner {
+        id: String,
+        holder: Option<String>,
+        actor: String,
+    },
 
     /// One operation would end several live claims of other actors (a run's
     /// steps, a delete, a reclaim inside `lease.grace`): `held` lists each
     /// issue with its holder.
-    #[error(
-        "{what} would end live claims of other actors: {}",
-        held.iter().map(|(id, holder)| format!("{id} (held by {holder})")).collect::<Vec<_>>().join(", ")
-    )]
-    ClaimsHeld { what: String, held: Vec<(String, String)> },
+    ClaimsHeld {
+        what: String,
+        held: Vec<(String, String)>,
+    },
 
     /// `holder` is whoever holds the claim now, if anyone does.
-    #[error("lease lost on {id}: {detail}")]
-    LeaseLost { id: String, detail: String, holder: Option<String> },
+    LeaseLost {
+        id: String,
+        detail: String,
+        holder: Option<String>,
+    },
 
     /// An optimistic-concurrency guard (`if_revision`, `if_status`,
     /// `if_assignee`) no longer holds. Nothing was written.
-    #[error("precondition failed on {id}: expected {field} {expected}, found {actual}")]
-    Conflict { id: String, field: &'static str, expected: String, actual: String },
+    Conflict {
+        id: String,
+        field: &'static str,
+        expected: String,
+        actual: String,
+    },
 
-    #[error("dependency cycle: {}", path.join(" -> "))]
-    Cycle { path: Vec<String> },
+    Cycle {
+        path: Vec<String>,
+    },
 
     /// A policy refusal (closing an issue with open children, deleting an
     /// issue other issues depend on, ...). Usually overridable with `force`.
-    #[error("{0}")]
     Refused(String),
 
-    #[error(
-        "event cursor {since} is behind retained history (oldest retained seq is {floor}); re-baseline from an export"
-    )]
-    EventsTruncated { since: i64, floor: i64 },
+    EventsTruncated {
+        since: i64,
+        floor: i64,
+    },
 
-    #[error("database is busy: {0}")]
     Busy(String),
 
     /// Another bd process holds a lock file (not the database) past the
     /// wait: the message names the file and says what to do.
-    #[error("{0}")]
     Locked(String),
 
-    #[error("database schema v{found} is newer than this binary supports (v{supported}); upgrade bd")]
-    SchemaTooNew { found: i64, supported: i64 },
+    SchemaTooNew {
+        found: i64,
+        supported: i64,
+    },
 
-    #[error("{0}")]
     NoWorkspace(String),
 
     /// A bd server rejected the access token, or the token's role,
     /// workspaces or actor do not allow the operation.
-    #[error("{0}")]
     Unauthorized(String),
 
     /// A bd server could not be reached, refused the request, or answered
     /// unexpectedly, and the command did not take effect: it is safe to run
     /// again.
-    #[error("{0}")]
     Remote(String),
 
     /// A write reached a bd server, but its answer was lost: it may have
     /// taken effect, so running it again could apply it twice.
-    #[error("{0}")]
     AnswerLost(String),
 
-    #[error("sqlite: {0}")]
     Sqlite(rusqlite::Error),
 
-    #[error("json: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(serde_json::Error),
 
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Invalid(msg)
+            | Error::Refused(msg)
+            | Error::Locked(msg)
+            | Error::NoWorkspace(msg)
+            | Error::Unauthorized(msg)
+            | Error::Remote(msg)
+            | Error::AnswerLost(msg) => f.write_str(msg),
+            Error::NotFound { kind, id } => write!(f, "{kind} not found: {id}"),
+            Error::AlreadyClaimed { id, holder } => write!(f, "{id} is already claimed by {holder}"),
+            Error::NotClaimable { id, status } => write!(f, "{id} is not claimable (status {status})"),
+            Error::NotReady { id, reasons } => write!(f, "{id} is not ready: {}", reasons.join("; ")),
+            Error::NotOwner { id, holder, actor } => {
+                write!(f, "{id} is held by {}, not {actor}", holder.as_deref().unwrap_or("nobody"))
+            }
+            Error::ClaimsHeld { what, held } => write!(
+                f,
+                "{what} would end live claims of other actors: {}",
+                held.iter().map(|(id, holder)| format!("{id} (held by {holder})")).collect::<Vec<_>>().join(", ")
+            ),
+            Error::LeaseLost { id, detail, .. } => write!(f, "lease lost on {id}: {detail}"),
+            Error::Conflict { id, field, expected, actual } => {
+                write!(f, "precondition failed on {id}: expected {field} {expected}, found {actual}")
+            }
+            Error::Cycle { path } => write!(f, "dependency cycle: {}", path.join(" -> ")),
+            Error::EventsTruncated { since, floor } => write!(
+                f,
+                "event cursor {since} is behind retained history (oldest retained seq is {floor}); re-baseline from an export"
+            ),
+            Error::Busy(msg) => write!(f, "database is busy: {msg}"),
+            Error::SchemaTooNew { found, supported } => {
+                write!(f, "database schema v{found} is newer than this binary supports (v{supported}); upgrade bd")
+            }
+            Error::Sqlite(e) => write!(f, "sqlite: {e}"),
+            Error::Json(e) => write!(f, "json: {e}"),
+            Error::Io(e) => write!(f, "io: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Json(e) => Some(e),
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(e: serde_json::Error) -> Self {
+        Error::Json(e)
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Error::Io(e)
+    }
 }
 
 impl From<rusqlite::Error> for Error {

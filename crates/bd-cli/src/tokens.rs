@@ -98,6 +98,7 @@ pub fn hex(bytes: &[u8]) -> String {
 /// Hex of `n` random bytes from the operating system.
 pub fn random_hex(n: usize) -> Result<String> {
     let mut buf = vec![0u8; n];
-    getrandom::getrandom(&mut buf).map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut buf)
+        .map_err(|_| Error::Io(std::io::Error::other("the system's random number generator failed")))?;
     Ok(hex(&buf))
 }

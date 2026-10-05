@@ -2919,7 +2919,7 @@ fn session_start_hook_reports_problems_in_one_line() {
     write_file(&agents, "claude/skills/deploy/SKILL.md", "deploy v2\n");
     write_file(&agents, "copilot/skills/triage/SKILL.md", "triage\n");
     let mutex = std::fs::File::options().write(true).open(root.join(".bd/agents.lock.mutex")).unwrap();
-    fs4::FileExt::lock(&mutex).unwrap();
+    mutex.lock().unwrap();
     let started = std::time::Instant::now();
     let copilot = copilot_context(&session_start(root, &["--harness", "copilot"], &[])).unwrap();
     let text = session_start(root, &["--harness", "claude"], &[CLAUDE]);
@@ -2930,7 +2930,7 @@ fn session_start_hook_reports_problems_in_one_line() {
     assert!(!text.contains("database"), "{text}");
     assert_eq!(copilot.lines().count(), 1, "{copilot}");
     assert_eq!(read(root, ".claude/skills/deploy/SKILL.md").as_deref(), Some("deploy v1\n"));
-    fs4::FileExt::unlock(&mutex).unwrap();
+    mutex.unlock().unwrap();
     assert!(session_start(root, &["--harness", "claude"], &[CLAUDE]).contains("deploy (changed: SKILL.md)"));
 
     // A set the workspace cannot serve, a lock bd cannot read: local errors, said the same way.

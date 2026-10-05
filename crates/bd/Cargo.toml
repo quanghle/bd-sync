@@ -18,9 +18,8 @@ serde_json = "1.0.151"
 tracing = "0.1.44"
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-fs4 = "1.1.0"
 ring = "0.17"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sha2 = "0.11"

@@ -62,8 +62,7 @@ The rules that keep the engine's guarantees are in
 ## Documentation
 
 User documentation lives in [docs/](docs/); the [README](README.md) links each
-page. Update the page a change affects in the same change. `AGENTS.md` and
-`CLAUDE.md` are identical: edit both.
+page. Update the page a change affects in the same change.
 
 ## Releases
 

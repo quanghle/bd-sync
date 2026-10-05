@@ -20,7 +20,7 @@
 //! ```
 //!
 //! A sign-in token with a refresh token is renewed before it expires (see
-//! `remote.rs`): the process that does it holds `credentials.lock`, next to
+//! `remote/renew.rs`): the process that does it holds `credentials.lock`, next to
 //! the file, so that two never spend one refresh token, which would revoke
 //! the sign-in; saving and removing tokens hold it too.
 //!
@@ -33,7 +33,7 @@
 //! `ca` is what the server's certificate was trusted against at login: the
 //! system's certificate authorities, or the SHA-256 of a CA file's
 //! certificates. A token is only sent under the same trust (see
-//! `remote::token_for`), so a checkout whose `.bd/remote.toml` names another
+//! `remote/config.rs`), so a checkout whose `.bd/remote.toml` names another
 //! CA for the same URL cannot redirect a saved token.
 //!
 //! On Unix the file is replaced

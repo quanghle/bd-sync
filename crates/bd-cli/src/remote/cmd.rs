@@ -200,7 +200,7 @@ fn show(app: &mut App) -> Result<i32> {
             ));
             lines.push(format!("actor       {}", s("actor")));
             if info["token"].is_object() {
-                lines.push(format!("access      {}", crate::auth::access_line(&info["token"])));
+                lines.push(format!("access      {}", crate::tokens::access_line(&info["token"])));
             }
             lines.push("✓ connected".into());
             view["connected"] = json!(true);
@@ -319,7 +319,7 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
     let (token, signed_in) = if let Some(provider) = a.provider.clone() {
         let workspace = c.url.rsplit_once("/w/").map_or("", |(_, w)| w);
         let remote = Remote::new(c.clone(), trust.clone(), String::new());
-        let issued = crate::oauth::sign_in(&remote, workspace, &keys.server, &provider)?;
+        let issued = super::sign_in::sign_in(&remote, workspace, &keys.server, &provider)?;
         credentials::check_token(&issued.token)
             .map_err(|_| Error::Remote(format!("{}: unexpected sign-in answer: not an access token", keys.server)))?;
         (issued.token.clone(), Some(issued))

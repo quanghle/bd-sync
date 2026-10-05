@@ -138,15 +138,12 @@ name = "bd"
 version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
+ "bd-cli",
  "bd-core",
+ "bd-server",
  "chrono",
  "clap",
  "fs4",
- "getrandom 0.2.17",
- "http-body-util",
- "hyper",
- "hyper-util",
- "libc",
  "rcgen",
  "ring",
  "rusqlite",
@@ -155,10 +152,29 @@ dependencies = [
  "serde_json",
  "sha2",
  "shlex",
+ "tempfile",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+ "ureq",
+]
+
+[[package]]
+name = "bd-cli"
+version = "0.2.0"
+dependencies = [
+ "bd-core",
+ "chrono",
+ "clap",
+ "fs4",
+ "getrandom 0.2.17",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shlex",
  "similar",
  "tempfile",
  "tokio",
- "tokio-rustls",
  "toml",
  "toml_edit",
  "tracing",
@@ -181,6 +197,33 @@ dependencies = [
  "thiserror",
  "toml",
  "tracing",
+]
+
+[[package]]
+name = "bd-server"
+version = "0.2.0"
+dependencies = [
+ "base64 0.22.1",
+ "bd-cli",
+ "bd-core",
+ "clap",
+ "getrandom 0.2.17",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "libc",
+ "rcgen",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+ "ureq",
 ]
 
 [[package]]

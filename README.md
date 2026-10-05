@@ -16,8 +16,8 @@ coordination engine:
 - **Agent assets**: skills and MCP definitions served per harness (Claude
   Code, Codex, Copilot CLI)
 
-It ships as a library (`crates/bd-core`) and a CLI (`crates/bd-cli`, binary
-`bd`). See [Features](docs/features.md) for the full list.
+It ships as an engine library (`crates/bd-core`), the commands (`crates/bd-cli`)
+and the server (`crates/bd-server`) as libraries, and the binary `bd` (`crates/bd`). See [Features](docs/features.md) for the full list.
 
 ## Install
 
@@ -26,7 +26,7 @@ Download a prebuilt binary from the
 attestations: [Install](docs/install.md)), or build from source:
 
 ```bash
-cargo install --path crates/bd-cli      # installs ~/.cargo/bin/bd
+cargo install --path crates/bd          # installs ~/.cargo/bin/bd
 ```
 
 Coming from Go beads? [Migrate](docs/beads.md#migrating-from-go-beads) first.

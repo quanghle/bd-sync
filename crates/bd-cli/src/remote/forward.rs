@@ -10,11 +10,11 @@ use super::delivery::{Delivery, OutputFile};
 use super::events::{follow_events, wait_for_events};
 use super::{Remote, identity, response_error, without_session_flag};
 use crate::app::App;
-use crate::auth::random_hex;
 use crate::cli::*;
 use crate::io;
 use crate::playbooks;
 use crate::protocol::{ExecRequest, ExecResponse};
+use crate::tokens::random_hex;
 
 /// `bd prime` in text mode, or with `--hook`: session hooks run it, so it
 /// gives up within the hook's budget (even against a server that accepts
@@ -109,7 +109,7 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
     playbooks::attach_listing(app, &cli.command, &mut request);
     check_outputs(app, &cli.command)?;
     // A session hook prints `bd prime` only once it knows the command worked.
-    let write = crate::serve::access(&cli.command) == crate::serve::Access::Write;
+    let write = crate::cli::access(&cli.command) == crate::cli::Access::Write;
     remote.exec_into(&request, &mut Delivery::new(output_files(app, &cli.command), hook, write))
 }
 

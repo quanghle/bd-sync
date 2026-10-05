@@ -73,9 +73,9 @@ pub struct Capture {
     pub token_actor: String,
     /// The most issues the token's actor and sub-actors may hold.
     pub max_claims: Option<u32>,
-    /// The request's access token itself, which `bd info` describes to its
-    /// client; the fields above are what it may override.
-    pub token: Option<crate::auth::Token>,
+    /// What `bd info` tells its client of the request's access token (the
+    /// server's summary of it); the fields above are what it may override.
+    pub token: Option<serde_json::Value>,
 }
 
 impl Capture {
@@ -188,8 +188,8 @@ pub fn policy() -> Option<bd_core::Policy> {
     })
 }
 
-/// The access token of the request being served, if any.
-pub fn request_token() -> Option<crate::auth::Token> {
+/// The summary of the access token of the request being served, if any.
+pub fn request_token() -> Option<serde_json::Value> {
     with_capture(|c| c.token.clone()).flatten()
 }
 

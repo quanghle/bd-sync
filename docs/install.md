@@ -48,7 +48,7 @@ download is blocked by Gatekeeper, run `xattr -d com.apple.quarantine bd`
 ## From source
 
 ```bash
-cargo install --path crates/bd-cli      # installs ~/.cargo/bin/bd
+cargo install --path crates/bd          # installs ~/.cargo/bin/bd
 ```
 
 Either way the binary is named `bd`, so put its directory ahead of any Go

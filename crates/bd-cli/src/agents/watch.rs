@@ -5,7 +5,7 @@
 //! (`bd serve --agents-every`) appends an `agents_changed` event for each
 //! harness whose set changed, and the watch waits for those with long polls
 //! (`events --since N --wait D --op agents_changed`), which the server holds
-//! without a command slot ([`crate::follow`]). It reads the events head
+//! without a command slot (`bd serve`'s `follow` module). It reads the events head
 //! first, then pulls, then waits for events after that head, so a change
 //! made during the first pull is not missed. A pull follows each answer
 //! with an event naming a watched harness and a revision other than the one

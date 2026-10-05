@@ -1,7 +1,8 @@
 # Contributing
 
-bd is a Rust workspace: the engine library `crates/bd-core` and the CLI
-`crates/bd-cli` (binary `bd`). [AGENTS.md](AGENTS.md) is the full guide for
+bd is a Rust workspace: the engine library `crates/bd-core`, the commands
+(`crates/bd-cli`, a library), `bd serve` (`crates/bd-server`, a library over
+`bd-cli`) and the binary `bd` (`crates/bd`). [AGENTS.md](AGENTS.md) is the full guide for
 agents and people alike: architecture, conventions and the task workflow.
 
 ## Tracking work
@@ -81,18 +82,22 @@ crates/bd-core/src/   store (WAL, transactions, busy handling) · schema · issu
                       manifests, MCP definitions, agents_changed events)
 crates/bd-core/tests/ engine integration tests (graph semantics, leases with a manual clock, concurrency,
                       playbook runs and gates, write policies)
-crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) · batch · bench · fmt · logging
+crates/bd-cli/src/    lib (run, execute, dispatch) · cli/ (clap; access: what bd serve runs for clients)
+                      · commands/ · playbooks · gates (gh probes) · batch · fmt · logging
                       · backup (bd backup and bd serve's backups: snapshots, naming, retention)
-                      io (stdio and files, or a captured request) · serve/ (bd serve: listen, routes, exec,
-                      sign-in endpoints, MCP endpoint, check) · jobs (its background jobs: reclaim, gate checks,
-                      agent sets, backups) · follow (long polls) · server_db (server.db) · auth/ (access tokens,
-                      accounts and their actors) · oauth/ (sign-in: one rule engine for every provider, GitHub,
-                      admission, refresh) · oidc · authorizer · oauth_server/ (the authorization server for MCP
-                      clients: authorize, token, clients, metadata documents, pages) · mcp/ (MCP tools over
-                      stdio and HTTP) · remote (client) · credentials (bd remote login)
-                      · protocol (wire format) · stream (streamed answers) · agents (bd agents) + agents/
-                      (checkout, lock, mcp_file, sync, approve, show, hook, watch) · hook (session hook
-                      output per harness)
-crates/bd-cli/tests/  end-to-end CLI tests; remote.rs runs real bd serve and client processes
+                      · io (stdio and files, or a captured request) · mcp/ (MCP tools over stdio)
+                      · remote/ (client) · credentials (bd remote login) · tokens (roles, token summaries)
+                      · protocol (wire format) · stream (reading streamed answers) · agents (bd agents)
+                      + agents/ (checkout, lock, mcp_file, sync, approve, show, hook, watch) · hook (session
+                      hook output per harness)
+crates/bd-server/src/ serve/ (bd serve: listen, routes, exec, sign-in endpoints, MCP endpoint, check)
+                      · stream (streamed answers) · mcp_http (MCP over HTTP) · jobs (background jobs:
+                      reclaim, gate checks, agent sets, backups) · follow (long polls) · server_db (server.db)
+                      · auth/ (access tokens, accounts and their actors) · oauth/ (sign-in: one rule engine
+                      for every provider, GitHub, admission, refresh) · oidc/ · authorizer · oauth_server/
+                      (the authorization server for MCP clients: authorize/, token, clients, metadata
+                      documents, pages)
+crates/bd/src/        main (the binary; hands bd serve and bd bench to bd-cli) · bench
+crates/bd/tests/      end-to-end CLI tests; remote.rs runs real bd serve and client processes
 ```
 

@@ -128,7 +128,7 @@ pub fn cmd_info(app: &mut App) -> Result<()> {
     });
     // Under bd serve: what the client's access token may do, so that a refusal can be told apart.
     let token = io::request_token();
-    info["token"] = token.as_ref().map_or(Value::Null, crate::auth::Token::summary);
+    info["token"] = token.clone().unwrap_or(Value::Null);
     let mut out = Out::new(&info)
         .line(format!("workspace   {workspace}"))
         .line(format!("prefix      {prefix} ({mode} ids)"))
@@ -138,7 +138,7 @@ pub fn cmd_info(app: &mut App) -> Result<()> {
         ))
         .line(format!("actor       {actor} (from {})", me.from));
     if token.is_some() {
-        out = out.line(format!("access      {}", crate::auth::access_line(&info["token"])));
+        out = out.line(format!("access      {}", crate::tokens::access_line(&info["token"])));
     }
     let out = out
         .line(format!("issues      {} ({} ready)   events head {head}", stats.total, stats.ready))

@@ -18,8 +18,8 @@ use bd_core::{Error, Result};
 use sha2::{Digest, Sha256};
 
 use super::lock::{LOCK_FILE, LockFile, skill_path};
-use crate::auth::random_hex;
 use crate::io;
+use crate::tokens::random_hex;
 
 /// The file whose OS lock serializes changes to `agents.lock` and to what it records.
 pub const MUTEX_FILE: &str = "agents.lock.mutex";

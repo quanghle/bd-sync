@@ -51,9 +51,9 @@ use std::time::{Duration, Instant};
 use bd_core::{Error, Result, Timestamp};
 use serde::{Deserialize, Serialize};
 
-use crate::auth::random_hex;
 use crate::paths::user_config_dir;
 use crate::protocol::valid_workspace_name;
+use crate::tokens::random_hex;
 
 const HEADER: &str = "# Access tokens saved by `bd remote login`. Keep this file private; never commit it.\n\n";
 

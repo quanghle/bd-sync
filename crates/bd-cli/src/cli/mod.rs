@@ -6,6 +6,7 @@ use std::time::Duration;
 use bd_core::agents::Harness;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
+mod access;
 mod agents;
 mod bench;
 mod claims;
@@ -17,6 +18,7 @@ mod remote;
 mod serve;
 mod workspace;
 
+pub use access::*;
 pub use agents::*;
 pub use bench::*;
 pub use claims::*;

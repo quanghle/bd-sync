@@ -10,11 +10,11 @@ use super::local::Local;
 use super::{Ran, Runner, Server};
 use crate::actor;
 use crate::app::App;
-use crate::auth::random_hex;
 use crate::cli::{Global, McpArgs};
 use crate::io;
 use crate::protocol::ExecRequest;
 use crate::remote;
+use crate::tokens::random_hex;
 
 /// Longest message a client may send.
 const MAX_LINE: usize = 1 << 20;

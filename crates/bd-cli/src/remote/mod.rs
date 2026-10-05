@@ -29,6 +29,7 @@ mod delivery;
 mod events;
 mod forward;
 mod renew;
+mod sign_in;
 
 pub use client::response_error;
 pub use cmd::cmd_remote;

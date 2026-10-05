@@ -4,7 +4,6 @@
 //! [`http`]) hand each message to [`Server::handle`]; tool calls run bd
 //! commands through a [`Runner`].
 
-pub mod http;
 pub mod local;
 mod stdio;
 pub mod tools;
@@ -20,18 +19,18 @@ pub const MODERN: &str = "2026-07-28";
 /// The session-based revision, for clients that start with `initialize`.
 pub const LEGACY: &str = "2025-11-25";
 
-const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
-const CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+pub const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+pub const CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
 const SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 /// How long clients may cache the tool list and discovery: the catalog only
 /// changes with bd's version.
 const TTL_MS: u64 = 3_600_000;
 
-const PARSE_ERROR: i64 = -32700;
-const INVALID_REQUEST: i64 = -32600;
-const METHOD_NOT_FOUND: i64 = -32601;
+pub const PARSE_ERROR: i64 = -32700;
+pub const INVALID_REQUEST: i64 = -32600;
+pub const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
-const UNSUPPORTED_VERSION: i64 = -32022;
+pub const UNSUPPORTED_VERSION: i64 = -32022;
 
 pub const INSTRUCTIONS: &str = "bd tracks this workspace's work. Loop: `ready`, then `claim` an issue and keep the \
                                 `token` it returns, work, `heartbeat` with that token during long work, and `close` \
@@ -213,10 +212,10 @@ impl<R: Runner> Server<R> {
 }
 
 /// A JSON-RPC error: code, message, data.
-type Failure = (i64, String, Option<Value>);
+pub type Failure = (i64, String, Option<Value>);
 
 /// A request names its protocol version in `_meta`: it is stateless.
-fn names_version(params: &Map<String, Value>) -> bool {
+pub fn names_version(params: &Map<String, Value>) -> bool {
     params.get("_meta").and_then(Value::as_object).is_some_and(|m| m.contains_key(VERSION_KEY))
 }
 
@@ -260,7 +259,7 @@ fn with_modern_fields(mut result: Value) -> Value {
     result
 }
 
-fn error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
+pub fn error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value {
     let mut e = json!({ "code": code, "message": message });
     if let Some(data) = data {
         e["data"] = data;

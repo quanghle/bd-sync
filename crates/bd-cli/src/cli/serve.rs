@@ -168,10 +168,10 @@ pub struct TokenCreateArgs {
     #[arg(long = "as", value_name = "ACTOR")]
     pub act_as: String,
     #[arg(long, value_enum, default_value = "write")]
-    pub role: crate::auth::Role,
+    pub role: crate::tokens::Role,
     /// Who holds it: a person's token (human) may also resolve human gates
     #[arg(long, value_enum, default_value = "agent")]
-    pub kind: crate::auth::Kind,
+    pub kind: crate::tokens::Kind,
     /// Workspaces the token may use (repeatable or comma separated; default all)
     #[arg(long = "workspace", value_delimiter = ',', value_name = "NAME")]
     pub workspaces: Vec<String>,

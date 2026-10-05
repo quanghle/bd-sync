@@ -1,33 +1,25 @@
 [package]
-name = "bd"
-# binary name: bd
+name = "bd-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "bd: command-line interface for the bd-core coordination engine"
+description = "bd's commands: the command-line grammar, each command's implementation, and the client of remote workspaces"
 
 [dependencies]
-base64 = "0.22"
 # Path only: the workspace crates are versioned together, so no version requirement to keep in sync.
 bd-core = { path = "../bd-core" }
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 fs4 = "1.1.0"
 getrandom = "0.2"
-http-body-util = "0.1"
-hyper = { version = "1", default-features = false, features = ["server", "http1"] }
-hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
-ring = "0.17"
-# <root>/server.db (server_db.rs); the version bd-core uses.
-rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11"
 shlex = "2.0.1"
 similar = "3.2.0"
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# `bd agents watch`: Ctrl-C and the server's long polls on one thread.
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros", "signal"] }
 toml = "1.1.6"
 toml_edit = "0.25.15"
 tracing = "0.1.44"
@@ -35,12 +27,4 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json", "fm
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
-rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tempfile = "3.27.0"
-
-[target.'cfg(unix)'.dependencies]
-# kill(2) of an authorizer command's process group (authorizer.rs).
-libc = "0.2"
-
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-rustix = { version = "1.1.5", features = ["pty"] }

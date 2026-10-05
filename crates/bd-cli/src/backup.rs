@@ -1,5 +1,5 @@
 //! Backups of a workspace's database, taken by `bd serve`'s backup job
-//! ([`crate::jobs`]) for every workspace it serves and by `bd backup` for a
+//! for every workspace it serves and by `bd backup` for a
 //! local one. A backup is a [`Store::snapshot`] (`VACUUM INTO`, checked and
 //! flushed) written under a temporary name and then renamed to
 //! `<backup dir>/<name>/<name>-<UTC time>.db`; the newest `keep` are kept. The

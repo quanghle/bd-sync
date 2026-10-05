@@ -10,10 +10,10 @@ use serde_json::{Value, json};
 
 use super::{Configured, Remote, Source, Trust, configured, env};
 use crate::app::App;
-use crate::auth::random_hex;
 use crate::credentials::{self, Renewal};
 use crate::io;
 use crate::protocol::{RefreshRequest, RevokeAnswer};
+use crate::tokens::random_hex;
 
 impl Remote {
     /// Revoke this remote's token on its server, if it came from GitHub

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bd-core", "crates/bd-cli"]
+members = ["crates/bd-core", "crates/bd-cli", "crates/bd-server", "crates/bd"]
 
 [workspace.package]
 edition = "2024"

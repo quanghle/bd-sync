@@ -80,7 +80,7 @@ jobs:
           }
           bd_version=$(cargo metadata --format-version 1 --no-deps --locked | jq -r '.packages[] | select(.name == "bd") | .version')
           if [[ $bd_version != "$version" ]]; then
-            echo "::error file=crates/bd-cli/Cargo.toml::Package bd has version '$bd_version' but [workspace.package] version is $version. Use version.workspace = true."
+            echo "::error file=crates/bd/Cargo.toml::Package bd has version '$bd_version' but [workspace.package] version is $version. Use version.workspace = true."
             exit 1
           fi
           if ! cargo metadata --format-version 1 --locked >/dev/null; then

@@ -5553,6 +5553,7 @@ fn oidc_answer(mut conn: std::net::TcpStream, state: &std::sync::Mutex<OidcState
 }
 
 /// The login bd gives an OIDC account with no user name (`oidc::pseudonym`).
+#[cfg(unix)]
 fn pseudonym(issuer: &str, subject: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(format!("{issuer}\n{subject}").as_bytes());
@@ -7907,6 +7908,7 @@ fn a_refused_request_leaves_its_connection_usable() {
 
 #[test]
 fn a_busy_or_unwritable_server_db_is_answered_as_such() {
+    #[cfg_attr(not(unix), expect(unused_variables))]
     let (server, log) = {
         let root = oauth_root("loopback_redirects = true\n");
         let log = root.path().join("server.log");

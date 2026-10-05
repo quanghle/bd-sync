@@ -57,7 +57,7 @@ The rules that keep the engine's guarantees are in
   assignee. Ending or taking over another actor's claim needs `take_over`,
   never `force`.
 - Commands print and read only through `io.rs`, so `bd serve` can run them
-  in-process; every new command needs a class in `serve::access`.
+  in-process; every new command needs a class in `cli::access`.
 
 ## Documentation
 

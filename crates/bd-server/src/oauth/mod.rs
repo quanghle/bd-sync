@@ -3,7 +3,7 @@
 //! command line (`bd remote login --provider <name>`, the device flow) or in
 //! a browser through an MCP client (`oauth_server/`), instead of an admin
 //! creating one. `<root>/auth.toml` turns it on and decides who may sign in
-//! and what their token may do; docs/remote.md describes it.
+//! and what their token may do; docs/sign-in.md describes it.
 //!
 //! - `config`: `auth.toml` as written and checked (`parse`), loaded here
 //!   with its secret files and cached until one of them changes (`load`).

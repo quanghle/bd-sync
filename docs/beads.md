@@ -1,62 +1,85 @@
 # Differences from beads
 
-bd re-implements [beads](https://github.com/gastownhall/beads) (the `bd` issue
-tracker for AI coding agents) in Rust, as a coordination engine on SQLite WAL.
+bd re-implements [beads](https://github.com/gastownhall/beads), the `bd`
+issue tracker for AI coding agents, as a coordination engine on SQLite WAL.
 It keeps beads' data model and command vocabulary, and changes how state is
-stored, shared and guarded.
+stored, shared and guarded. This page is the only one that compares the
+two; the rest of the documentation describes bd on its own.
 
-## How beads works (and what this keeps)
+## Data model and engine
 
 Beads stores issues in an embedded Dolt (versioned SQL) database under
-`.beads/`, syncs it across machines with `bd dolt push/pull`, and gives agents
-a dependency-aware work queue:
+`.beads/` and syncs copies of it with `bd dolt push/pull`.
 
-| beads concept | beads implementation | here |
+| concept | beads | bd |
 |---|---|---|
-| Issues | `issues` table; hash ids `prefix-<base36>` with adaptive length; child ids `parent.N` | same id scheme (plus `counter` mode) |
-| Dependencies | `dependencies(issue_id, depends_on_id, type)`; one edge per pair; cycle check via recursive CTE | same, plus BFS cycle *path* in errors |
-| Ready work | materialized `issues.is_blocked`, recomputed per affected set to a fixpoint; ready = `open` ∧ ¬blocked ∧ not deferred | same model; deferral also hides grandchildren (beads checks one level) |
-| `conditional-blocks` | documented as "runs only if the blocker fails"; implemented exactly like `blocks` | implemented as documented, using an explicit close outcome (`bd close --failed`) |
-| Claims | `UPDATE … WHERE row_lock = ?` compare-and-swap; Dolt merges + retries | `BEGIN IMMEDIATE`: the read-check-write runs under SQLite's single writer lock, so no retries |
-| Leases | node-local `leases` table, 5 min TTL, `bd heartbeat`, `bd reclaim` with 2×TTL grace | same, plus a fencing token, and `claim --next` auto-reclaims |
-| Concurrency guards | random `row_lock`; `--if-assignee/--if-status` (exit 13) | monotonic `revision` plus the same guards |
-| Events | audit `events` table plus an opt-in `bd_events_journal` with gapless seq from a counter row | one always-on log; `AUTOINCREMENT` seq written in the mutation's transaction |
-| Memory | `config` rows `kv.memory.<key>`, key derived from content, injected by `bd prime` | dedicated table with authorship, revisions, and CAS |
-| Workflows | formulas cooked into protos, poured into molecules (hash-id issues); gates; wisps in a separate table | playbooks run straight into `<run>.<step>` issues in one transaction; gates arm when their step could start; ephemeral runs ([Playbooks](playbooks.md)) |
+| Issues | hash ids `prefix-<base36>` of adaptive length; child ids `parent.N` | same scheme, plus `id.mode = counter` |
+| Dependencies | one typed edge per pair; cycle check by recursive CTE | same, and a cycle error shows the cycle's path |
+| Ready work | materialized `is_blocked`, recomputed per affected set; ready = `open`, not blocked, not deferred | same model; deferral also hides grandchildren (beads checks one level) |
+| `conditional-blocks` | documented as "runs only if the blocker fails", implemented like `blocks` | implemented as documented, through an explicit close outcome (`bd close --failed`) |
+| Claims | `UPDATE … WHERE row_lock = ?` compare-and-swap, with Dolt merges and retries | `BEGIN IMMEDIATE`: read, check and write under SQLite's single writer lock, no retries |
+| Leases | node-local `leases` table, 5 min TTL, `heartbeat`, `reclaim` with 2×TTL grace | same, plus a fencing token; `claim --next` reclaims dead claims first |
+| Concurrency guards | random `row_lock`; `--if-assignee`/`--if-status` (exit 13) | a monotonic `revision` and the same guards |
+| Events | audit table, plus an opt-in journal with gapless seq from a counter row | one always-on log; `AUTOINCREMENT` seq written in the change's own transaction |
+| Memory | `config` rows `kv.memory.<key>` | a table of its own, with authorship, revisions and compare-and-set |
+| Sharing | copies of the database synced with `bd dolt push/pull`: two disconnected machines can claim the same issue | one database, shared through `bd serve`, where claims stay atomic ([Remote server](remote.md)) |
+| History | Dolt commits | the event log ([Event history](concepts.md#event-history)) |
 
-Beyond the table:
+Not carried over: beads' `owner` field and its Dolt commit history.
 
-- **Sharing**: beads syncs copies of its Dolt database with `bd dolt push/pull`,
-  so two disconnected machines can claim the same issue. bd keeps one
-  database and shares it through `bd serve`, where claims stay atomic
-  ([Modes of operation](modes.md), [Remote server](remote.md)).
-- **Workflows**: beads' formulas, protos, molecules and wisps become
-  playbooks and runs; the [Playbooks](playbooks.md) page maps each beads
-  command to its equivalent.
-- **Not carried over**: beads' `owner` field and Dolt commit history. The
-  event log ([Event history](concepts.md#event-history)) records every change
-  instead.
+## Workflows: formulas become playbooks
+
+| beads | bd |
+|---|---|
+| formula (`.beads/formulas/*.formula.toml`) | playbook (`.bd/playbooks/*.toml`; `*.formula.toml` files load too) |
+| `bd cook`, then `bd mol pour` | `bd playbook run`, in one step (`bd playbook plan` previews) |
+| proto (a template epic stored in the database) | none: the file is the template |
+| molecule | run: an epic with one issue per step, ids `<run>.<step>` |
+| wisp (`bd mol wisp`) | ephemeral run (`--ephemeral`, or `ephemeral = true`) |
+| `bd mol bond` | `bd playbook run --parent <issue>` or `--after <issue>` |
+| `bd mol squash` / `burn` / `distill` | `bd playbook compact` / `discard` / `extract` |
+| `bd mol current` / `progress` | `bd playbook status`, `bd playbook runs` |
+| gate | gate; arms when its step could start, rather than at creation |
+
+Formula files load as playbooks as they are. The loader accepts beads'
+spellings:
+
+- top level: `formula` (for the name), `type = "workflow"` (any other type
+  is refused), `phase = "vapor"` (ephemeral) and `"liquid"`/`"solid"`
+  (persistent);
+- steps: `depends_on` (for `needs`), `acceptance`, `estimated_minutes`,
+  `with` (for `expand_vars`);
+- gates: `id` (for `await_id`), `duration` (for `timeout`), type `bead`
+  (for `issue`).
+
+A step with `type = "human"` is refused, with a pointer to
+[human gates](playbooks.md#gates).
 
 ## Migrating from Go beads
 
-Run the export with the Go binary, before uninstalling it:
+Export with the Go binary before uninstalling it:
 
 ```bash
 beads export --all -o beads.jsonl       # the Go CLI (still named bd if not renamed)
-bd init --prefix <same-prefix>          # same prefix keeps new ids consistent; existing ids are kept as-is
+bd init --prefix <same-prefix>          # the same prefix keeps new ids consistent
 bd import beads.jsonl --dry-run         # preview, then run without --dry-run
 bd doctor
 git config --unset core.hooksPath       # beads routes git hooks to .beads/hooks
 rm -rf .beads                           # once the import checks out
 ```
 
-The import keeps ids, statuses, priorities, timestamps, close reasons,
-labels, dependencies, comments, and memories. Gates keep their condition
-(`metadata.gate`), wisps stay ephemeral, and protos (template issues) are
-skipped: copy the formula files to `.bd/playbooks/` instead, where they load
-as playbooks. Beads' `owner` field and its
-Dolt commit history have no equivalent here; `hooked` issues become
-`in_progress` with a fresh lease, and `tombstone` rows are skipped.
-Agent hooks generated by beads (`bd prime --hook-json`, `bd codex-hook`,
-`bd cursor-hook`) must be switched to plain `bd prime` (`bd prime --hook
-copilot` in Copilot CLI hooks, which read only a JSON object).
+The import is all or nothing. It keeps ids, statuses, priorities,
+timestamps, close reasons, labels, dependencies, comments and memories.
+Gates keep their condition (`metadata.gate`), wisps stay ephemeral, and
+protos are skipped: copy the formula files to `.bd/playbooks/` instead.
+`hooked` issues become `in_progress` with a fresh lease, and `tombstone`
+rows are skipped.
+
+After migrating:
+
+- Replace agent hooks generated by beads (`bd prime --hook-json`,
+  `bd codex-hook`, `bd cursor-hook`) with plain `bd prime`, or with
+  `bd prime --hook <harness>` ([Session-start hooks](agents.md#session-start-hooks)).
+- `$BEADS_ACTOR` still works: it is read after `$BD_ACTOR`
+  ([Actors](concepts.md#actors)).
+- Both binaries are named `bd`: put this one first on `PATH`.

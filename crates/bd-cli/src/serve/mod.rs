@@ -368,7 +368,7 @@ fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Tok
             Err(Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7))
         }
         Ok(Verified::Unknown) => Err(denied()),
-        Err(Error::Busy(_)) => Err(Reject::busy("checking access tokens")),
+        Err(Error::Busy(_) | Error::Locked(_)) => Err(Reject::busy("checking access tokens")),
         Err(e) => Err(Reject::internal(e)),
     }
 }
@@ -434,8 +434,12 @@ const DRAIN_MAX: usize = 16 << 10;
 /// dropped, when small: hyper closes a connection whose request body was
 /// left unread, and a client's next request would need a new one (often
 /// right after a refusal: the first, unauthenticated, MCP request).
+/// Only a body that says it is that small: a larger one closes the
+/// connection anyway, and reading it would ask a client that waits for
+/// `100 Continue` to send it.
 async fn drained(body: Option<Incoming>, response: Response<Body>) -> Response<Body> {
-    if let Some(body) = body {
+    let small = |b: &Incoming| hyper::body::Body::size_hint(b).exact().is_some_and(|n| n <= DRAIN_MAX as u64);
+    if let Some(body) = body.filter(small) {
         let _ = read_body(body, DRAIN_MAX, Duration::from_secs(1)).await;
     }
     response

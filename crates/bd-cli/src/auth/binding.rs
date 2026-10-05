@@ -185,9 +185,11 @@ pub fn end_sign_ins_before(root: &Path, issuer: &str, subject: &str, at: Timesta
 
 /// Forget the account with this issuer and subject, as its provider says it
 /// was deleted: the account and every token of it, erased as `revoke
-/// --account --forget` does. Whether there was one.
+/// --account --forget` does. Whether there was one. Over every row, as
+/// `revoke --account --forget` is: an account's tokens may act as an actor it
+/// no longer has (linked since), which a load by its actor would not find.
 pub fn forget_account(root: &Path, issuer: &str, subject: &str) -> Result<bool> {
-    let found = change_scoped(root, &Scope { account: Some((issuer, subject)), ..Scope::default() }, |_, file| {
+    let found = change(root, |file| {
         let theirs = |g: &Identity| g.issuer == issuer && g.subject == subject;
         let before = (file.accounts.len(), file.tokens.len());
         let provider =

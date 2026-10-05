@@ -35,15 +35,15 @@ pub struct Lifetime {
     /// Until when its refreshes may renew it, if it is refreshed: they
     /// decide again, by the workspace it signed in for.
     pub refresh: Option<(Timestamp, Duration)>,
-    /// The fingerprint of the `[[oidc.<name>.allow]]` rule that let it in,
-    /// kept for its refreshes (`oidc::decide`).
+    /// The fingerprint of the `[[<provider>.allow]]` rule that let it in,
+    /// kept for its refreshes (`oauth::decide`).
     pub rule: Option<String>,
 }
 
 /// Add an access token for an account that signed in for
 /// `workspace`. It acts as the account's actor: the one bound to it at an
 /// earlier sign-in, else its login, bound to it now. It is named
-/// `github-<actor>-<random>` (the actor cut to 40 characters), and expires
+/// `<provider>:<login>-<random>` from its actor (cut to 55 characters), and expires
 /// after `life.ttl`; with `life.refresh`, `(limit, idle)`, it may be
 /// refreshed until the earlier of `limit` and `idle` after each refresh.
 pub fn issue_sign_in_token(

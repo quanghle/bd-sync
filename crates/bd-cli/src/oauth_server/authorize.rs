@@ -1,22 +1,28 @@
 //! The authorization endpoint (OAuth 2.1 authorization code with PKCE),
 //! where people let an MCP client use a workspace for them, signing in with
-//! GitHub's web flow:
+//! a provider (GitHub's web flow, or an OIDC provider):
 //!
 //! 1. `GET <issuer>/oauth/authorize` ([`begin`]): the client and its
 //!    redirect URI are checked first, and refused on a page, never by a
 //!    redirect (RFC 6749 section 4.1.2.1); then the other parameters, whose
-//!    errors go back to the client with `iss` (RFC 9207). The browser goes
-//!    on to GitHub with a PKCE challenge of this server's own.
-//! 2. `GET <issuer>/oauth/github/callback` ([`callback`]): GitHub's code is
-//!    exchanged for the account, and the rules of `auth.toml` decide what it
-//!    may do in the workspace the client asked for (`oauth/`). A consent
-//!    page shows what the client would get.
+//!    errors go back to the client with `iss` (RFC 9207). With several
+//!    providers, a page chooses one (`/oauth/choose`); the browser goes on
+//!    to it with a PKCE challenge (and, for OIDC, a nonce) of this server's own.
+//! 2. `GET <issuer>/oauth/<provider>/callback` ([`callback`]): the
+//!    provider's code is exchanged for the account (a provider that posts
+//!    its answer, `form_post`, is relayed there first: [`relay`]), and the
+//!    rules of `auth.toml` or the authorizer decide what it may do in the
+//!    workspace the client asked for (`oauth::judge`). A consent page shows
+//!    what the client would get.
 //! 3. `POST <issuer>/oauth/consent` ([`decide`]): approved, the client gets
 //!    an authorization code, redeemed at the token endpoint with its PKCE
 //!    verifier; denied, an `access_denied` error.
 //!
-//! Each step is bound to the browser that started it by a cookie, and kept
-//! in memory for minutes ([`Flows`]): a restart ends authorizations under way.
+//! Each step is bound to the browser that started it by a cookie. The steps
+//! before a sign-in keep nothing on the server: the request is sealed into
+//! the chooser link ([`Pending`]) and a per-flow cookie (`Sealer`). Consents
+//! and codes are kept in memory for minutes ([`Flows`]): a restart ends
+//! authorizations under way.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -582,7 +588,9 @@ fn request_of(cx: &Ctx<'_>, oauth_config: &OauthConfig, query: &str) -> Result<A
             tracing::info!(target: "bd::serve", client = %params.client_id, error = %why, "OAuth client refused");
             return Err(refused(400, "This application isn't set up to connect to this server."));
         }
-        Err(Error::Busy(_)) => return Err(refused(503, "The server is busy. Try again in a moment.")),
+        Err(Error::Busy(_) | Error::Locked(_)) => {
+            return Err(refused(503, "The server is busy. Try again in a moment."));
+        }
         Err(e) => return Err(internal(&e, "looking up an OAuth client")),
     };
     check(params, client, oauth_config, cx.issuer)
@@ -916,7 +924,7 @@ fn signed_in(
             let why = format!("{label} didn't respond as expected. Try again in a moment.");
             return Answer::Page(pages::refusal(502, &format!("Couldn't reach {label}"), &why, Some(&link)));
         }
-        Err(Error::Busy(why)) => {
+        Err(Error::Busy(why) | Error::Locked(why)) => {
             tracing::warn!(target: "bd::serve", %provider, error = %why, "web sign-in could not be decided");
             let link = back("temporarily_unavailable", "the server could not check access");
             let why = "The server couldn't check your access just now. Try again in a moment.";

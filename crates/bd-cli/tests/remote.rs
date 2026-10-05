@@ -174,7 +174,20 @@ fn create_token(root: &Path, name: &str, actor: &str, extra: &[&str]) -> String 
 }
 
 impl Drop for Server {
+    /// A graceful stop where there is one (SIGTERM on Unix), so the server ends as in production and writes its
+    /// coverage profile (`cargo llvm-cov`); killed if it has not stopped within 10 seconds.
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill").args(["-TERM", &self.child.id().to_string()]).status();
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                if let Ok(Some(_)) = self.child.try_wait() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -4890,6 +4903,10 @@ struct GithubState {
     known: std::collections::HashMap<u64, String>,
     /// Organizations whose installation of the App is suspended.
     suspended: Vec<String>,
+    /// Each installation's token generation (`ghs_<installation>_<generation>`): older ones are refused (401).
+    token_generation: std::collections::HashMap<usize, u32>,
+    /// API requests (to /user/<id>, /orgs/, /app/) to answer 502 before answering again.
+    failing: usize,
 }
 
 impl FakeGithub {
@@ -4971,6 +4988,32 @@ impl FakeGithub {
         self.state.lock().unwrap().suspended.push(org.to_string());
     }
 
+    /// The App uninstalled from `org`: its installation and tokens are gone (installations keep their numbers).
+    fn uninstall(&self, org: &str) {
+        let mut s = self.state.lock().unwrap();
+        for o in s.installed.iter_mut().filter(|o| *o == org) {
+            *o = "-".into();
+        }
+    }
+
+    /// The installation tokens given for `org` so far no longer work (401), as after they expired.
+    fn expire_tokens(&self, org: &str) {
+        let mut s = self.state.lock().unwrap();
+        if let Some(i) = s.installed.iter().position(|o| o == org) {
+            *s.token_generation.entry(i + 1).or_default() += 1;
+        }
+    }
+
+    /// The account `login` was deleted: GitHub no longer knows its id.
+    fn delete_account(&self, login: &str) {
+        self.state.lock().unwrap().known.retain(|_, l| l != login);
+    }
+
+    /// The next `n` API requests fail with 502.
+    fn fail_next(&self, n: usize) {
+        self.state.lock().unwrap().failing = n;
+    }
+
     fn leave(&self, login: &str, of: &str) {
         self.state.lock().unwrap().members.retain(|(l, o)| !(l == login && o == of));
     }
@@ -5036,8 +5079,12 @@ fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>)
     let body = String::from_utf8(body).unwrap();
     let login = bearer.as_deref().and_then(|b| b.strip_prefix("gho_")).map(String::from);
     let app = bearer.as_deref().is_some_and(app_jwt);
-    // Installation tokens are `ghs_<installation>`.
-    let installation = bearer.as_deref().and_then(|b| b.strip_prefix("ghs_")).and_then(|i| i.parse::<usize>().ok());
+    // Installation tokens are `ghs_<installation>_<generation>`.
+    let installation_token = bearer.as_deref().and_then(|b| b.strip_prefix("ghs_")).and_then(|t| {
+        let (i, generation) = t.split_once('_').unwrap_or((t, "0"));
+        Some((i.parse::<usize>().ok()?, generation.parse::<u32>().ok()?))
+    });
+    let mut installation = installation_token.map(|(i, _)| i);
     let form = |key: &str| body.split('&').find_map(|kv| kv.strip_prefix(&format!("{key}="))).map(String::from);
     let mut words = request.split_whitespace();
     let (method, path) = (words.next().unwrap(), words.next().unwrap());
@@ -5048,6 +5095,22 @@ fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>)
     };
     std::thread::sleep(hold);
     let mut s = state.lock().unwrap();
+    let api = path.starts_with("/user/") || path.starts_with("/orgs/") || path.starts_with("/app/");
+    let refused = if api && s.failing > 0 {
+        s.failing -= 1;
+        Some((502, json!({ "message": "Server Error" })))
+    } else {
+        // An installation token of an uninstalled installation, or of an earlier generation, is refused.
+        installation_token
+            .filter(|(i, generation)| {
+                s.installed.get(i - 1).is_none_or(|o| o == "-")
+                    || *generation != s.token_generation.get(i).copied().unwrap_or(0)
+            })
+            .map(|_| (401, json!({ "message": "Bad credentials" })))
+    };
+    if refused.is_some() {
+        installation = None;
+    }
     // The web flow's sign-in page: back to the redirect URI at once.
     if let Some(query) = path.strip_prefix("/login/oauth/authorize?").filter(|_| method == "GET") {
         let q = decode_form(query);
@@ -5072,6 +5135,7 @@ fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>)
     let active = json!({ "state": "active", "role": "member" });
     let not_found = (404, json!({ "message": "Not Found" }));
     let (status, answer) = match (method, path) {
+        _ if refused.is_some() => refused.clone().unwrap(),
         ("POST", "/login/device/code") if s.disabled => (
             200,
             json!({ "error": "device_flow_disabled", "error_description": "Device Flow must be explicitly enabled for this App" }),
@@ -5136,6 +5200,7 @@ fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>)
                 .installed
                 .iter()
                 .enumerate()
+                .filter(|(_, org)| *org != "-")
                 .map(|(i, org)| {
                     let suspended = s.suspended.contains(org).then_some("2026-01-01T00:00:00Z");
                     json!({ "id": i + 1, "suspended_at": suspended })
@@ -5147,10 +5212,15 @@ fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>)
             let id = p["/app/installations/".len()..p.len() - "/access_tokens".len()].to_string();
             let org = id.parse::<usize>().ok().and_then(|i| s.installed.get(i - 1));
             match org {
+                None => not_found.clone(),
+                Some(org) if org == "-" => not_found.clone(),
                 Some(org) if s.suspended.contains(org) => {
                     (403, json!({ "message": "This installation has been suspended" }))
                 }
-                _ => (201, json!({ "token": format!("ghs_{id}"), "expires_at": "2099-01-01T00:00:00Z" })),
+                _ => {
+                    let generation = s.token_generation.get(&id.parse::<usize>().unwrap()).copied().unwrap_or(0);
+                    (201, json!({ "token": format!("ghs_{id}_{generation}"), "expires_at": "2099-01-01T00:00:00Z" }))
+                }
             }
         }
         ("GET", p) if p.starts_with("/user/") && p[6..].parse::<u64>().is_ok() && installation.is_some() => {
@@ -5184,6 +5254,9 @@ fn github_answer(conn: impl Read + Write, state: &std::sync::Mutex<GithubState>)
                     Some(i) => (200, json!({ "id": i + 1 })),
                     None => not_found,
                 },
+                [org, "memberships", _] if installed_on(org) && s.blocked.iter().any(|b| b == org) => {
+                    (403, json!({ "message": "Resource not accessible by integration" }))
+                }
                 [org, "memberships", user] if installed_on(org) && member(&s, user, org) => (200, active),
                 [org, "teams", team, "memberships", user]
                     if (login.is_some() || installed_on(org)) && member(&s, user, &format!("{org}/{team}")) =>
@@ -5513,8 +5586,11 @@ fn github_login(dir: &Path, url: &str) -> Output {
 
 /// The token saved on the client machine `dir`, if any.
 fn saved_token(dir: &Path) -> Option<String> {
+    // Parsed: a text search for `token = "` would find `refresh_token = "` too.
     let text = std::fs::read_to_string(dir.join(".xdg").join("bd").join("credentials.toml")).ok()?;
-    Some(text.split("token = \"").nth(1)?.split('"').next()?.to_string())
+    let file: toml::Table = text.parse().ok()?;
+    let entry = file.get("servers")?.as_table()?.values().next()?.as_table()?;
+    entry.get("token")?.as_str().map(String::from)
 }
 
 /// `bd` on the client machine `dir`, using the workspace `url` with its saved token.
@@ -5661,6 +5737,101 @@ fn github_sign_in_issues_tokens_by_the_rules() {
         "{stderr}"
     );
     check(signed_in(carol.path(), &url, &["list"]), "other tokens still work");
+}
+
+#[test]
+fn github_app_failures_fail_a_refresh_for_now_and_only_github_ends_a_sign_in() {
+    let github = FakeGithub::start();
+    github.install("acme");
+    github.member("bob", "acme");
+    github.member("carol", "acme/eng");
+    let server = refresh_server(&github, "[[github.allow]]\ngroups = [\"acme/eng\", \"acme\"]\n");
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+    let login = |who: &str| {
+        github.next(who, 0);
+        let dir = tempfile::tempdir().unwrap();
+        check(github_login(dir.path(), &url), "login");
+        dir
+    };
+    let (bob, carol) = (login("bob"), login("carol"));
+    // A refresh: whether it renewed the token, and the client's stderr.
+    let renew = |dir: &Path| {
+        let before = saved(dir, "token").unwrap();
+        renewal_due(dir);
+        let out = signed_in(dir, &url, &["list"]);
+        (saved(dir, "token").unwrap_or_default() != before, String::from_utf8_lossy(&out.stderr).to_string())
+    };
+    let live = |login: &str| {
+        let theirs = |t: &Value| t["identity"]["login"] == login && t["revoked_at"].is_null();
+        stored(&root, "tokens").iter().any(theirs)
+    };
+
+    // A team, asked as the App.
+    assert!(renew(carol.path()).0);
+    assert!(github.log().iter().any(|l| l.starts_with("GET /orgs/acme/teams/eng/memberships/carol")));
+    // GitHub refuses the token it gave (401): a new one is minted and the request sent again, at once.
+    github.expire_tokens("acme");
+    assert!(renew(bob.path()).0, "renewed with a new installation token");
+    // GitHub unwell (502), or the App may not read acme's members (403): this refresh fails, quietly while the
+    // access token works, and the sign-in stays.
+    github.fail_next(1);
+    assert!(!renew(bob.path()).0);
+    github.state.lock().unwrap().blocked.push("acme".into());
+    assert!(!renew(bob.path()).0);
+    github.state.lock().unwrap().blocked.clear();
+    assert!(live("bob") && renew(bob.path()).0, "kept, and renewed once GitHub tells");
+    // The App uninstalled everywhere: no refresh, nothing revoked.
+    github.uninstall("acme");
+    assert!(!renew(carol.path()).0);
+    assert!(live("carol"));
+    // An account GitHub no longer has: its sign-in ends.
+    github.install("acme");
+    github.delete_account("bob");
+    let (renewed, stderr) = renew(bob.path());
+    assert!(!renewed && stderr.contains("no account bob"), "{stderr}");
+    assert!(!live("bob"));
+}
+
+#[test]
+fn github_sign_ins_without_the_app_keep_to_the_rule_that_let_them_in() {
+    let github = FakeGithub::start();
+    github.set_id("alice", 42);
+    github.set_id("bob", 7);
+    github.member("bob", "acme");
+    let rules = "[[github.allow]]\nsubjects = [\"42\"]\nrole = \"admin\"\n\n[[github.allow]]\ngroups = [\"acme\"]\n";
+    let server = sign_in_server(&github, rules);
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+    let login = |who: &str| {
+        github.next(who, 0);
+        let dir = tempfile::tempdir().unwrap();
+        check(github_login(dir.path(), &url), "login");
+        assert!(saved(dir.path(), "refresh_token").is_some(), "{who}: refreshed without the GitHub App");
+        dir
+    };
+    let (alice, bob) = (login("alice"), login("bob"));
+
+    // A refresh asks GitHub nothing: by subject decided again, by group as the rule that let bob in.
+    let asked = github.log().len();
+    for dir in [&alice, &bob] {
+        let before = saved_token(dir.path()).unwrap();
+        renewal_due(dir.path());
+        check(signed_in(dir.path(), &url, &["list"]), "renewed");
+        assert_ne!(saved_token(dir.path()).unwrap(), before);
+    }
+    assert_eq!(github.log().len(), asked, "{:?}", github.log());
+
+    // That rule changed: bob's sign-in ends at its next refresh. Alice's subject is put in deny: hers too.
+    let config = std::fs::read_to_string(root.join("auth.toml")).unwrap();
+    let config = config.replace("groups = [\"acme\"]\n", "groups = [\"acme\"]\nrole = \"read\"\n");
+    std::fs::write(root.join("auth.toml"), config.replacen("[github]\n", "[github]\ndeny = [\"42\"]\n", 1)).unwrap();
+    for (dir, says) in [(&bob, "no rule"), (&alice, "may not use this bd server")] {
+        renewal_due(dir.path());
+        let out = signed_in(dir.path(), &url, &["list"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("could not be renewed") && stderr.contains(says), "{stderr}");
+    }
+    let live = stored(&root, "tokens").into_iter().filter(|t| t["revoked_at"].is_null()).count();
+    assert_eq!(live, 0, "both revoked");
 }
 
 /// A server whose GitHub sign-in goes to `github` and refreshes tokens with
@@ -7143,6 +7314,16 @@ fn github_sign_in_trusts_a_private_ca_named_in_auth_toml() {
     {
         assert!(log.iter().any(|l| l.starts_with(asked)), "{asked}: {log:?}");
     }
+
+    // ca_cert taken out again: the next sign-in trusts the usual CAs only, whatever was trusted before.
+    let config = std::fs::read_to_string(root.join("auth.toml")).unwrap();
+    std::fs::write(root.join("auth.toml"), config.replacen("ca_cert = \"ghes-ca.pem\"\n", "", 1)).unwrap();
+    github.next("alice", 0);
+    let again = tempfile::tempdir().unwrap();
+    let out = github_login(again.path(), &url);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(8), "{stderr}");
+    assert!(stderr.contains("invalid peer certificate"), "{stderr}");
 }
 
 #[test]

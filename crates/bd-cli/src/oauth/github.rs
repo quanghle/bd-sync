@@ -450,14 +450,20 @@ impl AppApi<'_> {
     }
 
     /// GET `path` with an installation token (`org`'s, or any): `None` when
-    /// the App is not installed there. A token GitHub refuses is not used again.
+    /// the App is not installed there. A token GitHub refuses is not used
+    /// again, and the request is sent once more with a new one (a token can
+    /// end before its `expires_at`, as when the App's key changes).
     pub(super) fn get(&self, org: Option<&str>, path: &str) -> Result<Option<(u16, Value)>> {
-        let Some((installation, token)) = self.token(org)? else { return Ok(None) };
-        let (status, body) = self.api.get(&token, path)?;
-        if status == 401 {
+        let mut retried = false;
+        loop {
+            let Some((installation, token)) = self.token(org)? else { return Ok(None) };
+            let (status, body) = self.api.get(&token, path)?;
+            if status != 401 || retried {
+                return Ok(Some((status, body)));
+            }
             installations().tokens.remove(&format!("{} {installation}", self.app()));
+            retried = true;
         }
-        Ok(Some((status, body)))
     }
 
     /// The account with this user id as GitHub names it now, and when

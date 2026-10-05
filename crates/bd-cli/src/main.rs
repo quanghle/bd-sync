@@ -351,9 +351,8 @@ mod tests {
     fn only_a_busy_database_suggests_raising_the_busy_timeout() {
         let db = render_error(&Error::Busy("timed out after 10s waiting for the write lock".into()), false, None);
         assert!(db.starts_with("error: database is busy: timed out") && db.contains("--busy-timeout-ms"), "{db}");
-        let file =
-            render_error(&Error::Locked("another bd process is changing the access tokens; retry".into()), false, None);
-        assert_eq!(file, "error: another bd process is changing the access tokens; retry\n");
+        let file = render_error(&Error::Locked("another bd process is changing server.db; retry".into()), false, None);
+        assert_eq!(file, "error: another bd process is changing server.db; retry\n");
         let json: serde_json::Value =
             serde_json::from_str(&render_error(&Error::Locked("x".into()), true, None)).unwrap();
         assert_eq!((&json["error"]["code"], &json["error"]["exit_code"]), (&"busy".into(), &5.into()));

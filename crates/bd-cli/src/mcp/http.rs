@@ -74,32 +74,37 @@ pub fn check_content_type(headers: &HeaderMap) -> Result<(), Answer> {
     ))
 }
 
-/// Answer the message POSTed as `body` with `headers`.
-/// Whether the message in `body` calls a tool, the one kind that runs a
-/// command: read without building the message, as the server sizes what it
-/// holds for it before answering.
-pub fn runs_tools(body: &[u8]) -> bool {
-    #[derive(serde::Deserialize)]
-    struct Peek {
-        method: Option<String>,
-    }
-    serde_json::from_slice::<Peek>(body).is_ok_and(|p| p.method.as_deref() == Some("tools/call"))
+/// The message POSTed as `body`, or the answer to one that is not JSON.
+pub fn parse(body: &[u8]) -> std::result::Result<Value, Answer> {
+    serde_json::from_slice(body).map_err(|e| {
+        Answer::Message(StatusCode::BAD_REQUEST, error(Value::Null, PARSE_ERROR, &format!("invalid JSON: {e}"), None))
+    })
 }
 
+/// Whether `message` calls a tool, the one kind that runs a command: the
+/// server sizes what it holds for it on this, so it must be the message
+/// [`answer_message`] answers, never another reading of its body.
+pub fn runs_tools(message: &Value) -> bool {
+    message.get("method").and_then(Value::as_str) == Some("tools/call")
+}
+
+/// Answer the message POSTed as `body` with `headers`.
+#[cfg(test)]
 pub fn answer<R: Runner>(server: &mut Server<R>, headers: &HeaderMap, body: &[u8]) -> Answer {
-    let message: Value = match serde_json::from_slice(body) {
-        Ok(m) => m,
-        Err(e) => {
-            let e = error(Value::Null, PARSE_ERROR, &format!("invalid JSON: {e}"), None);
-            return Answer::Message(StatusCode::BAD_REQUEST, e);
-        }
-    };
+    match parse(body) {
+        Ok(message) => answer_message(server, headers, &message),
+        Err(answer) => answer,
+    }
+}
+
+/// The answer to `message`, POSTed with `headers`, already parsed.
+pub fn answer_message<R: Runner>(server: &mut Server<R>, headers: &HeaderMap, message: &Value) -> Answer {
     let modern = message.get("params").and_then(Value::as_object).is_some_and(names_version);
-    if let Err((code, text, data)) = check_headers(&message, headers, modern) {
+    if let Err((code, text, data)) = check_headers(message, headers, modern) {
         let id = message.get("id").filter(|id| id.is_string() || id.is_number()).cloned().unwrap_or(Value::Null);
         return Answer::Message(StatusCode::BAD_REQUEST, error(id, code, &text, data));
     }
-    match server.handle(&message) {
+    match server.handle(message) {
         None => Answer::Accepted,
         Some(answer) => {
             let status = match answer["error"]["code"].as_i64() {
@@ -391,14 +396,18 @@ mod tests {
 
     #[test]
     fn only_tool_calls_are_sized_as_commands() {
-        assert!(runs_tools(br#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ready"}}"#));
+        let runs = |body: &str| parse(body.as_bytes()).is_ok_and(|m| runs_tools(&m));
+        assert!(runs(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ready"}}"#));
+        // A key given twice is read as the message is answered: the last one.
+        assert!(runs(r#"{"jsonrpc":"2.0","id":1,"method":"ping","method":"tools/call","params":{"name":"ready"}}"#));
         for light in [
-            &br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#[..],
-            br#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-            br#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"method":"tools/call"}}"#,
-            b"not json",
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"method":"tools/call"}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","method":"ping"}"#,
+            "not json",
         ] {
-            assert!(!runs_tools(light), "{}", String::from_utf8_lossy(light));
+            assert!(!runs(light), "{light}");
         }
     }
 

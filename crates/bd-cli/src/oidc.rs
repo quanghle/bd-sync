@@ -20,8 +20,9 @@
 //! their consent or were deleted (Apple's server-to-server notifications)
 //! are taken at `<issuer>/oauth/<name>/events` ([`Oidc::account_event`]).
 //!
-//! bd proves who signed in, and only that: an `[authorizer]` decides who
-//! gets in (`authorizer.rs`). The account is its issuer and its `sub`
+//! bd proves who signed in here; `[[oidc.<name>.allow]]` rules
+//! (`oauth/rules.rs`), or an `[authorizer]` (`authorizer.rs`), decide who
+//! gets in. The account is its issuer and its `sub`
 //! claim, which never changes. Its login, which its actor is made of, is
 //! never an email: its `preferred_username` unless that is one (Entra's is
 //! the user principal name), else a pseudonym of the account ([`pseudonym`]),

@@ -94,7 +94,10 @@ async fn message(
     }
     // The body as large as it says it is (or may be).
     let reserve = declared.map_or(MAX_MCP_BODY, |n| usize::try_from(n).unwrap_or(MAX_MCP_BODY));
-    let budget = match queue(&server.body_budget, kib(reserve * BODY_COPIES), "receiving other requests").await {
+    // Its body's share and, for a tool call, its answer's, in one wait (a second wait on the same queue would hold
+    // up everyone behind it); the answer's is given back once the message turns out to be none.
+    let permits = kib(reserve * BODY_COPIES) + kib(MCP_ANSWER_BUDGET);
+    let mut budget = match queue(&server.body_budget, permits, "receiving other requests").await {
         Ok(permit) => permit,
         Err(reject) => return reject.response(),
     };
@@ -105,18 +108,19 @@ async fn message(
     };
     // A tool call runs a command: a slot, and memory for its output. Any other message (initialize, ping, tools/list,
     // a notification) needs neither.
-    let (answer_budget, slot) = match mcp_http::runs_tools(&body) {
+    // Parsed once: what is held for the message is decided on the very message answered.
+    let message = match mcp_http::parse(&body) {
+        Ok(m) => m,
+        Err(answer) => return mcp_response(answer, None),
+    };
+    drop(body);
+    let answer = budget.split(kib(MCP_ANSWER_BUDGET) as usize);
+    let (answer_budget, slot) = match mcp_http::runs_tools(&message) {
         false => (None, None),
-        true => {
-            let answer = match queue(&server.body_budget, kib(MCP_ANSWER_BUDGET), "receiving other requests").await {
-                Ok(permit) => permit,
-                Err(reject) => return reject.response(),
-            };
-            match queue(&server.running, 1, "running other commands").await {
-                Ok(slot) => (Some(answer), Some(slot)),
-                Err(reject) => return reject.response(),
-            }
-        }
+        true => match queue(&server.running, 1, "running other commands").await {
+            Ok(slot) => (answer, Some(slot)),
+            Err(reject) => return reject.response(),
+        },
     };
     let srv = server.clone();
     let job = tokio::task::spawn_blocking(move || {
@@ -125,7 +129,7 @@ async fn message(
         let runner = ToolRunner { server: &srv, ws: &ws, token: &token, session: &session };
         let mut mcp = mcp::Server::for_request(runner, token.role == Role::Read);
         let answer = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            mcp_response(mcp_http::answer(&mut mcp, &parts.headers, &body), answer_budget)
+            mcp_response(mcp_http::answer_message(&mut mcp, &parts.headers, &message), answer_budget)
         }));
         tracing::debug!(target: "bd::serve", workspace = %ws.name, token = %token.name, ms = started.elapsed().as_millis() as u64, "mcp message");
         answer.map_err(|_| tracing::error!(target: "bd::serve", workspace = %ws.name, "MCP request panicked"))

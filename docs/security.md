@@ -58,6 +58,11 @@ playbook run gets the same answer as a single command
   bringing their own playbooks, and at most `--max-followers` waiting
   requests; slow or stalled readers lose their answer. Excess requests are
   answered 503, which clients retry ([Followers](remote.md#followers)).
+  Connections: at most 512, and 64 from one address (other than this
+  machine's, as a proxy's are everyone's); a request's headers, and an idle
+  keep-alive connection's next request, within 75 seconds; and each
+  connection closes after 15 minutes, once its answer under way is sent
+  (cut 2 minutes later), so a very long streamed answer is cut there.
 - **The server's host is not limited by tokens.** `bd` run on the host opens
   `bd.db` directly; guard the root directory like the database it is.
 - **Backups hold everything.** On Unix, backup files (`bd serve
@@ -344,8 +349,8 @@ above.
   machine is not counted). A code sent again revokes the token it issued
   only when its client sends it with its PKCE verifier. The authorization endpoint
   does not tell which workspaces exist before the rules let an account in
-  (the device flow of `bd remote login --provider github` does, before sending
-  anyone to GitHub). It does not
+  (the device flow of `bd remote login --provider <name>` does, before sending
+  anyone to the provider). It does not
   rate-limit them: do that per address at the proxy ([Behind a
   proxy](mcp.md#behind-a-proxy)), on every path with `/oauth/` or
   `/v2/auth/` in it:

@@ -1,7 +1,7 @@
 //! The authorizer: whether an account that signed in may use a workspace of
 //! `bd serve`, and with what access, decided by the admin's own code instead
-//! of `auth.toml`'s rules. bd still proves who signed in (GitHub's sign-in,
-//! and the account bound to its actor); the authorizer only says whether
+//! of `auth.toml`'s rules. bd still proves who signed in (the provider's
+//! sign-in, and the account bound to its actor); the authorizer only says whether
 //! that account gets in, at every sign-in and every refresh:
 //!
 //! ```toml

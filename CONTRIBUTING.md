@@ -83,9 +83,13 @@ crates/bd-core/tests/ engine integration tests (graph semantics, leases with a m
                       playbook runs and gates, write policies)
 crates/bd-cli/src/    cli (clap) · commands · playbooks · gates (gh probes) · batch · bench · fmt · logging
                       · backup (bd backup and bd serve's backups: snapshots, naming, retention)
-                      io (stdio and files, or a captured request) · serve (bd serve) · jobs (its background
-                      jobs: reclaim, gate checks, agent sets, backups) · auth (access tokens)
-                      · oauth (sign-in: GitHub, providers, refresh) · oidc · authorizer · remote (client) · credentials (bd remote login)
+                      io (stdio and files, or a captured request) · serve/ (bd serve: listen, routes, exec,
+                      sign-in endpoints, MCP endpoint, check) · jobs (its background jobs: reclaim, gate checks,
+                      agent sets, backups) · follow (long polls) · server_db (server.db) · auth/ (access tokens,
+                      accounts and their actors) · oauth/ (sign-in: one rule engine for every provider, GitHub,
+                      admission, refresh) · oidc · authorizer · oauth_server/ (the authorization server for MCP
+                      clients: authorize, token, clients, metadata documents, pages) · mcp/ (MCP tools over
+                      stdio and HTTP) · remote (client) · credentials (bd remote login)
                       · protocol (wire format) · stream (streamed answers) · agents (bd agents) + agents/
                       (checkout, lock, mcp_file, sync, approve, show, hook, watch) · hook (session hook
                       output per harness)

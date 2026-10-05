@@ -79,26 +79,18 @@ pub(super) fn run(a: &ServeArgs) -> Result<()> {
             }
         }
         let decider = if sign_in.authorizer.is_some() { "the authorizer" } else { "rules" };
+        // Every provider's sign-ins are refreshed: its rules or the authorizer decide again at each refresh.
         if let Some(github) = &sign_in.github {
-            match sign_in.refreshes("github") {
-                true => tracing::info!(
-                    target: "bd::serve",
-                    github = %github.url,
-                    decider,
-                    token_ttl = %shown(sign_in.token_ttl),
-                    refresh_limit = %shown(sign_in.refresh_limit),
-                    refresh_idle = %shown(sign_in.refresh_idle),
-                    "GitHub sign-in is on, with refreshed tokens"
-                ),
-                false => tracing::warn!(
-                    target: "bd::serve",
-                    github = %github.url,
-                    decider,
-                    token_ttl = %shown(sign_in.token_ttl),
-                    "GitHub sign-in is on; its tokens are not refreshed (rules need github.private_key to be applied \
-                     again), so people sign in again each token_ttl"
-                ),
-            }
+            tracing::info!(
+                target: "bd::serve",
+                github = %github.url,
+                decider,
+                app = github.app.is_some(),
+                token_ttl = %shown(sign_in.token_ttl),
+                refresh_limit = %shown(sign_in.refresh_limit),
+                refresh_idle = %shown(sign_in.refresh_idle),
+                "GitHub sign-in is on, with refreshed tokens"
+            );
         }
         // Each OIDC provider's discovery, tried once now, so that a wrong issuer shows before anyone signs in.
         for oidc in &sign_in.oidc {

@@ -1551,6 +1551,109 @@ mod tests {
     }
 
     #[test]
+    fn forgetting_a_linked_account_erases_the_tokens_of_its_former_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let life = Lifetime { ttl: Duration::from_secs(3600), refresh: None, rule: None };
+        let apple = Identity {
+            provider: "apple".into(),
+            issuer: "https://appleid.apple.com".into(),
+            subject: "001.abc.1".into(),
+            login: "u-0123456789ab".into(),
+        };
+        issue_sign_in_token(dir.path(), &gh("alice", 1), grant.clone(), life.clone(), "proj", true).unwrap();
+        issue_sign_in_token(dir.path(), &apple, grant, life, "proj", true).unwrap();
+        link(dir.path(), "apple:u-0123456789ab", "github:alice").unwrap();
+        assert!(forget_account(dir.path(), &apple.issuer, &apple.subject).unwrap());
+        let tokens = read(dir.path()).unwrap().tokens;
+        assert!(tokens.iter().all(|t| t.identity.as_ref().is_none_or(|g| !g.same(&apple))), "{tokens:?}");
+        assert_eq!(tokens.len(), 1, "github:alice's stays");
+    }
+
+    #[test]
+    fn the_sign_in_cap_counts_each_client_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let (hour, week) = (Duration::from_secs(3600), Duration::from_secs(7 * 24 * 3600));
+        let life = Lifetime { ttl: hour, refresh: Some((Timestamp::now().plus(week * 4), week)), rule: None };
+        let alice = gh("alice", 1);
+        let resource = "https://bd.example.com/w/proj/mcp";
+        let at = |client: &'static str| ForClient { id: client, resource };
+        let cli = issue_sign_in_token(dir.path(), &alice, grant.clone(), life.clone(), "proj", true).unwrap();
+        let other =
+            issue_client_token(dir.path(), &alice, grant.clone(), life.clone(), at("https://b.example/c"), true);
+        let first: Vec<String> = (0..MAX_SIGN_INS + 1)
+            .map(|_| {
+                let issued = issue_client_token(
+                    dir.path(),
+                    &alice,
+                    grant.clone(),
+                    life.clone(),
+                    at("https://a.example/c"),
+                    true,
+                );
+                issued.unwrap().token.id
+            })
+            .collect();
+        let file = read(dir.path()).unwrap();
+        let live = |id: &str| file.tokens.iter().any(|t| t.id == id && t.revoked_at.is_none());
+        assert!(!live(&first[0]) && first[1..].iter().all(|id| live(id)), "the client's oldest goes");
+        assert!(live(&cli.token.id) && live(&other.unwrap().token.id), "the CLI's and another client's stay");
+    }
+
+    /// Replace `from` with `to` in the accounts' stored records and lookup columns.
+    fn edit_accounts(root: &Path, from: &str, to: &str) {
+        let conn = server_db::open(root).unwrap();
+        let sql = "UPDATE accounts SET data = replace(data, ?1, ?2), actor_key = replace(actor_key, ?1, ?2)";
+        conn.execute(sql, [from, to]).unwrap();
+    }
+
+    #[test]
+    fn a_refresh_is_refused_once_the_account_acts_as_another_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let (hour, week) = (Duration::from_secs(3600), Duration::from_secs(7 * 24 * 3600));
+        let life = Lifetime { ttl: hour, refresh: Some((Timestamp::now().plus(week * 4), week)), rule: None };
+        let alice = gh("alice", 1);
+        let issued = issue_sign_in_token(dir.path(), &alice, grant.clone(), life, "proj", false).unwrap();
+        let state = issued.token.refresh.clone().unwrap();
+        // Bound to another actor since (as a link does, its tokens otherwise revoked with it).
+        edit_accounts(dir.path(), "github:alice", "github:carol");
+        let last = LastRefresh { spent: state.sha256.clone(), request: hash("r") };
+        let now = Timestamp::now();
+        let e = rotate_with(
+            dir.path(),
+            &issued.token.id,
+            &state.sha256,
+            last,
+            &alice,
+            true,
+            grant,
+            false,
+            true,
+            None,
+            now.plus(hour),
+            now.plus(week),
+        );
+        let Err(e) = e else { panic!("rotated") };
+        assert!(matches!(e, Error::Unauthorized(_)) && e.to_string().contains("now acts as github:carol"), "{e}");
+    }
+
+    #[test]
+    fn no_account_signs_in_as_the_servers_own_actor() {
+        // Accounts' actors carry their provider's name, so none takes `bd-serve`; were one bound to it, it is refused.
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let life = Lifetime { ttl: Duration::from_secs(3600), refresh: None, rule: None };
+        let mallory = gh("mallory", 9);
+        issue_sign_in_token(dir.path(), &mallory, grant.clone(), life.clone(), "proj", false).unwrap();
+        edit_accounts(dir.path(), "github:mallory", crate::jobs::ACTOR);
+        let Err(e) = issue_sign_in_token(dir.path(), &mallory, grant, life, "proj", false) else { panic!("issued") };
+        assert!(matches!(e, Error::Unauthorized(_)) && e.to_string().contains("is bd serve's own"), "{e}");
+        assert!(preview_actor(dir.path(), &mallory, false).is_err());
+    }
+
+    #[test]
     fn writers_wait_for_each_other() {
         let dir = tempfile::tempdir().unwrap();
         let held = server_db::open(dir.path()).unwrap();

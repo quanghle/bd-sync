@@ -585,7 +585,11 @@ expired first; so does a long-running one (`bd agents watch`, `bd events
   login, `groups` by active membership, `min_account_age`). Otherwise (an
   OIDC provider, or GitHub without the App) the account is taken as it
   signed in: rules by `subjects` or `anyone` apply again, and any other rule
-  keeps the sign-in only if it is the one that let it in, unchanged. What
+  keeps the sign-in only if it is the one that let it in, unchanged; such a
+  refresh never widens the token's workspaces (an earlier rule it cannot
+  apply may have narrowed them). A membership the provider will not tell,
+  of a rule for other workspaces, narrows the deciding rule's token to the
+  workspace asked for, as that rule letting the account in would. What
   the first matching rule grants now applies: role, kind, workspaces and
   `max_claims` may change at a refresh. GitHub is asked as the GitHub App, with installation tokens: the
   server never keeps anyone's own GitHub token. An organization the App is

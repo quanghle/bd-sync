@@ -791,6 +791,7 @@ mod tests {
             ),
             (with("deny = [\"alice\"]", "users = [\"a\"]"), "github.deny \"alice\" is not a GitHub user id"),
             (with("deny = [7]", "users = [\"a\"]"), "line 3: invalid type"),
+            (with("deny = [\"0042\"]", "users = [\"a\"]"), "github.deny \"0042\" is not a GitHub user id"),
             (with("", "users = [\"../admin\"]"), "users \"../admin\" is not one"),
             (with("", "groups = [\"acme/x/y\"]"), "groups \"acme/x/y\" is not one"),
             (with("", "groups = [\"acme/\"]"), "is not one"),
@@ -936,6 +937,23 @@ mod tests {
             Decision::In { grant, via, .. } => Some((grant.role, via)),
             _ => None,
         }
+    }
+
+    #[test]
+    fn a_rule_github_will_not_decide_for_other_workspaces_narrows_the_next() {
+        // Were eve in vendor, its rule would decide `secret` (read), and acme's rule would cover proj alone. GitHub will
+        // not say: so it covers proj alone all the same, never write in `secret`.
+        let g = github(
+            "[github]\nclient_id = \"x\"\n\
+             [[github.allow]]\ngroups = [\"vendor\"]\nrole = \"read\"\nworkspaces = [\"secret\"]\n\
+             [[github.allow]]\ngroups = [\"acme\"]\n",
+        );
+        let decided = decide_in(&g, &mut known("eve", None, vec!["acme"], vec!["vendor"]), "proj");
+        let Decision::In { grant, .. } = decided.decision else { panic!("{decided:?}") };
+        assert_eq!(grant.workspaces, ["proj"]);
+        let known_out = decide_in(&g, &mut known("eve", None, vec!["acme"], vec![]), "proj");
+        let Decision::In { grant, .. } = known_out.decision else { panic!() };
+        assert_eq!(grant.workspaces, ["*"], "known not to be in vendor: all of acme's rule");
     }
 
     #[test]

@@ -102,9 +102,7 @@ pub fn refresh_found(
             revoke("the GitHub account no longer exists")?;
             return Err(refused(format!("GitHub has no account {} any more", user.login)));
         };
-        if named.issuer != user.issuer {
-            return Err(refused(format!("{} signed in at another GitHub than the server's now", user.who())));
-        }
+        // Its issuer is the GitHub the App asks, the one the sign-in was at: `provides` refused any other above.
         (now_user, created, fresh) = (named, made, true);
     }
     let mut unknown = Vec::new();
@@ -163,8 +161,13 @@ pub fn refresh_found(
             };
             unknown = d.unknown;
             match d.decision {
-                Decision::In { grant, via, by_login } => {
+                Decision::In { mut grant, via, by_login } => {
                     rule = d.rule;
+                    // Without fresh facts, rules before the kept one that need them were not applied: one may have
+                    // narrowed the sign-in to its workspace. So a refresh keeps the workspaces it had, at most.
+                    if app.is_none() {
+                        grant.workspaces = within(&grant.workspaces, &token.workspaces);
+                    }
                     (grant, via, by_login, true)
                 }
                 out => {
@@ -218,6 +221,16 @@ pub fn refresh_found(
     Ok(answer_of(issued, now_user.login, via))
 }
 
+/// The workspaces of `granted` that `had` covers too (`*`: every one).
+fn within(granted: &[String], had: &[String]) -> Vec<String> {
+    let all = |w: &[String]| w.iter().any(|w| w == "*");
+    match (all(granted), all(had)) {
+        (_, true) => granted.to_vec(),
+        (true, false) => had.to_vec(),
+        (false, false) => granted.iter().filter(|w| had.contains(w)).cloned().collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,14 +258,15 @@ mod tests {
 
     /// Sign `subject` in to `workspace` as poll_oidc does; the refresh secret.
     fn sign_in(root: &Path, subject: &str, workspace: &str) -> Result<String> {
+        sign_in_with(root, subject, workspace, serde_json::json!({}))
+    }
+
+    /// [`sign_in`] with these ID token claims.
+    fn sign_in_with(root: &Path, subject: &str, workspace: &str, all: Value) -> Result<String> {
         let s = load(root)?.unwrap();
         let oidc = s.oidc("acme").unwrap();
-        let claims = crate::oidc::Claims {
-            subject: subject.into(),
-            login: format!("user-{subject}"),
-            email: None,
-            all: serde_json::json!({}),
-        };
+        let claims =
+            crate::oidc::Claims { subject: subject.into(), login: format!("user-{subject}"), email: None, all };
         let Admitted { user, grant, by_login, rule, .. } = admit_oidc(root, &s, oidc, &claims, workspace, None)?;
         let life = auth::Lifetime { rule, ..s.lifetime(Timestamp::now(), &user.provider) };
         let issued = auth::issue_sign_in_token(root, &user, grant, life, workspace, by_login)?;
@@ -291,6 +305,38 @@ mod tests {
         let e = refresh(dir.path(), &secret, "r-1", None).unwrap_err();
         assert!(e.to_string().contains("may not use this bd server"), "{e}");
         assert_eq!(live(dir.path()), 1, "s-1's sign-in was revoked");
+    }
+
+    #[test]
+    fn a_refresh_never_widens_a_sign_in_an_earlier_rule_narrowed() {
+        // Contractors read `secret`; everyone in acme writes everywhere else. Carol is both: her sign-in for proj is
+        // narrowed to proj, never write in secret. A refresh cannot apply the contractors rule (no claims) and must
+        // not lose that.
+        let dir = root(
+            "[[oidc.acme.allow]]\ngroups = [\"contractors\"]\nrole = \"read\"\nworkspaces = [\"secret\"]\n\
+             [[oidc.acme.allow]]\ngroups = [\"acme\"]\n",
+        );
+        let carol = sign_in_with(dir.path(), "s-1", "proj", serde_json::json!({ "groups": ["contractors", "acme"] }));
+        let refreshed = refresh(dir.path(), &carol.unwrap(), "r-1", None).unwrap();
+        assert_eq!(refreshed.workspaces, ["proj"], "still narrowed");
+        // Bob, in acme only, keeps every workspace.
+        let bob = sign_in_with(dir.path(), "s-2", "proj", serde_json::json!({ "groups": ["acme"] })).unwrap();
+        assert_eq!(refresh(dir.path(), &bob, "r-2", None).unwrap().workspaces, ["*"]);
+        assert_eq!(within(&["*".into()], &["proj".into()]), ["proj"]);
+        assert_eq!(within(&["a".into(), "b".into()], &["b".into(), "c".into()]), ["b"]);
+    }
+
+    #[test]
+    fn a_refresh_that_loses_a_race_revokes_the_sign_in() {
+        // Two refreshes with one secret: the second found it current, but another rotated it meanwhile.
+        let dir = root("[[oidc.acme.allow]]\nsubjects = [\"s-1\"]\n");
+        let secret = sign_in(dir.path(), "s-1", "proj").unwrap();
+        let found = auth::find_refresh(dir.path(), &secret).unwrap();
+        assert!(found.as_ref().is_some_and(|(_, current)| *current));
+        refresh(dir.path(), &secret, "r-1", None).unwrap();
+        let e = refresh_found(dir.path(), found, &secret, "r-2", None).unwrap_err();
+        assert!(matches!(e, Error::Unauthorized(_)) && e.to_string().contains("used already"), "{e}");
+        assert_eq!(live(dir.path()), 0);
     }
 
     #[test]

@@ -30,7 +30,7 @@ fn busy_wait() -> Duration {
 }
 
 /// The schema this bd writes (`PRAGMA user_version`).
-const VERSION: i64 = 2;
+const VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE accounts (
@@ -79,6 +79,7 @@ CREATE TABLE auth_events (
 );
 CREATE INDEX auth_events_at ON auth_events (at);
 CREATE INDEX auth_events_actor ON auth_events (actor_key) WHERE actor_key IS NOT NULL;
+CREATE INDEX auth_events_kind ON auth_events (kind, seq);
 CREATE INDEX auth_events_account ON auth_events (issuer, subject) WHERE subject IS NOT NULL;
 ";
 
@@ -199,12 +200,15 @@ pub fn scrub(root: &Path) -> Result<bool> {
     Ok(busy == 0)
 }
 
-/// `e` of the database at `path`, said so.
+/// `e` of the database at `path`, said so. Waiting for another writer is
+/// `Error::Locked`: its wait is this module's own, which `--busy-timeout-ms`
+/// does not set.
 pub fn failed(path: &Path, e: rusqlite::Error) -> Error {
     match Error::from(e) {
-        Error::Busy(_) => {
-            Error::Busy(format!("another bd process is changing {} and did not finish in time; retry", path.display()))
-        }
+        Error::Busy(_) => Error::Locked(format!(
+            "another bd process is changing {} and did not finish in time; retry",
+            path.display()
+        )),
         Error::Sqlite(e) => Error::Io(std::io::Error::other(format!("{}: {e}", path.display()))),
         other => other,
     }
@@ -493,6 +497,72 @@ mod tests {
         assert_eq!(left, KEPT_REGISTRATIONS + 1 - PRUNE_BATCH);
     }
 
+    #[test]
+    fn rows_are_written_only_as_far_as_they_changed() {
+        use rusqlite::types::Value as V;
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open(dir.path()).unwrap();
+        // Which columns an UPDATE sets: a trigger per column fires only when its column is in the SET list.
+        conn.execute_batch(
+            "CREATE TEMP TABLE fired (col TEXT); \
+             CREATE TEMP TRIGGER on_name AFTER UPDATE OF name ON tokens BEGIN INSERT INTO fired VALUES ('name'); END; \
+             CREATE TEMP TRIGGER on_family AFTER UPDATE OF family ON tokens BEGIN INSERT INTO fired VALUES ('family'); END;",
+        )
+        .unwrap();
+        let keys: Columns = vec![("id", V::Text("t1".into()))];
+        let columns = |sha: &str, family: Option<&str>, data: Option<&str>| -> Columns {
+            let mut c: Columns = vec![
+                ("sha256", V::Text(sha.into())),
+                ("family", family.map_or(V::Null, |f| V::Text(f.into()))),
+                ("actor_key", V::Text("alice".into())),
+                ("name", V::Text("n".into())),
+                ("ended_at", V::Null),
+            ];
+            c.extend(data.map(|d| ("data", V::Text(d.into()))));
+            c
+        };
+        write(dir.path(), &mut conn, |tx| put_row(tx, "tokens", &keys, &columns("a", None, Some("{}")), None)).unwrap();
+        let was = columns("a", None, None);
+        write(dir.path(), &mut conn, |tx| {
+            put_row(tx, "tokens", &keys, &columns("b", Some("f"), Some("{\"x\":1}")), Some(&was))
+        })
+        .unwrap();
+        let row: (String, Option<String>, String) = conn
+            .query_row("SELECT sha256, family, data FROM tokens WHERE id = 't1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("b".into(), Some("f".into()), "{\"x\":1}".into()));
+        let fired: Vec<String> = conn
+            .prepare("SELECT col FROM fired")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(fired, ["family"], "NULL to a value is a change; the name, unchanged, is not set");
+
+        // sync_rows: the changed row with how it was, the new one without, the gone one deleted, the same one not at all.
+        #[derive(serde::Serialize)]
+        struct Row(&'static str, u32);
+        let (mut upserted, mut deleted) = (Vec::new(), Vec::new());
+        sync_rows(
+            &[Row("a", 1), Row("b", 1), Row("c", 1)],
+            &[Row("a", 1), Row("b", 2), Row("d", 1)],
+            |r| r.0,
+            |k| {
+                deleted.push(*k);
+                Ok(())
+            },
+            |was, r, _| {
+                upserted.push((was.map(|w| w.1), r.0));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!((upserted, deleted), (vec![(Some(1), "b"), (None, "d")], vec!["c"]));
+    }
+
     /// Every lookup server.db's code prepares uses an index: none reads a
     /// whole table but those that read every row by design.
     #[test]
@@ -519,6 +589,8 @@ mod tests {
             "DELETE FROM oauth_clients WHERE client_id = ?1",
             "DELETE FROM auth_events WHERE seq IN (SELECT seq FROM auth_events WHERE at < ?1 ORDER BY at LIMIT ?2)",
             "DELETE FROM auth_events WHERE issuer = ?1 AND subject = ?2",
+            "DELETE FROM auth_events WHERE kind = 'client_registered' AND seq <= (SELECT seq FROM auth_events \
+             WHERE kind = 'client_registered' ORDER BY seq DESC LIMIT 1 OFFSET ?1)",
             "SELECT at FROM auth_events WHERE at >= ?1 AND (actor_key = ?2 OR (actor_key > ?3 AND actor_key < ?4)) \
              ORDER BY seq DESC LIMIT ?5",
         ];

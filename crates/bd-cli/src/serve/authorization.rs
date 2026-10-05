@@ -63,7 +63,9 @@ pub(super) async fn register_client(server: &Arc<Server>, req: Request<Incoming>
         }
         Ok(Some(Err((error, why)))) => oauth_error(StatusCode::BAD_REQUEST, error, &why),
         Ok(None) => Reject::new(StatusCode::NOT_FOUND, "not_found", "no such authorization server", 3).response(),
-        Err(Error::Busy(why)) => oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", &why),
+        Err(Error::Busy(why) | Error::Locked(why)) => {
+            oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", &why)
+        }
         Err(e) => {
             tracing::error!(target: "bd::serve", error = %e, "registering an OAuth client");
             let why = "the server could not register the client; see the server log";
@@ -179,7 +181,7 @@ pub(super) async fn account_events(server: &Arc<Server>, req: Request<Incoming>)
             Reject::new(StatusCode::NOT_FOUND, "not_found", "no such endpoint", 3).response()
         }
         Err(Error::Invalid(why)) => Reject::new(StatusCode::BAD_REQUEST, "invalid", &why, 2).response(),
-        Err(e @ (Error::Remote(_) | Error::Busy(_))) => {
+        Err(e @ (Error::Remote(_) | Error::Busy(_) | Error::Locked(_))) => {
             tracing::warn!(target: "bd::serve", error = %e, "an account notification could not be handled now");
             Reject::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "try again later", 5).response()
         }

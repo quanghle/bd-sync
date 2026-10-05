@@ -224,8 +224,8 @@ server. `bd serve` refuses to start with `[oauth]` but no
 provider for a browser (GitHub without `client_secret_file`, and no OIDC
 provider), no such `--public-url`, or no redirect allowed; and with
 `client_secret_file` but no `[oauth]`. Like the rest of `auth.toml`,
-`[oauth]` is read again for each request, so it can be changed without a
-restart, or removed together with `client_secret_file` to turn the
+`[oauth]` is read again once the file, or a file it names, changes (and at
+least every 30 seconds), so it can be changed without a restart, or removed together with `client_secret_file` to turn the
 authorization server off: a `client_secret_file` left without `[oauth]` is
 a mistake that fails every GitHub sign-in and refresh, and the endpoints'
 metadata, until fixed.

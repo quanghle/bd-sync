@@ -219,7 +219,7 @@ pub fn redeem(root: &Path, flows: &Mutex<Flows>, request: Request) -> Result<Val
             tracing::info!(target: "bd::serve", login = %admitted.user.login, client = %code.client_id, "OAuth token refused: {why}");
             return Err(invalid_grant("the account may not get a token now"));
         }
-        Err(Error::Busy(why)) => {
+        Err(Error::Busy(why) | Error::Locked(why)) => {
             tracing::warn!(target: "bd::serve", "OAuth token not issued: {why}");
             return keep(&code, refusal(503, "temporarily_unavailable", "the server is busy; retry"));
         }
@@ -281,7 +281,7 @@ pub fn refresh(root: &Path, request: Request) -> Result<Value, Refusal> {
             tracing::info!(target: "bd::serve", %client, token = %token.name, "OAuth token not refreshed: {why}");
             Err(invalid_grant("the refresh token is not valid any more: authorize again"))
         }
-        Err(Error::Remote(why) | Error::Busy(why)) => {
+        Err(Error::Remote(why) | Error::Busy(why) | Error::Locked(why)) => {
             tracing::warn!(target: "bd::serve", %client, token = %token.name, "OAuth token not refreshed: {why}");
             Err(refusal(503, "temporarily_unavailable", "the server could not refresh the token now; retry later"))
         }
@@ -311,7 +311,7 @@ pub fn revoke_named(root: &Path, body: &str) -> Result<(), Refusal> {
             tracing::info!(target: "bd::serve", %client, token = %token.name, actor = %token.actor, "OAuth token revoked by its client");
             Ok(())
         }
-        Err(Error::Busy(why)) => {
+        Err(Error::Busy(why) | Error::Locked(why)) => {
             tracing::warn!(target: "bd::serve", "OAuth token not revoked: {why}");
             Err(refusal(503, "temporarily_unavailable", "the server is busy; retry"))
         }
@@ -324,6 +324,48 @@ mod tests {
     use super::*;
 
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+    #[test]
+    fn a_refresh_the_server_cannot_decide_now_is_answered_503_and_revokes_nothing() {
+        // The authorizer cannot be asked (no such command), past any grace: try again later, the sign-in stays.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(crate::oauth::FILE),
+            "[github]\nclient_id = \"x\"\n[authorizer]\ncommand = [\"./no-such-authorizer\"]\n",
+        )
+        .unwrap();
+        let user = crate::auth::Identity {
+            provider: "github".into(),
+            issuer: "https://github.com".into(),
+            subject: "1".into(),
+            login: "alice".into(),
+        };
+        let grant = crate::auth::Grant {
+            role: crate::auth::Role::Write,
+            kind: crate::auth::Kind::Agent,
+            workspaces: vec![],
+            max_claims: None,
+        };
+        let week = std::time::Duration::from_secs(7 * 24 * 3600);
+        let life = crate::auth::Lifetime {
+            ttl: std::time::Duration::from_secs(3600),
+            refresh: Some((Timestamp::now().plus(week * 4), week)),
+            rule: None,
+        };
+        let client =
+            crate::auth::ForClient { id: "https://app.example/client", resource: "https://bd.example.com/w/proj/mcp" };
+        let issued = crate::auth::issue_client_token(dir.path(), &user, grant, life, client, true).unwrap();
+        let request = Request::Refresh {
+            secret: issued.refresh_secret.unwrap(),
+            client_id: Some(client.id.into()),
+            resource: None,
+        };
+        let refusal = refresh(dir.path(), request).unwrap_err();
+        let shown = format!("{refusal:?}");
+        assert!(shown.contains("503") && shown.contains("temporarily_unavailable"), "{shown}");
+        let still = crate::auth::find_by_secret(dir.path(), &issued.secret).unwrap();
+        assert!(still.is_some(), "not revoked");
+    }
 
     #[test]
     fn token_requests_are_checked_for_form() {

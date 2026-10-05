@@ -85,7 +85,7 @@ fn poll_oidc(root: &Path, sign_in: &SignIn, provider: &str, poll: &SignInPoll) -
     let claims = oidc.verify(&md, id_token, None)?;
     // The provider gives a code's token once, so a poll sent again would find it gone: not busy, ended.
     let admitted = admit_oidc(root, sign_in, oidc, &claims, &poll.workspace, None).map_err(|e| match e {
-        Error::Busy(why) => Error::Remote(why),
+        Error::Busy(why) | Error::Locked(why) => Error::Remote(why),
         e => e,
     })?;
     let Admitted { user, grant, via, by_login, rule, .. } = admitted;
@@ -150,7 +150,7 @@ pub fn poll(root: &Path, provider: &str, poll: &SignInPoll) -> Result<SignInAnsw
     };
     // GitHub gave the code's token once, so a poll sent again would find the sign-in gone: not busy, ended.
     let admitted = admit(root, &sign_in, &api, access, &poll.workspace, None, &mut None).map_err(|e| match e {
-        Error::Busy(why) => Error::Remote(why),
+        Error::Busy(why) | Error::Locked(why) => Error::Remote(why),
         e => e,
     });
     let Admitted { user, grant, via, by_login, unknown, rule, .. } = admitted?;

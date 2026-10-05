@@ -18,7 +18,7 @@ global options, environment variables, configuration keys and exit codes.
 | Playbooks and gates | `playbook list/show/plan/run/status/runs/compact/discard/extract`, `gate list/show/check/resolve/create`, `purge` | [Playbooks](playbooks.md) |
 | Data | `export`, `import` (bd or beads JSONL, all or nothing), `batch` (many writes in one transaction, `--dry-run` rolls back), `backup --to DIR` (a verified copy of a local workspace's database; the newest `--keep` are kept) | [Migrating](beads.md#migrating-from-go-beads), [Backups](modes.md#backing-up-a-local-workspace) |
 | Operations | `metrics`, `bench` | [Observability](observability.md), [Benchmarks](benchmarks.md) |
-| Remote | `serve`, `serve token create/list/revoke/accounts`, `remote set/show/unset/login/logout` | [Remote server](remote.md) |
+| Remote | `serve`, `serve check`, `serve token create/list/revoke/accounts/events/link/name` (`revoke --account/--client/--forget`), `remote set/show/unset/login/logout` | [Remote server](remote.md), [MCP sign-in](mcp.md#signing-in-with-oauth) |
 
 ## Global options
 
@@ -49,6 +49,7 @@ Besides the variables of the global options:
 | `BD_PLAYBOOK_PATH` | extra playbook directories, colon separated (semicolons on Windows) ([Playbooks](playbooks.md#writing-a-playbook)) |
 | `BD_GH` | the `gh` binary GitHub gates run ([Gates](playbooks.md#gates)) |
 | `BD_TOKEN`, `BD_CA_CERT`, `BD_REMOTE_RETRY_SECS`, `BD_INSECURE_HTTP` | remote clients ([Clients](remote.md#clients)) |
+| `BD_SERVE_ROOT`, `BD_SERVE_PUBLIC_URL` | `bd serve token ...` and `bd serve check`'s `--root`, `bd serve`'s and `bd serve check`'s `--public-url` ([Remote server](remote.md)) |
 
 ## Configuration (`bd config list|get|set|unset`)
 

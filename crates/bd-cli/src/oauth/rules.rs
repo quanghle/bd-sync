@@ -112,7 +112,10 @@ pub(crate) fn deny_list(table: &str, deny: Vec<String>, proves: Proves) -> std::
 
 fn subject_ok(s: &str, proves: Proves) -> bool {
     match proves {
-        Proves::Github => !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit()),
+        // As GitHub writes ids, which subjects are compared with as text: `0042` would never match user 42.
+        Proves::Github => {
+            !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit()) && !s.starts_with('0')
+        }
         Proves::Oidc => !s.is_empty() && s.len() <= 255 && s.chars().all(|c| !c.is_control() && !c.is_whitespace()),
     }
 }
@@ -356,8 +359,10 @@ pub struct Decided {
 /// The workspaces rules before the one that decides let an account into:
 /// that rule's grant then covers the workspace asked for alone, and, with
 /// none deciding, they are where it may go instead.
+/// With `maybe`, a rule for other workspaces that might have let it in (the
+/// provider would not tell): the deciding grant is narrowed all the same.
 #[derive(Default)]
-struct Elsewhere(Vec<String>);
+struct Elsewhere(Vec<String>, bool);
 
 impl Elsewhere {
     fn note(&mut self, grant: &Grant) {
@@ -370,7 +375,7 @@ impl Elsewhere {
 
     fn grant(&self, grant: &Grant, workspace: &str) -> Grant {
         let mut grant = grant.clone();
-        if !self.0.is_empty() {
+        if !self.0.is_empty() || self.1 {
             grant.workspaces = vec![workspace.to_string()];
         }
         grant
@@ -390,9 +395,13 @@ pub fn decide(rules: &[Rule], facts: &mut dyn Facts, kept: Option<&str>, workspa
     for rule in rules {
         let before = unknown.len();
         let Some((via, by_login)) = lets_in(rule, facts, kept, &mut unknown)? else {
-            // Not knowing is not "no": a rule further down may grant more than this one would have.
-            if unknown.len() > before && rule.grant.allows_workspace(workspace) {
-                return Ok(Decided { decision: Decision::Unknown, rule: None, unknown });
+            // Not knowing is not "no": a rule further down may grant more than this one would have, here or (were it
+            // to let the account in elsewhere) in workspaces this one decides.
+            if unknown.len() > before {
+                if rule.grant.allows_workspace(workspace) {
+                    return Ok(Decided { decision: Decision::Unknown, rule: None, unknown });
+                }
+                elsewhere.1 = true;
             }
             continue;
         };

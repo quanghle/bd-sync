@@ -10,6 +10,7 @@ pub mod authorizer;
 pub mod follow;
 pub mod jobs;
 pub mod mcp_http;
+pub mod metrics;
 pub mod oauth;
 pub mod oauth_server;
 pub mod oidc;

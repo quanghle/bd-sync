@@ -77,6 +77,7 @@ use crate::auth::{self, Role, Token, Verified, Verifier};
 use crate::follow::{self, Feeds, HeadReader, Subscription};
 use crate::jobs;
 use crate::mcp_http;
+use crate::metrics;
 use crate::oauth_server::{authorize, cimd, pages, token};
 use crate::stream::{FrameWriter, Limits, ResponseBody, Stalls};
 use crate::{oauth, oauth_server};
@@ -355,11 +356,47 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     Some(secret.trim()).filter(|s| scheme.eq_ignore_ascii_case("bearer") && !s.is_empty())
 }
 
-fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Token, Reject> {
+/// The address a request's connection came from (a proxy's, behind one).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Peer(pub(super) std::net::IpAddr);
+
+/// When and from where (a proxy's address, behind one) a request came.
+pub(super) struct Received {
+    pub(super) at: Instant,
+    pub(super) peer: Option<std::net::IpAddr>,
+}
+
+/// The [`Peer`] of a request.
+fn peer(extensions: &hyper::http::Extensions) -> Option<std::net::IpAddr> {
+    extensions.get::<Peer>().map(|p| p.0)
+}
+
+/// Log a request refused for its access token, or for what its token may
+/// not do: from where, with which token (by name, never its secret), and
+/// why. Requests without a token are not logged: MCP clients send one to
+/// learn where to get a token.
+fn log_refused(
+    counter: &metrics::Counter,
+    peer: Option<std::net::IpAddr>,
+    token: Option<&str>,
+    workspace: Option<&str>,
+    why: &str,
+) {
+    counter.add();
+    let peer = peer.map(tracing::field::display);
+    tracing::info!(target: "bd::serve", peer, token, workspace, %why, "request refused");
+}
+
+fn authenticate(
+    server: &Server,
+    headers: &HeaderMap,
+    peer: Option<std::net::IpAddr>,
+) -> std::result::Result<Token, Reject> {
     let secret = bearer(headers).ok_or_else(denied)?;
     match server.tokens.verify(secret) {
         Ok(Verified::Valid(token)) => Ok(token),
         Ok(Verified::Expired(token)) => {
+            log_refused(&metrics::REFUSED_EXPIRED_TOKEN, peer, Some(&token.name), None, "access token expired");
             let at = token.expires_at.map(|t| t.to_rfc3339()).unwrap_or_default();
             let renew = match &token.identity {
                 Some(g) => format!("sign in again: `bd remote login --provider {}`", g.provider),
@@ -368,7 +405,10 @@ fn authenticate(server: &Server, headers: &HeaderMap) -> std::result::Result<Tok
             let msg = format!("access token {} expired at {at}; {renew}", token.name);
             Err(Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7))
         }
-        Ok(Verified::Unknown) => Err(denied()),
+        Ok(Verified::Unknown) => {
+            log_refused(&metrics::REFUSED_UNKNOWN_TOKEN, peer, None, None, "unknown access token");
+            Err(denied())
+        }
         Err(Error::Busy(_) | Error::Locked(_)) => Err(Reject::busy("checking access tokens")),
         Err(e) => Err(Reject::internal(e)),
     }
@@ -832,10 +872,11 @@ impl Server {
         ws: &Workspace,
         token: &Token,
         request: ExecRequest,
-        started: Instant,
+        received: Received,
         waited: Option<Waited>,
         mut out: FrameWriter,
     ) -> std::result::Result<(), Reject> {
+        let request_id = request.request_id.clone();
         let mut cli = match Cli::try_parse_from(std::iter::once("bd".to_string()).chain(request.argv.iter().cloned())) {
             Ok(cli) => cli,
             Err(e) => return respond(&mut out, &parse_failure(&e)),
@@ -847,7 +888,16 @@ impl Server {
         let name = bd_cli::command_name(&cli.command);
         let (access, resolved) = match authorize(&cli, token, request.actor.as_deref(), request.session.as_deref()) {
             Ok(a) => a,
-            Err(e) => return respond(&mut out, &failure(&e, json)),
+            Err(e) => {
+                log_refused(
+                    &metrics::REFUSED_FORBIDDEN,
+                    received.peer,
+                    Some(&token.name),
+                    Some(&ws.name),
+                    &e.to_string(),
+                );
+                return respond(&mut out, &failure(&e, json));
+            }
         };
         let actor = resolved.actor.clone();
         // A write is applied once per request id; a retry replays its response.
@@ -923,6 +973,7 @@ impl Server {
                 5,
             ));
         }
+        metrics::COMMANDS.add();
         tracing::info!(
             target: "bd::serve",
             workspace = %ws.name,
@@ -931,7 +982,9 @@ impl Server {
             command = name,
             exit_code,
             bytes = sent.bytes,
-            ms = started.elapsed().as_millis() as u64,
+            ms = received.at.elapsed().as_millis() as u64,
+            peer = received.peer.map(tracing::field::display),
+            request = request_id.as_deref(),
             waited_ms = waited.map(|w| w.took.as_millis() as u64),
             "exec"
         );

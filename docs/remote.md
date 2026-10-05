@@ -526,7 +526,8 @@ response:
 `role` defaults to read and `kind` to agent; the token covers the
 workspace asked about. `via` is shown on the consent page as what let the
 account in (plain text, 100 characters at most); `reason`, for a refusal
-too (`{"allow": false, "reason": "..."}`), goes to the server log only: the
+too (`{"allow": false, "reason": "..."}`), goes to the server log only (emails
+in it replaced by `<email>`): the
 person is told only that the account may not use the workspace.
 
 - **Fail closed.** No answer within `timeout`, a command that exits
@@ -534,7 +535,7 @@ person is told only that the account may not use the workspace.
   not one JSON object of these fields (64 KiB at most) lets no one in. A
   sign-in then fails (`bd remote login` says to sign in again in a moment;
   an MCP client's browser gets a page to try again from), and the server log
-  says why, with the command's stderr. At most 8 are asked at once.
+  says why, with the command's stderr (emails in it replaced by `<email>`). At most 8 are asked at once.
 - **Caps.** It can grant no more than `auth.toml` allows: a role above
   `max_role`, kind `human` without `human = true`, or more `max_claims` than
   the cap refuses the account, and the log says so. A cap of `max_claims`

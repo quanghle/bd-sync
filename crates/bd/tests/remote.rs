@@ -2121,7 +2121,7 @@ fn oversized_requests_are_refused_before_their_body_is_read() {
 }
 
 #[test]
-fn server_log_is_plain_text_with_one_line_per_request() {
+fn server_log_is_plain_text_with_one_line_per_request_and_refusal() {
     let root = Server::prepare();
     let secret = create_token(root.path(), "alice-laptop", "alice", &[]);
     let log = root.path().join("server.log");
@@ -2138,10 +2138,20 @@ fn server_log_is_plain_text_with_one_line_per_request() {
     BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
     let base = line.split_whitespace().find(|w| w.starts_with("http")).unwrap().to_string();
     let server = KillOnDrop::new(child);
-    let alice = Client { dir: tempfile::tempdir().unwrap(), url: format!("{base}/w/proj"), token: secret, ca: None };
+    let alice =
+        Client { dir: tempfile::tempdir().unwrap(), url: format!("{base}/w/proj"), token: secret.clone(), ca: None };
     alice.ok(&["create", "Logged"]);
+    // Refusals are logged too: an unknown token, by where it came from, and a known one asking more than it may.
+    let guessed = "bd_0123456789abcdef0123456789abcdef";
+    let stranger =
+        Client { dir: tempfile::tempdir().unwrap(), url: format!("{base}/w/proj"), token: guessed.into(), ca: None };
+    assert_eq!(stranger.code(&["list"]), 7);
+    assert_eq!(alice.code(&["--actor", "bob", "create", "Not as bob"]), 7);
     // The answer may reach the client before the server logs the request.
-    eventually("the request's log line", || std::fs::read_to_string(&log).unwrap().contains(" exec "));
+    eventually("the requests' log lines", || {
+        let text = std::fs::read_to_string(&log).unwrap();
+        text.contains(" exec ") && text.matches("request refused").count() == 2
+    });
     drop(server);
 
     let text = std::fs::read_to_string(&log).unwrap();
@@ -2150,6 +2160,17 @@ fn server_log_is_plain_text_with_one_line_per_request() {
     let exec: Vec<&str> = text.lines().filter(|l| l.contains("bd::serve") && l.contains(" exec ")).collect();
     assert_eq!(exec.len(), 1, "{text}");
     assert!(exec[0].contains("token=alice-laptop") && exec[0].contains("exit_code=0"), "{}", exec[0]);
+    assert!(exec[0].contains("peer=127.0.0.1") && exec[0].contains("request="), "{}", exec[0]);
+    let refused: Vec<&str> = text.lines().filter(|l| l.contains("request refused")).collect();
+    assert!(refused[0].contains("peer=127.0.0.1") && refused[0].contains("unknown access token"), "{}", refused[0]);
+    assert!(
+        refused[1].contains(r#"token="alice-laptop""#)
+            && refused[1].contains(r#"workspace="proj""#)
+            && refused[1].contains("not bob"),
+        "{}",
+        refused[1]
+    );
+    assert!(!text.contains(guessed) && !text.contains(&secret), "never a secret: {text}");
 }
 
 /// Poll until `done` holds, with a deadline generous enough for loaded CI machines.
@@ -7672,6 +7693,41 @@ fn get_json(base: &str, path: &str) -> (u16, Value) {
     let mut r = agent.get(format!("{base}{path}")).call().unwrap();
     let text = r.body_mut().read_to_string().unwrap();
     (r.status().as_u16(), serde_json::from_str(&text).unwrap_or(Value::Null))
+}
+
+#[test]
+fn metrics_count_answers_and_refusals_for_admin_tokens_only() {
+    let server = Server::start();
+    let alice = server.token("alice-laptop", "alice", &[]);
+    let ops = server.token("ops", "ops", &["--role", "admin"]);
+    server.client(&alice).ok(&["create", "Counted"]);
+    let mut stranger = server.client("");
+    stranger.token = "bdt_wrong".into();
+    assert_eq!(stranger.code(&["list"]), 7);
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let metrics = |secret: &str| {
+        let mut request = agent.get(format!("{}/metrics", server.base));
+        if !secret.is_empty() {
+            request = request.header("authorization", format!("Bearer {secret}"));
+        }
+        let mut r = request.call().unwrap();
+        (r.status().as_u16(), r.body_mut().read_to_string().unwrap())
+    };
+    assert_eq!(metrics("").0, 401, "no token");
+    assert_eq!(metrics(&alice).0, 403, "not an admin token");
+    let (status, text) = metrics(&ops);
+    assert_eq!(status, 200, "{text}");
+    let value = |series: &str| -> u64 {
+        let line =
+            text.lines().find(|l| l.starts_with(&format!("{series} "))).unwrap_or_else(|| panic!("{series}: {text}"));
+        line.rsplit(' ').next().unwrap().parse().unwrap()
+    };
+    assert!(value("bd_serve_commands_total") >= 1, "{text}");
+    assert!(value("bd_serve_refused_total{reason=\"unknown_token\"}") >= 1, "{text}");
+    assert!(value("bd_serve_refused_total{reason=\"forbidden\"}") >= 1, "alice at /metrics: {text}");
+    assert!(value("bd_serve_responses_total{class=\"4xx\"}") >= 2, "{text}");
+    assert!(value("bd_serve_connections_open") >= 1, "{text}");
+    assert!(!text.contains("alice") && !text.contains("127.0.0.1"), "counts only, nothing that names anyone: {text}");
 }
 
 fn challenge_of(headers: &ureq::http::HeaderMap) -> String {

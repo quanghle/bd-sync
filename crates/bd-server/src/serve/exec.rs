@@ -6,7 +6,7 @@ use super::*;
 pub(super) async fn exec(server: &Arc<Server>, workspace: String, req: Request<Incoming>) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let mut body = Some(body);
-    let response = command(server, workspace, &parts.headers, &mut body).await;
+    let response = command(server, workspace, &parts.headers, peer(&parts.extensions), &mut body).await;
     drained(body, response).await
 }
 
@@ -15,19 +15,22 @@ async fn command(
     server: &Arc<Server>,
     workspace: String,
     headers: &hyper::HeaderMap,
+    peer: Option<std::net::IpAddr>,
     body: &mut Option<Incoming>,
 ) -> Response<Body> {
     let started = Instant::now();
-    let token = match authenticate(server, headers) {
+    let token = match authenticate(server, headers, peer) {
         Ok(t) => t,
         Err(r) => return r.response(),
     };
     if let Some(resource) = &token.resource {
         let msg = format!("access token {} works only at MCP endpoint {resource}", token.name);
+        log_refused(&metrics::REFUSED_FORBIDDEN, peer, Some(&token.name), Some(&workspace), &msg);
         return Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7).response();
     }
     if !token.allows_workspace(&workspace) {
         let msg = format!("access token {} may not use workspace {workspace}", token.name);
+        log_refused(&metrics::REFUSED_FORBIDDEN, peer, Some(&token.name), Some(&workspace), &msg);
         return Reject::new(StatusCode::FORBIDDEN, "unauthorized", msg, 7).response();
     }
     let Some(ws) = server.workspace(&workspace) else {
@@ -106,8 +109,11 @@ async fn command(
     let job = tokio::task::spawn_blocking(move || {
         // Held until the command finishes, even if the client goes away meanwhile.
         let _held = (slot, budget, planning);
-        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| srv.run(&ws, &token, request, started, waited, out)));
+        let ran = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            srv.run(&ws, &token, request, Received { at: started, peer }, waited, out)
+        }));
         ran.unwrap_or_else(|_| {
+            metrics::PANICS.add();
             tracing::error!(target: "bd::serve", workspace = %ws.name, "command panicked");
             Err(Reject::failed())
         })

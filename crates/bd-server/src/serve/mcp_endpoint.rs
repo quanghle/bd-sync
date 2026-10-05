@@ -57,7 +57,8 @@ async fn message(
     if let Err(a) = mcp_http::check_origin(&parts.headers) {
         return mcp_response(a, None);
     }
-    let token = match authenticate(server, &parts.headers) {
+    let peer = peer(&parts.extensions);
+    let token = match authenticate(server, &parts.headers, peer) {
         Ok(t) => t,
         Err(r) if r.status == StatusCode::UNAUTHORIZED => {
             // A request without a token learns where to get one, with no error (RFC 6750).
@@ -68,11 +69,13 @@ async fn message(
     };
     if let Some(bound) = token.resource.as_ref().filter(|bound| endpoint.resource.as_ref() != Some(*bound)) {
         let msg = format!("access token {} works only at MCP endpoint {bound}", token.name);
+        log_refused(&metrics::REFUSED_FORBIDDEN, peer, Some(&token.name), Some(&endpoint.workspace), &msg);
         return endpoint
             .challenge(Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7), Some("invalid_token"));
     }
     if !token.allows_workspace(&endpoint.workspace) {
         let msg = format!("access token {} may not use workspace {}", token.name, endpoint.workspace);
+        log_refused(&metrics::REFUSED_FORBIDDEN, peer, Some(&token.name), Some(&endpoint.workspace), &msg);
         let reject = Reject::new(StatusCode::FORBIDDEN, "unauthorized", msg, 7);
         return endpoint.challenge(reject, Some("insufficient_scope"));
     }
@@ -126,13 +129,16 @@ async fn message(
     let job = tokio::task::spawn_blocking(move || {
         // The answer's share is held until it is sent; the body's, and the slot, until the message is answered.
         let _held = (slot, budget);
-        let runner = ToolRunner { server: &srv, ws: &ws, token: &token, session: &session };
+        let runner = ToolRunner { server: &srv, ws: &ws, token: &token, session: &session, peer };
         let mut mcp = mcp::Server::for_request(runner, token.role == Role::Read);
         let answer = std::panic::catch_unwind(AssertUnwindSafe(|| {
             mcp_response(mcp_http::answer_message(&mut mcp, &parts.headers, &message), answer_budget)
         }));
         tracing::debug!(target: "bd::serve", workspace = %ws.name, token = %token.name, ms = started.elapsed().as_millis() as u64, "mcp message");
-        answer.map_err(|_| tracing::error!(target: "bd::serve", workspace = %ws.name, "MCP request panicked"))
+        answer.map_err(|_| {
+            metrics::PANICS.add();
+            tracing::error!(target: "bd::serve", workspace = %ws.name, "MCP request panicked")
+        })
     });
     match job.await {
         Ok(Ok(response)) => response,
@@ -176,6 +182,7 @@ pub(super) struct ToolRunner<'a> {
     pub(super) ws: &'a Workspace,
     pub(super) token: &'a Token,
     pub(super) session: &'a str,
+    pub(super) peer: Option<std::net::IpAddr>,
 }
 
 impl mcp::Runner for ToolRunner<'_> {
@@ -183,7 +190,15 @@ impl mcp::Runner for ToolRunner<'_> {
         let started = Instant::now();
         let cli = Cli::try_parse_from(std::iter::once("bd").chain(argv.iter().map(String::as_str)))
             .map_err(|e| Error::invalid(e.to_string().lines().next().unwrap_or("invalid command line").to_string()))?;
-        let (access, resolved) = authorize(&cli, self.token, None, Some(self.session))?;
+        let (access, resolved) = authorize(&cli, self.token, None, Some(self.session)).inspect_err(|e| {
+            log_refused(
+                &metrics::REFUSED_FORBIDDEN,
+                self.peer,
+                Some(&self.token.name),
+                Some(&self.ws.name),
+                &e.to_string(),
+            )
+        })?;
         let actor = resolved.actor.clone();
         let mut app = self.server.open_app(self.ws, self.token, &cli.global, resolved)?;
         // A model's tool calls never carry a person's rights: no admin-only
@@ -201,6 +216,7 @@ impl mcp::Runner for ToolRunner<'_> {
             self.server.feeds.committed(&self.ws.name);
         }
         self.server.close_app(self.ws, self.token, &mut app);
+        metrics::TOOL_CALLS.add();
         tracing::info!(
             target: "bd::serve",
             workspace = %self.ws.name,
@@ -209,6 +225,7 @@ impl mcp::Runner for ToolRunner<'_> {
             command = bd_cli::command_name(&cli.command),
             exit_code,
             ms = started.elapsed().as_millis() as u64,
+            peer = self.peer.map(tracing::field::display),
             "mcp tool call"
         );
         let stdout = String::from_utf8_lossy(buffer.borrow().output()?).into_owned();

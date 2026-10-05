@@ -71,6 +71,14 @@ pub(super) async fn handle(
     let oauth = oauth_endpoint(&server, &path);
     let response = if path == "/healthz" && req.method() == Method::GET {
         response(StatusCode::OK, "text/plain", Body::whole(Bytes::from_static(b"ok\n")))
+    } else if path == "/metrics" {
+        if req.method() == Method::GET {
+            metrics_page(&server, &req)
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET"));
+            r
+        }
     } else if let Some(workspace) = exec_path(&path) {
         if req.method() == Method::POST {
             exec(&server, workspace.to_string(), req).await
@@ -187,5 +195,28 @@ pub(super) async fn handle(
         let msg = format!("no such endpoint; workspaces are at /w/<name>/v{PROTOCOL}/exec");
         Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response()
     };
+    metrics::answered(response.status().as_u16());
     Ok(response)
+}
+
+/// `GET /metrics`: the server's counters ([`metrics`]), for admin tokens
+/// only, as they tell how busy the server is and how often it is refused.
+fn metrics_page(server: &Server, req: &Request<Incoming>) -> Response<Body> {
+    let token = match authenticate(server, req.headers(), peer(req.extensions())) {
+        Ok(t) => t,
+        Err(r) => return r.response(),
+    };
+    if let Some(resource) = &token.resource {
+        let msg = format!("access token {} works only at MCP endpoint {resource}", token.name);
+        log_refused(&metrics::REFUSED_FORBIDDEN, peer(req.extensions()), Some(&token.name), None, &msg);
+        return Reject::new(StatusCode::UNAUTHORIZED, "unauthorized", msg, 7).response();
+    }
+    if token.role != Role::Admin {
+        let msg = format!("access token {} is not an admin token; /metrics needs one", token.name);
+        log_refused(&metrics::REFUSED_FORBIDDEN, peer(req.extensions()), Some(&token.name), None, &msg);
+        return Reject::new(StatusCode::FORBIDDEN, "unauthorized", msg, 7).response();
+    }
+    let mut r = response(StatusCode::OK, "text/plain; version=0.0.4", Body::whole(Bytes::from(metrics::render())));
+    r.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    r
 }

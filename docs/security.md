@@ -192,10 +192,18 @@ and the GDPR's data minimization (Art. 5(1)(c)) are the guide.
 - **Logs.** `bd serve` logs sign-ins, refreshes, refusals and revocations
   with the provider, the account's subject and login (a user name or a
   pseudonym), its actor and token names, and never a secret, a token's
-  hash, or an email. An authorizer's refusal reasons and stderr go to the
-  log as it wrote them, so an authorizer should not write emails there
-  either. Keep logs only as long as needed (OWASP Logging Cheat Sheet,
-  ASVS 16.1.1), readable by the admin only.
+  hash, or an email. An account erased (`--forget`, or deleted at its
+  provider) is not named by its subject as it is erased, and a sign-in
+  refused because another account holds its actor names that account by
+  its actor only. An authorizer's refusal reasons and stderr are logged
+  with anything shaped like an email replaced by `<email>`; still, an
+  authorizer should not write emails there. The IP address a connection
+  came from (a proxy's, behind one) is on each request line, on requests
+  refused for their access token, on connections refused over the
+  connection limits and, at `debug`, on TLS and connection failures.
+  `GET /metrics` (admin tokens only) holds counts, never who. Keep logs
+  only as long as needed (OWASP Logging Cheat Sheet, ASVS 16.1.1),
+  readable by the admin only.
 - **At rest.** Encryption at rest is a choice for the threat model (GDPR
   Art. 32; OWASP Cryptographic Storage). bd relies on file permissions:
   `server.db` is created 0600, and `bd serve` warns if its root is open to

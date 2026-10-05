@@ -191,10 +191,11 @@ pub fn account_event(root: &Path, provider: &str, body: &[u8]) -> Result<()> {
         }
         crate::oidc::AccountChange::Deleted => {
             let known = auth::forget_account(root, &oidc.issuer, subject)?;
-            tracing::info!(target: "bd::serve", %provider, %subject, known, "an account was deleted at its provider: forgotten");
+            // Not by its subject: the account is erased from server.db, and the log must not keep what it no longer does.
+            tracing::info!(target: "bd::serve", %provider, known, "an account was deleted at its provider: forgotten");
         }
         crate::oidc::AccountChange::Other(kind) => {
-            tracing::debug!(target: "bd::serve", %provider, %subject, %kind, "an account notification needs nothing done");
+            tracing::debug!(target: "bd::serve", %provider, %kind, "an account notification needs nothing done");
         }
     }
     Ok(())

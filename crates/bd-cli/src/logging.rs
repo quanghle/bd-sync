@@ -31,6 +31,33 @@ pub fn init(format: LogFormat, default_filter: &str) {
     };
 }
 
+/// Log panics as errors (target `bd::panic`), with their message, where
+/// they happened and, with `RUST_BACKTRACE`, a backtrace, instead of the
+/// default hook's plain text: `bd serve` catches a command's panic and goes
+/// on, and its log stays one entry a line (JSON too) with the panic in it.
+pub fn log_panics() {
+    std::panic::set_hook(Box::new(log_panic));
+}
+
+fn log_panic(info: &std::panic::PanicHookInfo<'_>) {
+    let payload = info.payload();
+    let message = (payload.downcast_ref::<&str>().copied())
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("(no message)");
+    let location = info.location().map(|l| format!("{}:{}", l.file(), l.line()));
+    let thread = std::thread::current();
+    let backtrace = std::backtrace::Backtrace::capture();
+    let backtrace = (backtrace.status() == std::backtrace::BacktraceStatus::Captured).then(|| backtrace.to_string());
+    tracing::error!(
+        target: "bd::panic",
+        panic = message,
+        location = location.as_deref(),
+        thread = thread.name(),
+        backtrace = backtrace.as_deref(),
+        "panicked"
+    );
+}
+
 /// Text logs' fields, every control character escaped: values from requests
 /// (a client ID, a redirect URI) are logged, and a newline in one must not
 /// start a line of its own, passing for another entry (log injection). The
@@ -121,6 +148,25 @@ mod tests {
         assert_eq!(text.matches('\n').count(), 1, "one entry, one line: {text}");
         assert!(text.contains(r"client=x\n2026-10-04T00:00:00Z  INFO bd::serve: forged\r\u{1b}[31m"), "{text}");
         assert!(text.contains(r#"why="a\nb""#) && text.contains(r"refused\nhere"), "{text}");
+    }
+
+    #[test]
+    fn panics_are_logged_entries() {
+        let out = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = out.clone();
+        let subscriber = tracing_subscriber::fmt().with_writer(move || Sink(sink.clone())).json().finish();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(log_panic));
+        let caught = tracing::subscriber::with_default(subscriber, || {
+            std::panic::catch_unwind(|| panic!("broke on\nissue {}", 7))
+        });
+        std::panic::set_hook(previous);
+        assert!(caught.is_err());
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(entry["target"], "bd::panic", "{text}");
+        assert_eq!(entry["fields"]["panic"], "broke on\nissue 7", "{text}");
+        assert!(entry["fields"]["location"].as_str().unwrap().contains("logging.rs"), "{text}");
     }
 
     struct Sink(Arc<Mutex<Vec<u8>>>);

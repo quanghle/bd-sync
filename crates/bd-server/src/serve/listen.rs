@@ -4,7 +4,14 @@
 
 use super::*;
 
+/// Connections refused over a limit are warned of at most this often, with
+/// how many were left out (`skipped`); `/metrics` counts them all.
+static PEER_FULL: metrics::Throttle = metrics::Throttle::new(10_000);
+static SERVER_FULL: metrics::Throttle = metrics::Throttle::new(10_000);
+
 pub(super) fn run(a: &ServeArgs) -> Result<()> {
+    bd_cli::logging::log_panics();
+    metrics::start();
     let root = a.root.as_ref().ok_or_else(|| {
         Error::invalid(
             "bd serve needs --root DIR (or $BD_SERVE_ROOT): the directory holding <name>/.bd/bd.db workspaces",
@@ -240,17 +247,23 @@ pub(super) async fn serve(
             },
         };
         let Some(from_peer) = PeerSlot::take(&peers, peer.ip()) else {
-            tracing::warn!(target: "bd::serve", %peer, "too many connections from this address; closing this one");
+            metrics::CONNECTIONS_REFUSED_PEER.add();
+            if let Some(skipped) = PEER_FULL.pass() {
+                tracing::warn!(target: "bd::serve", %peer, skipped, "too many connections from this address; closing this one");
+            }
             continue;
         };
         let Ok(permit) = connections.clone().try_acquire_owned() else {
-            tracing::warn!(target: "bd::serve", %peer, "too many connections; closing this one");
+            metrics::CONNECTIONS_REFUSED_TOTAL.add();
+            if let Some(skipped) = SERVER_FULL.pass() {
+                tracing::warn!(target: "bd::serve", %peer, skipped, "too many connections; closing this one");
+            }
             continue;
         };
         let server = server.clone();
         let tls = tls.clone();
         tokio::spawn(async move {
-            let _permit = (permit, from_peer);
+            let _permit = (permit, from_peer, metrics::Open::counted());
             connection(server, stream, peer, tls).await;
         });
     }
@@ -273,7 +286,10 @@ pub(super) async fn serve(
 pub(super) async fn connection(server: Arc<Server>, stream: TcpStream, peer: SocketAddr, tls: Option<TlsAcceptor>) {
     let _ = stream.set_nodelay(true);
     let stream = Stalls::new(stream, WRITE_STALL);
-    let service = service_fn(move |req| handle(server.clone(), req));
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        req.extensions_mut().insert(Peer(peer.ip().to_canonical()));
+        handle(server.clone(), req)
+    });
     let mut http = http1::Builder::new();
     http.timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT).max_buf_size(READ_BUFFER);
     let served = match tls {

@@ -67,8 +67,8 @@ pub(super) fn bind(
             target: "bd::serve",
             login = %user.login,
             subject = %user.subject,
+            // The other account by its actor only, which the admin resolves it by: not its subject.
             actor = %other.actor,
-            bound_to = %other.subject,
             "sign-in refused: the login's actor belongs to another account"
         );
         let whose = match related(&other.actor, &wanted) {

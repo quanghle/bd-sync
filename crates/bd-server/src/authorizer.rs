@@ -366,13 +366,52 @@ impl Authorizer {
     }
 }
 
-/// `s` cut to `max` characters, for the log.
+/// `s` cut to `max` characters, for the log, its emails left out: the
+/// authorizer is sent the account's email, and its reasons and stderr may
+/// repeat it, while the log keeps none.
 fn clip(s: &str, max: usize) -> String {
-    let s: String = s.chars().filter(|c| !c.is_control()).collect();
+    let s: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let s = without_emails(&s);
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}…", &s[..i]),
         None => s,
     }
+}
+
+/// `s` with each word shaped like an email (`<local>@<domain>.<tld>`, words
+/// split at spaces, quotes, brackets and punctuation that addresses do not
+/// hold) replaced by `<email>`.
+fn without_emails(s: &str) -> String {
+    let apart = |c: char| c.is_whitespace() || "\"'`<>()[]{},;:=|\\".contains(c);
+    let email = |w: &str| {
+        let w = w.trim_end_matches(['.', '!', '?']);
+        w.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty() && !domain.contains('@') && domain.split('.').filter(|p| !p.is_empty()).count() >= 2
+        })
+    };
+    let mut out = String::with_capacity(s.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        if email(word) {
+            // Keep the sentence's own end.
+            let end = &word[word.trim_end_matches(['.', '!', '?']).len()..];
+            out.push_str("<email>");
+            out.push_str(end);
+        } else {
+            out.push_str(word);
+        }
+        word.clear();
+    };
+    for c in s.chars() {
+        if apart(c) {
+            flush(&mut word, &mut out);
+            out.push(c);
+        } else {
+            word.push(c);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
 }
 
 /// Run the command with `body` on its stdin: its stdout, if it exits 0
@@ -699,6 +738,17 @@ mod tests {
             let e = doc(bad).unwrap_err();
             assert!(e.contains(says), "{bad}: {e}");
         }
+    }
+
+    #[test]
+    fn logged_text_leaves_emails_out() {
+        assert_eq!(
+            clip("denied alice@example.com (\"bob.smith+bd@mail.example.org\"); see admin@x.io.", 500),
+            "denied <email> (\"<email>\"); see <email>."
+        );
+        assert_eq!(clip("user@localhost and @handle and a@b", 500), "user@localhost and @handle and a@b");
+        assert_eq!(clip("email=carol@example.com\nnext", 500), "email=<email> next");
+        assert_eq!(clip("aaaa x@y.zz", 6), "aaaa <…");
     }
 
     #[test]

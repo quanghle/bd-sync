@@ -364,6 +364,7 @@ async fn schedule(
             let (runner, done_tx) = (runner.clone(), done_tx.clone());
             tokio::task::spawn_blocking(move || {
                 let ok = std::panic::catch_unwind(AssertUnwindSafe(|| runner(&ws, job))).unwrap_or_else(|_| {
+                    crate::metrics::PANICS.add();
                     tracing::error!(target: "bd::serve", workspace = %ws.name, job = job.name(), "background job panicked");
                     false
                 });

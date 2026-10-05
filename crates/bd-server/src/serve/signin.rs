@@ -220,7 +220,16 @@ pub(super) async fn revoke_own(server: &Arc<Server>, req: Request<Incoming>) -> 
         Some(_) => None,
         None => match server.tokens.verify(&secret) {
             Ok(Verified::Valid(t) | Verified::Expired(t)) => Some(t),
-            Ok(Verified::Unknown) => return denied().response(),
+            Ok(Verified::Unknown) => {
+                log_refused(
+                    &metrics::REFUSED_UNKNOWN_TOKEN,
+                    peer(req.extensions()),
+                    None,
+                    None,
+                    "unknown access token",
+                );
+                return denied().response();
+            }
             Err(e) => return Reject::internal(e).response(),
         },
     };

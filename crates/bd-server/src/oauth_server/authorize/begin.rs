@@ -93,6 +93,12 @@ fn start(
     provider: &str,
     browser: &str,
 ) -> (Answer, Vec<String>) {
+    // Before the browser goes to the provider: a secret the sign-in will need and does not have now.
+    if sign_in.ready_for(provider, true).is_err() {
+        let link = request.error_url(cx.issuer, "temporarily_unavailable", "sign-in is unavailable just now");
+        let why = "Signing in isn't available just now. Try again in a moment.";
+        return (Answer::Page(pages::refusal(503, "Try again in a moment", why, Some(&link))), Vec::new());
+    }
     let secrets = (|| Ok::<_, Error>((auth::random_hex(16)?, auth::random_hex(32)?, auth::random_hex(16)?)))();
     let (state, verifier, nonce) = match secrets {
         Ok(s) => s,

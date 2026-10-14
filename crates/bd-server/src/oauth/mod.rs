@@ -30,6 +30,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::auth::{self, Grant, Identity, Kind, Role};
+use crate::secrets::{Pass, Source};
 use bd_cli::protocol::{Issued, SignInAnswer, SignInCode, SignInPoll};
 
 mod admit;
@@ -87,6 +88,9 @@ pub struct SignIn {
     pub authorizer: Option<crate::authorizer::Authorizer>,
     /// The authorization server for MCP clients, if `[oauth]` turns it on.
     pub oauth: Option<OauthConfig>,
+    /// The command fetching the secrets fields name (`[secrets]`,
+    /// `secrets.rs`), instead of files.
+    pub secrets: Option<crate::secrets::Secrets>,
 }
 
 impl SignIn {
@@ -121,21 +125,33 @@ impl SignIn {
         }
     }
 
-    /// The files holding secrets of sign-in, as written (relative to `root`
-    /// unless absolute): the GitHub App's key and client secret, OIDC
-    /// client secrets or the keys signing them, and the authorizer's token.
-    pub fn secret_files(&self, root: &Path) -> Vec<PathBuf> {
-        let mut files: Vec<&PathBuf> = Vec::new();
+    /// Where the secrets of sign-in come from: the GitHub App's key and
+    /// client secret, OIDC client secrets or the keys signing them, and the
+    /// authorizer's token.
+    fn secret_sources(&self) -> Vec<&Source> {
+        let mut sources: Vec<&Source> = Vec::new();
         if let Some(g) = &self.github {
-            files.extend(g.private_key.iter().chain(&g.client_secret_file));
+            sources.extend(g.private_key.iter().chain(&g.client_secret_file));
         }
-        files.extend(self.oidc.iter().flat_map(|o| o.secret_files()));
+        sources.extend(self.oidc.iter().flat_map(|o| o.secret_sources()));
         if let Some(crate::authorizer::How::Https { token_file: Some(f), .. }) =
             self.authorizer.as_ref().map(|a| &a.how)
         {
-            files.push(f);
+            sources.push(f);
         }
-        files.into_iter().map(|f| if f.is_relative() { root.join(f) } else { f.clone() }).collect()
+        sources
+    }
+
+    /// The files holding secrets of sign-in (relative to `root` unless
+    /// absolute).
+    pub fn secret_files(&self, root: &Path) -> Vec<PathBuf> {
+        let files = self.secret_sources().into_iter().filter_map(Source::path);
+        files.map(|f| if f.is_relative() { root.join(f) } else { f.to_path_buf() }).collect()
+    }
+
+    /// The secrets the `[secrets]` command fetches, by name.
+    pub fn secret_names(&self) -> std::collections::BTreeSet<String> {
+        self.secret_sources().into_iter().filter_map(Source::name).map(str::to_string).collect()
     }
 
     /// What the server offers, for a message: `it offers github and okta
@@ -168,6 +184,28 @@ impl SignIn {
         github.into_iter().chain(self.oidc.iter().map(|o| (o.name.as_str(), o.label.as_str()))).collect()
     }
 
+    /// Whether a sign-in with `provider` (in a browser if `web`) has every
+    /// secret it needs now: [`secret_unavailable`] for the first it lacks
+    /// (one the `[secrets]` command has not given), told before anyone is
+    /// sent to the provider or a provider's code is spent.
+    /// A provider it does not have passes: the caller refuses it as such.
+    pub fn ready_for(&self, provider: &str, web: bool) -> Result<()> {
+        // The provider's own secrets: the device flow needs no client secret from GitHub; the App's key serves
+        // refreshes, and says so there.
+        let own = match (provider, &self.github, self.oidc(provider)) {
+            ("github", Some(g), _) => match web && g.client_secret.is_none() && g.client_secret_file.is_some() {
+                true => Err(secret_unavailable("github.client_secret_file")),
+                false => Ok(()),
+            },
+            ("github", None, _) | (_, _, None) => return Ok(()),
+            (_, _, Some(o)) => o.ready(),
+        };
+        if let Some(a) = &self.authorizer {
+            a.ready()?;
+        }
+        own
+    }
+
     /// How long the tokens of a sign-in with `provider` at `now` last.
     pub fn lifetime(&self, now: Timestamp, provider: &str) -> auth::Lifetime {
         let refresh = self.refreshes(provider).then(|| (now.plus(self.refresh_limit), self.refresh_idle));
@@ -176,28 +214,118 @@ impl SignIn {
 }
 
 /// Sign-in as `<root>/auth.toml` configures it (`None` without the file):
-/// as last read, unless it or a secret file it names changed since.
+/// its settings, the secrets of its files read, and those of the
+/// `[secrets]` command filled in while an answer of it serves (left empty
+/// otherwise: a step that needs one says sign-in is unavailable,
+/// [`secret_unavailable`]). As last read, unless it or a file it names
+/// changed since, the command answered with other values, or its answer
+/// stopped serving. Never waits for the command, nor fails for it: a
+/// mistake in the file is `Error::Invalid`, as without `[secrets]`.
 pub fn load(root: &Path) -> Result<Option<SignIn>> {
     let fresh = |(file, seen): &(PathBuf, Option<Stamp>)| stamp(file) == *seen;
-    if let Some((sign_in, files, at)) = loaded().get(root)
-        && at.elapsed() < RELOAD_AT_LEAST
-        && files.iter().all(fresh)
+    if let Some(cached) = loaded().get(root)
+        && cached.at.elapsed() < RELOAD_AT_LEAST
+        && cached.files.iter().all(fresh)
+        && cached
+            .secrets
+            .is_none_or(|(g, until)| g == crate::secrets::generation(root) && until.is_none_or(|t| Instant::now() < t))
     {
-        return Ok(sign_in.clone());
+        return Ok(cached.sign_in.clone());
     }
-    // Stamped before reading: a change made while reading is seen at the next load.
+    // Each file stamped before it is read: a change made while reading is seen at the next load.
     let path = root.join(FILE);
     let before = stamp(&path);
-    let sign_in = load_files(root)?;
     let mut files = vec![(path, before)];
-    if let Some(s) = &sign_in {
-        // The CA file is no secret, but read with them: a change to it is seen too.
-        let ca = s.github.iter().filter_map(|g| g.ca_cert.as_ref());
-        let ca = ca.map(|f| if f.is_relative() { root.join(f) } else { f.clone() });
-        files.extend(s.secret_files(root).into_iter().chain(ca).map(|f| (f.clone(), stamp(&f))));
-    }
-    loaded().insert(root.to_path_buf(), (sign_in.clone(), files, Instant::now()));
+    let (sign_in, secrets) = load_files(root, &mut files)?;
+    let cached = Cached { sign_in: sign_in.clone(), files, at: Instant::now(), secrets };
+    loaded().insert(root.to_path_buf(), cached);
     Ok(sign_in)
+}
+
+/// [`load`] for `bd serve check`, the `[secrets]` command's first answer
+/// waited for: the settings, and why the command gave none.
+pub fn load_at_start(root: &Path) -> Result<(Option<SignIn>, Option<String>)> {
+    let Some(settings) = load(root)? else { return Ok((None, None)) };
+    let Some(wanted) = wanted(root, &settings) else { return Ok((Some(settings), None)) };
+    match crate::secrets::wait(root, reader(root), &wanted) {
+        Ok(()) => {
+            loaded().remove(root);
+            Ok((load(root)?, None))
+        }
+        Err(why) => Ok((Some(settings), Some(format!("{}: {why}", root.join(FILE).display())))),
+    }
+}
+
+/// At the server's start, after [`load`]: the `[secrets]` command's first
+/// answer, waited for in the background (the server serves meanwhile), and
+/// logged once it is had, or why not.
+pub fn report_first_answer(root: &Path) {
+    let Ok(Some(settings)) = load(root) else { return };
+    let Some(wanted) = wanted(root, &settings) else { return };
+    let root = root.to_path_buf();
+    let reported = std::thread::Builder::new().name("bd-secrets-start".into()).spawn(
+        move || match crate::secrets::wait(&root, reader(&root), &wanted) {
+            Ok(()) => tracing::info!(target: "bd::serve", "the [secrets] command answered: sign-in has its secrets"),
+            Err(why) => tracing::warn!(
+                target: "bd::serve",
+                error = %why,
+                "sign-in needing the [secrets] command's secrets is unavailable until it answers (asked again every \
+                 30s); everything else is served"
+            ),
+        },
+    );
+    if let Err(e) = reported {
+        tracing::warn!(target: "bd::serve", error = %e, "the [secrets] command's first answer will not be reported");
+    }
+}
+
+/// `<root>/auth.toml` read and checked now (`None` without it, or with no
+/// provider), no secret read.
+pub fn parse_file(root: &Path) -> Result<Option<SignIn>> {
+    let path = root.join(FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::invalid(format!("{}: {e}", path.display()))),
+    }
+}
+
+/// Why a step that needs the secret of `field`, which the `[secrets]`
+/// command has not given (no answer of it serves), cannot go on: sign-in is
+/// unavailable for now (`Error::Locked`: 503, try again). Logged at most
+/// once a minute; the command's own failures are logged as they come.
+pub(crate) fn secret_unavailable(field: &str) -> Error {
+    static LOGGED: crate::metrics::Throttle = crate::metrics::Throttle::new(60_000);
+    if let Some(skipped) = LOGGED.pass() {
+        tracing::warn!(target: "bd::serve", field, skipped, "sign-in needs a secret the [secrets] command has not given");
+    }
+    Error::Locked("sign-in is unavailable on this bd server just now; try again in a moment".into())
+}
+
+/// What `settings` ask the `[secrets]` command for, if anything: its
+/// secrets, and a check that an answer serves the fields naming them (their
+/// own loading of it, no file read).
+fn wanted(root: &Path, settings: &SignIn) -> Option<crate::secrets::Wanted> {
+    let secrets = settings.secrets.clone()?;
+    let names = settings.secret_names();
+    if names.is_empty() {
+        return None;
+    }
+    let (settings, root) = (settings.clone(), root.to_path_buf());
+    let check: crate::secrets::Check = Arc::new(move |fetched| {
+        let refused = load_secrets(&mut settings.clone(), &root, &Pass::Answer(fetched));
+        if refused.is_empty() { Ok(()) } else { Err(refused.join("; ")) }
+    });
+    Some(crate::secrets::Wanted { secrets, names, check })
+}
+
+/// How the `[secrets]` keeper reads what `<root>/auth.toml` wants now.
+fn reader(root: &Path) -> crate::secrets::Reader {
+    let root = root.to_path_buf();
+    Arc::new(move || match parse_file(&root) {
+        Ok(settings) => Ok(settings.and_then(|s| wanted(&root, &s))),
+        Err(e) => Err(e.to_string()),
+    })
 }
 
 /// What tells a file's content changed: its modification time, size and
@@ -213,50 +341,105 @@ fn stamp(path: &Path) -> Option<Stamp> {
     Some((meta.modified().ok(), meta.len(), inode))
 }
 
-/// Each root's settings as last read, from which files (stamped), and when:
-/// read again once any of them changed, and at least every
+/// A root's settings as last read: read again once a file they come from
+/// changed (stamped), the `[secrets]` answers changed generation or the one
+/// they were made with stopped serving, or at least every
 /// [`RELOAD_AT_LEAST`] (a change a coarse clock would not show).
-type Loaded = HashMap<PathBuf, (Option<SignIn>, Vec<(PathBuf, Option<Stamp>)>, Instant)>;
-static LOADED: LazyLock<Mutex<Loaded>> = LazyLock::new(Default::default);
+struct Cached {
+    sign_in: Option<SignIn>,
+    files: Vec<(PathBuf, Option<Stamp>)>,
+    at: Instant,
+    secrets: Option<Served>,
+}
+
+/// The generation of the `[secrets]` answers when settings were made, and
+/// until when the one filled in serves (none: none was).
+type Served = (u64, Option<Instant>);
+
+static LOADED: LazyLock<Mutex<HashMap<PathBuf, Cached>>> = LazyLock::new(Default::default);
 const RELOAD_AT_LEAST: Duration = Duration::from_secs(30);
 
-fn loaded() -> std::sync::MutexGuard<'static, Loaded> {
+fn loaded() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Cached>> {
     LOADED.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// `<root>/auth.toml` and the secret files it names, read now.
-fn load_files(root: &Path) -> Result<Option<SignIn>> {
-    let path = root.join(FILE);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error::invalid(format!("{}: {e}", path.display()))),
+/// `<root>/auth.toml` read now with the secrets of its files (a mistake in
+/// either `Error::Invalid`), and each of those of the `[secrets]` command
+/// its kept answer gives now (its keeper woken to read the file again; or,
+/// if the file wants nothing of it, told so at once).
+/// The files it names are stamped into `files` before they are read.
+fn load_files(root: &Path, files: &mut Vec<(PathBuf, Option<Stamp>)>) -> Result<(Option<SignIn>, Option<Served>)> {
+    let Some(mut sign_in) = parse_file(root)? else {
+        crate::secrets::poke(root);
+        return Ok((None, None));
     };
-    let Some(mut sign_in) = parse(&text).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))? else {
-        return Ok(None);
+    // The CA file is no secret, but read with them: a change to it is seen too.
+    let ca = sign_in.github.iter().filter_map(|g| g.ca_cert.as_ref());
+    let ca = ca.map(|f| if f.is_relative() { root.join(f) } else { f.clone() });
+    let named: Vec<PathBuf> = sign_in.secret_files(root).into_iter().chain(ca).collect();
+    files.extend(named.into_iter().map(|f| (f.clone(), stamp(&f))));
+    if let Some(e) = load_secrets(&mut sign_in, root, &Pass::Files).into_iter().next() {
+        return Err(Error::invalid(format!("{}: {e}", root.join(FILE).display())));
+    }
+    let Some(wanted) = wanted(root, &sign_in) else {
+        crate::secrets::poke(root);
+        return Ok((Some(sign_in), None));
+    };
+    crate::secrets::ensure(root, reader(root));
+    let (fetched, generation) = crate::secrets::current(root, &wanted.secrets, &wanted.names);
+    let good_until = fetched.as_ref().and_then(|f| f.good_until);
+    // Each field on its own: one the answer lacks, or one that refuses its value (checked against the fields as
+    // they were when it came: a name since moved to another field), stays empty, and only steps needing it wait.
+    let refused = fetched.map(|f| load_secrets(&mut sign_in, root, &Pass::Answer(&f))).unwrap_or_default();
+    if !refused.is_empty() {
+        crate::secrets::refit(root);
+        static LOGGED: crate::metrics::Throttle = crate::metrics::Throttle::new(60_000);
+        if let Some(skipped) = LOGGED.pass() {
+            let error = refused.join("; ");
+            tracing::warn!(target: "bd::serve", %error, skipped, "the fields refuse the [secrets] command's kept answer: asked again");
+        }
+    }
+    Ok((Some(sign_in), Some((generation, good_until))))
+}
+
+/// Read into `sign_in` the secrets `pass` reads (files, or an answer of the
+/// `[secrets]` command), each field on its own and checked as it needs (a
+/// key must be a key); with the files, the CA certificates. Why each field
+/// that could not be read was not: none if all were.
+fn load_secrets(sign_in: &mut SignIn, root: &Path, pass: &Pass<'_>) -> Vec<String> {
+    let mut refused = Vec::new();
+    let mut field = |read: std::result::Result<(), String>| {
+        if let Err(e) = read {
+            refused.push(e);
+        }
     };
     if let Some(github) = &mut sign_in.github {
-        if let Some(key) = &github.private_key {
-            let key = if key.is_relative() { root.join(key) } else { key.clone() };
-            github.app = Some(AppKey::load(&key).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?);
-        }
-        if let Some(ca) = &github.ca_cert {
+        let key = github.private_key.as_ref().map(|k| k.read("github.private_key", root, pass));
+        field((|| {
+            if let Some((at, pem)) = key.transpose()?.flatten() {
+                github.app = Some(AppKey::from_pem(&pem, &at)?);
+            }
+            Ok(())
+        })());
+        if let (Some(ca), Pass::Files) = (&github.ca_cert, pass) {
             let ca = if ca.is_relative() { root.join(ca) } else { ca.clone() };
-            github.roots = Some(CaCerts::load(&ca).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?);
+            field(CaCerts::load(&ca).map(|roots| github.roots = Some(roots)));
         }
-        if let Some(file) = &github.client_secret_file {
-            let file = if file.is_relative() { root.join(file) } else { file.clone() };
-            let secret = ClientSecret::load(&file).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
-            github.client_secret = Some(secret);
-        }
+        let secret = github.client_secret_file.as_ref().map(|s| s.read("github.client_secret_file", root, pass));
+        field((|| {
+            if let Some((at, text)) = secret.transpose()?.flatten() {
+                github.client_secret = Some(ClientSecret::parse(&text, &at)?);
+            }
+            Ok(())
+        })());
     }
     for oidc in &mut sign_in.oidc {
-        oidc.load_secret(root).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
+        field(oidc.load_secret(root, pass));
     }
     if let Some(authorizer) = &mut sign_in.authorizer {
-        authorizer.load_token(root).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))?;
+        field(authorizer.load_token(root, pass));
     }
-    Ok(Some(sign_in))
+    refused
 }
 
 /// The authorization server's settings in `<root>/auth.toml` (`[oauth]`),
@@ -275,7 +458,11 @@ fn enabled(root: &Path) -> Result<SignIn> {
         Ok(Some(sign_in)) => Ok(sign_in),
         Ok(None) => Err(not_enabled()),
         Err(e) => {
-            tracing::warn!(target: "bd::serve", error = %e, "sign-in refused: auth.toml cannot be used");
+            // Anyone may start a sign-in: at most once a minute.
+            static LOGGED: crate::metrics::Throttle = crate::metrics::Throttle::new(60_000);
+            if let Some(skipped) = LOGGED.pass() {
+                tracing::warn!(target: "bd::serve", error = %e, skipped, "sign-in refused: auth.toml cannot be used");
+            }
             Err(Error::Remote("sign-in is not working on this bd server: its admin finds why in the server log".into()))
         }
     }
@@ -638,7 +825,7 @@ mod tests {
         let all = sign_in(&format!(
             "[sign_in]\nrefresh_limit = \"14d\"\nrefresh_idle = \"1d\"\n{base}private_key = \"app.pem\"{rule}"
         ));
-        assert_eq!(all.github.as_ref().unwrap().private_key.as_deref(), Some(Path::new("app.pem")));
+        assert_eq!(all.github.as_ref().unwrap().private_key, Some("app.pem".into()));
         assert_eq!(
             (all.refresh_limit, all.refresh_idle),
             (Duration::from_secs(14 * 86400), Duration::from_secs(86400))
@@ -664,7 +851,7 @@ mod tests {
         let e = load(dir.path()).unwrap_err().to_string();
         assert!(e.contains("app.pem") && e.contains(FILE), "{e}");
         std::fs::write(dir.path().join("app.pem"), "not a key").unwrap();
-        assert!(load(dir.path()).unwrap_err().to_string().contains("no private key in the file"));
+        assert!(load(dir.path()).unwrap_err().to_string().contains("no PEM private key in it"));
         std::fs::write(dir.path().join("app.pem"), TEST_KEY).unwrap();
         let all = load(dir.path()).unwrap().unwrap();
         let key = all.github.as_ref().unwrap().app.as_ref().expect("loaded");
@@ -684,6 +871,194 @@ mod tests {
         let all = load(dir.path()).unwrap().unwrap();
         assert_eq!(all.github.as_ref().unwrap().client_secret.as_ref().map(|s| s.0.as_str()), Some("s3cret"));
         assert!(!format!("{all:?}").contains("s3cret"), "never the secret");
+    }
+
+    #[test]
+    fn named_secrets_need_a_secrets_command_and_it_needs_them() {
+        let base = "[github]\nclient_id = \"Iv1.x\"\n[[github.allow]]\nusers = [\"a\"]\n";
+        let named = base.replace("[[github", "private_key = { secret = \"app-key\" }\n[[github");
+        let secrets = "[secrets]\ncommand = [\"bin/bd-secrets\"]\n";
+        assert!(error(&named).contains("no [secrets] command fetches it"));
+        assert!(error(&format!("{base}{secrets}")).contains("[secrets] fetches nothing"));
+        assert!(error(secrets).contains("need a provider"));
+        let all = sign_in(&format!("{named}{secrets}"));
+        assert_eq!(all.secret_names().into_iter().collect::<Vec<_>>(), ["app-key"]);
+        assert!(all.secret_files(Path::new("/srv")).is_empty(), "no file to stamp or check");
+    }
+
+    #[test]
+    fn steps_needing_a_secret_not_given_are_refused_before_anything_is_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(FILE),
+            "[secrets]\ncommand = [\"./no-such-command\"]\n\
+             [github]\nclient_id = \"Iv1.x\"\nclient_secret_file = { secret = \"gh-web\" }\n\
+             [oidc.corp]\nissuer = \"https://idp.example\"\nclient_id = \"c\"\nclient_secret_file = { secret = \"corp\" }\n\
+             [authorizer]\nurl = \"https://authz.example/bd\"\ntoken_file = { secret = \"authz\" }\n\
+             [oauth]\nloopback_redirects = true\n",
+        )
+        .unwrap();
+        // The command has not answered: the settings load all the same, and serve what needs no secret.
+        let mut s = load(dir.path()).unwrap().unwrap();
+        assert!(s.oauth.is_some());
+        for (provider, web) in [("github", true), ("github", false), ("corp", false), ("corp", true)] {
+            let e = s.ready_for(provider, web).unwrap_err();
+            assert!(matches!(e, Error::Locked(_)), "{provider} {web}: {e}");
+        }
+        // A provider it does not have is no wait: refused at once as such by the caller (no retries for a typo).
+        assert!(s.ready_for("corpp", false).is_ok() && s.ready_for("corpp", true).is_ok());
+        // Without the authorizer's token to wait for: GitHub's device flow needs none; the rest still do.
+        s.authorizer = None;
+        assert!(s.ready_for("github", false).is_ok());
+        assert!(s.ready_for("github", true).is_err() && s.ready_for("corp", false).is_err());
+        crate::secrets::forget(dir.path());
+    }
+
+    /// A device-flow sign-in needing a secret no answer gives is refused before the provider is asked anything: its
+    /// device code is good once.
+    #[test]
+    fn the_device_flow_asks_the_provider_nothing_while_a_secret_it_needs_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", provider.local_addr().unwrap());
+        std::fs::write(
+            dir.path().join(FILE),
+            format!(
+                "[secrets]\ncommand = [\"./no-such-command\"]\n[github]\nclient_id = \"Iv1.x\"\nurl = \"{url}\"\n\
+                 api_url = \"{url}\"\n[authorizer]\nurl = \"https://authz.example/bd\"\ntoken_file = {{ secret = \"authz\" }}\n"
+            ),
+        )
+        .unwrap();
+        let e = start(dir.path(), "github").unwrap_err();
+        assert!(matches!(e, Error::Locked(_)), "{e:?}");
+        let code = SignInPoll { device_code: "dc-1".into(), workspace: "proj".into() };
+        let e = poll(dir.path(), "github", &code).unwrap_err();
+        assert!(matches!(e, Error::Locked(_)), "{e:?}");
+        provider.set_nonblocking(true).unwrap();
+        assert!(provider.accept().is_err(), "the provider was never asked");
+        crate::secrets::forget(dir.path());
+    }
+
+    /// Loads tell the keeper what changed: fields that refuse the kept values (names swapped) have it ask again at
+    /// once; `[secrets]` removed has it see so at once, not at its next nap's end.
+    #[cfg(unix)]
+    #[test]
+    fn loads_tell_the_keeper_what_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("bd-secrets"), "#!/bin/sh\ncat >/dev/null\necho run >> runs\ncat vault.json\n")
+            .unwrap();
+        let answer = serde_json::json!({ "secrets": { "app-key": TEST_KEY, "web-secret": "s3cret" } });
+        std::fs::write(root.join("vault.json"), answer.to_string()).unwrap();
+        let runs = || std::fs::read_to_string(root.join("runs")).unwrap_or_default().lines().count();
+        let config = |key: &str, secret: &str| {
+            format!(
+                "[secrets]\ncommand = [\"/bin/sh\", \"./bd-secrets\"]\n[github]\nclient_id = \"Iv1.x\"\n\
+                 private_key = {{ secret = \"{key}\" }}\nclient_secret_file = {{ secret = \"{secret}\" }}\n\
+                 [[github.allow]]\nusers = [\"a\"]\n[oauth]\nloopback_redirects = true\n"
+            )
+        };
+        // Each write seen by the next load, however coarse the clock.
+        let save = |text: &str| {
+            let file = root.join(FILE);
+            let before = std::fs::metadata(&file).ok().and_then(|m| m.modified().ok());
+            std::fs::write(&file, text).unwrap();
+            if let Some(before) = before {
+                let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+                f.set_modified(before + Duration::from_secs(1)).unwrap();
+            }
+        };
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            let at = Instant::now();
+            while !done() {
+                assert!(at.elapsed() < Duration::from_secs(10), "never: {what}");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        save(&config("app-key", "web-secret"));
+        assert_eq!(load_at_start(root).unwrap().1, None);
+        assert_eq!(runs(), 1);
+        // The names swapped between the fields: the kept key is no client secret. Asked again at once (its ttl is
+        // 10 minutes off), by the load that found it.
+        save(&config("web-secret", "app-key"));
+        load(root).unwrap();
+        until("asked again", &|| runs() == 2);
+        // [secrets] gone: the keeper, napping for a minute, sees it at once.
+        save("[github]\nclient_id = \"Iv1.x\"\n[[github.allow]]\nusers = [\"a\"]\n");
+        load(root).unwrap();
+        until("seen gone", &|| crate::secrets::seen(root).0);
+        crate::secrets::forget(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_secrets_command_fetches_what_fields_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let script = root.join("bd-secrets");
+        // Answers with what the test puts in its vault.
+        std::fs::write(&script, "#!/bin/sh\ncat > request.json\ncat vault.json\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let vault = |key: &str, secret: &str| {
+            let answer = serde_json::json!({ "secrets": { "app-key": key, "web-secret": secret } });
+            std::fs::write(root.join("vault.json"), answer.to_string()).unwrap();
+        };
+        vault(TEST_KEY, "s3cret-1\n");
+        std::fs::write(
+            root.join(FILE),
+            // Run by sh, never exec'd itself: a script just written may still be open in a child another thread
+            // forks meanwhile ("text file busy").
+            "[secrets]\ncommand = [\"/bin/sh\", \"./bd-secrets\"]\n[github]\nclient_id = \"Iv1.x\"\n\
+             private_key = { secret = \"app-key\" }\nclient_secret_file = { secret = \"web-secret\" }\n\
+             [[github.allow]]\nusers = [\"a\"]\n[oauth]\nloopback_redirects = true\n",
+        )
+        .unwrap();
+        let (all, unanswered) = load_at_start(root).unwrap();
+        let all = all.unwrap();
+        assert_eq!(unanswered, None);
+        let g = all.github.as_ref().unwrap();
+        assert!(g.app_key().unwrap().is_some());
+        assert_eq!(g.client_secret.as_ref().map(|s| s.0.as_str()), Some("s3cret-1"));
+        assert!(!format!("{all:?}").contains("s3cret"), "never the secret");
+        let sent: Value = serde_json::from_str(&std::fs::read_to_string(root.join("request.json")).unwrap()).unwrap();
+        assert_eq!(sent, serde_json::json!({ "version": 1, "secrets": ["app-key", "web-secret"] }));
+        crate::secrets::forget(root);
+
+        // A failing command: the settings load all the same; the start is told why, a step needing the secret
+        // that sign-in is unavailable, and nothing more.
+        let other = tempfile::tempdir().unwrap();
+        let copy =
+            |to: &Path| std::fs::write(to.join(FILE), std::fs::read_to_string(root.join(FILE)).unwrap()).unwrap();
+        copy(other.path());
+        std::fs::write(other.path().join("bd-secrets"), "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(other.path().join("bd-secrets"), std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let (settings, unanswered) = load_at_start(other.path()).unwrap();
+        let why = unanswered.unwrap();
+        assert!(why.contains(FILE) && why.contains("[secrets] command failed") && why.contains("exited with"), "{why}");
+        let settings = settings.unwrap();
+        assert!(settings.oauth.is_some(), "the settings serve");
+        let e = settings.github.as_ref().unwrap().app_key().unwrap_err();
+        assert!(matches!(e, Error::Locked(_)), "{e}");
+        assert!(!e.to_string().contains(FILE) && !e.to_string().contains("exited"), "{e}");
+        assert!(load(other.path()).unwrap().is_some(), "a load never fails for the command");
+        crate::secrets::forget(other.path());
+
+        // A mistake in a file the settings read is one, [secrets] or not, the command never blamed.
+        let typo = tempfile::tempdir().unwrap();
+        let text = std::fs::read_to_string(root.join(FILE)).unwrap();
+        let text = text.replace("client_secret_file = { secret = \"web-secret\" }", "client_secret_file = \"missing\"");
+        std::fs::write(typo.path().join(FILE), text).unwrap();
+        let e = load_at_start(typo.path()).unwrap_err();
+        assert!(matches!(e, Error::Invalid(_)) && e.to_string().contains("github.client_secret_file"), "{e}");
+        assert!(!e.to_string().contains("[secrets]"), "{e}");
+
+        // A wrong value is told by the field it serves.
+        vault("not a key", "s3cret-1");
+        let (_, unanswered) = load_at_start(root).unwrap();
+        let why = unanswered.unwrap();
+        assert!(why.contains("github.private_key (secret app-key): no PEM private key"), "{why}");
+        crate::secrets::forget(root);
     }
 
     #[test]
@@ -725,10 +1100,7 @@ mod tests {
     #[test]
     fn github_app_keys_sign_jwts_for_their_app() {
         use base64::Engine;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("app.pem");
-        std::fs::write(&path, TEST_KEY).unwrap();
-        let key = AppKey::load(&path).unwrap();
+        let key = AppKey::from_pem(TEST_KEY.as_bytes(), "github.private_key").unwrap();
         let jwt = key.jwt("Iv1.test").unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3, "{jwt}");

@@ -73,8 +73,11 @@ pub enum Error {
 
     Busy(String),
 
-    /// Another bd process holds a lock file (not the database) past the
-    /// wait: the message names the file and says what to do.
+    /// Something other than a workspace's database is busy past the wait:
+    /// another bd process holds a lock file or `bd serve`'s `server.db`, or
+    /// `bd serve`'s sign-in has no secrets to use yet or no answer from its
+    /// authorizer. The message says what, and what to do; trying again
+    /// later may succeed.
     Locked(String),
 
     SchemaTooNew {

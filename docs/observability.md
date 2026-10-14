@@ -69,6 +69,20 @@ with code 1.
 - **Sign-in**: sign-ins, refreshes, refusals and revocations, with the
   provider, subject, login, actor and token name, never a secret or an
   email ([What bd keeps about people](security.md#what-bd-keeps-about-people)).
+- **Sign-in secrets** ([from a command](sign-in.md#secrets-from-a-command)):
+  at start, which command fetches how many secrets, then (once known, the
+  server serving meanwhile) that it answered, or why the steps needing
+  them are unavailable until it does; each failed attempt (every 30
+  seconds) as a warning (`the [secrets] command's last answer serves until
+  secrets.max_stale runs out` with how long, or `sign-in needing the
+  [secrets] command's secrets is unavailable until it answers`); a step
+  refused for want of one, at most once a minute with how many were left
+  out (`sign-in needs a secret the [secrets] command has not given`,
+  `field`, `skipped`); fields refusing a kept answer (`the fields refuse
+  the [secrets] command's kept answer: asked again`), at most once a
+  minute. Misconfigured sign-in seen by anonymous requests (metadata, the
+  authorization server, device-flow sign-ins), and account notifications
+  that cannot be handled, are likewise logged at most once a minute.
 - **Limits**: connections refused over the total or per-address limit are
   warned of at most once every 10 seconds per limit, with how many were
   left out (`skipped`).

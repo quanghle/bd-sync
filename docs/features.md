@@ -49,7 +49,8 @@ one SQLite database in WAL mode.
   backups on its own ([Remote server](remote.md)).
 - **Sign-in**: people get their own tokens by signing in with any OpenID
   Connect provider, from the command line (device flow) or a browser,
-  under rules or the admin's own authorizer ([Signing in](sign-in.md)).
+  under rules or the admin's own authorizer, with its secrets in files or
+  fetched from a vault by the admin's command ([Signing in](sign-in.md)).
 - **MCP server**: bd's coordination tools over MCP, on stdio (`bd mcp`)
   and over Streamable HTTP per workspace, with an OAuth 2.1 authorization
   server for clients that sign people in ([MCP server](mcp.md)).

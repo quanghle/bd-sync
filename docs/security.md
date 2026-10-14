@@ -76,7 +76,15 @@ provider, under `auth.toml`'s rules or the admin's authorizer
 - **Secret files** (client secrets, signing keys, the authorizer's token)
   live under the root, read by `bd serve` only; it warns at start about any
   its group or others may read. Keep them mode 0600. A signed client
-  secret lasts 5 minutes.
+  secret lasts 5 minutes. Instead, the admin's [secrets
+  command](sign-in.md#secrets-from-a-command) can fetch them from a vault:
+  then they are kept in memory only, never written to a file nor logged by
+  bd (the command's stderr is logged when it fails, so it must print none
+  there), and used
+  at most `max_stale` past their `ttl` while the command fails. While it
+  has no answer, the sign-in steps needing them fail closed (503; a
+  refresh fails as when a provider does not answer, 502), telling
+  requests nothing of why, and the rest of the server runs on.
 - **An account no rule lets in gets nothing.** An `anyone = true` rule must
   be last; its tokens read by default, may write at most, and are always
   agent tokens. `deny` keeps an account out for good.

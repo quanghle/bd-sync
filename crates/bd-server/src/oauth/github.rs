@@ -12,8 +12,9 @@ pub struct Github {
     pub url: String,
     /// GitHub's REST API.
     pub api_url: String,
-    /// The GitHub App's private key file, as written (relative to the root).
-    pub private_key: Option<PathBuf>,
+    /// Where the GitHub App's private key comes from, as written: a file
+    /// (relative to the root), or the `[secrets]` command.
+    pub private_key: Option<Source>,
     /// The key itself, read by [`load`]: it reads accounts and memberships
     /// at refreshes, for the rules.
     pub app: Option<AppKey>,
@@ -22,8 +23,8 @@ pub struct Github {
     pub ca_cert: Option<PathBuf>,
     /// Its certificates, read by [`load`].
     pub roots: Option<CaCerts>,
-    /// The GitHub App's client secret file, as written (relative to the root).
-    pub client_secret_file: Option<PathBuf>,
+    /// Where the GitHub App's client secret comes from, as written.
+    pub client_secret_file: Option<Source>,
     /// The secret itself, read by [`load`]: the web flow needs it.
     pub client_secret: Option<ClientSecret>,
     /// GitHub user ids that may never sign in, whatever decides.
@@ -33,6 +34,15 @@ pub struct Github {
 }
 
 impl Github {
+    /// The App's key, if one is configured: `Error::Locked` while the
+    /// `[secrets]` command has not given it.
+    pub(super) fn app_key(&self) -> Result<Option<&AppKey>> {
+        match (&self.private_key, &self.app) {
+            (Some(_), None) => Err(secret_unavailable("github.private_key")),
+            (_, app) => Ok(app.as_ref()),
+        }
+    }
+
     /// Whether a rule names organizations or teams, whose memberships an
     /// OAuth app reads with the `read:org` scope.
     pub(super) fn reads_orgs(&self) -> bool {
@@ -81,41 +91,40 @@ impl<M: Memberships> Facts for GithubFacts<'_, M> {
 /// that get installation tokens.
 #[derive(Clone)]
 pub struct AppKey {
-    pub(super) path: PathBuf,
     pub(super) pair: Arc<ring::signature::RsaKeyPair>,
 }
 
 impl std::fmt::Debug for AppKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Never the key.
-        f.debug_struct("AppKey").field("path", &self.path).finish()
+        f.write_str("AppKey(..)")
     }
 }
 
 impl PartialEq for AppKey {
     fn eq(&self, other: &AppKey) -> bool {
-        self.path == other.path
+        use ring::signature::KeyPair;
+        self.pair.public_key().as_ref() == other.pair.public_key().as_ref()
     }
 }
 
 impl Eq for AppKey {}
 
 impl AppKey {
-    /// The RSA key of a PEM file (PKCS#1, as GitHub gives them, or PKCS#8).
-    pub(super) fn load(path: &Path) -> std::result::Result<AppKey, String> {
+    /// The RSA key in `pem` (PKCS#1, as GitHub gives them, or PKCS#8),
+    /// from `at`, as messages name it.
+    pub(super) fn from_pem(pem: &[u8], at: &str) -> std::result::Result<AppKey, String> {
         use ureq::tls::PemItem;
-        let at = format!("github.private_key {}", path.display());
-        let pem = std::fs::read(path).map_err(|e| format!("{at}: {e}"))?;
-        let key = ureq::tls::parse_pem(&pem)
+        let key = ureq::tls::parse_pem(pem)
             .find_map(|item| match item {
                 Ok(PemItem::PrivateKey(k)) => Some(k),
                 _ => None,
             })
-            .ok_or_else(|| format!("{at}: no private key in the file"))?;
+            .ok_or_else(|| format!("{at}: no PEM private key in it"))?;
         let pair = ring::signature::RsaKeyPair::from_der(key.der())
             .or_else(|_| ring::signature::RsaKeyPair::from_pkcs8(key.der()))
             .map_err(|e| format!("{at}: not a usable RSA key, as GitHub Apps' are ({e})"))?;
-        Ok(AppKey { path: path.to_path_buf(), pair: Arc::new(pair) })
+        Ok(AppKey { pair: Arc::new(pair) })
     }
 
     /// A JWT for the GitHub App `client_id`: valid for 9 minutes (GitHub
@@ -180,15 +189,9 @@ impl std::fmt::Debug for ClientSecret {
 }
 
 impl ClientSecret {
-    /// The secret in `path`: one line, as GitHub shows it.
-    pub(super) fn load(path: &Path) -> std::result::Result<ClientSecret, String> {
-        let at = format!("github.client_secret_file {}", path.display());
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{at}: {e}"))?;
-        let secret = text.trim();
-        if secret.is_empty() || secret.len() > 256 || !secret.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(format!("{at}: not a client secret (one line of printable characters)"));
-        }
-        Ok(ClientSecret(secret.to_string()))
+    /// The secret in `bytes`, from `at`: one line, as GitHub shows it.
+    pub(super) fn parse(bytes: &[u8], at: &str) -> std::result::Result<ClientSecret, String> {
+        Ok(ClientSecret(crate::secrets::one_line(bytes, at, "a client secret", 256)?))
     }
 }
 
@@ -577,6 +580,9 @@ pub fn web_sign_in(
 ) -> Result<Admitted> {
     let github = github_of(sign_in)?;
     let Some(secret) = &github.client_secret else {
+        if github.client_secret_file.is_some() {
+            return Err(secret_unavailable("github.client_secret_file"));
+        }
         return Err(Error::Remote("this bd server has no GitHub client secret for web sign-in".into()));
     };
     let api = Api::new(github);

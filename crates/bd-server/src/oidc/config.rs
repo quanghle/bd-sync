@@ -1,6 +1,6 @@
 //! Providers as `auth.toml` configures them: `[oidc.<name>]`, client secrets and the keys that sign them.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -8,6 +8,7 @@ use bd_core::{Error, Result, Timestamp};
 use serde::Deserialize;
 
 use super::*;
+use crate::secrets::{Pass, Source};
 
 /// `[oidc.<name>]` as written.
 #[derive(Debug, Deserialize)]
@@ -16,7 +17,7 @@ pub(crate) struct OidcDoc {
     issuer: String,
     client_id: String,
     #[serde(default)]
-    client_secret_file: Option<PathBuf>,
+    client_secret_file: Option<Source>,
     #[serde(default)]
     label: Option<String>,
     #[serde(default)]
@@ -39,7 +40,7 @@ pub(crate) struct OidcDoc {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SignedSecretDoc {
-    key_file: PathBuf,
+    key_file: Source,
     key_id: String,
     team_id: String,
 }
@@ -49,8 +50,9 @@ pub(crate) struct SignedSecretDoc {
 /// ID, `aud` the issuer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignedSecret {
-    /// As written (relative to the root).
-    pub key_file: PathBuf,
+    /// Where the key comes from, as written: a file (relative to the
+    /// root), or the `[secrets]` command.
+    pub key_file: Source,
     pub key_id: String,
     pub team_id: String,
     /// Read by [`Oidc::load_secret`].
@@ -97,7 +99,7 @@ pub(crate) fn parse(name: &str, doc: OidcDoc) -> std::result::Result<Oidc, Strin
     if client_id.is_empty() || client_id.len() > 255 || !client_id.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(format!("{at}.client_id is not a client ID"));
     }
-    if doc.client_secret_file.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+    if doc.client_secret_file.as_ref().is_some_and(Source::is_empty) {
         return Err(format!("{at}.client_secret_file is empty: name the file, or leave it out"));
     }
     let form_post = match doc.response_mode.as_deref() {
@@ -112,7 +114,7 @@ pub(crate) fn parse(name: &str, doc: OidcDoc) -> std::result::Result<Oidc, Strin
         }
         Some(d) => {
             let plain = |id: &str| !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric());
-            if d.key_file.as_os_str().is_empty() {
+            if d.key_file.is_empty() {
                 return Err(format!("{at}.signed_secret.key_file is empty: name the file holding the key"));
             }
             if !plain(d.key_id.trim()) || !plain(d.team_id.trim()) {
@@ -162,17 +164,16 @@ pub(crate) fn parse(name: &str, doc: OidcDoc) -> std::result::Result<Oidc, Strin
     })
 }
 
-/// The P-256 key of a PEM file (PKCS#8 with its public key, as Apple's
-/// `.p8` keys are).
-fn signing_key(path: &Path) -> std::result::Result<SigningKey, String> {
+/// The P-256 key in `pem` (PKCS#8 with its public key, as Apple's `.p8`
+/// keys are).
+fn signing_key(pem: &[u8]) -> std::result::Result<SigningKey, String> {
     use ureq::tls::PemItem;
-    let pem = std::fs::read(path).map_err(|e| e.to_string())?;
-    let key = ureq::tls::parse_pem(&pem)
+    let key = ureq::tls::parse_pem(pem)
         .find_map(|item| match item {
             Ok(PemItem::PrivateKey(k)) => Some(k),
             _ => None,
         })
-        .ok_or("no private key in the file")?;
+        .ok_or("no PEM private key in it")?;
     let rng = ring::rand::SystemRandom::new();
     let alg = &ring::signature::ECDSA_P256_SHA256_FIXED_SIGNING;
     let pair = ring::signature::EcdsaKeyPair::from_pkcs8(alg, key.der(), &rng)
@@ -199,38 +200,55 @@ pub(super) fn endpoint_ok(url: &str, issuer: &str) -> bool {
 }
 
 impl Oidc {
-    /// Read the client secret, or the key that signs it (relative to `root`).
-    pub(crate) fn load_secret(&mut self, root: &Path) -> std::result::Result<(), String> {
+    /// Read the client secret, or the key that signs it: a file's (relative
+    /// to `root`), or as the `[secrets]` command fetched it.
+    pub(crate) fn load_secret(&mut self, root: &Path, pass: &Pass<'_>) -> std::result::Result<(), String> {
         if let Some(signed) = &mut self.signed_secret {
-            let file = &signed.key_file;
-            let path = if file.is_relative() { root.join(file) } else { file.clone() };
-            let at = format!("oidc.{}.signed_secret.key_file {}", self.name, path.display());
-            signed.key = Some(signing_key(&path).map_err(|e| format!("{at}: {e}"))?);
+            let field = format!("oidc.{}.signed_secret.key_file", self.name);
+            if let Some((at, pem)) = signed.key_file.read(&field, root, pass)? {
+                signed.key = Some(signing_key(&pem).map_err(|e| format!("{at}: {e}"))?);
+            }
             return Ok(());
         }
-        let Some(file) = &self.client_secret_file else { return Ok(()) };
-        let path = if file.is_relative() { root.join(file) } else { file.clone() };
-        let at = format!("oidc.{}.client_secret_file {}", self.name, path.display());
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{at}: {e}"))?;
-        let secret = text.trim();
-        if secret.is_empty() || secret.len() > 1024 || !secret.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(format!("{at}: not a client secret (one line of printable characters)"));
-        }
-        self.client_secret = Some(Secret(secret.to_string()));
+        let Some(source) = &self.client_secret_file else { return Ok(()) };
+        let Some((at, bytes)) = source.read(&format!("oidc.{}.client_secret_file", self.name), root, pass)? else {
+            return Ok(());
+        };
+        self.client_secret = Some(Secret(crate::secrets::one_line(&bytes, &at, "a client secret", 1024)?));
         Ok(())
     }
 
-    /// The files holding its secrets (relative to the root, as written).
-    pub fn secret_files(&self) -> impl Iterator<Item = &PathBuf> {
+    /// Where its secrets come from, as written.
+    pub fn secret_sources(&self) -> impl Iterator<Item = &Source> {
         self.client_secret_file.iter().chain(self.signed_secret.iter().map(|s| &s.key_file))
+    }
+
+    /// Whether it has the secret its requests need now: [`secret_unavailable`]
+    /// (`crate::oauth`) while the `[secrets]` command has not given it.
+    pub(crate) fn ready(&self) -> Result<()> {
+        match &self.signed_secret {
+            Some(s) if s.key.is_none() => {
+                Err(crate::oauth::secret_unavailable(&format!("oidc.{}.signed_secret.key_file", self.name)))
+            }
+            None if self.client_secret_file.is_some() && self.client_secret.is_none() => {
+                Err(crate::oauth::secret_unavailable(&format!("oidc.{}.client_secret_file", self.name)))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// The client secret sent with a request now: the file's, or one
     /// signed for it.
     pub(super) fn secret(&self) -> Result<Option<Secret>> {
-        let Some(signed) = &self.signed_secret else { return Ok(self.client_secret.clone()) };
+        let Some(signed) = &self.signed_secret else {
+            if self.client_secret_file.is_some() && self.client_secret.is_none() {
+                return Err(crate::oauth::secret_unavailable(&format!("oidc.{}.client_secret_file", self.name)));
+            }
+            return Ok(self.client_secret.clone());
+        };
+        // Read with the settings unless the [secrets] command gives it, and has not yet.
         let Some(SigningKey(pair)) = &signed.key else {
-            return Err(Error::Io(std::io::Error::other("the signing key of a client secret was not read")));
+            return Err(crate::oauth::secret_unavailable(&format!("oidc.{}.signed_secret.key_file", self.name)));
         };
         let now = Timestamp::now().millis() / 1000;
         let header = serde_json::json!({ "alg": "ES256", "kid": signed.key_id });

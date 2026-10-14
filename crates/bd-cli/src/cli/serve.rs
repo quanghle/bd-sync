@@ -74,8 +74,9 @@ pub enum ServeAction {
     /// Manage access tokens (run on the server host)
     #[command(subcommand)]
     Token(TokenCommand),
-    /// Check <root>/auth.toml and its secret files as a running server would read them, and print what to register
-    /// at providers and clients (callback URLs, endpoints); exits 2 on a mistake
+    /// Check <root>/auth.toml and its secret files as a running server would read them (running its [secrets]
+    /// command, on Unix only as the root directory's owner), and print what to register at providers and clients
+    /// (callback URLs, endpoints); exits 2 on a mistake
     Check(ServeCheckArgs),
 }
 

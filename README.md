@@ -64,7 +64,7 @@ sessions never share claims ([Actors](docs/concepts.md#actors)).
 | [Modes of operation](docs/modes.md) | local workspaces and their backups, remote workspaces, the embedded library |
 | [Playbooks and gates](docs/playbooks.md) | repeatable multi-step work, runs, gates |
 | [Remote server](docs/remote.md) | `bd serve`, access tokens and roles, clients, background jobs, backups, followers, the protocol |
-| [Signing in](docs/sign-in.md) | OpenID Connect providers, rules, accounts and actors, refreshing, authorizers, the device flow |
+| [Signing in](docs/sign-in.md) | OpenID Connect providers, rules, accounts and actors, refreshing, authorizers, secrets from a command, the device flow |
 | [MCP server](docs/mcp.md) | `bd mcp` and `/w/<name>/mcp`, discovery, OAuth for MCP clients, the tool catalog |
 | [Agent assets, sessions and hooks](docs/agents.md) | serving, pulling and approving skills and MCP definitions; session-start hooks; subagents |
 | [Command reference](docs/commands.md) | commands, global options, environment variables, configuration, exit and error codes |

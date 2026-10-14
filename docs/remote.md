@@ -97,9 +97,12 @@ neither would know the other's sign-ins in progress. What lasts is on
 disk: the workspaces' databases and `<root>/server.db` (accounts, tokens,
 registered OAuth clients, the audit trail). A restart loses what is kept
 in memory: OAuth authorizations in progress (the person starts again), a
-device-flow answer the client did not receive (it signs in again), and
-cached provider and client metadata (fetched again). Tokens, accounts and
-refreshes carry on.
+device-flow answer the client did not receive (it signs in again),
+cached provider and client metadata (fetched again), and the [secrets
+command](sign-in.md#secrets-from-a-command)'s answers (asked again at
+start: while the command fails, sign-in needing them is unavailable, the
+`max_stale` grace gone with them). Tokens, accounts and refreshes carry
+on.
 
 Ctrl-C or SIGTERM lets running commands finish (up to 30 seconds). The
 server keeps database connections open, so restart it after replacing or

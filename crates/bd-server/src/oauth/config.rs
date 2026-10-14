@@ -16,6 +16,8 @@ struct Doc {
     pub(super) oauth: Option<OauthDoc>,
     #[serde(default)]
     pub(super) authorizer: Option<crate::authorizer::AuthorizerDoc>,
+    #[serde(default)]
+    pub(super) secrets: Option<crate::secrets::SecretsDoc>,
 }
 
 /// `[sign_in]`: how long the tokens of any provider's sign-ins last.
@@ -52,11 +54,11 @@ pub(super) struct GithubDoc {
     #[serde(default)]
     pub(super) api_url: Option<String>,
     #[serde(default)]
-    pub(super) private_key: Option<PathBuf>,
+    pub(super) private_key: Option<Source>,
     #[serde(default)]
     pub(super) ca_cert: Option<PathBuf>,
     #[serde(default)]
-    pub(super) client_secret_file: Option<PathBuf>,
+    pub(super) client_secret_file: Option<Source>,
     #[serde(default)]
     pub(super) deny: Vec<String>,
     #[serde(default)]
@@ -180,11 +182,10 @@ pub(super) fn parse(text: &str) -> std::result::Result<Option<SignIn>, String> {
         format!("{}{message}{hint}", line.map(|n| format!("line {}: ", n + 1)).unwrap_or_default())
     })?;
     if doc.github.is_none() && doc.oidc.is_empty() {
-        return match doc.oauth.is_some() || doc.authorizer.is_some() || doc.sign_in.is_some() {
-            true => {
-                Err("[sign_in], [authorizer] and [oauth] need a provider to sign in with: [github] or [oidc.<name>]"
-                    .into())
-            }
+        return match doc.oauth.is_some() || doc.authorizer.is_some() || doc.sign_in.is_some() || doc.secrets.is_some() {
+            true => Err("[sign_in], [authorizer], [oauth] and [secrets] need a provider to sign in with: [github] or \
+                         [oidc.<name>]"
+                .into()),
             false => Ok(None),
         };
     }
@@ -244,7 +245,21 @@ pub(super) fn parse(text: &str) -> std::result::Result<Option<SignIn>, String> {
         }
     }
     let oauth = doc.oauth.map(oauth_config).transpose()?;
-    let sign_in = SignIn { github, oidc, token_ttl, refresh_limit, refresh_idle, authorizer, oauth };
+    let secrets = doc.secrets.map(crate::secrets::parse).transpose()?;
+    let sign_in = SignIn { github, oidc, token_ttl, refresh_limit, refresh_idle, authorizer, oauth, secrets };
+    match (sign_in.secret_names().is_empty(), &sign_in.secrets) {
+        (false, None) => {
+            return Err("a field names a secret ({ secret = \"<name>\" }), but no [secrets] command fetches it: add \
+                        [secrets], or name a file"
+                .into());
+        }
+        (true, Some(_)) => {
+            return Err("[secrets] fetches nothing: name a secret in a field ({ secret = \"<name>\" }), or remove \
+                        [secrets]"
+                .into());
+        }
+        _ => {}
+    }
     let secret = sign_in.github.as_ref().is_some_and(|g| g.client_secret_file.is_some());
     if sign_in.oauth.is_some() && sign_in.browser_providers().is_empty() {
         return Err("[oauth] needs a provider people sign in with in a browser: github.client_secret_file (GitHub's \
@@ -272,7 +287,7 @@ pub(super) fn github(g: GithubDoc, authorized: bool) -> std::result::Result<Gith
         None if url.eq_ignore_ascii_case("https://github.com") => "https://api.github.com".to_string(),
         None => format!("{url}/api/v3"),
     };
-    if g.private_key.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+    if g.private_key.as_ref().is_some_and(Source::is_empty) {
         return Err("github.private_key is empty: name the GitHub App's private key file, or leave it out".into());
     }
     let private_key = g.private_key;
@@ -282,7 +297,7 @@ pub(super) fn github(g: GithubDoc, authorized: bool) -> std::result::Result<Gith
             .into());
     }
     let client_secret_file = g.client_secret_file;
-    if client_secret_file.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+    if client_secret_file.as_ref().is_some_and(Source::is_empty) {
         return Err("github.client_secret_file is empty: name the file holding a client secret of the GitHub App, \
                     or leave it out"
             .into());

@@ -173,6 +173,19 @@ pub struct BackupArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+pub struct RenamePrefixArgs {
+    /// New prefix (lowercase letters, digits and '-')
+    #[arg(value_name = "NEW_PREFIX")]
+    pub prefix: String,
+    /// Rename ids with this prefix instead of the current issue_prefix
+    #[arg(long, value_name = "OLD")]
+    pub from: Option<String>,
+    /// Report what would change, then roll back
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 pub struct ImportArgs {
     /// JSONL file, or - for stdin
     pub file: String,

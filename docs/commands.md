@@ -9,7 +9,7 @@ and error codes.
 
 | area | commands | see |
 |---|---|---|
-| Workspace | `init` (`--prefix`, `--id-mode hash\|counter`), `info`, `config get/set/unset/list`, `stats`, `doctor`, `version` | [Configuration](#configuration), [Observability](observability.md) |
+| Workspace | `init` (`--prefix`, `--id-mode hash\|counter`), `info`, `config get/set/unset/list`, `rename-prefix`, `stats`, `doctor`, `version` | [Configuration](#configuration), [Renaming the prefix](#renaming-the-prefix), [Observability](observability.md) |
 | Issues | `create`, `show`, `list`, `update`, `close`, `reopen`, `defer`, `undefer`, `delete`, `label add/rm/list` | [Issues](concepts.md#issues) |
 | Dependencies | `dep add/rm/list/tree/cycles`, `blocked` | [Dependency types](concepts.md#dependency-types) |
 | Ready work and claims | `ready`, `claim` (`--next`), `heartbeat` (`hb`), `release` (`unclaim`), `reclaim`, `leases` | [Ready work](concepts.md#ready-work), [Claims](concepts.md#claims-leases-and-recovery) |
@@ -59,6 +59,59 @@ offset (`+2d`) or RFC 3339. Status values accept `wip`/`inprogress` for
 - **`bd backup --to DIR [--keep 24] [--name NAME]`** writes a verified copy
   of a local workspace's database ([Backing up](modes.md#backing-up-a-local-workspace)).
 
+### Renaming the prefix
+
+```bash
+bd rename-prefix NEW [--from OLD] [--dry-run]
+```
+
+`bd config set issue_prefix` changes only the prefix of new ids;
+`bd rename-prefix` also renames the existing issues, all in one
+transaction, and then sets `issue_prefix` to `NEW`. `NEW` is normalized
+like `config set issue_prefix` (lowercased, a trailing `-` dropped).
+
+- **What is renamed.** Every issue whose id starts with `OLD-` becomes
+  `NEW-` and the rest of its id, children included (`old-abc.1` becomes
+  `new-abc.1`). `OLD` defaults to the current `issue_prefix`; `--from`
+  names another, such as the prefix of imported issues or the old one
+  after a `config set issue_prefix`. Other ids are left alone.
+- **What moves with an issue:** both ends of its dependencies (with their
+  type and metadata), labels, comments, its claim (same holder, token and
+  expiry), its child counter (the next child of `new-abc` continues the
+  numbering) and its event history (`bd history NEW-…`).
+- **References.** JSON strings that equal a renamed id are rewritten in
+  issue and dependency metadata (playbook runs and `issue` gates
+  included, `<rig>:<id>` too) and in event payloads. An `issue` gate
+  awaiting a unique partial id (`--await old-ab` for `old-abc`) awaits
+  the renamed id; a partial that matched several ids already stays. In titles,
+  descriptions, design, acceptance criteria, notes, close reasons,
+  comments and memories, a whole-word id (or a child id of one, like
+  `old-abc.2`) is rewritten when it names a renamed issue; look-alikes
+  such as `old-abcd` with no such issue stay. Event payloads keep their
+  text as recorded; only exact id strings change there.
+- **Nested prefixes.** When `NEW` extends `OLD` (`bd` to `bd-sync`), ids
+  that already start with `NEW-` are kept, not prefixed twice. Renaming
+  back (`bd-sync` to `bd`) works too.
+- **Conflicts refuse.** If a new id already belongs to an issue that is
+  not being renamed, or would be longer than 255 characters, nothing
+  changes and the command exits 2 naming the ids.
+- **Live claims keep running** under the new ids: holders must use them
+  from then on (their lease tokens stay valid). The output says how many
+  claims moved.
+- Revisions and `updated_at` are unchanged, so `--if-revision` guards
+  taken on the new ids hold. `bd backup`'s default name follows
+  `issue_prefix`, so later backups go to a new name.
+- The event log records one `prefix_renamed` event (from, to and the
+  counts) and a `config_set` of `issue_prefix`. Renaming to the current
+  prefix does nothing. `--from NEW`, when the ids already carry `NEW-` and
+  `issue_prefix` is another prefix, only sets `issue_prefix` (a
+  `config_set` event, no `prefix_renamed`). A rename to another prefix
+  that finds no ids still sets `issue_prefix` and records
+  `prefix_renamed` with `renamed` 0.
+- `--dry-run` reports the same counts, then rolls back.
+- Through `bd serve` it needs an admin token. It is not available in
+  `bd batch` or as an MCP tool.
+
 ## Global options
 
 | option | env | meaning |
@@ -101,7 +154,7 @@ and unsetting need an admin token.
 
 | key | default | meaning |
 |---|---|---|
-| `issue_prefix` | set by `bd init` (from the directory name) | id prefix; cannot be unset |
+| `issue_prefix` | set by `bd init` (from the directory name) | id prefix of new issues; cannot be unset; [`bd rename-prefix`](#renaming-the-prefix) renames existing ones |
 | `id.mode` | `hash` | `hash` or `counter` |
 | `lease.ttl` | `5m` | claim lease duration (at least 1s) |
 | `lease.grace` | `10m` | how long past expiry before a claim is dead and reclaimable |

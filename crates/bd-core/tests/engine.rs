@@ -1198,3 +1198,344 @@ fn a_writer_past_the_busy_timeout_is_told_the_database_is_busy() {
     assert!(e.to_string().starts_with("database is busy: timed out after"), "{e}");
     writer.execute_batch("COMMIT").unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// Renaming the issue prefix
+
+fn rename(env: &mut Env, to: &str, from: Option<&str>) -> Result<RenamePrefixOutcome> {
+    env.clock.advance(Duration::from_millis(10));
+    let o = RenamePrefixOptions { to: to.into(), from: from.map(String::from) };
+    env.store.write("rename-prefix", "alice", |tx| tx.rename_prefix(&o))
+}
+
+/// Every edge as (issue, depends on, type, metadata), in order.
+fn edges(env: &Env) -> Vec<(String, String, String, serde_json::Value)> {
+    env.store
+        .read(|r| {
+            let mut stmt = r.conn().prepare(
+                "SELECT issue_id, depends_on_id, dep_type, metadata FROM dependencies ORDER BY issue_id, depends_on_id",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let meta: String = row.get(3)?;
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, serde_json::from_str(&meta).unwrap()))
+            })?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .unwrap()
+}
+
+fn all_ids(env: &Env) -> Vec<String> {
+    let all = ListQuery { all: true, ..Default::default() };
+    let mut ids: Vec<String> = env.store.read(|r| r.list(&all)).unwrap().into_iter().map(|i| i.id).collect();
+    ids.sort();
+    ids
+}
+
+fn prefix(env: &Env) -> String {
+    env.store.read(|r| config::prefix(r.conn())).unwrap()
+}
+
+fn head(env: &Env) -> i64 {
+    env.store.read(|r| r.event_head()).unwrap()
+}
+
+#[test]
+fn rename_prefix_moves_ids_edges_claims_events_and_references() {
+    let mut env = Env::new();
+    let parent = env.create("Parent", 1);
+    let c1 = env.create_with(NewIssue { parent: Some(parent.clone()), ..NewIssue::titled("Child 1") });
+    let c2 = env.create_with(NewIssue { parent: Some(parent.clone()), ..NewIssue::titled("Child 2") });
+    assert_eq!((c1.as_str(), c2.as_str()), ("t-1.1", "t-1.2"));
+    let two = env.create_with(NewIssue { labels: vec!["infra".into()], ..NewIssue::titled("Two") });
+    let three = env.create_with(NewIssue {
+        description: "After t-1.2 lands (and t-2), not t-10 or xt-1.".into(),
+        ..NewIssue::titled("Three")
+    });
+    assert_eq!((two.as_str(), three.as_str()), ("t-2", "t-3"));
+    env.store
+        .write("dep", "alice", |tx| {
+            tx.add_dependency(&three, &two, DepType::Blocks, Some(json!({"why": "t-2", "note": "t-1-notes"})))
+        })
+        .unwrap();
+    env.store.write("comment", "alice", |tx| tx.add_comment(&parent, "blocked on t-2")).unwrap();
+    env.store.write("remember", "alice", |tx| tx.remember(Some("plan"), "see t-1.", None)).unwrap();
+    let claim = env.store.write("claim", "bob", |tx| tx.claim(&two, &ClaimOptions::default())).unwrap();
+
+    let map = |id: &str| id.replacen("t-", "new-", 1);
+    let edges_before = edges(&env);
+    let blocked_before: Vec<(String, bool)> =
+        all_ids(&env).into_iter().map(|id| (map(&id), env.issue(&id).is_blocked)).collect();
+    let history_before: Vec<i64> = env.store.read(|r| r.history(&parent)).unwrap().iter().map(|e| e.seq).collect();
+    let revision_before = env.issue(&parent).revision;
+    let head_before = head(&env);
+
+    let out = rename(&mut env, "new", None).unwrap();
+    assert_eq!((out.from.as_str(), out.to.as_str()), ("t", "new"));
+    assert_eq!((out.renamed, out.kept, out.claims), (5, 0, 1));
+    assert_eq!(out.metadata, 1, "the edge naming t-2");
+    // Issue t-3's description, the comment and the memory.
+    assert_eq!(out.text, 3);
+    assert_eq!(out.examples[0], ("t-1".to_string(), "new-1".to_string()));
+
+    // One transaction, recording the new prefix and the rename.
+    let appended: Vec<Event> = env.events().into_iter().filter(|e| e.seq > head_before).collect();
+    assert!(appended.iter().all(|e| e.tx == appended[0].tx), "{appended:#?}");
+    let ops: Vec<&str> = appended.iter().map(|e| e.op.as_str()).collect();
+    assert_eq!(ops, ["config_set", "prefix_renamed"]);
+    let summary = &appended[1];
+    assert_eq!(summary.issue_id, None);
+    assert_eq!((summary.data["from"].as_str(), summary.data["to"].as_str()), (Some("t"), Some("new")));
+    assert_eq!(summary.data["renamed"], 5);
+
+    // Ids: the new ones, children included, and none of the old.
+    assert_eq!(all_ids(&env), ["new-1", "new-1.1", "new-1.2", "new-2", "new-3"]);
+    assert!(matches!(env.store.read(|r| r.issue("t-1")), Err(Error::NotFound { .. })));
+    assert_eq!(prefix(&env), "new");
+    assert_eq!(env.issue("new-1").revision, revision_before, "revisions are left alone");
+
+    // Edges (types and metadata kept, the id in the metadata renamed) and blocked flags.
+    let expected: Vec<_> = edges_before
+        .iter()
+        .map(|(a, b, t, m)| {
+            let m = if a == "t-3" { json!({"why": "new-2", "note": "t-1-notes"}) } else { m.clone() };
+            (map(a), map(b), t.clone(), m)
+        })
+        .collect();
+    assert_eq!(edges(&env), expected);
+    assert!(!edges(&env).iter().any(|(a, b, _, _)| a.starts_with("t-") || b.starts_with("t-")));
+    let blocked_after: Vec<(String, bool)> = all_ids(&env)
+        .into_iter()
+        .map(|id| {
+            let b = env.issue(&id).is_blocked;
+            (id, b)
+        })
+        .collect();
+    assert_eq!(blocked_after, blocked_before);
+    assert!(env.issue("new-3").is_blocked);
+
+    // Labels, comments, memories and text.
+    assert_eq!(env.issue("new-2").labels, ["infra"]);
+    let comments = env.store.read(|r| r.comments("new-1")).unwrap();
+    assert_eq!(comments.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(), ["blocked on new-2"]);
+    assert_eq!(env.store.read(|r| r.memory("plan")).unwrap().unwrap().content, "see new-1.");
+    assert_eq!(env.issue("new-3").description, "After new-1.2 lands (and new-2), not t-10 or xt-1.");
+
+    // History moved with the issue, and events' id fields were renamed.
+    let history_after: Vec<Event> = env.store.read(|r| r.history("new-1")).unwrap();
+    let seqs: Vec<i64> = history_after.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, history_before);
+    assert!(env.store.read(|r| r.history("t-1")).unwrap().is_empty());
+    let dep_added = env.events().into_iter().find(|e| e.op == "dep_added" && e.issue_id.as_deref() == Some("new-3"));
+    let dep_added = dep_added.expect("the blocks edge's event");
+    assert!(!dep_added.data.to_string().contains("\"t-2\""), "{}", dep_added.data);
+
+    // The live claim goes on under the new id with the same token.
+    let lease = env.store.read(|r| r.lease("new-2")).unwrap().expect("lease moved");
+    assert_eq!(
+        (lease.holder.as_str(), lease.token, lease.expires_at),
+        ("bob", claim.lease.token, claim.lease.expires_at)
+    );
+    let issue = env.issue("new-2");
+    assert_eq!((issue.status, issue.assignee.as_deref()), (Status::InProgress, Some("bob")));
+    env.store.write("heartbeat", "bob", |tx| tx.heartbeat("new-2", Some(claim.lease.token), None)).unwrap();
+
+    // Nothing dangles, and child ids go on where they were.
+    let dangling = env
+        .store
+        .read(|r| Ok(r.conn().prepare("PRAGMA foreign_key_check")?.query_map([], |_| Ok(()))?.count()))
+        .unwrap();
+    assert_eq!(dangling, 0);
+    env.assert_healthy();
+    let next = env.create_with(NewIssue { parent: Some("new-1".into()), ..NewIssue::titled("Child 3") });
+    assert_eq!(next, "new-1.3");
+    assert!(env.create("Fresh", 2).starts_with("new-"));
+}
+
+#[test]
+fn rename_prefix_rewrites_issue_gates_which_still_resolve() {
+    let mut env = Env::new();
+    let upstream = env.create("Upstream", 1);
+    let mut gate_ids = Vec::new();
+    for await_id in [upstream.clone(), format!("rig:{upstream}")] {
+        // Work of its own, so neither gate waits for the other.
+        let work = env.create("Work", 1);
+        let mut spec = gates::GateSpec::new(gates::GateKind::Issue);
+        spec.await_id = Some(await_id);
+        let gate = env
+            .store
+            .write("gate", "alice", |tx| {
+                tx.create_gate(gates::NewGate {
+                    spec,
+                    blocks: vec![work.clone()],
+                    title: None,
+                    description: String::new(),
+                    assignee: None,
+                    parent: None,
+                    priority: None,
+                    ephemeral: false,
+                })
+            })
+            .unwrap();
+        gate_ids.push(gate.id);
+    }
+    rename(&mut env, "new", None).unwrap();
+    let gate_ids: Vec<String> = gate_ids.iter().map(|id| id.replacen("t-", "new-", 1)).collect();
+    let awaited: Vec<String> =
+        gate_ids.iter().map(|id| env.issue(id).metadata["gate"]["await_id"].as_str().unwrap().to_string()).collect();
+    assert_eq!(awaited, ["new-1", "rig:new-1"]);
+    assert!(env.issue(&gate_ids[0]).title.starts_with("Wait for new-1"), "{}", env.issue(&gate_ids[0]).title);
+
+    let verdicts = |env: &Env| -> Vec<Option<gates::Verdict>> {
+        gate_ids
+            .iter()
+            .map(|id| {
+                env.store.read(|r| gates::evaluate_local(r.conn(), &gates::view(r.conn(), id)?, r.now())).unwrap()
+            })
+            .collect()
+    };
+    assert!(verdicts(&env).iter().all(|v| matches!(v, Some(gates::Verdict::Pending(_)))), "{:?}", verdicts(&env));
+    env.close("new-1");
+    assert!(verdicts(&env).iter().all(|v| matches!(v, Some(gates::Verdict::Resolve(_)))), "{:?}", verdicts(&env));
+    env.assert_healthy();
+}
+
+#[test]
+fn rename_prefix_refuses_ids_that_belong_to_other_issues() {
+    let mut env = Env::new();
+    env.create("Mine", 1);
+    env.create_with(NewIssue { id: Some("x-1".into()), ..NewIssue::titled("Theirs") });
+    let head_before = head(&env);
+    let err = rename(&mut env, "x", None).unwrap_err();
+    assert!(matches!(&err, Error::Invalid(m) if m.contains("x-1")), "{err}");
+    assert_eq!(all_ids(&env), ["t-1", "x-1"]);
+    assert_eq!(prefix(&env), "t");
+    assert_eq!(head(&env), head_before);
+    env.assert_healthy();
+}
+
+#[test]
+fn rename_prefix_to_a_longer_nested_prefix_keeps_ids_that_have_it() {
+    let mut env = Env::new();
+    let one = env.create_with(NewIssue { id: Some("bd-1".into()), ..NewIssue::titled("Old") });
+    let seven = env.create_with(NewIssue { id: Some("bd-sync-7".into()), ..NewIssue::titled("New") });
+    env.dep(&one, &seven, DepType::Blocks);
+    env.create("Other", 2);
+    let out = rename(&mut env, "bd-sync", Some("bd")).unwrap();
+    assert_eq!((out.renamed, out.kept), (1, 1));
+    assert_eq!(all_ids(&env), ["bd-sync-1", "bd-sync-7", "t-1"]);
+    assert_eq!(prefix(&env), "bd-sync");
+    let deps: Vec<String> =
+        env.store.read(|r| graph::dependencies_of(r.conn(), "bd-sync-1")).unwrap().into_iter().map(|e| e.id).collect();
+    assert_eq!(deps, ["bd-sync-7"]);
+    env.assert_healthy();
+}
+
+#[test]
+fn rename_prefix_to_a_shorter_nested_prefix_renames_chained_ids() {
+    let mut env = Env::new();
+    let q = env.create_with(NewIssue { id: Some("bd-sync-q".into()), ..NewIssue::titled("Q") });
+    let qq = env.create_with(NewIssue { id: Some("bd-sync-sync-q".into()), ..NewIssue::titled("QQ") });
+    env.dep(&qq, &q, DepType::Blocks);
+    let out = rename(&mut env, "bd", Some("bd-sync")).unwrap();
+    assert_eq!((out.renamed, out.kept), (2, 0));
+    assert_eq!(all_ids(&env), ["bd-q", "bd-sync-q"]);
+    assert_eq!(env.issue("bd-q").title, "Q");
+    assert_eq!(env.issue("bd-sync-q").title, "QQ");
+    let deps: Vec<String> =
+        env.store.read(|r| graph::dependencies_of(r.conn(), "bd-sync-q")).unwrap().into_iter().map(|e| e.id).collect();
+    assert_eq!(deps, ["bd-q"]);
+    assert!(env.issue("bd-sync-q").is_blocked);
+    env.assert_healthy();
+}
+
+#[test]
+fn rename_prefix_needs_an_admin_policy() {
+    let mut env = Env::new();
+    env.create("One", 1);
+    let o = RenamePrefixOptions { to: "new".into(), from: None };
+    let policy = |admin| Policy { actor: "alice".into(), admin, human: false, max_claims: None };
+    let err = env
+        .store
+        .write("rename-prefix", "alice", |tx| {
+            tx.set_policy(Some(policy(false)));
+            tx.rename_prefix(&o)
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::Unauthorized(_)), "{err}");
+    assert_eq!(all_ids(&env), ["t-1"]);
+    env.store
+        .write("rename-prefix", "alice", |tx| {
+            tx.set_policy(Some(policy(true)));
+            tx.rename_prefix(&o)
+        })
+        .unwrap();
+    assert_eq!(all_ids(&env), ["new-1"]);
+}
+
+#[test]
+fn rename_prefix_to_the_same_prefix_does_nothing() {
+    let mut env = Env::new();
+    env.create("One", 1);
+    let head_before = head(&env);
+    let out = rename(&mut env, " T- ", None).unwrap();
+    assert_eq!(out, RenamePrefixOutcome { from: "t".into(), to: "t".into(), ..Default::default() });
+    assert!(!out.prefix_set);
+    assert_eq!(head(&env), head_before);
+    assert_eq!(all_ids(&env), ["t-1"]);
+    assert!(matches!(rename(&mut env, "Not valid!", None), Err(Error::Invalid(_))));
+}
+
+#[test]
+fn rename_prefix_from_the_new_prefix_only_sets_issue_prefix() {
+    let mut env = Env::new();
+    env.create("One", 1);
+    env.store.write("config", "alice", |tx| config::set(tx, "issue_prefix", "q")).unwrap();
+    let head_before = head(&env);
+    let out = rename(&mut env, "t", Some("t")).unwrap();
+    assert_eq!((out.renamed, out.prefix_set), (0, true));
+    assert_eq!(prefix(&env), "t");
+    assert_eq!(all_ids(&env), ["t-1"]);
+    let appended: Vec<Event> = env.events().into_iter().filter(|e| e.seq > head_before).collect();
+    let ops: Vec<&str> = appended.iter().map(|e| e.op.as_str()).collect();
+    assert_eq!(ops, ["config_set"]);
+    // Again: now a full no-op.
+    let head_before = head(&env);
+    let out = rename(&mut env, "t", Some("t")).unwrap();
+    assert!(!out.prefix_set);
+    assert_eq!(head(&env), head_before);
+}
+
+#[test]
+fn rename_prefix_rewrites_a_gate_awaiting_a_unique_partial_id() {
+    let mut env = Env::new();
+    let awaited = env.create_with(NewIssue { id: Some("t-ab12x".into()), ..NewIssue::titled("Upstream") });
+    let work = env.create("Work", 1);
+    let mut spec = gates::GateSpec::new(gates::GateKind::Issue);
+    spec.await_id = Some("t-ab12".into());
+    let gate = env
+        .store
+        .write("gate", "alice", |tx| {
+            tx.create_gate(gates::NewGate {
+                spec,
+                blocks: vec![work.clone()],
+                title: None,
+                description: String::new(),
+                assignee: None,
+                parent: None,
+                priority: None,
+                ephemeral: false,
+            })
+        })
+        .unwrap();
+    let out = rename(&mut env, "new", None).unwrap();
+    assert!(out.prefix_set);
+    let gate_id = gate.id.replacen("t-", "new-", 1);
+    assert_eq!(env.issue(&gate_id).metadata["gate"]["await_id"], "new-ab12x");
+    let verdict = |env: &Env| {
+        env.store.read(|r| gates::evaluate_local(r.conn(), &gates::view(r.conn(), &gate_id)?, r.now())).unwrap()
+    };
+    assert!(matches!(verdict(&env), Some(gates::Verdict::Pending(_))), "{:?}", verdict(&env));
+    env.close(&awaited.replacen("t-", "new-", 1));
+    assert!(matches!(verdict(&env), Some(gates::Verdict::Resolve(_))), "{:?}", verdict(&env));
+    env.assert_healthy();
+}

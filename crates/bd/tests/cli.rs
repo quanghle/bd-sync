@@ -3330,3 +3330,94 @@ fn mcp_serves_the_local_workspace_on_stdio() {
     assert_eq!(ready["issues"][0]["id"], "t-2");
     assert_eq!(ready["more"], true, "{ready}");
 }
+
+#[test]
+fn rename_prefix_moves_ids_claims_and_references() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Parent"]);
+    let child = ws.id(&["create", "Child", "--parent", "t-1"]);
+    assert_eq!(child, "t-1.1");
+    ws.ok(&["create", "Other"]);
+    ws.ok(&["dep", "add", "t-1", "t-2"]);
+    ws.ok(&["comment", "add", "t-1", "blocked on t-2"]);
+    let key = ws.json(&["remember", "see t-1"])["memory"]["key"].as_str().unwrap().to_string();
+    let token = ws.json_as("bob", &["claim", "t-2"])["lease"]["token"].as_i64().unwrap().to_string();
+    let head = || ws.json(&["info"])["events_head"].as_i64().unwrap();
+    let before = head();
+
+    // A dry run reports what a run would do and changes nothing.
+    let dry = ws.json(&["rename-prefix", "new", "--dry-run"]);
+    assert_eq!(dry["dry_run"], true, "{dry}");
+    assert_eq!((dry["from"].as_str(), dry["to"].as_str()), (Some("t"), Some("new")), "{dry}");
+    assert_eq!((dry["renamed"].as_u64(), dry["kept"].as_u64(), dry["claims"].as_u64()), (Some(3), Some(0), Some(1)));
+    assert_eq!(dry["text"].as_u64(), Some(2), "the comment and the memory: {dry}");
+    ws.ok(&["show", "t-1"]);
+    assert_eq!(ws.ok(&["config", "get", "issue_prefix"]).trim(), "t");
+    assert_eq!(head(), before, "a dry run appends nothing");
+
+    let run = ws.json(&["rename-prefix", "new"]);
+    assert_eq!(run["dry_run"], false);
+    for k in ["renamed", "kept", "claims", "metadata", "events", "text"] {
+        assert_eq!(run[k], dry[k], "{k}: the dry run counted what the run did");
+    }
+    ws.ok(&["show", "new-1"]);
+    assert_eq!(ws.code_as("tester", &["show", "t-1"]), 3);
+    assert_eq!(ws.json(&["show", "new-1.1"])["title"], "Child");
+    assert_eq!(ws.json(&["comments", "new-1"])[0]["text"], "blocked on new-2");
+    assert_eq!(ws.ok(&["recall", &key]).trim(), "see new-1");
+    let shown = ws.json(&["show", "new-1"]);
+    assert!(shown.to_string().contains("new-2") && !shown.to_string().contains("\"t-2\""), "{shown}");
+
+    // The live claim moved with its token: its holder goes on under the new id.
+    let leases = ws.ok(&["leases"]);
+    assert!(leases.contains("new-2") && leases.contains("bob"), "{leases}");
+    assert!(ws.run_as("bob", &["heartbeat", "new-2", "--token", &token]).status.success());
+    assert!(!ws.json(&["history", "new-1"]).as_array().unwrap().is_empty());
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+    assert_eq!(ws.ok(&["config", "get", "issue_prefix"]).trim(), "new");
+    assert!(ws.id(&["create", "Fresh"]).starts_with("new-"));
+    let events = ws.ok(&["--json", "events", "--since", "0", "--op", "prefix_renamed"]);
+    let events: Vec<Value> = events.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!((events[0]["data"]["from"].as_str(), events[0]["data"]["to"].as_str()), (Some("t"), Some("new")));
+    assert_eq!(events[0]["data"]["renamed"].as_u64(), Some(3));
+
+    // A new id that belongs to another issue refuses the whole rename.
+    ws.ok(&["create", "Foreign", "--id", "x-1"]);
+    let before = head();
+    let out = ws.run_as("tester", &["rename-prefix", "x"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("x-1"), "{}", String::from_utf8_lossy(&out.stderr));
+    ws.ok(&["show", "new-1"]);
+    assert_eq!(ws.ok(&["config", "get", "issue_prefix"]).trim(), "new");
+    assert_eq!(head(), before);
+
+    // The same prefix is nothing to do; an invalid one is refused.
+    assert!(ws.ok(&["rename-prefix", "new"]).contains("nothing to rename"));
+    assert_eq!(head(), before);
+    assert_eq!(ws.code_as("tester", &["rename-prefix", "Bad Prefix!"]), 2);
+
+    // Not a batch operation.
+    assert_eq!(ws.batch_as("tester", "rename-prefix z\n").status.code(), Some(2));
+    ws.ok(&["show", "new-1"]);
+
+    // --from renames ids left behind by `config set issue_prefix`.
+    ws.ok(&["config", "set", "issue_prefix", "q"]);
+    let q = ws.id(&["create", "Under q"]);
+    assert!(q.starts_with("q-"), "{q}");
+    ws.ok(&["rename-prefix", "q", "--from", "new"]);
+    ws.ok(&["show", "q-1"]);
+    ws.ok(&["show", "q-1.1"]);
+    ws.ok(&["show", &q]);
+    assert_eq!(ws.code_as("tester", &["show", "new-1"]), 3);
+    assert_eq!(ws.ok(&["config", "get", "issue_prefix"]).trim(), "q");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+
+    // --from NEW with the ids already under NEW only sets issue_prefix back.
+    ws.ok(&["config", "set", "issue_prefix", "other"]);
+    let out = ws.ok(&["rename-prefix", "q", "--from", "q"]);
+    assert!(out.contains("nothing to rename") && out.contains("issue_prefix = q"), "{out}");
+    assert_eq!(ws.ok(&["config", "get", "issue_prefix"]).trim(), "q");
+    ws.ok(&["show", "q-1"]);
+    ws.ok(&["show", &q]);
+}

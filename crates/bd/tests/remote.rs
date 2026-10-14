@@ -429,6 +429,7 @@ fn tokens_bind_actor_role_and_workspace() {
     assert_eq!(alice.with_stdin(&["batch"], "config set lease.ttl 10m\n").status.code(), Some(7));
     assert_eq!(alice.code(&["doctor"]), 7);
     assert_eq!(alice.code(&["events", "prune", "--keep", "1"]), 7);
+    assert_eq!(alice.code(&["rename-prefix", "x"]), 7);
     admin.ok(&["config", "set", "lease.ttl", "10m"]);
     assert_eq!(alice.json(&["config", "get", "lease.ttl"])["value"], "10m");
     assert_eq!(admin.code(&["doctor"]), 0);

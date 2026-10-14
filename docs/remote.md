@@ -177,7 +177,7 @@ reserved: no token acts as it or its sub-actors.
 |---|---|
 | `read` | read-only commands; its database connection is query-only |
 | `write` | every command except the admin ones |
-| `admin` | also `config set/unset`, `import`, `events prune`, `doctor`, and taking over other actors' claims |
+| `admin` | also `config set/unset`, `rename-prefix`, `import`, `events prune`, `doctor`, and taking over other actors' claims |
 
 The server checks these in the engine, so `bd batch` and playbook runs get
 the same answer as single commands:

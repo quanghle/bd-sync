@@ -1251,3 +1251,27 @@ fn reopening_up_closed_groups_blocks_what_it_should_in_order() {
     assert_eq!(env.ready_ids(), [run, x, h1]);
     env.assert_healthy();
 }
+
+#[test]
+fn a_renamed_run_keeps_its_steps_and_completes_itself() {
+    let mut env = Env::new();
+    let run = env.start(RELEASE, &[("version", "1.2.0")]);
+    assert_eq!(run, "t-1");
+    let o = RenamePrefixOptions { to: "new".into(), from: None };
+    let out = env.store.write("rename-prefix", "alice", |tx| tx.rename_prefix(&o)).unwrap();
+    assert_eq!(out.renamed, 4);
+    for step in ["new-1.bump", "new-1.changelog", "new-1.tag"] {
+        let issue = env.issue(step);
+        assert_eq!(issue.metadata["playbook"]["run"], "new-1", "{step}");
+        assert_eq!(playbook::run_of(&issue).as_deref(), Some("new-1"), "{step}");
+    }
+    assert_eq!(playbook::run_of(&env.issue("new-1")).as_deref(), Some("new-1"));
+    assert_eq!(env.ready_ids(), vec!["new-1.bump"]);
+    env.close("new-1.bump");
+    env.close("new-1.changelog");
+    let last = env.close("new-1.tag");
+    assert_eq!(last.completed.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["new-1"]);
+    let status = env.store.read(|r| playbook::run_status(r.conn(), "new-1", r.now())).unwrap();
+    assert_eq!((status.progress.total, status.progress.done), (3, 3));
+    env.assert_healthy();
+}

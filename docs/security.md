@@ -39,8 +39,8 @@ playbook run gets the same answer as a single command
   claim needs `--take-over` and an admin token (unless the claim is held by
   the token's own actor or a sub-actor). Getting past a human gate needs a
   human token. Only admins change `metadata.playbook` on existing issues,
-  set configuration (`gate.repos` included), import, prune events or run
-  `doctor`.
+  set configuration (`gate.repos` included), rename the issue prefix,
+  import, prune events or run `doctor`.
 - **Actors are bound to tokens.** A token acts as its actor or its
   sub-actors; `--actor` and `$BD_ACTOR` may name nothing else. The
   server's own actor, `bd-serve`, is reserved.

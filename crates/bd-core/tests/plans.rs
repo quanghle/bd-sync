@@ -74,6 +74,11 @@ const WHOLE_TABLE: &[(&str, &str)] = &[
     ("FROM events WHERE 1=1 AND op IN", "events"),
     ("FROM events WHERE 1=1 AND actor = ?", "events"),
     ("SELECT seq FROM events ORDER BY seq DESC LIMIT 1 OFFSET", "events"),
+    // rename-prefix: the rows that may name a renamed id, read once each
+    ("FROM issues WHERE instr(metadata", "issues"),
+    ("FROM dependencies WHERE instr(metadata", "dependencies"),
+    ("FROM comments WHERE instr(text", "comments"),
+    ("FROM events WHERE instr(data", "events"),
 ];
 
 static STATEMENTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -404,6 +409,16 @@ fn run_the_commands(ws: &mut Ws) {
     commands(ws);
 }
 
+/// The commands, then renaming the prefix: every issue, edge, comment,
+/// lease and event moves. Kept out of [`no_statement_is_prepared_again`]:
+/// the rename's `PRAGMA defer_foreign_keys` expires the connection's cached
+/// statements (SQLite does so for every flag pragma), so those it runs
+/// next are prepared again, once, by design.
+fn run_the_commands_and_rename(ws: &mut Ws) {
+    run_the_commands(ws);
+    ws.write("alice", None, |tx| tx.rename_prefix(&RenamePrefixOptions { to: "u".into(), from: None }));
+}
+
 /// Statistics a workspace's first commands left when bd still ran `PRAGMA
 /// optimize` as each command exited (or that `ANALYZE` run by hand leaves):
 /// it analyzes a table the first time it is used, the issues with one issue
@@ -563,7 +578,7 @@ fn analyzed_then_opened() -> Ws {
 #[test]
 fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
     let mut statements = statements_of(walk_the_graph);
-    let commands = statements_of(run_the_commands);
+    let commands = statements_of(run_the_commands_and_rename);
     assert!(commands.len() > 50, "{} statements", commands.len());
     statements.extend(commands);
 

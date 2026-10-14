@@ -171,6 +171,8 @@ pub enum Command {
     /// Read or change workspace configuration
     #[command(subcommand)]
     Config(ConfigCommand),
+    /// Rename existing issues to a new id prefix (ids, edges, claims, events, references) and make it the issue_prefix
+    RenamePrefix(RenamePrefixArgs),
     /// Export a consistent JSONL snapshot
     Export(ExportArgs),
     /// Import a JSONL snapshot (bd or beads format), all or nothing

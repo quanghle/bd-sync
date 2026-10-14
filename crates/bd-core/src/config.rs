@@ -140,11 +140,7 @@ pub fn list(conn: &Connection) -> Result<Vec<ConfigEntry>> {
 fn validate(key: &str, value: &str) -> Result<String> {
     let v = value.trim();
     match key {
-        "issue_prefix" => {
-            let p = v.trim_end_matches('-').to_ascii_lowercase();
-            validate_prefix(&p)?;
-            Ok(p)
-        }
+        "issue_prefix" => normalize_prefix(v),
         "id.mode" => Ok(IdMode::parse(v)?.as_str().to_string()),
         "lease.ttl" | "lease.grace" => {
             let d = parse_duration(v)?;
@@ -176,6 +172,14 @@ fn validate(key: &str, value: &str) -> Result<String> {
             KNOWN.iter().map(|(k, _, _)| *k).collect::<Vec<_>>().join(", ")
         ))),
     }
+}
+
+/// An issue prefix as `config set issue_prefix` stores it: trimmed, without
+/// trailing `-`, lowercased, then validated.
+pub fn normalize_prefix(v: &str) -> Result<String> {
+    let p = v.trim().trim_end_matches('-').to_ascii_lowercase();
+    validate_prefix(&p)?;
+    Ok(p)
 }
 
 pub fn validate_prefix(prefix: &str) -> Result<()> {

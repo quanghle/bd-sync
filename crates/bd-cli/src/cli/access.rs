@@ -60,6 +60,18 @@ pub fn access(cmd: &Command) -> Access {
         )
         | C::Gate(GateCommand::List(_) | GateCommand::Show(_))
         | C::Agents(AgentsCommand::Manifest(_) | AgentsCommand::Fetch(_)) => Access::Read,
+        // Everything else writes, `RenamePrefix` included (admin-only, checked when it runs).
         _ => Access::Write,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_prefix_is_a_write() {
+        let cmd = Command::RenamePrefix(RenamePrefixArgs { prefix: "x".into(), from: None, dry_run: true });
+        assert_eq!(access(&cmd), Access::Write);
     }
 }

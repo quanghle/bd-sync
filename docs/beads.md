@@ -73,7 +73,9 @@ timestamps, close reasons, labels, dependencies, comments and memories.
 Gates keep their condition (`metadata.gate`), wisps stay ephemeral, and
 protos are skipped: copy the formula files to `.bd/playbooks/` instead.
 `hooked` issues become `in_progress` with a fresh lease, and `tombstone`
-rows are skipped.
+rows are skipped. Issues imported with another prefix can be renamed
+afterwards with `bd rename-prefix <prefix> --from <beads prefix>`
+([Renaming the prefix](commands.md#renaming-the-prefix)).
 
 After migrating:
 

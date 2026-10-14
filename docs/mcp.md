@@ -412,7 +412,7 @@ the server's name.
 model get past what the CLI asks of agents: taking over or ending other
 actors' claims (`--take-over`), `--force`, `delete`, `defer` beyond
 `update`, gates, playbooks, `batch`, `import`/`export`, `config`,
-`doctor`, `events prune`, `agents`, `serve`, `remote` and `forget`. Tool
+`rename-prefix`, `doctor`, `events prune`, `agents`, `serve`, `remote` and `forget`. Tool
 calls never carry the token's admin or human rights, locally or on a
 server, so a model cannot take over another actor's claim or open a human
 gate.

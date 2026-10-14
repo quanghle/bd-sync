@@ -15,7 +15,8 @@ a JSON `metadata` object.
 - **Ids** are `<prefix>-<base36 hash>` by default (`id.mode = hash`, short
   and adaptive in length), or sequential numbers with `id.mode = counter`.
   A child created with `--parent` gets `<parent>.<n>`. Commands accept any
-  unique prefix of an id.
+  unique prefix of an id. `bd rename-prefix` renames existing ids to a new
+  prefix ([Renaming the prefix](commands.md#renaming-the-prefix)).
 - **Types**: `task` (default), `bug`, `feature`, `epic`, `chore`,
   `decision`, `spike`, `story`, `milestone`, and `gate` (reserved for
   [gates](playbooks.md#gates)). `types.custom` adds more.
@@ -171,7 +172,7 @@ commit-ordered; `tx` groups the events of one transaction.
 | issues | `created`, `updated` (field-level old/new), `closed`, `reopened`, `deleted` (with a snapshot) |
 | claims | `claimed`, `released`, `reclaimed`, `lease_granted` |
 | graph | `dep_added`, `dep_removed`, `dep_updated`, `blocked`, `unblocked` |
-| other | `commented`, `memory_set`, `memory_deleted`, `config_set`, `config_unset`, `imported`, `pruned` |
+| other | `commented`, `memory_set`, `memory_deleted`, `config_set`, `config_unset`, `prefix_renamed` ([Renaming the prefix](commands.md#renaming-the-prefix)), `imported`, `pruned` |
 | playbooks and gates | `run_started`, `run_compacted`, `purged`, `gate_escalated`, `gate_updated` |
 | agent assets | `agents_changed` (written by `bd serve`; see [Agent assets](agents.md#serving-sets)) |
 

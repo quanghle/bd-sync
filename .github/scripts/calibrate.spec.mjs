@@ -90,6 +90,14 @@ describe('joinRuns', () => {
 		expect(rows.map((r) => r.id)).toEqual(['squid-a.1', 'squid-b.1'])
 	})
 
+	it('tells a judge draft accepted as the score from one a person confirmed', () => {
+		const [row] = joinRuns([run('squid-c.1', { score: { overall: 4, complexity: 3, by: 'judge' }, score_judge: { complexity: 3, overall: 4 } })], {
+			followUpsOf: () => [],
+			traceOf: () => ({ work: null, why: 'none' }),
+		})
+		expect(row).toMatchObject({ overall: 4, overallFrom: 'accepted', confirmedComplexity: 3 })
+	})
+
 	it('prefers the confirmed score and complexity, and marks a judge draft', () => {
 		expect(rows[0]).toMatchObject({ tier: 'standard', overall: 3, overallFrom: 'person', judged: 3, confirmedComplexity: 4 })
 		expect(rows[1]).toMatchObject({ estimate: 2, judged: 3, overall: 4, overallFrom: 'judge' })

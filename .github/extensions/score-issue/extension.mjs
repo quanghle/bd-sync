@@ -208,7 +208,7 @@ async function run(ctx) {
         "",
         work,
         "",
-        "Draft only: a person confirms or adjusts it as the score metadata (.bd/rubric.md, Recording).",
+        "Draft: accepted as the score metadata, or confirmed or adjusted by a person when the run asks for one (.bd/rubric.md, Recording).",
     ].join("\n");
     const rec = await agent(
         `Record a score in bd. Run these two commands, in order, exactly as given except that <Text> is the "Text" under it, ` +
@@ -229,7 +229,7 @@ const scoreIssue = defineWorkflow({
         name: "score-issue",
         description:
             `A judge (${JUDGE.model}, ${JUDGE.effort} effort) scores how well an agent did on a bd issue (or playbook run) against the rubric in .bd/rubric.md ` +
-            "and stores a draft score for a person to confirm. Use for scoring finished agent work on a bd issue, epic or playbook run, e.g. from a playbook's score step. " +
+            "and stores a draft score, for the playbook to accept or a person to confirm. Use for scoring finished agent work on a bd issue, epic or playbook run, e.g. from a playbook's score step. " +
             "args: { issue, range?, workdir?, base?, result?, context?, actor?, dryRun? }. The judge reads the rubric, the issue and its children, comments, history " +
             "and the change, and scores each dimension with evidence, plus the work's complexity (kept out of overall). Then .github/scripts/trace-run.mjs traces " +
             "which agents did each step with which model and effort, and for how long, from the Copilot CLI sessions on this machine (after the judge, which is shown " +
@@ -237,8 +237,8 @@ const scoreIssue = defineWorkflow({
             "judge finds the commits named in close reasons and comments, or by `git log --all --grep=<issue>`. workdir (with base, default main) points at uncommitted " +
             "work in a worktree. result is a plan-implement-review result, summarized as evidence; context is free text from the caller (e.g. what a person had to " +
             "correct). The draft goes into the issue's score_judge metadata (rubric version, overall, dims, complexity, confidence, by: the judge model) and the " +
-            "reasoning, the complexity estimate's gap and the trace summary into a comment on the issue, written as actor (pass your bd actor); a person then sets the " +
-            "score metadata (.bd/rubric.md, Recording). dryRun returns the score and trace summary without writing to bd.",
+            "reasoning, the complexity estimate's gap and the trace summary into a comment on the issue, written as actor (pass your bd actor); the playbook then accepts it, or a person " +
+            "sets the score metadata (.bd/rubric.md, Recording). dryRun returns the score and trace summary without writing to bd.",
         phases: [
             { title: "Setup", detail: "find the main checkout and the rubric version" },
             { title: "Judge", detail: "the judge scores the work against the rubric, with evidence" },

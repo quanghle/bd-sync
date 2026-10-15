@@ -1,14 +1,19 @@
 # Score how well an agent did on an issue, against .bd/rubric.md: a judge model scores, a person confirms.
 # Preview with: bd playbook plan score --var issue=<id>
-description = "Score agent work on an issue: a judge model drafts a score against .bd/rubric.md, a person confirms or adjusts it"
+description = "Score agent work on an issue: a judge model drafts a score against .bd/rubric.md, the draft is accepted, or a person confirms or adjusts it (confirm=person)"
 title = "Score {{issue}}"
 
 [vars.issue]
 description = "The issue, epic or playbook run to score (open or closed)"
 required = true
 
+[vars.confirm]
+description = "Who confirms the judge's score: judge (its draft is the score, no gate) or person (a human gate)"
+default = "judge"
+enum = ["judge", "person"]
+
 [vars.approver]
-description = "Who confirms the score"
+description = "Who confirms the score (confirm=person)"
 default = "Quang Le"
 
 [[steps]]
@@ -23,9 +28,21 @@ comments its reasoning there. Do not score it yourself: the judge is gpt-6-astra
 acceptance_criteria = "{{issue}} has score_judge metadata and the judge's comment; the close reason gives the overall score and confidence."
 
 [[steps]]
+id = "accept"
+title = "Accept the score of {{issue}}"
+needs = ["judge"]
+condition = "{{confirm}} == judge"
+description = """
+No person confirms this score (confirm=judge): copy {{issue}}'s score_judge metadata into its score
+metadata, every field but confidence, with `by` set to `judge` (.bd/rubric.md, Recording). A person
+may still adjust it later by setting score with their own name."""
+acceptance_criteria = "{{issue}} has score metadata equal to score_judge with by=judge; the close reason gives the overall score."
+
+[[steps]]
 id = "confirm"
 title = "Confirm the score of {{issue}}"
 needs = ["judge"]
+condition = "{{confirm}} == person"
 description = """
 A person reads the judge's comment and score_judge on {{issue}}, sets the score metadata
 (.bd/rubric.md, Recording: copy the draft to agree, change it and comment why to adjust), then

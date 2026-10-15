@@ -30,6 +30,11 @@ enum = ["no", "yes"]
 description = "Who resolves the requirements, design and sign-off gates"
 default = "Quang Le"
 
+[vars.score_confirm]
+description = "Who confirms the judge's score: judge (its draft is the score, no gate) or person (a human gate)"
+default = "judge"
+enum = ["judge", "person"]
+
 # 1. Requirements -------------------------------------------------------------
 
 [[steps]]
@@ -241,10 +246,24 @@ each step, with which model and effort, into the run's work metadata (.github/sc
 acceptance_criteria = "Evidence: the run's score_judge and work metadata and the judge's comment; the close reason gives the overall score, complexity (and the estimate) and confidence, and names any session the trace could not find."
 
 [[steps]]
+id = "score-accept"
+title = "Accept score: {{task}}"
+type = "task"
+needs = ["score"]
+condition = "{{score_confirm}} == judge"
+description = """
+No person confirms this run's score (score_confirm=judge): copy the run's score_judge metadata into \
+its score metadata, every field but confidence, with `by` set to `judge` \
+(`bd update <run> --set-metadata 'score={...,"by":"judge"}'`; .bd/rubric.md, Recording). A person \
+may still adjust it later by setting score with their own name."""
+acceptance_criteria = "Evidence: the run's score metadata, equal to score_judge with by=judge; the close reason gives the overall score."
+
+[[steps]]
 id = "score-confirm"
 title = "Confirm score: {{task}}"
 type = "decision"
 needs = ["score"]
+condition = "{{score_confirm}} == person"
 description = """
 A person reads the judge's comment and score_judge on the run, sets the run's score metadata \
 (.bd/rubric.md, Recording: copy the draft, complexity included, to agree; change it and comment why, \
@@ -263,10 +282,10 @@ description = "Check the run's score_judge and the judge's comment, set the run'
 id = "recalibrate-check"
 title = "Recalibration check: {{task}}"
 type = "task"
-needs = ["score-confirm"]
+needs = ["score-accept", "score-confirm"]
 description = """
 Run `node .github/scripts/recalibrate-due.mjs --start --actor <your bd actor>`. It counts the change \
-runs whose score a person confirmed and that no recalibration covers yet (this run included). At 10 it \
+runs with a confirmed score (the judge's or a person's) that no recalibration covers yet (this run included). At 10 it \
 starts the `recalibrate` playbook over them and marks each covered run, so none counts twice; below 10 it \
 starts nothing. When it starts one, the new run's report step is next work: leave it to the next session or \
 claim it. Never resolve its approval gate."""

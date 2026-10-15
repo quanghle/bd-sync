@@ -18,12 +18,13 @@ describe('pendingRuns', () => {
 		const issues = [
 			run('b', { score }, 'change', '2026-10-15T02:00:00Z'),
 			run('a', { score }, 'change', '2026-10-15T01:00:00Z'),
+			run('accepted', { score: { ...score, by: 'judge' } }, 'change', '2026-10-15T03:00:00Z'),
 			run('judged', { score_judge: score }),
 			run('done', { score, recalibrated: 'r1' }),
 			run('other', { score }, 'score'),
 			{ id: 'plain', created_at: '2026-10-15T00:00:00Z' },
 		]
-		expect(pendingRuns(issues)).toEqual(['a', 'b'])
+		expect(pendingRuns(issues)).toEqual(['a', 'b', 'accepted'])
 	})
 })
 

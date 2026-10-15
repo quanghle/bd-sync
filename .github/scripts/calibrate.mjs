@@ -85,7 +85,8 @@ export function joinRuns(issues, { followUpsOf, traceOf }) {
         judged: md.score_judge?.complexity ?? null,
         confirmedComplexity: confirmed?.complexity ?? null,
         overall: confirmed?.overall ?? md.score_judge?.overall ?? null,
-        overallFrom: confirmed ? 'person' : md.score_judge ? 'judge' : null,
+        // 'accepted': the judge's draft taken as the score with no person confirming it (by: judge).
+        overallFrom: confirmed ? (confirmed.by === 'judge' ? 'accepted' : 'person') : md.score_judge ? 'judge' : null,
         findings: {
           serious: findings.filter((f) => ['blocker', 'serious'].includes(severityOf(f))).length,
           minor: findings.filter((f) => !['blocker', 'serious'].includes(severityOf(f))).length,
@@ -272,7 +273,7 @@ export function render(runs, agg) {
         n(r.estimate),
         n(complexityOf(r)),
         gapCell(r),
-        r.overall == null ? '–' : `${r.overall}${r.overallFrom === 'judge' ? ' (draft)' : ''}`,
+        r.overall == null ? '–' : `${r.overall}${r.overallFrom === 'judge' ? ' (draft)' : r.overallFrom === 'accepted' ? ' (judge)' : ''}`,
         r.findings.serious,
         r.findings.minor,
         r.findings.followUps ?? '?',

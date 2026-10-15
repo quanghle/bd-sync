@@ -22,7 +22,7 @@ title = "Report on {{count}} runs"
 description = """
 Run `node .github/scripts/calibrate.mjs --json` and `node .github/scripts/reviewer-catch.mjs --json` and \
 read them for the covered runs ({{runs}}), against the rest: estimate against judged and confirmed \
-complexity per band, the judge's gap from the person's score, findings per run, cost and agent time by \
+complexity per band, the judge's gap from a person's score (runs whose score is the judge's accepted draft, `by: judge`, have none), how many scores were accepted against confirmed by a person, findings per run, cost and agent time by \
 role, model and effort, and each reviewer model's catch rate (cells under 5 pairs are thin: no conclusion). \
 Comment the findings on this run (`bd comment add <run> ...`): numbers, not impressions."""
 acceptance_criteria = "Evidence: a comment on the run with the figures read from both reports, and which cells are too thin to act on."

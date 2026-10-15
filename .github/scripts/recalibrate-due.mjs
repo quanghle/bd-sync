@@ -1,10 +1,11 @@
 #!/usr/bin/env node
-// Whether enough change runs have a person-confirmed score since the last recalibration, and starts the recalibrate
+// Whether enough change runs have a confirmed score since the last recalibration, and starts the recalibrate
 // playbook when they do. The last step of a change run calls it with --start.
 //
 //   node .github/scripts/recalibrate-due.mjs [--root <checkout>] [--every 10] [--start] [--actor <name>]
 //
-// A change run counts once its `score` metadata (the person's, not the judge's `score_judge`) is set and it has no
+// A change run counts once its `score` metadata (a person's, or the judge's draft accepted with `by: judge`; not a bare
+// `score_judge`) is set and it has no
 // `recalibrated` metadata. --start runs `bd playbook run recalibrate` over the counted runs, then sets each one's
 // `recalibrated` to the new run's id, so no run counts twice and a second call finds nothing due. Prints one JSON object:
 // { due, count, every, runs, started }.

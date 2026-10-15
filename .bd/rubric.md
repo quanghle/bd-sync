@@ -2,7 +2,7 @@
 
 Version: 2
 
-How well an agent did on a bd issue (or a playbook run and its steps), scored 1 to 5 on each dimension below, plus an overall score, and how hard the work was (Complexity, kept apart from the score). The `score-issue` workflow has a judge (`gpt-6-astra`) judge the work against this rubric and stores a draft; a person confirms or adjusts it. Bump the version when an anchor changes meaning, so scores stay comparable.
+How well an agent did on a bd issue (or a playbook run and its steps), scored 1 to 5 on each dimension below, plus an overall score, and how hard the work was (Complexity, kept apart from the score). The `score-issue` workflow has a judge (`gpt-6-astra`) judge the work against this rubric and stores a draft, which becomes the score as it is or, when a person confirms scores (`score_confirm=person` on a `change` run, `confirm=person` on a `score` run), once they confirm or adjust it. Bump the version when an anchor changes meaning, so scores stay comparable.
 
 ## Scale
 
@@ -125,7 +125,7 @@ Scores live in the scored issue's metadata (for a playbook run, the run issue), 
 ```
 
 - `score_judge`: the judge's draft (`by` is the judge model, `gpt-6-astra`, plus `confidence`); the workflow also comments its reasoning on the issue, with the complexity gap and a summary of the work trace.
-- `score`: the confirmed score, set by a person. To agree, copy the draft with `by` set to the person; to adjust, change the numbers and comment why, starting the comment with `Score adjusted:` (the judge is not shown it on a rerun):
+- `score`: the confirmed score. By default the judge's draft is accepted as it is: copied without `confidence`, with `by` set to `judge`. A person may set it instead, behind a human gate when the run asks for one, or later over an accepted draft. To agree, copy the draft with `by` set to the person; to adjust, change the numbers and comment why, starting the comment with `Score adjusted:` (the judge is not shown it on a rerun):
 
   ```bash
   bd update <issue> --set-metadata 'score={"rubric":2,"overall":4,"dims":{...},"complexity":3,"by":"Quang Le"}'
@@ -134,7 +134,7 @@ Scores live in the scored issue's metadata (for a playbook run, the run issue), 
 - `complexity_estimate`: the agent's estimate from the requirements step (Complexity).
 - `work`: who did what, written by `.github/scripts/trace-run.mjs` when the run is scored. Per step of the run: each agent (the session's main thread, a subagent, a workflow agent) with its model, effort, requests, tokens and times, including its active span (first request to the end of its last, approximate), plus totals per model and effort, and a `timing` block (each step's elapsed time from its claim or the previous step's close, gate waits, and human wait). It comes from the Copilot CLI session logs (`~/.copilot/session-state`) on the machine that scores, so sessions run elsewhere are listed as missing; each request carries its AI credits (1 credit = $0.01), and a request logged without them counts as unpriced. It holds no transcript content (prompts, tool output, thinking), but it does store each agent's label: a subagent's type and description, or a workflow's agent label, cut to 80 characters, so keep secrets out of those. Run it by hand for an older run: `node .github/scripts/trace-run.mjs <run> --summary` (add `--write` to store it).
 
-The gap between `score_judge` and `score` over many issues shows how far the judge can be trusted. Read scores next to `complexity` and `work`: which model and effort did which kind of work, and how it went. `node .github/scripts/calibrate.mjs` joins them across every run, with cost and time.
+The gap between `score_judge` and a person's `score` (one whose `by` is not `judge`) over many issues shows how far the judge can be trusted. Read scores next to `complexity` and `work`: which model and effort did which kind of work, and how it went. `node .github/scripts/calibrate.mjs` joins them across every run, with cost and time.
 
 ## Project notes: bd-sync
 

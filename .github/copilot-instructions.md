@@ -17,7 +17,8 @@ A coding agent session gets bd from `.github/workflows/copilot-setup-steps.yml`,
 
 - Start with `bd prime`. If it fails, run `bd remote show` and say in the pull request that bd was unreachable or refused the token; don't recreate a local database.
 - If `bd prime` warns that you are the plain default actor, run every bd command as `BD_SESSION=<your branch name> bd ...`.
-- Find the bd issue the task names (`bd show <id>`; otherwise `bd query 'status = open AND title ~ "..."'`), or create one with `bd create` when the task has none.
+- The GitHub issue you were assigned names its bd issue in a hidden `<!-- bd:<id> -->` line at the end of its body (`bd github push --create` writes it), or in its text. Use that id: `bd show <id>`, then claim it.
+- If the GitHub issue names no bd issue, don't create one (a later `bd github pull` would import the GitHub issue as a second bd issue): say so in the pull request, and the maintainer links it.
 - Claim with a lease that outlasts builds and test runs: `bd claim <id> --ttl 60m`, and keep the printed token. Renew with `bd heartbeat <id> --token <t> --ttl 60m` before long steps (`cargo test --workspace` takes a while); if a heartbeat fails, stop: the claim is gone.
 - Put the bd issue id in the pull request title or description and in commit messages, as this repository's commits do (`... (bd-xxxx)`).
 - You may commit and push to your own branch for the pull request; that is the exception to "do not commit or push". Never push to `main` or to another branch.

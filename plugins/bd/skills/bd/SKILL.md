@@ -25,6 +25,16 @@ bd is the repository's shared task tracker: a dependency-aware work queue with l
 - `bd create "Title" -d "why and what" --dep discovered-from:<id>` for work found along the way; `bd dep add <issue> <depends-on>` orders it.
 - `bd comment add <id> "..."` leaves context for whoever picks an issue up; `bd remember "..."` stores a durable insight (`bd memories <query>` searches them).
 
+## Working efficiently
+
+- Keep output small: `bd ready --brief`, `bd list --brief` and `bd show <id> --brief` print only the key fields.
+- When an issue is not ready or not where you expected, ask why: `bd ready --explain`, `bd show <id> --why`.
+- Search with `bd query '<expr>'` instead of paging through lists, for example `bd query 'status = open AND label = x AND updated > 7d'`.
+- Capture a quick follow-up with `bd q "title"`: it prints only the new id.
+- Close a repeat with `bd duplicate <id> --of <other>`, and replaced work with `bd supersede <id> --with <newer>`, rather than closing it by hand: the link is kept.
+- `bd epic status` shows each open epic's progress.
+- `bd close <id> --reason "..." --claim-next` finishes an issue and claims the next ready one in one step.
+
 ## Claims and take-overs
 
 - Exit code 4 is a claim conflict: someone else holds it (possibly another session of your own actor), or it is not ready. Re-read with `bd show`; do not answer a 4 with `--take-over`, and `--force` never ends another actor's claim.

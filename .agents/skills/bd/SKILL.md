@@ -29,6 +29,16 @@ Claude Code subagents share their parent session's id, so their plain `bd` comma
 6. Finish: `bd close <id> --reason "..."` (add `--failed` if it failed), or give it back with `bd release <id>`.
 7. Never end or take over work another agent holds: closing, releasing, reassigning, moving out of `in_progress` or deleting its live claim fails with exit 4 naming the holder, and `--force` does not change that. `--take-over` takes it over and is recorded in the history; use it only when asked to.
 
+## Working efficiently
+
+- Keep output small: `bd ready --brief`, `bd list --brief` and `bd show <id> --brief` print only the key fields.
+- When an issue is not ready or not where you expected, ask why: `bd ready --explain`, `bd show <id> --why`.
+- Search with `bd query '<expr>'` instead of paging through lists, for example `bd query 'status = open AND label = x AND updated > 7d'`.
+- Capture a quick follow-up with `bd q "title"`: it prints only the new id.
+- Close a repeat with `bd duplicate <id> --of <other>`, and replaced work with `bd supersede <id> --with <newer>`, rather than closing it by hand: the link is kept.
+- `bd epic status` shows each open epic's progress.
+- `bd close <id> --reason "..." --claim-next` finishes an issue and claims the next ready one in one step.
+
 ## Playbooks and gates
 
 - Repeatable multi-step work lives in `.bd/playbooks/*.toml`: `bd playbook list`, then `bd playbook run <name> --var key=value` (preview with `bd playbook plan`). Its steps are ordinary issues `<run>.<step>`: work them with `bd ready --run <run>`, claim, close.

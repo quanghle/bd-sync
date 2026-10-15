@@ -28,6 +28,11 @@ The bd section says that the project tracks its work with bd, to run
 compacted or summarized, and gives the core loop (`bd ready`,
 `bd claim --next`, `bd heartbeat <id> --token <t>`, `bd close <id>`).
 
+`bd init` ends by suggesting this step: `  agents: bd setup <harness>`,
+naming the harness whose agent session ran it (Claude Code, Codex or
+Copilot CLI, told by the session id variable each sets), or
+`bd setup --list` outside an agent session.
+
 The hooks are bd's own fixed commands, so `bd setup` runs in agent
 sessions too, with no approval step. It runs only on the local machine:
 it is never forwarded to a bd server, and refused through `bd serve`.
@@ -157,7 +162,9 @@ From a shell: `claude plugin marketplace add quanghle/bd-sync`, then
 `claude plugin install bd@bd`. The plugin runs the same hooks as
 `bd setup claude` writes (SessionStart, SubagentStart and PreToolUse, all
 bare `bd` commands, so `bd` must be on `PATH`), and adds a short `bd`
-skill teaching the work loop. It has no version, so installs follow the
+skill teaching the work loop and how to work efficiently (`--brief`,
+`bd ready --explain`, `bd query`, `bd q`, `bd duplicate`/`bd supersede`,
+`bd epic status`, `bd close --claim-next`). It has no version, so installs follow the
 repository's commits.
 
 Use the plugin or the hooks in settings, not both: Claude Code runs a

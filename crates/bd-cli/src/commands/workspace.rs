@@ -87,9 +87,19 @@ pub fn cmd_init(app: &mut App, a: &InitArgs) -> Result<()> {
         .line(format!("✓ Initialized bd workspace at {}", path.display()))
         .line(format!("  prefix: {prefix}   ids: {}   journal: WAL", id_mode.as_str()))
         .line("  next: bd create \"First task\" -p 1   then: bd ready".to_string())
+        .line(format!("  agents: {}", setup_hint(&crate::agents::session_harnesses())))
         .id(path.display().to_string());
     app.print(out);
     Ok(())
+}
+
+/// `bd init`'s hint for wiring an agent harness to bd: `bd setup` for the
+/// harnesses whose session runs the command, else the list of harnesses.
+fn setup_hint(harnesses: &[bd_core::agents::Harness]) -> String {
+    if harnesses.is_empty() {
+        return "bd setup --list   then: bd setup <harness>".into();
+    }
+    harnesses.iter().map(|h| format!("bd setup {}", h.name())).collect::<Vec<_>>().join("   or: ")
 }
 
 pub fn cmd_info(app: &mut App) -> Result<()> {
@@ -160,4 +170,24 @@ pub fn format_timing(app: &App) -> String {
         ));
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use bd_core::agents::Harness;
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn the_setup_hint_names_commands_that_parse() {
+        assert_eq!(setup_hint(&[]), "bd setup --list   then: bd setup <harness>");
+        assert_eq!(setup_hint(&[Harness::Claude]), "bd setup claude");
+        assert_eq!(setup_hint(&[Harness::Claude, Harness::Codex]), "bd setup claude   or: bd setup codex");
+        Cli::try_parse_from(["bd", "setup", "--list"]).unwrap();
+        for h in Harness::ALL {
+            let hint = setup_hint(&[h]);
+            Cli::try_parse_from(hint.split(' ')).unwrap_or_else(|e| panic!("{hint}: {e}"));
+        }
+    }
 }

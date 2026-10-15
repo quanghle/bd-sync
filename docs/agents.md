@@ -391,8 +391,13 @@ Two commands run at the start of each agent session:
   harness's set with pull semantics (removals and restores applied, new or
   changed assets only reported), and tells the session what changed.
 - `bd prime --hook <harness>` prints the [prime](concepts.md#comments-and-memory)
-  context: the actor, its claims, ready work, gates, playbooks and
-  memories.
+  context: the actor, the core loop, its claims, ready work, gates,
+  playbooks and memories. The core loop is kept to a dozen lines, as it is
+  injected into every session and again after compaction; besides claim,
+  heartbeat and close it names the commands that keep context small:
+  `--brief` on `bd ready`/`list`/`show`, `bd ready --explain` and
+  `bd show <id> --why` for work that is not ready, `bd query` for searches,
+  `bd q` for quick capture, and `bd duplicate`/`bd supersede`.
 
 Both print in the format the harness reads: plain text for Claude Code and
 Codex, one `{"additionalContext": "..."}` JSON object for Copilot CLI. Both

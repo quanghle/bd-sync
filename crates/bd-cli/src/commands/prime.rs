@@ -95,29 +95,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     }
     o.push(String::new());
     o.push("## Core loop".into());
-    o.push("- `bd ready` lists unblocked work in queue order (priority, then age).".into());
-    o.push(format!("- `bd claim --next` atomically takes the head of the queue with a {ttl} lease; `bd claim <id>` takes a specific issue."));
-    o.push("- `bd heartbeat <id> --token <t>` renews the lease while you work; a lost lease means stop.".into());
-    o.push(
-        "- `bd close <id> --reason \"...\"` finishes (`--failed` if it failed; `--claim-next` also claims the next ready issue); `bd release <id>` gives it back."
-            .into(),
-    );
-    o.push(
-        "- A live claim is its holder's: claiming it again (even as your own actor, from another session) or \
-         closing, releasing or reassigning another actor's fails with exit 4, `--force` or not. `--take-over` \
-         takes it over and is recorded; use it only on purpose."
-            .into(),
-    );
-    o.push(
-        "- `bd create \"title\" --dep <id>` records discovered work; `bd dep add <issue> <depends-on>` orders it."
-            .into(),
-    );
-    o.push(
-        "- `bd comment add <id> \"...\"` leaves context; `bd remember \"insight\"` stores durable memory shown here."
-            .into(),
-    );
-    o.push("- `--json` on any command gives machine output; `--if-revision N` makes an update compare-and-set (exit 13 on conflict).".into());
-    o.push("- `bd playbook run <name> --var k=v` starts repeatable multi-step work (`bd playbook list`); `bd playbook status <run>` shows its steps; gates in front of steps are listed by `bd gate list`.".into());
+    o.extend(core_loop(&ttl));
     o.push(String::new());
     o.push(format!(
         "## Status: {} ready · {} waiting on children · {} in progress · {} blocked · {} deferred · {} open total",
@@ -239,6 +217,38 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     Ok(())
 }
 
+/// The lines of `bd prime`'s "## Core loop" section. Every `bd ...` command
+/// they name in backticks parses (see the tests), and they stay few: prime is
+/// injected into every agent session and again after compaction.
+fn core_loop(ttl: &str) -> Vec<String> {
+    vec![
+        "- `bd ready` lists unblocked work in queue order (priority, then age); `--brief` on `bd ready`, `bd list` \
+         and `bd show <id>` keeps output small."
+            .into(),
+        format!("- `bd claim --next` atomically takes the head of the queue with a {ttl} lease; `bd claim <id>` takes a specific issue."),
+        "- `bd heartbeat <id> --token <t>` renews the lease while you work; a lost lease means stop.".into(),
+        "- `bd close <id> --reason \"...\"` finishes (`--failed` if it failed; `--claim-next` also claims the next ready issue); `bd release <id>` gives it back."
+            .into(),
+        "- A live claim is its holder's: claiming it again (even as your own actor, from another session) or \
+         closing, releasing or reassigning another actor's fails with exit 4, `--force` or not. `--take-over` \
+         takes it over and is recorded; use it only on purpose."
+            .into(),
+        "- Not ready, or not where you expected? `bd ready --explain` and `bd show <id> --why` say why. Search with \
+         `bd query 'status = open AND label = x AND updated > 7d'`."
+            .into(),
+        "- `bd create \"title\" --dep <id>` records discovered work (`bd q \"title\"` prints only the id); \
+         `bd dep add <issue> <depends-on>` orders it."
+            .into(),
+        "- Close repeats with `bd duplicate <id> --of <other>` and replaced work with `bd supersede <id> --with <newer>`, \
+         not by hand."
+            .into(),
+        "- `bd comment add <id> \"...\"` leaves context; `bd remember \"insight\"` stores durable memory shown here."
+            .into(),
+        "- `--json` on any command gives machine output; `--if-revision N` makes an update compare-and-set (exit 13 on conflict).".into(),
+        "- `bd playbook run <name> --var k=v` starts repeatable multi-step work (`bd playbook list`); `bd playbook status <run>` shows its steps; gates in front of steps are listed by `bd gate list`.".into(),
+    ]
+}
+
 /// `bd prime`'s warning when this session may share its actor, and so its
 /// claims, with another: the actor is the plain default (no `--actor`,
 /// `$BD_ACTOR` or agent session) and holds claims.
@@ -255,4 +265,74 @@ fn shared_actor_warning(me: &crate::actor::Resolved, claims: usize) -> Option<St
         if claims == 1 { "" } else { "s" },
         crate::actor::SESSION_VAR,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    /// The `bd ...` commands in backticks in `text`, placeholders (`<id>`)
+    /// filled in, as argument vectors.
+    fn commands_in(text: &str) -> Vec<Vec<String>> {
+        let mut out = Vec::new();
+        for (i, span) in text.split('`').enumerate() {
+            if i % 2 == 0 || !span.starts_with("bd ") {
+                continue;
+            }
+            // A lease token is a number; every other placeholder an id or a name.
+            let filled = span.replace("<t>", "1").replace(['<', '>'], "");
+            out.push(shlex::split(&filled).unwrap_or_else(|| panic!("unbalanced quotes in {span:?}")));
+        }
+        out
+    }
+
+    #[test]
+    fn every_core_loop_command_parses() {
+        let lines = core_loop("5m");
+        let argvs = commands_in(&lines.join("\n"));
+        assert!(argvs.len() >= 15, "{argvs:?}");
+        for argv in argvs {
+            if let Err(e) = Cli::try_parse_from(&argv) {
+                panic!("{argv:?} does not parse:\n{e}");
+            }
+        }
+        // The flags named on their own apply to the commands they are named with.
+        for argv in [
+            &["bd", "ready", "--brief"][..],
+            &["bd", "list", "--brief"],
+            &["bd", "show", "x", "--brief"],
+            &["bd", "close", "x", "--failed"],
+            &["bd", "close", "x", "--claim-next"],
+            &["bd", "update", "x", "--if-revision", "3", "--status", "open"],
+            &["bd", "--json", "ready"],
+        ] {
+            Cli::try_parse_from(argv).unwrap_or_else(|e| panic!("{argv:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn the_skills_working_efficiently_commands_parse() {
+        for skill in [
+            include_str!("../../../../.agents/skills/bd/SKILL.md"),
+            include_str!("../../../../plugins/bd/skills/bd/SKILL.md"),
+        ] {
+            let section = skill.split("## Working efficiently").nth(1).expect("a Working efficiently section");
+            let section = section.split("\n## ").next().unwrap();
+            let argvs = commands_in(section);
+            assert!(argvs.len() >= 10, "{argvs:?}");
+            for argv in argvs {
+                Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?} does not parse:\n{e}"));
+            }
+        }
+    }
+
+    #[test]
+    fn the_core_loop_stays_compact() {
+        let lines = core_loop("5m");
+        assert!(lines.len() <= 12, "{} lines", lines.len());
+        let bytes: usize = lines.iter().map(String::len).sum();
+        assert!(bytes <= 2000, "{bytes} bytes");
+    }
 }

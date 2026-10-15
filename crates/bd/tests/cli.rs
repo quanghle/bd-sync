@@ -4377,9 +4377,26 @@ fn close_claim_next_in_a_batch() {
 }
 
 #[test]
-fn prime_mentions_claim_next() {
+fn prime_mentions_the_commands_that_save_work() {
     let ws = Ws::new();
-    assert!(ws.ok(&["prime"]).contains("--claim-next"));
+    let plain = ws.ok(&["prime"]);
+    let copilot = copilot_context(&ws.ok(&["prime", "--hook", "copilot"])).unwrap();
+    for text in [&plain, &copilot] {
+        for needle in [
+            "--claim-next",
+            "--brief",
+            "`bd ready --explain`",
+            "`bd show <id> --why`",
+            "`bd query '",
+            "`bd q \"title\"`",
+            "`bd duplicate <id> --of <other>`",
+            "`bd supersede <id> --with <newer>`",
+        ] {
+            assert!(text.contains(needle), "{needle} in {text}");
+        }
+    }
+    // Still compact: the whole of prime in a fresh workspace.
+    assert!(plain.lines().count() <= 25, "{} lines: {plain}", plain.lines().count());
 }
 
 /// The sequence number of the newest event.
@@ -5496,4 +5513,34 @@ fn setup_refuses_outside_a_project() {
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no .bd or .git in"), "{out:?}");
     assert!(!dir.path().join(".claude").exists());
+}
+
+#[test]
+fn init_suggests_wiring_the_agent_harness() {
+    let init = |env: &[(&str, &str)]| {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = Ws::cmd_in(dir.path(), "tester", &["init", "--prefix", "t"]);
+        for (k, v) in env {
+            c.env(k, v);
+        }
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let plain = init(&[]);
+    assert!(plain.contains("  agents: bd setup --list   then: bd setup <harness>\n"), "{plain}");
+    for (var, harness) in
+        [("CLAUDE_CODE_SESSION_ID", "claude"), ("CODEX_THREAD_ID", "codex"), ("COPILOT_AGENT_SESSION_ID", "copilot")]
+    {
+        let text = init(&[(var, "0199a213-81c0-7800-8aa1-bbab2a035a53")]);
+        assert!(text.contains(&format!("  agents: bd setup {harness}\n")), "{text}");
+        assert!(!text.contains("--list"), "{text}");
+    }
+    // The JSON answer keeps its shape.
+    let dir = tempfile::tempdir().unwrap();
+    let out = Ws::cmd_in(dir.path(), "tester", &["--json", "init", "--prefix", "t"]).output().unwrap();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort();
+    assert_eq!(keys, ["id_mode", "path", "prefix"]);
 }

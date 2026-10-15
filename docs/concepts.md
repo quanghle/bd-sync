@@ -230,14 +230,20 @@ does not rebuild `started_at`, the revision, the blocked flag, comments,
 children or dependents. A gate's `metadata.gate.armed_at` follows its
 `unblocked`, `blocked` and `gate_armed` events. A deleted issue resolves
 by its id; before its creation (or after its deletion) it did not exist,
-which is an answer, not an error.
+which is an answer, not an error. A purge or a run compaction, which
+records the issues it removed in its own event, counts as a deletion too,
+also once the id is used again (`bd create --id`, an import), so each life
+of a reused id is told apart.
 
 Anything the events cannot tell is left out and listed as unknown
 (`unknown` in JSON, `! key: not recorded (reason)` in text), never
 guessed: a value an event written before bd recorded it lacks (a reopen's
 previous close reason, an import's previous fields, a gate's escalation),
 or one that changed without any event ("changed without a recorded event
-between #a and #b"). Schema v4 records `history_complete_from`, the seq
+between #a and #b"). When the events cannot tell whether the issue existed
+at all (it was created or deleted without one), no value is shown:
+`exists` is false and listed as unknown, and the text says it may or may
+not have existed. Schema v4 records `history_complete_from`, the seq
 from which every change is recorded; before it, an older bd made three
 kinds of writes without an event: gate arming, the text rewrites of
 `rename-prefix`, and the edges a deletion dropped. Values those writes

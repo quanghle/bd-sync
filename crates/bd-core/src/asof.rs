@@ -123,7 +123,9 @@ pub struct Retained {
 pub struct IssueAsOf {
     pub id: String,
     pub point: PointView,
-    /// Whether the issue existed then (created and not yet deleted).
+    /// Whether the issue existed then (created and not yet deleted). False,
+    /// with no values reported, also when the history cannot tell: then
+    /// `exists` is listed in `unknown`.
     pub exists: bool,
     /// Its creation: the latest at or before the point, else the first after it.
     pub created: Option<EventRef>,
@@ -146,6 +148,11 @@ pub struct IssueAsOf {
 }
 
 impl IssueAsOf {
+    /// Whether the history cannot tell if the issue existed then.
+    pub fn existence_unknown(&self) -> bool {
+        self.unknown.iter().any(|u| u.key == "exists")
+    }
+
     /// Whether the deletion is at or before the point.
     pub fn deleted_by_then(&self) -> bool {
         self.deleted.as_ref().is_some_and(|d| match (self.point.seq, self.point.time) {
@@ -673,36 +680,42 @@ pub fn issue_as_of(conn: &Connection, id: &str, point: Point) -> Result<IssueAsO
         Some(_) => Some(issues::snapshot(conn, id)?),
         None => None,
     };
-    if row.is_none() {
-        if history.is_empty() {
-            return Err(Error::not_found("issue", id));
-        }
-        let last = history.last().map(|e| e.seq).unwrap_or(0);
-        if history.last().is_some_and(|e| e.op != "deleted") {
-            let mut stmt = conn.prepare_cached(
-                "SELECT seq, tx, ts, actor, op, issue_id, data FROM events
-                 WHERE seq > ?1 AND op IN ('purged','run_compacted') ORDER BY seq",
-            )?;
-            let rows = stmt.query_map([last], |r| {
-                let data: String = r.get(6)?;
-                Ok(Event {
-                    seq: r.get(0)?,
-                    tx: r.get(1)?,
-                    ts: r.get(2)?,
-                    actor: r.get(3)?,
-                    op: r.get(4)?,
-                    issue_id: r.get(5)?,
-                    data: serde_json::from_str(&data).unwrap_or_else(|_| json!({})),
-                })
-            })?;
-            for e in rows {
-                let e = e?;
-                if e.data["ids"].as_array().is_some_and(|ids| ids.iter().any(|x| x == id)) {
-                    history.push(e);
-                    break;
-                }
+    // Purges and run compactions record the issues they removed in `ids`,
+    // under the run's id or none: merged into the issue's history wherever
+    // they are retained, as the id may have been used again since (or that
+    // reuse deleted too), so both passes see every life of the id.
+    {
+        let mut stmt = conn.prepare_cached(
+            "SELECT seq, tx, ts, actor, op, issue_id, data FROM events
+             WHERE seq > ?1 AND op IN ('purged','run_compacted') ORDER BY seq",
+        )?;
+        let rows = stmt.query_map([floor - 1], |r| {
+            let data: String = r.get(6)?;
+            Ok(Event {
+                seq: r.get(0)?,
+                tx: r.get(1)?,
+                ts: r.get(2)?,
+                actor: r.get(3)?,
+                op: r.get(4)?,
+                issue_id: r.get(5)?,
+                data: serde_json::from_str(&data).unwrap_or_else(|_| json!({})),
+            })
+        })?;
+        let own: BTreeSet<i64> = history.iter().map(|e| e.seq).collect();
+        let mut removals = Vec::new();
+        for e in rows {
+            let e = e?;
+            if !own.contains(&e.seq) && e.data["ids"].as_array().is_some_and(|ids| ids.iter().any(|x| x == id)) {
+                removals.push(e);
             }
         }
+        if !removals.is_empty() {
+            history.extend(removals);
+            history.sort_by_key(|e| e.seq);
+        }
+    }
+    if row.is_none() && history.is_empty() {
+        return Err(Error::not_found("issue", id));
     }
 
     let marker: i64 = meta_get(conn, HISTORY_COMPLETE_FROM)?.and_then(|v| v.parse().ok()).unwrap_or(head + 1);
@@ -717,13 +730,18 @@ pub fn issue_as_of(conn: &Connection, id: &str, point: Point) -> Result<IssueAsO
             || (matches!(e.op.as_str(), "purged" | "run_compacted")
                 && e.data["ids"].as_array().is_some_and(|ids| ids.iter().any(|x| x == id)))
     };
-    let created = history
-        .iter()
-        .rfind(|e| is_creation(e) && point.includes(e))
-        .or_else(|| history.iter().find(|e| is_creation(e)))
-        .map(EventRef::of);
-    let deleted =
-        history.iter().find(|e| is_deletion(e) && created.as_ref().is_none_or(|c| e.seq > c.seq)).map(EventRef::of);
+    let created_by_point = history.iter().rfind(|e| is_creation(e) && point.includes(e));
+    let created = created_by_point.or_else(|| history.iter().find(|e| is_creation(e))).map(EventRef::of);
+    // The life the point is in: after its creation, the first deletion that
+    // ends it; when that creation is not by then (pruned, so the reuse's
+    // stands in), the latest deletion by then, which ended an earlier life.
+    let first_after = || history.iter().find(|e| is_deletion(e) && created.as_ref().is_none_or(|c| e.seq > c.seq));
+    let deleted = if created.is_none() || created_by_point.is_some() {
+        first_after()
+    } else {
+        history.iter().rfind(|e| is_deletion(e) && point.includes(e)).or_else(first_after)
+    }
+    .map(EventRef::of);
     let last_event = history.iter().rfind(|e| point.includes(e)).map(|e| e.seq);
     let mut out = IssueAsOf {
         id: id.to_string(),
@@ -890,10 +908,20 @@ pub fn issue_as_of(conn: &Connection, id: &str, point: Point) -> Result<IssueAsO
         }
         let value = match (&f.side, &b.side) {
             (Side::Known(x), Side::Known(y)) if same(key, x, y) => Ok(x.clone()),
-            (Side::Known(_), Side::Known(_)) => {
+            (Side::Known(x), Side::Known(_)) => {
                 let a = f.at.map_or_else(|| "the point".to_string(), |s| format!("#{s}"));
                 let b = b.at.map_or_else(|| "now".to_string(), |s| format!("#{s}"));
-                Err(format!("changed without a recorded event between {a} and {b}"))
+                Err(if *key == Key::Exists {
+                    // Neither pass is wrong about its own events: one of the issue's lives has no retained record.
+                    let (then, later) =
+                        if *x == json!(true) { ("existed", "did not") } else { ("did not exist", "did") };
+                    format!(
+                        "created or deleted without a retained event between {a} and {b}: its events up to the point \
+                         say it {then}, the later ones that it {later}"
+                    )
+                } else {
+                    format!("changed without a recorded event between {a} and {b}")
+                })
             }
             (Side::Known(x), _) | (_, Side::Known(x)) => Ok(x.clone()),
             (Side::Unknown(r), Side::Unknown(s)) => {
@@ -911,11 +939,13 @@ pub fn issue_as_of(conn: &Connection, id: &str, point: Point) -> Result<IssueAsO
     }
     out.incomplete = incomplete;
 
+    // Whether it existed then; when the history cannot tell, nothing is
+    // reported as that moment's state: `exists` is false and listed unknown.
     out.exists = match merged.remove(&Key::Exists) {
         Some(Ok(v)) => v == json!(true),
         Some(Err(reason)) => {
             out.unknown.push(Unknown { key: Key::Exists.name(), reason });
-            true
+            false
         }
         None => true,
     };

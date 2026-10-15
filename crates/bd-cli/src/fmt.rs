@@ -504,6 +504,7 @@ pub fn as_of(d: &IssueAsOf) -> Vec<String> {
     let mut out = vec![format!("{} as of {point} ({last})", d.id)];
     if !d.exists {
         let line = match (&d.deleted, &d.created) {
+            _ if d.existence_unknown() => "  may or may not have existed (see below); no values shown".to_string(),
             (Some(x), _) if d.deleted_by_then() => format!("  deleted at #{} ({})", x.seq, x.ts),
             (_, Some(c)) => format!("  did not exist yet (created #{} at {})", c.seq, c.ts),
             _ => "  did not exist".to_string(),
@@ -629,5 +630,33 @@ mod tests {
         assert!(diff.contains(&"    priority: 2 -> 1".to_string()), "{diff:?}");
         assert!(diff.contains(&"    labels: +x -y".to_string()), "{diff:?}");
         assert!(diff.contains(&r#"    metadata: {} -> {"compaction":{"level":1}}"#.to_string()), "{diff:?}");
+    }
+
+    #[test]
+    fn as_of_unknown_existence_shows_no_values() {
+        use bd_core::asof::{PointView, Retained, Unknown};
+        let mut d = IssueAsOf {
+            id: "t-1".into(),
+            point: PointView { seq: Some(3), time: None },
+            exists: false,
+            created: None,
+            deleted: None,
+            fields: Default::default(),
+            labels: vec![],
+            dependencies: vec![],
+            unknown: vec![Unknown {
+                key: "exists".into(),
+                reason: "created or deleted without a retained event".into(),
+            }],
+            last_event: Some(1),
+            retained_from: Retained { seq: 1, ts: None },
+            history_complete_from: 1,
+            incomplete: false,
+        };
+        let out = as_of(&d);
+        assert_eq!(out[1], "  may or may not have existed (see below); no values shown");
+        assert!(out.iter().any(|l| l.starts_with("! exists: ")), "{out:?}");
+        d.unknown.clear();
+        assert_eq!(as_of(&d)[1], "  did not exist");
     }
 }

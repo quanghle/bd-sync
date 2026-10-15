@@ -642,6 +642,89 @@ fn as_of_deleted_and_purged_issues() {
     assert!(!a.exists && a.deleted_by_then());
 }
 
+/// A reused id's first life: just before its removal, the recorded state;
+/// from the removal to the reuse, not existing, removed by `removal`; then
+/// the second life.
+fn assert_lives(env: &Env, id: &str, first: (i64, &Value), removal: i64, second: (i64, &Value)) {
+    let a = env.at(id, Point::Seq(first.0));
+    assert!(differences(&a, first.1, true).is_empty(), "{:?}", differences(&a, first.1, true));
+    let a = env.at(id, Point::Seq(removal));
+    assert!(!a.exists && a.unknown.is_empty() && a.fields.is_empty(), "{a:?}");
+    assert!(a.deleted_by_then() && a.deleted.as_ref().map(|d| d.seq) == Some(removal), "{a:?}");
+    let a = env.at(id, Point::Seq(second.0));
+    assert!(differences(&a, second.1, true).is_empty(), "{:?}", differences(&a, second.1, true));
+}
+
+#[test]
+fn as_of_purged_id_reused() {
+    let mut env = Env::new();
+    let id = env.create(NewIssue { ephemeral: true, description: "first life".into(), ..NewIssue::titled("One") });
+    env.close(&id);
+    let (closed, first) = (env.head(), env.snap(&id));
+    env.w(|tx| tx.purge_ephemeral(None, false));
+    let purged = env.head();
+    assert!(!env.at(&id, Point::Seq(purged)).exists);
+    // The id used again: the purge is no event of its own, yet still ends the first life.
+    let again = NewIssue { id: Some(id.clone()), description: "second life".into(), ..NewIssue::titled("Two") };
+    env.create(again);
+    let (reused, second) = (env.head(), env.snap(&id));
+    assert_lives(&env, &id, (closed, &first), purged, (reused, &second));
+    let a = env.at(&id, Point::Seq(purged));
+    assert_eq!(a.created.as_ref().map(|c| c.seq), Some(env.history(&id)[0].seq), "{a:?}");
+
+    // The reuse deleted too: no row, and the last event a deletion.
+    env.w(|tx| tx.delete_issues(std::slice::from_ref(&id), &DeleteOptions { force: true, ..Default::default() }));
+    assert_lives(&env, &id, (closed, &first), purged, (reused, &second));
+    let a = env.at(&id, Point::Seq(env.head()));
+    assert!(!a.exists && a.deleted_by_then() && a.unknown.is_empty(), "{a:?}");
+
+    // The first life's creation pruned: the purge still tells it existed before it.
+    env.prune_before(closed);
+    let a = env.at(&id, Point::Seq(closed));
+    assert!(a.exists && !a.existence_unknown(), "{a:?}");
+    let a = env.at(&id, Point::Seq(purged));
+    assert!(!a.exists && a.deleted_by_then(), "{a:?}");
+    assert_eq!(a.deleted.as_ref().map(|d| d.seq), Some(purged), "{a:?}");
+}
+
+#[test]
+fn as_of_compacted_run_step_id_reused() {
+    let mut env = Env::new();
+    let toml = "[[steps]]\nid = \"a\"\ndescription = \"first life\"\n";
+    let pb = playbook::parse_toml(toml, "test.toml", "test").unwrap();
+    let plan = playbook::compile(&pb, &playbook::RunRequest::default(), &playbook::Loader::default()).unwrap();
+    let run = env.w(|tx| tx.start_run(&plan, &playbook::StartOptions::default())).run.id;
+    let step = format!("{run}.a");
+    env.close(&step);
+    let (closed, first) = (env.head(), env.snap(&step));
+    let compact = playbook::CompactOptions { force: true, ..Default::default() };
+    env.w(|tx| tx.compact_run(&run, &compact));
+    let compacted = env.history(&run).iter().rfind(|e| e.op == "run_compacted").unwrap().seq;
+    assert!(!env.at(&step, Point::Seq(env.head())).exists);
+    let again = NewIssue { id: Some(step.clone()), description: "second life".into(), ..NewIssue::titled("Again") };
+    env.create(again);
+    let (reused, second) = (env.head(), env.snap(&step));
+    assert_lives(&env, &step, (closed, &first), compacted, (reused, &second));
+    env.w(|tx| tx.delete_issues(std::slice::from_ref(&step), &DeleteOptions { force: true, ..Default::default() }));
+    assert_lives(&env, &step, (closed, &first), compacted, (reused, &second));
+}
+
+#[test]
+fn as_of_unknown_existence_reports_no_values() {
+    let mut env = Env::new();
+    let id = env.create(NewIssue { description: "kept".into(), ..NewIssue::titled("Work") });
+    // Deleted without any event, then created again under the same id.
+    env.sql(&format!("DELETE FROM issues WHERE id = '{id}'"));
+    let gap = env.head();
+    env.create(NewIssue { id: Some(id.clone()), ..NewIssue::titled("Again") });
+    let a = env.at(&id, Point::Seq(gap));
+    assert!(!a.exists && a.existence_unknown(), "{a:?}");
+    assert!(a.fields.is_empty() && a.labels.is_empty() && a.dependencies.is_empty(), "{a:?}");
+    let reason = reason_of(&a, "exists");
+    assert!(reason.contains("created or deleted without a retained event"), "{reason}");
+    assert!(reason.contains("say it existed"), "{reason}");
+}
+
 #[test]
 fn as_of_reports_unknown_for_old_payloads() {
     let mut env = Env::new();

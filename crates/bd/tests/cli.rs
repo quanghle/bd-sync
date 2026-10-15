@@ -4090,6 +4090,28 @@ fn show_as_of_seq_time_and_deleted() {
     assert_eq!(floor_minus_one["fields"]["description"], "second");
 }
 
+#[test]
+fn show_as_of_purged_id_reused() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Scratch", "-d", "first life", "--ephemeral"]);
+    ws.ok(&["close", "t-1"]);
+    let closed = ws.seq_of("t-1", "closed");
+    ws.ok(&["purge"]);
+    let purged = ws.json(&["show", "t-1", "--as-of", "-0s"])["deleted"]["seq"].as_i64().unwrap();
+    ws.ok(&["create", "Again", "-d", "second life", "--id", "t-1"]);
+    let reused = ws.seq_of("t-1", "created");
+    assert!(purged > closed && reused > purged);
+
+    let gone = ws.json(&["show", "t-1", "--as-of", &format!("#{purged}")]);
+    assert_eq!((gone["exists"].as_bool(), gone["unknown"].as_array().map(Vec::len)), (Some(false), Some(0)), "{gone}");
+    let text = ws.ok(&["show", "t-1", "--as-of", &format!("#{purged}")]);
+    assert!(text.contains(&format!("deleted at #{purged}")), "{text}");
+    let first = ws.json(&["show", "t-1", "--as-of", &format!("#{closed}")]);
+    assert_eq!(first["fields"]["description"], "first life");
+    let second = ws.json(&["show", "t-1", "--as-of", &format!("#{reused}")]);
+    assert_eq!(second["fields"]["description"], "second life");
+}
+
 /// `t` (RFC 3339) moved by `ms` milliseconds, in RFC 3339.
 fn bd_time(t: &str, ms: i64) -> String {
     let parsed = chrono::DateTime::parse_from_rfc3339(t).unwrap() + chrono::Duration::milliseconds(ms);

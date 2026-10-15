@@ -1,0 +1,258 @@
+playbook = "change"
+title = "Change ({{tier}}): {{task}}"
+description = """
+One step list for every change; the tier sets how deep each step goes and adds steps for \
+riskier work. small: bug fix, refactor, isolated command change. standard: new command or flag, \
+schema migration, public behavior, wire protocol, feature. critical: authentication, sign-in and \
+tokens, server security, data migrations that can lose data, release, CI and supply chain. Each step closes with the evidence its acceptance criteria \
+name (`bd comment add` on the step, then `bd close <step> --reason "..."`). Decision records \
+live in bd: the step's design field (`bd update <step> --design "..."`) or `decision` issues \
+under the step, never repo files or chat. If a step finds the work belongs to a higher tier, \
+stop and start a new run at that tier. Human gates are resolved by a person (`bd gate resolve`), \
+never by an agent."""
+labels = ["change:{{tier}}"]
+
+[vars.task]
+description = "What changes, in a few words (used in titles)"
+required = true
+
+[vars.tier]
+description = "small | standard | critical"
+required = true
+enum = ["small", "standard", "critical"]
+
+[vars.approval]
+description = "standard: put a human design approval in front of implementation (always on for critical)"
+default = "no"
+enum = ["no", "yes"]
+
+[vars.approver]
+description = "Who resolves the requirements, design and sign-off gates"
+default = "Quang Le"
+
+# 1. Requirements -------------------------------------------------------------
+
+[[steps]]
+id = "requirements"
+title = "Requirements: {{task}}"
+type = "story"
+description = """
+small: short requirements, the problem (for a bug, how to reproduce it), the expected behavior, \
+what is out of scope.
+standard: detailed acceptance criteria, user-visible behavior, public interface (commands, \
+flags, output and JSON shapes, exit codes, wire protocol, MCP tools), schema and migrations, local \
+and remote workspaces, Linux, macOS and Windows, out of scope.
+critical: the standard criteria plus actors and data involved, compliance or policy \
+constraints, rollout and rollback expectations.
+Every tier: start this run before investigating the task, and make the estimate its first \
+update: how hard the work is from the task alone, against .bd/rubric.md (Complexity: size, \
+ambiguity, novelty, risk, breadth), on the run (the parent of this step), so it measures how well \
+work is sized up front. bd can only order it against bd events, so investigation before the run \
+started can't be checked: don't do it. \
+`bd update <run> --set-metadata 'complexity_estimate={"rubric":2,"score":3,"factors":"...","by":"<your bd actor>"}'`. \
+Keep it in that metadata only, out of comments and close reasons: the judge must score complexity \
+without seeing it."""
+acceptance_criteria = """
+Evidence: the requirements in this step's acceptance field (`bd update <step> --acceptance "..."`), \
+each one testable; open questions answered or recorded with `bd create`; the run's \
+complexity_estimate metadata, with the factors behind it (not repeated in the close reason), \
+set as the run's first update after it started (bd history), before any commit for the task. small: 2-5 bullets."""
+
+[[steps]]
+id = "requirements-approval"
+title = "Requirements approval: {{task}}"
+type = "decision"
+condition = "{{tier}} == critical"
+needs = ["requirements"]
+description = "Record the approval of the requirements, with any changes the approver asked for."
+acceptance_criteria = "Evidence: the approver and any conditions in the close reason."
+
+[steps.gate]
+type = "human"
+title = "Approve requirements: {{task}}"
+assignee = "{{approver}}"
+description = "Review the requirements step of this run, then `bd gate resolve` this gate."
+
+# 2. Decisions ----------------------------------------------------------------
+
+[[steps]]
+id = "decisions"
+title = "Decisions: {{task}}"
+type = "decision"
+needs = ["requirements", "requirements-approval"]
+description = """
+small: local decisions in this step's design field, approach chosen, alternatives dropped, \
+conventions followed or departed from (AGENTS.md).
+standard: architecture and implementation decisions in the design field, structure, command \
+and API shape and naming, transactions, events and readiness (graph::recompute seeds), indexes and \
+query plans, test plan; each significant decision (breaking change, schema change, new dependency, \
+raised MSRV, new convention) as its own \
+issue: `bd create "Decision: ..." -t decision --parent <step> --design "..."`. A significant \
+decision needs approval: ask, and add a gate (`bd gate create --type human --blocks <implement step>`) \
+if the run has none.
+critical: formal ADRs, one per significant decision: \
+`bd create "ADR: ..." -t decision --parent <step> -l adr:proposed --design "..."` with Context, \
+Decision, Alternatives considered and Consequences; close each once written (it is a record); its \
+status is its label (adr:proposed, adr:accepted, adr:rejected, adr:superseded). The design field \
+summarizes the architecture and lists the ADR ids."""
+acceptance_criteria = """
+Evidence: the design field lists each decision with its reason ('none beyond the obvious fix' is \
+fine for a one-line small change); standard and critical: the API surface and test plan mapped to \
+the requirements, significant decisions or ADRs as child decision issues."""
+
+# 3. Security -----------------------------------------------------------------
+
+[[steps]]
+id = "security"
+title = "Security: {{task}}"
+type = "task"
+labels = ["security"]
+needs = ["decisions"]
+description = """
+small: quick impact assessment, does it touch tokens or policy checks, untrusted input from \
+clients, providers or servers, text reaching a terminal or an agent's context, files, new \
+dependencies?
+standard: threat assessment of the design, authorization (roles, actor binding, admin/local \
+checks, claim overrides), untrusted input and its escaping, size and time limits, secrets in logs \
+or output, file permissions, the agent-asset approval gate, third-party code, unbounded work.
+critical: threat model (STRIDE or equivalent), assets, trust boundaries, entry points, data \
+flows; each threat with likelihood, impact and mitigation."""
+acceptance_criteria = """
+Evidence: in this step's design field, each threat considered with its mitigation (or why it \
+does not apply), referencing the decisions it covers; small: the verdict and one line of \
+reasoning. Mitigations that need code go into the test plan."""
+
+[[steps]]
+id = "risk-review"
+title = "Risk review: {{task}}"
+type = "task"
+labels = ["security"]
+condition = "{{tier}} == critical"
+needs = ["security"]
+description = "Review residual risk after mitigations, dependency and supply-chain impact, secrets handling, monitoring, and the rollback plan."
+acceptance_criteria = "Evidence: in this step's design field, the residual risks accepted or rejected and the rollback plan."
+
+[[steps]]
+id = "design-approval"
+title = "Design approval: {{task}}"
+type = "decision"
+condition = "{{tier}} == critical || {{approval}} == yes"
+needs = ["security", "risk-review"]
+description = """
+Record the approval of the decisions and security work. critical: explicit architecture and \
+security approval; relabel each ADR (`bd label rm <adr> adr:proposed`, then \
+`bd label add <adr> adr:accepted` or adr:rejected)."""
+acceptance_criteria = "Evidence: the approver and any conditions in the close reason; critical: no ADR left adr:proposed."
+
+[steps.gate]
+type = "human"
+title = "Approve design: {{task}}"
+assignee = "{{approver}}"
+description = "Review the decisions, security and (critical) risk-review steps of this run, then `bd gate resolve` this gate."
+
+# 4. Implement, verify, review ------------------------------------------------
+
+[[steps]]
+id = "implement"
+title = "Implement: {{task}}"
+type = "task"
+needs = ["security", "risk-review", "design-approval"]
+description = """
+Implement against the requirements and decisions, following AGENTS.md Conventions & Patterns, \
+with tests for each requirement and mitigation (unit tests in the crate, end-to-end ones in \
+crates/bd/tests/; critical: negative and abuse cases too) and the docs/ or CONTRIBUTING.md page \
+the change affects. A deviation from a recorded decision goes back to the decisions step (and \
+its approval). The `plan-implement-review` workflow covers this step, verify and review; pass it \
+this run's review step as reviewStep (its planner reads this run's requirements and decisions as \
+settled input, and its review-fix loop is recorded on that step) and tier={{tier}}. It comments \
+the findings whose fix a re-review confirmed and returns them as confirmedFixes, and returns filed \
+findings its triage dropped in dropped (with bdId): close those after closing this step and verify \
+(bd won't close a child of a blocked step). The controller (whoever starts the workflow) sets the \
+coding agents' model and effort with model and effort (AGENTS.md "Delegating to agents")."""
+acceptance_criteria = "Evidence: close reason names the commit(s); a comment maps each requirement (and mitigation) to its code and test."
+
+[[steps]]
+id = "verify"
+title = "Verify: {{task}}"
+type = "task"
+needs = ["implement"]
+description = """
+Run the CI gates: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` \
+and `cargo test --workspace`. Run `target/release/bd bench --workers 8` (and `--mode remote` when \
+claims go through the server) when recompute, claims, indexes or the write path change, and check \
+`crates/bd-core/tests/plans.rs` covers new queries. Keep Linux, macOS and Windows building: check \
+cfg-gated code on the other platforms (CI, or the Windows host and the Mac) when it changes; \
+always for critical."""
+acceptance_criteria = "Evidence: a comment with the gate results, and the bench and other-platform results where they apply."
+
+[[steps]]
+id = "review"
+title = "Review: {{task}}"
+type = "task"
+needs = ["verify"]
+description = """
+small: review the diff (`/code-review`).
+standard: independent review by someone other than the implementer, a fresh reviewer agent or a person.
+critical: independent code and security review (`/code-review` at high effort plus `/security-review`, or a person).
+Review-fix loop, recorded on this step (the `plan-implement-review` workflow with reviewStep does it):
+1. File each blocker or serious finding as a child issue: \
+`bd create "Finding: ..." -t bug --parent <step> -l severity:<blocker|serious> -d "..."`.
+2. Fix it, then close it with the fix (`bd close <finding> --reason "fixed in <commit>"`), or close a \
+finding that turns out wrong with the reason it is not a defect. A finding can't close while this \
+step is blocked, so close fixed findings once implement and verify are closed.
+3. After fixes, run verify again and re-review the fix diff; new findings go back to 1.
+Minor findings become follow-ups (`bd create ... --dep discovered-from:<step>`); nits and rejected \
+findings go in a comment. bd refuses to close this step while a finding is open: unresolved \
+findings wait for a person, never `--force`."""
+acceptance_criteria = """
+Evidence: a comment per review round with who reviewed and the counts; every blocker/serious \
+finding a closed child issue with its fix or rejection reason."""
+
+[[steps]]
+id = "signoff"
+title = "Sign-off and merge: {{task}}"
+type = "task"
+condition = "{{tier}} == critical"
+needs = ["review"]
+description = "After sign-off, merge. The records are already shared through the bd server."
+acceptance_criteria = "Evidence: the approver and the merge commit in the close reason."
+
+[steps.gate]
+type = "human"
+title = "Sign off: {{task}}"
+assignee = "{{approver}}"
+description = "Final sign-off: check the evidence on every step of this run, then `bd gate resolve` this gate."
+
+# 5. Score --------------------------------------------------------------------
+
+[[steps]]
+id = "score"
+title = "Score: {{task}}"
+type = "task"
+needs = ["review", "signoff"]
+description = """
+Score how well the agent work on this run went, against .bd/rubric.md: run the `score-issue` \
+workflow with issue=<this run> (the parent of this step) and actor=<your bd actor>; pass range \
+(the commits from implement's close reason), result (when plan-implement-review did the work) and \
+context (anything a person had to correct). Fable is the judge: do not score it yourself. It \
+stores the draft as the run's score_judge metadata (with the judged complexity) and comments its \
+reasoning on the run, with the gap from the complexity estimate; then it traces which agents did \
+each step, with which model and effort, into the run's work metadata (.claude/scripts/trace-run.mjs)."""
+acceptance_criteria = "Evidence: the run's score_judge and work metadata and the judge's comment; the close reason gives the overall score, complexity (and the estimate) and confidence, and names any session the trace could not find."
+
+[[steps]]
+id = "score-confirm"
+title = "Confirm score: {{task}}"
+type = "decision"
+needs = ["score"]
+description = """
+A person reads the judge's comment and score_judge on the run, sets the run's score metadata \
+(.bd/rubric.md, Recording: copy the draft, complexity included, to agree; change it and comment why, \
+starting with "Score adjusted:", to adjust), then resolves the gate and closes this step."""
+acceptance_criteria = "Evidence: the run's score metadata, set by a person; the close reason names who and any change from the judge's score."
+
+[steps.gate]
+type = "human"
+title = "Confirm score: {{task}}"
+assignee = "{{approver}}"
+description = "Check the run's score_judge and the judge's comment, set the run's score metadata (.bd/rubric.md, Recording), then `bd gate resolve` this gate."

@@ -11,6 +11,16 @@ This repository tracks its work with **bd**, the Rust coordination engine built 
 - Use bd for all task tracking; no markdown TODO lists.
 - Do not commit or push unless explicitly asked.
 
+## Changes
+
+AGENTS.md (Changes, Scoring agent work, Delegating to agents) has the details; in short:
+
+- Run each change through the `change` playbook: `bd playbook run change --var task="..." --var tier=<small|standard|critical>`, optionally `--parent <issue>`. Work its steps in order and close each with the evidence its acceptance criteria name; record decisions in bd (the step's design field or `decision` issues under it), not in repo files. Human gates are a person's: never `bd gate resolve` one yourself.
+- At the requirements step, before investigating, set the run's `complexity_estimate` metadata from the task alone (`.bd/rubric.md`, Complexity).
+- For implement, verify and review, use the `plan-implement-review` workflow (the Copilot CLI extension in `.github/extensions/plan-implement-review/`, a port of `.claude/workflows/plan-implement-review.js`) with `reviewStep` = the run's review step and the run's `tier`. Close the `confirmedFixes` it returns (and the `dropped` findings with a `bdId`, as not a defect) once implement and verify are closed. Its gate is CI's: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`.
+- The score step runs the `score-issue` Claude Code workflow (its judge is Fable): don't score your own work; leave that step for a Claude Code session or the maintainer.
+- When delegating to subagents, match the agent to the task: the light `task` agent for running commands and reporting output, `general-purpose` for code; escalate a level when a cheaper run fails rather than retrying at the same one.
+
 ## Copilot coding agent (github.com)
 
 A coding agent session gets bd from `.github/workflows/copilot-setup-steps.yml`, with `BD_REMOTE` and `BD_TOKEN` from the repository's `copilot` environment. No session hook runs, so:
@@ -18,6 +28,7 @@ A coding agent session gets bd from `.github/workflows/copilot-setup-steps.yml`,
 - Start with `bd prime`. If it fails, run `bd remote show` and say in the pull request that bd was unreachable or refused the token; don't recreate a local database.
 - If `bd prime` warns that you are the plain default actor, run every bd command as `BD_SESSION=<your branch name> bd ...`.
 - The GitHub issue you were assigned names its bd issue in a hidden `<!-- bd:<id> -->` line at the end of its body (`bd github push --create` writes it), or in its text. Use that id: `bd show <id>`, then claim it.
+- If the bd issue is a step of a `change` run (its parent has `metadata.playbook.role = run`), work that step and its siblings as the playbook describes, with the `plan-implement-review` workflow if this session offers it; otherwise implement the issue directly and run the CI gates above before opening the pull request. Don't start a `change` run yourself.
 - If the GitHub issue names no bd issue, don't create one (a later `bd github pull` would import the GitHub issue as a second bd issue): say so in the pull request, and the maintainer links it.
 - Claim with a lease that outlasts builds and test runs: `bd claim <id> --ttl 60m`, and keep the printed token. Renew with `bd heartbeat <id> --token <t> --ttl 60m` before long steps (`cargo test --workspace` takes a while); if a heartbeat fails, stop: the claim is gone.
 - Put the bd issue id in the pull request title or description and in commit messages, as this repository's commits do (`... (bd-xxxx)`).

@@ -1,0 +1,39 @@
+# Score how well an agent did on an issue, against .bd/rubric.md: Fable judges, a person confirms.
+# Preview with: bd playbook plan score --var issue=<id>
+description = "Score agent work on an issue: Fable drafts a score against .bd/rubric.md, a person confirms or adjusts it"
+title = "Score {{issue}}"
+
+[vars.issue]
+description = "The issue, epic or playbook run to score (open or closed)"
+required = true
+
+[vars.approver]
+description = "Who confirms the score"
+default = "Quang Le"
+
+[[steps]]
+id = "judge"
+title = "Judge {{issue}}"
+description = """
+Run the score-issue workflow (.claude/workflows/score-issue.js; Claude Code, where the judge model
+fable is available) with issue={{issue}} and actor=<your bd actor>. Pass range when the change is
+known (e.g. main..<branch>), result when a plan-implement-review run did the work, and context for
+anything a person had to correct. It stores the draft as {{issue}}'s score_judge metadata and
+comments its reasoning there. Do not score it yourself: the judge is Fable."""
+acceptance_criteria = "{{issue}} has score_judge metadata and the judge's comment; the close reason gives the overall score and confidence."
+
+[[steps]]
+id = "confirm"
+title = "Confirm the score of {{issue}}"
+needs = ["judge"]
+description = """
+A person reads the judge's comment and score_judge on {{issue}}, sets the score metadata
+(.bd/rubric.md, Recording: copy the draft to agree, change it and comment why to adjust), then
+resolves the gate and closes this step."""
+acceptance_criteria = "{{issue}} has score metadata set by a person; the close reason names who and any change from the judge's score."
+
+[steps.gate]
+type = "human"
+title = "Confirm the score of {{issue}}"
+assignee = "{{approver}}"
+description = "Check {{issue}}'s score_judge and the judge's comment, set its score metadata (.bd/rubric.md, Recording), then: bd gate resolve <this gate>"

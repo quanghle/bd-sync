@@ -4583,13 +4583,24 @@ fn remote_set_and_login_point_to_the_agent_assets_served() {
 
 /// Replace (or create) `rel` under `agents` whole, as an admin's tooling
 /// would: written beside it, then renamed into place, so the server's
-/// agents job never reads it half written.
+/// agents job never reads it half written. Directories it needs are made
+/// beside it too, with the file, and the first of them renamed into place:
+/// the job sees the set before the edit or after it, never an empty
+/// directory on the way (whose error a test counting warnings would count).
 fn put(agents: &Path, rel: &str, text: &str) {
-    let path = rel.split('/').fold(agents.to_path_buf(), |p, c| p.join(c));
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let staged = agents.parent().unwrap().join("staged.tmp");
+    let parts: Vec<&str> = rel.split('/').collect();
+    let (mut place, mut new) = (agents.to_path_buf(), 0);
+    while new + 1 < parts.len() && place.join(parts[new]).is_dir() {
+        place.push(parts[new]);
+        new += 1;
+    }
+    let staging = agents.parent().unwrap().join("staging");
+    std::fs::create_dir(&staging).unwrap();
+    let staged = parts[new..].iter().fold(staging.clone(), |p, c| p.join(c));
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
     std::fs::write(&staged, text).unwrap();
-    std::fs::rename(&staged, path).unwrap();
+    std::fs::rename(staging.join(parts[new]), place.join(parts[new])).unwrap();
+    std::fs::remove_dir(&staging).unwrap();
 }
 
 /// The `agents_changed` events of workspace `proj`, oldest first.
@@ -4662,11 +4673,19 @@ fn agents_changed_events_follow_edits_of_the_servers_sets() {
     let failed = || lines(&["background job failed", "job=\"agents\""]);
     put(&agents, "copilot/skills/lint/README.md", "no SKILL.md here\n");
     eventually("the warning", || warnings() == 1);
-    assert_eq!(lines(&["agent set cannot be read", "copilot/skills/lint: no SKILL.md"]), 1);
+    let said = || {
+        std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.contains("agent set"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(lines(&["agent set cannot be read", "copilot/skills/lint: no SKILL.md"]), 1, "{}", said());
     put(&agents, "claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nv3\n");
     eventually("the claude set's third event", || agents_changes(&reader).len() == 3);
     agents_runs(&log, logged(&log, "job=\"agents\""), 10);
-    assert_eq!((warnings(), failed()), (1, 0), "warned once, never failed");
+    assert_eq!((warnings(), failed()), (1, 0), "warned once, never failed: {}", said());
     assert_eq!(agents_changes(&reader).len(), 3);
 
     // Readable again: said once, and recorded; another error later is warned about again.

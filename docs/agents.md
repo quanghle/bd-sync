@@ -115,7 +115,11 @@ seconds) appends an `agents_changed` event (actor `bd-serve`, data
 which `bd agents watch` waits for. Revisions are kept in the database, so a
 change made while the server was down still gets its event. A set that
 cannot be read gets no event and one log warning per distinct error;
-clients asking for it get the error.
+clients asking for it get the error. Each run reads the set as it is at
+that moment, so change a served set atomically: write each file beside
+its place and rename it in, and build a new skill
+directory whole before moving it into `skills/`. A file written in place
+can be read half written, and its partial contents served and announced.
 
 ## Trust
 

@@ -471,14 +471,18 @@ fn same_file(a: &Metadata, b: &Metadata) -> bool {
 /// Whether `a` and `b` are the metadata of the same file, as far as stable
 /// std tells on Windows: it has no file IDs there (`MetadataExt::file_index`
 /// is unstable), so a swap for a file with the same times, size and
-/// attributes goes unnoticed.
+/// attributes goes unnoticed. A directory is compared by its creation time
+/// and attributes only: its write time (and size) change whenever an entry
+/// is added, removed or renamed in it, which is an edit of the set, not a
+/// swap, and would otherwise fail every read that overlaps one (a swap for
+/// a symlink or junction changes its attributes; for another directory, its
+/// creation time).
 #[cfg(windows)]
 fn same_file(a: &Metadata, b: &Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
-    a.creation_time() == b.creation_time()
-        && a.last_write_time() == b.last_write_time()
-        && a.file_size() == b.file_size()
-        && a.file_attributes() == b.file_attributes()
+    let contents =
+        a.is_dir() && b.is_dir() || a.last_write_time() == b.last_write_time() && a.file_size() == b.file_size();
+    a.creation_time() == b.creation_time() && a.file_attributes() == b.file_attributes() && contents
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -980,6 +984,37 @@ mod tests {
         write(&dir, "claude/skills/a/Notes/x.md", "x");
         write(&dir, "claude/skills/a/notes/y.md", "x");
         assert!(load_err(&dir, Harness::Claude).contains("Notes and notes differ only in case"));
+    }
+
+    /// Set the write time of the directory `dir`, as adding an entry to it does.
+    fn set_dir_modified(dir: &Path, time: std::time::SystemTime) {
+        let mut options = OpenOptions::new();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_WRITE_ATTRIBUTES, and FILE_FLAG_BACKUP_SEMANTICS to open a directory.
+            options.access_mode(0x100).custom_flags(0x0200_0000);
+        }
+        #[cfg(not(windows))]
+        options.read(true);
+        options.open(dir).unwrap().set_modified(time).unwrap();
+    }
+
+    #[test]
+    fn a_directory_edited_while_it_is_read_is_still_the_same_directory() {
+        // An admin's edit landing between a directory's check and its listing (on Windows, its
+        // write time changes) is read as it is now, not refused as a swap.
+        let (_tmp, dir) = agents();
+        write(&dir, "claude/skills/deploy/SKILL.md", SKILL);
+        let walk =
+            Walk { root: std::fs::canonicalize(&dir).unwrap(), base: label_of(&dir), files: 0, dirs: 0, bytes: 0 };
+        let (meta, canon) = walk.resolve(&dir.join("claude/skills/deploy"), "deploy").unwrap();
+        write(&dir, "claude/skills/deploy/notes.md", "# Notes\n");
+        set_dir_modified(&canon, std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30));
+        assert_eq!(walk.list(&canon, &meta, "deploy").unwrap(), ["SKILL.md", "notes.md"]);
+        walk.recheck(&canon, &meta, "deploy").unwrap();
+        let set = AgentSet::load(&dir, Harness::Claude).unwrap();
+        assert_eq!(set.skills["deploy"].keys().collect::<Vec<_>>(), ["SKILL.md", "notes.md"]);
     }
 
     #[cfg(unix)]

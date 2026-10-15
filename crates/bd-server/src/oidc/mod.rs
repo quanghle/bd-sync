@@ -49,7 +49,6 @@ pub use discovery::*;
 pub use events::*;
 pub use id_token::*;
 
-use std::path::PathBuf;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -82,8 +81,9 @@ pub struct Oidc {
     /// Exactly as its ID tokens' `iss` says it.
     pub issuer: String,
     pub client_id: String,
-    /// As written (relative to the root).
-    pub client_secret_file: Option<PathBuf>,
+    /// Where its client secret comes from, as written: a file (relative to
+    /// the root), or the `[secrets]` command.
+    pub client_secret_file: Option<crate::secrets::Source>,
     /// Read by [`Oidc::load_secret`].
     pub client_secret: Option<Secret>,
     /// Asked for, `openid` first.

@@ -63,14 +63,23 @@ bd remote login --provider corp                                      # on a clie
 ```
 
 `bd serve check` reads `auth.toml` and the files it names as the server
-would, without starting one, and exits 2 on a mistake. With `[oauth]` and
-`--public-url`, it also prints each provider's callback URL, account
+would, without starting one, and exits 2 on a mistake. With
+[`[secrets]`](#secrets-from-a-command) it also runs that command, as the
+server would. On Unix it runs the command only when run as the owner of
+the root directory, who can already change everything under it. Run as
+anyone else, root included, it runs no command, and when `auth.toml` has
+`[secrets]` it exits 2 before reading any file `auth.toml` names, naming
+the owner to run it as (for example `sudo -u <owner> bd serve check --root
+...`). On Windows it makes no such check.
+With `[oauth]` and `--public-url`, it also prints each provider's callback URL, account
 notification endpoints and the MCP endpoints to give clients.
 
 `bd serve` refuses to start with a mistake in `auth.toml`: an unknown
 field, a rule that names nobody, an `http` issuer that is not on this
 machine, a secret file it cannot read, two providers with the same issuer,
-or `[sign_in]`, `[authorizer]` or `[oauth]` without any provider. After it
+or `[sign_in]`, `[authorizer]`, `[oauth]` or `[secrets]` without any
+provider. (It never waits for a [secrets command](#secrets-from-a-command):
+sign-in needing its secrets is unavailable until it answers.) After it
 starts, it reads the file again when it or a file it names changes (and at
 least every 30 seconds), so changes need no restart. A mistake made while
 it runs fails sign-ins and refreshes, with the reason in the server log.
@@ -84,7 +93,7 @@ dashes, not starting with a dash:
 |---|---|---|
 | `issuer` | required | https URL without query or fragment (http only on this machine); its discovery document is `<issuer>/.well-known/openid-configuration` |
 | `client_id` | required | bd's client ID at the provider |
-| `client_secret_file` | none (public client) | file holding the client secret, relative to the root |
+| `client_secret_file` | none (public client) | file holding the client secret, relative to the root, or `{ secret = "<name>" }` ([below](#secrets-from-a-command)) |
 | `[oidc.<name>.signed_secret]` | | instead of `client_secret_file`, for providers whose client secret is a signed JWT (below) |
 | `label` | the name | shown on the sign-in page; plain text, at most 40 characters |
 | `scopes` | `["email", "profile"]` | asked for besides `openid` |
@@ -351,9 +360,14 @@ the person is told only that the account may not use the workspace.
 - **The command** runs in the root with a cleared environment: `PATH`,
   `HOME`, `LANG`, the Windows basics (`SystemRoot`, `windir`, `PATHEXT`,
   `TEMP`, `TMP`, `USERPROFILE`) when set, and the variables `env` names. On
-  Unix it runs in its own process group, killed once it answers or times
-  out, so nothing it starts outlives it. It runs as the user `bd serve`
-  runs as. Treat the request as data: it carries names chosen by whoever
+  Unix it runs in its own process group, killed once it answers and exits
+  (it has a second to exit after answering) or times out, and when the
+  server stops, so nothing it starts in its group outlives it (on Windows
+  the command alone is killed at its timeout, and a stopping server leaves
+  it to finish). It runs as the user `bd serve` runs as. In a container,
+  run `bd serve` under an init (`docker run --init`, or `tini`): a process
+  the command starts in a session of its own is reaped by none other once
+  it ends. Treat the request as data: it carries names chosen by whoever
   signs in.
 - **The URL** gets `Authorization: Bearer <token_file>`, with no proxy and
   no redirects followed.
@@ -365,6 +379,136 @@ the person is told only that the account may not use the workspace.
   short outage does not end sign-ins.
 - Its `reason` (cut to 500 characters) and stderr (2 KiB) are logged with
   anything shaped like an email replaced by `<email>`.
+
+## Secrets from a command
+
+Instead of files, the secrets `auth.toml` names (client secrets, the keys
+that sign them, the authorizer's `token_file`) can come from the admin's
+own command: one that asks a vault or a cloud's secret manager, which bd
+knows nothing of. A field takes `{ secret = "<name>" }` instead of a path,
+and `[secrets]` names the command:
+
+```toml
+[secrets]
+command = ["bin/bd-secrets"]            # run as is, no shell; relative to the root if it has a /
+# timeout = "10s"                       # 1s to 60s
+# env = ["VAULT_CREDENTIALS"]           # variables passed to the command besides the basics
+# ttl = "10m"                           # how long an answer is good for, unless it says (1m to 24h)
+# max_stale = "1h"                      # how long past that the last answer is used while it fails (at most 7d)
+
+[oidc.corp]
+issuer = "https://id.example.com"
+client_id = "bd-server"
+client_secret_file = { secret = "corp-client-secret" }   # or, under [oidc.corp.signed_secret], key_file = { secret = ... }
+
+[authorizer]
+url = "https://authz.internal/bd"
+token_file = { secret = "authz-token" }
+```
+
+A file with names and no `[secrets]`, or `[secrets]` and no names, is
+refused. A name is 1 to 256 printable characters with no spaces, and no
+run of more than 32 letters and digits mixing both: one shaped like a
+long token or a hex client secret is refused, never quoted, in case a
+value was pasted in its place. That is a guard, not a proof: a value
+with punctuation in it passes as a name. The server's start line and
+`bd serve check`'s summary count the names; a failure names the secret it
+is about. bd asks for every name at once, with one JSON object on the
+command's stdin:
+
+```json
+{ "version": 1, "secrets": ["authz-token", "corp-client-secret"] }
+```
+
+It answers with one JSON object on stdout, exactly the names asked, each a
+string (a key's PEM text, newlines and all), and optionally how long they
+are good for:
+
+```json
+{ "secrets": { "authz-token": "...", "corp-client-secret": "..." }, "ttl": "15m" }
+```
+
+- **Only what needs a secret waits for it.** `auth.toml`'s settings, its
+  secret files and CA certificates load without the command, and a
+  mistake in them is one, as without `[secrets]`. Each field naming a
+  secret is filled on its own from the command's kept answer; one it
+  lacks stays empty (the command is asked for all the names at once: while
+  it fails for one, say a name the vault lacks, the others serve on until
+  `max_stale` runs out), and only the steps that use it (a sign-in or refresh
+  that needs that client secret, the App's key or the authorizer's token)
+  fail, the log saying why: a sign-in answers 503, try again, before anyone
+  is sent to the provider or a provider's code is spent; a refresh fails
+  (502) as when a provider does not answer, and the client refreshes later
+  on its own instead of waiting. Metadata,
+  revocation, account notifications, admin-issued tokens, workspaces and
+  background jobs never wait for it.
+- **When it runs.** A keeper per server runs it, in the background only:
+  once three quarters of an answer's `ttl` (held to 1m–24h) passed, on its
+  own timer, whether requests come or not; at once when `auth.toml` names
+  fewer or other secrets or another command, or moves a secret to a field
+  that refuses its value; and 30 seconds after the start of an attempt
+  that failed. It reads `auth.toml` again before each attempt and when
+  the server loads it, so a fixed command or a removed `[secrets]` is
+  never asked as it was, and an answer to a command or names `auth.toml`
+  no longer asks for is not kept (one that comes while it is invalid or
+  being saved is, serving the command that gave it only). While `auth.toml` is invalid it asks nothing. A file
+  briefly missing or empty while it is saved forgets nothing;
+  `[secrets]` gone for 10 seconds forgets the answer. A new value takes
+  effect without a restart.
+- **At start**, the server never waits for it: it serves at once, and
+  logs the first attempt's outcome when it comes. `bd serve check` waits
+  for it, and exits 2 if it fails (run it as the root's owner, above).
+- **Fail closed, after a grace.** While it fails, the last answer is used
+  until `max_stale` past its `ttl`, with a warning in the log at each
+  attempt; then the steps needing its secrets answer 503 until it answers.
+  An answer serves the command that gave it, name by name: changing
+  `max_stale`, `ttl`, `timeout` or `env` keeps it serving (`max_stale` as
+  set now decides how long). It lives in memory only: a restart asks
+  again.
+- **Strict answers.** A non-zero exit, no answer within `timeout`, an
+  answer that is not one JSON object of `secrets` and `ttl` (at most
+  256 KiB), a name missing or not asked for, or an empty value is a
+  failure. So is an answer whose values the fields refuse (a key must be a
+  key, a client secret one line): the last good answer keeps serving, and
+  the command is asked again 30 seconds later. Exit non-zero when the
+  vault fails: an error printed as a value would be taken for one.
+- **Values stay out of sight.** They are kept in memory only, never
+  written to a file, and bd itself never logs or shows them. Messages
+  name the field and the secret's name, never a value, nor what the
+  answer held; `env` names variables
+  only, and neither is a `command` written as a string instead of a list.
+  The command's stderr is read until it answers or times out (the first
+  64 KiB kept, whole lines only; past 1 MiB it is closed, stopping a
+  command that floods it), the values it last gave left out, then cut to
+  2 KiB for the log. Only those: on its first run, in every `bd serve
+  check`, and after a rotation, what it prints of a value it fetched then
+  reaches the log as is. So print none on stderr (no `set -x`).
+  Requests are told only that sign-in is unavailable, never why.
+- **The command** runs as the authorizer's does: in the root, as the user
+  `bd serve` runs as, with a cleared environment (`PATH`, `HOME`, `LANG`,
+  the Windows basics, and the variables `env` names), in its own process
+  group on Unix, killed once it answers and exits, times out, or the
+  server stops; on Unix a process it starts that leaves the group holds
+  nothing of the server's past the timeout (on Windows, see the
+  authorizer's command above).
+
+A command for a vault's command-line client can be a few lines of shell,
+for example with `jq`. It fails as a whole when any read fails, so that
+the vault's error reaches the log and never stands in for a value. Values
+pass through the environment of the one `jq` that needs them, never its
+command line, which other users of the machine can read:
+
+```sh
+#!/bin/sh
+# `vault-cli read <name>` stands for your vault's client: exits non-zero on failure.
+set -euf                                  # -f: names are never globbed
+answer='{}'
+for name in $(jq -r '.secrets[]'); do
+  value=$(vault-cli read "$name")
+  answer=$(printf '%s' "$answer" | VALUE="$value" jq --arg n "$name" '. + {($n): env.VALUE}')
+done
+printf '%s' "$answer" | jq '{secrets: ., ttl: "15m"}'
+```
 
 ## The device flow
 

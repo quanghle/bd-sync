@@ -182,7 +182,12 @@ pub(super) async fn account_events(server: &Arc<Server>, req: Request<Incoming>)
         }
         Err(Error::Invalid(why)) => Reject::new(StatusCode::BAD_REQUEST, "invalid", &why, 2).response(),
         Err(e @ (Error::Remote(_) | Error::Busy(_) | Error::Locked(_))) => {
-            tracing::warn!(target: "bd::serve", error = %e, "an account notification could not be handled now");
+            // Anyone may post here: at most once a minute. Every one, server.db held by another writer included
+            // (settings that cannot be used were logged by account_event too).
+            static LOGGED: crate::metrics::Throttle = crate::metrics::Throttle::new(60_000);
+            if let Some(skipped) = LOGGED.pass() {
+                tracing::warn!(target: "bd::serve", error = %e, skipped, "an account notification could not be handled now");
+            }
             Reject::new(StatusCode::SERVICE_UNAVAILABLE, "busy", "try again later", 5).response()
         }
         Err(e) => Reject::internal(e).response(),
@@ -347,10 +352,14 @@ pub(super) fn oauth_error(status: StatusCode, error: &str, description: &str) ->
     r
 }
 
-/// `auth.toml` or `--public-url` do not let sign-in work: the details go
-/// to the log, not to whoever asked.
-fn sign_in_misconfigured(e: &str) -> Response<Body> {
-    tracing::error!(target: "bd::serve", error = %e, "sign-in is misconfigured");
+/// The answer while `auth.toml` (or `--public-url`) cannot be used:
+/// logged here, at most once a minute, as anyone may send these requests;
+/// the answer tells nothing of why.
+fn sign_in_misconfigured(e: &Error) -> Response<Body> {
+    static LOGGED: crate::metrics::Throttle = crate::metrics::Throttle::new(60_000);
+    if let Some(skipped) = LOGGED.pass() {
+        tracing::error!(target: "bd::serve", error = %e, skipped, "sign-in is misconfigured");
+    }
     let msg = "the server's sign-in settings are not valid; see the server log";
     Reject::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg, 1).response()
 }

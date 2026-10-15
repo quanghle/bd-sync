@@ -10,7 +10,7 @@
 //! # url = "https://authz.internal/bd"           # or POST to this (http only to this machine)
 //! # token_file = "authz-token"                  # sent as a bearer token to url (relative to the root)
 //! timeout = "5s"                                # an answer within this, or the sign-in fails (1s to 60s)
-//! env = ["GOOGLE_APPLICATION_CREDENTIALS"]      # passed to the command, with PATH, HOME and LANG; nothing else
+//! env = ["GOOGLE_APPLICATION_CREDENTIALS"]      # passed to the command, besides PATH, HOME, LANG and Windows' basics
 //! refresh_grace = "4h"                          # while it cannot answer, a refresh keeps the last decision this long
 //! max_role = "write"                            # the most it may grant (read, write, admin); default write
 //! human = false                                 # whether it may grant kind human (opens human gates)
@@ -25,31 +25,26 @@
 //! A grant beyond the caps denies, and is logged: a broken or compromised
 //! authorizer cannot hand out more than `auth.toml` allows.
 
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bd_core::{Error, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{Grant, Kind, Role};
+use crate::helper::{self, Helper};
+use crate::secrets::Source;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
-const TIMEOUT_RANGE: (Duration, Duration) = (Duration::from_secs(1), Duration::from_secs(60));
 /// The largest answer read.
 const MAX_ANSWER: u64 = 64 << 10;
-/// What of the command's stderr goes to the log.
-const MAX_STDERR: usize = 2 << 10;
 /// Authorizers asked at once; more are told the server is busy.
 const MAX_RUNNING: usize = 8;
 /// The longest `via` shown on the consent page.
 const MAX_VIA: usize = 100;
 /// The longest `reason` logged.
 const MAX_REASON: usize = 500;
-/// Variables every command gets, from the server's environment, besides `env`.
-const PASSED: &[&str] = &["PATH", "HOME", "LANG", "SystemRoot", "windir", "PATHEXT", "TEMP", "TMP", "USERPROFILE"];
 /// The version of [`Request`] sent.
 const VERSION: u32 = 1;
 
@@ -59,15 +54,15 @@ static RUNNING: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct AuthorizerDoc {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::helper::some_argv")]
     command: Option<Vec<String>>,
     #[serde(default)]
     url: Option<String>,
     #[serde(default)]
-    token_file: Option<PathBuf>,
+    token_file: Option<Source>,
     #[serde(default)]
     timeout: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::helper::env_names")]
     env: Vec<String>,
     #[serde(default)]
     refresh_grace: Option<String>,
@@ -85,7 +80,6 @@ pub(crate) struct AuthorizerDoc {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Authorizer {
     pub how: How,
-    pub timeout: Duration,
     /// While the authorizer cannot answer, a refresh keeps the access its
     /// sign-in had if that was last decided at most this long ago.
     pub refresh_grace: Option<Duration>,
@@ -95,12 +89,11 @@ pub struct Authorizer {
 /// How the authorizer is asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum How {
-    /// Run this, as is: the program and its arguments, and the variables
-    /// of the server's environment it gets besides [`PASSED`].
-    Command { argv: Vec<String>, env: Vec<String> },
-    /// POST to this URL, with the bearer token in `token_file` (read by
-    /// [`Authorizer::load_token`]).
-    Https { url: String, token_file: Option<PathBuf>, token: Option<Bearer> },
+    /// Run this command (`helper.rs`), with its timeout.
+    Command(Helper),
+    /// POST to this URL, with the bearer token `token_file` names (read by
+    /// [`Authorizer::load_token`]), answered within `timeout`.
+    Https { url: String, token_file: Option<Source>, token: Option<Bearer>, timeout: Duration },
 }
 
 /// A bearer token, never shown.
@@ -202,22 +195,10 @@ pub(crate) fn parse(doc: AuthorizerDoc) -> std::result::Result<Authorizer, Strin
         (Some(_), Some(_)) => return Err("[authorizer] names both command and url: choose one".into()),
         (None, None) => return Err("[authorizer] needs command or url".into()),
         (Some(argv), None) => {
-            if argv.is_empty() || argv[0].trim().is_empty() {
-                return Err("authorizer.command is empty: name the program, then its arguments".into());
-            }
-            if argv.iter().any(|a| a.contains('\0')) {
-                return Err("authorizer.command holds a NUL character".into());
-            }
             if doc.token_file.is_some() {
                 return Err("authorizer.token_file goes with url only: a command reads what it needs itself".into());
             }
-            for name in &doc.env {
-                let ok = !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-                if !ok {
-                    return Err(format!("authorizer.env {name:?} is not a variable name"));
-                }
-            }
-            How::Command { argv, env: doc.env }
+            How::Command(helper::parse("authorizer", argv, doc.env, doc.timeout.as_deref(), DEFAULT_TIMEOUT)?)
         }
         (None, Some(url)) => {
             let url = url.trim().to_string();
@@ -234,24 +215,15 @@ pub(crate) fn parse(doc: AuthorizerDoc) -> std::result::Result<Authorizer, Strin
             if !doc.env.is_empty() {
                 return Err("authorizer.env goes with command only".into());
             }
-            if doc.token_file.as_ref().is_some_and(|p| p.as_os_str().is_empty()) {
+            if doc.token_file.as_ref().is_some_and(Source::is_empty) {
                 return Err("authorizer.token_file is empty: name the file, or leave it out".into());
             }
-            How::Https { url, token_file: doc.token_file, token: None }
+            let timeout = helper::timeout("authorizer", doc.timeout.as_deref(), DEFAULT_TIMEOUT)?;
+            How::Https { url, token_file: doc.token_file, token: None, timeout }
         }
     };
     let duration =
         |field: &str, raw: &str| bd_core::time::parse_duration(raw).map_err(|e| format!("authorizer.{field}: {e}"));
-    let timeout = match &doc.timeout {
-        None => DEFAULT_TIMEOUT,
-        Some(raw) => {
-            let t = duration("timeout", raw)?;
-            if !(TIMEOUT_RANGE.0..=TIMEOUT_RANGE.1).contains(&t) {
-                return Err(format!("authorizer.timeout {raw:?}: use 1s to 60s"));
-            }
-            t
-        }
-    };
     let refresh_grace = doc.refresh_grace.as_deref().map(|raw| duration("refresh_grace", raw)).transpose()?;
     if doc.max_claims == Some(0) {
         return Err("authorizer.max_claims must be at least 1".into());
@@ -263,7 +235,7 @@ pub(crate) fn parse(doc: AuthorizerDoc) -> std::result::Result<Authorizer, Strin
         max_claims: doc.max_claims,
         workspaces,
     };
-    Ok(Authorizer { how, timeout, refresh_grace, caps })
+    Ok(Authorizer { how, refresh_grace, caps })
 }
 
 /// Whether `url` is http to this machine.
@@ -282,17 +254,35 @@ fn loopback_http(url: &str) -> bool {
 }
 
 impl Authorizer {
-    /// Read the bearer token of an HTTPS authorizer (relative to `root`).
-    pub(crate) fn load_token(&mut self, root: &Path) -> std::result::Result<(), String> {
-        let How::Https { token_file: Some(file), token, .. } = &mut self.how else { return Ok(()) };
-        let path = if file.is_relative() { root.join(file) } else { file.clone() };
-        let at = format!("authorizer.token_file {}", path.display());
-        let text = std::fs::read_to_string(&path).map_err(|e| format!("{at}: {e}"))?;
-        let secret = text.trim();
-        if secret.is_empty() || secret.len() > 4096 || !secret.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(format!("{at}: not a token (one line of printable characters)"));
+    /// Whether it can be asked now: [`crate::oauth::secret_unavailable`]
+    /// while the `[secrets]` command has not given its HTTPS token.
+    pub fn ready(&self) -> Result<(), Error> {
+        match &self.how {
+            How::Https { token_file: Some(_), token: None, .. } => {
+                Err(crate::oauth::secret_unavailable("authorizer.token_file"))
+            }
+            _ => Ok(()),
         }
-        *token = Some(Bearer(secret.to_string()));
+    }
+
+    /// How long it has to answer.
+    pub fn timeout(&self) -> Duration {
+        match &self.how {
+            How::Command(h) => h.timeout,
+            How::Https { timeout, .. } => *timeout,
+        }
+    }
+
+    /// Read the bearer token of an HTTPS authorizer: its file's (relative
+    /// to `root`), or as the secrets helper fetched it.
+    pub(crate) fn load_token(
+        &mut self,
+        root: &Path,
+        pass: &crate::secrets::Pass<'_>,
+    ) -> std::result::Result<(), String> {
+        let How::Https { token_file: Some(source), token, .. } = &mut self.how else { return Ok(()) };
+        let Some((at, bytes)) = source.read("authorizer.token_file", root, pass)? else { return Ok(()) };
+        *token = Some(Bearer(crate::secrets::one_line(&bytes, &at, "a token", 4096)?));
         Ok(())
     }
 
@@ -305,10 +295,19 @@ impl Authorizer {
         let Some(_slot) = Slot::take() else {
             return Outcome::Unavailable { why: "too many authorizations under way".into() };
         };
+        if let How::Https { token_file: Some(_), token: None, .. } = &self.how {
+            // Its token comes from the [secrets] command, which has not given it yet.
+            return Outcome::Unavailable {
+                why: "its token_file secret: the [secrets] command has not given it".into(),
+            };
+        }
         let body = serde_json::to_vec(request).unwrap_or_default();
         let answered = match &self.how {
-            How::Command { argv, env } => run(root, argv, env, &body, self.timeout),
-            How::Https { url, token, .. } => post(url, token.as_ref(), &body, self.timeout),
+            How::Command(h) => {
+                // Its stderr is cut, and emails left out (clip), by run.
+                helper::run(root, h, &body, MAX_ANSWER, &|err| err.to_string())
+            }
+            How::Https { url, token, timeout, .. } => post(url, token.as_ref(), &body, *timeout),
         };
         match answered {
             Ok(bytes) => self.decide(request.workspace, &bytes),
@@ -369,7 +368,7 @@ impl Authorizer {
 /// `s` cut to `max` characters, for the log, its emails left out: the
 /// authorizer is sent the account's email, and its reasons and stderr may
 /// repeat it, while the log keeps none.
-fn clip(s: &str, max: usize) -> String {
+pub(crate) fn clip(s: &str, max: usize) -> String {
     let s: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     let s = without_emails(&s);
     match s.char_indices().nth(max) {
@@ -412,106 +411,6 @@ fn without_emails(s: &str) -> String {
     }
     flush(&mut word, &mut out);
     out
-}
-
-/// Run the command with `body` on its stdin: its stdout, if it exits 0
-/// within `timeout` with at most [`MAX_ANSWER`] bytes. It runs in a process
-/// group of its own (on Unix), which is killed once it has answered or ran
-/// out of time, so nothing it started outlives it or keeps bd waiting on
-/// its output past the deadline.
-fn run(
-    root: &Path,
-    argv: &[String],
-    env: &[String],
-    body: &[u8],
-    timeout: Duration,
-) -> std::result::Result<Vec<u8>, String> {
-    let deadline = Instant::now() + timeout;
-    let program = Path::new(&argv[0]);
-    let program = match program.is_relative() && program.components().count() > 1 {
-        true => root.join(program),
-        false => program.to_path_buf(),
-    };
-    let mut command = Command::new(&program);
-    command.args(&argv[1..]).current_dir(root).env_clear();
-    for name in PASSED.iter().copied().chain(env.iter().map(String::as_str)) {
-        if let Some(value) = std::env::var_os(name) {
-            command.env(name, value);
-        }
-    }
-    command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
-    let mut child = command.spawn().map_err(|e| format!("{} could not be run: {e}", program.display()))?;
-    let group = Group(child.id());
-    let mut stdin = child.stdin.take().expect("piped");
-    let body = body.to_vec();
-    // Written and read on threads, so that a command which reads or writes little cannot stall the others; read
-    // through channels, so that output a process it started keeps open never holds bd past the deadline.
-    std::thread::spawn(move || {
-        let _ = stdin.write_all(&body);
-    });
-    let (out_tx, out_rx) = std::sync::mpsc::channel();
-    let mut stdout = child.stdout.take().expect("piped");
-    std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let read = (&mut stdout).take(MAX_ANSWER + 1).read_to_end(&mut out);
-        let _ = out_tx.send(read.map(|_| out));
-    });
-    let (err_tx, err_rx) = std::sync::mpsc::channel();
-    let mut stderr = child.stderr.take().expect("piped");
-    std::thread::spawn(move || {
-        let mut err = Vec::new();
-        let _ = (&mut stderr).take(MAX_STDERR as u64).read_to_end(&mut err);
-        let _ = err_tx.send(err);
-    });
-    let late = || format!("it did not answer within {}", fmt_duration(timeout));
-    // Its answer is all there once nothing holds its output open any more (or never, by the deadline).
-    let out = out_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    // Whatever it left running goes, answered or not: the group is killed before the command is reaped, so its
-    // id still names it, never another process's.
-    let status = group.end(&mut child);
-    let exited = status.as_ref().is_some_and(|s| s.code().is_some());
-    let out = match out {
-        Ok(read) => read.map_err(|e| format!("reading its answer: {e}"))?,
-        Err(_) if exited => {
-            return Err(format!("{}: it exited, but a process it started kept its output open", late()));
-        }
-        Err(_) => return Err(late()),
-    };
-    let Some(status) = status else { return Err("waiting for it failed".into()) };
-    let err = err_rx.recv_timeout(Duration::from_millis(100)).unwrap_or_default();
-    // First: past the limit, it was left writing to a closed pipe, which may be why it failed.
-    if out.len() as u64 > MAX_ANSWER {
-        return Err(format!("its answer is larger than {} KiB", MAX_ANSWER >> 10));
-    }
-    if !status.success() {
-        let err = String::from_utf8_lossy(&err);
-        return Err(format!("it exited with {status}: {}", clip(err.trim(), MAX_STDERR)));
-    }
-    Ok(out)
-}
-
-/// The process group of an authorizer command: its id, the command's own
-/// (Unix only: elsewhere the command alone is killed).
-struct Group(#[cfg_attr(not(unix), allow(dead_code))] u32);
-
-impl Group {
-    /// Kill the command, if it still runs, and on Unix every process left in
-    /// its group; then reap the command: how it ended (killed, if it still
-    /// ran), if that can be told.
-    fn end(&self, child: &mut std::process::Child) -> Option<std::process::ExitStatus> {
-        #[cfg(unix)]
-        if let Ok(id) = i32::try_from(self.0) {
-            // SAFETY: kill(2) with a negative pid signals the process group the command leads; it touches no
-            // memory of this process.
-            unsafe {
-                libc::kill(-id, libc::SIGKILL);
-            }
-        }
-        let _ = child.kill();
-        child.wait().ok()
-    }
 }
 
 /// One of the [`MAX_RUNNING`] authorizations under way, given back when
@@ -564,10 +463,6 @@ fn post(url: &str, token: Option<&Bearer>, body: &[u8], timeout: Duration) -> st
     }
 }
 
-fn fmt_duration(d: Duration) -> String {
-    bd_core::time::format_duration_ms(i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
-
 /// The access a sign-in has had: what a refresh within `refresh_grace`
 /// keeps while the authorizer cannot answer.
 impl Authorizer {
@@ -618,15 +513,21 @@ pub fn refused(who: &str, workspace: &str) -> Error {
     Error::Unauthorized(format!("{who} may not use workspace {workspace} on this bd server"))
 }
 
-/// Why the authorizer could not say, for the person: busy, for a page
-/// that can be loaded again.
+/// Why the authorizer could not say, for the person: busy for now
+/// (`Error::Locked`: shown as written, 503, try again), for a page that can
+/// be loaded again.
 pub fn unavailable() -> Error {
-    Error::Busy("this bd server could not check the account's access just now; sign in again in a moment".into())
+    Error::Locked("this bd server could not check the account's access just now; sign in again in a moment".into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
+    #[cfg(unix)]
+    use std::time::Instant;
 
     fn doc(toml_text: &str) -> std::result::Result<Authorizer, String> {
         parse(toml::from_str::<AuthorizerDoc>(toml_text).map_err(|e| e.to_string())?)
@@ -634,7 +535,8 @@ mod tests {
 
     fn command(argv: &[&str]) -> Authorizer {
         let mut a = doc(r#"command = ["x"]"#).unwrap();
-        a.how = How::Command { argv: argv.iter().map(|s| s.to_string()).collect(), env: vec![] };
+        let argv = argv.iter().map(|s| s.to_string()).collect();
+        a.how = How::Command(Helper { argv, env: vec![], timeout: DEFAULT_TIMEOUT });
         a
     }
 
@@ -652,8 +554,9 @@ mod tests {
     fn nothing_a_command_starts_outlives_it_or_holds_bd_past_its_time() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("authorize");
-        let mut a = command(&["./authorize"]);
-        a.timeout = Duration::from_secs(1);
+        let mut a = command(&["/bin/sh", "./authorize"]);
+        let How::Command(h) = &mut a.how else { unreachable!() };
+        h.timeout = Duration::from_secs(1);
         let user = user();
         let request = request("sign_in", "proj", &user, None, None, None, None);
         let alive = |dir: &Path| {
@@ -710,7 +613,7 @@ mod tests {
     #[test]
     fn the_table_is_checked() {
         let a = doc(r#"command = ["bin/authorize", "--org", "acme"]"#).unwrap();
-        assert_eq!(a.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(a.timeout(), DEFAULT_TIMEOUT);
         assert_eq!(
             a.caps,
             Caps { max_role: Role::Write, human: false, max_claims: None, workspaces: vec!["*".into()] }
@@ -729,7 +632,7 @@ mod tests {
             ("url = \"https://u:p@authz.example/x\"", "not a plain URL"),
             ("command = [\"x\"]\ntoken_file = \"t\"", "url only"),
             ("url = \"https://a.example\"\nenv = [\"X\"]", "command only"),
-            ("command = [\"x\"]\nenv = [\"A=B\"]", "not a variable name"),
+            ("command = [\"x\"]\nenv = [\"A=B\"]", "entry 1 is not a variable name"),
             ("command = [\"x\"]\ntimeout = \"2m\"", "1s to 60s"),
             ("command = [\"x\"]\nmax_claims = 0", "at least 1"),
             ("command = [\"x\"]\nworkspaces = [\"a b\"]", "authorizer.workspaces"),
@@ -738,6 +641,10 @@ mod tests {
             let e = doc(bad).unwrap_err();
             assert!(e.contains(says), "{bad}: {e}");
         }
+        // As auth.toml's errors show it (the message, never the line quoted: oauth/config.rs), a command line written
+        // as a string is not quoted back.
+        let e = toml::from_str::<AuthorizerDoc>("command = \"bin/authorize --token s3cret\"").unwrap_err();
+        assert!(e.message().contains("not a string") && !e.message().contains("s3cret"), "{}", e.message());
     }
 
     #[test]
@@ -792,6 +699,13 @@ mod tests {
         assert!(matches!(a.ask(Path::new("."), &request), Outcome::Deny { .. }), "not asked beyond its workspaces");
     }
 
+    #[test]
+    fn unavailable_is_busy_for_now_and_says_so_as_written() {
+        let e = unavailable();
+        assert!(matches!(e, Error::Locked(_)), "503, retried");
+        assert!(e.to_string().starts_with("this bd server could not check"), "never 'database is busy': {e}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_command_is_asked_on_stdin_and_answers_on_stdout() {
@@ -804,7 +718,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-        let mut a = command(&["./authorize"]);
+        let mut a = command(&["/bin/sh", "./authorize"]);
         let user = user();
         let request =
             request("sign_in", "proj", &user, None, Some("https://chatgpt.com/oauth/client.json"), None, None);
@@ -817,8 +731,8 @@ mod tests {
         assert_eq!(sent["subject"], "7");
         assert_eq!(sent["login"], "alice");
         assert_eq!(sent["client"], "https://chatgpt.com/oauth/client.json");
-        if let (How::Command { env, .. }, Some(name)) = (&mut a.how, std::env::var("CARGO_PKG_NAME").ok()) {
-            env.push("CARGO_PKG_NAME".into());
+        if let (How::Command(h), Some(name)) = (&mut a.how, std::env::var("CARGO_PKG_NAME").ok()) {
+            h.env.push("CARGO_PKG_NAME".into());
             let Outcome::Allow { via, .. } = a.ask(dir.path(), &request) else { panic!("not allowed") };
             assert_eq!(via, name, "passed when named");
         }
@@ -830,8 +744,9 @@ mod tests {
             ("head -c 70000 /dev/zero", "larger than"),
         ] {
             std::fs::write(&script, format!("#!/bin/sh\ncat >/dev/null\n{body}\n")).unwrap();
-            let mut quick = command(&["./authorize"]);
-            quick.timeout = Duration::from_millis(500);
+            let mut quick = command(&["/bin/sh", "./authorize"]);
+            let How::Command(h) = &mut quick.how else { unreachable!() };
+            h.timeout = Duration::from_millis(500);
             let Outcome::Unavailable { why } = quick.ask(dir.path(), &request) else { panic!("{body}: decided") };
             assert!(why.contains(says), "{body}: {why}");
         }

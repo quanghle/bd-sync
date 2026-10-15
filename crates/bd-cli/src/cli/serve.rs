@@ -127,7 +127,8 @@ A running bd serve applies changes to <root>/auth.toml without a restart (it
 re-reads the file when it changes and at least every 30 s), so check an edited
 copy before it replaces the live file, or before starting bd serve: it reads
 auth.toml and its secret files as a running server would, without starting
-one. It prints the sign-in providers, and with --public-url what to register
+one, running its [secrets] command (on Unix only as the root directory's
+owner). It prints the sign-in providers, and with --public-url what to register
 at providers and clients (callback URLs, account notification URLs, MCP
 endpoints). Exits 2 on a mistake.";
 

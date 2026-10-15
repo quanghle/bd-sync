@@ -119,7 +119,8 @@ crates/bd-server/src/ serve/ (bd serve: listen, routes, exec, sign-in endpoints,
                       · stream (streamed answers) · mcp_http (MCP over HTTP) · jobs (background jobs:
                       reclaim, gate checks, agent sets, backups) · follow (long polls) · server_db (server.db)
                       · auth/ (access tokens, accounts and their actors) · oauth/ (sign-in: one rule engine
-                      for every provider, GitHub, admission, refresh) · oidc/ · authorizer · oauth_server/
+                      for every provider, GitHub, admission, refresh) · oidc/ · authorizer · secrets
+                      (secrets fetched by the admin's command) · helper (running such commands) · oauth_server/
                       (the authorization server for MCP clients: authorize/, token, clients, metadata
                       documents, pages)
 crates/bd/src/        main (the binary; hands bd serve and bd bench to bd-cli) · bench

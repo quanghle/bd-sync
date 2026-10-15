@@ -1,0 +1,3 @@
+# Commands in this checkout run on a bd server; `bd remote show` checks the connection.
+# The access token comes from `bd remote login` ($BD_TOKEN goes only to $BD_REMOTE): never commit it.
+url = "https://bd.quangle.net/w/bd-sync"

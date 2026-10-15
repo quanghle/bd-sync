@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use bd_core::Timestamp;
@@ -316,7 +314,7 @@ fn providers_like_apple_post_their_answers_and_take_signed_secrets() {
     let signed = "[signed_secret]\nkey_file = \"AuthKey.p8\"\nkey_id = \"KEY123\"\nteam_id = \"TEAM123\"\n";
     let mut o = doc(&format!("response_mode = \"form_post\"\n{signed}")).unwrap();
     assert!(o.form_post && doc("").unwrap().signed_secret.is_none() && !doc("").unwrap().form_post);
-    assert_eq!(o.secret_files().collect::<Vec<_>>(), [&PathBuf::from("AuthKey.p8")]);
+    assert_eq!(o.secret_sources().collect::<Vec<_>>(), [&crate::secrets::Source::from("AuthKey.p8")]);
     for (bad, says) in [
         ("response_mode = \"fragment\"", "neither"),
         (&format!("client_secret_file = \"s\"\n{signed}"), "not both"),
@@ -336,12 +334,12 @@ fn providers_like_apple_post_their_answers_and_take_signed_secrets() {
     let pem = format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n", STANDARD.encode(pkcs8.as_ref()));
     std::fs::write(dir.path().join("AuthKey.p8"), pem).unwrap();
     assert!(o.secret().is_err(), "not read yet");
-    o.load_secret(dir.path()).unwrap();
+    o.load_secret(dir.path(), &crate::secrets::Pass::Files).unwrap();
     assert!(!format!("{o:?}").contains(&STANDARD.encode(pkcs8.as_ref())[..20]), "never the key");
     let mut rsa_key = o.clone();
     std::fs::write(dir.path().join("rsa.pem"), include_str!("../../tests/fixtures/github-app.pem")).unwrap();
     rsa_key.signed_secret.as_mut().unwrap().key_file = "rsa.pem".into();
-    assert!(rsa_key.load_secret(dir.path()).unwrap_err().contains("not a P-256 key"));
+    assert!(rsa_key.load_secret(dir.path(), &crate::secrets::Pass::Files).unwrap_err().contains("not a P-256 key"));
 
     // Each secret: signed for the client, for a few minutes.
     let Secret(jwt) = o.secret().unwrap().unwrap();

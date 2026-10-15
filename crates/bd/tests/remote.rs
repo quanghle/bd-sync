@@ -8018,6 +8018,117 @@ fn serve_check_reads_auth_toml_as_the_server_would_and_says_what_to_register() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("bogus"), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_secrets_command_gives_check_and_the_server_their_sign_in_secrets() {
+    let root = oauth_root("loopback_redirects = true\n");
+    let path = |name: &str| root.path().join(name);
+    // The secrets move from files to a vault the command reads.
+    let key = std::fs::read_to_string(path("app.pem")).unwrap();
+    let vault = json!({ "secrets": { "app-key": key, "web-secret": "s3cret" } });
+    std::fs::write(path("vault.json"), vault.to_string()).unwrap();
+    std::fs::remove_file(path("app.pem")).unwrap();
+    std::fs::remove_file(path("github-secret")).unwrap();
+    std::fs::write(path("bd-secrets"), "#!/bin/sh\ncat >/dev/null\ncat vault.json\n").unwrap();
+    std::fs::set_permissions(path("bd-secrets"), std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let config = std::fs::read_to_string(path("auth.toml")).unwrap();
+    let config = config
+        .replace("private_key = \"app.pem\"", "private_key = { secret = \"app-key\" }")
+        .replace("client_secret_file = \"github-secret\"", "client_secret_file = { secret = \"web-secret\" }");
+    // Run by sh, never exec'd itself: a script just written may still be open in a child another test forks
+    // meanwhile ("text file busy").
+    std::fs::write(
+        path("auth.toml"),
+        format!("[secrets]\ncommand = [\"/bin/sh\", \"./bd-secrets\"]\ntimeout = \"60s\"\n{config}"),
+    )
+    .unwrap();
+    let check = || bd(root.path()).args(["serve", "check", "--json", "--root"]).arg(root.path()).output().unwrap();
+    let v: Value = serde_json::from_str(&check_out(check())).unwrap();
+    assert_eq!(v["secrets"], json!(2), "how many, never their names: {v}");
+    assert!(!v.to_string().contains("s3cret"), "{v}");
+
+    // A command that fails fails the check, which says why without a value.
+    std::fs::write(path("vault.json"), "{\"secrets\":{\"app-key\":\"s3cret-x\"}}").unwrap();
+    let out = check();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("[secrets] command failed: its answer lacks web-secret"), "{stderr}");
+    assert!(!stderr.contains("s3cret"), "{stderr}");
+
+    // As the server would: a root named relative to where check runs finds the command all the same.
+    std::fs::write(path("vault.json"), vault.to_string()).unwrap();
+    let (parent, name) = (root.path().parent().unwrap(), root.path().file_name().unwrap());
+    let out = bd(parent).args(["serve", "check", "--json", "--root"]).arg(name).output().unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&check_out(out)).unwrap()["secrets"], json!(2));
+
+    // The vault down at start: the server starts all the same, sign-in unavailable (503, why only in the log),
+    // and admin-issued tokens work.
+    std::fs::write(
+        path("bd-secrets"),
+        "#!/bin/sh
+echo $$ > vault.pid
+echo 'vault https://vault.internal:8200 denied role bd-prod' >&2
+sleep 60
+exit 1
+",
+    )
+    .unwrap();
+    // The vault hangs: the server listens at once all the same, never waiting for it.
+    let started = std::time::Instant::now();
+    let server = Server::launch(root, "127.0.0.1:0", &["--public-url", "https://bd.example.com/bd"]);
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    // What needs no secret goes on: metadata, revocation, admin-issued tokens.
+    let (status, meta) = get_json(&server.base, "/.well-known/oauth-authorization-server/bd");
+    assert_eq!(status, 200, "{meta}");
+    let (status, _, body) =
+        browse(&format!("{}/bd/oauth/revoke", server.base), None, Some(("", "token=nothing-known&client_id=x")));
+    assert_eq!(status, 200, "{body}");
+    let client = server.client(&server.token("ops", "ops", &[]));
+    client.ok(&["create", "still served"]);
+    // What needs a secret the command has not given says so before the browser is sent to the provider.
+    let request = r#"{"redirect_uris":["http://127.0.0.1/cb"],"token_endpoint_auth_method":"none"}"#;
+    let (status, _, registered) = post_json(&format!("{}/bd/oauth/register", server.base), request);
+    assert_eq!(status, 201, "{registered}");
+    let authorize = format!(
+        "{}/bd/oauth/authorize?client_id={}&redirect_uri=http%3A%2F%2F127.0.0.1%3A9%2Fcb&response_type=code&state=s&\
+         code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256&\
+         resource=https%3A%2F%2Fbd.example.com%2Fbd%2Fw%2Fproj%2Fmcp",
+        server.base,
+        registered["client_id"].as_str().unwrap()
+    );
+    let (status, headers, page) = browse(&authorize, None, None);
+    assert_eq!(status, 503, "{page}");
+    assert!(headers.get("location").is_none() && page.contains("Try again in a moment"), "{page}");
+    assert!(!page.contains("vault") && !page.contains("secret"), "{page}");
+    // A link back to the client, which hears it is unavailable for now instead of waiting on its redirect URI.
+    assert!(page.contains("127.0.0.1:9/cb?") && page.contains("error=temporarily_unavailable"), "{page}");
+    // Anyone may post account notifications: nothing of the vault or the settings in the answer.
+    let (status, _, answer) = post_json(&format!("{}/bd/oauth/acme/events", server.base), "{\"payload\":\"x\"}");
+    assert_eq!(status, 404, "{answer}");
+    let shown = answer.to_string();
+    assert!(!shown.contains("vault") && !shown.contains("auth.toml") && !shown.contains("secrets"), "{shown}");
+    // The server stopping ends the command still hanging, rather than leave it running with no deadline.
+    let pid_file = server.root.path().join("vault.pid");
+    let at = std::time::Instant::now();
+    let pid = loop {
+        if let Ok(pid) = std::fs::read_to_string(&pid_file)
+            && !pid.trim().is_empty()
+        {
+            break pid.trim().to_string();
+        }
+        assert!(at.elapsed() < Duration::from_secs(10), "the command never started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    drop(server);
+    let alive =
+        || Command::new("kill").args(["-0", &pid]).stderr(std::process::Stdio::null()).status().unwrap().success();
+    let at = std::time::Instant::now();
+    while alive() {
+        assert!(at.elapsed() < Duration::from_secs(5), "the vault command outlived the server");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// A successful command's stdout.
 fn check_out(out: Output) -> String {
     check(out, "bd serve check")

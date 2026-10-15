@@ -81,7 +81,7 @@ To have an agent harness start each session with that context, run
 | [Playbooks and gates](docs/playbooks.md) | repeatable multi-step work, runs, gates |
 | [GitHub Issues sync](docs/github.md) | `bd github status/pull/push/sync`: linking, mapping, conflicts, comments, markers |
 | [Remote server](docs/remote.md) | `bd serve`, access tokens and roles, clients, background jobs, backups, followers, the protocol |
-| [Signing in](docs/sign-in.md) | OpenID Connect providers, rules, accounts and actors, refreshing, authorizers, the device flow |
+| [Signing in](docs/sign-in.md) | OpenID Connect providers, rules, accounts and actors, refreshing, authorizers, secrets from a command, the device flow |
 | [MCP server](docs/mcp.md) | `bd mcp` and `/w/<name>/mcp`, discovery, OAuth for MCP clients, the tool catalog |
 | [Setting up agent harnesses](docs/setup.md) | `bd setup` for Claude Code, Codex, Copilot CLI, Cursor, Gemini CLI and opencode; the Claude Code plugin |
 | [Agent assets, sessions and hooks](docs/agents.md) | serving, pulling and approving skills and MCP definitions; session-start hooks; subagents |

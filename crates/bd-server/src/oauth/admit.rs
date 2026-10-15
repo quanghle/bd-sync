@@ -7,6 +7,8 @@ use super::*;
 /// Start a sign-in: the one-time code the provider gives for it.
 pub fn start(root: &Path, provider: &str) -> Result<SignInCode> {
     let sign_in = enabled(root)?;
+    // Before the person is sent anywhere: a secret the sign-in will need and does not have now is told at once.
+    sign_in.ready_for(provider, false)?;
     if provider != "github" {
         return start_oidc(&sign_in, provider);
     }
@@ -121,6 +123,8 @@ pub fn poll(root: &Path, provider: &str, poll: &SignInPoll) -> Result<SignInAnsw
         return Err(Error::invalid(format!("invalid workspace name {:?}", poll.workspace)));
     }
     let sign_in = enabled(root)?;
+    // Before the provider's code is redeemed (it is good once): the client polls again, as long as its retries last.
+    sign_in.ready_for(provider, false)?;
     if provider != "github" {
         return poll_oidc(root, &sign_in, provider, poll);
     }
@@ -177,8 +181,22 @@ pub fn poll(root: &Path, provider: &str, poll: &SignInPoll) -> Result<SignInAnsw
 /// `<issuer>/oauth/<provider>/events`): an account that revoked its consent
 /// has its sign-ins from before ended, and a deleted one is forgotten. A
 /// provider without `account_events` takes none (`NotFound`).
+/// It needs no secret, so the `[secrets]` command's answers never matter.
+///
+/// Anyone may post here: settings that cannot be used now are
+/// `Error::Locked` (the provider sends again later), why only in the log,
+/// at most once a minute.
 pub fn account_event(root: &Path, provider: &str, body: &[u8]) -> Result<()> {
-    let sign_in = load(root)?;
+    static LOGGED: crate::metrics::Throttle = crate::metrics::Throttle::new(60_000);
+    let sign_in = match load(root) {
+        Ok(sign_in) => sign_in,
+        Err(e) => {
+            if let Some(skipped) = LOGGED.pass() {
+                tracing::error!(target: "bd::serve", error = %e, skipped, "an account notification came, but auth.toml cannot be used");
+            }
+            return Err(Error::Locked("the server cannot take notifications now; send again later".into()));
+        }
+    };
     let oidc = sign_in.as_ref().and_then(|s| s.oidc(provider)).filter(|o| !o.account_events.is_empty());
     let Some(oidc) = oidc else { return Err(Error::not_found("provider taking account notifications", provider)) };
     let md = oidc.metadata()?;
@@ -225,7 +243,7 @@ pub(super) fn admit(
 /// `client`, if any), for any provider: never if its provider's `deny`
 /// names it; else as the authorizer decides, or the provider's rules.
 /// `Error::Unauthorized` (said to the person signing in) if they do not let
-/// it in, `Error::Busy` if the authorizer could not say, `Error::Remote` if
+/// it in, `Error::Locked` if the authorizer could not say, `Error::Remote` if
 /// the provider would not tell what a rule needs.
 pub(super) fn judge(
     root: &Path,
@@ -285,7 +303,7 @@ pub(super) fn judge(
 }
 
 /// What `authorizer` grants the account `request` is about, or why not:
-/// `Unauthorized` (for the person) when it refuses, `Busy` when it cannot
+/// `Unauthorized` (for the person) when it refuses, `Locked` when it cannot
 /// say. Its reasons go to the log only.
 pub(super) fn ask(
     root: &Path,

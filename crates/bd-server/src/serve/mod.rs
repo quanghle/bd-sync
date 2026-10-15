@@ -740,11 +740,10 @@ impl Server {
     /// The issuer of the server's authorization server, if `auth.toml` turns
     /// it on (read for each request, as sign-ins do); an error if `auth.toml`
     /// is not valid or `--public-url` cannot be an issuer.
-    fn issuer(&self) -> std::result::Result<Option<String>, String> {
-        match oauth::load_oauth(&self.root) {
-            Ok(Some(_)) => oauth_server::issuer(self.public_url.as_deref()).map(Some),
-            Ok(None) => Ok(None),
-            Err(e) => Err(e.to_string()),
+    fn issuer(&self) -> Result<Option<String>> {
+        match oauth::load_oauth(&self.root)? {
+            Some(_) => oauth_server::issuer(self.public_url.as_deref()).map(Some).map_err(Error::invalid),
+            None => Ok(None),
         }
     }
 

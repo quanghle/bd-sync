@@ -86,7 +86,11 @@ pub fn refresh_found(
     // A provider that can be asked again (GitHub, through its App) proves the account afresh: as it is named now,
     // and with the memberships rules ask. Otherwise the sign-in is decided on what bd kept of it.
     let github = match user.provider.as_str() {
-        "github" => github_of(&sign_in).ok().and_then(|g| g.app.as_ref().map(|key| (g, key))),
+        "github" => match github_of(&sign_in) {
+            // With the App's key configured, a refresh needs it: none from the [secrets] command yet, none now.
+            Ok(g) => g.app_key().map_err(lasting)?.map(|key| (g, key)),
+            Err(_) => None,
+        },
         _ => None,
     };
     // All of a refresh's calls to GitHub end within one budget, as it holds a refresh slot meanwhile and its client
@@ -139,6 +143,8 @@ pub fn refresh_found(
                     // Since the last decision, not the last refresh: refreshes kept meanwhile do not extend it.
                     let within = authorizer.refresh_grace.is_some_and(|grace| now < state.decided_at.plus(grace));
                     if !within {
+                        // Its token not given by the [secrets] command: this refresh fails, as when it does not decide.
+                        authorizer.ready().map_err(lasting)?;
                         tracing::warn!(target: "bd::serve", login = %now_user.login, %why, "sign-in not refreshed: the authorizer did not decide");
                         return Err(Error::Remote(
                             "this bd server could not check the account's access just now; try again later".into(),
@@ -228,6 +234,18 @@ fn within(granted: &[String], had: &[String]) -> Vec<String> {
         (_, true) => granted.to_vec(),
         (true, false) => had.to_vec(),
         (false, false) => granted.iter().filter(|w| had.contains(w)).cloned().collect(),
+    }
+}
+
+/// A secret of the `[secrets]` command a refresh needs and does not have:
+/// a failure of this refresh (502), as when a provider does not answer, not
+/// a busy server (503), which clients retry at once for as long as they
+/// wait: a vault down for an hour would stall every command meanwhile. The
+/// client refreshes later on its own.
+fn lasting(e: Error) -> Error {
+    match e {
+        Error::Locked(why) => Error::Remote(why),
+        e => e,
     }
 }
 
@@ -324,6 +342,24 @@ mod tests {
         assert_eq!(refresh(dir.path(), &bob, "r-2", None).unwrap().workspaces, ["*"]);
         assert_eq!(within(&["*".into()], &["proj".into()]), ["proj"]);
         assert_eq!(within(&["a".into(), "b".into()], &["b".into(), "c".into()]), ["b"]);
+    }
+
+    #[test]
+    fn a_refresh_needing_a_secret_not_given_fails_it_and_is_not_busy() {
+        let dir = root("[[oidc.acme.allow]]\nanyone = true\n");
+        let secret = sign_in(dir.path(), "s-1", "proj").unwrap();
+        // The authorizer's token comes from a vault that has not answered.
+        configure(
+            dir.path(),
+            "[authorizer]\nurl = \"https://authz.invalid/bd\"\ntoken_file = { secret = \"authz\" }\n\
+             [secrets]\ncommand = [\"./no-such-command\"]\n",
+        );
+        let e = refresh(dir.path(), &secret, "r-1", None).unwrap_err();
+        // A 502, not a 503 clients retry at once for as long as they wait (every command stalled meanwhile).
+        assert!(matches!(e, Error::Remote(_)), "{e:?}");
+        assert!(!e.to_string().contains("authz") && !e.to_string().contains("secret"), "{e}");
+        assert_eq!(live(dir.path()), 1, "kept, refreshed later");
+        crate::secrets::forget(dir.path());
     }
 
     #[test]

@@ -32,5 +32,6 @@ rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"]
 tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dependencies]
-# kill(2) of an authorizer command's process group (authorizer.rs).
+# The admin's helper commands (helper.rs): kill(2) of their process group, and poll(2)/fcntl(2) to read their output;
+# `bd serve check`'s owner gate (serve/check.rs): geteuid(2) and getpwuid_r(3).
 libc = "0.2"

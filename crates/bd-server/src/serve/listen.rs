@@ -60,8 +60,12 @@ pub(super) fn run(a: &ServeArgs) -> Result<()> {
             "the root is open to others than its owner, and the workspaces' databases with it: chmod 700 it"
         );
     }
-    // Checked now so that a mistake shows at once; later loads read it again once it (or a secret file) changes.
-    if let Some(sign_in) = oauth::load(&root)? {
+    // Checked now so that a mistake shows at once (secret files and CA included); later loads read it again once
+    // it (or a file it names) changes. The [secrets] command is never waited for: the server serves at once, sign-in
+    // needing its secrets unavailable until it answers; its first answer, or why none, is logged when known.
+    let sign_in = oauth::load(&root)?;
+    oauth::report_first_answer(&root);
+    if let Some(sign_in) = sign_in {
         if let Some(o) = &sign_in.oauth {
             let issuer = oauth_server::issuer(public_url.as_deref()).map_err(Error::invalid)?;
             tracing::info!(
@@ -85,6 +89,17 @@ pub(super) fn run(a: &ServeArgs) -> Result<()> {
                 );
             }
         }
+        if let Some(s) = &sign_in.secrets {
+            // How many, not their names: a value pasted in a name's place would be logged at every start.
+            tracing::info!(
+                target: "bd::serve",
+                command = %s.helper.argv[0],
+                secrets = sign_in.secret_names().len(),
+                ttl = %shown(s.ttl),
+                max_stale = %shown(s.max_stale),
+                "sign-in secrets are fetched by the [secrets] command"
+            );
+        }
         let decider = if sign_in.authorizer.is_some() { "the authorizer" } else { "rules" };
         // Every provider's sign-ins are refreshed: its rules or the authorizer decide again at each refresh.
         if let Some(github) = &sign_in.github {
@@ -92,7 +107,7 @@ pub(super) fn run(a: &ServeArgs) -> Result<()> {
                 target: "bd::serve",
                 github = %github.url,
                 decider,
-                app = github.app.is_some(),
+                app = github.private_key.is_some(),
                 token_ttl = %shown(sign_in.token_ttl),
                 refresh_limit = %shown(sign_in.refresh_limit),
                 refresh_idle = %shown(sign_in.refresh_idle),
@@ -121,13 +136,13 @@ pub(super) fn run(a: &ServeArgs) -> Result<()> {
         }
         if let Some(a) = &sign_in.authorizer {
             let by = match &a.how {
-                crate::authorizer::How::Command { argv, .. } => format!("command {}", argv[0]),
+                crate::authorizer::How::Command(h) => format!("command {}", h.argv[0]),
                 crate::authorizer::How::Https { url, .. } => format!("url {url}"),
             };
             tracing::info!(
                 target: "bd::serve",
                 by = %by,
-                timeout = %shown(a.timeout),
+                timeout = %shown(a.timeout()),
                 max_role = a.caps.max_role.as_str(),
                 human = a.caps.human,
                 max_claims = ?a.caps.max_claims,
@@ -274,11 +289,15 @@ pub(super) async fn serve(
     server.stopping.send_replace(true);
     // GitHub gates are checked again after a restart; no need to wait for gh.
     bd_cli::gh::cancel_gh_calls();
+    // The [secrets] and authorizer commands running now, or started while the rest drains, would run on with no
+    // deadline once the server is gone: killed now, and as they start.
+    crate::helper::end_all();
     let all = u32::try_from(MAX_RUNNING).unwrap_or(u32::MAX);
     let commands = tokio::time::timeout(COMMANDS_GRACE, server.running.acquire_many(all));
     let followers = u32::try_from(server.waits.followers).unwrap_or(u32::MAX);
     let followers = tokio::time::timeout(FOLLOWERS_GRACE, server.followers.acquire_many(followers));
     let _ = tokio::join!(commands, followers, jobs.stop(JOBS_GRACE));
+    crate::helper::end_all();
     Ok(())
 }
 

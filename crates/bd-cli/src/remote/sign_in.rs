@@ -42,7 +42,9 @@ fn poll_second() -> Duration {
 pub fn sign_in(remote: &Remote, workspace: &str, server: &str, provider: &str) -> Result<Issued> {
     let plain = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-';
     if provider.is_empty() || provider.len() > 32 || !provider.chars().all(plain) {
-        return Err(Error::invalid(format!("--provider {provider:?} is not a provider's name, such as github")));
+        return Err(Error::invalid(format!(
+            "--provider {provider:?} is not a provider name (lowercase letters, digits and -, at most 32 characters)"
+        )));
     }
     let start = SignInStart { workspace: workspace.to_string() };
     let code: SignInCode = remote.auth_request(&format!("{provider}/device"), &start, Duration::ZERO)?;

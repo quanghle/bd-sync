@@ -110,7 +110,7 @@ bd release <id> --token <t>                  # give it back
   reserved for you, or held by a `claim.pools` alias. An issue with open
   children is not ready: the refusal (exit 4) names the children, and
   `claim --next --parent <id>` claims one of them. `--allow-blocked` claims
-  a blocked or deferred issue by id anyway.
+  an open issue by id despite its blockers, deferral or open children.
 - **The token** is the sequence number of the `claimed` event: unique and
   increasing. Pass it to `heartbeat`, `close` and `release`, so a worker
   that lost its claim cannot act on it. Claiming again with `--token` is an

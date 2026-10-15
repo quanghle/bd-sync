@@ -481,6 +481,21 @@ fn live_claims_are_protected_from_other_actors() {
 }
 
 #[test]
+fn config_keys_are_read_and_unset_by_name() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "lease.ttl", "10m"]);
+    assert_eq!(ws.json(&["config", "get", "lease.ttl"])["value"], "10m");
+    assert_eq!(ws.json(&["config", "unset", "lease.ttl"])["removed"], true);
+    assert_eq!(ws.json(&["config", "get", "lease.ttl"])["value"], "5m");
+    // The same key argument in a batch line.
+    ws.ok(&["config", "set", "lease.ttl", "10m"]);
+    let script = ws.dir.path().join("ops.txt");
+    std::fs::write(&script, "config unset lease.ttl\n").unwrap();
+    ws.json(&["batch", "-f", script.to_str().unwrap()]);
+    assert_eq!(ws.json(&["config", "get", "lease.ttl"])["value"], "5m");
+}
+
+#[test]
 fn dead_claims_are_anyones() {
     let ws = Ws::new();
     for n in 1..=3 {

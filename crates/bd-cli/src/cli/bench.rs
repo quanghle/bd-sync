@@ -18,28 +18,30 @@ pub enum BenchMode {
 
 #[derive(Args, Debug, Clone)]
 pub struct BenchArgs {
-    /// Concurrent workers
+    /// Concurrent workers, at least 1
     #[arg(short, long, default_value_t = 8)]
     pub workers: usize,
+    /// How the workers run
     #[arg(long, value_enum, default_value = "threads")]
     pub mode: BenchMode,
-    /// Issues to seed
+    /// Issues to seed, at least 1
     #[arg(short = 'n', long, default_value_t = 2000)]
     pub issues: usize,
     /// Average blocking dependencies per issue (random DAG)
     #[arg(long, default_value_t = 1.0)]
     pub deps: f64,
-    /// Simulated work per claim
+    /// Simulated work per claim, in milliseconds
     #[arg(long, default_value_t = 0, value_name = "MS")]
     pub work_ms: u64,
     /// Heartbeat once per claim before closing
     #[arg(long)]
     pub heartbeat: bool,
-    /// Durability (off | normal | full)
+    /// SQLite synchronous level: off, normal or full
     #[arg(long, default_value = "normal")]
     pub durability: String,
-    /// Keep the scratch database at this path instead of a temp dir (remote mode: <root>/<name>/.bd/bd.db)
-    #[arg(long)]
+    /// Keep the scratch database at PATH, which must not exist yet, instead of in a temporary directory (remote
+    /// mode: a path shaped <root>/<name>/.bd/bd.db)
+    #[arg(long, value_name = "PATH")]
     pub keep: Option<PathBuf>,
     /// RNG seed for the generated graph
     #[arg(long, default_value_t = 42)]

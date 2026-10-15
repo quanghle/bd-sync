@@ -129,8 +129,8 @@ fn oauth_config(o: OauthDoc) -> std::result::Result<OauthConfig, String> {
     for raw in &o.redirect_hosts {
         let Some(host) = dns_name(raw) else {
             return Err(format!(
-                "oauth.redirect_hosts {raw:?} is not a host name such as chatgpt.com (loopback_redirects = true \
-                 allows this machine)"
+                "oauth.redirect_hosts {raw:?} is not a host name such as client.example.com (loopback_redirects = \
+                 true allows this machine)"
             ));
         };
         if !redirect_hosts.contains(&host) {

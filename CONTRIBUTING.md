@@ -59,6 +59,19 @@ The rules that keep the engine's guarantees are in
 - Commands print and read only through `io.rs`, so `bd serve` can run them
   in-process; every new command needs a class in `cli::access`.
 
+Help text: command summaries are imperative phrases ("List ready work"), at
+most 80 characters, capitalized, with no trailing period; every visible flag,
+argument and possible value has help in the same style, and global flags fit
+on one line of 80 characters. Detail goes in a long help (`long_about`), and
+examples in an `Examples:` block of `after_long_help`, each of which must
+parse. Help states the runtime defaults and validator bounds that clap cannot
+show, and authorization notes name the exact case they apply to (live-claim
+overrides, admin-only commands). Flags that mean the same thing share their
+wording (the constants and suffix macros in `cli/mod.rs`); durations are
+`DURATION`, times `TIME`. Help uses no first- or second-person pronouns and
+names no products in sign-in examples. The tests in `cli/tests.rs` check
+these rules on the help as written.
+
 ## Documentation
 
 User documentation lives in [docs/](docs/); the [README](README.md) links each

@@ -11,11 +11,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
-    /// Read-only commands; the database connection is query-only.
+    /// Read-only commands, on a query-only database connection
     Read,
-    /// Every command a local user runs, except admin ones.
+    /// Also commands that change the workspace, except admin-only ones
     Write,
-    /// Also `config set/unset`, `import`, `events prune`, `doctor`.
+    /// Also config set/unset, rename-prefix, import, events prune, doctor, and ending or taking over other actors' live claims
     Admin,
 }
 
@@ -33,9 +33,9 @@ impl Role {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
-    /// A person: may also resolve human gates and move work past them.
+    /// A person: may also resolve human gates and move work past them
     Human,
-    /// A program (the default of `bd serve token create`).
+    /// A program
     Agent,
 }
 

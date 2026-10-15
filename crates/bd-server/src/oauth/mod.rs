@@ -498,6 +498,7 @@ mod tests {
         {
             let e = error(&format!("{github}[oauth]\nredirect_hosts = [\"{bad}\"]\n"));
             assert!(e.contains("is not a host name"), "{bad}: {e}");
+            assert!(bad.contains("chatgpt") || !e.contains("chatgpt"), "{e}");
         }
         assert!(error(&format!("{github}[oauth]\nissuer = \"https://x\"\n")).contains("unknown field"));
         let hosts = "[oauth]\nredirect_hosts = [\"chatgpt.com\"]\n";

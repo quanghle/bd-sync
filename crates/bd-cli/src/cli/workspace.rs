@@ -374,8 +374,9 @@ the same flags as on the command line. $N stands for the id that operation N
 produced (counting operations from 1, not lines), $$ for a literal $, and
 lines starting with # are comments. The operations: create, update, close,
 duplicate, supersede, reopen, defer, undefer, delete, dep, label, comment add, claim, release,
-heartbeat, remember, forget, config set and config unset. If one fails, none
-is applied.";
+heartbeat, remember, forget, config set, config unset and compact (the apply
+form of `bd compact`: `compact ID --summary TEXT --if-revision N`, the summary
+given on the line itself, never - or @FILE). If one fails, none is applied.";
 
 const BATCH_EXAMPLES: &str = "\
 Example file:
@@ -383,6 +384,8 @@ Example file:
   create \"Run the migration\" --dep $1
   # $2 waits on $1
   claim $1
+  close t-7
+  compact $4 --summary \"Shipped the fix.\" --if-revision 3
 
 Examples:
   bd batch -f ops.txt --dry-run
@@ -396,6 +399,23 @@ pub struct BatchArgs {
     pub file: Option<PathBuf>,
     #[arg(long, help = DRY_RUN_HELP)]
     pub dry_run: bool,
+}
+
+/// `compact` in `bd batch`: the apply form of `bd compact`.
+#[derive(Args, Debug, Clone)]
+#[command(group(clap::ArgGroup::new("target").required(true).args(["id", "apply"])))]
+pub struct BatchCompactArgs {
+    /// The closed issue whose text the summary replaces
+    #[arg(value_name = "ID")]
+    pub id: Option<String>,
+    /// The same, named as `bd compact --apply ID` names it
+    #[arg(long, value_name = "ID")]
+    pub apply: Option<String>,
+    /// The summary itself (- and @FILE are not read inside a batch)
+    #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
+    pub summary: String,
+    #[arg(long, value_name = "N", help = if_revision_help!())]
+    pub if_revision: i64,
 }
 
 pub const COMPLETION_LONG_ABOUT: &str = "\

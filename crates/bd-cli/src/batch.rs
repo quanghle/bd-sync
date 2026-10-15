@@ -50,6 +50,7 @@ enum Op {
     Forget(KeyArg),
     #[command(subcommand)]
     Config(ConfigCommand),
+    Compact(BatchCompactArgs),
 }
 
 fn run(tx: &mut WriteCtx<'_>, op: &Op) -> Result<Out> {
@@ -73,6 +74,7 @@ fn run(tx: &mut WriteCtx<'_>, op: &Op) -> Result<Out> {
         Op::Remember(a) => exec_remember(tx, a),
         Op::Forget(a) => exec_forget(tx, a),
         Op::Config(c) => exec_config(tx, c),
+        Op::Compact(a) => exec_batch_compact(tx, a),
     }
 }
 

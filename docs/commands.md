@@ -429,7 +429,11 @@ bd graph ID|--all [--format text|dot|html] [--edges TYPE,...|all] [--max-nodes N
   `update`, `close`, `duplicate`, `supersede`, `dep add`, …), `$N` stands
   for the id produced by the Nth operation, and `#` starts a comment. Any
   failure rolls back everything; `--dry-run` runs everything, reports, then
-  rolls back.
+  rolls back. `compact ID --summary TEXT --if-revision N` (or `compact
+  --apply ID ...`) is the apply form of `bd compact`, with the summary on
+  the line itself: `--summary -` and `--summary @FILE` are refused there,
+  as the batch's own input is the stdin or file
+  ([Compaction](concepts.md#compaction)).
 - **`bd backup --to DIR [--keep 24] [--name NAME]`** writes a verified copy
   of a local workspace's database ([Backing up](modes.md#backing-up-a-local-workspace)).
 

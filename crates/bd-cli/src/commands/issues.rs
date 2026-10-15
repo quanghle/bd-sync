@@ -477,6 +477,31 @@ pub fn summary_input(summary: &str) -> Option<&str> {
     }
 }
 
+/// The apply form of `bd compact`: `summary` replaces the closed issue's
+/// text if it is still at `if_revision`.
+pub fn exec_compact(tx: &mut WriteCtx<'_>, raw: &str, summary: &str, if_revision: i64) -> Result<Out> {
+    let id = tx.resolve_id(raw)?;
+    let guard = Guard { if_revision: Some(if_revision), ..Default::default() };
+    let out = tx.compact_issue(&id, summary, &guard)?;
+    let line = format!(
+        "✓ Compacted {id} (level {}): {} -> {} bytes; `bd history {id} --diff` shows the original",
+        out.level, out.original_size, out.size
+    );
+    Ok(Out::new(&out).line(line).id(id))
+}
+
+/// `compact` in `bd batch`: the summary is on the line, as the batch's own
+/// input is the stdin or file `-` and `@FILE` would read.
+pub fn exec_batch_compact(tx: &mut WriteCtx<'_>, a: &BatchCompactArgs) -> Result<Out> {
+    if summary_input(&a.summary).is_some() {
+        return Err(Error::invalid(
+            "compact in bd batch takes the summary itself: --summary - and --summary @FILE are not read inside a batch",
+        ));
+    }
+    let raw = a.id.as_deref().or(a.apply.as_deref()).ok_or_else(|| Error::invalid("compact needs an issue id"))?;
+    exec_compact(tx, raw, &a.summary, a.if_revision)
+}
+
 /// `bd compact`: list candidates, apply a summary, or count.
 pub fn cmd_issue_compact(app: &mut App, a: &IssueCompactArgs) -> Result<()> {
     let older_than = parse_duration(a.older_than.as_deref().unwrap_or("30d"))?;
@@ -488,17 +513,9 @@ pub fn cmd_issue_compact(app: &mut App, a: &IssueCompactArgs) -> Result<()> {
             },
             None => return Err(Error::invalid("--apply needs --summary")),
         };
-        let guard = Guard { if_revision: a.if_revision, ..Default::default() };
-        let out = app.write("compact", |tx| {
-            let id = tx.resolve_id(raw)?;
-            tx.compact_issue(&id, &summary, &guard)
-        })?;
-        let id = out.issue.id.clone();
-        let line = format!(
-            "✓ Compacted {id} (level {}): {} -> {} bytes; `bd history {id} --diff` shows the original",
-            out.level, out.original_size, out.size
-        );
-        app.print(Out::new(&out).line(line).id(id));
+        let if_revision = a.if_revision.ok_or_else(|| Error::invalid("--apply needs --if-revision"))?;
+        let out = app.write("compact", |tx| exec_compact(tx, raw, &summary, if_revision))?;
+        app.print(out);
         return Ok(());
     }
     if a.stats {

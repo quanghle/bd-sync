@@ -4198,6 +4198,50 @@ fn compact_analyze_apply_stats_end_to_end() {
 }
 
 #[test]
+fn batch_compacts_in_its_transaction() {
+    let ws = Ws::new();
+    let long = "A long description of the work, with the reasons it was done this way.";
+    ws.ok(&["create", "Done", "-d", long, "--notes", "Notes from the work"]);
+    ws.ok(&["create", "Other", "-d", long]);
+    let rev = ws.json(&["show", "t-1"])["revision"].as_i64().unwrap();
+    let script = ws.dir.path().join("ops.txt");
+    let batch = |ops: String| {
+        std::fs::write(&script, ops).unwrap();
+        ws.code_as("tester", &["batch", "-f", script.to_str().unwrap()])
+    };
+
+    // Closed and compacted in one batch, the compaction naming the close's id.
+    let closed = rev + 1;
+    assert_eq!(batch(format!("close t-1\ncompact $1 --summary \"Did it.\" --if-revision {closed}\n")), 0);
+    let shown = ws.json(&["show", "t-1"]);
+    assert_eq!((shown["status"].as_str(), shown["description"].as_str()), (Some("closed"), Some("Did it.")));
+    assert_eq!(shown["notes"], "");
+    assert_eq!(shown["metadata"]["compaction"]["level"], 1);
+    assert!(ws.seq_of("t-1", "compacted") > ws.seq_of("t-1", "closed"));
+
+    // `--apply ID` names the issue as `bd compact` does; a stale revision rolls back the close before it.
+    let rev2 = ws.json(&["show", "t-2"])["revision"].as_i64().unwrap();
+    assert_eq!(batch(format!("close t-2\ncompact --apply $1 --summary Short --if-revision {rev2}\n")), 13);
+    let other = ws.json(&["show", "t-2"]);
+    assert_eq!((other["status"].as_str(), other["description"].as_str()), (Some("open"), Some(long)), "rolled back");
+
+    // The summary is on the line: - and @FILE are refused, rolling back the batch.
+    std::fs::write(ws.dir.path().join("summary.md"), "From a file.").unwrap();
+    for summary in ["-", "@summary.md"] {
+        std::fs::write(&script, format!("close t-2\ncompact t-2 --summary {summary} --if-revision {}\n", rev2 + 1))
+            .unwrap();
+        let out = Ws::cmd_in(ws.dir.path(), "tester", &["batch", "-f", script.to_str().unwrap()]).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{summary}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("not read inside a batch") && err.contains("line 2"), "{err}");
+        assert_eq!(ws.json(&["show", "t-2"])["status"], "open", "{summary}: rolled back");
+    }
+    // One issue, named once; the revision guard is required.
+    assert_eq!(batch("compact t-1 --apply t-1 --summary x --if-revision 1\n".into()), 2);
+    assert_eq!(batch("compact t-1 --summary x\n".into()), 2);
+}
+
+#[test]
 fn close_claims_the_next_issue_siblings_first() {
     let ws = Ws::new();
     let parent = ws.id(&["create", "Parent", "-p", "2"]);

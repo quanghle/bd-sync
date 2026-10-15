@@ -305,6 +305,20 @@ bd compact --stats
 `--analyze` and `--stats` are reads, `--apply` a write (a write token
 through `bd serve`).
 
+`bd batch` runs the apply form as an operation, `compact ID --summary TEXT
+--if-revision N` (`compact --apply ID ...` reads the same), in the batch's
+one transaction: several summaries applied together, or an issue closed and
+compacted at once, where `$N` names the close's issue and the revision is
+the one after the close. The summary is quoted on the line (`--summary -`
+and `--summary @FILE` are refused, since the batch's input is the stdin or
+file), and a stale revision or any other failing line rolls back the whole
+batch (exit 13 for the revision).
+
+```text
+close t-12 --reason "Shipped"
+compact $1 --summary "Fixed the retry loop; see the PR." --if-revision 8
+```
+
 ## Comments and memory
 
 ```bash

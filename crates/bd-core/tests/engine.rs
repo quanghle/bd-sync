@@ -739,6 +739,39 @@ fn claim_next_auto_reclaims_stale_leases() {
 }
 
 #[test]
+fn suggest_next_names_what_claim_next_would_without_writing() {
+    let mut env = Env::new();
+    let dead = env.create("Held by a dead claim", 0);
+    let lower = env.create("Lower priority", 2);
+    env.store.write("claim", "dead", |tx| tx.claim(&dead, &ClaimOptions::default())).unwrap();
+    env.clock.advance(Duration::from_secs(301 + 600));
+    let before = env.events().len();
+    let (issue, _) = env
+        .store
+        .write("close", "alive", |tx| tx.suggest_next(&ReadyQuery::default(), None))
+        .unwrap()
+        .expect("a suggestion");
+    assert_eq!(issue.id, dead, "the dead claim's issue, reclaimed first by claim_next");
+    assert_eq!(issue.assignee.as_deref(), Some("dead"), "as stored: nothing was reclaimed");
+    assert_eq!(env.events().len(), before, "nothing written");
+    assert_eq!(env.issue(&dead).status, Status::InProgress);
+    let claim = env
+        .store
+        .write("claim", "alive", |tx| tx.claim_next(&ReadyQuery::default(), &ClaimOptions::default()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.issue.id, issue.id, "the issue suggested");
+
+    // With lease.auto_reclaim off, claim_next leaves dead claims alone, and so does the suggestion.
+    let urgent = env.create("Urgent", 0);
+    env.store.write("claim", "dead", |tx| tx.claim(&urgent, &ClaimOptions::default())).unwrap();
+    env.clock.advance(Duration::from_secs(301 + 600));
+    env.store.write("config", "alice", |tx| config::set(tx, "lease.auto_reclaim", "false")).unwrap();
+    let next = env.store.write("close", "alive", |tx| tx.suggest_next(&ReadyQuery::default(), None)).unwrap();
+    assert_eq!(next.map(|(i, _)| i.id), Some(lower));
+}
+
+#[test]
 fn optimistic_concurrency_guards() {
     let mut env = Env::new();
     let a = env.create("A", 1);
@@ -2524,6 +2557,18 @@ fn closing_as_a_duplicate_refuses_nonsense_and_writes_nothing() {
     refused(&mut env, &x, &y, Replacement::Duplicate, 2, "remove that edge first");
     assert_eq!(env.issue(&x).status, Status::Open);
     env.store.write("rm", "alice", |tx| tx.remove_dependency(&x, &y)).unwrap();
+    // Nor one the other way: y blocked by x would be released by closing x.
+    env.dep(&y, &x, DepType::Blocks);
+    refused(
+        &mut env,
+        &x,
+        &y,
+        Replacement::Supersede,
+        2,
+        &format!("{y} already depends on {x} via blocks; remove that edge first"),
+    );
+    assert_eq!(env.issue(&x).status, Status::Open);
+    env.store.write("rm", "alice", |tx| tx.remove_dependency(&y, &x)).unwrap();
     let head_before = head_before.max(head(&env));
 
     // The reverse edge of the same type.

@@ -68,7 +68,8 @@ To have an agent harness start each session with that context, run
 `bd setup <harness>` in the project (`claude`, `codex`, `copilot`,
 `cursor`, `gemini` or `opencode`), or install the Claude Code plugin:
 `/plugin marketplace add quanghle/bd-sync`, then `/plugin install bd@bd`
-([Setting up agent harnesses](docs/setup.md)).
+(or, in Claude Code 2.1.275+, `/plugin install bd --marketplace
+quanghle/bd-sync`; see [Setting up agent harnesses](docs/setup.md)).
 
 ## Documentation
 

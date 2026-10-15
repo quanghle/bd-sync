@@ -137,8 +137,10 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         token: a.token,
     };
     let ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
-    // The next issue's query, parsed before anything is written; the search
-    // starts under the first named issue's parent unless --parent says where.
+    // The next issue's query and --ttl, parsed before anything is written
+    // (a bad one fails even when nothing would be closed); the search starts
+    // under the first named issue's parent unless --parent says where.
+    let ttl = a.next.ttl.as_deref().map(|t| parse_duration(t).and_then(bd_core::claims::validate_ttl)).transpose()?;
     let next = if a.claim_next || a.suggest_next {
         let q = next_query(tx, &a.next)?;
         let near = match (&q.filter.parent, ids.first()) {
@@ -199,7 +201,6 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
             json["next_note"] = json!("nothing closed: not claiming");
             out = out.line("No issue closed: not claiming next");
         } else {
-            let ttl = a.next.ttl.as_deref().map(parse_duration).transpose()?;
             match tx.claim_next_near(&q, near.as_deref(), &ClaimOptions { ttl, ..Default::default() })? {
                 Some((c, from)) => {
                     json["next"] = next_json(from, searched(from), &c.issue, Some(&c));
@@ -210,7 +211,8 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
             }
         }
     } else {
-        match tx.next_ready(&q, near.as_deref())? {
+        // The issue --claim-next would claim, dead claims it would reclaim first included.
+        match tx.suggest_next(&q, near.as_deref())? {
             Some((issue, from)) => {
                 json["next"] = next_json(from, searched(from), &issue, None);
                 out = out

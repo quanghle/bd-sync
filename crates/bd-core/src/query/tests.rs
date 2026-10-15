@@ -355,6 +355,43 @@ fn comparisons_and_length_are_bounded() {
     assert_eq!(err(&wide).column, 8 + 2045);
 }
 
+#[test]
+fn canonical_text_longer_than_the_limit_round_trips() {
+    let s = seeded();
+    // Accepted queries whose canonical text outgrows MAX_BYTES: escapes
+    // doubling a value, normalized values, tight keywords gaining spaces.
+    let backslashes = format!("title={}", "\\".repeat(MAX_BYTES - 6));
+    let chain = |term: &str, sep: &str| {
+        let mut src = String::new();
+        for n in 0..MAX_COMPARISONS {
+            let next = if n == 0 { term.to_string() } else { format!("{sep}{term}") };
+            if src.len() + next.len() > MAX_BYTES {
+                break;
+            }
+            src.push_str(&next);
+        }
+        src
+    };
+    let wip = chain("status=wip", " OR ");
+    let mixed = chain(&format!("title='{}'", "\"".repeat(25)), "AND NOT ");
+    let pinned = chain("NOT(pinned=0)", "OR ");
+    for src in [backslashes, wip, mixed, pinned] {
+        assert!(src.len() <= MAX_BYTES, "{}", src.len());
+        let e = parse(&src).unwrap_or_else(|err| panic!("{src}: {err}"));
+        let text = e.to_string();
+        assert!(text.len() <= 2 * src.len() + 14 * e.comparisons(), "{} from {}", text.len(), src.len());
+        assert!(text.len() <= MAX_CANONICAL_BYTES);
+        check_valid(&s, &e);
+    }
+    // Over MAX_BYTES, only the canonical text itself: not the same query respaced.
+    let e = parse(&format!("title={}", "\\".repeat(MAX_BYTES - 6))).unwrap();
+    let text = e.to_string();
+    assert!(text.len() > MAX_BYTES);
+    let e = err(&format!(" {text}"));
+    assert_eq!(e.message, "query longer than 4096 bytes");
+    assert!(err(&"x".repeat(MAX_CANONICAL_BYTES + 1)).message.starts_with("query longer"));
+}
+
 // ---- compile and semantics --------------------------------------------------
 
 const ALL: [&str; 5] = ["t-1", "t-10", "t-11", "t-2", "t-3"];

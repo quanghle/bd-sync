@@ -171,9 +171,9 @@ issue to the one that replaces it.
 Refused, with nothing written: an issue that is its own duplicate; a CANONICAL
 that is closed as a duplicate itself (name its root instead) or a duplicate of
 ID; an ID that is closed already, unless it has this edge (then nothing
-changes); another type of edge between the two; open children or blockers on
-ID, unless --force; another actor's live claim on ID, unless --take-over; and
-a failed --if-* guard (exit 13).";
+changes); another type of edge between the two, either way; open children or
+blockers on ID, unless --force; another actor's live claim on ID, unless
+--take-over; and a failed --if-* guard (exit 13).";
 
 const DUPLICATE_EXAMPLES: &str = "\
 Examples:
@@ -192,9 +192,9 @@ points from the closed issue to the one that replaces it.
 Refused, with nothing written: an issue that supersedes itself; a NEWER that is
 closed as superseded itself (name its root instead) or superseded by ID; an ID
 that is closed already, unless it has this edge (then nothing changes); another
-type of edge between the two; open children or blockers on ID, unless --force;
-another actor's live claim on ID, unless --take-over; and a failed --if-*
-guard (exit 13).";
+type of edge between the two, either way; open children or blockers on ID,
+unless --force; another actor's live claim on ID, unless --take-over; and a
+failed --if-* guard (exit 13).";
 
 const SUPERSEDE_EXAMPLES: &str = "\
 Examples:

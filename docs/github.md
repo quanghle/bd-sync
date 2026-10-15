@@ -185,6 +185,13 @@ permission failure, a server error, a timeout or a cancellation stops the
 writes. What succeeded is still recorded, the rest is retried by the next
 run, and the command exits 1.
 
+A push GitHub accepts but answers without some of the fields sent (an
+assignee it will not assign, say) is reported as `partial`, not `pushed`:
+`! ID #N partial: FIELDS (GitHub did not apply FIELDS; the next push tries
+again)` in text, `"action": "partial"` and a `partial` count in `--json`.
+GitHub's side is recorded as synced and bd's is not, so the next push sends
+those fields again.
+
 ## Configuration
 
 | key | meaning |

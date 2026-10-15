@@ -98,7 +98,7 @@ impl WriteCtx<'_> {
     /// and `take_over` is not set; `id` is closed already without that edge;
     /// `target` has the same edge back to `id`, or is itself closed as a
     /// duplicate (or superseded), when the root is the one to name; an edge of
-    /// another type joins the two; or `id` has open children or blockers and
+    /// another type joins the two, in either direction; or `id` has open children or blockers and
     /// `force` is not set.
     pub fn close_as(
         &mut self,
@@ -136,11 +136,21 @@ impl WriteCtx<'_> {
         // `close_issue` checks again and records the override.
         self.check_claim_override(&old, opts.take_over)?;
 
-        if graph::load_edge(self.conn(), target, id)?.is_some_and(|e| e.dep_type == dep_type) {
-            return Err(Error::Refused(format!(
-                "{target} is already {} {id}; the relation would run both ways",
-                kind.verb()
-            )));
+        match graph::load_edge(self.conn(), target, id)? {
+            Some(e) if e.dep_type == dep_type => {
+                return Err(Error::Refused(format!(
+                    "{target} is already {} {id}; the relation would run both ways",
+                    kind.verb()
+                )));
+            }
+            // An edge of another type either way joins the two (the one from `id` is refused by `add_dependency`).
+            Some(e) => {
+                return Err(Error::Refused(format!(
+                    "{target} already depends on {id} via {}; remove that edge first",
+                    e.dep_type
+                )));
+            }
+            None => {}
         }
         if other.status == Status::Closed
             && let Some(root) =

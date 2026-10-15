@@ -608,6 +608,20 @@ impl WriteCtx<'_> {
         }
     }
 
+    /// Run `f` in a savepoint that is always rolled back: what it wrote (its
+    /// events included) is undone whatever it returns, so it can answer
+    /// "what would happen" without writing.
+    pub fn trial<T>(&mut self, f: impl FnOnce(&mut WriteCtx<'_>) -> Result<T>) -> Result<T> {
+        let (first_seq, events) = (self.first_seq, self.events);
+        self.tx.execute_batch("SAVEPOINT bd_trial")?;
+        let out = f(self);
+        // AUTOINCREMENT's counter rolls back too, so event seqs stay gapless.
+        self.tx.execute_batch("ROLLBACK TO bd_trial; RELEASE bd_trial")?;
+        self.first_seq = first_seq;
+        self.events = events;
+        out
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.tx
     }

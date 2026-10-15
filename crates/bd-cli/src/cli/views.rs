@@ -26,7 +26,8 @@ Every status is searched: the expression alone decides (status != closed
 leaves closed issues out). Limits: 4096 bytes, 128 comparisons, and nesting
 depth 32, where each NOT and each opening parenthesis counts one level. Errors
 give the column and point at it. --parse-only prints the parsed expression in
-canonical form (JSON with --json) without opening the workspace.";
+canonical form (JSON with --json) without opening the workspace; that text
+parses back to the same expression, and is accepted up to 10240 bytes.";
 
 const QUERY_EXAMPLES: &str = "\
 Examples:

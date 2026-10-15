@@ -953,6 +953,31 @@ fn failed_pushes_are_reported_and_aborts_record_what_succeeded() {
 }
 
 #[test]
+fn a_push_github_answers_without_some_fields_is_partial_and_retried() {
+    let mut w = ws();
+    w.fake.add(1, "Issue 1", |_| {});
+    w.run(Direction::Pull);
+    let id = w.by_ref(1).id;
+    w.edit(&id, IssuePatch { title: Some("Renamed".into()), ..Default::default() });
+    // GitHub accepts the PATCH and answers with the issue as it was: the title dropped.
+    let unchanged = w.fake.get(1);
+    w.fake.answer_with("PATCH repos/acme/app/issues/1", &[], unchanged);
+    let r = w.run(Direction::Push);
+    let partial = row(&r, 1);
+    assert_eq!(partial.action, "partial", "{:?}", r.results);
+    assert_eq!(partial.changed, ["title"]);
+    assert_eq!(partial.detail.as_deref(), Some("GitHub did not apply title; the next push tries again"));
+    assert_eq!((r.counts.get("partial"), r.counts.get("pushed")), (Some(&1), None));
+    let text = render(&r).text.join("\n");
+    assert!(text.contains(&format!("! {id} #1 partial: title (GitHub did not apply title")), "{text}");
+    // bd's side is left unstamped: the next push sends it again.
+    w.fake.take_log();
+    let r = w.run(Direction::Push);
+    assert_eq!(row(&r, 1).action, "partial");
+    assert_eq!(Fake::writes(&w.fake.take_log()).len(), 1);
+}
+
+#[test]
 fn pushed_comments_carry_markers_and_are_adopted_after_a_crash() {
     let mut w = ws();
     w.fake.add(7, "A", |_| {});

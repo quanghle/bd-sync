@@ -90,10 +90,16 @@ itself, ready once its last child closed, comes in normal queue order. The
 filters `-a`, `--unassigned`, `-t`, `-l` (all of the labels), `--parent` (only
 that subtree, with no fallback to the queue) and `--sort` (default
 `priority`) narrow the search as they do for `bd claim --next`, and `--ttl`
-sets the new lease. It claims nothing when every issue named was already
-closed, so a retried close does not claim a second issue. `--suggest-next`
-names the same issue without claiming it. Without one of the two modes, the
-filter flags and `--ttl` are refused (exit 2), as are both modes together.
+sets the new lease (default `lease.ttl`, as for `bd claim`). With
+`lease.auto_reclaim` on, leases expired past `lease.grace` are reclaimed
+first, as `bd claim --next` does. It claims nothing when every issue named was
+already closed, so a retried close does not claim a second issue.
+`--suggest-next` names the same issue without claiming it or writing
+anything: an issue held by a dead claim that `--claim-next` would reclaim is
+named as it stands (still held), and `bd claim` reclaims it. The filters and
+`--ttl` are checked before anything closes, so a bad one fails (exit 2) even
+when nothing would close. Without one of the two modes, the filter flags and
+`--ttl` are refused (exit 2), as are both modes together.
 With a mode, `--json` gives `{closed, next}`: `closed` is what `bd close`
 alone prints, and `next` is null or `{from, parent, issue, lease,
 reclaimed}` (`lease.token` is the new fencing token; `--suggest-next` has
@@ -130,7 +136,7 @@ twice (exit 2), a missing issue (3), another actor's live claim without
 failed `--if-revision`, `--if-status` or `--if-assignee` (13), and, each with
 exit 2, a Y that is itself closed as a duplicate (or superseded: the message
 names its root), an edge back from Y to X, another type of edge between the
-two, and an X that is closed already without that edge. An X closed already
+two in either direction, and an X that is closed already without that edge. An X closed already
 with that edge makes the command a no-op. See
 [dependency types](concepts.md#dependency-types) for the direction.
 
@@ -278,7 +284,11 @@ error: query: column 19: unknown field "bogus" (fields: status, priority, ...)
 in canonical form (keywords upper case, values quoted, parentheses only
 where the grouping needs them), or as a JSON tree with `--json`
 (`{"and": [...]}`, `{"or": [...]}`, `{"not": ...}`, and
-`{"field", "op", "value"}` with `null` for `none`).
+`{"field", "op", "value"}` with `null` for `none`). The canonical text
+parses back to the same expression. It can be longer than the query it came
+from (quotes, spaces, escapes, `wip` written `"in_progress"`), at most twice
+as long plus 14 bytes a comparison, so a query over 4096 bytes is accepted
+when it is exactly canonical text, up to 10240 bytes.
 
 ```bash
 bd query 'status = open AND (priority <= 1 OR label = urgent)'

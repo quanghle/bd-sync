@@ -482,9 +482,13 @@ second issue; `claim` of the issue it already holds fails with
 `already_claimed` naming its own actor (the holder may still `release` or
 `close` without the token, and claim again); `close` of a closed issue
 succeeds with `already_closed: true`, and with `claim_next` claims nothing
-more (`next_note: "nothing closed: not claiming"`): the claim the first call
-made is the actor's, listed with its token by `bd prime`. After a lost answer, `show` or
-`list` tells whether a write took effect. (`bd mcp` in a remote workspace
+more (`next_note: "nothing closed: not claiming"`). The claim the first call
+made is the actor's, but its token was in the lost answer, and no tool shows
+it again (`show` leaves lease tokens out): `list` with `status:
+["in_progress"]` and `assignee` set to the actor finds the issue, which the
+actor can `close` or `release` without the token, then `claim` again for a
+new one. After a lost answer, `show` or `list` tells whether a write took
+effect. (`bd mcp` in a remote workspace
 forwards each call with its own request id, so its own retries to the
 server are safe.)
 

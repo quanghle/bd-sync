@@ -79,6 +79,7 @@ const UPSTREAM_KEYS: &[&str] = &[
     "dependency_count",
     "dependent_count",
     "comment_count",
+    "comments_omitted",
     "parent",
     // exportIssueRecord
     "_type",
@@ -159,6 +160,7 @@ const DERIVED: &[&str] = &[
     "dependency_count",
     "dependent_count",
     "comment_count",
+    "comments_omitted",
     "lease_expires_at",
     "heartbeat_at",
     "lease_granted_node",

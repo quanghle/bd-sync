@@ -677,6 +677,16 @@ fn show_why_says_whether_an_issue_is_ready() {
         text.contains("\n\nNot ready:\n  - status is in_progress\n  - claimed by tester (lease expires "),
         "{text}"
     );
+
+    // A gate is never ready work, whatever its state.
+    let gate = ws.id(&["gate", "create", "-t", "timer", "--timeout", "1h", "--blocks", &open]);
+    let v = ws.json(&["show", &gate, "--why"]);
+    assert_eq!(v["why"]["ready"], false);
+    assert!(reason_kinds(&v["why"]).contains(&"excluded_type".to_string()), "{v}");
+    let excluded = v["why"]["reasons"].as_array().unwrap().iter().find(|r| r["kind"] == "excluded_type").unwrap();
+    assert_eq!(excluded["issue_type"], "gate");
+    let text = ws.ok(&["show", &gate, "--why"]);
+    assert!(text.contains(&format!("a gate: it opens through bd gate check or bd gate resolve {gate}")), "{text}");
 }
 
 #[test]
@@ -4225,6 +4235,28 @@ fn close_claims_the_next_issue_siblings_first() {
 }
 
 #[test]
+fn close_suggest_next_names_what_claim_next_would() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "lease.grace", "0s"]);
+    let dead = ws.id(&["create", "Held by a dead claim", "-p", "0"]);
+    ws.id(&["create", "Lower", "-p", "2"]);
+    let a = ws.id(&["create", "A", "-p", "3"]);
+    let b = ws.id(&["create", "B", "-p", "3"]);
+    ws.json_as("crashy", &["claim", &dead, "--ttl", "1s"]);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    // The dead claim's issue, which --claim-next reclaims first; nothing is written.
+    let v = ws.json(&["close", &a, "--suggest-next"]);
+    assert_eq!(v["next"]["issue"]["id"], dead.as_str(), "{v}");
+    assert_eq!(v["next"]["issue"]["assignee"], "crashy", "as stored: {v}");
+    assert_eq!(ws.json(&["show", &dead])["assignee"], "crashy");
+    let v = ws.json(&["close", &b, "--claim-next"]);
+    assert_eq!(v["next"]["issue"]["id"], dead.as_str(), "{v}");
+    assert_eq!(v["next"]["issue"]["assignee"], "tester", "{v}");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
 fn close_claim_next_refuses_what_makes_no_sense() {
     let ws = Ws::new();
     let a = ws.id(&["create", "A"]);
@@ -4238,10 +4270,16 @@ fn close_claim_next_refuses_what_makes_no_sense() {
         &["close", &a, "-a", "ann"],
         &["close", &a, "--ttl", "5m"],
         &["close", &a, "--suggest-next", "--ttl", "5m"],
+        &["close", &a, "--claim-next", "--ttl", "garbage"],
+        &["close", &a, "--claim-next", "--ttl", "0s"],
     ] {
         assert_eq!(ws.code_as("tester", args), 2, "{args:?}");
     }
     assert_eq!(ws.json(&["show", &a])["status"], "open", "nothing closed");
+    // A bad --ttl fails even when the close itself would change nothing.
+    let done = ws.id(&["create", "Done"]);
+    ws.ok(&["close", &done]);
+    assert_eq!(ws.code_as("tester", &["close", &done, "--claim-next", "--ttl", "garbage"]), 2);
 
     // Another actor's live claim: refused (exit 4), and nothing is claimed.
     ws.id(&["create", "B"]);

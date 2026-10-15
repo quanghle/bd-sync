@@ -882,6 +882,8 @@ fn apply(
             row.action = "pushed".into();
             row.changed = it.pushed_fields.clone();
             if !it.unapplied.is_empty() {
+                // Sent, but GitHub's answer dropped some fields: bd's side stays unstamped.
+                row.action = "partial".into();
                 row.detail =
                     Some(format!("GitHub did not apply {}; the next push tries again", it.unapplied.join(", ")));
             }
@@ -1069,7 +1071,7 @@ fn icon(action: &str) -> &'static str {
         "pushed" | "would push" => "↑",
         "linked" => "⇄",
         "comments" | "recorded" | "would sync comments" => "…",
-        "conflict" | "error" | "stale" | "gone" => "!",
+        "conflict" | "error" | "stale" | "gone" | "partial" => "!",
         "deferred" | "skipped" => "-",
         a if a.starts_with("would link") => "⇄",
         _ => "=",

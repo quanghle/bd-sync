@@ -113,7 +113,8 @@ pub(crate) fn is_reclaimable(conn: &Connection, lease: &Lease, now: Timestamp) -
     Ok(lease.expires_at <= now.minus(config::lease_grace(conn)?))
 }
 
-fn validate_ttl(ttl: Duration) -> Result<Duration> {
+/// A requested lease duration, refused when under a second.
+pub fn validate_ttl(ttl: Duration) -> Result<Duration> {
     if ttl < Duration::from_secs(1) {
         return Err(Error::invalid("lease ttl must be at least 1s"));
     }
@@ -351,6 +352,23 @@ impl WriteCtx<'_> {
             }
         }
         Ok(head(query)?.map(|issue| (issue, NextFrom::Queue)))
+    }
+
+    /// The issue [`Self::claim_next_near`] would claim, without claiming it
+    /// and without writing anything: with `lease.auto_reclaim` on, the
+    /// expired leases it would reclaim first are reclaimed in a savepoint
+    /// that is rolled back ([`WriteCtx::trial`]), so an issue held by a dead
+    /// claim can be the one named. The issue is returned as it is stored
+    /// (still held by that dead claim, which `bd claim` reclaims).
+    pub fn suggest_next(&mut self, query: &ReadyQuery, near: Option<&str>) -> Result<Option<(Issue, NextFrom)>> {
+        if !config::auto_reclaim(self.conn())? {
+            return self.next_ready(query, near);
+        }
+        let found = self.trial(|tx| {
+            tx.reclaim_expired(&ReclaimOptions::default())?;
+            tx.next_ready(query, near)
+        })?;
+        found.map(|(issue, from)| Ok((issues::require(self.conn(), &issue.id)?, from))).transpose()
     }
 
     /// [`Self::claim_next`], searching near `near` first as

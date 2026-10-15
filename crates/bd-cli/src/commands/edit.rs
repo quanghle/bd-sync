@@ -60,6 +60,13 @@ fn create_temp(id: &str, field: &str, text: &str) -> Result<PathBuf> {
 /// the edited text would go nowhere. A caught signal is reset to its default
 /// by exec, so the editor keeps its own handling. The signals are never read,
 /// only absorbed.
+///
+/// Dropping it does not give the signals back their default handling: tokio
+/// (signal-hook-registry) never unregisters its process-wide handler, so the
+/// rest of the process goes on ignoring Ctrl-C and Ctrl-\. That is why only
+/// `bd edit` absorbs, and only around the editor: what follows it is short (read
+/// the file, one write transaction, print) and the process then exits. Nothing
+/// long-running may follow an edit in the same process.
 struct Absorbing {
     _runtime: tokio::runtime::Runtime,
     #[cfg(unix)]
@@ -107,7 +114,8 @@ fn run_editor(editor: &str, path: &Path) -> Result<()> {
         }
         cmd.arg(path);
     }
-    // Registered before the spawn, so no Ctrl-C finds bd without a handler.
+    // Registered before the spawn, so no Ctrl-C finds bd without a handler;
+    // the handler outlives this (see `Absorbing`).
     let _absorbing = absorb_interrupts();
     let status = cmd
         .spawn()

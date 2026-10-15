@@ -35,7 +35,7 @@ Every field of an issue line is mapped, kept or dropped:
 |---|---|
 | mapped to a bd column, label, edge, comment or gate | `id`, `title`, `description`, `design`, `acceptance_criteria`, `notes`, `status`, `priority`, `issue_type`, `assignee`, `created_by`, `external_ref`, `estimated_minutes`, `metadata`, the timestamps (`created_at`, `updated_at`, `started_at`, `closed_at`, `due_at`, `defer_until`), `close_reason`, `labels`, `dependencies`, `comments`, `ephemeral` (and the old `wisp`), `parent` when a parent-child edge backs it, and `await_type`, `await_id`, `timeout` and `waiters` when they form a gate |
 | kept in `metadata.beads.<field>` | every other field: `owner`, `spec_id`, `closed_by_session`, `source_system`, `sender`, `mol_type`, `wisp_type`, `work_type`, the compaction fields, and any key bd does not know. A dependency's `thread_id` is kept in the edge's metadata as `beads.thread_id` |
-| dropped | derived and node-local values bd computes itself: `is_blocked`, `revision`, `dependency_count`, `dependent_count`, `comment_count` and the lease fields; also every field of a tombstone or proto (template) line, which is skipped |
+| dropped | derived and node-local values bd computes itself: `is_blocked`, `revision`, `dependency_count`, `dependent_count`, `comment_count`, `comments_omitted` and the lease fields; also every field of a tombstone or proto (template) line, which is skipped |
 
 `owner` is kept rather than mapped: bd's `assignee` reserves claims (only
 that actor may claim), which beads' owner, an attribution, does not mean,

@@ -4,7 +4,9 @@
 use chrono::NaiveDate;
 
 use super::lex::{Tok, Token, lex};
-use super::{Comparison, Expr, Field, MAX_BYTES, MAX_COMPARISONS, MAX_DEPTH, Op, ParseError, Value};
+use super::{
+    Comparison, Expr, Field, MAX_BYTES, MAX_CANONICAL_BYTES, MAX_COMPARISONS, MAX_DEPTH, Op, ParseError, Value,
+};
 use crate::model::Status;
 use crate::time::{Timestamp, local_day, parse_filter_time};
 
@@ -12,6 +14,14 @@ use crate::time::{Timestamp, local_day, parse_filter_time};
 /// fault (one past the end when more was expected).
 pub fn parse(src: &str) -> Result<Expr, ParseError> {
     if src.len() > MAX_BYTES {
+        // Canonical text may be longer than the query it was printed from:
+        // accepted up to MAX_CANONICAL_BYTES, when it is exactly that text.
+        if src.len() <= MAX_CANONICAL_BYTES
+            && let Ok(e) = parse_unbounded(src)
+            && e.to_string() == src
+        {
+            return Ok(e);
+        }
         // The first character that does not fit in MAX_BYTES.
         let mut column = 1;
         for (n, (at, c)) in src.char_indices().enumerate() {
@@ -22,6 +32,11 @@ pub fn parse(src: &str) -> Result<Expr, ParseError> {
         }
         return Err(ParseError::new(column, format!("query longer than {MAX_BYTES} bytes")));
     }
+    parse_unbounded(src)
+}
+
+/// [`parse`] without the length limit; the caller bounds `src`.
+fn parse_unbounded(src: &str) -> Result<Expr, ParseError> {
     let toks = lex(src)?;
     let end = src.chars().count() + 1;
     if toks.is_empty() {

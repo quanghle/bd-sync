@@ -450,6 +450,7 @@ fn run_the_commands(ws: &mut Ws) {
         tx.claim_next_near(&ReadyQuery::default(), near.as_deref(), &ClaimOptions::default())
     });
     ws.write("bot", agent(), |tx| tx.next_ready(&ReadyQuery::default(), Some(&family)));
+    ws.write("bot", agent(), |tx| tx.suggest_next(&ReadyQuery::default(), Some(&family)));
     ws.write("bot", agent(), |tx| tx.claim(&other, &ClaimOptions::default()));
     ws.clock.advance(Duration::from_secs(3600));
     ws.write("bd-serve", None, |tx| tx.reclaim_expired(&ReclaimOptions { dry_run: true, ..Default::default() }));

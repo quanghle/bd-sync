@@ -56,6 +56,12 @@ wait on through `waits-for`: it may close before the children it spawned.
 | `related`, `discovered-from`, `tracks`, `caused-by`, `validates`, `supersedes`, `duplicates`, `replies-to` | informational only |
 | custom (`[a-z][a-z0-9-]{0,31}`) | informational only |
 
+Only the first four affect readiness. Cycles of `blocks`,
+`conditional-blocks` and `parent-child` edges are refused when the edge is
+written, with the cycle's path in the error; `bd dep cycles` checks a whole
+workspace. `bd dep list` and `bd dep tree` show edges (`--direction`,
+`--max-depth`), and `bd blocked` lists blocked issues with their blockers.
+
 `duplicates` and `supersedes` edges point from the closed issue to the one
 that replaces it, as in beads: `X duplicates Y` means X is a duplicate of Y,
 and `X supersedes Y` means X is superseded by Y. `bd duplicate X --of Y` and
@@ -63,12 +69,6 @@ and `X supersedes Y` means X is superseded by Y. `bd duplicate X --of Y` and
 `duplicate of Y` or `superseded by Y`) in one transaction, leaving everything
 else of X and Y as it is; `bd dep add X Y -t duplicates` writes the same edge
 without closing.
-
-Only the first four affect readiness. Cycles of `blocks`,
-`conditional-blocks` and `parent-child` edges are refused when the edge is
-written, with the cycle's path in the error; `bd dep cycles` checks a whole
-workspace. `bd dep list` and `bd dep tree` show edges (`--direction`,
-`--max-depth`), and `bd blocked` lists blocked issues with their blockers.
 
 ## Ready work
 

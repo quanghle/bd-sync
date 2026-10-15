@@ -15,7 +15,9 @@
 //! with `= none`), so `!=` and `NOT` are exact complements.
 //!
 //! The limits ([`MAX_BYTES`], [`MAX_DEPTH`], [`MAX_COMPARISONS`]) bound the
-//! parser's recursion and the size and height of the compiled SQL.
+//! parser's recursion and the size and height of the compiled SQL; canonical
+//! text, which can be longer than the query it came from, is accepted up to
+//! [`MAX_CANONICAL_BYTES`].
 
 mod compile;
 mod lex;
@@ -37,6 +39,21 @@ pub use parse::parse;
 /// The longest query accepted, in bytes. With [`MAX_COMPARISONS`] it bounds
 /// the work of lexing and parsing, and the SQL text compiled from it.
 pub const MAX_BYTES: usize = 4096;
+
+/// The longest canonical text ([`Expr`]'s `Display`) accepted: a query
+/// longer than [`MAX_BYTES`] parses only if it is exactly the canonical text
+/// of what it parses to, so `parse(&e.to_string()) == e` holds for every
+/// accepted `e` (the round trip `bd query --parse-only` promises).
+///
+/// The canonical text of an accepted query is at most 2 × [`MAX_BYTES`] +
+/// 14 × [`MAX_COMPARISONS`] bytes, below this: each byte of the source
+/// becomes at most two (a value's `"` and `\` are escaped, a tight `AND`,
+/// `OR` or `NOT` gains spaces; parentheses are only ever dropped), and each
+/// comparison gains at most 14 more (spaces around its operator, the quotes,
+/// and a normalized value longer than the one written: `wip` is
+/// `"in_progress"`, `0` is `"false"`). Nesting and comparisons are those of
+/// the source, so the SQL bounds of [`MAX_DEPTH`] hold unchanged.
+pub const MAX_CANONICAL_BYTES: usize = 2 * MAX_BYTES + 16 * MAX_COMPARISONS;
 
 /// The deepest nesting accepted: every `NOT` and every `(` adds one level
 /// for what it encloses (`NOT (a)` is 2, `NOT NOT NOT a` is 3). The parser

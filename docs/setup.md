@@ -146,6 +146,13 @@ This repository is also a Claude Code plugin marketplace
 /plugin install bd@bd
 ```
 
+Claude Code 2.1.275 and later also take it in one step, adding the
+marketplace as they install:
+
+```text
+/plugin install bd --marketplace quanghle/bd-sync
+```
+
 From a shell: `claude plugin marketplace add quanghle/bd-sync`, then
 `claude plugin install bd@bd`. The plugin runs the same hooks as
 `bd setup claude` writes (SessionStart, SubagentStart and PreToolUse, all

@@ -1,6 +1,6 @@
 # Agent Instructions
 
-This repository tracks its work with **bd**, the Rust coordination engine built here. Issues live in `.bd/bd.db` (local SQLite in WAL mode, gitignored). Use bd for all task tracking: no markdown TODO lists, no ad hoc memory files.
+This repository tracks its work with **bd**, the Rust coordination engine built here. Issues live on `https://bd.quangle.net/w/bd-sync`, selected by `.bd/remote.toml`. That file contains the workspace URL and is safe to commit; access tokens are stored separately by `bd remote login` in the user's private credentials file. Do not recreate a local database or export JSONL to share issues. Use bd for all task tracking: no markdown TODO lists, no ad hoc memory files.
 
 Run `bd prime` for current context: your claims, ready work, and project memories. Session-start hooks run it automatically in Claude Code and Copilot CLI.
 

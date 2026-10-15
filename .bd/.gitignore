@@ -1,5 +1,6 @@
 # SQLite database and WAL files are local state.
-# Share issues with `bd export -o .bd/issues.jsonl`.
+# Issues are shared through the remote server; ad hoc exports are local state.
+issues.jsonl
 bd.db
 bd.db-wal
 bd.db-shm

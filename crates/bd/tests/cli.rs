@@ -6,6 +6,8 @@ use std::process::{Command, Output};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod piped;
+
 #[cfg(target_os = "linux")]
 mod pty;
 
@@ -3807,15 +3809,9 @@ fn agents_watch_pulls_a_local_workspaces_changes() {
 
 /// Send `messages` to `bd mcp` (one per line, then end of input); its answers.
 fn mcp_session(mut cmd: Command, messages: &[Value]) -> Vec<Value> {
-    use std::io::Write;
     use std::process::Stdio;
-    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    for m in messages {
-        writeln!(stdin, "{m}").unwrap();
-    }
-    drop(stdin);
-    let out = child.wait_with_output().unwrap();
+    let input = messages.iter().map(|m| format!("{m}\n")).collect::<String>();
+    let out = piped::output_with_input(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()), input);
     assert!(out.status.success(), "bd mcp failed: {}", String::from_utf8_lossy(&out.stderr));
     String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect()
 }
@@ -3833,6 +3829,30 @@ fn mcp_result(answer: &Value) -> (bool, Value) {
     let result = &answer["result"];
     assert_eq!(result["resultType"], "complete", "{answer}");
     (result["isError"] == true, serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap())
+}
+
+/// Each side alone exceeds every platform's pipe buffer (over 256 KiB of requests and of
+/// answers), so writing all the input before draining the output would hang.
+#[test]
+fn mcp_session_drains_answers_while_it_writes() {
+    const N: i64 = 1500;
+    let ws = Ws::new();
+    ws.ok(&["create", "First", "-p", "1"]);
+    let mut cmd = Ws::cmd_in(ws.dir.path(), "", &["mcp"]);
+    cmd.env_remove("BD_ACTOR");
+    let messages: Vec<Value> = (1..=N).map(|i| mcp_call(i, "show", serde_json::json!({ "ids": ["t-1"] }))).collect();
+    let answers = mcp_session(cmd, &messages);
+    assert_eq!(answers.len(), N as usize);
+    assert_eq!(answers[N as usize - 1]["id"], N);
+}
+
+#[test]
+fn piped_input_survives_a_command_that_never_reads_it() {
+    use std::process::Stdio;
+    let mut cmd = Ws::cmd_in(std::path::Path::new("."), "", &["version"]);
+    let out = piped::output_with_input(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()), vec![b'x'; 4 << 20]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!out.stdout.is_empty());
 }
 
 #[test]
@@ -4019,10 +4039,8 @@ fn rename_prefix_moves_ids_claims_and_references() {
 impl Ws {
     fn with_stdin(&self, args: &[&str], input: &str) -> Output {
         let mut c = Ws::cmd_in(self.dir.path(), "tester", args);
-        c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
-        let mut child = c.spawn().unwrap();
-        std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
-        child.wait_with_output().unwrap()
+        c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        piped::output_with_input(&mut c, input)
     }
 
     /// The seq of the last event of `id` with `op`.

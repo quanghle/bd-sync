@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+mod piped;
+
 #[cfg(target_os = "linux")]
 #[allow(dead_code, reason = "tests/cli.rs uses all of the helper, and tests the helper itself")]
 mod pty;
@@ -230,10 +232,7 @@ impl Client {
     }
 
     fn with_stdin(&self, args: &[&str], input: &str) -> Output {
-        let mut child =
-            self.cmd(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
-        child.wait_with_output().unwrap()
+        piped::output_with_input(self.cmd(args).stdout(Stdio::piped()).stderr(Stdio::piped()), input)
     }
 }
 
@@ -705,9 +704,7 @@ fn checkout_dir() -> tempfile::TempDir {
 
 /// Run `cmd` with `input` on its stdin; returns its output.
 fn with_input(mut cmd: Command, input: &str) -> Output {
-    let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
-    child.wait_with_output().unwrap()
+    piped::output_with_input(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()), input)
 }
 
 /// `bd remote login --no-verify` in `dir`, for its checkout's server and CA, saving `token` under `config`
@@ -2931,15 +2928,10 @@ fn a_gate_check_opens_due_gates_beside_one_it_may_not() {
 fn seed_large(server: &Server, n: usize, kib: usize) {
     let text = "Ünïcödé 日本語 with \"quotes\", a tab\tand a backslash \\ in it. ".repeat(kib * 16);
     let script: String = (0..n).map(|i| format!("create 'Issue {i}' -d '{text}'\n")).collect();
-    let mut child = bd(&server.root.path().join("proj"))
-        .arg("batch")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
+    let out = piped::output_with_input(
+        bd(&server.root.path().join("proj")).arg("batch").stdout(Stdio::null()).stderr(Stdio::piped()),
+        script,
+    );
     assert!(out.status.success(), "seeding: {}", String::from_utf8_lossy(&out.stderr));
 }
 

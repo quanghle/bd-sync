@@ -1,0 +1,39 @@
+# Prepares the Copilot coding agent's environment on github.com: installs the bd CLI so the
+# agent tracks its work in bd as AGENTS.md describes. The agent reaches the workspace through
+# BD_REMOTE (a variable) and BD_TOKEN (a secret) of the repository's `copilot` environment, and
+# needs the bd server's host on the coding agent's firewall allowlist.
+name: Copilot Setup Steps
+
+# Runs on its own when this file changes, so a broken setup shows up before an agent session.
+on:
+  workflow_dispatch:
+  push:
+    paths: [.github/workflows/copilot-setup-steps.yml]
+  pull_request:
+    paths: [.github/workflows/copilot-setup-steps.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  # The coding agent runs only a job of this name.
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      attestations: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The checkout's installer: it checks the release's SHA256SUMS and, with gh logged in,
+      # its build attestation. /usr/local/bin is on the agent's PATH.
+      - name: Install bd
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BD_ATTESTATION: require
+        run: |
+          sh scripts/install.sh --dir "$RUNNER_TEMP/bd"
+          sudo install -m 0755 "$RUNNER_TEMP/bd/bd" /usr/local/bin/bd
+          bd --version

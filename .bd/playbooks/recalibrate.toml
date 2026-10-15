@@ -1,0 +1,65 @@
+# Recalibrate how complexity is judged and which model and effort each role gets, from the evidence of the last change runs.
+# Started by the last step of a change run once enough runs have a confirmed score (node .github/scripts/recalibrate-due.mjs --start).
+# Preview with: bd playbook plan recalibrate --var count=10 --var runs=a,b
+description = "Recalibrate from the change runs scored since the last recalibration: report, propose, a person approves, apply"
+title = "Recalibrate from {{count}} change runs"
+
+[vars.count]
+description = "How many change runs this recalibration covers"
+required = true
+
+[vars.runs]
+description = "The covered change runs, comma separated (each has its recalibrated metadata pointing here)"
+required = true
+
+[vars.approver]
+description = "Who approves the proposed changes"
+default = "Quang Le"
+
+[[steps]]
+id = "report"
+title = "Report on {{count}} runs"
+description = """
+Run `node .github/scripts/calibrate.mjs --json` and `node .github/scripts/reviewer-catch.mjs --json` and \
+read them for the covered runs ({{runs}}), against the rest: estimate against judged and confirmed \
+complexity per band, the judge's gap from the person's score, findings per run, cost and agent time by \
+role, model and effort, and each reviewer model's catch rate (cells under 5 pairs are thin: no conclusion). \
+Comment the findings on this run (`bd comment add <run> ...`): numbers, not impressions."""
+acceptance_criteria = "Evidence: a comment on the run with the figures read from both reports, and which cells are too thin to act on."
+
+[[steps]]
+id = "propose"
+title = "Propose changes from {{count}} runs"
+type = "decision"
+needs = ["report"]
+description = """
+Propose what the evidence supports, and only that: edits to the complexity anchors in .bd/rubric.md, to \
+the model and effort rules in AGENTS.md (Delegating to agents) or to the defaults of the \
+plan-implement-review and score-issue extensions. Each proposal names the figures behind it, the \
+exact text or value to change and the expected effect. 'No change' is a result: say which figures \
+show nothing to act on. Put it in this step's design field (`bd update <step> --design "..."`)."""
+acceptance_criteria = "Evidence: the design field lists each proposed change with its figures and exact edit, or says no change and why."
+
+[[steps]]
+id = "approval"
+title = "Approve the proposal"
+type = "decision"
+needs = ["propose"]
+description = "Record the approval of the proposal, with any change the approver asked for."
+acceptance_criteria = "Evidence: the approver, and what was approved, changed or rejected, in the close reason."
+
+[steps.gate]
+type = "human"
+title = "Approve the recalibration of {{count}} runs"
+assignee = "{{approver}}"
+description = "Read the propose step's design field, then `bd gate resolve` this gate."
+
+[[steps]]
+id = "apply"
+title = "Apply the approved changes"
+needs = ["approval"]
+description = """
+Make exactly the approved edits (nothing was approved: close this step saying so). Run \
+`node --test '.github/scripts/*.spec.mjs'` when a script or extension changed, and `bd playbook plan` \
+on each playbook that changed."""
+acceptance_criteria = "Evidence: the close reason names the files changed and the test result, or that nothing was approved."

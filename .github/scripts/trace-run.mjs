@@ -1,27 +1,28 @@
 #!/usr/bin/env node
-// Which agents did each step of a bd playbook run, with which model and effort, from Claude Code transcripts.
+// Which agents did each step of a bd playbook run, with which model and effort, from Copilot CLI session logs.
 //
-//   node .claude/scripts/trace-run.mjs <run> [--root <checkout>] [--projects <dir>] [--actor <name>] [--write] [--summary]
+//   node .github/scripts/trace-run.mjs <run> [--root <checkout>] [--sessions <dir>] [--actor <name>] [--write] [--summary]
 //
-// Every agent actor in the run's bd history (<name>/claude-<8 hex>, or a subagent's <name>/claude-<8 hex>.agent-<id>)
-// is a Claude Code session whose id ends with those 8 hex digits. The session's own thread, its subagents and its workflow agents each keep a transcript; every model
-// request in them goes to the first step of the run closed at or after it. Requests before the run was created or after
-// its last closed step are left out; an issue without steps is its own only step. Only labels (an agent's description or
-// workflow label, at most 80 characters), model ids, effort, token counts and times are read out: transcript content
-// (prompts, tool output, thinking) never reaches the result, which --write stores as the run's work metadata.
-// It also records times: each agent's active span per step (its first request to the end of its last), each step's elapsed
-// time (from its claim or the previous step's close, whichever is earlier, to its close), gate waits (armed to resolved)
-// and the human wait at human gates. Request end times are approximate: subagent transcripts record no response stop, so
-// the last entry written for a request stands in for its end.
+// Every agent actor in the run's bd history (<name>/copilot-<8 hex>, or a BD_SESSION sub-actor's <name>/copilot-<8 hex>.<name>)
+// is a Copilot CLI session whose id ends with those 8 hex digits. Its events.jsonl holds the session's own thread, its
+// subagents and its workflow agents; every model request in it goes to the first step of the run closed at or after it.
+// Requests before the run was created or after its last closed step are left out; an issue without steps is its own only
+// step. Only labels (an agent's display name or workflow label, at most 80 characters), model ids, effort, token counts,
+// AI credits and times are read out: prompts, tool output and reasoning never reach the result, which --write stores as
+// the run's work metadata.
+// It also records times: each agent's active span per step (its first request's start to the end of its last), each step's
+// elapsed time (from its claim or the previous step's close, whichever is earlier, to its close), gate waits (armed to
+// resolved) and the human wait at human gates.
 // It prints the result as JSON, or with --summary as a short list of who did what for a comment.
 import { execFileSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const SESSION_SUFFIX = /\/claude-([0-9a-f]{8})(?:\.agent-[0-9a-z]+)?$/
+const SESSION_SUFFIX = /\/copilot-([0-9a-f]{8})(?:\.[0-9a-z-]+)*$/
 const LABEL_MAX = 80
+const WORKFLOW_NOTE = /Workflow "([^"]+)" run ([0-9a-f-]{36})/
 
 const label = (s) => (s.length > LABEL_MAX ? `${s.slice(0, LABEL_MAX - 1)}…` : s)
 export const readJson = (file) => {
@@ -31,11 +32,11 @@ export const readJson = (file) => {
     return null
   }
 }
-export const readJsonl = (file) =>
+export const readJsonl = (file, keep = () => true) =>
   readFileSync(file, 'utf8')
     .split('\n')
     .flatMap((line) => {
-      if (!line) return []
+      if (!line || !keep(line)) return []
       try {
         return [JSON.parse(line)]
       } catch {
@@ -47,81 +48,84 @@ const list = (dir) => (existsSync(dir) ? readdirSync(dir) : [])
 /** The 8 hex digits of an agent actor's session, or null for a person or any other actor. */
 export const sessionSuffix = (actor) => SESSION_SUFFIX.exec(actor)?.[1] ?? null
 
-/** Sessions whose id ends with the suffix, in any project under projectsDir. */
-export function findSessions(projectsDir, suffix) {
-  return list(projectsDir).flatMap((project) =>
-    list(join(projectsDir, project))
-      .filter((f) => f.endsWith(`${suffix}.jsonl`))
-      .map((f) => ({ dir: join(projectsDir, project), session: f.slice(0, -'.jsonl'.length) })),
-  )
+/** Sessions under sessionsDir whose id ends with the suffix and that have an event log. */
+export function findSessions(sessionsDir, suffix) {
+  return list(sessionsDir)
+    .filter((d) => d.endsWith(suffix) && existsSync(join(sessionsDir, d, 'events.jsonl')))
+    .map((session) => ({ dir: sessionsDir, session }))
+}
+
+const EVENT_TYPES = ['"type":"session.usage_record"', '"type":"subagent.started"', '"type":"subagent.configured"', 'system.notification']
+
+/**
+ * The subagents a session started, from its events: { agents: Map agentId -> { agentName, agentDisplayName (a workflow
+ * agent's label), workflowRunId, model, effort }, workflows: Map workflow run id -> workflow name (from its completion
+ * notice) }.
+ */
+export function subagentsOf(events) {
+  const agents = new Map()
+  const workflows = new Map()
+  for (const e of events) {
+    if (e.type === 'system.notification') {
+      const m = WORKFLOW_NOTE.exec(e.data?.content ?? '')
+      if (m) workflows.set(m[2], m[1])
+    } else if (e.type === 'subagent.started' && e.agentId) {
+      agents.set(e.agentId, { ...agents.get(e.agentId), ...e.data })
+    } else if (e.type === 'subagent.configured' && e.agentId) {
+      agents.set(e.agentId, { ...agents.get(e.agentId), effort: e.data?.reasoningEffort })
+    }
+  }
+  return { agents, workflows }
 }
 
 /**
- * One model request per API request id: model, effort (the response's own, else the request that preceded it), token
- * usage, its start (ts, the first entry) and end (the latest entry). Input and cache tokens are known when a response
- * starts; output only once it ends (an entry with a stop_reason), which subagent transcripts don't record, so final says
- * whether usage.output_tokens is the real count. For the same reason end is approximate: without a stop entry, the last
- * entry written (the last content block) stands in for the end of the response.
+ * A session's model requests, one per API call (usage record), with the agent that made it. Each: id, model, effort,
+ * tokens (input without its cache parts, output, cache_read, cache_write, nano_aiu: the AI credits it cost, in
+ * billionths), ts (its start: the record's time less its duration), end (the record's time), owned (the log is the
+ * session that made it; a fork or resume copies its parent's records), and the agent's kind and label: 'main', or a
+ * subagent's, or a workflow agent's ('<workflow>:<label>', the workflow from its completion notice, else 'workflow').
  */
-export function requestsOf(entries) {
-  const byId = new Map()
-  let effort = 'unknown'
-  for (const e of entries) {
-    if (e.type === 'api-request') effort = e.params?.output_config?.effort ?? effort
-    if (e.type !== 'assistant' || !e.message?.usage || !e.timestamp) continue
-    const model = e.message.model
-    if (!model || model.startsWith('<')) continue
-    // A response is written as several entries (one per content block); keep the first time and the final usage.
-    const id = e.requestId ?? e.message.id ?? `${e.timestamp}:${byId.size}`
-    const prev = byId.get(id)
-    const final = Boolean(e.message.stop_reason)
-    const end = prev && prev.end > e.timestamp ? prev.end : e.timestamp
-    if (prev?.final && !final) {
-      prev.end = end
-      continue
-    }
-    byId.set(id, { id, ts: prev?.ts ?? e.timestamp, end, model, effort: prev?.effort ?? e.effort ?? effort, usage: e.message.usage, final })
+export function requestsOf(events, session = null) {
+  const { agents, workflows } = subagentsOf(events)
+  const labelOf = (id) => {
+    const a = agents.get(id)
+    if (!a) return { kind: 'subagent', label: label(id) }
+    const name = a.agentDisplayName ?? a.agentDescription ?? a.agentName ?? id
+    if (a.workflowRunId) return { kind: 'workflow', label: label(`${workflows.get(a.workflowRunId) ?? 'workflow'}:${name}`) }
+    return { kind: 'subagent', label: label([a.agentName, name].filter((x, i, all) => x && all.indexOf(x) === i).join(': ')) }
   }
-  return [...byId.values()]
+  const out = []
+  for (const e of events) {
+    const u = e.type === 'session.usage_record' ? e.data?.usage : null
+    if (!u?.model || !e.timestamp) continue
+    const end = Date.parse(e.timestamp)
+    if (!Number.isFinite(end)) continue
+    const cache_read = u.cacheReadTokens ?? 0
+    const cache_write = u.cacheWriteTokens ?? 0
+    const who = e.agentId ? labelOf(e.agentId) : { kind: 'main', label: 'main' }
+    out.push({
+      id: u.apiCallId ?? u.accounting?.usageId ?? e.id,
+      ts: new Date(end - (u.duration ?? 0)).toISOString(),
+      end: e.timestamp,
+      model: u.model,
+      effort: u.reasoningEffort ?? agents.get(e.agentId)?.effort ?? 'unknown',
+      tokens: { input: Math.max(0, (u.inputTokens ?? 0) - cache_read - cache_write), output: u.outputTokens ?? 0, cache_read, cache_write, nano_aiu: u.copilotUsage?.totalNanoAiu ?? 0 },
+      owned: !session || !u.accounting?.sourceSessionId || u.accounting.sourceSessionId === session,
+      ...who,
+    })
+  }
+  return out
 }
 
-/** Every transcript of a session: its own thread, its subagents and its workflow agents, with a label for each. */
-export function sessionSources(dir, session) {
-  const root = join(dir, session)
-  const sources = [{ file: join(dir, `${session}.jsonl`), kind: 'main', label: 'main' }]
-  const sub = join(root, 'subagents')
-  for (const f of list(sub).filter((f) => /^agent-[\w-]+\.jsonl$/.test(f))) {
-    const meta = readJson(join(sub, f.replace(/\.jsonl$/, '.meta.json'))) ?? {}
-    sources.push({ file: join(sub, f), kind: 'subagent', label: label([meta.agentType, meta.description].filter(Boolean).join(': ') || f) })
-  }
-  const wfs = join(sub, 'workflows')
-  for (const wf of list(wfs)) {
-    const name = readJson(join(root, 'workflows', `${wf}.json`))?.workflowName ?? wf
-    const labels = new Map(
-      list(join(wfs, wf)).includes('journal.jsonl')
-        ? readJsonl(join(wfs, wf, 'journal.jsonl'))
-            .filter((e) => e.type === 'started' && e.agentId)
-            .map((e) => [e.agentId, e.label ?? e.phase ?? e.agentId])
-        : [],
-    )
-    for (const f of list(join(wfs, wf)).filter((f) => /^agent-[\w-]+\.jsonl$/.test(f))) {
-      const id = f.slice('agent-'.length, -'.jsonl'.length)
-      sources.push({ file: join(wfs, wf, f), kind: 'workflow', label: label(`${name}:${labels.get(id) ?? id}`) })
-    }
-  }
-  return sources.filter((s) => existsSync(s.file))
-}
+/** The events of a session's log that requests and subagents are read from (the log can be tens of MB: other lines are skipped unparsed). */
+export const sessionEvents = (dir, session) => readJsonl(join(dir, session, 'events.jsonl'), (line) => EVENT_TYPES.some((t) => line.includes(t)))
 
-// output counts only requests whose final usage was recorded; output_unknown counts the others. cache_write_1h is the
-// part of cache_write that went to the 1-hour cache (priced higher than the 5-minute one).
-const ZERO = () => ({ input: 0, output: 0, cache_read: 0, cache_write: 0, cache_write_1h: 0, output_unknown: 0 })
+/** The requests in a session's event log. */
+export const sessionRequests = (dir, session) => requestsOf(sessionEvents(dir, session), session)
+
+const ZERO = () => ({ input: 0, output: 0, cache_read: 0, cache_write: 0, nano_aiu: 0 })
 const add = (t, r) => {
-  t.input += r.usage.input_tokens ?? 0
-  t.cache_read += r.usage.cache_read_input_tokens ?? 0
-  t.cache_write += r.usage.cache_creation_input_tokens ?? 0
-  t.cache_write_1h += r.usage.cache_creation?.ephemeral_1h_input_tokens ?? 0
-  if (r.final) t.output += r.usage.output_tokens ?? 0
-  else t.output_unknown++
+  for (const k of Object.keys(t)) t[k] += r.tokens[k] ?? 0
 }
 
 const pad2 = (n) => String(n).padStart(2, '0')
@@ -184,41 +188,33 @@ export function timingOf({ createdAt, steps }) {
 }
 
 /**
- * The trace of a run from its bd record and the transcripts under projectsDir.
+ * The trace of a run from its bd record and the session logs under sessionsDir.
  * record: { run, createdAt, steps: [{ id, closedAt | null, startedAt?, type?, gate?: { type, armedAt } }], actors: [string] }
- * birthOf(file): when a transcript file was created, in ms (0 where the filesystem doesn't record it).
  */
-export function trace(record, { projectsDir, now = new Date(), birthOf = (file) => statSync(file).birthtimeMs }) {
+export function trace(record, { sessionsDir, now = new Date() }) {
   const closed = record.steps.filter((s) => s.closedAt).sort((a, b) => a.closedAt.localeCompare(b.closedAt))
   const sessions = []
   const missing = []
-  const requests = []
-  const read = []
   const seenSessions = new Set()
+  // A resumed or forked session starts with a copy of its parent's records (same API call ids): count each request once,
+  // for the session that made it (owned), else the first one read.
+  const byId = new Map()
   for (const actor of new Set(record.actors)) {
     const suffix = sessionSuffix(actor)
     if (!suffix) continue
-    const found = findSessions(projectsDir, suffix)
+    const found = findSessions(sessionsDir, suffix)
     if (!found.length && !missing.some((m) => sessionSuffix(m) === suffix)) missing.push(actor)
     for (const { dir, session } of found) {
       if (seenSessions.has(session)) continue
       seenSessions.add(session)
       sessions.push({ actor, session })
-      const rs = sessionSources(dir, session).flatMap((src) => requestsOf(readJsonl(src.file)).map((r) => ({ ...r, actor, kind: src.kind, label: src.label })))
-      read.push({ start: rs.reduce((m, r) => (r.ts < m ? r.ts : m), '\uffff'), born: birthOf(join(dir, `${session}.jsonl`)) || 0, rs })
+      for (const r of sessionRequests(dir, session)) {
+        const prev = byId.get(r.id)
+        if (!prev || (r.owned && !prev.owned)) byId.set(r.id, { ...r, actor })
+      }
     }
   }
-  // A resumed or forked session starts with a copy of its parent's requests (same ids and times): count each request once,
-  // for the session that made it: the one that started first or, on a tie (a fork; transcripts have no fork marker), the
-  // one whose transcript file was created first, else (no birth time on this filesystem) the one with more requests.
-  const seen = new Set()
-  const byBirth = (a, b) => (a.born && b.born ? a.born - b.born : 0)
-  for (const { rs } of read.sort((a, b) => a.start.localeCompare(b.start) || byBirth(a, b) || b.rs.length - a.rs.length))
-    for (const r of rs) {
-      if (seen.has(r.id)) continue
-      seen.add(r.id)
-      requests.push(r)
-    }
+  const requests = [...byId.values()].sort((a, b) => a.ts.localeCompare(b.ts))
 
   const steps = new Map(closed.map((s) => [s.id, { step: s.id, closed_at: s.closedAt, agents: new Map() }]))
   const totals = new Map()
@@ -252,7 +248,7 @@ export function trace(record, { projectsDir, now = new Date(), birthOf = (file) 
     }
 
   return {
-    version: 2,
+    version: 3,
     traced_at: now.toISOString(),
     run: record.run,
     sessions,
@@ -269,8 +265,7 @@ export function trace(record, { projectsDir, now = new Date(), birthOf = (file) 
 
 const short = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n))
 const fmtTokens = (t) =>
-  `in ${short(t.input + t.cache_read + t.cache_write)} (cache read ${short(t.cache_read)}), out ${short(t.output)}` +
-  (t.output_unknown ? ` + ${t.output_unknown} req unknown` : '')
+  `in ${short(t.input + t.cache_read + t.cache_write)} (cache read ${short(t.cache_read)}), out ${short(t.output)}, ${(t.nano_aiu / 1e9).toFixed(1)} credits`
 
 /**
  * The trace as a few lines for a comment: the times, then per step its elapsed time and each agent's model, effort,
@@ -345,13 +340,13 @@ export function readRecord(run, bd) {
 }
 
 function main(argv) {
-  const valued = ['--projects', '--root', '--actor']
+  const valued = ['--sessions', '--root', '--actor']
   const opt = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined)
   const run = argv.find((a, i) => !a.startsWith('--') && !valued.includes(argv[i - 1]))
-  if (!run) throw new Error('usage: trace-run.mjs <run> [--root <checkout>] [--projects <dir>] [--actor <name>] [--write] [--summary]')
+  if (!run) throw new Error('usage: trace-run.mjs <run> [--root <checkout>] [--sessions <dir>] [--actor <name>] [--write] [--summary]')
   const root = opt('--root')
-  const projectsDir = opt('--projects') ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'projects')
-  const result = trace(readRecord(run, bdRunner(root)), { projectsDir })
+  const sessionsDir = opt('--sessions') ?? join(process.env.COPILOT_HOME ?? join(homedir(), '.copilot'), 'session-state')
+  const result = trace(readRecord(run, bdRunner(root)), { sessionsDir })
   // Print first, so a failed write still leaves the trace on stdout.
   process.stdout.write(`${argv.includes('--summary') ? summarize(result) : JSON.stringify(result, null, 2)}\n`)
   if (!argv.includes('--write')) return

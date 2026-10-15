@@ -6,15 +6,9 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { aggregate, costOf, joinRuns, overlaps, render, roleOf, untracedWhy } from './calibrate.mjs'
 
-const prices = {
-	source: 'test prices',
-	cache_write_multiplier: 1.25,
-	cache_write_1h_multiplier: 2,
-	note: 'test note',
-	models: { 'claude-opus-5-5': { input: 4, output: 20, cache_read: 0.2 } },
-}
-const tokens = (input, output, cache_read = 0, cache_write = 0, output_unknown = 0, cache_write_1h = 0) => ({ input, output, cache_read, cache_write, cache_write_1h, output_unknown })
-const agent = (kind, label, requests, t, model = 'claude-opus-5-5', effort = 'medium', times = {}) => ({ kind, label, model, effort, requests, tokens: t, ...times })
+// credits: the AI credits a request cost; left out, a trace stored without them.
+const tokens = (input, output, cache_read = 0, cache_write = 0, credits) => ({ input, output, cache_read, cache_write, ...(credits == null ? {} : { nano_aiu: credits * 1e9 }) })
+const agent = (kind, label, requests, t, model = 'claude-opus-5.5', effort = 'medium', times = {}) => ({ kind, label, model, effort, requests, tokens: t, ...times })
 const work = (...agents) => ({ steps: [{ step: 's', agents }] })
 // An agent's times: first request at `from`, last request at `last`, which ended at `end` (minutes:seconds past 01:00).
 const at = (from, last, end) => ({ first: `2026-10-15T01:${from}Z`, last: `2026-10-15T01:${last}Z`, ...(end ? { end: `2026-10-15T01:${end}Z` } : {}) })
@@ -45,23 +39,20 @@ describe('roleOf', () => {
 })
 
 describe('costOf', () => {
-	it('prices input, cache reads, cache writes at the multiplier, and known output', () => {
-		// 1M input $4 + 1M cache read $0.20 + 1M cache write $5 + 1M output $20
-		expect(costOf('claude-opus-5-5', tokens(1e6, 1e6, 1e6, 1e6), prices)).toBeCloseTo(29.2)
-		expect(costOf('claude-unknown', tokens(1, 1), prices)).toBeNull()
-		// Of 2M cache writes, 1M went to the 1-hour cache: $5 + $8.
-		expect(costOf('claude-opus-5-5', tokens(0, 0, 0, 2e6, 0, 1e6), prices)).toBeCloseTo(13)
+	it('prices tokens from the AI credits they cost, at $0.01 a credit', () => {
+		expect(costOf(tokens(1e6, 1e6, 1e6, 1e6, 400))).toBeCloseTo(4)
+		expect(costOf({ nano_aiu: 13_074_213_820_000 })).toBeCloseTo(130.74)
 	})
 
-	it('prices traces stored before the TTL split at the 5-minute rate', () => {
-		const { cache_write_1h: _, ...old } = tokens(0, 0, 0, 1e6)
-		expect(costOf('claude-opus-5-5', old, prices)).toBeCloseTo(5)
+	it('has no cost for a trace stored without credits', () => {
+		expect(costOf(tokens(1, 1))).toBeNull()
+		expect(costOf(undefined)).toBeNull()
 	})
 })
 
 describe('untracedWhy', () => {
 	it('says why a trace can\'t stand for the run, or null', () => {
-		expect(untracedWhy({ sessions: [], missing: ['a/claude-1'], steps: [] })).toBe('sessions not on this machine')
+		expect(untracedWhy({ sessions: [], missing: ['a/copilot-1'], steps: [] })).toBe('sessions not on this machine')
 		expect(untracedWhy({ sessions: [], missing: [], steps: [] })).toBe('no agent sessions')
 		expect(untracedWhy({ sessions: [{}], missing: [], steps: [], outside_requests: 7 })).toBe("no requests inside the run's step windows (7 outside)")
 		expect(untracedWhy({ sessions: [{}], missing: [], steps: [{}] })).toBeNull()
@@ -174,13 +165,13 @@ describe('aggregate and render', () => {
 			overall: 3,
 			findings: { serious: 2, minor: 0, followUps: 1 },
 			work: work(
-				agent('workflow', 'wf:review:code', 10, tokens(1_000_000, 0, 0, 0, 10), 'claude-opus-5-5', 'high', at('00:00', '03:00', '04:30')),
+				agent('workflow', 'wf:review:code', 10, tokens(1_000_000, 0, 0, 0, 400), 'claude-opus-5.5', 'high', at('00:00', '03:00', '04:30')),
 				agent('subagent', 'Explore: x', 2, tokens(10, 0), 'claude-mystery-1', 'low', { ...at('00:00', '00:30', '01:00'), active_ms: 45_000 }),
 			),
 			timing: null,
 		},
 	]
-	const agg = aggregate(rows, prices)
+	const agg = aggregate(rows)
 
 	it('measures the estimate gap against the confirmed complexity, else the judged one', () => {
 		expect(agg.gap).toMatchObject({ runs: 3, distribution: [[0, 1], [1, 2]], byTier: { small: { runs: 2, mean: 0.5 }, standard: { runs: 1, mean: 1 } } })
@@ -191,9 +182,9 @@ describe('aggregate and render', () => {
 		expect(agg.bands).toEqual({ 2: { runs: 1, overall: 4, serious: 0 }, 3: { runs: 1, overall: 4, serious: 0 }, 4: { runs: 1, overall: 3, serious: 2 } })
 	})
 
-	it('costs roles by model and effort, keeping unknown output and unpriced models apart', () => {
+	it('costs roles by model and effort, keeping traces without credits apart', () => {
 		const reviewer = agg.roles.find((x) => x.role === 'reviewer')
-		expect(reviewer).toMatchObject({ model: 'claude-opus-5-5', effort: 'high', runs: 1, requests: 10, outputUnknown: 10 })
+		expect(reviewer).toMatchObject({ model: 'claude-opus-5.5', effort: 'high', runs: 1, requests: 10 })
 		expect(reviewer.cost).toBeCloseTo(4)
 		expect(agg.roles.find((x) => x.role === 'other')).toMatchObject({ unpriced: 2, cost: 0 })
 		expect(agg.mainPerRequest).toEqual([{ id: 'r1', requests: 4, perRequest: 100_000 }])
@@ -244,14 +235,14 @@ describe('aggregate and render', () => {
 				{ step: 'r4.score', elapsed_ms: 5 * 60_000 },
 			]),
 		}
-		expect(aggregate([row], prices).stepTimes).toEqual([
+		expect(aggregate([row]).stepTimes).toEqual([
 			{ step: 'requirements', runs: 1, elapsedMs: 10 * 60_000, traced: 1, agentMs: 30_000 },
 			{ step: 'score', runs: 1, elapsedMs: 5 * 60_000, traced: 0, agentMs: null },
 		])
 	})
 
-	it('renders every section, with notional costs and drafts marked', () => {
-		const md = render([{ ...rows[0], overallFrom: 'judge', traced: 'stored' }, { ...rows[1], overallFrom: 'person', traced: null, untraced: 'no agent sessions' }], agg, prices)
+	it('renders every section, with costs from credits and drafts marked', () => {
+		const md = render([{ ...rows[0], overallFrom: 'judge', traced: 'stored' }, { ...rows[1], overallFrom: 'person', traced: null, untraced: 'no agent sessions' }], agg)
 		for (const heading of [
 			'## Runs',
 			'## Complexity: estimate vs judged',
@@ -262,27 +253,27 @@ describe('aggregate and render', () => {
 			'## Main-thread context per request',
 		])
 			expect(md).toContain(heading)
-		expect(md).toContain('Costs are notional (test prices)')
+		expect(md).toContain('Costs are Copilot AI credits as USD (1 credit = $0.01)')
 		expect(md).toContain('| r1 | small | 2 | 3 | 1 | 4 (draft) |')
 		expect(md).toContain('none: no agent sessions')
 		expect(md).toContain('+ 2 req unpriced')
 	})
 
 	it('renders times next to costs, and says which time is primary', () => {
-		const md = render([{ ...rows[0], overallFrom: 'judge', traced: 'stored' }, { ...rows[1], overallFrom: 'person', traced: null, untraced: 'no agent sessions' }], agg, prices)
+		const md = render([{ ...rows[0], overallFrom: 'judge', traced: 'stored' }, { ...rows[1], overallFrom: 'person', traced: null, untraced: 'no agent sessions' }], agg)
 		expect(md).toContain('| follow-ups | cost | agent time | human wait | elapsed | trace |')
 		expect(md).toMatch(/\| r1 \|(.*\|){9} 2m 00s \| 0s \| 30m 00s \| stored \|/)
 		expect(md).toMatch(/\| r2 \|(.*\|){9} – \| 10m 00s \| 1h 00m \|/)
-		expect(md).toContain('| requests | cost | agent time | output unknown (req) |')
+		expect(md).toContain('| requests | cost | agent time |')
 		expect(md).toContain('| 2 | 1 | 0 | – | – | 10m 00s | 1h 00m |')
 		expect(md).toContain('| requirements | 2 | 10m 00s | 1 | 0s |')
 		expect(md).toContain('| implement | 1 | 20m 00s | 1 | 2m 00s |')
-		for (const phrase of ['Agent time is the primary time figure', 'Request end times are approximate', 'includes idle gaps and is context only', 'Human wait (human gates, armed to resolved) is counted apart'])
+		for (const phrase of ['Agent time is the primary time figure', "A request's start is its record's time less its duration", 'includes idle gaps and is context only', 'Human wait (human gates, armed to resolved) is counted apart'])
 			expect(md).toContain(phrase)
 	})
 
 	it('says when there is nothing to time', () => {
-		const md = render([], aggregate([], prices), prices)
+		const md = render([], aggregate([]))
 		expect(md).toContain('No run has a complexity yet.')
 		expect(md).toContain('No closed steps.')
 	})
@@ -295,7 +286,7 @@ const traced = (id, created, closed, session, requests, active = [created, close
 	findings: { serious: 0, minor: 0, followUps: 0 },
 	work: {
 		sessions: [{ session }],
-		steps: [{ step: `${id}.s`, closed_at: closed, agents: [{ ...agent('main', 'main', requests, tokens(1e6, 0)), first: active[0], last: active[1], end: active[1] }] }],
+		steps: [{ step: `${id}.s`, closed_at: closed, agents: [{ ...agent('main', 'main', requests, tokens(1e6, 0, 0, 0, 400)), first: active[0], last: active[1], end: active[1] }] }],
 	},
 })
 
@@ -327,20 +318,20 @@ describe('overlaps', () => {
 		const o = overlaps(partial)
 		expect(o.groups).toEqual([{ runs: ['a', 'b'], kept: 'a', doubleCounted: true }])
 		expect([...o.excluded]).toEqual([])
-		expect(aggregate(partial, prices).roles.find((x) => x.role === 'main').requests).toBe(14)
+		expect(aggregate(partial).roles.find((x) => x.role === 'main').requests).toBe(14)
 	})
 
 	it('counts an overlap group once in the role totals, and says so', () => {
-		const agg = aggregate(runs, prices)
+		const agg = aggregate(runs)
 		// wide 20m + other-session 10m + later 10m; nested's 10m is inside wide's.
 		expect(agg.roles.find((x) => x.role === 'main')).toMatchObject({ requests: 9 + 3 + 4, runs: 3, activeMs: 40 * 60_000 })
 		expect(agg.runTimes.nested.agentMs).toBe(10 * 60_000)
 		expect(agg.runCosts.nested.cost).toBeCloseTo(4)
-		const md = render(runs.map((r) => Object.assign(structuredClone(r), { tier: 'small', traced: 'stored' })), agg, prices)
+		const md = render(runs.map((r) => Object.assign(structuredClone(r), { tier: 'small', traced: 'stored' })), agg)
 		expect(md).toContain('| nested | small |')
 		expect(md).toContain('stored, overlaps (left out of totals)')
 		expect(md).toContain('nested + wide (totals use wide)')
-		expect(md).toContain('test note')
+		expect(md).toContain('A request with no logged credits')
 	})
 })
 
@@ -378,7 +369,7 @@ describe('calibrate CLI', () => {
 		const script = fileURLToPath(new URL('./calibrate.mjs', import.meta.url))
 		let out
 		try {
-			out = execFileSync('node', [script, '--projects', bin, '--write'], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdio: ['ignore', 'pipe', 'pipe'] })
+			out = execFileSync('node', [script, '--sessions', bin, '--write'], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` }, stdio: ['ignore', 'pipe', 'pipe'] })
 		} catch (e) {
 			throw new Error(`exit ${e.status}: ${e.stderr}`, { cause: e })
 		}

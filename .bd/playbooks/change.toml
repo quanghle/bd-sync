@@ -234,10 +234,10 @@ description = """
 Score how well the agent work on this run went, against .bd/rubric.md: run the `score-issue` \
 workflow with issue=<this run> (the parent of this step) and actor=<your bd actor>; pass range \
 (the commits from implement's close reason), result (when plan-implement-review did the work) and \
-context (anything a person had to correct). Fable is the judge: do not score it yourself. It \
+context (anything a person had to correct). The judge is gpt-6-astra: do not score it yourself. It \
 stores the draft as the run's score_judge metadata (with the judged complexity) and comments its \
 reasoning on the run, with the gap from the complexity estimate; then it traces which agents did \
-each step, with which model and effort, into the run's work metadata (.claude/scripts/trace-run.mjs)."""
+each step, with which model and effort, into the run's work metadata (.github/scripts/trace-run.mjs)."""
 acceptance_criteria = "Evidence: the run's score_judge and work metadata and the judge's comment; the close reason gives the overall score, complexity (and the estimate) and confidence, and names any session the trace could not find."
 
 [[steps]]
@@ -256,3 +256,18 @@ type = "human"
 title = "Confirm score: {{task}}"
 assignee = "{{approver}}"
 description = "Check the run's score_judge and the judge's comment, set the run's score metadata (.bd/rubric.md, Recording), then `bd gate resolve` this gate."
+
+# 6. Recalibration check ------------------------------------------------------
+
+[[steps]]
+id = "recalibrate-check"
+title = "Recalibration check: {{task}}"
+type = "task"
+needs = ["score-confirm"]
+description = """
+Run `node .github/scripts/recalibrate-due.mjs --start --actor <your bd actor>`. It counts the change \
+runs whose score a person confirmed and that no recalibration covers yet (this run included). At 10 it \
+starts the `recalibrate` playbook over them and marks each covered run, so none counts twice; below 10 it \
+starts nothing. When it starts one, the new run's report step is next work: leave it to the next session or \
+claim it. Never resolve its approval gate."""
+acceptance_criteria = "Evidence: the script's output in the close reason (due, count, and the recalibrate run's id when one started)."

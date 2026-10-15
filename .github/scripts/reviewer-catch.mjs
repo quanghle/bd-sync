@@ -2,31 +2,27 @@
 // How often each reviewer model and effort catches what a paired pass over the same diff and prompt found, by the
 // complexity band of the bd run it reviewed: the evidence for which model and effort the reviewer roles get.
 //
-//   node .claude/scripts/reviewer-catch.mjs [--root <checkout>] [--projects <dir>] [--json]
+//   node .github/scripts/reviewer-catch.mjs [--root <checkout>] [--sessions <dir>] [--json]
 //
-// Reads this project's workflow journals on this machine (<projects>/<encoded checkout or its worktrees>/<session>/
-// subagents/workflows/<wf>/journal.jsonl), each agent's meta and transcript beside them, the workflow's run record, and
-// `bd show` for complexity. Read-only: it writes no file and nothing to bd.
+// Reads the Copilot CLI sessions on this machine (<sessions>/<session>/): the review and validate agents that
+// plan-implement-review recorded in files/workflow-agents/<run id>.jsonl (their label, a hash of their prompt, their
+// result), and events.jsonl for the model and reasoning effort each agent actually ran with; and `bd show` for
+// complexity. Copilot keeps neither a workflow agent's prompt nor its result, which is why the extension records them.
+// Read-only: it writes no file and nothing to bd.
 //
-// Passes. A review agent labelled review:<kind>:r<N> (or r<N>@<level>, an escalated retry) is a cheap pass,
-// review:<kind>:confirm-r<N>@strong a confirmation, review:<kind>:r<N>@shadow:<model>-<effort> a shadow (plan-implement-
-// review's shadowReview). Model comes from the agent's meta, else its transcript's requests, as a class; effort from the
-// transcript. What can't be read is 'unknown', never guessed. A pass without a result failed and is never paired.
+// Passes. A review agent labelled review:<kind>:r<N> is a real pass, review:<kind>:r<N>@shadow:<model>-<effort> a shadow
+// (plan-implement-review's shadowReview). Model and effort come from the session's subagent events, else what the workflow
+// asked for. What can't be read is 'unknown', never guessed. A pass without a result failed and is never paired.
 //
-// Prompt. An agent's prompt is its computed task: the leading user entry (before the first assistant entry) that starts
-// with '[Workflow harness — computed task]'. Many transcripts open with a '[Workflow harness — user request]' relay that
-// is the same for every agent of a workflow, so it says nothing about the pass. Without a computed-task entry the
-// leading user entries are joined; without a transcript the prompt is unknown.
-//
-// Pairing. Within one journal, kind and round, every confirmation pairs with every cheap pass (escalated ones too), and
-// every shadow with the plain cheap pass. A pair counts only when both prompts are identical (same diff, same
-// instructions): a focused re-review against a full confirmation is skipped as differentPrompt. A pair whose prompt
-// can't be read is kept as 'unchecked'.
+// Pairing. Within one workflow run, kind and round, every shadow pairs with the real pass. A pair counts only when both
+// prompts hash alike (same diff, same instructions); the extension gives both the same prompt, so a differing hash is
+// skipped as differentPrompt.
 //
 // Matching. Findings are matched one-to-one, greedily by best score. Both must name a file with the same basename. When
 // both have a line, they match if the lines are at most 5 apart (score 1 - |delta|/10); when either lacks one, they
 // match if the Jaccard similarity of their claims' lowercase word tokens (3+ characters) is at least 0.3. Validator
-// verdicts join to findings by file basename plus the whitespace-collapsed claim text in the validator's prompt.
+// verdicts join to findings by file basename plus the whitespace-collapsed claim text of the finding each validator
+// was given.
 //
 // Catch rate. For one side of a pair: raised = its findings, matched = those the partner also found, missed = the
 // partner's findings it did not find, union = raised + missed, catch = raised / union, summed over pairs.
@@ -37,52 +33,23 @@
 // counts each match once per side (2m). Catch there is 50% (no shared finding) to 100% (the same set) by construction,
 // so those rows report agreement = matched / raised = 2m / (rA + rB) instead (a Dice coefficient, null when nothing
 // was raised), with catch null.
-//
-// Bias. Confirmation passes ran only where the workflow asked for one (escalation, an uncertain cheap pass, a tier that
-// confirms), so cheap-vs-confirm pairs are not a random sample of reviews; shadow pairs are the unbiased comparison.
 import { execFileSync } from 'node:child_process'
 import { existsSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { bdRunner, readJson, readJsonl, requestsOf } from './trace-run.mjs'
+import { bdRunner, readJsonl, sessionEvents, subagentsOf } from './trace-run.mjs'
 
-// ---------- prompts ----------
-export const COMPUTED_TASK = '[Workflow harness — computed task]'
-
-/** The text of a transcript entry: its string content, or its text blocks joined. */
-export function textOf(entry) {
-  const c = entry?.message?.content
-  if (typeof c === 'string') return c
-  return Array.isArray(c) ? c.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n') : ''
-}
-
-/** An agent's prompt from its transcript entries: the computed task, else the leading user entries, else null. */
-export function promptOf(entries) {
-  if (!entries?.length) return null
-  const lead = []
-  for (const e of entries) {
-    if (e.type === 'assistant') break
-    if (e.type === 'user') lead.push(textOf(e))
-  }
-  const task = lead.find((t) => t.startsWith(COMPUTED_TASK))
-  if (task != null) return task
-  if (lead.length) return lead.join('\n\n')
-  const first = entries.find((e) => e.type === 'user')
-  return first ? textOf(first) : null
-}
-
-// ---------- labels and facts ----------
+// ---------- labels ----------
 const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max'])
-const LABEL = /^review:([a-z0-9-]+):(confirm-)?r(\d+)(?:@(.+))?$/
+const LABEL = /^review:([a-z0-9-]+):r(\d+)(?:@(.+))?$/
 
 /** A review pass's label parsed, or null for any other agent. */
 export function parseLabel(label) {
   const m = LABEL.exec(label ?? '')
   if (!m) return null
-  const [, kind, confirm, round, suffix] = m
+  const [, kind, round, suffix] = m
   const base = { kind, round: Number(round) }
-  if (confirm) return { ...base, type: 'confirm', ...(suffix ? { level: suffix } : {}) }
   if (suffix?.startsWith('shadow:')) {
     const spec = suffix.slice('shadow:'.length)
     const at = spec.lastIndexOf('-')
@@ -91,78 +58,33 @@ export function parseLabel(label) {
     if (at > 0 && EFFORTS.has(effort)) return { ...base, type: 'shadow', shadow: { model, effort } }
     return null
   }
-  return { ...base, type: 'cheap', ...(suffix ? { level: suffix } : {}) }
-}
-
-/** A model id as its class (haiku, sonnet, opus, fable), else the id itself, else 'unknown'. */
-export function modelClass(id) {
-  if (!id) return 'unknown'
-  return /haiku|sonnet|opus|fable/.exec(id)?.[0] ?? id
-}
-
-const mode = (xs) => {
-  const counts = new Map()
-  for (const x of xs) counts.set(x, (counts.get(x) ?? 0) + 1)
-  let best = null
-  for (const [x, c] of counts) if (best == null || c > counts.get(best)) best = x
-  return best
-}
-
-/** Model class, effort and prompt of an agent from its meta (or null) and transcript entries (or null). */
-export function agentFacts(meta, entries) {
-  const requests = entries?.length ? requestsOf(entries) : []
-  return {
-    model: modelClass(meta?.model ?? mode(requests.map((r) => r.model))),
-    effort: mode(requests.map((r) => r.effort).filter((e) => e && e !== 'unknown')) ?? 'unknown',
-    prompt: promptOf(entries),
-  }
+  return suffix ? null : { ...base, type: 'real' }
 }
 
 // ---------- passes ----------
-const parsed = (result) => {
-  if (typeof result !== 'string') return result ?? null
-  try {
-    return JSON.parse(result)
-  } catch {
-    return null
-  }
-}
-
-/** Each agent's last 'started' entry matching the label test, with its result (parsed), deduped by agentId. */
-function agentsOf(entries, test) {
-  const started = new Map()
-  for (const e of entries) if (e.type === 'started' && test(e.label)) started.set(e.agentId, e)
-  const results = new Map()
-  for (const e of entries) if (e.type === 'result') results.set(e.agentId ?? e.key, e)
-  return [...started.values()].map((s) => {
-    const r = results.get(s.agentId) ?? [...results.values()].find((x) => x.key === s.key)
-    return { started: s, result: r ? parsed(r.result) : null }
-  })
-}
-
 /**
- * The review passes of one journal ({ wf, entries }): label fields, model, effort, prompt and findings, or failed when
- * the agent left no readable findings. factsOf(agentId) gives agentFacts for the agent.
+ * The review passes of one journal ({ run, agents: [{ label, model, effort, prompt, result }] }): label fields, model,
+ * effort, prompt hash and findings, or failed when the agent left no readable findings.
  */
-export function passesOf(journal, factsOf) {
-  return agentsOf(journal.entries, (l) => parseLabel(l) != null).map(({ started, result }) => {
-    const label = parseLabel(started.label)
-    const facts = factsOf(started.agentId) ?? { model: 'unknown', effort: 'unknown', prompt: null }
-    // A shadow's label records the model and effort it was started with; the transcript, when readable, wins.
-    const model = facts.model !== 'unknown' ? facts.model : label.shadow ? modelClass(label.shadow.model) : 'unknown'
-    const effort = facts.effort !== 'unknown' ? facts.effort : (label.shadow?.effort ?? 'unknown')
-    const findings = Array.isArray(result?.findings) ? result.findings : null
-    return {
-      journal: journal.wf,
-      agentId: started.agentId,
-      label: started.label,
-      ...label,
-      model,
-      effort,
-      prompt: facts.prompt,
-      findings,
-      failed: findings == null,
-    }
+export function passesOf(journal) {
+  return journal.agents.flatMap((a) => {
+    const label = parseLabel(a.label)
+    if (!label) return []
+    const known = (x) => (x && x !== 'unknown' ? x : null)
+    const findings = Array.isArray(a.result?.findings) ? a.result.findings : null
+    return [
+      {
+        journal: journal.run,
+        label: a.label,
+        ...label,
+        // A shadow's label records the model and effort it was started with, for when the session log is not here.
+        model: known(a.model) ?? label.shadow?.model ?? 'unknown',
+        effort: known(a.effort) ?? label.shadow?.effort ?? 'unknown',
+        prompt: a.prompt ?? null,
+        findings,
+        failed: findings == null,
+      },
+    ]
   })
 }
 
@@ -171,27 +93,12 @@ const basename = (file) => String(file ?? '').split(/[\\/]/).pop()
 const collapse = (s) => String(s ?? '').replace(/\s+/g, ' ').trim()
 const keyOf = (file, claim) => `${basename(file)}\0${collapse(claim)}`
 
-/** The finding a validator was given, from its prompt: { file, line, claim }, or null. */
-function findingIn(prompt) {
-  if (!prompt) return null
-  // The finding comes before the ledger, whose settled findings could also carry claims.
-  const from = /\n\s*Finding:\n/.exec(prompt)?.index ?? 0
-  const m = /\n([^\n]*)\n\s*Claim: ([\s\S]*?)\n\s*Evidence:/.exec(prompt.slice(from))
-  if (!m) return null
-  const head = m[1]
-  const at = head.lastIndexOf(' — ')
-  if (at < 0) return null
-  const where = /^(.*?)(?::(\d+))?\s*$/.exec(head.slice(at + 3))
-  return { file: where[1], line: where[2] ? Number(where[2]) : null, claim: m[2] }
-}
-
 /** Verdicts of the journal's validators, keyed by file basename and collapsed claim text. */
-export function validatorsOf(journal, factsOf) {
+export function validatorsOf(journal) {
   const verdicts = new Map()
-  for (const { started, result } of agentsOf(journal.entries, (l) => typeof l === 'string' && l.startsWith('validate:'))) {
-    if (typeof result?.valid !== 'boolean') continue
-    const finding = findingIn(factsOf(started.agentId)?.prompt)
-    if (finding) verdicts.set(keyOf(finding.file, finding.claim), { valid: result.valid, blocking: Boolean(result.blocking) })
+  for (const a of journal.agents) {
+    if (!a.label?.startsWith('validate:') || typeof a.result?.valid !== 'boolean' || !a.finding) continue
+    verdicts.set(keyOf(a.finding.file, a.finding.claim), { valid: a.result.valid, blocking: Boolean(a.result.blocking) })
   }
   return verdicts
 }
@@ -200,7 +107,7 @@ export function validatorsOf(journal, factsOf) {
 export const verdictOf = (finding, verdicts) => verdicts.get(keyOf(finding.file, finding.claim)) ?? null
 
 // ---------- pairing ----------
-/** Pairs of passes over the same diff and prompt: { pairs: [{ source, a, b, prompt }], skipped }. a is the cheap or real pass. */
+/** Pairs of passes over the same diff and prompt: { pairs: [{ source, a, b }], skipped }. a is the real pass. */
 export function pairPasses(passes) {
   const groups = new Map()
   for (const p of passes) {
@@ -209,17 +116,13 @@ export function pairPasses(passes) {
   }
   const pairs = []
   const skipped = { differentPrompt: 0, failed: 0 }
-  const pair = (source, a, b) => {
-    if (a.failed || b.failed) skipped.failed++
-    else if (a.prompt == null || b.prompt == null) pairs.push({ source, a, b, prompt: 'unchecked' })
-    else if (a.prompt === b.prompt) pairs.push({ source, a, b, prompt: 'same' })
-    else skipped.differentPrompt++
-  }
-  for (const group of groups.values()) {
-    const cheap = group.filter((p) => p.type === 'cheap')
-    for (const b of group.filter((p) => p.type === 'confirm')) for (const a of cheap) pair('confirm', a, b)
-    for (const b of group.filter((p) => p.type === 'shadow')) for (const a of cheap.filter((p) => !p.level)) pair('shadow', a, b)
-  }
+  for (const group of groups.values())
+    for (const b of group.filter((p) => p.type === 'shadow'))
+      for (const a of group.filter((p) => p.type === 'real')) {
+        if (a.failed || b.failed) skipped.failed++
+        else if (a.prompt !== b.prompt) skipped.differentPrompt++
+        else pairs.push({ source: 'shadow', a, b })
+      }
   return { pairs, skipped }
 }
 
@@ -365,19 +268,17 @@ const rowsTable = (rows) =>
     : 'No pairs.'
 
 /**
- * The report as markdown. data: { journals, passes, failed, pairs: [{ source, prompt, band }], skipped, rows: { all,
+ * The report as markdown. data: { journals, passes, failed, pairs: [{ band }], skipped, rows: { all,
  * validated } }. Prints only counts, labels, models, efforts and bands: never claims, paths or prompts.
  */
 export function render(data) {
-  const bySource = (s) => data.pairs.filter((p) => p.source === s).length
   const unverified = data.rows.validated.reduce((n, r) => n + r.unverified, 0)
   return [
     `# Reviewer catch rate`,
     ``,
     `${data.journals} journals, ${data.passes} review passes (${data.failed} failed). ` +
-      `${data.pairs.length} pairs: ${bySource('confirm')} cheap vs confirm, ${bySource('shadow')} real vs shadow. ` +
+      `${data.pairs.length} pairs of real vs shadow passes. ` +
       `Skipped: ${data.skipped.differentPrompt} with different prompts, ${data.skipped.failed} with a failed side. ` +
-      `${data.pairs.filter((p) => p.prompt === 'unchecked').length} with the prompt unchecked, ` +
       `${data.pairs.filter((p) => p.band === 'unknown').length} with the band unknown.`,
     ``,
     `## All findings`,
@@ -394,72 +295,57 @@ export function render(data) {
       `Findings match one-to-one on the same file basename, with lines at most 5 apart, or similar claims when a line is missing. ` +
       `missed = the partner's findings this side did not raise; catch = raised / union, with union = raised + missed, summed over pairs. ` +
       `Where model/effort equals vs, both sides of each pair sum into one row, so catch would be 50% to 100% by construction; those rows show agree = matched / raised instead (matched counts each match once per side), and catch –. ` +
-      `Thin rows have under 5 pairs. Confirmations ran only where the workflow asked for one, so cheap-vs-confirm rows are a biased sample; shadow rows are not.`,
+      `Thin rows have under 5 pairs.`,
   ].join('\n')
 }
 
 // ---------- journals ----------
 const list = (dir) => (existsSync(dir) ? readdirSync(dir) : [])
-
-/** A checkout path as Claude Code names its projects directory. */
-export const encodeProject = (path) => path.replace(/[^a-zA-Z0-9]/g, '-')
-
-/** This project's directories under projectsDir: the main checkout's and its .claude/worktrees/* checkouts'. */
-export function projectDirs(projectsDir, root) {
-  const checkout = encodeProject(root)
-  const worktrees = `${encodeProject(join(root, '.claude/worktrees'))}-`
-  return list(projectsDir).filter((d) => d === checkout || d.startsWith(worktrees))
-}
-
-const AGENT_ID = /^[0-9a-zA-Z_-]+$/
+const RUN_FILE = /^[0-9a-f-]{36}\.jsonl$/
 
 /**
- * Every workflow journal of this project: { wf, workflow, args, entries, factsOf }. factsOf(agentId) reads the agent's
- * meta and transcript beside the journal, once, into agentFacts.
+ * Every recorded workflow run on this machine: { run, workflow, args: { reviewStep, issue }, agents: [{ label, model,
+ * effort, prompt, result, finding }] }. An agent's model and effort come from its subagent events (matched by workflow
+ * run and label), else what the workflow asked for. A run resumed after a pause recorded its replayed agents again: each
+ * label and prompt counts once, the last record standing.
  */
-export function readJournals(projectsDir, root) {
-  return projectDirs(projectsDir, root).flatMap((project) =>
-    list(join(projectsDir, project)).flatMap((session) => {
-      const workflows = join(projectsDir, project, session, 'subagents', 'workflows')
-      return list(workflows).flatMap((wf) => {
-        const dir = join(workflows, wf)
-        const file = join(dir, 'journal.jsonl')
-        if (!existsSync(file)) return []
-        const record = readJson(join(projectsDir, project, session, 'workflows', `${wf}.json`))
-        let args = record?.args ?? null
-        if (typeof args === 'string')
-          try {
-            args = JSON.parse(args)
-          } catch {
-            args = null
-          }
-        const facts = new Map()
-        const factsOf = (id) => {
-          if (typeof id !== 'string' || !AGENT_ID.test(id)) return agentFacts(null, null)
-          if (!facts.has(id)) {
-            const transcript = join(dir, `agent-${id}.jsonl`)
-            facts.set(id, agentFacts(readJson(join(dir, `agent-${id}.meta.json`)), existsSync(transcript) ? readJsonl(transcript) : null))
-          }
-          return facts.get(id)
+export function readJournals(sessionsDir) {
+  return list(sessionsDir).flatMap((session) => {
+    const dir = join(sessionsDir, session, 'files', 'workflow-agents')
+    const files = list(dir).filter((f) => RUN_FILE.test(f))
+    if (!files.length) return []
+    const { agents: started } = existsSync(join(sessionsDir, session, 'events.jsonl')) ? subagentsOf(sessionEvents(sessionsDir, session)) : { agents: new Map() }
+    const ran = new Map()
+    for (const a of started.values()) if (a.workflowRunId) ran.set(`${a.workflowRunId}\0${a.agentDisplayName}`, a)
+    return files.map((f) => {
+      const run = f.slice(0, -'.jsonl'.length)
+      const records = readJsonl(join(dir, f))
+      const header = records.find((r) => r.type === 'run')
+      const byKey = new Map()
+      for (const r of records.filter((r) => r.type === 'agent' && typeof r.label === 'string')) byKey.set(`${r.label}\0${r.prompt_sha256}`, r)
+      const agents = [...byKey.values()].map((r) => {
+        const actual = ran.get(`${run}\0${r.label}`)
+        return {
+          label: r.label,
+          model: actual?.model ?? r.model ?? 'unknown',
+          effort: actual?.effort ?? r.effort ?? 'unknown',
+          prompt: r.prompt_sha256 ?? null,
+          result: r.result ?? null,
+          finding: r.finding ?? null,
         }
-        return [{ wf, workflow: record?.workflowName ?? null, args: args && typeof args === 'object' ? args : null, entries: readJsonl(file), factsOf }]
       })
-    }),
-  )
+      return { run, workflow: header?.workflow ?? null, args: header ? { reviewStep: header.reviewStep, issue: header.issue } : null, agents }
+    })
+  })
 }
 
 // ---------- bands ----------
 const ISSUE_ID = /^[a-z0-9.-]+$/
-const ISSUE_IN_PROMPT = /\(bd issue: ([a-z0-9.-]+)/
 
-/** The bd issue a workflow worked on: its run record's reviewStep (as its run) or issue, else one named in a prompt. */
-export function runOf(args, prompts) {
+/** The bd issue a workflow worked on: its run record's reviewStep (as its run), else its issue. */
+export function runOf(args) {
   if (typeof args?.reviewStep === 'string') return args.reviewStep.replace(/\.review$/, '')
   if (typeof args?.issue === 'string') return args.issue
-  for (const p of prompts ?? []) {
-    const m = ISSUE_IN_PROMPT.exec(p ?? '')
-    if (m) return m[1]
-  }
   return null
 }
 
@@ -497,7 +383,7 @@ export function bandOf(id, bd, cache = new Map()) {
 const side = (p) => ({ label: p.label, model: p.model, effort: p.effort, findings: p.findings.length })
 
 /**
- * The report over journals ({ wf, workflow, args, entries, factsOf }), with bands from bd: counts, JSON-safe pairs (labels,
+ * The report over journals (as readJournals gives them), with bands from bd: counts, JSON-safe pairs (labels,
  * models, efforts and counts, never claims or prompts) and rows for both views.
  */
 export function report({ journals, bd }) {
@@ -508,7 +394,7 @@ export function report({ journals, bd }) {
   let passes = 0
   let failed = 0
   for (const journal of journals) {
-    const ps = passesOf(journal, journal.factsOf)
+    const ps = passesOf(journal)
     passes += ps.length
     failed += ps.filter((p) => p.failed).length
     const got = pairPasses(ps)
@@ -516,8 +402,8 @@ export function report({ journals, bd }) {
     skipped.failed += got.skipped.failed
     // Only journals with pairs need validators and a band, which saves a bd call per other workflow.
     if (!got.pairs.length) continue
-    const verdicts = validatorsOf(journal, journal.factsOf)
-    const run = runOf(journal.args, ps.map((p) => p.prompt))
+    const verdicts = validatorsOf(journal)
+    const run = runOf(journal.args)
     const { band, source } = run ? bandOf(run, bd, cache) : { band: 'unknown', source: null }
     for (const pair of got.pairs) {
       observations.push(...observe(pair, band, verdicts))
@@ -525,13 +411,12 @@ export function report({ journals, bd }) {
       pairs.push({
         run,
         workflow: journal.workflow,
-        wf: journal.wf,
+        wf: journal.run,
         source: pair.source,
         kind: pair.a.kind,
         round: pair.a.round,
         band,
         bandSource: source,
-        prompt: pair.prompt,
         a: side(pair.a),
         b: side(pair.b),
         matched: m.matches.length,
@@ -558,7 +443,7 @@ function mainCheckout() {
 
 function main(argv) {
   const opt = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined)
-  const projectsDir = opt('--projects') ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'projects')
+  const sessionsDir = opt('--sessions') ?? join(process.env.COPILOT_HOME ?? join(homedir(), '.copilot'), 'session-state')
   const root = opt('--root') ?? mainCheckout()
   const run = bdRunner(root)
   // An issue bd doesn't know just has no band. Any other failure means bd itself is unavailable: say so once and stop
@@ -575,7 +460,7 @@ function main(argv) {
       throw e
     }
   }
-  const result = report({ journals: readJournals(projectsDir, root), bd })
+  const result = report({ journals: readJournals(sessionsDir), bd })
   process.stdout.write(`${argv.includes('--json') ? JSON.stringify(result, null, 2) : render(result)}\n`)
 }
 

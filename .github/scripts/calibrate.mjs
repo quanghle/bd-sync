@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 // The evidence for changing how complexity is judged and which model and effort each role gets: every change playbook
 // run's complexity estimate and judged complexity, its score, the findings its review filed, and who did the work with
-// which model and effort at what (notional) cost and for how long: agent active time (first request to the end of the last,
+// which model and effort at what cost (Copilot AI credits, as USD) and for how long: agent active time (first request to the end of the last,
 // per agent and step) next to cost, each step's elapsed time, and the human wait at gates (armed to resolved), apart.
 //
-//   node .claude/scripts/calibrate.mjs [--root <checkout>] [--projects <dir>] [--json] [--write]
+//   node .github/scripts/calibrate.mjs [--root <checkout>] [--sessions <dir>] [--json] [--write]
 //
 // Read-only unless --write, which stores a backfilled trace as the work metadata of a run that has none. Traces come from
-// the run's work metadata, else from trace-run on this machine's transcripts. Costs use .claude/scripts/prices.json. Timing
+// the run's work metadata, else from trace-run on this machine's session logs. Costs are the AI credits Copilot logged per
+// request (1 credit = $0.01); a stored trace without them is unpriced. Timing
 // (step elapsed times, gate waits) is read from the bd list at report time, not from the stored trace, which is written
 // before the run's last steps and its score gate close.
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -38,23 +38,11 @@ export function roleOf(agent) {
 }
 
 // ---------- cost ----------
-/**
- * Notional USD for a token count under the price table; null when the model has no price. Unknown output costs 0 here and
- * is counted apart. Cache writes to the 1-hour cache (cache_write_1h, part of cache_write) cost more than 5-minute ones.
- */
-export function costOf(model, tokens, prices) {
-  const p = prices.models[model]
-  if (!p) return null
-  const m = 1e-6
-  const hour = tokens.cache_write_1h ?? 0
-  return (
-    tokens.input * p.input * m +
-    tokens.cache_read * p.cache_read * m +
-    (tokens.cache_write - hour) * p.input * prices.cache_write_multiplier * m +
-    hour * p.input * (prices.cache_write_1h_multiplier ?? prices.cache_write_multiplier) * m +
-    tokens.output * p.output * m
-  )
-}
+const USD_PER_CREDIT = 0.01
+const NANO = 1e9
+
+/** USD for a token count from the AI credits it cost (nano_aiu); null when the trace recorded none (an older trace). */
+export const costOf = (tokens) => (typeof tokens?.nano_aiu === 'number' ? (tokens.nano_aiu / NANO) * USD_PER_CREDIT : null)
 
 /** Why a trace can't stand for the run's work, or null when it can. */
 export function untracedWhy(work) {
@@ -158,7 +146,7 @@ export function overlaps(runs) {
 }
 
 /** The joined runs reduced to what a rules review reads. */
-export function aggregate(runs, prices) {
+export function aggregate(runs) {
   const overlap = overlaps(runs)
   const withGap = runs.filter((r) => r.estimate != null && complexityOf(r) != null)
   const gaps = withGap.map((r) => complexityOf(r) - r.estimate)
@@ -180,20 +168,18 @@ export function aggregate(runs, prices) {
   const runCosts = new Map()
   for (const r of runs)
     for (const a of agentsOf(r)) {
-      const c = costOf(a.model, a.tokens, prices)
-      const rc = runCosts.get(r.id) ?? { cost: 0, outputUnknown: 0, unpriced: 0 }
-      rc.outputUnknown += a.tokens.output_unknown ?? 0
+      const c = costOf(a.tokens)
+      const rc = runCosts.get(r.id) ?? { cost: 0, unpriced: 0 }
       if (c == null) rc.unpriced += a.requests
       else rc.cost += c
       runCosts.set(r.id, rc)
       // An overlapping run's requests are already in the run kept for its group.
       if (overlap.excluded.has(r.id)) continue
       const key = `${roleOf(a)}\0${a.model}\0${a.effort}`
-      const x = roles.get(key) ?? { role: roleOf(a), model: a.model, effort: a.effort, runs: new Set(), requests: 0, cost: 0, activeMs: 0, unpriced: 0, outputUnknown: 0 }
+      const x = roles.get(key) ?? { role: roleOf(a), model: a.model, effort: a.effort, runs: new Set(), requests: 0, cost: 0, activeMs: 0, unpriced: 0 }
       x.runs.add(r.id)
       x.requests += a.requests
       x.activeMs += activeMs(a)
-      x.outputUnknown += a.tokens.output_unknown ?? 0
       if (c == null) x.unpriced += a.requests
       else x.cost += c
       roles.set(key, x)
@@ -264,18 +250,17 @@ export function aggregate(runs, prices) {
 const n = (x, digits = 1) => (x == null ? '–' : Number.isInteger(x) ? String(x) : x.toFixed(digits))
 const usd = (x) => (x == null ? '–' : `$${x.toFixed(2)}`)
 const k = (x) => (x >= 1000 ? `${Math.round(x / 1000)}k` : String(x))
-const runCost = (c) =>
-  c ? usd(c.cost) + (c.outputUnknown ? ` + ${c.outputUnknown} req output unknown` : '') + (c.unpriced ? ` + ${c.unpriced} req unpriced` : '') : '–'
+const runCost = (c) => (c ? usd(c.cost) + (c.unpriced ? ` + ${c.unpriced} req unpriced` : '') : '–')
 const dur = fmtDuration
 const table = (head, rows) => [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`, ...rows.map((r) => `| ${r.join(' | ')} |`)].join('\n')
 
 /** The report as markdown. */
-export function render(runs, agg, prices) {
+export function render(runs, agg) {
   const gapCell = (r) => (r.estimate != null && complexityOf(r) != null ? n(complexityOf(r) - r.estimate) : '–')
   return [
     `# Calibration report`,
     ``,
-    `${agg.runs} change playbook runs: ${agg.scored} scored, ${agg.traced} traced. Costs are notional (${prices.source}).`,
+    `${agg.runs} change playbook runs: ${agg.scored} scored, ${agg.traced} traced. Costs are Copilot AI credits as USD (1 credit = $0.01).`,
     ``,
     `## Runs`,
     ``,
@@ -337,7 +322,7 @@ export function render(runs, agg, prices) {
     ``,
     agg.roles.length
       ? table(
-          ['role', 'model', 'effort', 'runs', 'requests', 'cost', 'agent time', 'output unknown (req)'],
+          ['role', 'model', 'effort', 'runs', 'requests', 'cost', 'agent time'],
           agg.roles.map((x) => [
             x.role,
             x.model,
@@ -346,14 +331,13 @@ export function render(runs, agg, prices) {
             x.requests,
             usd(x.cost) + (x.unpriced ? ` + ${x.unpriced} req unpriced` : ''),
             dur(x.activeMs),
-            x.outputUnknown,
           ]),
         )
       : 'No traced runs.',
     ``,
-    `Roles come from agent labels (main thread, workflow roles, subagent descriptions); "other" is a subagent whose description names no role. Output is priced only where the transcript recorded it (most subagent and workflow requests don't), so those costs are low by the unknown output. ${prices.note}`,
+    `Roles come from agent labels (main thread, workflow roles, subagent descriptions); "other" is a subagent whose description names no role. A request with no logged credits (a trace stored by an older version) is unpriced, so its cost is low.`,
     ``,
-    `Agent time is the primary time figure: each agent's span from its first request to the end of its last, per step, summed (parallel agents add up, like cost; a main thread's span includes time it waited on its own agents or on a person). Request end times are approximate: subagent transcripts record no response stop, so the last entry written stands in, and traces stored before end times were recorded stop at the last request's start. Elapsed (a step: its claim or the previous step's close, whichever is earlier, to its close; a run: created to last close) includes idle gaps and is context only. Human wait (human gates, armed to resolved) is counted apart from both.`,
+    `Agent time is the primary time figure: each agent's span from its first request to the end of its last, per step, summed (parallel agents add up, like cost; a main thread's span includes time it waited on its own agents or on a person). A request's start is its record's time less its duration; traces stored before end times were recorded stop at the last request's start. Elapsed (a step: its claim or the previous step's close, whichever is earlier, to its close; a run: created to last close) includes idle gaps and is context only. Human wait (human gates, armed to resolved) is counted apart from both.`,
     ...(agg.overlaps.groups.length
       ? [
           ``,
@@ -373,9 +357,8 @@ export function render(runs, agg, prices) {
 function main(argv) {
   const opt = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined)
   const root = opt('--root')
-  const projectsDir = opt('--projects') ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'projects')
+  const sessionsDir = opt('--sessions') ?? join(process.env.COPILOT_HOME ?? join(homedir(), '.copilot'), 'session-state')
   const bd = bdRunner(root)
-  const prices = JSON.parse(readFileSync(fileURLToPath(new URL('./prices.json', import.meta.url)), 'utf8'))
   const issues = bd(['list', '--all', '-n', '0'])
   // A run without a review step has no follow-ups; any other failure leaves the count unknown, not zero.
   const followUpsOf = (step) => {
@@ -389,7 +372,7 @@ function main(argv) {
   }
   const traceOf = (id) => {
     try {
-      const work = trace(readRecord(id, bd), { projectsDir })
+      const work = trace(readRecord(id, bd), { sessionsDir })
       const why = untracedWhy(work)
       return why ? { work: null, why } : { work, why: null }
     } catch (e) {
@@ -397,8 +380,8 @@ function main(argv) {
     }
   }
   const runs = joinRuns(issues, { followUpsOf, traceOf })
-  const agg = aggregate(runs, prices)
-  process.stdout.write(`${argv.includes('--json') ? JSON.stringify({ runs, aggregate: agg }, null, 2) : render(runs, agg, prices)}\n`)
+  const agg = aggregate(runs)
+  process.stdout.write(`${argv.includes('--json') ? JSON.stringify({ runs, aggregate: agg }, null, 2) : render(runs, agg)}\n`)
   // Only finished runs: a backfill of an open run misses its remaining work and would stand in for it as 'stored'.
   if (argv.includes('--write'))
     for (const { id, work } of runs.filter((r) => r.traced === 'backfilled'))

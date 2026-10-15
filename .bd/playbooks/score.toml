@@ -1,6 +1,6 @@
-# Score how well an agent did on an issue, against .bd/rubric.md: Fable judges, a person confirms.
+# Score how well an agent did on an issue, against .bd/rubric.md: a judge model scores, a person confirms.
 # Preview with: bd playbook plan score --var issue=<id>
-description = "Score agent work on an issue: Fable drafts a score against .bd/rubric.md, a person confirms or adjusts it"
+description = "Score agent work on an issue: a judge model drafts a score against .bd/rubric.md, a person confirms or adjusts it"
 title = "Score {{issue}}"
 
 [vars.issue]
@@ -15,11 +15,11 @@ default = "Quang Le"
 id = "judge"
 title = "Judge {{issue}}"
 description = """
-Run the score-issue workflow (.claude/workflows/score-issue.js; Claude Code, where the judge model
-fable is available) with issue={{issue}} and actor=<your bd actor>. Pass range when the change is
+Run the score-issue workflow (the Copilot CLI extension .github/extensions/score-issue/; its judge
+is gpt-6-astra) with issue={{issue}} and actor=<your bd actor>. Pass range when the change is
 known (e.g. main..<branch>), result when a plan-implement-review run did the work, and context for
 anything a person had to correct. It stores the draft as {{issue}}'s score_judge metadata and
-comments its reasoning there. Do not score it yourself: the judge is Fable."""
+comments its reasoning there. Do not score it yourself: the judge is gpt-6-astra."""
 acceptance_criteria = "{{issue}} has score_judge metadata and the judge's comment; the close reason gives the overall score and confidence."
 
 [[steps]]

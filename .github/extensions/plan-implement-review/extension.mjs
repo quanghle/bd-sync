@@ -1,6 +1,8 @@
 // Copilot CLI port of .claude/workflows/plan-implement-review.js: the same planner → coder → gate →
 // review → validate → triage → fix loop, with a decision ledger that stops circular fixes.
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { defineWorkflow, joinSession } from "@github/copilot-sdk/extension";
 
 // ---------- schemas ----------
@@ -370,13 +372,38 @@ function parseArgs(raw) {
     };
 }
 
+// Copilot exposes neither a workflow agent's prompt nor its result after the run, and the reviewer-catch script
+// (.github/scripts/reviewer-catch.mjs) needs both to pair reviewers. So each review and validate agent is also appended, as a
+// JSON line, to <session folder>/files/workflow-agents/<run id>.jsonl: the label, the models and efforts asked for, a
+// hash of the prompt (never the prompt), the result and, for a validator, the finding it judged. The folder is set once
+// the session has joined; without it nothing is recorded.
+let sessionDir;
+const recordAgent = (run, entry) => {
+    if (!sessionDir || !run) return;
+    try {
+        const dir = join(sessionDir, "files", "workflow-agents");
+        mkdirSync(dir, { recursive: true });
+        appendFileSync(join(dir, `${run}.jsonl`), `${JSON.stringify({ run, ...entry })}\n`);
+    } catch {
+        // Evidence for a report: never worth failing a review.
+    }
+};
+const RECORDED = /^(review|validate):/;
+
 async function run(ctx) {
     const { A, TASK, BASE, MAX_ROUNDS, MAX_GATE_FIXES, MAX_PLAN_REVISIONS, MAX_AMENDMENTS, TTL, SHADOWS, CODER_OPTS } = parseArgs(ctx.args);
 
     // Workflow subagents: `kind` picks the built-in agent, `effort` its reasoning effort, `model` a Copilot model id.
     // Identical prompt + options are memoized into one subagent, so labels must be unique per call.
-    const agent = (prompt, { label, kind = "general-purpose", effort, model, schema }) =>
-        ctx.agent(prompt, { label, agent: kind, schema, ...(model ? { model } : {}), ...(effort ? { reasoningEffort: effort } : {}) });
+    const agent = async (prompt, { label, kind = "general-purpose", effort, model, schema, finding }) => {
+        const result = await ctx.agent(prompt, { label, agent: kind, schema, ...(model ? { model } : {}), ...(effort ? { reasoningEffort: effort } : {}) });
+        if (RECORDED.test(label)) {
+            const prompt_sha256 = createHash("sha256").update(prompt).digest("hex");
+            recordAgent(ctx.runId, { type: "agent", label, kind, model: model ?? null, effort: effort ?? null, prompt_sha256, result, ...(finding ? { finding } : {}) });
+        }
+        return result;
+    };
+    recordAgent(ctx.runId, { type: "run", workflow: "plan-implement-review", reviewStep: A.reviewStep ?? null, issue: A.issue ?? null, tier: A.tier ?? null });
 
     // Mechanical agents (claim, heartbeat, bd:root, setup, gate, bd records) only run commands and report output: the task
     // agent at low effort. One that fails its schema (null, or a result its caller rejects) is escalated once to the
@@ -832,7 +859,7 @@ async function run(ctx) {
                     `If fixing it would undo or contradict a ledger entry, list that id in conflictsWith; such a finding is valid only if the entry ` +
                     `itself causes a concrete defect. A finding that restates an already decided one is valid=false. If uncertain, valid=false. ` +
                     `If blocking, write a precise minimal fixInstruction.`,
-                { label: `validate:r${round}:${ids[i]}`, effort: "high", schema: VERDICT },
+                { label: `validate:r${round}:${ids[i]}`, effort: "high", schema: VERDICT, finding: { file: f.file, line: f.line ?? null, claim: f.claim } },
             ).then((v) => (v ? { ...f, id: ids[i], round, ...v } : { ...f, id: ids[i], round, unvalidated: true })),
         );
     }
@@ -1183,4 +1210,5 @@ const planImplementReview = defineWorkflow({
     run: async (ctx) => JSON.parse(JSON.stringify((await run(ctx)) ?? null)),
 });
 
-await joinSession({ workflows: [planImplementReview] });
+const session = await joinSession({ workflows: [planImplementReview] });
+sessionDir = session.workspacePath;

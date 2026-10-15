@@ -372,7 +372,8 @@ mod tests {
             assert!(MANIFEST_FIELDS.contains(&key.as_str()), "plugin.json: {key} is not a manifest field");
         }
         assert!(plugin.get("version").is_none(), "installs track commits");
-        let skill = PLUGIN_SKILL;
+        // A Windows checkout may have CRLF line endings.
+        let skill = PLUGIN_SKILL.replace("\r\n", "\n");
         let front = skill.strip_prefix("---\n").and_then(|s| s.split_once("\n---\n")).map(|(f, _)| f).unwrap();
         assert!(front.lines().any(|l| l == "name: bd"), "{front}");
         assert!(front.lines().any(|l| l.starts_with("description: ")), "{front}");

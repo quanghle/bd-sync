@@ -229,10 +229,14 @@ main() {
 
     mkdir "$bd_tmp/x"
     tar -xzf "$bd_tmp/$m_asset" -C "$bd_tmp/x" bd || die "cannot extract bd from $m_asset"
-    [ -f "$bd_tmp/x/bd" ] && [ ! -L "$bd_tmp/x/bd" ] || die "$m_asset does not hold a regular file named bd"
+    if [ ! -f "$bd_tmp/x/bd" ] || [ -L "$bd_tmp/x/bd" ]; then
+        die "$m_asset does not hold a regular file named bd"
+    fi
 
     mkdir -p "$m_dir" 2>/dev/null || die "cannot create $m_dir; set BD_INSTALL_DIR (or pass --dir) to a directory you can write"
-    [ -d "$m_dir" ] && [ -w "$m_dir" ] || die "$m_dir is not writable; set BD_INSTALL_DIR (or pass --dir) to a directory you can write"
+    if [ ! -d "$m_dir" ] || [ ! -w "$m_dir" ]; then
+        die "$m_dir is not writable; set BD_INSTALL_DIR (or pass --dir) to a directory you can write"
+    fi
     m_stage=$m_dir/.bd.tmp.$$
     # Clean up the staged copy if anything below fails.
     if ! { cp "$bd_tmp/x/bd" "$m_stage" && chmod 0755 "$m_stage" && mv -f "$m_stage" "$m_dir/bd"; }; then

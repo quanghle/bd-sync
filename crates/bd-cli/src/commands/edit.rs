@@ -97,8 +97,11 @@ fn run_editor(editor: &str, path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         // Through the shell, as git does, so a value like `code --wait` works.
+        // A Ctrl-C reaches the shell too; one that waits on the editor (dash
+        // does, bash execs it) must outlive it. A trap, not an ignored
+        // signal, so the editor starts with Ctrl-C's default again.
         cmd = std::process::Command::new("sh");
-        cmd.arg("-c").arg(format!("{editor} \"$@\"")).arg(editor).arg(path);
+        cmd.arg("-c").arg(format!("trap : INT; {editor} \"$@\"")).arg(editor).arg(path);
     }
     #[cfg(windows)]
     {

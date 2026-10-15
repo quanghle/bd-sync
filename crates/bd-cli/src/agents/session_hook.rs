@@ -381,9 +381,14 @@ fn read_json(path: &Path) -> Option<Value> {
 const MAX_READ: u64 = 4 << 20;
 
 fn shown(root: &Path, path: &Path) -> String {
-    match path.strip_prefix(root) {
-        Ok(rel) => rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"),
-        Err(_) => path.display().to_string(),
+    // The root may be canonical while the path is not (macOS's /var is /private/var): compare them canonical too.
+    let canonical = || {
+        let (root, path) = (std::fs::canonicalize(root).ok()?, std::fs::canonicalize(path).ok()?);
+        path.strip_prefix(root).ok().map(Path::to_path_buf)
+    };
+    match path.strip_prefix(root).ok().map(Path::to_path_buf).or_else(canonical) {
+        Some(rel) => rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"),
+        None => path.display().to_string(),
     }
 }
 
@@ -821,7 +826,8 @@ mod tests {
         std::fs::write(cache.join("abc123/hooks/hooks.json"), &hooks).unwrap();
         let r = ensure(&checkout, Harness::Claude, true, &homes).unwrap();
         assert_eq!(r.state, HookState::Present);
-        assert_eq!(r.file, cache.join("abc123/hooks/hooks.json").display().to_string());
+        // Compared as paths: on Windows the expected one mixes '/' and '\'.
+        assert_eq!(Path::new(&r.file), cache.join("abc123/hooks/hooks.json"));
         let rel = ".claude/settings.json";
         let o = ensure_entries(
             dir.path(),

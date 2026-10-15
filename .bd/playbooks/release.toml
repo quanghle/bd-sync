@@ -104,11 +104,25 @@ title = "Release workflow for v{{version}} succeeds"
 description = "Opened by bd gate check when the release.yml run for tag v{{version}} succeeds; escalates if it fails, is cancelled, or takes over 3h."
 
 [[steps]]
+id = "packaging"
+title = "Check the rendered packaging for v{{version}}"
+needs = ["verify"]
+description = """
+The release workflow's "Render packaging" job uploads the artifact packaging-v{{version}} (nothing is published):
+  gh run download <run-id> --repo {{repo}} --name packaging-v{{version}} --dir packaging
+Check that homebrew/bd.rb, the winget manifests and the npm package.json files and tarballs carry
+{{version}}, and that the checksums in bd.rb and the winget installer manifest equal the lines of the
+release's SHA256SUMS (gh release download v{{version}} --repo {{repo}} --pattern SHA256SUMS).
+Publishing them (a Homebrew tap, winget-pkgs, npm) is by hand, only if desired: RELEASING.md, "Packaging"."""
+acceptance_criteria = "The packaging artifact exists and carries version {{version}} and the release's checksums."
+
+[[steps]]
 id = "announce"
 title = "Final check and announce v{{version}}"
-needs = ["push", "verify"]
+needs = ["push", "verify", "packaging"]
 description = """
-1. Install from the release on one machine as docs/install.md describes; bd version prints {{version}}.
+1. Install from the release on one machine: BD_INSTALL_DIR=$(mktemp -d) sh scripts/install.sh --version v{{version}}
+   (docs/install.md describes the script); the installed bd --version prints {{version}}.
 2. Put the highlights from "notes" on top of the generated notes:
      gh release view v{{version}} --repo {{repo}} --json body --jq .body > notes.md
      (edit notes.md)

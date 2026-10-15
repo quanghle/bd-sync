@@ -158,3 +158,77 @@ pub struct CommentAddArgs {
     #[arg(long)]
     pub stdin: bool,
 }
+
+pub const DUPLICATE_LONG_ABOUT: &str = "\
+Close an issue as a duplicate of another
+
+Adds the edge ID -> CANONICAL of type `duplicates` and closes ID in one
+transaction, with outcome done and the reason `duplicate of CANONICAL`. Nothing
+else moves: the children, labels, comments and other edges of ID stay on ID,
+and CANONICAL is not touched. As in beads, the edge points from the closed
+issue to the one that replaces it.
+
+Refused, with nothing written: an issue that is its own duplicate; a CANONICAL
+that is closed as a duplicate itself (name its root instead) or a duplicate of
+ID; an ID that is closed already, unless it has this edge (then nothing
+changes); another type of edge between the two; open children or blockers on
+ID, unless --force; another actor's live claim on ID, unless --take-over; and
+a failed --if-* guard (exit 13).";
+
+const DUPLICATE_EXAMPLES: &str = "\
+Examples:
+  bd duplicate bd-14 --of bd-12
+  bd duplicate bd-14 --of bd-12 --take-over --if-revision 3";
+
+pub const SUPERSEDE_LONG_ABOUT: &str = "\
+Close an issue as superseded by another
+
+Adds the edge ID -> NEWER of type `supersedes` (read: ID is superseded by
+NEWER) and closes ID in one transaction, with outcome done and the reason
+`superseded by NEWER`. Nothing else moves: the children, labels, comments and
+other edges of ID stay on ID, and NEWER is not touched. As in beads, the edge
+points from the closed issue to the one that replaces it.
+
+Refused, with nothing written: an issue that supersedes itself; a NEWER that is
+closed as superseded itself (name its root instead) or superseded by ID; an ID
+that is closed already, unless it has this edge (then nothing changes); another
+type of edge between the two; open children or blockers on ID, unless --force;
+another actor's live claim on ID, unless --take-over; and a failed --if-*
+guard (exit 13).";
+
+const SUPERSEDE_EXAMPLES: &str = "\
+Examples:
+  bd supersede bd-12 --with bd-20
+  bd supersede bd-12 --with bd-20 --force";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = DUPLICATE_EXAMPLES)]
+pub struct DuplicateArgs {
+    /// Issue to close as a duplicate
+    pub id: String,
+    /// Issue that ID repeats and that stays open
+    #[arg(long, value_name = "ID", required = true)]
+    pub of: String,
+    #[arg(long, help = concat!("Close despite open children or blockers", force_claim_suffix!()))]
+    pub force: bool,
+    #[arg(long, help = concat!("Close another actor's live claim", take_over_suffix!()))]
+    pub take_over: bool,
+    #[command(flatten)]
+    pub guard: GuardArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = SUPERSEDE_EXAMPLES)]
+pub struct SupersedeArgs {
+    /// Issue to close as superseded
+    pub id: String,
+    /// Issue that replaces ID
+    #[arg(long = "with", value_name = "ID", required = true)]
+    pub with: String,
+    #[arg(long, help = concat!("Close despite open children or blockers", force_claim_suffix!()))]
+    pub force: bool,
+    #[arg(long, help = concat!("Close another actor's live claim", take_over_suffix!()))]
+    pub take_over: bool,
+    #[command(flatten)]
+    pub guard: GuardArgs,
+}

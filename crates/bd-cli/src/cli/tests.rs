@@ -190,10 +190,18 @@ fn shared_flags_are_worded_alike() {
             assert_eq!(help(flag(&root, path, long)), expected, "`{path} --{long}`");
         }
     };
-    same(&[("bd claim", "ttl"), ("bd heartbeat", "ttl")], TTL_HELP);
+    same(&[("bd claim", "ttl"), ("bd heartbeat", "ttl"), ("bd close", "ttl")], TTL_HELP);
     same(&[("bd heartbeat", "token"), ("bd close", "token"), ("bd release", "token")], FENCING_TOKEN_HELP);
     same(
-        &[("bd list", "limit"), ("bd ready", "limit"), ("bd blocked", "limit"), ("bd playbook runs", "limit")],
+        &[
+            ("bd list", "limit"),
+            ("bd query", "limit"),
+            ("bd ready", "limit"),
+            ("bd stale", "limit"),
+            ("bd blocked", "limit"),
+            ("bd playbook runs", "limit"),
+            ("bd find-duplicates", "limit"),
+        ],
         LIMIT_HELP,
     );
     assert_eq!(
@@ -230,10 +238,12 @@ fn duration_and_time_flags_name_their_value() {
     const DURATION: &[(&str, &str)] = &[
         ("bd claim", "ttl"),
         ("bd heartbeat", "ttl"),
+        ("bd close", "ttl"),
         ("bd reclaim", "grace"),
         ("bd events", "wait"),
         ("bd events prune", "older-than"),
         ("bd purge", "older-than"),
+        ("bd compact", "older-than"),
         ("bd gate create", "timeout"),
         ("bd agents watch", "interval"),
         ("bd serve", "reclaim-every"),
@@ -243,6 +253,8 @@ fn duration_and_time_flags_name_their_value() {
         ("bd serve", "backup-every"),
         ("bd serve", "max-wait"),
         ("bd serve token events", "since"),
+        ("bd list", "stale"),
+        ("bd ready", "stale"),
     ];
     const TIME: &[(&str, &str)] = &[
         ("bd create", "due"),
@@ -250,6 +262,17 @@ fn duration_and_time_flags_name_their_value() {
         ("bd update", "due"),
         ("bd update", "defer"),
         ("bd defer", "until"),
+        ("bd show", "as-of"),
+        ("bd list", "created-after"),
+        ("bd list", "created-before"),
+        ("bd list", "updated-after"),
+        ("bd list", "updated-before"),
+        ("bd list", "closed-after"),
+        ("bd list", "closed-before"),
+        ("bd ready", "created-after"),
+        ("bd ready", "created-before"),
+        ("bd ready", "updated-after"),
+        ("bd ready", "updated-before"),
     ];
     let root = cli();
     let value_name =
@@ -318,9 +341,20 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd reclaim",
         "bd defer",
         "bd ready",
+        "bd query",
+        "bd epic status",
+        "bd epic close-eligible",
+        "bd stale",
+        "bd orphans",
+        "bd graph",
         "bd create",
+        "bd q",
         "bd update",
+        "bd edit",
         "bd close",
+        "bd duplicate",
+        "bd supersede",
+        "bd find-duplicates",
         "bd dep add",
         "bd events",
         "bd events prune",
@@ -330,6 +364,7 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd export",
         "bd backup",
         "bd purge",
+        "bd compact",
         "bd doctor",
         "bd playbook plan",
         "bd playbook run",
@@ -339,12 +374,17 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd gate create",
         "bd gate check",
         "bd gate resolve",
+        "bd github status",
+        "bd github pull",
+        "bd github push",
+        "bd github sync",
         "bd agents status",
         "bd agents pull",
         "bd agents approve",
         "bd agents watch",
         "bd agents manifest",
         "bd hook session-start",
+        "bd setup",
         "bd mcp",
         "bd serve",
         "bd serve check",
@@ -355,6 +395,7 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd remote set",
         "bd remote login",
         "bd remote logout",
+        "bd completion",
     ] {
         let cmd = command(&root, path);
         assert!(cmd.get_long_about().is_some(), "`{path}` has no long help");

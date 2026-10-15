@@ -1,0 +1,41 @@
+{
+  "description": "bd: session context (again after compaction) and subagent actors",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bd hook session-start --harness claude"
+          },
+          {
+            "type": "command",
+            "command": "bd prime --hook claude"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bd hook subagent-start || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(bd *)",
+            "command": "bd hook pre-tool-use || true"
+          }
+        ]
+      }
+    ]
+  }
+}

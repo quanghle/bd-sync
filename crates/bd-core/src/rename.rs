@@ -42,7 +42,7 @@ use std::collections::HashMap;
 
 use rusqlite::params;
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::config;
 use crate::error::{Error, Result};
@@ -185,7 +185,11 @@ impl WriteCtx<'_> {
             for old in &olds {
                 out.claims += self.move_issue(old, &map[old])?;
             }
-            self.rewrite_references(&from, &to, &old_dash, &before_ids, &map, &mut out)?;
+            let rewritten = self.rewrite_references(&from, &to, &old_dash, &before_ids, &map, &mut out)?;
+            // After the payloads were rewritten, so these are recorded as written.
+            for (id, changes) in rewritten {
+                self.emit("references_renamed", Some(&id), json!({ "from": from, "to": to, "changes": changes }))?;
+            }
         }
 
         out.prefix_set = config::prefix(self.conn())? != to;
@@ -231,6 +235,12 @@ impl WriteCtx<'_> {
     /// the moves: JSON strings in issue and edge metadata and event payloads,
     /// and whole tokens in issue text, comments and memories. Rows are
     /// prefiltered by containing `<from>-` and written only when changed.
+    ///
+    /// Returns, for each issue whose text, close reason or metadata changed,
+    /// its id and those changes as `{old, new}`, the old value as the rewrite
+    /// of event payloads leaves it (a string equal to a renamed id is
+    /// renamed): what its `references_renamed` event records, so its history
+    /// reads the same forward and back (see `asof`).
     fn rewrite_references(
         &self,
         from: &str,
@@ -239,7 +249,7 @@ impl WriteCtx<'_> {
         before: &[String],
         map: &HashMap<String, String>,
         out: &mut RenamePrefixOutcome,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, Map<String, Value>)>> {
         let conn = self.conn();
         let rewrite_meta = |raw: &str, gate: bool| -> Option<String> {
             let mut v: Value = serde_json::from_str(raw).ok()?;
@@ -275,7 +285,9 @@ impl WriteCtx<'_> {
             })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
+        let mut rewritten = Vec::new();
         for (id, mut fields, mut close_reason, metadata) in issues {
+            let (old_fields, old_close_reason) = (fields.clone(), close_reason.clone());
             let mut text_changed = false;
             for f in fields.iter_mut() {
                 if let Some(new) = rewrite_text(f, from, to, map) {
@@ -293,6 +305,26 @@ impl WriteCtx<'_> {
             }
             out.text += usize::from(text_changed);
             out.metadata += usize::from(new_meta.is_some());
+            let mut changes = Map::new();
+            let mut record = |name: &str, old: Value, new: Value| {
+                let mut old = old;
+                rewrite_json(&mut old, map);
+                if old != new {
+                    changes.insert(name.to_string(), json!({ "old": old, "new": new }));
+                }
+            };
+            for (n, name) in ["title", "description", "design", "acceptance_criteria", "notes"].into_iter().enumerate()
+            {
+                record(name, json!(old_fields[n]), json!(fields[n]));
+            }
+            record("close_reason", json!(old_close_reason), json!(close_reason));
+            if let Some(new) = &new_meta {
+                let parse = |raw: &str| serde_json::from_str::<Value>(raw).unwrap_or_else(|_| json!({}));
+                record("metadata", parse(&metadata), parse(new));
+            }
+            if !changes.is_empty() {
+                rewritten.push((id.clone(), changes));
+            }
             let [title, description, design, acceptance_criteria, notes] = fields;
             conn.prepare_cached(
                 "UPDATE issues SET title = ?2, description = ?3, design = ?4, acceptance_criteria = ?5, notes = ?6,
@@ -365,12 +397,12 @@ impl WriteCtx<'_> {
                 out.events += 1;
             }
         }
-        Ok(())
+        Ok(rewritten)
     }
 }
 
 /// A character that may appear in an issue id (and so continues a token).
-fn is_id_char(c: u8) -> bool {
+pub(crate) fn is_id_char(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-')
 }
 
@@ -434,38 +466,56 @@ fn starts_with_ignore_case(s: &str, prefix: &str) -> bool {
 /// (trailing `.`, `-`, `_` trimmed), or its part before some `.`, is a key
 /// of `map`. Returns the new text only if something changed.
 pub(crate) fn rewrite_text(text: &str, from: &str, to: &str, map: &HashMap<String, String>) -> Option<String> {
-    let needle = format!("{from}-");
-    let bytes = text.as_bytes();
+    let needle_len = from.len() + 1;
     let mut out = String::new();
     let mut copied = 0; // bytes of `text` already in `out`
-    let mut at = 0;
-    while let Some(off) = text[at..].find(&needle) {
-        let start = at + off;
-        if start > 0 && is_id_char(bytes[start - 1]) {
-            at = start + 1;
-            continue;
-        }
-        let mut end = start;
-        while end < bytes.len() && is_id_char(bytes[end]) {
-            end += 1;
-        }
-        // Id characters are ASCII, so these are char boundaries.
-        let candidate = text[start..end].trim_end_matches(['.', '-', '_']);
+    for (start, candidate) in id_tokens(text, from) {
         let named = map.contains_key(candidate)
             || candidate.match_indices('.').any(|(dot, _)| map.contains_key(&candidate[..dot]));
         if named {
             out.push_str(&text[copied..start]);
             out.push_str(to);
             out.push('-');
-            copied = start + needle.len();
+            copied = start + needle_len;
         }
-        at = end;
     }
     if copied == 0 {
         return None;
     }
     out.push_str(&text[copied..]);
     Some(out)
+}
+
+/// The whole-token id references to `<prefix>-` ids in free text, with the
+/// byte offset each starts at: a maximal run of id characters (ASCII
+/// alphanumerics, `_`, `.`, `-`) that starts with `<prefix>-` and does not
+/// follow an id character, its trailing `.`, `-` and `_` trimmed (so `t-1.`
+/// at the end of a sentence is `t-1`). The token may be `<prefix>` alone
+/// when nothing follows the dash. Shared by `rename-prefix` and `bd orphans`.
+pub(crate) fn id_tokens<'a>(text: &'a str, prefix: &str) -> impl Iterator<Item = (usize, &'a str)> + use<'a> {
+    let needle = format!("{prefix}-");
+    let first = needle.chars().next().map_or(1, char::len_utf8);
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    std::iter::from_fn(move || {
+        while let Some(off) = text[at..].find(&needle) {
+            let start = at + off;
+            if start > 0 && is_id_char(bytes[start - 1]) {
+                at = start + first;
+                continue;
+            }
+            let mut end = start;
+            while end < bytes.len() && is_id_char(bytes[end]) {
+                end += 1;
+            }
+            // Never stand still, whatever the prefix is made of; for a
+            // prefix of id characters `end` is already past the needle.
+            at = end.max(start + needle.len());
+            // Id characters are ASCII, so these are char boundaries.
+            return Some((start, text[start..end].trim_end_matches(['.', '-', '_'])));
+        }
+        None
+    })
 }
 
 #[cfg(test)]
@@ -513,6 +563,19 @@ mod tests {
         // Nested prefixes: a kept `bd-sync-7` is not in the map.
         let nested = map(&[("bd-1", "bd-sync-1")]);
         assert_eq!(rewrite_text("bd-sync-7 bd-1", "bd", "bd-sync", &nested).as_deref(), Some("bd-sync-7 bd-sync-1"));
+    }
+
+    #[test]
+    fn id_tokens_are_whole_trimmed_tokens() {
+        fn tokens<'a>(text: &'a str, prefix: &str) -> Vec<(usize, &'a str)> {
+            id_tokens(text, prefix).collect()
+        }
+        assert_eq!(tokens("see t-1. (t-2) xt-3 t-4.5_ t-", "t"), [(4, "t-1"), (10, "t-2"), (20, "t-4.5"), (27, "t")]);
+        assert_eq!(tokens("ünï t-1", "t"), [(6, "t-1")]);
+        assert!(tokens("", "t").is_empty());
+        // A prefix of other characters never stalls the scan.
+        assert_eq!(tokens(" x- x-1", " x"), [(0, "")]);
+        assert_eq!(tokens("é-1 é-2", "é"), [(0, ""), (5, "")]);
     }
 
     #[test]

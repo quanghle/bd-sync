@@ -16,7 +16,6 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params};
@@ -102,12 +101,22 @@ impl TxStats {
     }
 }
 
-static BUSY_TIMEOUT_MS: AtomicU64 = AtomicU64::new(10_000);
-
 thread_local! {
+    /// How long [`busy_handler`] waits: the `busy_timeout` of the store this
+    /// thread last used ([`arm_busy_timeout`]). Per thread, not per process,
+    /// so stores opened with different timeouts (bd serve's requests, tests)
+    /// never shorten each other's waits.
+    static BUSY_TIMEOUT: Cell<Duration> = const { Cell::new(Duration::from_secs(10)) };
     static BUSY_STARTED: Cell<Option<Instant>> = const { Cell::new(None) };
     static BUSY_RETRIES: Cell<u32> = const { Cell::new(0) };
     static JITTER: Cell<u64> = Cell::new(jitter_seed());
+}
+
+/// Make [`busy_handler`] wait `opts.busy_timeout` on this thread: called
+/// before every statement a [`Store`] runs, as a store may move between
+/// threads.
+fn arm_busy_timeout(opts: &OpenOptions) {
+    BUSY_TIMEOUT.with(|c| c.set(opts.busy_timeout));
 }
 
 fn jitter_seed() -> u64 {
@@ -140,7 +149,7 @@ fn busy_handler(attempt: i32) -> bool {
         }
         (_, Some(t)) => t,
     });
-    if now.duration_since(started) >= Duration::from_millis(BUSY_TIMEOUT_MS.load(Ordering::Relaxed)) {
+    if now.duration_since(started) >= BUSY_TIMEOUT.with(Cell::get) {
         return false;
     }
     BUSY_RETRIES.with(|c| c.set(c.get().saturating_add(1)));
@@ -249,7 +258,7 @@ impl Store {
     }
 
     fn configure(conn: Connection, path: &Path, opts: OpenOptions) -> Result<Store> {
-        BUSY_TIMEOUT_MS.store(u64::try_from(opts.busy_timeout.as_millis()).unwrap_or(u64::MAX), Ordering::Relaxed);
+        arm_busy_timeout(&opts);
         conn.busy_handler(Some(busy_handler))?;
         let mode: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {
@@ -301,6 +310,7 @@ impl Store {
 
     /// Workspace metadata (`workspace_id`, `created_at`, `created_by_version`).
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        arm_busy_timeout(&self.opts);
         meta_get(&self.conn, key)
     }
 
@@ -310,6 +320,7 @@ impl Store {
 
     /// Run `f` against one consistent snapshot of the database.
     pub fn read<T>(&self, f: impl FnOnce(&ReadCtx<'_>) -> Result<T>) -> Result<T> {
+        arm_busy_timeout(&self.opts);
         let tx = self.conn.unchecked_transaction()?;
         let ctx = ReadCtx { conn: &tx, now: self.opts.clock.now() };
         let out = f(&ctx)?;
@@ -362,6 +373,7 @@ impl Store {
 
     /// Increment a durable observability counter in its own small transaction.
     pub fn bump_counter(&mut self, name: &str, delta: i64) -> Result<()> {
+        arm_busy_timeout(&self.opts);
         let tx = self.conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         bump_counter_in(&tx, name, delta)?;
         tx.commit()?;
@@ -370,6 +382,7 @@ impl Store {
 
     /// Truncate the WAL into the main database file.
     pub fn checkpoint(&self) -> Result<(i64, i64)> {
+        arm_busy_timeout(&self.opts);
         Ok(self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| Ok((r.get(1)?, r.get(2)?)))?)
     }
 
@@ -380,6 +393,7 @@ impl Store {
     /// owner may read it (mode 0600). It is checked (`quick_check`) and
     /// flushed to disk before this returns; on failure it is removed.
     pub fn snapshot(&self, dest: &Path) -> Result<()> {
+        arm_busy_timeout(&self.opts);
         snapshot(&self.conn, dest)
     }
 }
@@ -430,6 +444,7 @@ fn run_write<T>(
     f: impl FnOnce(&mut WriteCtx<'_>) -> Result<T>,
     begin: Instant,
 ) -> Result<(T, Option<TxStats>)> {
+    arm_busy_timeout(opts);
     BUSY_RETRIES.with(|c| c.set(0));
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| match Error::from(e) {
         Error::Busy(_) => {

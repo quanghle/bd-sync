@@ -5,6 +5,7 @@
 
 mod claims;
 mod config;
+mod edit;
 mod events;
 mod health;
 mod issues;
@@ -12,10 +13,12 @@ mod links;
 mod memory;
 mod prime;
 mod transfer;
+mod views;
 mod workspace;
 
 pub use claims::*;
 pub use config::*;
+pub use edit::*;
 pub use events::*;
 pub use health::*;
 pub use issues::*;
@@ -23,13 +26,37 @@ pub use links::*;
 pub use memory::*;
 pub use prime::*;
 pub use transfer::*;
+pub use views::*;
 pub use workspace::*;
 
-use bd_core::time::parse_when;
+use bd_core::time::{parse_duration, parse_filter_time, parse_when};
 use bd_core::{DepType, Error, Guard, Queries, Result, Status, Timestamp, WorkFilter};
 use serde_json::Value;
 
 use crate::cli::*;
+use crate::io;
+
+/// An I/O error naming the file it happened on.
+pub(crate) fn path_error(path: &std::path::Path, e: std::io::Error) -> Error {
+    Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
+/// Write `data` to the output file `path` named on the command line: under
+/// `bd serve` by sending it to the client, which writes it; locally through
+/// a sibling temp file moved over `path`, so a failure leaves no half file.
+pub fn write_output(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    if io::serving() {
+        return io::send_file(path, |w| Ok(w.write_all(data)?));
+    }
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".tmp");
+    let tmp = path.with_file_name(name);
+    std::fs::write(&tmp, data).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        path_error(&tmp, e)
+    })?;
+    io::replace_file(&tmp, path).map_err(|e| path_error(path, e))
+}
 
 pub fn filter_from<Q: Queries + ?Sized>(q: &Q, f: &FilterArgs) -> Result<WorkFilter> {
     let norm = |v: &[String]| v.iter().map(|t| t.trim().to_ascii_lowercase()).filter(|t| !t.is_empty()).collect();
@@ -44,8 +71,30 @@ pub fn filter_from<Q: Queries + ?Sized>(q: &Q, f: &FilterArgs) -> Result<WorkFil
         labels_any: f.labels_any.clone(),
         exclude_labels: f.exclude_labels.clone(),
         parent: f.parent.as_deref().map(|p| q.resolve_id(p)).transpose()?,
-        ids: Vec::new(),
+        ..Default::default()
     })
+}
+
+/// Parse a filter time given as `--<flag>`, naming the flag in the error.
+pub fn filter_time(flag: &str, v: &Option<String>, now: Timestamp) -> Result<Option<Timestamp>> {
+    v.as_deref().map(|s| parse_filter_time(s, now).map_err(|e| Error::invalid(format!("--{flag}: {e}")))).transpose()
+}
+
+/// Add the time and title filters of `bd list` and `bd ready` to `f`.
+pub fn time_filter_into<Q: Queries + ?Sized>(q: &Q, t: &TimeFilterArgs, f: &mut WorkFilter) -> Result<()> {
+    let now = q.now();
+    f.created_after = filter_time("created-after", &t.created_after, now)?;
+    f.created_before = filter_time("created-before", &t.created_before, now)?;
+    f.updated_after = filter_time("updated-after", &t.updated_after, now)?;
+    f.updated_before = filter_time("updated-before", &t.updated_before, now)?;
+    f.overdue_at = t.overdue.then_some(now);
+    f.stale_before = t
+        .stale
+        .as_deref()
+        .map(|s| parse_duration(s).map(|d| now.minus(d)).map_err(|e| Error::invalid(format!("--stale: {e}"))))
+        .transpose()?;
+    f.title_contains = t.title_contains.clone();
+    Ok(())
 }
 
 pub fn guard_from(g: &GuardArgs) -> Result<Guard> {

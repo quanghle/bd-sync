@@ -394,6 +394,80 @@ pub struct Comment {
     pub created_at: Timestamp,
 }
 
+/// Characters of the description a brief issue keeps (`show --brief`).
+pub const BRIEF_DESCRIPTION_CHARS: usize = 500;
+
+/// The fields an agent needs to choose an issue and start on it
+/// (`--brief`): key names as in [`Issue`], absent fields left out.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct IssueBrief {
+    pub id: String,
+    pub title: String,
+    pub status: Status,
+    pub priority: u8,
+    pub issue_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+}
+
+impl IssueBrief {
+    pub fn new(issue: &Issue, parent: Option<String>) -> Self {
+        IssueBrief {
+            id: issue.id.clone(),
+            title: issue.title.clone(),
+            status: issue.status,
+            priority: issue.priority,
+            issue_type: issue.issue_type.clone(),
+            assignee: issue.assignee.clone(),
+            parent,
+            labels: issue.labels.clone(),
+        }
+    }
+}
+
+/// A comment as a brief issue shows it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CommentBrief {
+    pub author: String,
+    pub text: String,
+    pub created_at: Timestamp,
+}
+
+impl From<Comment> for CommentBrief {
+    fn from(c: Comment) -> Self {
+        CommentBrief { author: c.author, text: c.text, created_at: c.created_at }
+    }
+}
+
+/// `show --brief`: the brief fields, the description cut to
+/// [`BRIEF_DESCRIPTION_CHARS`], the open blockers' ids and the last comments.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ShowBrief {
+    #[serde(flatten)]
+    pub brief: IssueBrief,
+    pub description: String,
+    #[serde(skip_serializing_if = "is_false")]
+    pub description_truncated: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<CommentBrief>,
+    pub comments_total: i64,
+}
+
+/// `text` cut on a character boundary to `max` characters, with `…` appended
+/// when cut, and whether it was.
+pub fn cut_chars(text: &str, max: usize) -> (String, bool) {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => (format!("{}…", &text[..at]), true),
+        None => (text.to_string(), false),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Memory {
     pub key: String,
@@ -648,7 +722,9 @@ impl SortPolicy {
     }
 }
 
-/// Filters shared by `ready`, `claim --next`, `list`, and `reclaim`.
+/// Filters shared by `ready`, `claim --next`, `list`, `blocked` and `reclaim`
+/// (the time and title fields are set only by `list` and `ready`). Each `_after`
+/// bound is inclusive and each `_before` bound exclusive.
 #[derive(Clone, Debug, Default)]
 pub struct WorkFilter {
     pub assignee: Option<String>,
@@ -664,6 +740,24 @@ pub struct WorkFilter {
     /// Only issues below this one in the parent-child hierarchy.
     pub parent: Option<String>,
     pub ids: Vec<String>,
+    /// Only issues created at or after this time.
+    pub created_after: Option<Timestamp>,
+    /// Only issues created before this time.
+    pub created_before: Option<Timestamp>,
+    /// Only issues last updated at or after this time.
+    pub updated_after: Option<Timestamp>,
+    /// Only issues last updated before this time.
+    pub updated_before: Option<Timestamp>,
+    /// Only issues closed at or after this time (so only closed issues).
+    pub closed_after: Option<Timestamp>,
+    /// Only issues closed before this time (so only closed issues).
+    pub closed_before: Option<Timestamp>,
+    /// Only issues not closed whose due time is before this one (`now` for `--overdue`).
+    pub overdue_at: Option<Timestamp>,
+    /// Only open or in-progress issues last updated before this time (`--stale`).
+    pub stale_before: Option<Timestamp>,
+    /// Only issues whose title contains this text (ASCII case-insensitive, taken literally).
+    pub title_contains: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -708,6 +802,16 @@ pub struct ListQuery {
     pub blocked_only: bool,
     /// Case-insensitive substring over id, title, description, notes.
     pub search: Option<String>,
+    pub sort: ListSort,
+    pub reverse: bool,
+    pub limit: Option<usize>,
+}
+
+/// A `bd query`: the expression's source text (parsed by bd-core, so its
+/// errors can point into it), and how to sort and limit the matches.
+#[derive(Clone, Debug, Default)]
+pub struct QueryRequest {
+    pub expr: String,
     pub sort: ListSort,
     pub reverse: bool,
     pub limit: Option<usize>,

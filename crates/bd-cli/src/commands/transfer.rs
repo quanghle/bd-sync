@@ -1,18 +1,14 @@
 //! `bd export` and `bd import`.
 
 use std::io::{BufReader, Write};
-use std::path::Path;
 
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::{Error, Queries, Result};
 
+use super::path_error;
 use crate::app::{App, Out};
 use crate::cli::*;
 use crate::io::{self, read_input};
-
-fn path_error(path: &Path, e: std::io::Error) -> Error {
-    Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
-}
 
 pub fn cmd_export(app: &mut App, a: &ExportArgs) -> Result<()> {
     let opts = ExportOptions {
@@ -78,9 +74,28 @@ pub fn cmd_import(app: &mut App, a: &ImportArgs) -> Result<()> {
         summary.memories,
         summary.leases_granted
     ));
+    if dry {
+        for (label, pick) in FIELD_REPORT {
+            let counts: Vec<String> = summary
+                .fields
+                .iter()
+                .map(|(k, c)| (k, pick(c)))
+                .filter(|(_, n)| *n > 0)
+                .map(|(k, n)| format!("{k} {n}"))
+                .collect();
+            if !counts.is_empty() {
+                out = out.line(format!("  fields {label}: {}", counts.join(", ")));
+            }
+        }
+    }
     for w in &summary.warnings {
         out = out.line(format!("  ! {w}"));
     }
     app.print(out);
     Ok(())
 }
+
+/// The lines of the `--dry-run` field report: a label and the count it lists.
+type FieldPick = fn(&bd_core::transfer::FieldCounts) -> usize;
+const FIELD_REPORT: [(&str, FieldPick); 3] =
+    [("mapped", |c| c.mapped), ("kept in metadata.beads", |c| c.kept), ("dropped", |c| c.dropped)];

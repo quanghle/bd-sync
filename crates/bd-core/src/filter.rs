@@ -121,6 +121,26 @@ pub(crate) fn apply_work_filter(q: &mut QueryParts, f: &WorkFilter) {
     if !f.ids.is_empty() {
         q.cond(&format!("i.id IN {}", placeholders(f.ids.len())), text_values(&f.ids));
     }
+    // Plain column conditions: list and ready read issues by scan or by
+    // status already (see plans.rs), so these need no index of their own.
+    let bounds = [
+        ("i.created_at >= ?", f.created_after),
+        ("i.created_at < ?", f.created_before),
+        ("i.updated_at >= ?", f.updated_after),
+        ("i.updated_at < ?", f.updated_before),
+        ("i.closed_at >= ?", f.closed_after),
+        ("i.closed_at < ?", f.closed_before),
+        ("i.due_at < ? AND i.status <> 'closed'", f.overdue_at),
+        ("i.status IN ('open','in_progress') AND i.updated_at < ?", f.stale_before),
+    ];
+    for (sql, t) in bounds {
+        if let Some(t) = t {
+            q.cond(sql, [SqlValue::Integer(t.millis())]);
+        }
+    }
+    if let Some(t) = f.title_contains.as_deref().filter(|t| !t.trim().is_empty()) {
+        q.cond("i.title LIKE ? ESCAPE '\\'", [SqlValue::Text(format!("%{}%", like_escape(t)))]);
+    }
 }
 
 /// Escape `%`, `_` and `\` for a LIKE pattern using `ESCAPE '\'`.

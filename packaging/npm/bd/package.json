@@ -1,0 +1,19 @@
+{
+  "name": "@NPM_SCOPE@/bd",
+  "version": "@VERSION@",
+  "description": "Coordination engine for agents and people, on SQLite",
+  "license": "MIT",
+  "bin": { "bd": "bin/bd.js" },
+  "files": ["bin/"],
+  "engines": { "node": ">=18" },
+  "repository": { "type": "git", "url": "git+https://github.com/@REPO@.git" },
+  "homepage": "https://github.com/@REPO@",
+  "optionalDependencies": {
+    "@NPM_SCOPE@/bd-linux-x64": "@VERSION@",
+    "@NPM_SCOPE@/bd-linux-arm64": "@VERSION@",
+    "@NPM_SCOPE@/bd-darwin-x64": "@VERSION@",
+    "@NPM_SCOPE@/bd-darwin-arm64": "@VERSION@",
+    "@NPM_SCOPE@/bd-win32-x64": "@VERSION@",
+    "@NPM_SCOPE@/bd-win32-arm64": "@VERSION@"
+  }
+}

@@ -17,6 +17,13 @@ to the page with the details.
   `gate.repos` lists the repositories a gate may name; a gate naming
   another is refused when written and escalated instead of probed
   ([Gates](playbooks.md#gates)).
+- **`bd github` runs `gh` with the credentials of whoever runs it** (through
+  `bd serve`, the server's, and only with an admin token), and can publish
+  workspace content: `github.repos` lists the repositories it may sync,
+  checked before any GitHub call, `push --create` publishes only issues
+  carrying the `--label` it names, and an issue marker links a bd issue only
+  on a GitHub issue opened by the account `gh` is signed in as
+  ([GitHub Issues sync](github.md)).
 
 ## Remote server
 
@@ -40,7 +47,7 @@ playbook run gets the same answer as a single command
   the token's own actor or a sub-actor). Getting past a human gate needs a
   human token. Only admins change `metadata.playbook` on existing issues,
   set configuration (`gate.repos` included), rename the issue prefix,
-  import, prune events or run `doctor`.
+  import, sync with GitHub (`bd github`), prune events or run `doctor`.
 - **Actors are bound to tokens.** A token acts as its actor or its
   sub-actors; `--actor` and `$BD_ACTOR` may name nothing else. The
   server's own actor, `bd-serve`, is reserved.

@@ -7,6 +7,7 @@ use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use bd_core::doctor;
+use bd_core::hierarchy;
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::*;
 use serde_json::json;
@@ -550,6 +551,103 @@ fn claim_next_takes_queue_head_and_respects_reservations_and_pools() {
 }
 
 #[test]
+fn claim_next_near_prefers_siblings_then_the_queue() {
+    let mut env = Env::new();
+    let parent = env.create("Parent", 2);
+    let a = env.create_with(NewIssue {
+        title: "a".into(),
+        priority: Some(2),
+        parent: Some(parent.clone()),
+        ..Default::default()
+    });
+    let b = env.create_with(NewIssue {
+        title: "b".into(),
+        priority: Some(3),
+        parent: Some(parent.clone()),
+        ..Default::default()
+    });
+    let z = env.create("Unrelated, more urgent", 0);
+    let near_next = |env: &mut Env, closing: &str, q: &ReadyQuery| {
+        let closing = closing.to_string();
+        env.store
+            .write("close", "bob", |tx| {
+                let near = tx.parent(&closing)?;
+                tx.close_issue(&closing, &CloseOptions::default())?;
+                tx.claim_next_near(q, near.as_deref(), &ClaimOptions::default())
+            })
+            .unwrap()
+            .map(|(c, from)| (c.issue.id, from, c.lease.token))
+    };
+
+    // Siblings first, though z has a higher priority.
+    let (got, from, token) = near_next(&mut env, &a, &ReadyQuery::default()).unwrap();
+    assert_eq!((got.as_str(), from), (b.as_str(), NextFrom::Siblings));
+    let lease = env.store.read(|r| r.lease(&b)).unwrap().unwrap();
+    assert_eq!((lease.holder.as_str(), lease.token), ("bob", token));
+    assert_eq!(env.issue(&b).status, Status::InProgress);
+
+    // Bob finishes b: the subtree has nothing ready left, so the queue
+    // decides (z before the newly ready parent, by priority).
+    env.store.write("close", "bob", |tx| tx.close_issue(&b, &CloseOptions::default())).unwrap();
+    let c = env.create_with(NewIssue {
+        title: "c".into(),
+        priority: Some(4),
+        parent: Some(parent.clone()),
+        assignee: Some("dave".into()),
+        ..Default::default()
+    });
+    let q = ReadyQuery::default();
+    let found = env.store.write("peek", "bob", |tx| tx.next_ready(&q, Some(&parent))).unwrap();
+    let (issue, from) = found.unwrap();
+    assert_eq!((issue.id.as_str(), from), (z.as_str(), NextFrom::Queue), "c is reserved for dave");
+
+    // An explicit parent filter searches only that subtree: no fallback.
+    let only_parent =
+        ReadyQuery { filter: WorkFilter { parent: Some(parent.clone()), ..Default::default() }, ..Default::default() };
+    let found = env.store.write("peek", "bob", |tx| tx.next_ready(&only_parent, Some(&z))).unwrap();
+    assert!(found.is_none(), "{found:?}");
+    let found = env.store.write("peek", "dave", |tx| tx.next_ready(&only_parent, None)).unwrap();
+    assert_eq!(found.map(|(i, f)| (i.id, f)), Some((c.clone(), NextFrom::Queue)));
+    env.assert_healthy();
+}
+
+#[test]
+fn next_ready_writes_nothing_and_close_then_claim_rolls_back_together() {
+    let mut env = Env::new();
+    let parent = env.create("Parent", 2);
+    let a = env.create_with(NewIssue { title: "a".into(), parent: Some(parent.clone()), ..Default::default() });
+    let b = env.create_with(NewIssue { title: "b".into(), parent: Some(parent.clone()), ..Default::default() });
+
+    let head = env.store.read(|r| r.event_head()).unwrap();
+    let found = env.store.write("peek", "bob", |tx| tx.next_ready(&ReadyQuery::default(), Some(&parent))).unwrap();
+    assert_eq!(found.map(|(i, f)| (i.id, f)), Some((a.clone(), NextFrom::Siblings)));
+    assert_eq!(env.store.read(|r| r.event_head()).unwrap(), head, "next_ready emits no events");
+    assert!(env.store.read(|r| r.lease(&a)).unwrap().is_none());
+    assert_eq!(env.issue(&a).status, Status::Open);
+
+    // Close and claim in one transaction, then fail: both roll back.
+    let err = env
+        .store
+        .write("close", "bob", |tx| {
+            tx.close_issue(&a, &CloseOptions::default())?;
+            let claimed = tx.claim_next_near(&ReadyQuery::default(), Some(&parent), &ClaimOptions::default())?;
+            assert_eq!(
+                claimed.as_ref().map(|(c, f)| (c.issue.id.as_str(), *f)),
+                Some((b.as_str(), NextFrom::Siblings))
+            );
+            Err::<(), _>(Error::invalid("a later batch line failed"))
+        })
+        .unwrap_err();
+    assert!(matches!(err, Error::Invalid(_)), "{err}");
+    assert_eq!(env.issue(&a).status, Status::Open);
+    assert_eq!(env.issue(&b).status, Status::Open);
+    assert!(env.issue(&b).assignee.is_none());
+    assert!(env.store.read(|r| r.lease(&b)).unwrap().is_none());
+    assert_eq!(env.store.read(|r| r.event_head()).unwrap(), head);
+    env.assert_healthy();
+}
+
+#[test]
 fn heartbeat_extends_lease_and_detects_loss() {
     let mut env = Env::new();
     let a = env.create("A", 1);
@@ -767,6 +865,385 @@ fn labels_metadata_and_reparenting() {
     assert!(env.store.read(|r| r.list(&q)).unwrap().is_empty());
 }
 
+const DAY: Duration = Duration::from_secs(86_400);
+
+fn ids_of(issues: Vec<Issue>) -> Vec<String> {
+    let mut ids: Vec<String> = issues.into_iter().map(|i| i.id).collect();
+    ids.sort();
+    ids
+}
+
+#[test]
+fn list_filters_by_time_and_title() {
+    let mut env = Env::new();
+    let a = env.create("Plan 50% done", 2);
+    let d = env.create("Later", 2);
+    let deferred = IssuePatch { status: Some(Status::Deferred), ..Default::default() };
+    env.store.write("u", "alice", |tx| tx.update_issue(&d, &deferred, &Guard::default(), false)).unwrap();
+    env.clock.advance(DAY);
+    let b = env.create_with(NewIssue {
+        due_at: Some(Timestamp(T0).plus(2 * DAY)),
+        priority: Some(2),
+        ..NewIssue::titled("Plan 50x done")
+    });
+    env.clock.advance(DAY);
+    let c = env.create("Ship_it", 2);
+    let x = env.create("Shipxit", 2);
+    env.clock.advance(DAY);
+    let notes = IssuePatch { notes: Some("touched".into()), ..Default::default() };
+    env.store.write("u", "alice", |tx| tx.update_issue(&a, &notes, &Guard::default(), false)).unwrap();
+    env.clock.advance(DAY);
+    env.close(&c);
+    env.clock.advance(DAY);
+    let (ia, ib, ic) = (env.issue(&a), env.issue(&b), env.issue(&c));
+
+    let list = |env: &Env, f: WorkFilter| {
+        ids_of(env.store.read(|r| r.list(&ListQuery { all: true, filter: f, ..Default::default() })).unwrap())
+    };
+    let sorted = |v: &[&String]| {
+        let mut v: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+        v.sort();
+        v
+    };
+    let w = WorkFilter::default;
+    // `_after` is inclusive, `_before` exclusive.
+    assert_eq!(list(&env, WorkFilter { created_after: Some(ib.created_at), ..w() }), sorted(&[&b, &c, &x]));
+    assert_eq!(list(&env, WorkFilter { created_before: Some(ib.created_at), ..w() }), sorted(&[&a, &d]));
+    assert_eq!(
+        list(&env, WorkFilter { created_after: Some(ib.created_at), created_before: Some(ic.created_at), ..w() }),
+        sorted(&[&b])
+    );
+    assert_eq!(list(&env, WorkFilter { updated_after: Some(ia.updated_at), ..w() }), sorted(&[&a, &c]));
+    assert_eq!(list(&env, WorkFilter { updated_before: Some(ia.updated_at), ..w() }), sorted(&[&b, &d, &x]));
+    let closed_at = ic.closed_at.unwrap();
+    assert_eq!(list(&env, WorkFilter { closed_after: Some(closed_at), ..w() }), sorted(&[&c]));
+    assert!(list(&env, WorkFilter { closed_before: Some(closed_at), ..w() }).is_empty());
+    assert_eq!(
+        list(&env, WorkFilter { closed_before: Some(closed_at.plus(Duration::from_millis(1))), ..w() }),
+        sorted(&[&c])
+    );
+    // Stale: open or in progress only, so neither the deferred nor the closed issue.
+    assert_eq!(list(&env, WorkFilter { stale_before: Some(ia.updated_at), ..w() }), sorted(&[&b, &x]));
+    let now = env.store.read(|r| Ok(r.now())).unwrap();
+    assert_eq!(list(&env, WorkFilter { stale_before: Some(now), ..w() }), sorted(&[&a, &b, &x]));
+    // Title: ASCII case-insensitive, `%` and `_` literal.
+    let title = |t: &str| list(&env, WorkFilter { title_contains: Some(t.into()), ..w() });
+    assert_eq!(title("50%"), sorted(&[&a]));
+    assert_eq!(title("plan 50"), sorted(&[&a, &b]));
+    assert_eq!(title("p_i"), sorted(&[&c]));
+    assert_eq!(title("  "), list(&env, w()));
+    assert!(title("\\").is_empty());
+    // Overdue: due in the past and not closed.
+    assert_eq!(list(&env, WorkFilter { overdue_at: Some(now), ..w() }), sorted(&[&b]));
+    assert!(list(&env, WorkFilter { overdue_at: Some(Timestamp(T0)), ..w() }).is_empty());
+    env.close(&b);
+    assert!(list(&env, WorkFilter { overdue_at: Some(now), ..w() }).is_empty());
+}
+
+#[test]
+fn ready_filters_by_time() {
+    let mut env = Env::new();
+    let old = env.create("Old", 0);
+    env.clock.advance(DAY);
+    let low = env.create("Low", 3);
+    let high = env.create_with(NewIssue { due_at: Some(Timestamp(T0)), priority: Some(1), ..NewIssue::titled("High") });
+    env.clock.advance(DAY);
+    let cutoff = env.issue(&low).created_at;
+    let ready = |f: WorkFilter| env.ready_ids_with(&ReadyQuery { filter: f, ..Default::default() });
+    // Queue order (priority) is kept.
+    assert_eq!(ready(WorkFilter { created_after: Some(cutoff), ..Default::default() }), [high.as_str(), low.as_str()]);
+    assert_eq!(ready(WorkFilter { created_before: Some(cutoff), ..Default::default() }), [old.as_str()]);
+    assert_eq!(ready(WorkFilter { updated_after: Some(cutoff), ..Default::default() }), [high.as_str(), low.as_str()]);
+    assert_eq!(ready(WorkFilter { updated_before: Some(cutoff), ..Default::default() }), [old.as_str()]);
+    let now = env.store.read(|r| Ok(r.now())).unwrap();
+    assert_eq!(ready(WorkFilter { overdue_at: Some(now), ..Default::default() }), [high.as_str()]);
+    assert_eq!(ready(WorkFilter { stale_before: Some(cutoff), ..Default::default() }), [old.as_str()]);
+    assert_eq!(ready(WorkFilter { title_contains: Some("LOW".into()), ..Default::default() }), [low.as_str()]);
+}
+
+fn under(title: &str, parent: &str) -> NewIssue {
+    NewIssue { parent: Some(parent.to_string()), ..NewIssue::titled(title) }
+}
+
+fn epic(title: &str) -> NewIssue {
+    NewIssue { issue_type: Some("epic".into()), ..NewIssue::titled(title) }
+}
+
+#[test]
+fn epic_status_counts_the_subtree() {
+    let mut env = Env::new();
+    let e = env.create_with(epic("Epic"));
+    let a = env.create_with(under("A", &e));
+    let b = env.create_with(under("B", &e));
+    let a1 = env.create_with(under("A1", &a));
+    let a2 = env.create_with(under("A2", &a));
+    let x = env.create("Outside blocker", 1);
+    let empty = env.create_with(epic("Empty"));
+    env.dep(&a2, &x, DepType::Blocks);
+    env.store.write("claim", "bob", |tx| tx.claim(&b, &ClaimOptions::default())).unwrap();
+    env.close(&a1);
+    let status = |env: &Env, id: &str| env.store.read(|r| r.epic_status(id)).unwrap();
+    let counts = |s: &hierarchy::EpicStatus| (s.total, s.closed, s.open, s.in_progress, s.blocked, s.percent);
+
+    let s = status(&env, &e);
+    assert_eq!((s.id.as_str(), s.title.as_str(), s.issue_type.as_str()), (e.as_str(), "Epic", "epic"));
+    assert_eq!(counts(&s), (4, 1, 2, 1, 1, Some(25)));
+    assert!(!s.close_eligible);
+    // Any issue's subtree, not only an epic's; never eligible unless an epic.
+    let sa = status(&env, &a);
+    assert_eq!(counts(&sa), (2, 1, 1, 0, 1, Some(50)));
+    assert!(!sa.close_eligible);
+    let none = status(&env, &empty);
+    assert_eq!(counts(&none), (0, 0, 0, 0, 0, None));
+    assert!(!none.close_eligible, "an epic without children is not eligible");
+    assert!(matches!(env.store.read(|r| r.epic_status("t-404")), Err(Error::NotFound { .. })));
+
+    env.close(&x);
+    env.close(&a2);
+    env.close(&a);
+    // A closed, B still in progress: 3 of 4 closed, floored.
+    let s = status(&env, &e);
+    assert_eq!(counts(&s), (4, 3, 0, 1, 0, Some(75)));
+    assert!(!s.close_eligible);
+    assert!(env.store.read(|r| r.close_eligible_epics()).unwrap().is_empty());
+    // The last direct child closes: eligible, as `bd stats` says.
+    env.store.write("close", "bob", |tx| tx.close_issue(&b, &CloseOptions::default())).unwrap();
+    let s = status(&env, &e);
+    assert_eq!(counts(&s), (4, 4, 0, 0, 0, Some(100)));
+    assert!(s.close_eligible);
+    assert_eq!(env.store.read(|r| r.close_eligible_epics()).unwrap(), [e.as_str()]);
+    assert_eq!(env.store.read(|r| r.stats()).unwrap().closable_epics, [e.as_str()]);
+    let open: Vec<String> = env.store.read(|r| r.epics(false)).unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(open, [e.as_str(), empty.as_str()]);
+
+    env.close(&e);
+    assert!(!status(&env, &e).close_eligible, "closed already");
+    let open: Vec<String> = env.store.read(|r| r.epics(false)).unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(open, [empty.as_str()]);
+    let all: Vec<String> = env.store.read(|r| r.epics(true)).unwrap().into_iter().map(|s| s.id).collect();
+    assert_eq!(all, [e.as_str(), empty.as_str()]);
+    let json = serde_json::to_value(status(&env, &e)).unwrap();
+    assert_eq!(
+        json,
+        json!({"id": e, "title": "Epic", "status": "closed", "issue_type": "epic", "total": 4, "closed": 4,
+               "open": 0, "in_progress": 0, "blocked": 0, "percent": 100, "close_eligible": false})
+    );
+    assert_eq!(serde_json::to_value(status(&env, &empty)).unwrap()["percent"], json!(null));
+}
+
+#[test]
+fn children_direct_and_recursive() {
+    let mut env = Env::new();
+    let p = env.create("Parent", 2);
+    let c1 = env.create_with(under("C1", &p));
+    let g = env.create_with(under("Grandchild", &c1));
+    let c2 = env.create_with(under("C2", &p));
+    env.create("Unrelated", 2);
+    env.close(&c2);
+    let children = |id: &str, recursive: bool| {
+        env.store.read(|r| r.child_issues(id, recursive)).unwrap().into_iter().map(|i| i.id).collect::<Vec<_>>()
+    };
+    // Creation order, closed ones too.
+    assert_eq!(children(&p, false), [c1.as_str(), c2.as_str()]);
+    assert_eq!(children(&p, true), [c1.as_str(), g.as_str(), c2.as_str()]);
+    assert_eq!(children(&c1, false), [g.as_str()]);
+    assert!(children(&g, true).is_empty());
+    assert!(matches!(env.store.read(|r| r.child_issues("t-404", false)), Err(Error::NotFound { .. })));
+}
+
+#[test]
+fn children_come_in_creation_order_after_an_import() {
+    // Rows out of creation order, so rowid (import) order differs from it.
+    let mut env = Env::new();
+    let row = |id: &str, day: u32, parent: &str| {
+        let deps = if parent.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#","dependencies":[{{"issue_id":"{id}","depends_on_id":"{parent}","type":"parent-child","created_at":"2026-01-0{day}T00:00:00Z","created_by":"alice","metadata":"{{}}"}}]"#
+            )
+        };
+        format!(
+            r#"{{"_type":"issue","id":"{id}","title":"{id}","status":"open","priority":2,"issue_type":"task","created_at":"2026-01-0{day}T00:00:00Z","updated_at":"2026-01-0{day}T00:00:00Z"{deps}}}"#
+        ) + "\n"
+    };
+    let jsonl = [
+        row("t-p", 1, ""),
+        row("t-late", 5, "t-p"),
+        row("t-grand", 4, "t-late"),
+        row("t-mid", 3, "t-p"),
+        row("t-early", 2, "t-p"),
+    ]
+    .concat();
+    env.store.write("import", "me", |tx| tx.import_jsonl(&mut jsonl.as_bytes(), &ImportOptions::default())).unwrap();
+    let children = |recursive: bool| {
+        env.store.read(|r| r.child_issues("t-p", recursive)).unwrap().into_iter().map(|i| i.id).collect::<Vec<_>>()
+    };
+    assert_eq!(children(false), ["t-early", "t-mid", "t-late"]);
+    assert_eq!(children(true), ["t-early", "t-mid", "t-grand", "t-late"]);
+}
+
+#[test]
+fn stale_flags_old_work_and_expired_leases() {
+    let mut env = Env::new();
+    let old = env.create("Old", 2);
+    let closed = env.create("Old but closed", 2);
+    env.close(&closed);
+    let deferred = env.create("Old but deferred", 2);
+    let patch = IssuePatch { status: Some(Status::Deferred), ..Default::default() };
+    env.store.write("u", "alice", |tx| tx.update_issue(&deferred, &patch, &Guard::default(), false)).unwrap();
+    env.clock.advance(10 * DAY);
+    let fresh = env.create("Fresh", 2);
+    let claimed = env.create("Claimed", 2);
+    let held = env.create("Held", 2);
+    env.store.write("claim", "bob", |tx| tx.claim(&claimed, &ClaimOptions::default())).unwrap();
+    // Past the 5m lease: bob's lease expired, carol's (taken later) did not.
+    env.clock.advance(Duration::from_secs(240));
+    env.store.write("claim", "carol", |tx| tx.claim(&held, &ClaimOptions::default())).unwrap();
+    env.clock.advance(Duration::from_secs(120));
+    let now = env.store.read(|r| Ok(r.now())).unwrap();
+    let rows = env.store.read(|r| r.stale(7 * DAY, None)).unwrap();
+    let ids: Vec<&str> = rows.iter().map(|s| s.issue.id.as_str()).collect();
+    assert_eq!(ids, [old.as_str(), claimed.as_str()], "least recently updated first");
+    assert!(rows[0].stale && rows[0].lease_holder.is_none() && rows[0].lease_expired_at.is_none());
+    assert!(!rows[1].stale, "updated recently, but its lease expired");
+    assert_eq!(rows[1].lease_holder.as_deref(), Some("bob"));
+    let expired = rows[1].lease_expired_at.unwrap();
+    assert!(expired <= now && expired > now.minus(Duration::from_secs(120)));
+    let json = serde_json::to_value(&rows[1]).unwrap();
+    assert_eq!((json["id"].as_str(), json["stale"].as_bool()), (Some(claimed.as_str()), Some(false)));
+    assert_eq!(json["lease_holder"], json!("bob"));
+    assert!(serde_json::to_value(&rows[0]).unwrap().get("lease_holder").is_none());
+
+    assert_eq!(env.store.read(|r| r.stale(7 * DAY, Some(1))).unwrap().len(), 1);
+    // Nothing is older than no time at all: every live issue, held or not.
+    let all: Vec<String> =
+        env.store.read(|r| r.stale(Duration::ZERO, None)).unwrap().into_iter().map(|s| s.issue.id).collect();
+    assert_eq!(all, [old.as_str(), fresh.as_str(), claimed.as_str(), held.as_str()]);
+}
+
+#[test]
+fn orphans_find_dangling_text_references() {
+    let mut env = Env::new();
+    let one = env.create("Parent", 2);
+    assert_eq!(one, "t-1");
+    let two = env.create_with(NewIssue {
+        description: "see t-99, and t-1. also (t-1), t-1.5 and t-1.5.2; xt-98, t-, bd-7 and t-99 again".into(),
+        design: "t-99".into(),
+        ..NewIssue::titled("Second")
+    });
+    let three = env.create("Fix t-42 (after t-2)", 2);
+    env.store.write("c", "alice", |tx| tx.add_comment(&one, "blocked on t-77, not t-3")).unwrap();
+    env.store.write("c", "alice", |tx| tx.add_comment(&one, "still t-77")).unwrap();
+    let found = env.store.read(|r| r.orphans("t")).unwrap();
+    let json = serde_json::to_value(&found).unwrap();
+    assert_eq!(
+        json,
+        json!([
+            {"id": one, "title": "Parent", "references": [{"id": "t-77", "field": "comment"}]},
+            {"id": two, "title": "Second", "references": [
+                {"id": "t-99", "field": "description"}, {"id": "t-99", "field": "design"}]},
+            {"id": three, "title": "Fix t-42 (after t-2)", "references": [{"id": "t-42", "field": "title"}]},
+        ])
+    );
+    // Another prefix: only its own references.
+    let bd = env.store.read(|r| r.orphans("bd")).unwrap();
+    assert_eq!(bd.len(), 1);
+    assert_eq!((bd[0].id.as_str(), bd[0].references[0].id.as_str()), (two.as_str(), "bd-7"));
+    assert!(env.store.read(|r| r.orphans("t x")).is_err());
+    assert!(env.store.read(|r| r.orphans("")).is_err());
+    // Creating the issue named settles the references to it.
+    for n in 4..=99 {
+        env.create(&format!("Filler {n}"), 2);
+    }
+    let left: Vec<String> = env.store.read(|r| r.orphans("t")).unwrap().into_iter().map(|o| o.id).collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn subgraph_walks_up_and_down_and_truncates() {
+    use bd_core::subgraph::EdgeSet;
+    let mut env = Env::new();
+    let ids: Vec<String> = (1..=12).map(|n| env.create(&format!("N{n}"), 2)).collect();
+    let id = |n: usize| ids[n - 1].clone();
+    // A chain 1 <- 2 <- 3, a diamond 3 <- {4, 5} <- 6, 3 a child of 12,
+    // 7 a child of 2 and 11 after 1 (reached only by turning around),
+    // 9 after 8 (unrelated) and 10 related to 3.
+    for (issue, target, t) in [
+        (2, 1, DepType::Blocks),
+        (3, 2, DepType::Blocks),
+        (4, 3, DepType::Blocks),
+        (5, 3, DepType::Blocks),
+        (6, 4, DepType::Blocks),
+        (6, 5, DepType::Blocks),
+        (3, 12, DepType::ParentChild),
+        (7, 2, DepType::ParentChild),
+        (11, 1, DepType::Blocks),
+        (9, 8, DepType::Blocks),
+        (10, 3, DepType::Related),
+    ] {
+        env.dep(&id(issue), &id(target), t);
+    }
+    let walk = |root: usize, edges: &EdgeSet, max: usize| env.store.read(|r| r.subgraph(Some(&id(root)), edges, max));
+    let node_ids = |g: &bd_core::subgraph::Subgraph| g.nodes.iter().map(|n| n.id.clone()).collect::<Vec<_>>();
+    let sorted = |ns: &[usize]| {
+        let mut v: Vec<String> = ns.iter().map(|n| id(*n)).collect();
+        v.sort();
+        v
+    };
+
+    let g = walk(3, &EdgeSet::Default, 200).unwrap();
+    assert_eq!(g.root.as_deref(), Some(id(3).as_str()));
+    assert_eq!(node_ids(&g), sorted(&[1, 2, 3, 4, 5, 6, 12]), "ancestors and descendants, nothing beside");
+    assert!(!g.truncated);
+    let edges: Vec<(String, String, String)> =
+        g.edges.iter().map(|e| (e.depends_on.clone(), e.issue.clone(), e.dep_type.to_string())).collect();
+    let e = |d: usize, i: usize, t: &str| (id(d), id(i), t.to_string());
+    assert_eq!(
+        edges,
+        [
+            e(1, 2, "blocks"),
+            e(12, 3, "parent-child"),
+            e(2, 3, "blocks"),
+            e(3, 4, "blocks"),
+            e(3, 5, "blocks"),
+            e(4, 6, "blocks"),
+            e(5, 6, "blocks"),
+        ]
+    );
+    let json = serde_json::to_value(&g).unwrap();
+    assert_eq!(json["edges"][0], json!({"issue": id(2), "depends_on": id(1), "type": "blocks"}));
+    assert_eq!(json["max_nodes"], 200);
+    assert_eq!(json["nodes"][0]["status"], "open");
+
+    // Related links only when asked for; blocks alone drops the parent.
+    assert_eq!(node_ids(&walk(3, &EdgeSet::All, 200).unwrap()), sorted(&[1, 2, 3, 4, 5, 6, 10, 12]));
+    let blocks = walk(3, &EdgeSet::Only(vec![DepType::Blocks]), 200).unwrap();
+    assert_eq!(node_ids(&blocks), sorted(&[1, 2, 3, 4, 5, 6]));
+    assert!(blocks.edges.iter().all(|e| e.dep_type == DepType::Blocks));
+
+    // Truncated in (distance, id) order: 12 sorts before 2 at distance 1.
+    let small = walk(3, &EdgeSet::Default, 2).unwrap();
+    assert_eq!(node_ids(&small), sorted(&[3, 12]));
+    assert!(small.truncated);
+    assert_eq!(small.edges.len(), 1);
+    assert_eq!(walk(3, &EdgeSet::Default, 2).unwrap().nodes, small.nodes, "deterministic");
+    assert_eq!(node_ids(&walk(3, &EdgeSet::Default, 1).unwrap()), [id(3)]);
+    assert!(matches!(env.store.read(|r| r.subgraph(Some("t-404"), &EdgeSet::Default, 5)), Err(Error::NotFound { .. })));
+
+    // Every open issue: closed ones left out, truncated past the bound.
+    env.close(&id(8));
+    let open = env.store.read(|r| r.subgraph(None, &EdgeSet::Default, 200)).unwrap();
+    assert_eq!(open.root, None);
+    assert_eq!(open.nodes.len(), 11);
+    assert!(!open.nodes.iter().any(|n| n.id == id(8)) && !open.truncated);
+    assert!(!open.edges.iter().any(|e| e.issue == id(8) || e.depends_on == id(8)));
+    let few = env.store.read(|r| r.subgraph(None, &EdgeSet::Default, 3)).unwrap();
+    assert_eq!(node_ids(&few), [id(1), id(10), id(11)], "id order");
+    assert!(few.truncated);
+    assert_eq!(few.edges.len(), 1, "11 after 1: {:?}", few.edges);
+}
+
 #[test]
 fn delete_protects_dependents_unless_forced_or_cascaded() {
     let mut env = Env::new();
@@ -826,6 +1303,84 @@ fn comments_and_memories() {
     assert_eq!(env.store.read(|r| r.memories(Some("RACE"))).unwrap().len(), 1);
     assert!(env.store.write("m", "bob", |tx| tx.forget(&w.memory.key)).unwrap().is_some());
     assert!(env.store.read(|r| r.memories(None)).unwrap().is_empty());
+}
+
+#[test]
+fn comments_tail_is_chronological_and_counted() {
+    let mut env = Env::new();
+    let a = env.create("A", 1);
+    for n in 0..5 {
+        env.clock.advance(Duration::from_millis(1));
+        env.store.write("c", "bob", |tx| tx.add_comment(&a, &format!("note {n}"))).unwrap();
+    }
+    // Two comments in the same millisecond keep their insertion order.
+    env.store.write("c", "bob", |tx| tx.add_comment(&a, "note 5")).unwrap();
+    let (tail, total) = env.store.read(|r| r.comments_tail(&a, 3)).unwrap();
+    let texts: Vec<&str> = tail.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!((texts, total), (vec!["note 3", "note 4", "note 5"], 6));
+    let (none, total) = env.store.read(|r| r.comments_tail(&a, 0)).unwrap();
+    assert_eq!((none.len(), total), (0, 6));
+    let (all, _) = env.store.read(|r| r.comments_tail(&a, 50)).unwrap();
+    assert_eq!(all, env.store.read(|r| r.comments(&a)).unwrap());
+}
+
+#[test]
+fn briefs_carry_the_parent_and_leave_out_the_rest() {
+    let mut env = Env::new();
+    let p = env.create("Parent", 1);
+    let c = env.create_with(NewIssue {
+        parent: Some(p.clone()),
+        labels: vec!["infra".into()],
+        description: "long text".into(),
+        ..NewIssue::titled("Child")
+    });
+    let issues = vec![env.issue(&p), env.issue(&c)];
+    let briefs = env.store.read(|r| r.briefs(&issues)).unwrap();
+    assert_eq!(briefs[0].parent, None);
+    assert_eq!(briefs[1].parent.as_deref(), Some(p.as_str()));
+    let v = serde_json::to_value(&briefs[1]).unwrap();
+    let keys: BTreeSet<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, BTreeSet::from(["id", "title", "status", "priority", "issue_type", "parent", "labels"]));
+    let v = serde_json::to_value(&briefs[0]).unwrap();
+    let keys: BTreeSet<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, BTreeSet::from(["id", "title", "status", "priority", "issue_type"]));
+}
+
+#[test]
+fn show_brief_cuts_the_description_and_names_blockers() {
+    let mut env = Env::new();
+    // 600 characters of two bytes each: a cut by bytes would split one.
+    let description = "é".repeat(600);
+    let a = env.create_with(NewIssue { description: description.clone(), ..NewIssue::titled("A") });
+    let b = env.create("Blocker", 1);
+    env.dep(&a, &b, DepType::Blocks);
+    for n in 0..4 {
+        env.clock.advance(Duration::from_millis(1));
+        env.store.write("c", "bob", |tx| tx.add_comment(&a, &format!("note {n}"))).unwrap();
+    }
+    let s = env.store.read(|r| r.show_brief(&a, 3)).unwrap();
+    assert!(s.description_truncated);
+    assert_eq!(s.description, format!("{}…", "é".repeat(BRIEF_DESCRIPTION_CHARS)));
+    assert_eq!(s.blockers, vec![b.clone()]);
+    let texts: Vec<&str> = s.comments.iter().map(|c| c.text.as_str()).collect();
+    assert_eq!((texts, s.comments_total), (vec!["note 1", "note 2", "note 3"], 4));
+    let v = serde_json::to_value(&s).unwrap();
+    assert_eq!(v["description_truncated"], json!(true));
+    assert_eq!(v["blockers"], json!([b]));
+    assert!(v.get("metadata").is_none() && v.get("created_at").is_none());
+
+    // A short description is kept whole and not flagged; no blockers or
+    // comments leave their keys out.
+    let short =
+        env.create_with(NewIssue { description: "é".repeat(BRIEF_DESCRIPTION_CHARS), ..NewIssue::titled("S") });
+    let s = env.store.read(|r| r.show_brief(&short, 3)).unwrap();
+    assert!(!s.description_truncated);
+    assert_eq!(s.description.chars().count(), BRIEF_DESCRIPTION_CHARS);
+    let v = serde_json::to_value(&s).unwrap();
+    for key in ["description_truncated", "blockers", "comments"] {
+        assert!(v.get(key).is_none(), "{key} should be left out");
+    }
+    assert_eq!(v["comments_total"], json!(0));
 }
 
 /// A recompute stops at the closed, unblocked issues below what changed:
@@ -979,6 +1534,11 @@ fn imports_beads_export_format() {
     assert_eq!(details.parent.as_deref(), Some("bd-a1"));
     assert_eq!(details.issue.status, Status::Closed);
     assert_eq!(env.issue("bd-b2").status, Status::InProgress);
+    // beads' owner has no column: kept in metadata.beads. Derived counts are dropped.
+    let epic = env.issue("bd-a1");
+    assert_eq!(epic.metadata["beads"], json!({ "owner": "x@y" }));
+    assert_eq!(out.fields["owner"].kept, 1);
+    assert_eq!(out.fields["dependency_count"].dropped, 1);
     assert_eq!(
         env.store.read(|r| r.memory("dolt-phantoms")).unwrap().unwrap().content,
         "Phantom DBs hide in three places"
@@ -1281,8 +1841,18 @@ fn rename_prefix_moves_ids_edges_claims_events_and_references() {
     let appended: Vec<Event> = env.events().into_iter().filter(|e| e.seq > head_before).collect();
     assert!(appended.iter().all(|e| e.tx == appended[0].tx), "{appended:#?}");
     let ops: Vec<&str> = appended.iter().map(|e| e.op.as_str()).collect();
-    assert_eq!(ops, ["config_set", "prefix_renamed"]);
-    let summary = &appended[1];
+    assert_eq!(ops, ["references_renamed", "config_set", "prefix_renamed"]);
+    // The rewritten text of the issue naming renamed ids, as old and new.
+    let references = &appended[0];
+    assert_eq!(references.issue_id.as_deref(), Some("new-3"));
+    assert_eq!(
+        references.data["changes"]["description"],
+        json!({
+            "old": "After t-1.2 lands (and t-2), not t-10 or xt-1.",
+            "new": "After new-1.2 lands (and new-2), not t-10 or xt-1.",
+        })
+    );
+    let summary = &appended[2];
     assert_eq!(summary.issue_id, None);
     assert_eq!((summary.data["from"].as_str(), summary.data["to"].as_str()), (Some("t"), Some("new")));
     assert_eq!(summary.data["renamed"], 5);
@@ -1537,5 +2107,537 @@ fn rename_prefix_rewrites_a_gate_awaiting_a_unique_partial_id() {
     assert!(matches!(verdict(&env), Some(gates::Verdict::Pending(_))), "{:?}", verdict(&env));
     env.close(&awaited.replacen("t-", "new-", 1));
     assert!(matches!(verdict(&env), Some(gates::Verdict::Resolve(_))), "{:?}", verdict(&env));
+    env.assert_healthy();
+}
+
+fn explain(env: &Env, id: &str, opts: ExplainOptions) -> Readiness {
+    env.store.read(|r| r.explain(id, opts)).unwrap()
+}
+
+fn texts(env: &Env, id: &str, reasons: &[NotReady]) -> Vec<String> {
+    let now = env.clock.now();
+    reasons.iter().map(|r| r.text(id, now)).collect()
+}
+
+#[test]
+fn explain_names_status_claims_and_excluded_types() {
+    let mut env = Env::new();
+    let task = env.create("Task", 2);
+    assert_eq!(
+        explain(&env, &task, ExplainOptions::default()),
+        Readiness { id: task.clone(), ready: true, reasons: vec![] }
+    );
+
+    // A claim: its status, and the lease while live, expired, then reclaimable (never its token).
+    let claim = env.store.write("claim", "agent-a", |tx| tx.claim(&task, &ClaimOptions::default())).unwrap();
+    let why = explain(&env, &task, ExplainOptions::default());
+    assert!(!why.ready);
+    let expires_at = claim.lease.expires_at;
+    assert_eq!(
+        why.reasons,
+        [
+            NotReady::Status { status: Status::InProgress },
+            NotReady::Claimed { holder: "agent-a".into(), expires_at, live: true, reclaimable: false },
+        ]
+    );
+    assert_eq!(
+        texts(&env, &task, &why.reasons),
+        ["status is in_progress".to_string(), format!("claimed by agent-a (lease expires {expires_at}, in 5m)")]
+    );
+    let json = serde_json::to_value(&why).unwrap();
+    assert_eq!(json["reasons"][1]["kind"], "claimed");
+    assert!(json["reasons"][1].get("token").is_none(), "{json}");
+    // The claim path's words leave the lease out.
+    assert_eq!(env.store.read(|r| r.not_ready_reasons(&task)).unwrap(), ["status is in_progress"]);
+    env.clock.advance(Duration::from_secs(6 * 60));
+    let why = explain(&env, &task, ExplainOptions::default());
+    assert!(matches!(why.reasons[1], NotReady::Claimed { live: false, reclaimable: false, .. }));
+    assert_eq!(
+        texts(&env, &task, &why.reasons)[1],
+        format!("claimed by agent-a (lease expired {expires_at}, reclaimable once lease.grace passes)")
+    );
+    env.clock.advance(Duration::from_secs(10 * 60));
+    let why = explain(&env, &task, ExplainOptions::default());
+    assert!(matches!(why.reasons[1], NotReady::Claimed { live: false, reclaimable: true, .. }));
+    assert_eq!(
+        texts(&env, &task, &why.reasons)[1],
+        format!("claimed by agent-a (lease expired {expires_at}, reclaimable)")
+    );
+
+    // Closed.
+    env.store
+        .write("close", "agent-a", |tx| tx.close_issue(&task, &CloseOptions { take_over: true, ..Default::default() }))
+        .unwrap();
+    assert_eq!(explain(&env, &task, ExplainOptions::default()).reasons, [NotReady::Status { status: Status::Closed }]);
+
+    // An epic, unless asked for.
+    let epic =
+        env.create_with(NewIssue { title: "Epic".into(), issue_type: Some("epic".into()), ..Default::default() });
+    let why = explain(&env, &epic, ExplainOptions::default());
+    assert_eq!(why.reasons, [NotReady::ExcludedType { issue_type: "epic".into() }]);
+    assert_eq!(
+        texts(&env, &epic, &why.reasons),
+        ["epics are left out of the ready queue (--include-epics or -t epic)"]
+    );
+    assert_eq!(
+        serde_json::to_value(&why.reasons[0]).unwrap(),
+        json!({ "kind": "excluded_type", "issue_type": "epic" })
+    );
+    assert!(explain(&env, &epic, ExplainOptions { include_epics: true, ..Default::default() }).ready);
+    assert!(
+        env.store.read(|r| r.not_ready_reasons(&epic)).unwrap().is_empty(),
+        "a type is no reason to refuse a claim"
+    );
+
+    // A gate, unless asked for.
+    let held = env.create("Held", 2);
+    let gate = env
+        .store
+        .write("gate", "alice", |tx| {
+            tx.create_gate(gates::NewGate {
+                spec: gates::GateSpec::new(gates::GateKind::Human),
+                blocks: vec![held.clone()],
+                title: None,
+                description: String::new(),
+                assignee: None,
+                parent: None,
+                priority: None,
+                ephemeral: false,
+            })
+        })
+        .unwrap()
+        .id;
+    let why = explain(&env, &gate, ExplainOptions::default());
+    assert_eq!(why.reasons, [NotReady::ExcludedType { issue_type: "gate".into() }]);
+    assert_eq!(
+        texts(&env, &gate, &why.reasons),
+        [format!("a gate: it opens through bd gate check or bd gate resolve {gate}, never as ready work")]
+    );
+    assert!(explain(&env, &gate, ExplainOptions { include_gates: true, ..Default::default() }).ready);
+}
+
+#[test]
+fn explain_names_blockers_with_their_gates() {
+    let mut env = Env::new();
+    let blocker = env.create("Blocker", 2);
+    let blocked = env.create("Blocked", 2);
+    env.dep(&blocked, &blocker, DepType::Blocks);
+    let maybe = env.create("Runs if the blocker fails", 2);
+    env.dep(&maybe, &blocker, DepType::ConditionalBlocks);
+
+    let why = explain(&env, &blocked, ExplainOptions::default());
+    assert_eq!(
+        why.reasons,
+        [NotReady::Blocked {
+            id: blocker.clone(),
+            title: "Blocker".into(),
+            status: Status::Open,
+            via: BlockerKind::Blocks,
+            detail: "blocker is open".into(),
+            gate: None,
+        }]
+    );
+    assert_eq!(texts(&env, &blocked, &why.reasons), [format!("blocked by {blocker} (blocker is open)")]);
+    let kid = env.create_with(NewIssue { title: "Kid".into(), parent: Some(blocked.clone()), ..Default::default() });
+    // The parent, blocked, is named (not its own blocker); the parent waits on its kid too.
+    let why = explain(&env, &kid, ExplainOptions::default());
+    assert!(
+        matches!(&why.reasons[..], [NotReady::Blocked { id, via: BlockerKind::Parent, gate: None, .. }] if id == &blocked),
+        "{why:?}"
+    );
+    assert_eq!(serde_json::to_value(&why.reasons[0]).unwrap()["via"], "parent");
+    let why = explain(&env, &maybe, ExplainOptions::default());
+    assert!(matches!(&why.reasons[..], [NotReady::Blocked { via: BlockerKind::Conditional, gate: None, .. }]));
+
+    // A gate issue that blocks: its kind.
+    let held = env.create("Held", 2);
+    let gate = env
+        .store
+        .write("gate", "alice", |tx| {
+            tx.create_gate(gates::NewGate {
+                spec: gates::GateSpec::new(gates::GateKind::Human),
+                blocks: vec![held.clone()],
+                title: None,
+                description: String::new(),
+                assignee: None,
+                parent: None,
+                priority: None,
+                ephemeral: false,
+            })
+        })
+        .unwrap()
+        .id;
+    let why = explain(&env, &held, ExplainOptions::default());
+    assert!(
+        matches!(&why.reasons[..], [NotReady::Blocked { id, via: BlockerKind::Blocks, gate: Some(g), .. }] if id == &gate && g == "human"),
+        "{why:?}"
+    );
+    assert_eq!(serde_json::to_value(&why.reasons[0]).unwrap()["gate"], "human");
+
+    // waits-for: the edge's gate, all-children when it names none.
+    let spawner = env.create("Spawner", 2);
+    env.create_with(NewIssue { title: "Spawned".into(), parent: Some(spawner.clone()), ..Default::default() });
+    let any = env.create("Any", 2);
+    let all = env.create("All", 2);
+    env.store
+        .write("dep", "alice", |tx| {
+            tx.add_dependency(&any, &spawner, DepType::WaitsFor, Some(json!({ "gate": "any-children" })))
+        })
+        .unwrap();
+    env.dep(&all, &spawner, DepType::WaitsFor);
+    for (id, want) in [(&any, "any-children"), (&all, "all-children")] {
+        let why = explain(&env, id, ExplainOptions::default());
+        assert!(
+            matches!(&why.reasons[..], [NotReady::Blocked { id: s, via: BlockerKind::WaitsFor, gate: Some(g), .. }] if s == &spawner && g == want),
+            "{why:?}"
+        );
+    }
+    // A spawner never waits on its children.
+    assert!(explain(&env, &spawner, ExplainOptions::default()).ready);
+}
+
+#[test]
+fn explain_names_deferrals_and_children() {
+    let mut env = Env::new();
+    let parent = env.create("Parent", 2);
+    let kid = env.create_with(NewIssue { title: "Kid".into(), parent: Some(parent.clone()), ..Default::default() });
+    let why = explain(&env, &parent, ExplainOptions::default());
+    assert_eq!(
+        why.reasons,
+        [NotReady::WaitsOnChildren {
+            open: 1,
+            children: vec![OpenChild { id: kid.clone(), status: Status::Open, assignee: None }],
+        }]
+    );
+    assert_eq!(
+        texts(&env, &parent, &why.reasons),
+        [format!(
+            "its children come first, and 1 is open ({kid} open): claim one of them (`bd claim --next --parent {parent}`)"
+        )]
+    );
+    assert_eq!(
+        serde_json::to_value(&why.reasons[0]).unwrap(),
+        json!({ "kind": "waits_on_children", "open": 1, "children": [{ "id": kid, "status": "open" }] })
+    );
+
+    let until = env.clock.now().plus(Duration::from_secs(3600));
+    env.store.write("defer", "alice", |tx| tx.defer_issue(&parent, Some(until))).unwrap();
+    let why = explain(&env, &kid, ExplainOptions::default());
+    assert_eq!(why.reasons, [NotReady::Deferred { source: parent.clone(), until: Some(until) }]);
+    assert_eq!(texts(&env, &kid, &why.reasons), [format!("ancestor {parent} is deferred until {until} (in 1h)")]);
+    assert!(explain(&env, &kid, ExplainOptions { include_deferred: true, ..Default::default() }).ready);
+    let why = explain(&env, &parent, ExplainOptions::default());
+    assert!(
+        matches!(&why.reasons[..], [NotReady::Deferred { source, .. }, NotReady::WaitsOnChildren { .. }] if source == &parent)
+    );
+    assert_eq!(texts(&env, &parent, &why.reasons[..1]), [format!("deferred until {until} (in 1h)")]);
+    let solo = env.create("Solo", 2);
+    env.store.write("defer", "alice", |tx| tx.defer_issue(&solo, None)).unwrap();
+    let why = explain(&env, &solo, ExplainOptions::default());
+    // An open-ended deferral is the status `deferred` too.
+    assert_eq!(
+        why.reasons,
+        [NotReady::Status { status: Status::Deferred }, NotReady::Deferred { source: solo.clone(), until: None }]
+    );
+    assert_eq!(serde_json::to_value(&why.reasons[1]).unwrap(), json!({ "kind": "deferred", "source": solo }));
+}
+
+#[test]
+fn not_ready_lists_the_open_issues_the_queue_leaves_out() {
+    let mut env = Env::new();
+    let blocker = env.create("Blocker", 3);
+    let blocked = env.create("Blocked", 1);
+    env.dep(&blocked, &blocker, DepType::Blocks);
+    let parent = env.create("Parent", 0);
+    let kid = env.create_with(NewIssue { title: "Kid".into(), parent: Some(parent.clone()), ..Default::default() });
+    let later = env.create("Later", 2);
+    env.store
+        .write("defer", "alice", |tx| tx.defer_issue(&later, Some(env.clock.now().plus(Duration::from_secs(60)))))
+        .unwrap();
+    let epic =
+        env.create_with(NewIssue { title: "Epic".into(), issue_type: Some("epic".into()), ..Default::default() });
+    env.create_with(NewIssue {
+        title: "Epic kid".into(),
+        parent: Some(epic.clone()),
+        priority: Some(4),
+        ..Default::default()
+    });
+    let claimed = env.create("Claimed", 2);
+    env.store.write("claim", "agent-a", |tx| tx.claim(&claimed, &ClaimOptions::default())).unwrap();
+
+    let ids = |q: &ReadyQuery| -> Vec<String> {
+        env.store.read(|r| r.not_ready(q)).unwrap().into_iter().map(|i| i.id).collect()
+    };
+    // By priority: open only, epics left out as in the queue.
+    assert_eq!(ids(&ReadyQuery::default()), [parent.clone(), blocked.clone(), later.clone()]);
+    assert_eq!(ids(&ReadyQuery { limit: Some(2), ..Default::default() }), [parent.clone(), blocked.clone()]);
+    assert_eq!(ids(&ReadyQuery { include_deferred: true, ..Default::default() }), [parent.clone(), blocked.clone()]);
+    assert_eq!(
+        ids(&ReadyQuery { include_epics: true, ..Default::default() }),
+        [parent.clone(), blocked.clone(), later.clone(), epic.clone()]
+    );
+    let under = WorkFilter { parent: Some(parent.clone()), ..Default::default() };
+    assert!(ids(&ReadyQuery { filter: under, ..Default::default() }).is_empty(), "the kid is ready");
+    assert!(env.ready_ids().contains(&kid) && env.ready_ids().contains(&blocker));
+    env.clock.advance(Duration::from_secs(61));
+    assert_eq!(ids(&ReadyQuery::default()), [parent, blocked]);
+}
+
+#[test]
+fn order_keys_say_why_the_queue_is_in_its_order() {
+    let mut env = Env::new();
+    let id = env.create("Task", 1);
+    let issue = env.issue(&id);
+    let created = issue.created_at;
+    let now = env.clock.now();
+    assert_eq!(ready::order_key(&issue, SortPolicy::Priority, now), format!("P1, created {created}"));
+    assert_eq!(ready::order_key(&issue, SortPolicy::Oldest, now), format!("created {created}"));
+    assert_eq!(ready::order_key(&issue, SortPolicy::Hybrid, now), format!("recent (last 48h): P1, created {created}"));
+    let later = now.plus(Duration::from_secs(49 * 3600));
+    assert_eq!(ready::order_key(&issue, SortPolicy::Hybrid, later), format!("older: created {created}"));
+}
+
+fn close_as(
+    env: &mut Env,
+    actor: &str,
+    id: &str,
+    target: &str,
+    kind: Replacement,
+    opts: &CloseAsOptions,
+) -> Result<CloseAsOutcome> {
+    env.clock.advance(Duration::from_millis(10));
+    env.store.write("close_as", actor, |tx| tx.close_as(id, target, kind, opts))
+}
+
+fn edges_of(env: &Env, id: &str) -> (Vec<Edge>, Vec<Edge>) {
+    env.store.read(|r| Ok((r.dependencies(id)?, r.dependents(id)?))).unwrap()
+}
+
+#[test]
+fn closing_as_a_duplicate_or_superseded_adds_the_edge_and_closes_in_one_transaction() {
+    let mut env = Env::new();
+    let canonical = env.create("Canonical", 1);
+    let dup = env.create_with(NewIssue { title: "Dup".into(), labels: vec!["x".into()], ..Default::default() });
+    let old = env.create("Old", 2);
+    env.store.write("c", "alice", |tx| tx.add_comment(&dup, "a comment")).unwrap();
+    let before_canonical = env.issue(&canonical);
+    let before_edges = edges_of(&env, &canonical);
+
+    let out =
+        close_as(&mut env, "alice", &dup, &canonical, Replacement::Duplicate, &CloseAsOptions::default()).unwrap();
+    assert!(!out.already);
+    assert_eq!(out.dep_type, DepType::Duplicates);
+    assert_eq!(out.target.id, canonical);
+    assert_eq!(out.issue.status, Status::Closed);
+    assert_eq!(out.issue.close_reason.as_deref(), Some(format!("duplicate of {canonical}").as_str()));
+    assert_eq!(out.issue.close_outcome, Some(Outcome::Done));
+    assert_eq!(out.issue.labels, vec!["x".to_string()]);
+    let (down, _) = edges_of(&env, &dup);
+    assert_eq!(down.len(), 1);
+    assert_eq!((down[0].id.as_str(), &down[0].dep_type), (canonical.as_str(), &DepType::Duplicates));
+    assert_eq!(env.store.read(|r| r.comments(&dup)).unwrap().len(), 1);
+
+    let events = env.events();
+    let added = events.iter().rev().find(|e| e.op == "dep_added").unwrap();
+    let closed = events.iter().rev().find(|e| e.op == "closed").unwrap();
+    assert_eq!(added.tx, closed.tx, "one transaction");
+    assert_eq!(added.issue_id.as_deref(), Some(dup.as_str()));
+    assert_eq!(closed.data["reason"], format!("duplicate of {canonical}"));
+    assert_eq!(closed.data["outcome"], "done");
+
+    let out =
+        close_as(&mut env, "alice", &old, &canonical, Replacement::Supersede, &CloseAsOptions::default()).unwrap();
+    assert_eq!(out.dep_type, DepType::Supersedes);
+    assert_eq!(out.issue.close_reason.as_deref(), Some(format!("superseded by {canonical}").as_str()));
+    let (down, _) = edges_of(&env, &old);
+    assert_eq!((down[0].id.as_str(), &down[0].dep_type), (canonical.as_str(), &DepType::Supersedes));
+
+    // The replacing issue is untouched: same revision, status and own edges.
+    assert_eq!(env.issue(&canonical), before_canonical);
+    let (down, up) = edges_of(&env, &canonical);
+    assert_eq!(down, before_edges.0);
+    assert_eq!(up.len(), 2, "only the two new incoming edges");
+    env.assert_healthy();
+}
+
+#[test]
+fn closing_as_a_duplicate_moves_nothing_else() {
+    let mut env = Env::new();
+    let canonical = env.create("Canonical", 1);
+    let dup = env.create("Dup", 1);
+    let child = env.create_with(NewIssue { title: "Child".into(), parent: Some(dup.clone()), ..Default::default() });
+    let other = env.create("Other", 1);
+    env.dep(&dup, &other, DepType::Related);
+
+    let opts = CloseAsOptions::default();
+    let e = close_as(&mut env, "alice", &dup, &canonical, Replacement::Duplicate, &opts).unwrap_err();
+    assert!(matches!(e, Error::Refused(ref m) if m.contains("open child")), "{e}");
+    assert_eq!(e.exit_code(), 2);
+    assert_eq!(env.issue(&dup).status, Status::Open);
+    assert_eq!(edges_of(&env, &dup).0.len(), 1, "the refused close rolled back its edge");
+
+    let force = CloseAsOptions { force: true, ..Default::default() };
+    close_as(&mut env, "alice", &dup, &canonical, Replacement::Duplicate, &force).unwrap();
+    assert_eq!(env.issue(&child).status, Status::Open);
+    assert_eq!(env.store.read(|r| r.details(&child)).unwrap().parent.as_deref(), Some(dup.as_str()));
+    let (down, _) = edges_of(&env, &dup);
+    let kinds: Vec<_> = down.iter().map(|e| (e.id.as_str(), e.dep_type.as_str())).collect();
+    assert!(kinds.contains(&(other.as_str(), "related")) && kinds.contains(&(canonical.as_str(), "duplicates")));
+    assert_eq!(edges_of(&env, &canonical).0.len(), 0);
+    env.assert_healthy();
+}
+
+#[test]
+fn closing_a_blocked_issue_as_a_duplicate_needs_force() {
+    let mut env = Env::new();
+    let canonical = env.create("Canonical", 1);
+    let blocker = env.create("Blocker", 1);
+    let dup = env.create("Dup", 1);
+    env.dep(&dup, &blocker, DepType::Blocks);
+    let e =
+        close_as(&mut env, "alice", &dup, &canonical, Replacement::Duplicate, &CloseAsOptions::default()).unwrap_err();
+    assert!(matches!(e, Error::Refused(ref m) if m.contains("blocked by")), "{e}");
+    let force = CloseAsOptions { force: true, ..Default::default() };
+    close_as(&mut env, "alice", &dup, &canonical, Replacement::Duplicate, &force).unwrap();
+    env.assert_healthy();
+}
+
+#[test]
+fn closing_as_a_duplicate_refuses_nonsense_and_writes_nothing() {
+    let mut env = Env::new();
+    let y = env.create("Y", 1);
+    let x = env.create("X", 1);
+    let z = env.create("Z", 1);
+    let opts = CloseAsOptions::default();
+    let head_before = head(&env);
+    let refused = |env: &mut Env, id: &str, target: &str, kind: Replacement, code: i32, needle: &str| {
+        let e = close_as(env, "alice", id, target, kind, &CloseAsOptions::default()).unwrap_err();
+        assert_eq!(e.exit_code(), code, "{e}");
+        assert!(e.to_string().contains(needle), "{e}");
+    };
+
+    refused(&mut env, &x, &x, Replacement::Duplicate, 2, "cannot be");
+    refused(&mut env, &x, "t-999", Replacement::Duplicate, 3, "t-999");
+    refused(&mut env, "t-999", &x, Replacement::Supersede, 3, "t-999");
+    // Another type of edge between them is not replaced.
+    env.dep(&x, &y, DepType::Blocks);
+    refused(&mut env, &x, &y, Replacement::Duplicate, 2, "remove that edge first");
+    assert_eq!(env.issue(&x).status, Status::Open);
+    env.store.write("rm", "alice", |tx| tx.remove_dependency(&x, &y)).unwrap();
+    let head_before = head_before.max(head(&env));
+
+    // The reverse edge of the same type.
+    close_as(&mut env, "alice", &z, &x, Replacement::Duplicate, &opts).unwrap();
+    let head_mid = head(&env);
+    // z is closed as a duplicate of x: x cannot be a duplicate of z, and a
+    // duplicate of the closed duplicate z is sent to its root.
+    refused(&mut env, &x, &z, Replacement::Duplicate, 2, "already a duplicate of");
+    let w = env.create("W", 1);
+    let head_w = head(&env);
+    refused(&mut env, &w, &z, Replacement::Duplicate, 2, &format!("mark {w} a duplicate of {x}"));
+    assert_eq!(head(&env), head_w);
+    assert!(head_w > head_mid && head_mid > head_before);
+    // The same chain check for supersedes.
+    let old = env.create("Old", 1);
+    close_as(&mut env, "alice", &old, &y, Replacement::Supersede, &opts).unwrap();
+    let older = env.create("Older", 1);
+    refused(&mut env, &older, &old, Replacement::Supersede, 2, &format!("mark {older} superseded by {y}"));
+    // A target closed as plain done is accepted, and so is a different relation to a closed duplicate.
+    let done = env.create("Done", 1);
+    env.close(&done);
+    let late = env.create("Late", 1);
+    close_as(&mut env, "alice", &late, &done, Replacement::Duplicate, &opts).unwrap();
+    let other = env.create("Other", 1);
+    close_as(&mut env, "alice", &other, &z, Replacement::Supersede, &opts).unwrap();
+    env.assert_healthy();
+}
+
+#[test]
+fn closing_an_already_closed_issue_as_a_duplicate_is_idempotent_only_with_the_edge() {
+    let mut env = Env::new();
+    let y = env.create("Y", 1);
+    let x = env.create("X", 1);
+    let plain = env.create("Plain", 1);
+    env.close(&plain);
+    let opts = CloseAsOptions::default();
+    close_as(&mut env, "alice", &x, &y, Replacement::Duplicate, &opts).unwrap();
+    let head_before = head(&env);
+    let revision = env.issue(&x).revision;
+    let again = close_as(&mut env, "alice", &x, &y, Replacement::Duplicate, &opts).unwrap();
+    assert!(again.already);
+    assert_eq!(again.issue.revision, revision);
+    assert_eq!(head(&env), head_before, "no events");
+
+    for (id, target, kind) in [(&x, &y, Replacement::Supersede), (&plain, &y, Replacement::Duplicate)] {
+        let e = close_as(&mut env, "alice", id, target, kind, &opts).unwrap_err();
+        assert!(matches!(e, Error::Refused(ref m) if m.contains("already closed") && m.contains("bd dep add")), "{e}");
+        assert_eq!(e.exit_code(), 2);
+    }
+    assert_eq!(head(&env), head_before);
+    assert_eq!(env.issue(&plain).close_reason, None);
+    env.assert_healthy();
+}
+
+#[test]
+fn closing_as_a_duplicate_checks_the_guards() {
+    let mut env = Env::new();
+    let y = env.create("Y", 1);
+    let x = env.create("X", 1);
+    let head_before = head(&env);
+    let rev = env.issue(&x).revision;
+    for guard in [
+        Guard { if_revision: Some(rev + 1), ..Default::default() },
+        Guard { if_status: Some(Status::InProgress), ..Default::default() },
+        Guard { if_assignee: Some(Some("bob".into())), ..Default::default() },
+    ] {
+        let e = close_as(
+            &mut env,
+            "alice",
+            &x,
+            &y,
+            Replacement::Duplicate,
+            &CloseAsOptions { guard, ..Default::default() },
+        )
+        .unwrap_err();
+        assert!(matches!(e, Error::Conflict { .. }), "{e}");
+        assert_eq!(e.exit_code(), 13);
+    }
+    assert_eq!(head(&env), head_before);
+    assert_eq!(env.issue(&x).status, Status::Open);
+    let guard = Guard { if_revision: Some(rev), ..Default::default() };
+    close_as(&mut env, "alice", &x, &y, Replacement::Duplicate, &CloseAsOptions { guard, ..Default::default() })
+        .unwrap();
+    env.assert_healthy();
+}
+
+#[test]
+fn closing_as_a_duplicate_ends_another_actors_claim_only_with_take_over() {
+    let mut env = Env::new();
+    let y = env.create("Y", 1);
+    let x = env.create("X", 1);
+    let token = env.store.write("claim", "bob", |tx| tx.claim(&x, &ClaimOptions::default())).unwrap().lease.token;
+    let head_before = head(&env);
+
+    for (force, take_over) in [(false, false), (true, false)] {
+        let opts = CloseAsOptions { force, take_over, ..Default::default() };
+        let e = close_as(&mut env, "alice", &x, &y, Replacement::Duplicate, &opts).unwrap_err();
+        assert!(matches!(e, Error::NotOwner { ref holder, .. } if holder.as_deref() == Some("bob")), "{e}");
+        assert_eq!(e.exit_code(), 4);
+    }
+    assert_eq!(head(&env), head_before);
+    assert_eq!(env.issue(&x).status, Status::InProgress);
+    assert!(edges_of(&env, &x).0.is_empty());
+
+    // The holder itself needs no takeover.
+    let own = env.create("Own", 1);
+    env.store.write("claim", "alice", |tx| tx.claim(&own, &ClaimOptions::default())).unwrap();
+    close_as(&mut env, "alice", &own, &y, Replacement::Supersede, &CloseAsOptions::default()).unwrap();
+    assert!(env.store.read(|r| r.lease(&own)).unwrap().is_none());
+
+    let opts = CloseAsOptions { take_over: true, ..Default::default() };
+    close_as(&mut env, "alice", &x, &y, Replacement::Duplicate, &opts).unwrap();
+    let closed = env.store.read(|r| r.history(&x)).unwrap().into_iter().rev().find(|e| e.op == "closed").unwrap();
+    assert_eq!(closed.data["claim_override"], json!({ "holder": "bob", "token": token }));
+    assert!(env.store.read(|r| r.lease(&x)).unwrap().is_none(), "the lease ends with the claim");
     env.assert_healthy();
 }

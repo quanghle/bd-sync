@@ -384,13 +384,13 @@ the server's name.
 | tool | runs | arguments | read-only |
 |---|---|---|---|
 | `ready` | `bd ready` | `limit` (1–100, default 10), `label` (all of these), `type`, `assignee`, `unassigned`, `parent` | yes |
-| `list` | `bd list` | `status` (list of `open`, `in_progress`, `blocked`, `deferred`, `closed`, `pinned`; default hides closed and pinned), `search`, `label`, `label_any`, `type`, `assignee`, `parent`, `blocked`, `sort` (`priority`, `created`, `updated`), `limit` (1–100, default 20) | yes |
-| `show` | `bd show` | `ids` (1–20, required) | yes |
+| `list` | `bd list` | `status` (list of `open`, `in_progress`, `blocked`, `deferred`, `closed`, `pinned`; default hides closed and pinned), `search`, `label`, `label_any`, `type`, `assignee`, `parent`, `blocked`, `updated_after` and `created_after` (a time as `bd list --updated-after` takes it: `7d` is 7 days ago, `+2d` 2 days ahead), `overdue`, `sort` (`priority`, `created`, `updated`), `limit` (1–100, default 20) | yes |
+| `show` | `bd show` | `ids` (1–20, required), `brief` (default `false`: key fields, the description cut to 500 characters, open blocker ids, the last 3 comments) | yes |
 | `create` | `bd create` | `title` (required), `description`, `type` (default task), `priority` (0–4, default 2), `labels`, `parent`, `deps` (`ID`, which blocks, or `TYPE:ID`), `assignee`, `claim` | no |
 | `update` | `bd update` | `id` (required), `title`, `description`, `design`, `acceptance`, `notes`, `append_notes`, `status` (`open`, `blocked`, `deferred`, `pinned`), `priority`, `type`, `assignee` (`""` unassigns), `add_labels`, `remove_labels`, `parent` (`""` detaches), `due`, `defer`, `if_revision` | no |
 | `claim` | `bd claim` | `id`, or `next: true` with the filters `label`, `type` and `parent` | no |
 | `heartbeat` | `bd heartbeat` | `id`, `token` (both required) | no |
-| `close` | `bd close` | `ids` (1–20) and `reason` (both required), `failed`, `token` | no |
+| `close` | `bd close` | `ids` (1–20) and `reason` (both required), `failed`, `token`, `claim_next` (then claim the next ready issue, as `bd close --claim-next`; default false) | no |
 | `release` | `bd release` | `id` (required), `reason`, `token` | no |
 | `reopen` | `bd reopen` | `ids` (1–20, required), `reason` | no |
 | `comment` | `bd comment add` | `id`, `text` (both required) | no |
@@ -412,10 +412,15 @@ the server's name.
 model get past what the CLI asks of agents: taking over or ending other
 actors' claims (`--take-over`), `--force`, `delete`, `defer` beyond
 `update`, gates, playbooks, `batch`, `import`/`export`, `config`,
-`rename-prefix`, `doctor`, `events prune`, `agents`, `serve`, `remote` and `forget`. Tool
+`rename-prefix`, `doctor`, `events prune`, `github`, `agents`, `serve`, `remote` and `forget`. Tool
 calls never carry the token's admin or human rights, locally or on a
 server, so a model cannot take over another actor's claim or open a human
 gate.
+
+The reporting views `query`, `epic`, `children`, `stale`, `orphans` and
+`graph` are not tools either, to keep the tool list small: an agent that
+needs one runs the command (`bd query '...' --json`); `list` takes the
+time filters agents use most.
 
 ### Leases and tokens
 
@@ -434,13 +439,18 @@ output schemas), so the model reads each thing once:
 - null fields, empty strings, empty lists and empty objects are left out
   (an empty `ready` is `{}`), and the JSON has no indentation;
 - `ready` and `list` return `{"issues": [...]}` with summaries (`id`,
-  `title`, `status`, `priority`, `type`, `assignee`, `labels`), and
-  `more: true` when the limit cut the list; `show` returns full issues
-  with their texts, dependencies, dependents, children, blockers, comments
-  and lease;
+  `title`, `status`, `priority`, `type`, `assignee`, `parent`, `labels`;
+  they run `bd ready --brief` and `bd list --brief`), and `more: true`
+  when the limit cut the list; `show` returns full issues with their
+  texts, dependencies, dependents, children, blockers, comments and lease,
+  or with `brief: true` what `bd show --brief` gives: the summary's fields,
+  the description cut to 500 characters (`description_truncated: true`
+  when cut), open blocker ids, the last 3 comments and `comments_total`;
 - writes return the changed issue's summary and what the change caused:
-  `close` the issues it unblocked, `claim` the token and expiry, `dep_add`
-  whether the issue is now blocked. Nothing to claim is
+  `close` the issues it unblocked (with `claim_next`, `{closed, next}`:
+  `next` has `from`, the claimed issue's summary and its lease's token and
+  expiry, and is left out when nothing was ready), `claim` the token and
+  expiry, `dep_add` whether the issue is now blocked. Nothing to claim is
   `{"message": "nothing matched"}`;
 - control and bidirectional formatting characters are escaped as `\u…`; a
   call may print at most 4 MiB.
@@ -471,7 +481,9 @@ resends a call after losing its answer runs it again: `create` creates a
 second issue; `claim` of the issue it already holds fails with
 `already_claimed` naming its own actor (the holder may still `release` or
 `close` without the token, and claim again); `close` of a closed issue
-succeeds with `already_closed: true`. After a lost answer, `show` or
+succeeds with `already_closed: true`, and with `claim_next` claims nothing
+more (`next_note: "nothing closed: not claiming"`): the claim the first call
+made is the actor's, listed with its token by `bd prime`. After a lost answer, `show` or
 `list` tells whether a write took effect. (`bd mcp` in a remote workspace
 forwards each call with its own request id, so its own retries to the
 server are safe.)
@@ -479,7 +491,7 @@ server are safe.)
 ### Context cost
 
 The tool list (names, descriptions and input schemas) is written by hand,
-with one-line descriptions and no output schemas, and costs about 1,500
-tokens (6.4 KB; a test keeps it under 6.5 KB). The `instructions` add
+with one-line descriptions and no output schemas, and costs about 1,550
+tokens (6.6 KB; a test keeps it under 6,656 bytes). The `instructions` add
 about 120 tokens. Most of a session's MCP context is results, which is why
 lists return summaries and results leave out empty fields.

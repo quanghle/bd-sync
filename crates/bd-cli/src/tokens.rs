@@ -15,7 +15,7 @@ pub enum Role {
     Read,
     /// Also commands that change the workspace, except admin-only ones
     Write,
-    /// Also config set/unset, rename-prefix, import, events prune, doctor, and ending or taking over other actors' live claims
+    /// Also config set/unset, rename-prefix, import, github, events prune, doctor, and ending or taking over other actors' live claims
     Admin,
 }
 

@@ -186,7 +186,9 @@ and gate in a single transaction, with readable ids `<run>.<step>`.
   own (groups are never assigned). `--after <id>` holds the run until other
   work closes; `--parent <id>` attaches it below an existing issue.
 - `compact` and `discard` take `--dry-run`, `--force` (unfinished runs) and
-  `--take-over` (other actors' claims in the run).
+  `--take-over` (other actors' claims in the run). `bd playbook compact`
+  folds a run; to summarise the text of old closed issues instead, see `bd
+  compact` ([Compaction](concepts.md#compaction)).
 
 **Fan-out at run time.** Give a collector step `needs = ["spawn"]` and
 `waits_for = "all-children"`, then create children under the spawner step

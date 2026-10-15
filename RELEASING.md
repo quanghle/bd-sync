@@ -77,6 +77,7 @@ on push), so the tag steps above and the tag deletions under
 | Check tag and version | ubuntu-24.04 | Reads the version with `cargo metadata`, fails unless the tag is `v<version>` and `Cargo.lock` is current, and decides whether this is a pre-release. |
 | Build (one per target) | see below | Builds `cargo build --release --locked -p bd --target <target>` with symbols stripped, checks the binary (static on Linux, no dynamic C runtime on Windows, macOS 11 minimum and system libraries only on macOS), packages it, then unpacks the archive and smoke-tests it (`bd version`, `bd init`, `bd create`, `bd ready`). |
 | Write SHA256SUMS | ubuntu-24.04 | Writes `SHA256SUMS` for all archives. On tags, if the release is already published, fails unless its `SHA256SUMS` is byte-identical to this run's (`.github/scripts/release-state.sh`, the check publish runs too), so nothing is attested for archives that would not be published. |
+| Render packaging | ubuntu-24.04 | Renders the Homebrew formula, winget manifests and npm packages for the release from its archives and `SHA256SUMS`, and uploads them as the workflow artifact `packaging-<tag>`. Runs on dry runs too; nothing is published, and publish does not wait for it (see [Packaging](#packaging-homebrew-winget-npm)). |
 | Attest build provenance | ubuntu-24.04 | Tags only. Signs a SLSA build-provenance attestation for every archive. |
 | Publish GitHub Release | ubuntu-24.04 | Tags only. Creates the release with generated notes, the archives and `SHA256SUMS`. On a re-run it completes a draft left by an interrupted publish, but never replaces the assets of a published release (see [If something fails](#if-something-fails)). |
 
@@ -91,7 +92,10 @@ on push), so the tag steps above and the tag deletions under
 
 Each archive holds the binary, `README.md` and the `docs/` directory it links
 to at its root, plus any `LICENSE*`, `COPYING*` or `NOTICE*` files present in
-the repository root.
+the repository root. When the built binary has `bd completion`, the archive
+also holds `completions/` (`bd.bash`, `_bd`, `bd.fish`, `_bd.ps1`), generated
+by that binary; the smoke test then requires the four files. Without the
+command the step prints a notice and the archive is built without them.
 
 Build settings live in the workflow's `env`, not in `Cargo.toml`:
 `CARGO_PROFILE_RELEASE_STRIP=symbols`; `CC_<target>=musl-gcc` for the static
@@ -151,9 +155,54 @@ for f in bd-*.tar.gz bd-*.zip; do
 done
 ```
 
+To try the install script against the release, install into a scratch
+directory and check the version:
+
+```bash
+BD_INSTALL_DIR=$(mktemp -d) sh scripts/install.sh --version "$tag"
+```
+
 For a stricter check, add
 `--signer-workflow quanghle/bd-sync/.github/workflows/release.yml --source-ref "refs/tags/$tag"`
 to `gh attestation verify`.
+
+## Packaging (Homebrew, winget, npm)
+
+The `Render packaging` job runs `scripts/render-packaging.sh` on the release's
+archives and uploads the result as the workflow artifact `packaging-<tag>` (on
+a dry run, `packaging-v<version>-dev.<commit>`). The name does not match the
+`bd-<tag>-*` patterns, so it never mixes into attestation or publishing. It
+holds:
+
+- `homebrew/bd.rb`, the formula, with the release's URLs and checksums;
+- `winget/manifests/<o>/<owner>/bd/<version>/`, the three winget manifests;
+- `npm/`, the main package and six per-platform packages (the archives'
+  binaries are verified against `SHA256SUMS` before they are copied in), and
+  `npm-tarballs/`, their `npm pack --ignore-scripts` tarballs.
+
+Nothing is published and nothing is attached to the GitHub release: release
+assets are checked against `SHA256SUMS` and never replaced, and the packaging
+can be regenerated at any time. Fetch the artifact of a run, or regenerate it
+from a published release:
+
+```bash
+gh run download <run-id> --repo quanghle/bd-sync --name packaging-vX.Y.Z
+
+gh release download vX.Y.Z --repo quanghle/bd-sync --dir dist
+bash scripts/render-packaging.sh --version X.Y.Z --tag vX.Y.Z --dist dist --out out
+```
+
+Publishing is manual and outside the workflow:
+
+- Homebrew: copy `homebrew/bd.rb` into a tap repository as `Formula/bd.rb`.
+- winget: `wingetcreate submit` the manifests directory, or open a pull request
+  against winget-pkgs with it.
+- npm: `npm publish` each platform tarball in `npm-tarballs/`, then the main
+  one (`bd`), so its optional dependencies exist.
+
+The templates live in `packaging/` and are checked, with the scripts, by
+`bash scripts/test-packaging.sh` (see [CONTRIBUTING.md](CONTRIBUTING.md)); the
+npm design is explained in [packaging/npm/README.md](packaging/npm/README.md).
 
 ## If something fails
 

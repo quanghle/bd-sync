@@ -452,10 +452,20 @@ fn purge_deletes_candidates_whose_subtree_and_ephemeral_ancestors_are_candidates
 
     let events = env.store.read(|r| r.events(&EventQuery { since: Some(head), ..Default::default() })).unwrap().events;
     let ops: Vec<(&str, Option<&str>)> = events.iter().map(|e| (e.op.as_str(), e.issue_id.as_deref())).collect();
-    assert_eq!(ops, vec![("purged", None), ("unblocked", Some(cond.as_str())), ("blocked", Some(waiter.as_str()))]);
+    // Each edge the purge drops is recorded on its survivor first, by survivor then target.
+    let mut dropped = vec![(cond.as_str(), a2.as_str()), (keep.as_str(), a2.as_str())];
+    dropped.sort();
+    let mut expected_ops: Vec<(&str, Option<&str>)> = dropped.iter().map(|(s, _)| ("dep_removed", Some(*s))).collect();
+    expected_ops.extend([("purged", None), ("unblocked", Some(cond.as_str())), ("blocked", Some(waiter.as_str()))]);
+    assert_eq!(ops, expected_ops);
+    for (e, (_, target)) in events.iter().zip(&dropped) {
+        assert_eq!((e.data["target"].as_str(), e.data["dropped_by"].as_str()), (Some(*target), Some(*target)));
+        assert!(expected.iter().any(|id| e.data["dropped_by"] == json!(id)), "dropped by a purged issue");
+    }
+    let summary = events.iter().find(|e| e.op == "purged").unwrap();
     let cutoff = env.store.read(|r| Ok(r.now())).unwrap().minus(Duration::from_secs(1800));
     assert_eq!(
-        events[0].data,
+        summary.data,
         json!({ "cutoff": cutoff, "ids": expected, "count": expected.len(), "detached": out.detached })
     );
     env.assert_healthy();
@@ -1236,13 +1246,30 @@ fn reopening_up_closed_groups_blocks_what_it_should_in_order() {
         ),
     ] {
         let since = env.store.read(|r| r.events(&EventQuery::default())).unwrap().head;
+        // What each reopen clears, recorded in its event.
+        let closed_before: std::collections::HashMap<String, Issue> = expected
+            .iter()
+            .filter(|(op, _, _)| *op == "reopened")
+            .map(|(_, id, _)| ((*id).clone(), env.issue(id)))
+            .collect();
         let out = env.store.write("reopen", "alice", |tx| tx.reopen_issue(reopen, None)).unwrap();
         let ids = |refs: &[IssueRef]| refs.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&out.reopened), reopened.into_iter().cloned().collect::<Vec<_>>());
         assert_eq!(ids(&out.newly_blocked), blocked.into_iter().cloned().collect::<Vec<_>>());
         let events = env.store.read(|r| r.events(&EventQuery { since: Some(since), ..Default::default() })).unwrap();
-        let events: Vec<_> =
+        let mut events: Vec<_> =
             events.events.into_iter().map(|e| (e.op, e.issue_id.unwrap_or_default(), e.data)).collect();
+        for (op, id, data) in &mut events {
+            if op != "reopened" {
+                continue;
+            }
+            let previous = data.as_object_mut().unwrap().remove("previous").expect("previous close fields");
+            let before = &closed_before[id.as_str()];
+            assert_eq!(previous["close_reason"], json!(before.close_reason), "{id}");
+            assert_eq!(previous["close_outcome"], json!(before.close_outcome), "{id}");
+            let closed_at = previous["closed_at"].as_str().map(Timestamp::parse_rfc3339);
+            assert_eq!(closed_at.map(Result::unwrap), before.closed_at, "{id}");
+        }
         let expected: Vec<_> = expected.into_iter().map(|(op, id, data)| (op.to_string(), id.clone(), data)).collect();
         assert_eq!(events, expected);
     }

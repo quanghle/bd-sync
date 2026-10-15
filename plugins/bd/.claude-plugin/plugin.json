@@ -1,0 +1,17 @@
+{
+  "name": "bd",
+  "description": "Task tracking for coding agents: dependency-aware ready work, leased claims, and durable memory, on SQLite.",
+  "author": {
+    "name": "quanghle",
+    "url": "https://github.com/quanghle"
+  },
+  "homepage": "https://github.com/quanghle/bd-sync",
+  "repository": "https://github.com/quanghle/bd-sync",
+  "license": "MIT",
+  "keywords": [
+    "issue-tracker",
+    "task-management",
+    "ai-workflow",
+    "agent-memory"
+  ]
+}

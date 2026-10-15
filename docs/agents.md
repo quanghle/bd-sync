@@ -432,6 +432,44 @@ half written.
 sets, so you can run `bd agents pull --harness <h>` before the first
 session (which also adds the hook).
 
+`bd setup <harness>` writes these hooks into a project's shared
+configuration (for Claude Code with the subagent hooks too), and
+instructions for harnesses without them; this repository is also a Claude
+Code plugin carrying the same hooks ([Setting up agent harnesses](setup.md)).
+A pull, and `bd setup` for Codex and Copilot CLI, count a hook already
+configured anywhere the harness reads hooks, an installed Claude Code
+plugin's included (`<claude home>/plugins/cache`), and add nothing then;
+`bd setup claude` counts only the shared `.claude/settings.json` and
+installed plugins
+([What counts as already set up](setup.md#what-counts-as-already-set-up)).
+
+### After compaction
+
+Compacting a conversation drops the bd context the session started with.
+Claude Code and Codex run SessionStart hooks again after compaction, with
+`"source": "compact"` in the hook's input, and add their output to the new
+context: `bd prime` then gives the session back its actor, its claims
+with their current lease tokens and the ready work, and `bd hook
+session-start` adds one line ahead of it, in a bd workspace:
+
+```text
+bd: the conversation was compacted. The bd context that follows (`bd prime`) lists your claims with their current lease tokens and the ready work: use those tokens for heartbeats and closes.
+```
+
+PreCompact and PostCompact hooks are not used: Claude Code and Codex do
+not add their output to the model's context.
+
+| harness | event after compaction |
+|---|---|
+| Claude Code | SessionStart, source `compact` (a group without a `matcher` runs for every source) |
+| Codex | SessionStart, source `compact` (the matcher must include `compact`) |
+| Copilot CLI | none: its preCompact output is not used, and its sessionStart sources are startup, resume and new |
+| Cursor | preCompact, which only offers a message to the user |
+| Gemini CLI | PreCompress, advisory (a `systemMessage` shown to the user only); SessionStart sources are startup, resume and clear |
+
+Where no hook runs after compaction, the agent instructions (bd's skill,
+or the section `bd setup` writes) tell the agent to run `bd prime` again.
+
 ### Claude Code
 
 `.claude/settings.json` (as in this repository):
@@ -456,7 +494,10 @@ set, it also writes `export CLAUDE_CODE_SESSION_ID=<id>` there, from the
 hook's input, so the session's commands act as the session even on
 versions that do not set the variable themselves. Leave out `matcher`
 rather than writing `"matcher": ""`: Copilot CLI refuses a
-`.claude/settings.json` with an empty matcher.
+`.claude/settings.json` with an empty matcher. A `matcher` that is there
+must include `compact` for the hooks to run after compaction. `bd setup
+claude` writes these hooks, and the bd plugin carries them
+([Setting up agent harnesses](setup.md#the-claude-code-plugin)).
 
 ### Copilot CLI
 
@@ -490,7 +531,9 @@ Codex loads project hooks only when the project's `.codex/` layer is
 trusted, and each hook must be trusted in `/hooks` (an edited hook needs
 trust again). A subagent's thread runs no `SessionStart` hooks. Codex
 shows the model a limited amount of hook output by default: a long
-`bd prime` may need `"additionalContextLimit"` raised.
+`bd prime` may need `"additionalContextLimit"` raised. Keep `compact` in
+the matcher, so the hooks run again after compaction; `bd setup codex`
+writes this file.
 
 ### Reloading
 

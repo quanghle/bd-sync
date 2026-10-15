@@ -112,6 +112,13 @@ mod tests {
         assert_eq!(shown["description"], "--force");
         assert_eq!(shown["lease"]["holder"], "me/mcp-1");
         assert!(shown["lease"].get("token").is_none());
+        let (err, brief) = call(&mut server, "show", json!({ "ids": [b], "brief": true }));
+        assert!(!err, "{brief}");
+        assert_eq!(brief["id"], b);
+        assert_eq!(brief["blockers"], json!([a]));
+        for key in ["design", "notes", "metadata", "created_at", "lease", "dependencies"] {
+            assert!(brief.get(key).is_none(), "{key} in {brief}");
+        }
 
         // A second claim without the token is refused, as on the command line.
         let (err, refused) = call(&mut server, "claim", json!({ "id": a }));
@@ -130,5 +137,35 @@ mod tests {
         let (err, missing) = call(&mut server, "show", json!({ "ids": ["nope-1"] }));
         assert!(err);
         assert_eq!(missing["error"]["exit_code"], 3);
+    }
+
+    #[test]
+    fn close_claims_the_next_issue() {
+        let (_dir, global) = workspace();
+        let mut server = Server::new(Local::new(global, Resolved::new("me/mcp-1", Source::Flag, "test")), false);
+        let id = |server: &mut Server<Local>, args: Value| {
+            call(server, "create", args).1["id"].as_str().unwrap().to_string()
+        };
+        let a = id(&mut server, json!({ "title": "a", "priority": 1 }));
+        let b = id(&mut server, json!({ "title": "b", "priority": 2 }));
+        let (_, claimed) = call(&mut server, "claim", json!({ "id": a }));
+        let token = claimed["lease"]["token"].as_i64().unwrap();
+
+        let args = json!({ "ids": [a], "reason": "done", "token": token, "claim_next": true });
+        let (err, closed) = call(&mut server, "close", args.clone());
+        assert!(!err, "{closed}");
+        assert_eq!(closed["closed"]["issue"]["id"], a);
+        assert_eq!(closed["next"]["from"], "queue");
+        assert_eq!(closed["next"]["issue"]["id"], b);
+        assert_eq!(closed["next"]["issue"]["assignee"], "me/mcp-1");
+        let next = closed["next"]["lease"]["token"].as_i64().unwrap();
+        let (err, hb) = call(&mut server, "heartbeat", json!({ "id": b, "token": next }));
+        assert!(!err, "{hb}");
+
+        // Sent again (an answer lost on the way), the close claims nothing more.
+        let (err, again) = call(&mut server, "close", args);
+        assert!(!err, "{again}");
+        assert!(again.get("next").is_none(), "{again}");
+        assert_eq!(again["next_note"], "nothing closed: not claiming");
     }
 }

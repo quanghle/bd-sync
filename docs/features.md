@@ -25,8 +25,10 @@ one SQLite database in WAL mode.
   `--if-revision`/`--if-status`/`--if-assignee` guards
   ([Optimistic concurrency](concepts.md#optimistic-concurrency)).
 - **History and memory**: a transactional event log with gapless,
-  commit-ordered sequence numbers; comments; durable project memories
-  ([Event history](concepts.md#event-history)).
+  commit-ordered sequence numbers, from which `bd show --as-of` rebuilds an
+  issue at a past moment; comments; durable project memories
+  ([Event history](concepts.md#event-history)); agent-written summaries of
+  old closed issues ([Compaction](concepts.md#compaction)).
 - **Per-session actors**: each agent session acts as its own actor
   `<user>/<session>` with no setup, so concurrent sessions never share
   claims ([Actors](concepts.md#actors)).
@@ -39,6 +41,11 @@ one SQLite database in WAL mode.
 - **Gates**: human, timer, issue, GitHub pull request and GitHub Actions
   run gates that arm when their step could start, with timeouts and
   escalation ([Gates](playbooks.md#gates)).
+- **GitHub Issues sync**: `bd github pull/push/sync` links GitHub issues
+  to bd issues and syncs titles, bodies, states and outcomes, labels,
+  priority labels, assignees and comments both ways, with per-side change
+  detection, conflict reporting and idempotent reruns
+  ([GitHub Issues sync](github.md)).
 
 **Sharing**
 
@@ -57,6 +64,11 @@ one SQLite database in WAL mode.
   per harness (Claude Code, Codex, Copilot CLI); checkouts pull them, with
   new or changed ones written only once a person approves them, and
   session-start hooks keep them current ([Agent assets](agents.md)).
+- **Harness setup**: `bd setup <harness>` writes bd's hooks (Claude Code,
+  Codex, Copilot CLI) or instructions (Cursor, Gemini CLI, opencode) into
+  a project, idempotently and removably; a Claude Code plugin carries the
+  same hooks and a bd skill. Sessions get their bd context back after
+  compaction ([Setting up agent harnesses](setup.md)).
 
 **Operations**
 

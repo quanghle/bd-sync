@@ -24,9 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bd_core::gates::{self, GateKind, GateSpec, NewGate};
+use bd_core::subgraph::EdgeSet;
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::*;
-use bd_core::{comments, config, events, metrics, playbook, requests};
+use bd_core::{asof, comments, config, events, hierarchy, metrics, playbook, requests};
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::{Connection, StatementStatus};
 use serde_json::json;
@@ -79,6 +80,10 @@ const WHOLE_TABLE: &[(&str, &str)] = &[
     ("FROM dependencies WHERE instr(metadata", "dependencies"),
     ("FROM comments WHERE instr(text", "comments"),
     ("FROM events WHERE instr(data", "events"),
+    // orphans: the issues whose text mentions the prefix, read once
+    ("FROM issues WHERE instr(title", "issues"),
+    // bd github: the issues linked to one repository, once per run
+    ("FROM issues i WHERE i.external_ref >= ?1 AND i.external_ref < ?2", "issues"),
 ];
 
 static STATEMENTS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
@@ -228,10 +233,15 @@ fn walk_the_graph(ws: &mut Ws) {
                 for id in [&run, &group, &inner, &first, &second, &later, &after, &gate] {
                     r.details(id)?;
                     r.not_ready_reasons(id)?;
+                    r.explain(id, ExplainOptions::default())?;
                     r.depths(std::slice::from_ref(id))?;
                     r.dep_tree(id, Direction::Down, usize::MAX)?;
                     r.dep_tree(id, Direction::Up, usize::MAX)?;
                     issues::descendants(r.conn(), id)?;
+                    hierarchy::epic_status(r.conn(), id)?;
+                    r.child_issues(id, false)?;
+                    r.child_issues(id, true)?;
+                    r.subgraph(Some(id), &EdgeSet::All, 50)?;
                 }
                 let below = WorkFilter { parent: Some(run.clone()), ..Default::default() };
                 r.ready(&ReadyQuery::default())?;
@@ -240,6 +250,13 @@ fn walk_the_graph(ws: &mut Ws) {
                 r.ready(&ReadyQuery { filter: below.clone(), include_epics: true, ..Default::default() })?;
                 r.list(&ListQuery { filter: below.clone(), ..Default::default() })?;
                 r.blocked(&below, None)?;
+                r.not_ready(&ReadyQuery::default())?;
+                r.not_ready(&ReadyQuery {
+                    filter: below.clone(),
+                    include_epics: true,
+                    limit: Some(5),
+                    ..Default::default()
+                })?;
                 playbook::run_status(r.conn(), &run, r.now())?;
                 playbook::runs(r.conn(), &Default::default(), r.now())?;
                 playbook::extract(r.conn(), &run, Some("plans"))?;
@@ -285,6 +302,13 @@ fn walk_the_graph(ws: &mut Ws) {
     ws.write("alice", None, |tx| tx.close_issue(&scratch_step, &CloseOptions::default()));
     ws.write("alice", None, |tx| tx.close_issue(&scratch, &CloseOptions::default()));
     ws.write("alice", None, |tx| tx.purge_ephemeral(None, false));
+    // Closing as a duplicate, and again as the idempotent no-op.
+    let twin = ws.create(NewIssue::titled("Twin"));
+    let close_as = |tx: &mut WriteCtx<'_>| {
+        tx.close_as(&twin, &after, Replacement::Duplicate, &CloseAsOptions { force: true, ..Default::default() })
+    };
+    ws.write("alice", None, close_as);
+    ws.write("alice", None, close_as);
     ws.write("alice", None, |tx| tx.delete_issues(std::slice::from_ref(&fallback), &DeleteOptions::default()));
     ws.write("alice", None, |tx| {
         tx.delete_issues(
@@ -331,6 +355,19 @@ fn run_the_commands(ws: &mut Ws) {
                 r.memory("deploy-notes")?;
                 r.comments(&other)?;
                 comments::count(r.conn(), &other)?;
+                r.comments_tail(&other, 3)?;
+                r.show_brief(&work, 3)?;
+                r.briefs(&[r.issue(&work)?, r.issue(&other)?])?;
+                for id in [&work, &other] {
+                    r.explain(id, ExplainOptions::default())?;
+                    r.explain(id, ExplainOptions { include_deferred: true, include_epics: true, include_gates: true })?;
+                }
+                r.not_ready(&ReadyQuery { limit: Some(5), ..Default::default() })?;
+                r.not_ready(&ReadyQuery {
+                    filter: WorkFilter { assignee: Some("bot".into()), ..Default::default() },
+                    include_deferred: true,
+                    ..Default::default()
+                })?;
                 r.config_entries()?;
                 r.config_value("lease.ttl")?;
                 r.label_counts()?;
@@ -347,6 +384,43 @@ fn run_the_commands(ws: &mut Ws) {
                 r.ready(&ReadyQuery { sort: SortPolicy::Hybrid, limit: Some(5), ..Default::default() })?;
                 r.list(&ListQuery { limit: Some(10), search: Some("wor".into()), ..Default::default() })?;
                 r.blocked(&WorkFilter::default(), Some(10))?;
+                // Every time and title filter: plain conditions on the same statements.
+                let now = r.now();
+                let timed = WorkFilter {
+                    created_after: Some(Timestamp(0)),
+                    created_before: Some(now),
+                    updated_after: Some(Timestamp(0)),
+                    updated_before: Some(now),
+                    overdue_at: Some(now),
+                    stale_before: Some(now),
+                    title_contains: Some("50%".into()),
+                    ..Default::default()
+                };
+                r.ready(&ReadyQuery { filter: timed.clone(), ..Default::default() })?;
+                let closed = WorkFilter { closed_after: Some(Timestamp(0)), closed_before: Some(now), ..timed };
+                r.list(&ListQuery { all: true, filter: closed, ..Default::default() })?;
+                // A query naming every field: conditions on the same statement, with
+                // label and parent as lookups by key per issue.
+                let expr = format!(
+                    "status = open AND priority <= 2 AND type ~ task AND NOT assignee = none \
+                     AND (label = infra OR label ~ inf OR label = none) \
+                     AND (title ~ wor OR description ~ x OR notes = '') AND id = t-* \
+                     AND (parent = {work} OR parent = none OR parent != t-99) \
+                     AND created > 7d AND updated != 2026-01-15 AND closed = none \
+                     AND (due < +3d OR defer >= 2026-01-01) AND pinned = false AND ephemeral = no"
+                );
+                for sort in [ListSort::Priority, ListSort::Id] {
+                    r.query(&QueryRequest { expr: expr.clone(), sort, reverse: false, limit: Some(10) })?;
+                }
+                // Hierarchy views: epics, those ready to close, stale work, orphans.
+                r.epics(true)?;
+                r.epics(false)?;
+                r.close_eligible_epics()?;
+                r.stale(Duration::from_secs(86_400), None)?;
+                r.stale(Duration::ZERO, Some(5))?;
+                r.orphans("t")?;
+                // Graph export of the open issues: the list statement, then edges per issue.
+                r.subgraph(None, &EdgeSet::Default, 10)?;
                 r.events_each(&EventQuery { limit: Some(5), ..Default::default() }, 2, &mut |_| Ok(()))?;
                 let after = EventQuery { since: Some(head.saturating_sub(10)), limit: Some(7), ..Default::default() };
                 r.events_each(&after, 3, &mut |_| Ok(()))?;
@@ -365,6 +439,17 @@ fn run_the_commands(ws: &mut Ws) {
     let epics =
         ReadyQuery { filter: WorkFilter { types: vec!["epic".into()], ..Default::default() }, ..Default::default() };
     ws.write("bot", agent(), |tx| tx.claim_next(&epics, &ClaimOptions::default()));
+    // Close a child and claim the next one near its parent, as `bd close
+    // --claim-next` does; then look without claiming, as --suggest-next does.
+    let family = ws.create(NewIssue::titled("Family"));
+    let first = ws.create(child("First", &family));
+    ws.create(child("Second", &family));
+    ws.write("bot", agent(), |tx| {
+        let near = tx.parent(&first)?;
+        tx.close_issue(&first, &CloseOptions::default())?;
+        tx.claim_next_near(&ReadyQuery::default(), near.as_deref(), &ClaimOptions::default())
+    });
+    ws.write("bot", agent(), |tx| tx.next_ready(&ReadyQuery::default(), Some(&family)));
     ws.write("bot", agent(), |tx| tx.claim(&other, &ClaimOptions::default()));
     ws.clock.advance(Duration::from_secs(3600));
     ws.write("bd-serve", None, |tx| tx.reclaim_expired(&ReclaimOptions { dry_run: true, ..Default::default() }));
@@ -400,6 +485,7 @@ fn run_the_commands(ws: &mut Ws) {
         tx.save_request_response("req-1", "{}")
     });
     ws.write("bd-serve", None, |tx| tx.prune_requests(Timestamp(T0 + 86_400_000), 10));
+    github_sync(ws);
     let head = ws.store.read(|r| r.event_head()).unwrap();
     ws.write("alice", None, |tx| tx.prune_events(&PruneOptions { before: Some(head - 20), ..Default::default() }));
     ws.write("alice", None, |tx| tx.prune_events(&PruneOptions { keep: Some(10), ..Default::default() }));
@@ -407,6 +493,116 @@ fn run_the_commands(ws: &mut Ws) {
         tx.prune_events(&PruneOptions { older_than: Some(Duration::from_secs(60)), ..Default::default() })
     });
     commands(ws);
+    history_and_compaction(ws, &work);
+}
+
+/// Issues as of past points (live, deleted, purged; before and after a prune;
+/// across history an older bd wrote), a deletion dropping a survivor's edge,
+/// and compaction: candidates, stats and a compaction.
+fn history_and_compaction(ws: &mut Ws, work: &str) {
+    let gone = ws.create(NewIssue::titled("Gone"));
+    let survivor = ws.create(NewIssue {
+        description: format!("Follows {work}, at length so that a summary is shorter"),
+        deps: vec![(DepType::Related, gone.clone())],
+        ..NewIssue::titled("Survivor")
+    });
+    let scratch = ws.create(NewIssue { ephemeral: true, ..NewIssue::titled("Scratch") });
+    ws.write("alice", None, |tx| tx.close_issue(&scratch, &CloseOptions::default()));
+    let mid = ws.store.read(|r| r.event_head()).unwrap();
+    let t_mid = ws.clock.now();
+    ws.write("alice", None, |tx| {
+        tx.delete_issues(std::slice::from_ref(&gone), &DeleteOptions { force: true, ..Default::default() })
+    });
+    ws.write("alice", None, |tx| tx.purge_ephemeral(None, false));
+    ws.write("alice", None, |tx| tx.close_issue(&survivor, &CloseOptions::default()));
+    let revision = ws.store.read(|r| r.issue(&survivor)).unwrap().revision;
+    let guard = Guard { if_revision: Some(revision), ..Default::default() };
+    ws.write("alice", None, |tx| tx.compact_issue(&survivor, "Followed it", &guard));
+    let reads = |ws: &Ws| {
+        ws.store
+            .read(|r| {
+                for id in [&survivor, &gone, &scratch, &work.to_string()] {
+                    for point in [asof::Point::Seq(mid), asof::Point::Time(t_mid), asof::Point::Seq(r.event_head()?)] {
+                        // Points before what is retained fail; the statements are what is checked.
+                        let _ = r.issue_as_of(id, point);
+                    }
+                }
+                r.compact_candidates(Duration::ZERO, None)?;
+                r.compact_candidates(Duration::from_secs(86_400), Some(5))?;
+                r.compact_stats(Duration::ZERO)?;
+                Ok(())
+            })
+            .unwrap();
+    };
+    reads(ws);
+    ws.write("alice", None, |tx| tx.prune_events(&PruneOptions { before: Some(mid), ..Default::default() }));
+    reads(ws);
+    // History an older bd wrote: everything so far.
+    let head = ws.store.read(|r| r.event_head()).unwrap();
+    ws.sql(&format!("UPDATE meta SET value = '{}' WHERE key = 'history_complete_from'", head + 1));
+    reads(ws);
+}
+
+/// `bd github`: a GitHub issue created in bd, a marker resolved, the linked
+/// issues listed, and an apply that pulls a change and imports a comment.
+fn github_sync(ws: &mut Ws) {
+    use bd_core::github::{self, GithubComment, GithubIssue, IssueApply, Stamp, SyncConfig};
+    let cfg = SyncConfig::default();
+    let issue = |n: u64, title: &str, body: &str| GithubIssue {
+        number: n,
+        node_id: String::new(),
+        title: title.into(),
+        body: body.into(),
+        open: true,
+        state_reason: None,
+        labels: vec!["bug".into()],
+        assignees: vec![],
+        updated_at: Timestamp(T0),
+        html_url: String::new(),
+        comments: 0,
+        pull_request: false,
+        author: Some("bd-bot".into()),
+    };
+    let gh = issue(7, "From GitHub", "");
+    let created = ws.write("sync", None, |tx| tx.github_create("acme/app", &gh, None, &cfg)).0;
+    let mine = ws.create(NewIssue::titled("Mine"));
+    ws.store
+        .read(|r| {
+            github::linked(r.conn(), "acme/app")?;
+            github::resolve_markers(r.conn(), &[issue(8, "Mine", &github::marker(&mine))], Some("bd-bot"))?;
+            Ok(())
+        })
+        .unwrap();
+    let local = ws.store.read(|r| r.issue(&created.id)).unwrap();
+    let mut changed = gh.clone();
+    changed.title = "Renamed".into();
+    changed.open = false;
+    let comment = GithubComment {
+        id: 1,
+        user: "octo".into(),
+        body: "hi".into(),
+        created_at: Timestamp(T0),
+        updated_at: Timestamp(T0),
+        html_url: String::new(),
+    };
+    let apply = IssueApply {
+        id: created.id.clone(),
+        expected_revision: local.revision,
+        repo: "acme/app".into(),
+        number: 7,
+        pull: Some(github::pull_changes(&local, github::Link::of(&local).as_ref(), &changed, &cfg)),
+        import: vec![comment],
+        adopt: vec![],
+        pushed_comments: vec![],
+        github_seen: changed.clone(),
+        github_after: changed,
+        own_github_at: None,
+        local_before: local,
+        stamp: Stamp::BOTH,
+        comment_count: 1,
+        set_external_ref: true,
+    };
+    ws.write("sync", None, |tx| tx.github_apply(&apply, &cfg));
 }
 
 /// The commands, then renaming the prefix: every issue, edge, comment,
@@ -580,6 +776,16 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
     let mut statements = statements_of(walk_the_graph);
     let commands = statements_of(run_the_commands_and_rename);
     assert!(commands.len() > 50, "{} statements", commands.len());
+    // The history's rarer statements ran: an older bd's history, a quiet deletion, dropped edges, arming.
+    for needle in [
+        "op IN ('prefix_renamed','deleted','purged','run_compacted')",
+        "op IN ('purged','run_compacted') ORDER BY seq",
+        "FROM dependencies INDEXED BY idx_deps_target WHERE depends_on_id = ?1",
+        "SELECT metadata FROM issues WHERE id = ?1",
+        "SELECT ts FROM events WHERE seq = ?1",
+    ] {
+        assert!(commands.iter().any(|s| s.contains(needle)), "no statement with {needle:?} ran");
+    }
     statements.extend(commands);
 
     let mut failures = Vec::new();
@@ -635,4 +841,20 @@ fn opening_never_waits_to_drop_statistics() {
     release.join().unwrap();
     // Free again, the next open drops them.
     assert!(!ws.reopen().analyzed());
+}
+
+/// `bd stale` reads only live issues, through the ready index, and each one's
+/// lease by its key.
+#[test]
+fn stale_searches_the_ready_index_and_leases_by_key() {
+    let statements = statements_of(run_the_commands);
+    let sql = statements.iter().find(|s| s.contains("le.holder, le.expires_at")).expect("bd stale's statement");
+    for ws in [used_by_commands(), Ws::new()] {
+        let details: Vec<String> = plan(ws.store.connection(), sql).into_iter().map(|r| r.2).collect();
+        assert!(
+            details.iter().any(|d| d.starts_with("SEARCH i USING INDEX idx_issues_ready (status=?)")),
+            "{details:#?}"
+        );
+        assert!(details.iter().any(|d| d == "SEARCH le USING PRIMARY KEY (issue_id=?) LEFT-JOIN"), "{details:#?}");
+    }
 }

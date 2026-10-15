@@ -57,6 +57,13 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
         "",
         "Repos GitHub gates may name: OWNER/REPO, OWNER/*, or * (unset: any locally, the workspace's own via bd serve)",
     ),
+    (
+        "github.repos",
+        "",
+        "Repos bd github may sync: OWNER/REPO, OWNER/*, or * (unset: any locally, the workspace's own via bd serve)",
+    ),
+    ("github.assignees", "", "GitHub logins mapped to bd assignees for bd github: login=actor,..."),
+    ("github.priority_labels", "", "Label prefix bd github maps to priority: <prefix>0..4 (unset: no mapping)"),
 ];
 
 #[derive(Clone, Debug, Serialize)]
@@ -158,6 +165,24 @@ fn validate(key: &str, value: &str) -> Result<String> {
             }
             Ok(repos.join(","))
         }
+        "github.repos" => {
+            let repos = split_list(v);
+            for r in &repos {
+                crate::gates::validate_repo_pattern_for(key, r)?;
+            }
+            Ok(repos.join(","))
+        }
+        "github.assignees" => {
+            Ok(parse_assignees(v)?.iter().map(|(l, a)| format!("{l}={a}")).collect::<Vec<_>>().join(","))
+        }
+        "github.priority_labels" => {
+            if v.chars().count() > 32 || v.chars().any(|c| c == ',' || c.is_whitespace() || c.is_control()) {
+                return Err(Error::invalid(format!(
+                    "invalid github.priority_labels {v:?} (a label prefix such as P or priority:, at most 32 characters, no commas or spaces)"
+                )));
+            }
+            Ok(v.to_string())
+        }
         "durability" => {
             Durability::parse(v)?;
             Ok(v.to_ascii_lowercase())
@@ -212,6 +237,27 @@ pub fn split_list(v: &str) -> Vec<String> {
     out
 }
 
+/// `github.assignees`: comma-separated `login=actor` pairs, each side
+/// trimmed. A login is a GitHub login (`[A-Za-z0-9-]`, 1 to 39); an actor is
+/// non-empty, at most 255 characters, without `,`, `=` or control characters.
+pub fn parse_assignees(v: &str) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for pair in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let bad = || Error::invalid(format!("invalid github.assignees entry {pair:?} (expected login=actor)"));
+        let (login, actor) = pair.split_once('=').ok_or_else(bad)?;
+        let (login, actor) = (login.trim(), actor.trim());
+        let login_ok = (1..=39).contains(&login.len()) && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        let actor_ok = !actor.is_empty()
+            && actor.chars().count() <= 255
+            && !actor.chars().any(|c| c == ',' || c == '=' || c.is_control());
+        if !login_ok || !actor_ok {
+            return Err(bad());
+        }
+        out.push((login.to_string(), actor.to_string()));
+    }
+    Ok(out)
+}
+
 pub fn prefix(conn: &Connection) -> Result<String> {
     get_or_default(conn, "issue_prefix")
 }
@@ -246,4 +292,28 @@ pub fn retain_days(conn: &Connection) -> Result<u64> {
 
 pub fn retain_rows(conn: &Connection) -> Result<u64> {
     Ok(get_or_default(conn, "events.retain_rows")?.parse().unwrap_or(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn github_keys_validate() {
+        assert_eq!(validate("github.repos", " acme/app , acme/* ").unwrap(), "acme/app,acme/*");
+        assert_eq!(validate("github.repos", "").unwrap(), "");
+        let e = validate("github.repos", "not a repo").unwrap_err().to_string();
+        assert!(e.contains("github.repos"), "{e}");
+        assert_eq!(validate("github.assignees", " octo = alice , x=y").unwrap(), "octo=alice,x=y");
+        assert_eq!(validate("github.assignees", "").unwrap(), "");
+        assert_eq!(validate("github.assignees", "octo-cat=Quang Le/s1").unwrap(), "octo-cat=Quang Le/s1");
+        for bad in ["octo", "=alice", "octo=", "oc_to=alice", "a=b=c", &format!("{}=x", "a".repeat(40))] {
+            assert!(validate("github.assignees", bad).is_err(), "{bad}");
+        }
+        assert_eq!(validate("github.priority_labels", " P ").unwrap(), "P");
+        assert_eq!(validate("github.priority_labels", "priority:").unwrap(), "priority:");
+        for bad in ["P 1", "a,b", &"x".repeat(33)] {
+            assert!(validate("github.priority_labels", bad).is_err(), "{bad}");
+        }
+    }
 }

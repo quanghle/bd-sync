@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use bd_core::duplicates::{CloseAsOptions, Replacement};
 use bd_core::{DepChange, DepType, Direction, Error, Guard, IssuePatch, Queries, Result, WriteCtx};
 use serde_json::json;
 
@@ -10,7 +11,7 @@ use crate::cli::*;
 use crate::fmt;
 use crate::io::read_input;
 
-use super::json_object;
+use super::{guard_from, json_object};
 
 pub fn exec_dep(tx: &mut WriteCtx<'_>, cmd: &DepCommand) -> Result<Out> {
     match cmd {
@@ -54,6 +55,42 @@ pub fn exec_dep(tx: &mut WriteCtx<'_>, cmd: &DepCommand) -> Result<Out> {
         }
         _ => Err(Error::invalid("only `dep add` and `dep rm` change data")),
     }
+}
+
+pub fn exec_duplicate(tx: &mut WriteCtx<'_>, a: &DuplicateArgs) -> Result<Out> {
+    exec_close_as(tx, &a.id, &a.of, Replacement::Duplicate, a.force, a.take_over, &a.guard)
+}
+
+pub fn exec_supersede(tx: &mut WriteCtx<'_>, a: &SupersedeArgs) -> Result<Out> {
+    exec_close_as(tx, &a.id, &a.with, Replacement::Supersede, a.force, a.take_over, &a.guard)
+}
+
+fn exec_close_as(
+    tx: &mut WriteCtx<'_>,
+    id: &str,
+    target: &str,
+    kind: Replacement,
+    force: bool,
+    take_over: bool,
+    guard: &GuardArgs,
+) -> Result<Out> {
+    let id = tx.resolve_id(id)?;
+    let target = tx.resolve_id(target)?;
+    let opts = CloseAsOptions { force, take_over, guard: guard_from(guard)? };
+    let r = tx.close_as(&id, &target, kind, &opts)?;
+    let mut out = Out::new(&r);
+    out = if r.already {
+        out.line(format!("= {id} is already closed as {} {target}", kind.verb()))
+    } else {
+        out.line(format!("✓ Closed {id} as {} {target}: {}", kind.verb(), r.issue.title))
+    };
+    for u in &r.unblocked {
+        out = out.line(format!("  ↳ unblocked {} [P{}] {}", u.id, u.priority, u.title));
+    }
+    for c in &r.completed {
+        out = out.line(format!("  ✓ completed {} {}", c.id, c.title));
+    }
+    Ok(out.id(id))
 }
 
 pub fn exec_label(tx: &mut WriteCtx<'_>, cmd: &LabelCommand) -> Result<Out> {

@@ -69,26 +69,32 @@ mod access;
 mod agents;
 mod bench;
 mod claims;
+mod github;
 mod hooks;
 mod issues;
 mod links;
 mod playbooks;
 mod remote;
 mod serve;
+mod setup;
 #[cfg(test)]
 mod tests;
+mod views;
 mod workspace;
 
 pub use access::*;
 pub use agents::*;
 pub use bench::*;
 pub use claims::*;
+pub use github::*;
 pub use hooks::*;
 pub use issues::*;
 pub use links::*;
 pub use playbooks::*;
 pub use remote::*;
 pub use serve::*;
+pub use setup::*;
+pub use views::*;
 pub use workspace::*;
 
 #[derive(Parser, Debug)]
@@ -110,7 +116,7 @@ const ROOT_AFTER_HELP: &str = "\
 Agent loop: bd ready -> bd claim --next -> bd heartbeat <id> -> bd close <id>
 Run `bd prime` for workflow context.
 Exit codes: 2 invalid, 3 not found, 4 claim conflict, 5 busy, 6 events
-truncated, 7 access denied, 8 server unreachable, 9 write's answer lost (may
+truncated or history pruned, 7 access denied, 8 server unreachable, 9 write's answer lost (may
 have taken effect), 13 stale guard.
 See `bd --help` for actors, sessions, remote use, durations and times.";
 
@@ -162,7 +168,8 @@ Durations:
 Times:
   2026-01-15 (local midnight), 2026-01-15 09:00 or 2026-01-15T09:00:30 (local),
   RFC 3339 such as 2026-01-15T09:00:00Z, +2h or 3d (from now), now, tomorrow
-  (local midnight).
+  (local midnight). In filters (--created-after and the like, and bd query) a
+  bare duration such as 7d counts back from now and +7d counts forward.
 
 Environment:
   BD_DB, BD_REMOTE, BD_TOKEN, BD_ACTOR, BEADS_ACTOR, BD_SESSION, BD_LOG,
@@ -171,7 +178,7 @@ Environment:
 
 Exit codes:
   0 ok, 1 other failure, 2 invalid, 3 not found, 4 claim conflict, 5 busy,
-  6 events truncated, 7 access denied, 8 server unreachable, 9 write's answer
+  6 events truncated or history pruned, 7 access denied, 8 server unreachable, 9 write's answer
   lost (may have taken effect), 13 stale guard.";
 
 #[derive(Args, Debug, Clone)]
@@ -232,16 +239,45 @@ pub enum Command {
     /// Create an issue
     #[command(long_about = CREATE_LONG_ABOUT)]
     Create(CreateArgs),
+    /// Create an issue and print only its id
+    #[command(name = "q", long_about = QUICK_LONG_ABOUT)]
+    Quick(QuickArgs),
     /// Show issue details
     Show(ShowArgs),
     /// List issues
     List(ListArgs),
+    /// Find issues matching an expression
+    #[command(long_about = QUERY_LONG_ABOUT)]
+    Query(QueryArgs),
+    /// Show epic progress and close finished epics
+    #[command(subcommand)]
+    Epic(EpicCommand),
+    /// List the children of an issue
+    Children(ChildrenArgs),
+    /// List open work not updated lately, and expired claims
+    #[command(long_about = STALE_LONG_ABOUT)]
+    Stale(StaleArgs),
+    /// Find issue text naming ids that do not exist
+    #[command(long_about = ORPHANS_LONG_ABOUT)]
+    Orphans(OrphansArgs),
     /// Update fields of an issue
     #[command(long_about = UPDATE_LONG_ABOUT)]
     Update(UpdateArgs),
+    /// Edit a field of an issue in an editor
+    #[command(long_about = EDIT_LONG_ABOUT)]
+    Edit(EditArgs),
     /// Close issues, all or none
     #[command(long_about = CLOSE_LONG_ABOUT)]
     Close(CloseArgs),
+    /// Close an issue as a duplicate of another
+    #[command(long_about = DUPLICATE_LONG_ABOUT)]
+    Duplicate(DuplicateArgs),
+    /// Close an issue as superseded by another
+    #[command(long_about = SUPERSEDE_LONG_ABOUT)]
+    Supersede(SupersedeArgs),
+    /// List likely duplicate pairs among open issues
+    #[command(long_about = FIND_DUPLICATES_LONG_ABOUT)]
+    FindDuplicates(FindDuplicatesArgs),
     /// Reopen closed issues
     Reopen(ReopenArgs),
     /// Hide an issue from ready work, until a time or indefinitely
@@ -273,6 +309,9 @@ pub enum Command {
     /// Manage dependencies
     #[command(subcommand)]
     Dep(DepCommand),
+    /// Export the dependency graph as text, Graphviz DOT or HTML
+    #[command(long_about = GRAPH_LONG_ABOUT)]
+    Graph(GraphArgs),
     /// Manage labels
     #[command(subcommand)]
     Label(LabelCommand),
@@ -303,6 +342,9 @@ pub enum Command {
     /// Run agent session hooks (called by an agent harness)
     #[command(subcommand)]
     Hook(HookCommand),
+    /// Write an agent harness's bd integration into this project
+    #[command(long_about = SETUP_LONG_ABOUT)]
+    Setup(SetupArgs),
     /// Show workspace statistics
     Stats,
     /// Print operational metrics (Prometheus text or JSON)
@@ -334,9 +376,15 @@ pub enum Command {
     /// Manage gates that hold work back (human, timer, issue, GitHub)
     #[command(subcommand)]
     Gate(GateCommand),
+    /// Sync issues with GitHub Issues through gh
+    #[command(subcommand)]
+    Github(GithubCommand),
     /// Delete closed ephemeral issues (finished ephemeral runs) for good
     #[command(long_about = PURGE_LONG_ABOUT)]
     Purge(PurgeArgs),
+    /// Summarise old closed issues' text: list candidates, apply a summary, count
+    #[command(long_about = COMPACT_LONG_ABOUT)]
+    Compact(IssueCompactArgs),
     /// Sync agent skills and MCP definitions from the workspace's .bd/agents
     #[command(subcommand)]
     Agents(AgentsCommand),
@@ -357,6 +405,9 @@ pub enum Command {
     Info,
     /// Print the version
     Version,
+    /// Print a shell completion script
+    #[command(long_about = COMPLETION_LONG_ABOUT)]
+    Completion(CompletionArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -373,6 +424,13 @@ pub struct KeyArg {
 
 pub fn parse_wait(s: &str) -> Result<Duration, String> {
     bd_core::time::parse_duration(s).map_err(|e| e.to_string())
+}
+
+pub fn parse_threshold(s: &str) -> Result<f64, String> {
+    match s.trim().parse::<f64>() {
+        Ok(t) if t > 0.0 && t <= 1.0 => Ok(t),
+        _ => Err(format!("invalid threshold {s:?} (above 0 and at most 1)")),
+    }
 }
 
 pub fn parse_priority(s: &str) -> Result<u8, String> {

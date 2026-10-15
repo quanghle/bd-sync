@@ -28,7 +28,11 @@ Code it also gives the session its own actor, by writing `export
 CLAUDE_CODE_SESSION_ID=<id>` (the session's own id, from the hook's JSON input
 on stdin) to $CLAUDE_ENV_FILE. A --harness other than the one running the
 hook makes it do and print nothing. Prints nothing when there is nothing to
-say.";
+say.
+
+Claude Code and Codex run SessionStart hooks again after compacting a
+conversation, with `\"source\": \"compact\"` in the hook's input: in a bd
+workspace the hook then says so, ahead of the context `bd prime` prints.";
 
 const HOOK_SESSION_START_HELP: &str = "\
 Hook entries, each followed by `bd prime` (`bd prime --hook copilot` for

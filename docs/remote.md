@@ -177,7 +177,7 @@ reserved: no token acts as it or its sub-actors.
 |---|---|
 | `read` | read-only commands; its database connection is query-only |
 | `write` | every command except the admin ones |
-| `admin` | also `config set/unset`, `rename-prefix`, `import`, `events prune`, `doctor`, and taking over other actors' claims |
+| `admin` | also `config set/unset`, `rename-prefix`, `import`, `github`, `events prune`, `doctor`, and taking over other actors' claims |
 
 The server checks these in the engine, so `bd batch` and playbook runs get
 the same answer as single commands:
@@ -306,7 +306,8 @@ retrying. Exit codes are the same as locally, plus:
 - **Waiting**: `events --follow` and `events --wait` wait on the server
   ([Followers](#followers)).
 - **Client only**: `init`, `backup`, `bench`, `serve`, `hook`, `remote` and
-  `mcp` run only on the local machine; `bd agents status`, `pull`,
+  `mcp` run only on the local machine, and `edit` opens a local editor, so the
+  server refuses it (use `bd update`); `bd agents status`, `pull`,
   `approve` and `watch` run on the client and read the server's sets
   ([Agent assets](agents.md)).
 - **`bd prime`**, which session hooks run, gives up within seconds when the

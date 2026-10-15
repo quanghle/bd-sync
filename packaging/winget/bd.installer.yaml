@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+PackageIdentifier: "@OWNER@.bd"
+PackageVersion: "@VERSION@"
+InstallerType: "zip"
+NestedInstallerType: "portable"
+NestedInstallerFiles:
+  - RelativeFilePath: "bd.exe"
+    PortableCommandAlias: "bd"
+Installers:
+  - Architecture: "x64"
+    InstallerUrl: "https://github.com/@REPO@/releases/download/@TAG@/bd-@TAG@-x86_64-pc-windows-msvc.zip"
+    InstallerSha256: "@SHA256_X86_64_PC_WINDOWS_MSVC@"
+  - Architecture: "arm64"
+    InstallerUrl: "https://github.com/@REPO@/releases/download/@TAG@/bd-@TAG@-aarch64-pc-windows-msvc.zip"
+    InstallerSha256: "@SHA256_AARCH64_PC_WINDOWS_MSVC@"
+ManifestType: "installer"
+ManifestVersion: "1.10.0"

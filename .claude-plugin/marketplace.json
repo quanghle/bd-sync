@@ -1,0 +1,14 @@
+{
+  "name": "bd",
+  "description": "bd task tracking for coding agents",
+  "owner": {
+    "name": "quanghle"
+  },
+  "plugins": [
+    {
+      "name": "bd",
+      "source": "./plugins/bd",
+      "description": "bd session context (again after compaction), subagent actors, and a skill teaching the bd work loop"
+    }
+  ]
+}

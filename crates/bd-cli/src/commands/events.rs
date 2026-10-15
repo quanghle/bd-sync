@@ -114,7 +114,7 @@ pub fn event_query(r: &bd_core::ReadCtx<'_>, a: &EventsArgs) -> Result<EventQuer
 /// its issue exists or only its events do, so a deleted issue never resolves
 /// to the issues its id is a prefix of (`t-1` of `t-10`, `bd-a1b2` of
 /// `bd-a1b2.1`); otherwise a unique prefix of an existing issue's id.
-fn events_issue(r: &bd_core::ReadCtx<'_>, raw: &str) -> Result<(String, bool)> {
+pub(crate) fn events_issue(r: &bd_core::ReadCtx<'_>, raw: &str) -> Result<(String, bool)> {
     let raw = raw.trim();
     let resolved = r.resolve_id(raw);
     let prefixed = format!("{}-{raw}", bd_core::config::prefix(r.conn())?);
@@ -177,6 +177,9 @@ pub fn cmd_history(app: &mut App, a: &HistoryArgs) -> Result<()> {
     };
     for e in &events {
         out = out.line(fmt::event_line(e)).id(e.seq.to_string());
+        if a.diff {
+            out = out.lines(fmt::event_diff(e));
+        }
     }
     app.print(out.items(events));
     Ok(())

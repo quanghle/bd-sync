@@ -4,7 +4,12 @@ use rusqlite::Connection;
 
 use crate::error::{Error, Result};
 
-pub const LATEST_VERSION: i64 = 3;
+pub const LATEST_VERSION: i64 = 4;
+
+/// The `meta` key holding the seq from which every write records its full
+/// payload (see [`crate::asof`]): events before it were written by an older
+/// bd, which left some changes unrecorded.
+pub const HISTORY_COMPLETE_FROM: &str = "history_complete_from";
 
 const V1: &str = r#"
 CREATE TABLE meta (
@@ -158,7 +163,17 @@ CREATE TABLE requests (
 );
 "#;
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, V1), (2, V2), (3, V3)];
+// v4: the seq from which every write records its full payload (see asof):
+// head + 1 when an existing workspace migrates, 1 for a new one. Bumping the
+// version also keeps older binaries, which would write events without those
+// payloads after the marker, out of the workspace.
+const V4: &str = r#"
+INSERT OR IGNORE INTO meta (key, value)
+SELECT 'history_complete_from',
+       CAST(COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'events'), 0) + 1 AS TEXT);
+"#;
+
+const MIGRATIONS: &[(i64, &str)] = &[(1, V1), (2, V2), (3, V3), (4, V4)];
 
 pub fn user_version(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
@@ -236,6 +251,29 @@ mod tests {
         let eph: i64 = conn.query_row("SELECT ephemeral FROM issues WHERE id = 't-1'", [], |r| r.get(0)).unwrap();
         assert_eq!(eph, 0);
         assert!(conn.execute("UPDATE issues SET ephemeral = 2 WHERE id = 't-1'", []).is_err(), "0/1 only");
+    }
+
+    #[test]
+    fn v3_databases_mark_where_complete_history_begins() {
+        let marker = |conn: &Connection| -> String {
+            conn.query_row("SELECT value FROM meta WHERE key = ?1", [HISTORY_COMPLETE_FROM], |r| r.get(0)).unwrap()
+        };
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in [V1, V2, V3] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO events (tx, ts, actor, op) VALUES (1, 0, 'bd', 'init');
+             INSERT INTO events (tx, ts, actor, op) VALUES (2, 0, 'bd', 'created');",
+        )
+        .unwrap();
+        assert_eq!(migrate(&mut conn).unwrap(), 4);
+        assert_eq!(marker(&conn), "3", "head + 1");
+
+        let mut fresh = Connection::open_in_memory().unwrap();
+        migrate(&mut fresh).unwrap();
+        assert_eq!(marker(&fresh), "1", "a new workspace records everything");
     }
 
     #[test]

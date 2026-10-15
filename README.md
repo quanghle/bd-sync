@@ -23,9 +23,19 @@ list.
 
 ## Install
 
-Download a prebuilt binary from the
-[releases](https://github.com/quanghle/bd-sync/releases) (checksums and
-attestations: [Install](docs/install.md)), or build from source:
+Install a prebuilt binary with the script (it checks the release's
+checksums; options, attestations and manual download: [Install](docs/install.md)):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/quanghle/bd-sync/main/scripts/install.sh | sh                  # Linux, macOS
+```
+
+```powershell
+irm https://raw.githubusercontent.com/quanghle/bd-sync/main/scripts/install.ps1 | iex                       # Windows
+```
+
+Or take an archive from the [releases](https://github.com/quanghle/bd-sync/releases),
+or build from source:
 
 ```bash
 cargo install --path crates/bd          # installs ~/.cargo/bin/bd
@@ -54,18 +64,26 @@ issue. Each agent session acts as its own actor, `<you>/<session>`, derived
 from the session id its harness sets or from `BD_SESSION`, so concurrent
 sessions never share claims ([Actors](docs/concepts.md#actors)).
 
+To have an agent harness start each session with that context, run
+`bd setup <harness>` in the project (`claude`, `codex`, `copilot`,
+`cursor`, `gemini` or `opencode`), or install the Claude Code plugin:
+`/plugin marketplace add quanghle/bd-sync`, then `/plugin install bd@bd`
+([Setting up agent harnesses](docs/setup.md)).
+
 ## Documentation
 
 | page | covers |
 |---|---|
 | [Features](docs/features.md) | everything bd does, with links |
-| [Install](docs/install.md) | prebuilt binaries, checking them, building from source |
+| [Install](docs/install.md) | install script, prebuilt binaries, checking them, completions, building from source |
 | [Concepts](docs/concepts.md) | issues, statuses, dependencies, ready work, claims and leases, optimistic concurrency, events, memory, actors |
 | [Modes of operation](docs/modes.md) | local workspaces and their backups, remote workspaces, the embedded library |
 | [Playbooks and gates](docs/playbooks.md) | repeatable multi-step work, runs, gates |
+| [GitHub Issues sync](docs/github.md) | `bd github status/pull/push/sync`: linking, mapping, conflicts, comments, markers |
 | [Remote server](docs/remote.md) | `bd serve`, access tokens and roles, clients, background jobs, backups, followers, the protocol |
 | [Signing in](docs/sign-in.md) | OpenID Connect providers, rules, accounts and actors, refreshing, authorizers, the device flow |
 | [MCP server](docs/mcp.md) | `bd mcp` and `/w/<name>/mcp`, discovery, OAuth for MCP clients, the tool catalog |
+| [Setting up agent harnesses](docs/setup.md) | `bd setup` for Claude Code, Codex, Copilot CLI, Cursor, Gemini CLI and opencode; the Claude Code plugin |
 | [Agent assets, sessions and hooks](docs/agents.md) | serving, pulling and approving skills and MCP definitions; session-start hooks; subagents |
 | [Command reference](docs/commands.md) | commands, global options, environment variables, configuration, exit and error codes |
 | [Observability](docs/observability.md) | logs, timing, metrics, `bd doctor` |

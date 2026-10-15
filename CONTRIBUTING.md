@@ -25,12 +25,22 @@ cargo build --release                      # target/release/bd
 cargo test --workspace                     # engine + CLI tests
 cargo clippy --workspace --all-targets && cargo fmt --all
 target/release/bd bench --workers 8        # throughput + invariant check on a scratch database
+bash scripts/test-packaging.sh             # install script, packaging templates and their rendering
 ```
+
+`scripts/test-packaging.sh` needs bash, curl, tar and python3 (or zip); node,
+ruby and shellcheck are used when present. It checks that the install scripts
+and templates name the same targets and files as the release workflow, runs
+`install.sh` against a `file://` fixture and renders the packaging. On Windows
+`scripts/test-install.ps1 -Binary target/release/bd.exe` runs `install.ps1`
+with the real binary.
 
 CI (`.github/workflows/ci.yml`) runs `cargo fmt --all --check`, then clippy
 with `-D warnings` and the tests on Linux, macOS and Windows, plus a check on
 the minimum supported Rust version (`rust-version` in `Cargo.toml`), so keep
-all three platforms and the MSRV building. Integration tests that spawn `bd`
+all three platforms and the MSRV building. A `packaging` job runs shellcheck on
+the scripts and `scripts/test-packaging.sh` on Linux and macOS, and the Windows
+test job runs `scripts/test-install.ps1`. Integration tests that spawn `bd`
 clear the agent-session variables (`BD_SESSION`, `CLAUDE_CODE_SESSION_ID`,
 `COPILOT_AGENT_SESSION_ID`, `CODEX_THREAD_ID`, ...) per command, so the tests
 pass inside an agent session too.
@@ -85,6 +95,9 @@ pushed: see [RELEASING.md](RELEASING.md).
 ## Layout
 
 ```
+scripts/              install.sh, install.ps1 (installers), render-packaging.sh (release packaging),
+                      test-packaging.sh, test-install.ps1 (their tests)
+packaging/            templates rendered per release: homebrew/, winget/, npm/ (see RELEASING.md)
 crates/bd-core/src/   store (WAL, transactions, busy handling) · schema · issues · graph (deps + blocked state)
                       ready · claims (leases) · events · comments · memory · config · transfer (JSONL)
                       metrics · doctor · queries (read API) · gates (conditions, arming, evaluation)

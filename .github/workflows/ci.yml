@@ -69,6 +69,32 @@ jobs:
         run: cargo build --release --locked -p bd
       - name: Smoke-test release binary
         run: ./target/release/bd --version
+      # The real bd.exe stands in for the release archive's binary.
+      - name: Test install.ps1
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-install.ps1 -Binary target/release/bd.exe
+
+  packaging:
+    name: packaging scripts (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: ShellCheck
+        if: runner.os == 'Linux'
+        run: |
+          command -v shellcheck || { sudo apt-get -o Acquire::Retries=3 update -q && sudo apt-get install -y -q shellcheck; }
+          shellcheck -s sh scripts/install.sh
+          shellcheck scripts/render-packaging.sh scripts/test-packaging.sh
+      - name: Test install.sh and packaging rendering
+        run: bash scripts/test-packaging.sh
 
   msrv:
     name: msrv

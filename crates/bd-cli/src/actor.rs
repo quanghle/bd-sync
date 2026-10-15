@@ -352,6 +352,9 @@ pub fn cmd_session_start(app: &mut App, a: &HookSessionStartArgs) -> Result<i32>
         return Ok(0);
     }
     let mut lines = Vec::new();
+    if crate::hook::compacted() && in_workspace(app) {
+        lines.push(COMPACTED_LINE.to_string());
+    }
     if let Some(file) = env("CLAUDE_ENV_FILE") {
         lines.extend(export_session_id(&file));
     }
@@ -362,6 +365,18 @@ pub fn cmd_session_start(app: &mut App, a: &HookSessionStartArgs) -> Result<i32>
     });
     crate::hook::print_context(harness, crate::hook::Event::SessionStart, &lines.join("\n"));
     Ok(0)
+}
+
+/// What `bd hook session-start` says when the conversation was compacted
+/// (`bd prime`, the next hook, prints the context itself; in a remote
+/// workspace it runs on the server, which never sees the hook's input).
+const COMPACTED_LINE: &str = "bd: the conversation was compacted. The bd context that follows (`bd prime`) lists your \
+     claims with their current lease tokens and the ready work: use those tokens for heartbeats and closes.";
+
+/// Whether the command runs in a bd workspace: a configured remote one, or
+/// a local database.
+fn in_workspace(app: &App) -> bool {
+    crate::remote::configured(app).ok().flatten().is_some() || app.db_path().is_ok_and(|p| p.is_file())
 }
 
 /// Append the session's id from the hook's input to Claude Code's `file`;

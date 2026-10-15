@@ -16,7 +16,7 @@ use crate::graph;
 use crate::ids;
 use crate::model::{
     BUILTIN_TYPES, DepType, GATE_TYPE, Guard, Issue, IssueDetails, IssuePatch, IssueRef, ListQuery, ListSort,
-    MAX_TITLE_CHARS, NewIssue, Outcome, Status, empty_object,
+    MAX_TITLE_CHARS, NewIssue, Outcome, QueryRequest, Status, empty_object,
 };
 use crate::ready;
 use crate::store::{WriteCtx, validate_actor};
@@ -27,6 +27,10 @@ pub(crate) const ISSUE_COLUMNS: &str = "i.id, i.title, i.description, i.design, 
     i.metadata, i.created_at, i.updated_at, i.started_at, i.closed_at, i.close_reason, i.close_outcome,
     i.due_at, i.defer_until, i.is_blocked, i.revision, i.ephemeral,
     (SELECT json_group_array(label) FROM (SELECT label FROM labels l WHERE l.issue_id = i.id ORDER BY label))";
+
+/// How many columns [`ISSUE_COLUMNS`] selects: a statement selecting more
+/// after them reads its own from this index on.
+pub(crate) const ISSUE_COLUMN_COUNT: usize = 26;
 
 pub(crate) fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<Issue> {
     let metadata: String = r.get(13)?;
@@ -77,12 +81,23 @@ pub fn resolve_id(conn: &Connection, input: &str) -> Result<String> {
     if input.is_empty() {
         return Err(Error::invalid("issue id must not be empty"));
     }
+    lookup_id(conn, input)?.ok_or_else(|| Error::not_found("issue", input))
+}
+
+/// [`resolve_id`]'s rules without its failure for an unknown id: `None` when
+/// the trimmed input is empty or matches nothing; still an error when it is
+/// ambiguous (`parent = X` in `bd query`).
+pub fn lookup_id(conn: &Connection, input: &str) -> Result<Option<String>> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(None);
+    }
     if ids::exists(conn, input)? {
-        return Ok(input.to_string());
+        return Ok(Some(input.to_string()));
     }
     let prefixed = format!("{}-{input}", config::prefix(conn)?);
     if ids::exists(conn, &prefixed)? {
-        return Ok(prefixed);
+        return Ok(Some(prefixed));
     }
     let mut matches: Vec<String> = Vec::new();
     for candidate in [input, prefixed.as_str()] {
@@ -95,8 +110,8 @@ pub fn resolve_id(conn: &Connection, input: &str) -> Result<String> {
         }
     }
     match matches.len() {
-        1 => Ok(matches.remove(0)),
-        0 => Err(Error::not_found("issue", input)),
+        0 => Ok(None),
+        1 => Ok(Some(matches.remove(0))),
         _ => Err(Error::invalid(format!("ambiguous id {input:?}: matches {}", matches.join(", ")))),
     }
 }
@@ -133,17 +148,7 @@ pub fn for_each(conn: &Connection, q: &ListQuery, mut f: impl FnMut(Issue) -> Re
             [pat.clone(), pat.clone(), pat.clone(), pat],
         );
     }
-    let (asc, desc) = if q.reverse { ("DESC", "ASC") } else { ("ASC", "DESC") };
-    let order = match q.sort {
-        ListSort::Priority => format!("ORDER BY i.priority {asc}, i.created_at {asc}, i.id {asc}"),
-        ListSort::Created => format!("ORDER BY i.created_at {desc}, i.id {desc}"),
-        ListSort::Updated => format!("ORDER BY i.updated_at {desc}, i.id {desc}"),
-        ListSort::Id => format!("ORDER BY i.id {asc}"),
-    };
-    let (tail, tail_params) = match q.limit {
-        Some(n) => (format!("{order} LIMIT ?"), vec![SqlValue::Integer(n as i64)]),
-        None => (order, vec![]),
-    };
+    let (tail, tail_params) = list_tail(q.sort, q.reverse, q.limit);
     let (sql, params) = parts.build(&format!("SELECT {ISSUE_COLUMNS} FROM issues i"), &tail, tail_params);
     let mut stmt = conn.prepare_cached(&sql)?;
     let mut rows = stmt.query(params_from_iter(params))?;
@@ -151,6 +156,44 @@ pub fn for_each(conn: &Connection, q: &ListQuery, mut f: impl FnMut(Issue) -> Re
         f(issue_from_row(row)?)?;
     }
     Ok(())
+}
+
+/// The `ORDER BY` (and `LIMIT ?`, with its parameter) of a listing of issues
+/// aliased `i`, shared by [`list`] and [`query`].
+pub(crate) fn list_tail(sort: ListSort, reverse: bool, limit: Option<usize>) -> (String, Vec<SqlValue>) {
+    let (asc, desc) = if reverse { ("DESC", "ASC") } else { ("ASC", "DESC") };
+    let order = match sort {
+        ListSort::Priority => format!("ORDER BY i.priority {asc}, i.created_at {asc}, i.id {asc}"),
+        ListSort::Created => format!("ORDER BY i.created_at {desc}, i.id {desc}"),
+        ListSort::Updated => format!("ORDER BY i.updated_at {desc}, i.id {desc}"),
+        ListSort::Id => format!("ORDER BY i.id {asc}"),
+    };
+    match limit {
+        Some(n) => (format!("{order} LIMIT ?"), vec![SqlValue::Integer(n as i64)]),
+        None => (order, vec![]),
+    }
+}
+
+/// The issues matching the `bd query` expression `q.expr`, of every status
+/// (the expression alone decides), sorted and limited as [`list`] does. A
+/// parse error, or a `parent` id that is ambiguous, is an invalid-input
+/// error showing the column in the expression; `now` anchors relative times.
+pub fn query(conn: &Connection, q: &QueryRequest, now: Timestamp) -> Result<Vec<Issue>> {
+    let expr = crate::query::parse_query(&q.expr)?;
+    let (frag, frag_params) = match crate::query::compile(conn, &expr, now) {
+        Ok(compiled) => compiled,
+        Err(crate::query::CompileError::Query(e)) => {
+            return Err(crate::query::query_error(&q.expr, e.column, &e.message));
+        }
+        Err(crate::query::CompileError::Db(e)) => return Err(e),
+    };
+    let mut parts = QueryParts::default();
+    parts.cond(&format!("({frag})"), frag_params);
+    let (tail, tail_params) = list_tail(q.sort, q.reverse, q.limit);
+    let (sql, params) = parts.build(&format!("SELECT {ISSUE_COLUMNS} FROM issues i"), &tail, tail_params);
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params_from_iter(params), issue_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub(crate) fn refs(conn: &Connection, ids: &[String]) -> Result<Vec<IssueRef>> {
@@ -197,7 +240,7 @@ pub(crate) fn is_playbook_container(issue: &Issue) -> bool {
 // The subtree drives every join, one edge or issue lookup per issue in it
 // (see `graph`'s module docs on query plans): planned from statistics, each
 // recursive step could scan every edge, and the final join every issue.
-const SUBTREE_CTE: &str = "WITH RECURSIVE sub(id) AS (
+pub(crate) const SUBTREE_CTE: &str = "WITH RECURSIVE sub(id) AS (
     SELECT issue_id FROM dependencies WHERE depends_on_id = ?1 AND dep_type = 'parent-child'
     UNION
     SELECT d.issue_id FROM sub s CROSS JOIN dependencies d ON d.depends_on_id = s.id
@@ -256,7 +299,7 @@ pub fn label_counts(conn: &Connection) -> Result<Vec<(String, i64)>> {
 }
 
 /// JSON snapshot of an issue with its outgoing edges (for events and export).
-pub(crate) fn snapshot(conn: &Connection, id: &str) -> Result<Value> {
+pub fn snapshot(conn: &Connection, id: &str) -> Result<Value> {
     let issue = require(conn, id)?;
     let mut stmt = conn.prepare_cached(
         "SELECT depends_on_id, dep_type, metadata FROM dependencies WHERE issue_id = ?1 ORDER BY depends_on_id",
@@ -398,6 +441,18 @@ pub struct DeleteOutcome {
     pub dry_run: bool,
 }
 
+/// The event [`WriteCtx::update_issue_as`] records: its op, and what it adds
+/// to the data beside `changes` (and `claim_override`).
+pub(crate) struct UpdateEvent<'a> {
+    pub op: &'a str,
+    pub extra: Option<Map<String, Value>>,
+}
+
+impl UpdateEvent<'static> {
+    /// A plain update: an `updated` event.
+    pub(crate) const UPDATED: UpdateEvent<'static> = UpdateEvent { op: "updated", extra: None };
+}
+
 fn record_change<T: Serialize + PartialEq>(changes: &mut Map<String, Value>, field: &str, old: &T, new: &T) {
     if old != new {
         changes.insert(
@@ -522,11 +577,12 @@ impl WriteCtx<'_> {
         guard: &Guard,
         take_over: bool,
     ) -> Result<UpdateOutcome> {
-        self.update_issue_as(id, patch, guard, take_over, false)
+        self.update_issue_as(id, patch, guard, take_over, false, UpdateEvent::UPDATED)
     }
 
     /// [`WriteCtx::update_issue`]; `playbook` when playbook runs update their
-    /// own bookkeeping (`metadata.playbook`), which callers under a policy may not.
+    /// own bookkeeping (`metadata.playbook`), which callers under a policy may
+    /// not. `event` names the op of the event recorded and what it adds to it.
     pub(crate) fn update_issue_as(
         &mut self,
         id: &str,
@@ -534,6 +590,7 @@ impl WriteCtx<'_> {
         guard: &Guard,
         take_over: bool,
         playbook: bool,
+        event: UpdateEvent<'_>,
     ) -> Result<UpdateOutcome> {
         let old = require(self.conn(), id)?;
         guard.check(&old)?;
@@ -744,7 +801,10 @@ impl WriteCtx<'_> {
         if let Some(o) = claim_override {
             data["claim_override"] = o;
         }
-        let seq = self.emit("updated", Some(id), data)?;
+        for (k, v) in event.extra.unwrap_or_default() {
+            data[k] = v;
+        }
+        let seq = self.emit(event.op, Some(id), data)?;
 
         let mut seeds = Vec::new();
         if let Some((old_parent, new_parent)) = parent_change {
@@ -939,6 +999,10 @@ impl WriteCtx<'_> {
     /// Reopen `id`. `current`: its child reopened just before, whose subtree
     /// is up to date.
     fn mark_reopened(&mut self, id: &str, reason: Option<String>, current: Option<&str>) -> Result<Vec<String>> {
+        // What the reopen clears, so the history can restore it (see `asof`).
+        let old = require(self.conn(), id)?;
+        let previous =
+            json!({ "close_reason": old.close_reason, "close_outcome": old.close_outcome, "closed_at": old.closed_at });
         self.conn()
             .prepare_cached(
                 "UPDATE issues SET status = 'open', closed_at = NULL, close_reason = NULL, close_outcome = NULL,
@@ -946,7 +1010,7 @@ impl WriteCtx<'_> {
                  WHERE id = ?2",
             )?
             .execute(params![self.now(), id])?;
-        self.emit("reopened", Some(id), json!({ "reason": reason }))?;
+        self.emit("reopened", Some(id), json!({ "reason": reason, "previous": previous }))?;
         let seeds = graph::seeds_for_terminal_flip(self.conn(), id)?;
         let changes = match current {
             Some(child) => graph::recompute_beside(self, seeds, child)?,
@@ -1009,18 +1073,8 @@ impl WriteCtx<'_> {
         // Someone else's work is named before anything `force` gets past.
         let mut overrides =
             self.check_removal_claims(&set, opts.take_over, &format!("deleting {}", ids_in.join(", ")))?;
-        let mut detached: BTreeSet<String> = BTreeSet::new();
-        {
-            let mut stmt = self.conn().prepare_cached("SELECT issue_id FROM dependencies WHERE depends_on_id = ?1")?;
-            for s in &set {
-                for row in stmt.query_map([s], |r| r.get::<_, String>(0))? {
-                    let d = row?;
-                    if !set.contains(&d) {
-                        detached.insert(d);
-                    }
-                }
-            }
-        }
+        let dropped = dropped_edges(self.conn(), &set)?;
+        let detached: BTreeSet<String> = dropped.iter().map(|e| e.survivor.clone()).collect();
         if !detached.is_empty() && !opts.force && !opts.cascade {
             return Err(Error::Refused(format!(
                 "{} other issue(s) depend on the issue(s) being deleted ({}); pass --cascade to delete them too or --force to drop those edges",
@@ -1042,6 +1096,7 @@ impl WriteCtx<'_> {
                 seeds.extend(graph::waiters_on(self.conn(), &p)?);
             }
         }
+        self.emit_dropped_edges(&dropped)?;
         for s in &deleted {
             let mut data = json!({ "issue": snapshot(self.conn(), s)? });
             if let Some(o) = overrides.remove(s) {
@@ -1085,20 +1140,9 @@ impl WriteCtx<'_> {
         if !overrides.is_empty() {
             data["claim_overrides"] = json!(overrides);
         }
-        let mut detached: BTreeSet<String> = BTreeSet::new();
-        let mut seeds: Vec<String> = Vec::new();
-        {
-            let mut stmt = self.conn().prepare_cached("SELECT issue_id FROM dependencies WHERE depends_on_id = ?1")?;
-            for s in set {
-                for row in stmt.query_map([s], |r| r.get::<_, String>(0))? {
-                    let d = row?;
-                    if !set.contains(&d) {
-                        detached.insert(d);
-                    }
-                }
-            }
-        }
-        seeds.extend(detached.iter().cloned());
+        let dropped = dropped_edges(self.conn(), set)?;
+        let detached: BTreeSet<String> = dropped.iter().map(|e| e.survivor.clone()).collect();
+        let mut seeds: Vec<String> = detached.iter().cloned().collect();
         for s in set {
             if let Some(p) = graph::parent_of(self.conn(), s)?
                 && !set.contains(&p)
@@ -1111,6 +1155,7 @@ impl WriteCtx<'_> {
         if !detached.is_empty() {
             data["detached"] = json!(detached);
         }
+        self.emit_dropped_edges(&dropped)?;
         self.emit(op, issue_id, data)?;
         let ids: Vec<&String> = set.iter().collect();
         for chunk in ids.chunks(500) {
@@ -1123,6 +1168,20 @@ impl WriteCtx<'_> {
         seeds.retain(|x| !set.contains(x));
         graph::recompute(self, seeds)?;
         Ok(detached.into_iter().collect())
+    }
+
+    /// Record a `dep_removed` event on each surviving issue for its edge
+    /// into a deleted one, which the deletion drops (with `dropped_by`), so
+    /// its history can tell what it depended on before (see `asof`).
+    fn emit_dropped_edges(&mut self, dropped: &[DroppedEdge]) -> Result<()> {
+        for e in dropped {
+            self.emit(
+                "dep_removed",
+                Some(&e.survivor),
+                json!({ "target": e.target, "type": e.dep_type, "metadata": e.metadata, "dropped_by": e.target }),
+            )?;
+        }
+        Ok(())
     }
 
     /// Delete closed ephemeral issues closed at least `older_than` ago (the
@@ -1146,6 +1205,36 @@ impl WriteCtx<'_> {
         let detached = self.delete_quietly(&purge, "purged", None, json!({ "cutoff": cutoff }), false)?;
         Ok(PurgeOutcome { deleted, detached, dry_run })
     }
+}
+
+/// An edge from an issue outside a deleted set into it, which the deletion drops.
+struct DroppedEdge {
+    survivor: String,
+    target: String,
+    dep_type: String,
+    metadata: Value,
+}
+
+/// The edges from issues outside `set` into it, by survivor then target.
+fn dropped_edges(conn: &Connection, set: &BTreeSet<String>) -> Result<Vec<DroppedEdge>> {
+    let mut out = Vec::new();
+    // By the index on targets, whatever statistics say: a lookup per issue of the set.
+    let mut stmt = conn.prepare_cached(
+        "SELECT issue_id, dep_type, metadata FROM dependencies INDEXED BY idx_deps_target WHERE depends_on_id = ?1",
+    )?;
+    for target in set {
+        let rows =
+            stmt.query_map([target], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?;
+        for row in rows {
+            let (survivor, dep_type, metadata) = row?;
+            if !set.contains(&survivor) {
+                let metadata = serde_json::from_str(&metadata).unwrap_or_else(|_| empty_object());
+                out.push(DroppedEdge { survivor, target: target.clone(), dep_type, metadata });
+            }
+        }
+    }
+    out.sort_by(|a, b| (&a.survivor, &a.target).cmp(&(&b.survivor, &b.target)));
+    Ok(out)
 }
 
 /// The `candidates` a purge deletes: those with only candidates below them and

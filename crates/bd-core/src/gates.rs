@@ -247,7 +247,13 @@ impl GateRepos {
     /// under `bd serve` (`served`), where gates may only use the workspace's
     /// own: a client must not point the server's credentials elsewhere.
     pub fn load(conn: &Connection, served: bool) -> Result<GateRepos> {
-        let list = config::split_list(&config::get_or_default(conn, "gate.repos")?);
+        GateRepos::load_key(conn, "gate.repos", served)
+    }
+
+    /// The allowlist in config `key` (`gate.repos`, `github.repos`), with
+    /// the same syntax and the same rule when unset.
+    pub fn load_key(conn: &Connection, key: &str, served: bool) -> Result<GateRepos> {
+        let list = config::split_list(&config::get_or_default(conn, key)?);
         Ok(if list.iter().any(|r| r == "*") || (list.is_empty() && !served) {
             GateRepos::Any
         } else {
@@ -268,6 +274,25 @@ impl GateRepos {
             Some(repo) if spec.kind.is_github() => self.check_repo(spec.kind, repo),
             _ => Ok(()),
         }
+    }
+
+    /// Refuse `repo` for `what` (such as `bd github`) unless the allowlist
+    /// read from config `key` allows it.
+    pub fn require(&self, key: &str, what: &str, repo: &str) -> Result<()> {
+        if self.allows(repo) {
+            return Ok(());
+        }
+        Err(Error::Refused(match self {
+            GateRepos::Only(list) if !list.is_empty() => format!(
+                "{what}: repo {repo} is not in {key} ({}); allow it with `bd config set {key} {},{repo}`",
+                list.join(", "),
+                list.join(",")
+            ),
+            _ => format!(
+                "{what}: repo {repo} is not allowed: through bd serve, only the workspace's own repository is \
+                 allowed unless {key} allows others (`bd config set {key} {repo}`, an admin access token)"
+            ),
+        }))
     }
 
     fn check_repo(&self, kind: GateKind, repo: &str) -> Result<()> {
@@ -310,6 +335,11 @@ fn repo_matches(pattern: &str, repo: &str) -> bool {
 
 /// An entry of `gate.repos`: `*`, `OWNER/*`, `HOST/OWNER/*`, or a repository.
 pub fn validate_repo_pattern(pattern: &str) -> Result<()> {
+    validate_repo_pattern_for("gate.repos", pattern)
+}
+
+/// An entry of the allowlist in config `key`, with the same syntax as `gate.repos`.
+pub fn validate_repo_pattern_for(key: &str, pattern: &str) -> Result<()> {
     let ok = pattern == "*"
         || match pattern.strip_suffix("/*") {
             Some(owner) => validate_repo(&format!("{owner}/x")).is_ok(),
@@ -318,7 +348,7 @@ pub fn validate_repo_pattern(pattern: &str) -> Result<()> {
     if ok {
         Ok(())
     } else {
-        Err(Error::invalid(format!("invalid gate.repos entry {pattern:?} (OWNER/REPO, HOST/OWNER/REPO, OWNER/* or *)")))
+        Err(Error::invalid(format!("invalid {key} entry {pattern:?} (OWNER/REPO, HOST/OWNER/REPO, OWNER/* or *)")))
     }
 }
 
@@ -627,6 +657,14 @@ pub fn overdue(gate: &GateView, now: Timestamp) -> Option<String> {
 /// Arming hook, called by [`graph::recompute`] for every net change of the
 /// blocked flag: a gate that became unblocked arms now; one that became
 /// blocked again disarms (and re-arms, restarting its clock, when unblocked).
+///
+/// It records no event of its own: `asof` derives each metadata change it
+/// makes from the `blocked` / `unblocked` event that goes with it. Terminal
+/// issues are never blocked (`graph`'s `should_block_sql` and
+/// `full_blocked_sql` give 0 for closed and pinned ones), so a terminal
+/// issue's change can only be to unblocked, which `arm` skips; every change
+/// it makes is on a live issue, for which `graph::publish` or
+/// `graph::recompute_all` emits that event with the same `ctx.now()`.
 pub(crate) fn note_block_changes(ctx: &mut WriteCtx<'_>, changes: &[BlockChange]) -> Result<()> {
     if changes.is_empty() {
         return Ok(());
@@ -758,9 +796,18 @@ impl WriteCtx<'_> {
 
     /// Record `armed_at` for a gate that is open and unblocked but not yet armed
     /// (gates created unblocked never see a blocked -> unblocked change).
+    /// Records a `gate_armed` event when it does: unlike arming through
+    /// [`note_block_changes`], no `unblocked` event goes with it.
     pub(crate) fn arm_gate_if_ready(&mut self, id: &str) -> Result<()> {
         let now = self.now().to_rfc3339();
-        self.conn()
+        let metadata = |conn: &Connection| -> Result<Value> {
+            let raw: String =
+                conn.prepare_cached("SELECT metadata FROM issues WHERE id = ?1")?.query_row([id], |r| r.get(0))?;
+            Ok(serde_json::from_str(&raw).unwrap_or_else(|_| json!({})))
+        };
+        let old = metadata(self.conn())?;
+        let armed = self
+            .conn()
             .prepare_cached(
                 "UPDATE issues SET metadata = json_set(metadata, '$.gate.armed_at', ?1)
                  WHERE id = ?2 AND issue_type = 'gate' AND status = 'open' AND is_blocked = 0
@@ -768,6 +815,10 @@ impl WriteCtx<'_> {
                    AND json_type(metadata, '$.gate.armed_at') IS NULL",
             )?
             .execute(params![now, id])?;
+        if armed == 1 {
+            let new = metadata(self.conn())?;
+            self.emit("gate_armed", Some(id), json!({ "changes": { "metadata": { "old": old, "new": new } } }))?;
+        }
         Ok(())
     }
 
@@ -816,7 +867,8 @@ impl WriteCtx<'_> {
         self.conn()
             .prepare_cached("UPDATE issues SET metadata = ?1, updated_at = ?2, revision = revision + 1 WHERE id = ?3")?
             .execute(params![metadata.to_string(), now, id])?;
-        self.emit("gate_escalated", Some(id), json!({ "reason": reason }))?;
+        let changes = json!({ "metadata": { "old": issue.metadata, "new": metadata } });
+        self.emit("gate_escalated", Some(id), json!({ "reason": reason, "changes": changes }))?;
         self.add_comment(id, &format!("Gate escalated: {reason}"))?;
         Ok(true)
     }
@@ -847,7 +899,13 @@ impl WriteCtx<'_> {
                 .prepare_cached("UPDATE issues SET metadata = json_set(metadata, '$.gate.run_id', ?1) WHERE id = ?2")?
                 .execute(params![run_id, id])?;
         }
-        self.emit("gate_updated", Some(id), json!({ "run_id": run_id, "previous_run_id": previous }))?;
+        let changes =
+            json!({ "metadata": { "old": issue.metadata, "new": issues::require(self.conn(), id)?.metadata } });
+        self.emit(
+            "gate_updated",
+            Some(id),
+            json!({ "run_id": run_id, "previous_run_id": previous, "changes": changes }),
+        )?;
         if let Some(prev) = &previous {
             let why = why.map(|w| format!(": {w}")).unwrap_or_default();
             self.add_comment(id, &format!("Now watching GitHub run {run_id} instead of {prev}{why}"))?;
@@ -901,5 +959,22 @@ mod tests {
         assert!(human.validate().is_err(), "repo is GitHub-only");
         assert_eq!(GateKind::parse("bead").unwrap(), GateKind::Issue);
         assert!(GateKind::parse("mail").is_err());
+    }
+
+    #[test]
+    fn allowlists_load_from_any_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT NOT NULL)").unwrap();
+        let repos = GateRepos::load_key(&conn, "github.repos", true).unwrap();
+        assert_eq!(repos, GateRepos::Only(vec![]));
+        let e = repos.require("github.repos", "bd github", "acme/app").unwrap_err();
+        assert!(matches!(&e, Error::Refused(m) if m.contains("github.repos") && m.contains("bd github")), "{e}");
+        assert_eq!(GateRepos::load_key(&conn, "github.repos", false).unwrap(), GateRepos::Any);
+        conn.execute("INSERT INTO config VALUES ('github.repos', 'acme/*')", []).unwrap();
+        let repos = GateRepos::load_key(&conn, "github.repos", false).unwrap();
+        repos.require("github.repos", "bd github", "ACME/app").unwrap();
+        let e = repos.require("github.repos", "bd github", "other/x").unwrap_err().to_string();
+        assert!(e.contains("not in github.repos (acme/*)"), "{e}");
+        assert_eq!(GateRepos::load(&conn, false).unwrap(), GateRepos::Any, "gate.repos is apart");
     }
 }

@@ -273,7 +273,7 @@ pub(super) async fn serve(
     // Requests waiting for events are answered at once, instead of at the end of their wait.
     server.stopping.send_replace(true);
     // GitHub gates are checked again after a restart; no need to wait for gh.
-    bd_cli::gates::cancel_gh_calls();
+    bd_cli::gh::cancel_gh_calls();
     let all = u32::try_from(MAX_RUNNING).unwrap_or(u32::MAX);
     let commands = tokio::time::timeout(COMMANDS_GRACE, server.running.acquire_many(all));
     let followers = u32::try_from(server.waits.followers).unwrap_or(u32::MAX);

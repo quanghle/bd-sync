@@ -134,6 +134,16 @@ pub struct ClaimOptions {
     pub token: Option<i64>,
 }
 
+/// Where [`WriteCtx::next_ready`] found the next issue: below the parent it
+/// was asked to look near first, or in the queue (the whole queue, or the
+/// subtree an explicit parent filter names).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NextFrom {
+    Siblings,
+    Queue,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Claim {
     pub issue: Issue,
@@ -314,19 +324,52 @@ impl WriteCtx<'_> {
     /// Stale leases past their grace window are reclaimed first when
     /// `lease.auto_reclaim` is on.
     pub fn claim_next(&mut self, query: &ReadyQuery, opts: &ClaimOptions) -> Result<Option<Claim>> {
+        self.claim_next_near(query, None, opts).map(|o| o.map(|(c, _)| c))
+    }
+
+    /// The first ready issue the actor may claim, without claiming it (and
+    /// without writing anything). With `near = Some(parent)` and no parent
+    /// filter in `query`, the subtree below `parent` is searched first
+    /// ([`NextFrom::Siblings`]), then the whole queue; an explicit parent
+    /// filter searches only that subtree.
+    pub fn next_ready(&self, query: &ReadyQuery, near: Option<&str>) -> Result<Option<(Issue, NextFrom)>> {
+        let pools = config::claim_pools(self.conn())?;
+        let actor = self.actor().to_string();
+        let now = self.now();
+        let head = |q: &ReadyQuery| -> Result<Option<Issue>> {
+            let mut q = q.clone();
+            q.limit = Some(1);
+            Ok(ready::ready_for(self.conn(), &q, now, Some((&actor, &pools)))?.into_iter().next())
+        };
+        if query.filter.parent.is_none()
+            && let Some(parent) = near
+        {
+            let mut siblings = query.clone();
+            siblings.filter.parent = Some(parent.to_string());
+            if let Some(issue) = head(&siblings)? {
+                return Ok(Some((issue, NextFrom::Siblings)));
+            }
+        }
+        Ok(head(query)?.map(|issue| (issue, NextFrom::Queue)))
+    }
+
+    /// [`Self::claim_next`], searching near `near` first as
+    /// [`Self::next_ready`] does. Only `opts.ttl` is used: the issue is
+    /// selected from the claimable ready queue, so no override applies.
+    pub fn claim_next_near(
+        &mut self,
+        query: &ReadyQuery,
+        near: Option<&str>,
+        opts: &ClaimOptions,
+    ) -> Result<Option<(Claim, NextFrom)>> {
         if config::auto_reclaim(self.conn())? {
             self.reclaim_expired(&ReclaimOptions::default())?;
         }
-        let pools = config::claim_pools(self.conn())?;
-        let actor = self.actor().to_string();
-        let mut q = query.clone();
-        q.limit = Some(1);
-        let head = ready::ready_for(self.conn(), &q, self.now(), Some((&actor, &pools)))?;
-        match head.into_iter().next() {
+        match self.next_ready(query, near)? {
             None => Ok(None),
-            Some(issue) => {
+            Some((issue, from)) => {
                 let claim_opts = ClaimOptions { ttl: opts.ttl, ..Default::default() };
-                self.claim_checked(&issue.id, &claim_opts, true).map(Some)
+                Ok(Some((self.claim_checked(&issue.id, &claim_opts, true)?, from)))
             }
         }
     }

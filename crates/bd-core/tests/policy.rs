@@ -1144,3 +1144,25 @@ fn a_claim_limit_caps_the_work_an_actor_and_its_agents_hold() {
     env.as_("bob", agent("bob"), |tx| tx.claim(&ids[7], &claim)).unwrap();
     env.assert_healthy();
 }
+
+#[test]
+fn closing_as_a_duplicate_needs_an_admin_to_take_over_another_actors_claim() {
+    let mut env = Env::new();
+    let canonical = env.create("Canonical");
+    let held = env.create("Held");
+    env.as_("bob/w1", agent("bob"), |tx| tx.claim(&held, &ClaimOptions::default())).unwrap();
+    let opts = CloseAsOptions { take_over: true, ..Default::default() };
+    denied(
+        env.as_("alice", agent("alice"), |tx| tx.close_as(&held, &canonical, Replacement::Duplicate, &opts)),
+        "needs an admin",
+    );
+    assert_eq!(env.issue(&held).status, Status::InProgress);
+    let plain = CloseAsOptions::default();
+    let e = env
+        .as_("alice", agent("alice"), |tx| tx.close_as(&held, &canonical, Replacement::Duplicate, &plain))
+        .unwrap_err();
+    assert!(matches!(e, Error::Unauthorized(_)), "{e}");
+    env.as_("alice", admin_agent("alice"), |tx| tx.close_as(&held, &canonical, Replacement::Duplicate, &opts)).unwrap();
+    assert_eq!(env.issue(&held).status, Status::Closed);
+    env.assert_healthy();
+}

@@ -11,6 +11,7 @@ use super::events::{follow_events, wait_for_events};
 use super::{Remote, identity, response_error, without_session_flag};
 use crate::app::App;
 use crate::cli::*;
+use crate::commands::summary_input;
 use crate::io;
 use crate::playbooks;
 use crate::protocol::{ExecRequest, ExecResponse};
@@ -137,6 +138,10 @@ fn attach_inputs(cmd: &Command, request: &mut ExecRequest) -> Result<()> {
             Some(f) => attach(request, &f.to_string_lossy()),
             None => Ok(()),
         },
+        Command::Compact(IssueCompactArgs { summary: Some(s), .. }) => match summary_input(s) {
+            Some(path) => attach(request, path),
+            None => Ok(()),
+        },
         _ => Ok(()),
     }
 }
@@ -159,6 +164,7 @@ fn check_outputs(app: &App, cmd: &Command) -> Result<()> {
 fn output_files(app: &App, cmd: &Command) -> Vec<OutputFile> {
     match cmd {
         Command::Export(ExportArgs { output: Some(path), .. }) => vec![OutputFile::new(path, path.clone(), false)],
+        Command::Graph(GraphArgs { output: Some(path), .. }) => vec![OutputFile::new(path, path.clone(), false)],
         Command::Playbook(PlaybookCommand::Extract(ExtractArgs { output: Some(path), .. })) => {
             vec![OutputFile::new(path, extract_target(app, path), true)]
         }

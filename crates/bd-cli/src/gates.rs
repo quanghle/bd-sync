@@ -4,19 +4,14 @@
 //! (GitHub gates through the `gh` CLI, outside any transaction, so slow
 //! network calls never hold the write lock), then applies the verdicts in one
 //! write transaction that re-checks each gate is still open. Each `gh` call
-//! is killed after [`GH_TIMEOUT`]. `bd serve` runs the same check on a timer
+//! is killed after [`crate::gh::GH_TIMEOUT`]. `bd serve` runs the same check on a timer
 //! (see `jobs.rs`).
 //!
 //! Every GitHub probe goes through [`probe_github`], which first checks the
 //! gate's repository against the workspace's [`GateRepos`] allowlist: a gate
 //! whose repository is not allowed escalates instead of being probed.
 
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::path::Path;
 
 use bd_core::gates::{self, GateKind, GatePhase, GateRepos, GateSpec, GateView, NewGate, Verdict};
 use bd_core::{Error, Queries, Result, Timestamp, WriteCtx};
@@ -26,6 +21,7 @@ use serde_json::{Value, json};
 use crate::app::{App, Out};
 use crate::cli::*;
 use crate::fmt::rel;
+use crate::gh::{gh_json, workdir};
 use crate::io;
 
 fn phase_icon(p: GatePhase) -> &'static str {
@@ -220,96 +216,6 @@ struct Checked {
     unblocked: Vec<String>,
 }
 
-fn gh_bin() -> String {
-    std::env::var("BD_GH").ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "gh".into())
-}
-
-/// How long one `gh` call may run before it is killed and its gate reported as an error.
-const GH_TIMEOUT: Duration = Duration::from_secs(60);
-
-static GH_CANCELLED: AtomicBool = AtomicBool::new(false);
-
-/// Stop running `gh` calls in this process, and fail later ones at once:
-/// `bd serve` is shutting down. Their gates are reported as errors and left as they are.
-pub fn cancel_gh_calls() {
-    GH_CANCELLED.store(true, Ordering::Relaxed);
-}
-
-/// Why [`output_within`] gave up on a command.
-#[derive(Debug)]
-enum Stopped {
-    Failed(std::io::Error),
-    TimedOut,
-    Cancelled,
-}
-
-/// Collect a child's output on its own thread, so a full pipe never stalls it.
-fn drain(pipe: Option<impl Read + Send + 'static>) -> mpsc::Receiver<Vec<u8>> {
-    let (tx, rx) = mpsc::channel();
-    if let Some(mut pipe) = pipe {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            let _ = tx.send(buf);
-        });
-    }
-    rx
-}
-
-/// Run `cmd` to completion like [`Command::output`], but kill it once
-/// `timeout` passes or `cancel` is set.
-fn output_within(mut cmd: Command, timeout: Duration, cancel: &AtomicBool) -> std::result::Result<Output, Stopped> {
-    if cancel.load(Ordering::Relaxed) {
-        return Err(Stopped::Cancelled);
-    }
-    let deadline = Instant::now() + timeout;
-    let mut child =
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(Stopped::Failed)?;
-    let (stdout, stderr) = (drain(child.stdout.take()), drain(child.stderr.take()));
-    let mut pause = Duration::from_millis(1);
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(Stopped::Failed)? {
-            break status;
-        }
-        let stop = if cancel.load(Ordering::Relaxed) {
-            Some(Stopped::Cancelled)
-        } else if Instant::now() >= deadline {
-            Some(Stopped::TimedOut)
-        } else {
-            None
-        };
-        if let Some(why) = stop {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(why);
-        }
-        std::thread::sleep(pause.min(deadline.saturating_duration_since(Instant::now())));
-        pause = (pause * 2).min(Duration::from_millis(50));
-    };
-    // A grandchild may still hold a pipe open; do not wait past the deadline for it.
-    let collect = |rx: mpsc::Receiver<Vec<u8>>| {
-        rx.recv_timeout(deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(100)))
-            .unwrap_or_default()
-    };
-    Ok(Output { status, stdout: collect(stdout), stderr: collect(stderr) })
-}
-
-fn gh_json(args: &[String], cwd: &Path) -> std::result::Result<Value, String> {
-    let sub = args.first().map(String::as_str).unwrap_or_default();
-    let mut cmd = Command::new(gh_bin());
-    cmd.args(args).current_dir(cwd);
-    let out = output_within(cmd, GH_TIMEOUT, &GH_CANCELLED).map_err(|e| match e {
-        Stopped::Failed(e) => format!("cannot run `{}`: {e} (install the GitHub CLI or set BD_GH)", gh_bin()),
-        Stopped::TimedOut => format!("gh {sub}: no answer within {}s", GH_TIMEOUT.as_secs()),
-        Stopped::Cancelled => format!("gh {sub}: cancelled, the server is shutting down"),
-    })?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("gh {sub}: {}", err.trim()));
-    }
-    serde_json::from_slice(&out.stdout).map_err(|e| format!("gh returned invalid JSON: {e}"))
-}
-
 fn repo_args(spec: &GateSpec) -> Vec<String> {
     // One token per flag, so a value can never be read as another flag.
     spec.repo.as_ref().map(|r| vec![format!("--repo={r}")]).unwrap_or_default()
@@ -482,13 +388,6 @@ fn probe_github(
         }
         _ => Err(format!("{} gates are not GitHub gates", spec.kind)),
     }
-}
-
-fn workdir(app: &App) -> PathBuf {
-    app.db_path()
-        .ok()
-        .and_then(|db| db.parent().and_then(Path::parent).map(Path::to_path_buf))
-        .unwrap_or_else(|| app.cwd.clone())
 }
 
 /// Apply a check's verdicts, each gate on its own: one that cannot be opened
@@ -719,69 +618,5 @@ mod tests {
             store.read(|r| r.events(&bd_core::EventQuery { since: Some(head), ..Default::default() })).unwrap();
         assert!(events.events.iter().all(|e| e.issue_id.as_deref() != Some(human.as_str())), "rolled back");
         assert!(events.events.windows(2).all(|w| w[1].seq == w[0].seq + 1), "gapless");
-    }
-
-    /// A command that runs for about ten seconds.
-    fn sleeper() -> Command {
-        #[cfg(windows)]
-        let c = {
-            let mut c = Command::new("ping");
-            c.args(["-n", "11", "127.0.0.1"]);
-            c
-        };
-        #[cfg(not(windows))]
-        let c = {
-            let mut c = Command::new("sleep");
-            c.arg("10");
-            c
-        };
-        c
-    }
-
-    #[test]
-    fn bounded_commands_return_their_output() {
-        #[cfg(windows)]
-        let (cmd, code, stderr) = {
-            let mut c = Command::new("cmd");
-            c.args(["/C", "echo out"]);
-            (c, 0, "")
-        };
-        #[cfg(not(windows))]
-        let (cmd, code, stderr) = {
-            let mut c = Command::new("sh");
-            c.args(["-c", "echo out; echo err >&2; exit 3"]);
-            (c, 3, "err")
-        };
-        let out = output_within(cmd, Duration::from_secs(30), &AtomicBool::new(false)).unwrap();
-        assert_eq!(out.status.code(), Some(code));
-        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "out");
-        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), stderr);
-        let missing = Command::new("/nonexistent/bd-test-gh");
-        assert!(matches!(
-            output_within(missing, Duration::from_secs(1), &AtomicBool::new(false)),
-            Err(Stopped::Failed(_))
-        ));
-    }
-
-    #[test]
-    fn slow_commands_are_killed_at_the_timeout_or_when_cancelled() {
-        let started = Instant::now();
-        let r = output_within(sleeper(), Duration::from_millis(200), &AtomicBool::new(false));
-        assert!(matches!(r, Err(Stopped::TimedOut)), "{r:?}");
-        assert!(started.elapsed() < Duration::from_secs(5), "killed at the timeout: {:?}", started.elapsed());
-
-        let cancel = std::sync::Arc::new(AtomicBool::new(false));
-        let flag = cancel.clone();
-        let canceller = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(200));
-            flag.store(true, Ordering::Relaxed);
-        });
-        let started = Instant::now();
-        let r = output_within(sleeper(), Duration::from_secs(60), &cancel);
-        assert!(matches!(r, Err(Stopped::Cancelled)), "{r:?}");
-        assert!(started.elapsed() < Duration::from_secs(5), "killed when cancelled: {:?}", started.elapsed());
-        canceller.join().unwrap();
-        let r = output_within(sleeper(), Duration::from_secs(60), &cancel);
-        assert!(matches!(r, Err(Stopped::Cancelled)), "nothing starts once cancelled: {r:?}");
     }
 }

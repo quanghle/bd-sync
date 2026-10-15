@@ -1,7 +1,11 @@
 //! Human-readable rendering.
 
+use bd_core::asof::IssueAsOf;
 use bd_core::time::format_duration_ms;
-use bd_core::{Event, Issue, IssueDetails, IssueRef, Lease, Status, Timestamp, TreeNode};
+use bd_core::{
+    Comment, Event, Issue, IssueBrief, IssueDetails, IssueRef, Lease, NotReady, Readiness, ShowBrief, Status,
+    Timestamp, TreeNode,
+};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -28,6 +32,80 @@ pub fn issue_line(i: &Issue, now: Timestamp) -> String {
         s.push_str(&format!(" {{{}}}", i.labels.join(", ")));
     }
     s
+}
+
+/// A brief issue on one line: `<id> P<n> <type> <status>[ @<assignee>][
+/// parent:<id>][ [l1,l2]] — <title>`, the title last as it may hold anything.
+pub fn brief_line(b: &IssueBrief) -> String {
+    let mut s = format!("{} P{} {} {}", b.id, b.priority, b.issue_type, b.status);
+    if let Some(a) = &b.assignee {
+        s.push_str(&format!(" @{a}"));
+    }
+    if let Some(p) = &b.parent {
+        s.push_str(&format!(" parent:{p}"));
+    }
+    if !b.labels.is_empty() {
+        s.push_str(&format!(" [{}]", b.labels.join(",")));
+    }
+    s.push_str(" — ");
+    s.push_str(&b.title);
+    s
+}
+
+/// One reason an issue is not ready, as `- <text>` under `indent`, with the
+/// gate on a line of its own when the reason names one.
+pub fn reason_lines(r: &NotReady, id: &str, now: Timestamp, indent: &str, out: &mut Vec<String>) {
+    out.push(format!("{indent}- {}", r.text(id, now)));
+    if let NotReady::Blocked { gate: Some(g), .. } = r {
+        out.push(format!("{indent}  gate: {g}"));
+    }
+}
+
+/// `bd show --why`: `Ready: yes`, or `Not ready:` and each reason below it,
+/// under `indent`.
+pub fn why_lines(w: &Readiness, now: Timestamp, indent: &str) -> Vec<String> {
+    if w.ready {
+        return vec![format!("{indent}Ready: yes")];
+    }
+    let mut out = vec![format!("{indent}Not ready:")];
+    let below = format!("{indent}  ");
+    for r in &w.reasons {
+        reason_lines(r, &w.id, now, &below, &mut out);
+    }
+    out
+}
+
+/// `bd show --brief`: the brief line, open blockers, the cut description and
+/// the last comments, then `why` (`--why`).
+pub fn show_brief(b: &ShowBrief, why: Option<&Readiness>, now: Timestamp) -> Vec<String> {
+    let mut out = vec![brief_line(&b.brief)];
+    if !b.blockers.is_empty() {
+        out.push(format!("  blocked by: {}", b.blockers.join(", ")));
+    }
+    block("Description", &b.description, &mut out);
+    if b.comments_total > 0 {
+        out.push(String::new());
+        out.push(comments_heading(b.comments.len(), b.comments_total));
+        for c in &b.comments {
+            comment_lines(&c.author, c.created_at, &c.text, &mut out);
+        }
+    }
+    if let Some(w) = why {
+        out.push(String::new());
+        out.extend(why_lines(w, now, ""));
+    }
+    out
+}
+
+fn comments_heading(shown: usize, total: i64) -> String {
+    if shown as i64 == total { format!("Comments ({shown}):") } else { format!("Comments ({shown} of {total}):") }
+}
+
+fn comment_lines(author: &str, at: Timestamp, text: &str, out: &mut Vec<String>) {
+    out.push(format!("  [{author}] {at}"));
+    for line in text.lines() {
+        out.push(format!("    {line}"));
+    }
 }
 
 /// Orders `issues` so each one listed with its parent (`parents[n]` is the
@@ -94,7 +172,19 @@ fn block(title: &str, body: &str, out: &mut Vec<String>) {
     }
 }
 
-pub fn details(d: &IssueDetails, now: Timestamp) -> Vec<String> {
+/// Titled blocks of text, each left out when empty (as in `bd show`).
+pub fn text_blocks(blocks: &[(&str, &str)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (title, body) in blocks {
+        block(title, body, &mut out);
+    }
+    out
+}
+
+/// `bd show`, with `comments_total` the issue's comments in all (more than
+/// `d.comments` holds under `--comments-tail`) and `why` its readiness
+/// (`--why`), after the status lines.
+pub fn details(d: &IssueDetails, now: Timestamp, comments_total: usize, why: Option<&Readiness>) -> Vec<String> {
     let i = &d.issue;
     let mut out = vec![format!("{} {} · {}", i.status.icon(), i.id, i.title)];
     let mut status = i.status.to_string();
@@ -141,11 +231,23 @@ pub fn details(d: &IssueDetails, now: Timestamp) -> Vec<String> {
     if i.metadata.as_object().is_some_and(|m| !m.is_empty()) {
         out.push(format!("  metadata: {}", i.metadata));
     }
+    if let Some(c) = i.metadata.get("compaction").filter(|c| c.is_object()) {
+        out.push(format!(
+            "  compacted: level {} at {} (original {} bytes; `bd history {} --diff` shows it)",
+            c["level"],
+            s(c, "compacted_at"),
+            c["original_size"],
+            i.id
+        ));
+    }
     if let Some(p) = &d.parent {
         out.push(format!("  parent: {p}"));
     }
     if let Some(l) = &d.lease {
         out.push(format!("  lease: {}", lease_text(l, now)));
+    }
+    if let Some(w) = why {
+        out.extend(why_lines(w, now, "  "));
     }
     block("Description", &i.description, &mut out);
     block("Design", &i.design, &mut out);
@@ -186,14 +288,11 @@ pub fn details(d: &IssueDetails, now: Timestamp) -> Vec<String> {
             out.push(format!("  {}", ref_line(c)));
         }
     }
-    if !d.comments.is_empty() {
+    if comments_total > 0 {
         out.push(String::new());
-        out.push(format!("Comments ({}):", d.comments.len()));
-        for c in &d.comments {
-            out.push(format!("  [{}] {}", c.author, c.created_at));
-            for line in c.text.lines() {
-                out.push(format!("    {line}"));
-            }
+        out.push(comments_heading(d.comments.len(), comments_total as i64));
+        for Comment { author, created_at, text, .. } in &d.comments {
+            comment_lines(author, *created_at, text, &mut out);
         }
     }
     out
@@ -276,6 +375,9 @@ pub fn event_summary(e: &Event) -> String {
         "run_compacted" | "purged" => format!("removed {} issue(s)", s(d, "count")),
         "gate_escalated" => truncate(&s(d, "reason"), 80),
         "gate_updated" => format!("watching run {}", s(d, "run_id")),
+        "gate_armed" => "armed".into(),
+        "compacted" => format!("level {}: {} -> {} bytes", s(d, "level"), s(d, "original_size"), s(d, "size")),
+        "references_renamed" => format!("references {}- -> {}-", s(d, "from"), s(d, "to")),
         "agents_changed" => {
             let short = |k: &str| s(d, k).chars().take(12).collect::<String>();
             format!("{} set: revision {} (was {})", s(d, "harness"), short("revision"), short("previous"))
@@ -299,4 +401,233 @@ pub fn event_line(e: &Event) -> String {
         line.push_str(&summary);
     }
     line
+}
+
+/// A value of a changed field, on one line: a string as it is, anything else as compact JSON.
+fn plain(v: &Value) -> String {
+    match v {
+        Value::String(x) => x.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Fields `bd history --diff` shows as line diffs.
+const TEXT_FIELDS: [&str; 4] = ["description", "design", "acceptance_criteria", "notes"];
+
+/// The field changes an event records (`data.changes`), indented under its
+/// line: text as a line diff, labels as `+a -b`, others as `old -> new`.
+pub fn event_diff(e: &Event) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(changes) = e.data.get("changes").and_then(Value::as_object) else { return out };
+    for (k, v) in changes {
+        if k == "labels" {
+            let names = |side: &str, sign: char| -> Vec<String> {
+                v.get(side)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .map(|l| format!("{sign}{}", plain(l)))
+                    .collect()
+            };
+            let mut all = names("added", '+');
+            all.extend(names("removed", '-'));
+            out.push(format!("    labels: {}", all.join(" ")));
+        } else if TEXT_FIELDS.contains(&k.as_str()) {
+            out.push(format!("    {k}:"));
+            let (old, new) = (v.get("old").map(plain).unwrap_or_default(), v.get("new").map(plain).unwrap_or_default());
+            out.extend(line_diff(&old, &new).into_iter().map(|l| format!("      {l}")));
+        } else {
+            let side = |key: &str| v.get(key).map(plain).unwrap_or_else(|| "null".into());
+            out.push(format!("    {k}: {} -> {}", side("old"), side("new")));
+        }
+    }
+    out
+}
+
+/// Above this many cells (old lines times new lines), [`line_diff`] gives up
+/// on a minimal diff: the whole old text is removed and the new one added.
+const MAX_DIFF_CELLS: usize = 2_000_000;
+
+/// The lines of `old` and `new` that differ: removed ones as `-line`, added
+/// ones as `+line`, and the unchanged lines between them as ` line`. Lines
+/// common to both ends are left out; nothing when the texts are the same.
+pub fn line_diff(old: &str, new: &str) -> Vec<String> {
+    let a: Vec<&str> = if old.is_empty() { Vec::new() } else { old.lines().collect() };
+    let b: Vec<&str> = if new.is_empty() { Vec::new() } else { new.lines().collect() };
+    let head = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let tail = a[head..].iter().rev().zip(b[head..].iter().rev()).take_while(|(x, y)| x == y).count();
+    let (a, b) = (&a[head..a.len() - tail], &b[head..b.len() - tail]);
+    let mut out = Vec::new();
+    if a.len().saturating_mul(b.len()) > MAX_DIFF_CELLS {
+        out.extend(a.iter().map(|l| format!("-{l}")));
+        out.extend(b.iter().map(|l| format!("+{l}")));
+        return out;
+    }
+    // Longest common subsequence, from the ends: lcs[i][j] for a[i..] and b[j..].
+    let width = b.len() + 1;
+    let mut lcs = vec![0u32; (a.len() + 1) * width];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i * width + j] = if a[i] == b[j] {
+                lcs[(i + 1) * width + j + 1] + 1
+            } else {
+                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            out.push(format!(" {}", a[i]));
+            i += 1;
+            j += 1;
+        } else if i < a.len() && (j == b.len() || lcs[(i + 1) * width + j] >= lcs[i * width + j + 1]) {
+            // Removals before additions.
+            out.push(format!("-{}", a[i]));
+            i += 1;
+        } else {
+            out.push(format!("+{}", b[j]));
+            j += 1;
+        }
+    }
+    out
+}
+
+/// `bd show --as-of`: the rebuilt issue, and what could not be rebuilt.
+pub fn as_of(d: &IssueAsOf) -> Vec<String> {
+    let point = match (d.point.seq, d.point.time) {
+        (Some(n), _) => format!("#{n}"),
+        (None, Some(t)) => t.to_string(),
+        (None, None) => String::new(),
+    };
+    let last = d.last_event.map(|n| format!("last change #{n}")).unwrap_or_else(|| "no change retained".into());
+    let mut out = vec![format!("{} as of {point} ({last})", d.id)];
+    if !d.exists {
+        let line = match (&d.deleted, &d.created) {
+            (Some(x), _) if d.deleted_by_then() => format!("  deleted at #{} ({})", x.seq, x.ts),
+            (_, Some(c)) => format!("  did not exist yet (created #{} at {})", c.seq, c.ts),
+            _ => "  did not exist".to_string(),
+        };
+        out.push(line);
+    } else {
+        let f = |k: &str| d.fields.get(k);
+        let text = |k: &str| f(k).map(plain).unwrap_or_else(|| "?".into());
+        out.push(format!("  title: {}", text("title")));
+        out.push(format!(
+            "  status: {}   priority: {}   type: {}",
+            text("status"),
+            f("priority").map(|p| format!("P{p}")).unwrap_or_else(|| "?".into()),
+            text("issue_type")
+        ));
+        let optional: [(&str, &str); 6] = [
+            ("assignee", "assignee"),
+            ("external_ref", "external"),
+            ("estimated_minutes", "estimate (minutes)"),
+            ("due_at", "due"),
+            ("defer_until", "deferred until"),
+            ("closed_at", "closed"),
+        ];
+        for (key, label) in optional {
+            if let Some(v) = f(key).filter(|v| !v.is_null()) {
+                let mut line = format!("  {label}: {}", plain(v));
+                if key == "closed_at" {
+                    line.push_str(&format!(" ({})", f("close_outcome").map(plain).unwrap_or_else(|| "?".into())));
+                    if let Some(r) = f("close_reason").filter(|r| !r.is_null()) {
+                        line.push_str(&format!(": {}", plain(r)));
+                    }
+                }
+                out.push(line);
+            }
+        }
+        if f("ephemeral") == Some(&Value::Bool(true)) {
+            out.push("  ephemeral".into());
+        }
+        if !d.labels.is_empty() {
+            out.push(format!("  labels: {}", d.labels.join(", ")));
+        }
+        if let Some(m) = f("metadata").filter(|m| m.as_object().is_some_and(|m| !m.is_empty())) {
+            out.push(format!("  metadata: {m}"));
+        }
+        out.extend(text_blocks(&[
+            ("Description", &f("description").map(plain).unwrap_or_default()),
+            ("Design", &f("design").map(plain).unwrap_or_default()),
+            ("Acceptance criteria", &f("acceptance_criteria").map(plain).unwrap_or_default()),
+            ("Notes", &f("notes").map(plain).unwrap_or_default()),
+        ]));
+        if !d.dependencies.is_empty() {
+            out.push(String::new());
+            out.push("Depends on:".into());
+            for e in &d.dependencies {
+                out.push(format!("  - [{}] {}", e.dep_type, e.target));
+            }
+        }
+    }
+    if d.incomplete || !d.unknown.is_empty() {
+        out.push(String::new());
+    }
+    if d.incomplete {
+        out.push(format!(
+            "! events before #{} were recorded by an older bd, which did not record every change; values it could \
+             not confirm are listed as unknown",
+            d.history_complete_from
+        ));
+    }
+    for u in &d.unknown {
+        out.push(format!("! {}: not recorded ({})", u.key, u.reason.replace('\n', " ")));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_diff_inserts_deletes_and_changes() {
+        assert!(line_diff("a\nb", "a\nb").is_empty());
+        assert_eq!(line_diff("a\nc", "a\nb\nc"), ["+b"]);
+        assert_eq!(line_diff("a\nb\nc", "a\nc"), ["-b"]);
+        assert_eq!(line_diff("a\nb\nc", "a\nx\nc"), ["-b", "+x"]);
+        assert_eq!(line_diff("a\nb\nc\nd", "a\nx\nc\ny"), ["-b", "+x", " c", "-d", "+y"]);
+        assert_eq!(line_diff("", "new\ntext"), ["+new", "+text"]);
+        assert_eq!(line_diff("old", ""), ["-old"]);
+    }
+
+    #[test]
+    fn line_diff_falls_back_on_large_texts() {
+        let old: Vec<String> = (0..1500).map(|n| format!("old {n}")).collect();
+        let new: Vec<String> = (0..1500).map(|n| format!("new {n}")).collect();
+        let diff = line_diff(&old.join("\n"), &new.join("\n"));
+        assert_eq!(diff.len(), 3000);
+        assert!(diff[..1500].iter().all(|l| l.starts_with("-old")));
+        assert!(diff[1500..].iter().all(|l| l.starts_with("+new")));
+    }
+
+    #[test]
+    fn event_diffs_and_summaries() {
+        let e = Event {
+            seq: 9,
+            tx: 9,
+            ts: Timestamp(0),
+            actor: "a".into(),
+            op: "compacted".into(),
+            issue_id: Some("t-1".into()),
+            data: serde_json::json!({
+                "level": 1, "original_size": 40, "size": 5,
+                "changes": {
+                    "description": { "old": "long\ntext", "new": "short" },
+                    "priority": { "old": 2, "new": 1 },
+                    "labels": { "added": ["x"], "removed": ["y"] },
+                    "metadata": { "old": {}, "new": { "compaction": { "level": 1 } } },
+                },
+            }),
+        };
+        assert_eq!(event_summary(&e), "level 1: 40 -> 5 bytes");
+        let diff = event_diff(&e);
+        assert!(diff.contains(&"    description:".to_string()), "{diff:?}");
+        assert!(diff.contains(&"      -long".to_string()) && diff.contains(&"      +short".to_string()), "{diff:?}");
+        assert!(diff.contains(&"    priority: 2 -> 1".to_string()), "{diff:?}");
+        assert!(diff.contains(&"    labels: +x -y".to_string()), "{diff:?}");
+        assert!(diff.contains(&r#"    metadata: {} -> {"compaction":{"level":1}}"#.to_string()), "{diff:?}");
+    }
 }

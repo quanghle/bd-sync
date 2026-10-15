@@ -1,0 +1,12 @@
+{
+  "name": "@NPM_SCOPE@/bd-@NPM_OS@-@NPM_CPU@",
+  "version": "@VERSION@",
+  "description": "bd binary for @NPM_OS@ @NPM_CPU@ (installed through @NPM_SCOPE@/bd)",
+  "license": "MIT",
+  "os": ["@NPM_OS@"],
+  "cpu": ["@NPM_CPU@"],
+  "files": ["bin/"],
+  "preferUnplugged": true,
+  "repository": { "type": "git", "url": "git+https://github.com/@REPO@.git" },
+  "homepage": "https://github.com/@REPO@"
+}

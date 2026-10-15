@@ -233,6 +233,36 @@ pub fn parse_when(input: &str, now: Timestamp) -> Result<Timestamp> {
     )))
 }
 
+/// Parse a bound for a time filter (`--created-after`, `bd query`): like
+/// [`parse_when`], except that a bare duration (`7d`), or one with a leading
+/// `-` (`-7d`), counts back from `now`; `+7d` still counts forward.
+pub fn parse_filter_time(input: &str, now: Timestamp) -> Result<Timestamp> {
+    let s = input.trim();
+    let bad = || {
+        Error::invalid(format!(
+            "invalid time {input:?} (examples: 2026-01-15, 2026-01-15T09:00:00Z, 7d (7 days ago), +2d)"
+        ))
+    };
+    if s.starts_with('+') {
+        return parse_when(s, now).map_err(|_| bad());
+    }
+    let back = s.strip_prefix('-').unwrap_or(s);
+    if let Ok(d) = parse_duration(back) {
+        return Ok(now.minus(d));
+    }
+    if back.len() != s.len() {
+        return Err(bad());
+    }
+    parse_when(s, now).map_err(|_| bad())
+}
+
+/// The local day `date` as the half-open interval `[midnight, next midnight)`
+/// (`created = 2026-01-15` in `bd query`).
+pub(crate) fn local_day(date: NaiveDate, input: &str) -> Result<(Timestamp, Timestamp)> {
+    let next = date.succ_opt().ok_or_else(|| Error::invalid(format!("date {input:?} out of range")))?;
+    Ok((local_midnight(date, input)?, local_midnight(next, input)?))
+}
+
 fn local_midnight(date: NaiveDate, input: &str) -> Result<Timestamp> {
     local_datetime(date.and_hms_opt(0, 0, 0).expect("midnight is valid"), input)
 }
@@ -259,6 +289,36 @@ mod tests {
         assert!(parse_duration("m").is_err());
         assert_eq!(format_duration_ms(299_000), "4m59s");
         assert_eq!(format_duration_ms(350), "350ms");
+    }
+
+    #[test]
+    fn filter_times() {
+        let now = Timestamp(1_000_000_000);
+        let week = 604_800_000;
+        assert_eq!(parse_filter_time("7d", now).unwrap(), Timestamp(1_000_000_000 - week));
+        assert_eq!(parse_filter_time(" -7d ", now).unwrap(), Timestamp(1_000_000_000 - week));
+        assert_eq!(parse_filter_time("1w", now).unwrap(), Timestamp(1_000_000_000 - week));
+        assert_eq!(parse_filter_time("+7d", now).unwrap(), Timestamp(1_000_000_000 + week));
+        assert_eq!(parse_filter_time("now", now).unwrap(), now);
+        assert_eq!(
+            parse_filter_time("2026-01-15T09:00:00Z", now).unwrap(),
+            Timestamp::parse_rfc3339("2026-01-15T09:00:00Z").unwrap()
+        );
+        let day = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        assert_eq!(parse_filter_time("2026-01-15", now).unwrap(), local_midnight(day, "").unwrap());
+        for bad in ["7x", "-", "-2026-01-15", "+x", "whenever", ""] {
+            let e = parse_filter_time(bad, now).unwrap_err().to_string();
+            assert!(e.contains("invalid time") && e.contains("7 days ago"), "{bad}: {e}");
+        }
+    }
+
+    #[test]
+    fn local_days() {
+        let day = NaiveDate::from_ymd_opt(2026, 1, 15).unwrap();
+        let (start, end) = local_day(day, "2026-01-15").unwrap();
+        assert_eq!(start, parse_when("2026-01-15", Timestamp(0)).unwrap());
+        assert_eq!(end, parse_when("2026-01-16", Timestamp(0)).unwrap());
+        assert!(start < end);
     }
 
     #[test]

@@ -446,7 +446,7 @@ mod tests {
         assert_eq!(
             canned.ran,
             [
-                (vec!["ready".to_string(), "--json".into(), "--limit=11".into()], false),
+                (vec!["ready".to_string(), "--json".into(), "--brief".into(), "--limit=11".into()], false),
                 (vec!["claim".to_string(), "--json".into(), "--".into(), "a".into()], true),
             ]
         );

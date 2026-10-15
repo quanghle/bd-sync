@@ -635,7 +635,8 @@ fn harness_lines(h: Harness, r: &HarnessReport, applied: bool) -> Vec<String> {
     }
     if let Some(hook) = &r.hook {
         match hook.state {
-            HookState::Present => {}
+            // A pull reports only these three.
+            HookState::Present | HookState::Updated | HookState::Removed | HookState::Absent => {}
             HookState::Added if applied => lines.push(format!(
                 "{h}: session-start hook added to {}: new sessions run `bd hook session-start` and `bd prime`{}",
                 hook.file,

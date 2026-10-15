@@ -99,7 +99,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     o.push(format!("- `bd claim --next` atomically takes the head of the queue with a {ttl} lease; `bd claim <id>` takes a specific issue."));
     o.push("- `bd heartbeat <id> --token <t>` renews the lease while you work; a lost lease means stop.".into());
     o.push(
-        "- `bd close <id> --reason \"...\"` finishes (add `--failed` when it failed); `bd release <id>` gives it back."
+        "- `bd close <id> --reason \"...\"` finishes (`--failed` if it failed; `--claim-next` also claims the next ready issue); `bd release <id>` gives it back."
             .into(),
     );
     o.push(

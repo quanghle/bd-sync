@@ -15,6 +15,9 @@ pub mod commands;
 pub mod credentials;
 pub mod fmt;
 pub mod gates;
+pub mod gh;
+pub mod github;
+pub mod graph_view;
 pub mod hook;
 pub mod io;
 pub mod logging;
@@ -23,6 +26,7 @@ pub mod paths;
 pub mod playbooks;
 pub mod protocol;
 pub mod remote;
+pub mod setup;
 pub mod stream;
 pub mod tokens;
 
@@ -30,7 +34,7 @@ use bd_core::{Error, Result};
 use serde_json::json;
 
 use crate::app::App;
-use crate::cli::{Cli, Command, CommentCommand, HookCommand, LabelCommand, MemoryCommand};
+use crate::cli::{Cli, Command, CommentCommand, EpicCommand, HookCommand, LabelCommand, MemoryCommand};
 use crate::commands::*;
 
 /// Run a command line: on the workspace's server when it is remote, else
@@ -62,19 +66,23 @@ pub fn run(cli: Cli) -> i32 {
     execute(&mut app, &cli.command)
 }
 
-/// Commands that never use a remote workspace.
+/// Commands that never use a remote workspace (`bd query --parse-only`
+/// reads no workspace at all).
 pub fn always_local(cmd: &Command) -> bool {
-    matches!(
-        cmd,
-        Command::Serve(_)
-            | Command::Mcp(_)
-            | Command::Remote(_)
-            | Command::Backup(_)
-            | Command::Hook(_)
-            | Command::Version
-            | Command::Bench(_)
-            | Command::BenchWorker(_)
-    )
+    matches!(cmd, Command::Query(a) if a.parse_only)
+        || matches!(
+            cmd,
+            Command::Serve(_)
+                | Command::Mcp(_)
+                | Command::Remote(_)
+                | Command::Backup(_)
+                | Command::Hook(_)
+                | Command::Setup(_)
+                | Command::Version
+                | Command::Completion(_)
+                | Command::Bench(_)
+                | Command::BenchWorker(_)
+        )
 }
 
 /// Run one command and return its exit code: locally, and for each request
@@ -94,6 +102,7 @@ pub fn execute(app: &mut App, cmd: &Command) -> i32 {
         && !matches!(
             cmd,
             Command::Events(_)
+                | Command::Edit(_)
                 | Command::Backup(_)
                 | Command::Bench(_)
                 | Command::BenchWorker(_)
@@ -173,9 +182,7 @@ fn hint(e: &Error) -> Option<&'static str> {
         Error::AlreadyClaimed { .. } => {
             "pick other work with `bd claim --next`; to renew a claim of yours, pass its lease token (`bd claim <id> --token <t>`). A claim whose holder stops heartbeating frees itself once its lease has been expired for lease.grace. Only to take it over deliberately: `bd update <id> --assignee <you> --take-over` (recorded in the event history)"
         }
-        Error::NotReady { .. } => {
-            "see `bd show <id>` for its blockers and children; `bd claim <id> --allow-blocked` overrides"
-        }
+        Error::NotReady { .. } => "see `bd show <id> --why` for why; `bd claim <id> --allow-blocked` overrides",
         Error::Conflict { .. } => {
             "another actor changed it first; re-read (`bd show <id> --json`) and retry with the new revision"
         }
@@ -185,6 +192,7 @@ fn hint(e: &Error) -> Option<&'static str> {
         }
         Error::Busy(_) => "another process holds the write lock; retry, or raise --busy-timeout-ms",
         Error::EventsTruncated { .. } => "re-baseline with `bd export` and tail from its head_seq",
+        Error::HistoryPruned { .. } => "pick a later --as-of; `bd events -n 1` shows what is retained",
         Error::NoWorkspace(_) => "create one with `bd init`",
         Error::Unauthorized(_) => {
             "check the access token (BD_TOKEN, or `bd remote login`), and its role, kind, workspaces and actor (`bd remote show`; `bd serve token list` on the server)"
@@ -226,14 +234,36 @@ pub fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
     match cmd {
         Command::Init(a) => cmd_init(app, a).map(|_| 0),
         Command::Create(a) => write_cmd(app, "create", |tx| exec_create(tx, a)),
+        Command::Quick(a) => {
+            let out = app.write("create", |tx| exec_create(tx, &a.to_create()))?;
+            if app.g.json {
+                app.print(out);
+            } else {
+                for id in out.ids {
+                    io::outln(id);
+                }
+            }
+            Ok(0)
+        }
         Command::Show(a) => cmd_show(app, a).map(|_| 0),
         Command::List(a) => cmd_list(app, a).map(|_| 0),
+        Command::Edit(a) => cmd_edit(app, a).map(|_| 0),
+        Command::Query(a) => cmd_query(app, a).map(|_| 0),
+        Command::Epic(EpicCommand::Status(a)) => cmd_epic_status(app, a).map(|_| 0),
+        Command::Epic(EpicCommand::CloseEligible(a)) => cmd_close_eligible(app, a).map(|_| 0),
+        Command::Children(a) => cmd_children(app, a).map(|_| 0),
+        Command::Stale(a) => cmd_stale(app, a).map(|_| 0),
+        Command::Orphans(a) => cmd_orphans(app, a).map(|_| 0),
+        Command::Graph(a) => cmd_graph(app, a).map(|_| 0),
         Command::Update(a) => write_cmd(app, "update", |tx| exec_update(tx, a)),
         Command::Close(a) => write_cmd(app, "close", |tx| exec_close(tx, a)),
+        Command::Duplicate(a) => write_cmd(app, "duplicate", |tx| exec_duplicate(tx, a)),
+        Command::Supersede(a) => write_cmd(app, "supersede", |tx| exec_supersede(tx, a)),
         Command::Reopen(a) => write_cmd(app, "reopen", |tx| exec_reopen(tx, a)),
         Command::Defer(a) => write_cmd(app, "defer", |tx| exec_defer(tx, a)),
         Command::Undefer(a) => write_cmd(app, "undefer", |tx| exec_undefer(tx, a)),
         Command::Delete(a) => write_cmd(app, "delete", |tx| exec_delete(tx, a)),
+        Command::FindDuplicates(a) => cmd_find_duplicates(app, a).map(|_| 0),
         Command::Ready(a) => cmd_ready(app, a).map(|_| 0),
         Command::Blocked(a) => cmd_blocked(app, a).map(|_| 0),
         Command::Claim(a) => write_cmd(app, "claim", |tx| exec_claim(tx, a)),
@@ -264,6 +294,7 @@ pub fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Hook(HookCommand::SessionStart(a)) => actor::cmd_session_start(app, a),
         Command::Hook(HookCommand::SubagentStart) => actor::cmd_subagent_start(app),
         Command::Hook(HookCommand::PreToolUse) => actor::cmd_pre_tool_use(app),
+        Command::Setup(a) => setup::cmd_setup(app, a),
         Command::Stats => cmd_stats(app).map(|_| 0),
         Command::Metrics(a) => cmd_metrics(app, a).map(|_| 0),
         Command::Doctor(a) => cmd_doctor(app, a),
@@ -275,7 +306,9 @@ pub fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Batch(a) => batch::cmd_batch(app, a).map(|_| 0),
         Command::Playbook(c) => playbooks::cmd_playbook(app, c).map(|_| 0),
         Command::Gate(c) => gates::cmd_gate(app, c).map(|_| 0),
+        Command::Github(c) => github::cmd_github(app, c),
         Command::Purge(a) => playbooks::cmd_purge(app, a).map(|_| 0),
+        Command::Compact(a) => cmd_issue_compact(app, a).map(|_| 0),
         Command::Agents(c) => agents::cmd_agents(app, c).map(|_| 0),
         Command::Bench(_) | Command::BenchWorker(_) | Command::Serve(_) => match HANDLER.get() {
             Some(handle) => handle(app, cmd),
@@ -284,6 +317,7 @@ pub fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Mcp(a) => mcp::cmd_mcp(app, a),
         Command::Remote(c) => remote::cmd_remote(app, c),
         Command::Info => cmd_info(app).map(|_| 0),
+        Command::Completion(a) => cmd_completion(a),
         Command::Version => {
             if app.g.json {
                 app.print_json(
@@ -297,18 +331,39 @@ pub fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
     }
 }
 
+/// `bd completion <shell>`: the completion script generated from [`Cli`]'s
+/// grammar. It opens no store, so it works without a workspace.
+fn cmd_completion(a: &cli::CompletionArgs) -> Result<i32> {
+    use clap::CommandFactory;
+    let mut buf = Vec::new();
+    clap_complete::generate(a.shell.generator(), &mut Cli::command(), "bd", &mut buf);
+    io::with_stdout(|w| w.write_all(&buf))?;
+    Ok(0)
+}
+
 pub fn command_name(cmd: &Command) -> &'static str {
     match cmd {
         Command::Init(_) => "init",
         Command::Create(_) => "create",
+        Command::Quick(_) => "q",
         Command::Show(_) => "show",
         Command::List(_) => "list",
+        Command::Query(_) => "query",
+        Command::Epic(_) => "epic",
+        Command::Children(_) => "children",
+        Command::Stale(_) => "stale",
+        Command::Orphans(_) => "orphans",
+        Command::Graph(_) => "graph",
         Command::Update(_) => "update",
+        Command::Edit(_) => "edit",
         Command::Close(_) => "close",
+        Command::Duplicate(_) => "duplicate",
+        Command::Supersede(_) => "supersede",
         Command::Reopen(_) => "reopen",
         Command::Defer(_) => "defer",
         Command::Undefer(_) => "undefer",
         Command::Delete(_) => "delete",
+        Command::FindDuplicates(_) => "find-duplicates",
         Command::Ready(_) => "ready",
         Command::Blocked(_) => "blocked",
         Command::Claim(_) => "claim",
@@ -326,6 +381,7 @@ pub fn command_name(cmd: &Command) -> &'static str {
         Command::History(_) => "history",
         Command::Prime(_) => "prime",
         Command::Hook(_) => "hook",
+        Command::Setup(_) => "setup",
         Command::Stats => "stats",
         Command::Metrics(_) => "metrics",
         Command::Doctor(_) => "doctor",
@@ -337,7 +393,9 @@ pub fn command_name(cmd: &Command) -> &'static str {
         Command::Batch(_) => "batch",
         Command::Playbook(_) => "playbook",
         Command::Gate(_) => "gate",
+        Command::Github(_) => "github",
         Command::Purge(_) => "purge",
+        Command::Compact(_) => "compact",
         Command::Agents(_) => "agents",
         Command::Bench(_) | Command::BenchWorker(_) => "bench",
         Command::Serve(_) => "serve",
@@ -345,6 +403,7 @@ pub fn command_name(cmd: &Command) -> &'static str {
         Command::Remote(_) => "remote",
         Command::Info => "info",
         Command::Version => "version",
+        Command::Completion(_) => "completion",
     }
 }
 

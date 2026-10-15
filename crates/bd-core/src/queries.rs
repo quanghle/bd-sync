@@ -2,23 +2,29 @@
 //! transactions ([`crate::WriteCtx`]), so a writer can read its own changes.
 
 use std::io::Write;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
+use crate::asof::{self, IssueAsOf, Point};
 use crate::claims::{self, LeaseView};
 use crate::comments;
+use crate::compaction::{self, Candidate, CompactStats};
 use crate::config::{self, ConfigEntry};
 use crate::error::Result;
 use crate::events::{self, EventPage, EventQuery};
 use crate::graph::{self, Direction, TreeNode};
+use crate::hierarchy::{self, EpicStatus, Orphan, StaleIssue};
 use crate::issues;
 use crate::memory;
 use crate::metrics::{self, Stats};
 use crate::model::{
-    Blocker, Comment, Edge, Event, Issue, IssueDetails, IssueRef, Lease, ListQuery, Memory, ReadyQuery, WorkFilter,
+    BRIEF_DESCRIPTION_CHARS, Blocker, Comment, CommentBrief, Edge, Event, Issue, IssueBrief, IssueDetails, IssueRef,
+    Lease, ListQuery, Memory, QueryRequest, ReadyQuery, ShowBrief, WorkFilter, cut_chars,
 };
-use crate::ready::{self, BlockedIssue};
+use crate::ready::{self, BlockedIssue, ExplainOptions, Readiness};
 use crate::store::{ReadCtx, WriteCtx};
+use crate::subgraph::{self, EdgeSet, Subgraph};
 use crate::time::Timestamp;
 use crate::transfer::{self, ExportOptions, ExportSummary};
 
@@ -47,12 +53,78 @@ pub trait Queries {
         issues::list(self.conn(), q)
     }
 
+    /// The issues matching a `bd query` expression.
+    fn query(&self, q: &QueryRequest) -> Result<Vec<Issue>> {
+        issues::query(self.conn(), q, self.now())
+    }
+
     fn children(&self, id: &str) -> Result<Vec<IssueRef>> {
         issues::children(self.conn(), id)
     }
 
+    /// The children of `id` as full issues (every descendant with
+    /// `recursive`), in creation order.
+    fn child_issues(&self, id: &str, recursive: bool) -> Result<Vec<Issue>> {
+        hierarchy::child_issues(self.conn(), id, recursive)
+    }
+
+    /// The progress of `id`'s subtree, counted recursively.
+    fn epic_status(&self, id: &str) -> Result<EpicStatus> {
+        hierarchy::epic_status(self.conn(), id)
+    }
+
+    /// [`Queries::epic_status`] of every epic not closed (every epic with `include_closed`).
+    fn epics(&self, include_closed: bool) -> Result<Vec<EpicStatus>> {
+        hierarchy::epics(self.conn(), include_closed)
+    }
+
+    /// Epics not closed whose children are all closed.
+    fn close_eligible_epics(&self) -> Result<Vec<String>> {
+        hierarchy::close_eligible(self.conn())
+    }
+
+    /// Open and in-progress issues not updated within `older_than`, or held
+    /// under an expired lease.
+    fn stale(&self, older_than: Duration, limit: Option<usize>) -> Result<Vec<StaleIssue>> {
+        hierarchy::stale(self.conn(), self.now(), older_than, limit)
+    }
+
+    /// Issues whose text names `<prefix>-` ids that do not exist.
+    fn orphans(&self, prefix: &str) -> Result<Vec<Orphan>> {
+        hierarchy::orphans(self.conn(), prefix)
+    }
+
     fn parent(&self, id: &str) -> Result<Option<String>> {
         graph::parent_of(self.conn(), id)
+    }
+
+    /// The brief form of each issue, with its parent.
+    fn briefs(&self, issues: &[Issue]) -> Result<Vec<IssueBrief>> {
+        issues.iter().map(|i| Ok(IssueBrief::new(i, graph::parent_of(self.conn(), &i.id)?))).collect()
+    }
+
+    /// The last `n` comments on an issue, in chronological order, and how
+    /// many it has in all.
+    fn comments_tail(&self, id: &str, n: usize) -> Result<(Vec<Comment>, i64)> {
+        Ok((comments::tail(self.conn(), id, n)?, comments::count(self.conn(), id)?))
+    }
+
+    /// `show --brief`: the brief fields, a cut description, the open
+    /// blockers' ids and the last `comments_tail` comments.
+    fn show_brief(&self, id: &str, comments_tail: usize) -> Result<ShowBrief> {
+        let issue = issues::require(self.conn(), id)?;
+        let parent = graph::parent_of(self.conn(), id)?;
+        let blockers = graph::blockers(self.conn(), id)?.into_iter().map(|b| b.id).collect();
+        let (comments, comments_total) = self.comments_tail(id, comments_tail)?;
+        let (description, description_truncated) = cut_chars(&issue.description, BRIEF_DESCRIPTION_CHARS);
+        Ok(ShowBrief {
+            brief: IssueBrief::new(&issue, parent),
+            description,
+            description_truncated,
+            blockers,
+            comments: comments.into_iter().map(CommentBrief::from).collect(),
+            comments_total,
+        })
     }
 
     /// Number of ancestors above each of `ids` in the hierarchy, in one pass.
@@ -78,6 +150,20 @@ pub trait Queries {
         ready::not_ready_reasons(self.conn(), &issue, self.now())
     }
 
+    /// Whether an issue is ready and every reason it is not, counted as
+    /// `opts` says (see [`ready::explain`]).
+    fn explain(&self, id: &str, opts: ExplainOptions) -> Result<Readiness> {
+        let issue = issues::require(self.conn(), id)?;
+        let reasons = ready::explain(self.conn(), &issue, self.now(), opts)?;
+        Ok(Readiness { id: issue.id, ready: reasons.is_empty(), reasons })
+    }
+
+    /// Open issues that `q`'s ready queue leaves out as blocked, waiting on
+    /// their children or deferred (see [`ready::not_ready`]).
+    fn not_ready(&self, q: &ReadyQuery) -> Result<Vec<Issue>> {
+        ready::not_ready(self.conn(), q, self.now())
+    }
+
     fn dependencies(&self, id: &str) -> Result<Vec<Edge>> {
         issues::require(self.conn(), id)?;
         graph::dependencies_of(self.conn(), id)
@@ -90,6 +176,15 @@ pub trait Queries {
 
     fn dep_tree(&self, id: &str, direction: Direction, max_depth: usize) -> Result<Vec<TreeNode>> {
         graph::dep_tree(self.conn(), id, direction, max_depth)
+    }
+
+    /// The subgraph around `root` (following edges only down or only up), or
+    /// of every issue not closed or pinned; at most `max_nodes` issues.
+    fn subgraph(&self, root: Option<&str>, edges: &EdgeSet, max_nodes: usize) -> Result<Subgraph> {
+        match root {
+            Some(id) => subgraph::around(self.conn(), id, edges, max_nodes),
+            None => subgraph::open_issues(self.conn(), edges, max_nodes),
+        }
     }
 
     fn cycles(&self) -> Result<Vec<Vec<String>>> {
@@ -130,6 +225,20 @@ pub trait Queries {
         f: &mut dyn FnMut(&[Event]) -> Result<()>,
     ) -> Result<(i64, i64)> {
         events::query_each(self.conn(), q, batch, f)
+    }
+
+    /// The issue as it was at `point`, rebuilt from its events ([`asof`]).
+    fn issue_as_of(&self, id: &str, point: Point) -> Result<IssueAsOf> {
+        asof::issue_as_of(self.conn(), id, point)
+    }
+
+    /// Closed issues to compact ([`compaction`]): closed at least `older_than` ago.
+    fn compact_candidates(&self, older_than: Duration, limit: Option<usize>) -> Result<Vec<Candidate>> {
+        compaction::candidates(self.conn(), self.now(), older_than, limit)
+    }
+
+    fn compact_stats(&self, older_than: Duration) -> Result<CompactStats> {
+        compaction::stats(self.conn(), self.now(), older_than)
     }
 
     fn history(&self, id: &str) -> Result<Vec<Event>> {

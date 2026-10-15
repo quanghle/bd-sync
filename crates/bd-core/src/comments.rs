@@ -20,6 +20,21 @@ pub fn list(conn: &Connection, issue_id: &str) -> Result<Vec<Comment>> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// The last `n` comments on an issue, in chronological order.
+pub fn tail(conn: &Connection, issue_id: &str, n: usize) -> Result<Vec<Comment>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, issue_id, author, text, created_at FROM comments WHERE issue_id = ?1
+         ORDER BY created_at DESC, id DESC LIMIT ?2",
+    )?;
+    let limit = i64::try_from(n).unwrap_or(i64::MAX);
+    let rows = stmt.query_map(params![issue_id, limit], |r| {
+        Ok(Comment { id: r.get(0)?, issue_id: r.get(1)?, author: r.get(2)?, text: r.get(3)?, created_at: r.get(4)? })
+    })?;
+    let mut out = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    out.reverse();
+    Ok(out)
+}
+
 pub fn count(conn: &Connection, issue_id: &str) -> Result<i64> {
     Ok(conn.prepare_cached("SELECT COUNT(*) FROM comments WHERE issue_id = ?1")?.query_row([issue_id], |r| r.get(0))?)
 }

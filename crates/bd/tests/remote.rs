@@ -356,6 +356,25 @@ fn remote_lifecycle_keeps_cli_output_and_exit_codes() {
 }
 
 #[test]
+fn remote_close_claims_the_next_issue() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    alice.ok(&["create", "Parent"]);
+    alice.ok(&["create", "First", "--parent", "t-1"]);
+    alice.ok(&["create", "Second", "--parent", "t-1"]);
+    alice.ok(&["create", "Elsewhere", "-p", "0"]);
+    let token = alice.json(&["claim", "t-1.1"])["lease"]["token"].as_i64().unwrap().to_string();
+
+    let v = alice.json(&["close", "t-1.1", "--token", &token, "-r", "done", "--claim-next"]);
+    assert_eq!(v["closed"]["issue"]["status"], "closed");
+    assert_eq!(v["next"]["from"], "siblings");
+    assert_eq!(v["next"]["issue"]["id"], "t-1.2");
+    assert_eq!(v["next"]["issue"]["assignee"], "alice", "the token's actor");
+    let next = v["next"]["lease"]["token"].as_i64().unwrap().to_string();
+    alice.ok(&["heartbeat", "t-1.2", "--token", &next]);
+}
+
+#[test]
 fn tokens_bind_actor_role_and_workspace() {
     let server = Server::start();
     let alice = server.client(&server.token("alice-laptop", "alice", &[]));
@@ -1144,6 +1163,15 @@ fn stdin_and_files_travel_with_the_command() {
     assert_eq!(snap.lines().count(), 4, "header + 3 issues: {snap}");
     assert!(!server.root.path().join("proj").join("snap.jsonl").exists(), "nothing written on the server");
     assert!(alice.ok(&["export"]).lines().count() == 4, "export to stdout");
+
+    // bd graph -o writes on the client too, the summary printed as locally.
+    let out = alice.ok(&["graph", "t-1", "--format", "html", "-o", "g.html"]);
+    assert!(out.contains("✓ Wrote graph (2 issues, 1 edge) to g.html"), "{out}");
+    let page = std::fs::read_to_string(alice.dir.path().join("g.html")).unwrap();
+    assert!(page.starts_with("<!doctype html>") && page.contains("t-2"), "{page}");
+    assert!(!server.root.path().join("proj").join("g.html").exists(), "nothing written on the server");
+    assert!(!alice.dir.path().join("g.html.tmp").exists());
+    assert!(alice.ok(&["graph", "t-1"]).contains("└─ [blocks] "), "text on stdout");
 
     // A file the client did not send is never read from the server's disk.
     let (_, r) = post(&alice.url, &admin.token, &json!({ "argv": ["import", "/etc/hostname", "--dry-run"] }));
@@ -8853,4 +8881,102 @@ fn a_flood_of_authorizations_never_drops_sign_ins_under_way() {
     let (status, _, page) = browse(&callback, Some(&cookie), None);
     assert_eq!(status, 200, "{page}");
     assert!(page.contains("name=\"consent\""), "{page}");
+}
+
+#[test]
+fn history_and_compaction_work_through_bd_serve() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let reader = server.client(&server.token("dashboard", "dash", &["--role", "read"]));
+    let long = "A long description of the work, with the reasons it was done this way.";
+    let created_at = alice.json(&["create", "Work", "-d", long])["created_at"].as_str().unwrap().to_string();
+    alice.ok(&["create", "Other", "-d", long]);
+    alice.ok(&["update", "t-1", "-p", "1"]);
+    alice.ok(&["close", "t-1", "t-2"]);
+    let seq = |client: &Client, id: &str, op: &str| -> i64 {
+        let history = client.json(&["history", id]);
+        history.as_array().unwrap().iter().rev().find(|e| e["op"] == op).unwrap()["seq"].as_i64().unwrap()
+    };
+
+    // As of a seq and a time, with a read token.
+    let first = seq(&reader, "t-1", "created");
+    let then = reader.json(&["show", "t-1", "--as-of", &format!("#{first}")]);
+    assert_eq!((then["fields"]["priority"].as_i64(), then["fields"]["status"].as_str()), (Some(2), Some("open")));
+    assert_eq!(reader.json(&["show", "t-1", "--as-of", &created_at])["fields"]["title"], "Work");
+    let diff = reader.ok(&["history", "t-1", "--diff"]);
+    assert!(diff.contains("    priority: 2 -> 1"), "{diff}");
+
+    // Candidates and stats with a read token; applying needs a write token.
+    let candidates = reader.json(&["compact", "--analyze", "--older-than", "0s"]);
+    assert_eq!(candidates.as_array().unwrap().len(), 2);
+    let rev = candidates[0]["revision"].as_i64().unwrap().to_string();
+    assert_eq!(reader.json(&["compact", "--stats"])["closed"], 2);
+    assert_eq!(reader.code(&["compact", "--apply", "t-1", "--if-revision", &rev, "--summary", "x"]), 7);
+
+    // The summary from the client's stdin, and from a file on the client.
+    check(
+        alice.with_stdin(&["compact", "--apply", "t-1", "--if-revision", &rev, "--summary", "-"], "Did it."),
+        "stdin",
+    );
+    write(alice.dir.path(), "summary.md", "Did the other.");
+    let rev2 = alice.json(&["show", "t-2"])["revision"].as_i64().unwrap().to_string();
+    // A file the client did not send is never read from the server's disk.
+    let argv = json!({ "argv": ["compact", "--apply", "t-2", "--if-revision", rev2, "--summary", "@/etc/hostname"] });
+    let (_, r) = post(&alice.url, &alice.token, &argv);
+    assert_eq!(r["exit_code"], 2, "{r}");
+    assert!(r["stderr"].as_str().unwrap().contains("did not send"), "{r}");
+    alice.ok(&["compact", "--apply", "t-2", "--if-revision", &rev2, "--summary", "@summary.md"]);
+    assert_eq!(reader.json(&["show", "t-1"])["description"], "Did it.");
+    assert_eq!(reader.json(&["show", "t-2"])["description"], "Did the other.");
+    assert_eq!(reader.json(&["compact", "--stats"])["compacted"], 2);
+
+    // The original, as of just before the compaction.
+    let compacted = seq(&reader, "t-1", "compacted");
+    assert_eq!(reader.json(&["show", "t-1", "--as-of", &(compacted - 1).to_string()])["fields"]["description"], long);
+}
+
+/// A `gh` for `bd github` through the server: the listing of acme/app holds
+/// one issue; anything else, `gh repo view` included, fails.
+#[cfg(unix)]
+fn issues_gh(dir: &Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let gh = dir.join("fake-gh");
+    std::fs::write(
+        &gh,
+        r#"#!/bin/sh
+echo "$*" >> "$(dirname "$0")/gh-calls.log"
+for a in "$@"; do endpoint="$a"; done
+case "$endpoint" in
+  repos/acme/app/issues\?state=open*) printf 'HTTP/2.0 200 OK\r\n\r\n[{"number":1,"title":"From GitHub","state":"open","updated_at":"2026-10-01T10:00:00Z","body":null,"labels":[],"assignees":[],"comments":0}]' ;;
+  *) printf 'HTTP/2.0 404 Not Found\r\n\r\n{"message":"Not Found"}'; exit 1 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    gh
+}
+
+#[cfg(unix)]
+#[test]
+fn github_sync_through_serve_is_admin_only() {
+    let tools = tempfile::tempdir().unwrap();
+    let gh = issues_gh(tools.path());
+    let server = Server::launch_with(Server::prepare(), "127.0.0.1:0", &[], |c| {
+        c.env("BD_GH", &gh);
+    });
+    let alice = server.client(&server.token("alice-laptop", "alice", &["--role", "write"]));
+    let ops = server.client(&server.token("ops", "ops", &["--role", "admin"]));
+    assert_eq!(alice.code(&["github", "pull", "--repo", "acme/app"]), 7, "a write token is not enough");
+    assert_eq!(alice.code(&["github", "status", "--repo", "acme/app"]), 7);
+    // github.repos unset: only the workspace's own repository, which gh cannot name here.
+    assert_eq!(ops.code(&["github", "pull", "--repo", "acme/app"]), 2);
+    ops.ok(&["config", "set", "github.repos", "acme/app"]);
+    let status = ops.json(&["github", "status", "--repo", "acme/app"]);
+    assert_eq!(status["results"][0]["action"], "would create", "{status}");
+    let pulled = ops.json(&["github", "pull", "--repo", "acme/app"]);
+    assert_eq!(pulled["counts"]["created"], 1, "{pulled}");
+    let issue = &alice.json(&["list"])[0];
+    assert_eq!((issue["title"].as_str(), issue["external_ref"].as_str()), (Some("From GitHub"), Some("gh:acme/app#1")));
+    assert_eq!(issue["created_by"], "ops");
 }

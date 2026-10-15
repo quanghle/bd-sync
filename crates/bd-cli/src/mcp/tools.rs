@@ -94,7 +94,7 @@ const MAX_IDS: usize = 20;
 pub static TOOLS: &[Tool] = &[
     Tool {
         name: "ready",
-        description: "Issues ready to work on (open, unblocked, not deferred) in queue order.",
+        description: "Ready issues (open, unblocked, not deferred) in queue order.",
         read_only: true,
         params: &[
             p("limit", Kind::Int(1, MAX_LIMIT), "Default 10"),
@@ -120,6 +120,9 @@ pub static TOOLS: &[Tool] = &[
             p("assignee", Kind::Str, ""),
             p("parent", Kind::Str, "Under this issue"),
             p("blocked", Kind::Bool, "Only blocked issues"),
+            p("updated_after", Kind::Str, "7d = 7 days ago"),
+            p("created_after", Kind::Str, ""),
+            p("overdue", Kind::Bool, ""),
             p("sort", Kind::Enum(&["priority", "created", "updated"]), ""),
             p("limit", Kind::Int(1, MAX_LIMIT), "Default 20"),
         ],
@@ -128,9 +131,9 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "show",
-        description: "Issue details: texts, dependencies, children, blockers, comments, claim.",
+        description: "Issue details: texts, deps, children, blockers, comments, claim.",
         read_only: true,
-        params: &[req("ids", Kind::List(1, MAX_IDS), "")],
+        params: &[req("ids", Kind::List(1, MAX_IDS), ""), p("brief", Kind::Bool, "Key fields and last 3 comments")],
         build: build_show,
         shape: Shape::Show,
     },
@@ -180,7 +183,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "claim",
-        description: "Claim an issue (or the next ready one) under a lease; keep the returned token.",
+        description: "Claim an issue (or the next ready one) under a lease; keep the token.",
         read_only: false,
         params: &[
             p("id", Kind::Str, "Issue to claim"),
@@ -194,7 +197,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "heartbeat",
-        description: "Renew a claim's lease during long work.",
+        description: "Renew a claim's lease.",
         read_only: false,
         params: &[req("id", Kind::Str, ""), req("token", Kind::Int(0, i64::MAX), "From claim")],
         build: build_heartbeat,
@@ -202,13 +205,14 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "close",
-        description: "Close finished issues; returns the issues this unblocked.",
+        description: "Close finished issues; returns what this unblocked.",
         read_only: false,
         params: &[
             req("ids", Kind::List(1, MAX_IDS), ""),
             req("reason", Kind::Str, "What was done"),
             p("failed", Kind::Bool, "The work failed"),
-            p("token", Kind::Int(0, i64::MAX), "From claim: only while that lease is held"),
+            p("token", Kind::Int(0, i64::MAX), "From claim: only while held"),
+            p("claim_next", Kind::Bool, "Then claim the next ready issue"),
         ],
         build: build_close,
         shape: Shape::Write,
@@ -220,7 +224,7 @@ pub static TOOLS: &[Tool] = &[
         params: &[
             req("id", Kind::Str, ""),
             p("reason", Kind::Str, ""),
-            p("token", Kind::Int(0, i64::MAX), "From claim: only while that lease is held"),
+            p("token", Kind::Int(0, i64::MAX), "From claim: only while held"),
         ],
         build: build_release,
         shape: Shape::Write,
@@ -235,7 +239,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "comment",
-        description: "Comment on an issue: context for whoever picks it up.",
+        description: "Comment on an issue for whoever picks it up.",
         read_only: false,
         params: &[req("id", Kind::Str, ""), req("text", Kind::Str, "")],
         build: build_comment,
@@ -490,6 +494,7 @@ impl Line {
 
 fn build_ready(a: &Args) -> Result<Vec<String>, String> {
     Line::new(&["ready"])
+        .switch("brief", true)
         .opt("limit", Some(a.int("limit").unwrap_or(READY_LIMIT) + 1))
         .each("label", a.list("label"))
         .opt("type", a.str("type"))
@@ -501,6 +506,7 @@ fn build_ready(a: &Args) -> Result<Vec<String>, String> {
 
 fn build_list(a: &Args) -> Result<Vec<String>, String> {
     Line::new(&["list"])
+        .switch("brief", true)
         .opt("limit", Some(a.int("limit").unwrap_or(LIST_LIMIT) + 1))
         .each("status", a.list("status"))
         .opt("search", a.str("search"))
@@ -510,12 +516,15 @@ fn build_list(a: &Args) -> Result<Vec<String>, String> {
         .opt("assignee", a.str("assignee"))
         .opt("parent", a.str("parent"))
         .switch("blocked", a.flag("blocked"))
+        .opt("updated-after", a.str("updated_after"))
+        .opt("created-after", a.str("created_after"))
+        .switch("overdue", a.flag("overdue"))
         .opt("sort", a.str("sort"))
         .done()
 }
 
 fn build_show(a: &Args) -> Result<Vec<String>, String> {
-    Line::new(&["show"]).args(a.list("ids")).done()
+    Line::new(&["show"]).switch("brief", a.flag("brief")).args(a.list("ids")).done()
 }
 
 fn build_create(a: &Args) -> Result<Vec<String>, String> {
@@ -585,6 +594,7 @@ fn build_close(a: &Args) -> Result<Vec<String>, String> {
         .opt("reason", a.str("reason"))
         .switch("failed", a.flag("failed"))
         .opt("token", a.int("token"))
+        .switch("claim-next", a.flag("claim_next"))
         .args(a.list("ids"))
         .done()
 }
@@ -653,6 +663,7 @@ fn summary(issue: &Value) -> Value {
         "priority": field("priority"),
         "type": field("issue_type"),
         "assignee": field("assignee"),
+        "parent": field("parent"),
         "labels": field("labels"),
     })
 }
@@ -730,16 +741,46 @@ mod tests {
             argv("close", json!({ "ids": ["a", "b"], "reason": "--take-over", "token": 7 })),
             ["close", "--json", "--reason=--take-over", "--token=7", "--", "a", "b"]
         );
+        assert_eq!(
+            argv("close", json!({ "ids": ["a"], "reason": "Done", "claim_next": true })),
+            ["close", "--json", "--reason=Done", "--claim-next", "--", "a"]
+        );
         assert_eq!(argv("memories", json!({})), ["memories", "--json"]);
     }
 
     #[test]
     fn limits_fetch_one_more() {
-        assert_eq!(argv("ready", json!({})), ["ready", "--json", "--limit=11"]);
+        assert_eq!(argv("ready", json!({})), ["ready", "--json", "--brief", "--limit=11"]);
+        assert_eq!(argv("list", json!({})), ["list", "--json", "--brief", "--limit=21"]);
         assert_eq!(
             argv("list", json!({ "limit": 5, "status": ["closed"] })),
-            ["list", "--json", "--limit=6", "--status=closed"]
+            ["list", "--json", "--brief", "--limit=6", "--status=closed"]
         );
+    }
+
+    #[test]
+    fn list_takes_time_filters() {
+        assert_eq!(
+            argv("list", json!({ "updated_after": "7d", "created_after": "2026-01-15", "overdue": true })),
+            [
+                "list",
+                "--json",
+                "--brief",
+                "--limit=21",
+                "--updated-after=7d",
+                "--created-after=2026-01-15",
+                "--overdue"
+            ]
+        );
+        // A time that looks like a flag stays the flag's value.
+        assert_eq!(
+            argv("list", json!({ "updated_after": "--all", "overdue": false })),
+            ["list", "--json", "--brief", "--limit=21", "--updated-after=--all"]
+        );
+        let err = invoke("list", json!({ "overdue": "yes" })).err().unwrap();
+        assert_eq!(err, "overdue must be true or false");
+        let err = invoke("list", json!({ "updated_after": 7 })).err().unwrap();
+        assert!(err.starts_with("updated_after must be"), "{err}");
     }
 
     #[test]
@@ -788,6 +829,26 @@ mod tests {
     }
 
     #[test]
+    fn show_is_brief_on_request() {
+        assert_eq!(argv("show", json!({ "ids": ["a"] })), ["show", "--json", "--", "a"]);
+        assert_eq!(argv("show", json!({ "ids": ["a"], "brief": false })), ["show", "--json", "--", "a"]);
+        assert_eq!(argv("show", json!({ "ids": ["a"], "brief": true })), ["show", "--json", "--brief", "--", "a"]);
+    }
+
+    #[test]
+    fn summaries_keep_the_parent() {
+        let inv = invoke("list", json!({})).unwrap();
+        let out = json!([
+            { "id": "a.1", "title": "t", "status": "open", "priority": 2, "issue_type": "task", "parent": "a" },
+            { "id": "b", "title": "u", "status": "open", "priority": 1, "issue_type": "bug" },
+        ]);
+        assert_eq!(
+            inv.result(&out.to_string()).unwrap(),
+            r#"{"issues":[{"id":"a.1","parent":"a","priority":2,"status":"open","title":"t","type":"task"},{"id":"b","priority":1,"status":"open","title":"u","type":"bug"}]}"#
+        );
+    }
+
+    #[test]
     fn show_drops_lease_tokens_and_escapes_text() {
         let inv = invoke("show", json!({ "ids": ["a"] })).unwrap();
         let out = json!({ "id": "a", "title": "\u{1b}[31mred\u{202e}", "lease": { "holder": "h", "token": 3 } });
@@ -799,7 +860,7 @@ mod tests {
 
     #[test]
     fn the_tool_list_stays_small() {
-        // About 1,500 tokens at 6.4 KB; every agent connected pays this per session.
+        // About 1,550 tokens at 6.6 KB; every agent connected pays this per session.
         let list = serde_json::to_string(&TOOLS.iter().map(Tool::describe).collect::<Vec<_>>()).unwrap();
         assert!(list.len() < 6656, "tools/list is {} bytes", list.len());
     }

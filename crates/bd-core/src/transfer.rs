@@ -7,9 +7,13 @@
 //!
 //! Import upserts by id in one transaction and also accepts beads'
 //! `bd export` format (`_type` issue/memory lines, `value` for memory
-//! content, string-encoded edge metadata).
+//! content, string-encoded edge metadata). Beads fields bd has no column for
+//! are kept under `metadata.beads.<field>` rather than dropped; only derived
+//! and node-local ones (counts, `is_blocked`, leases) are not, and
+//! [`ImportSummary::fields`] reports, per field, what was mapped, kept or
+//! dropped.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 
 use rusqlite::{Connection, params};
@@ -145,7 +149,50 @@ pub struct ImportSummary {
     pub leases_granted: usize,
     pub skipped: usize,
     pub warnings: Vec<String>,
+    /// Per issue field of the input (nulls and `_type` aside): how many lines
+    /// had it mapped to a column, kept in `metadata.beads`, or dropped.
+    pub fields: BTreeMap<String, FieldCounts>,
 }
+
+/// What import did with one field across the issue lines of an input.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FieldCounts {
+    pub mapped: usize,
+    pub kept: usize,
+    pub dropped: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Category {
+    Mapped,
+    Kept,
+    Dropped,
+}
+
+fn count(summary: &mut ImportSummary, key: &str, category: Category) {
+    let c = summary.fields.entry(key.to_string()).or_default();
+    match category {
+        Category::Mapped => c.mapped += 1,
+        Category::Kept => c.kept += 1,
+        Category::Dropped => c.dropped += 1,
+    }
+}
+
+/// Beads fields bd derives itself or holds per node (readiness, counts,
+/// leases): dropped on import, without a warning.
+pub const DERIVED_FIELDS: &[&str] = &[
+    "is_blocked",
+    "revision",
+    "dependency_count",
+    "dependent_count",
+    "comment_count",
+    "lease_expires_at",
+    "heartbeat_at",
+    "lease_granted_node",
+];
+
+/// The record marker of an export line: not a field, never counted.
+const RECORD_MARKER: &str = "_type";
 
 #[derive(Deserialize)]
 struct InIssue {
@@ -215,6 +262,9 @@ struct InIssue {
     mol_type: Option<String>,
     #[serde(default)]
     wisp_type: Option<String>,
+    /// Every key above does not consume: kept in `metadata.beads`.
+    #[serde(flatten)]
+    extra: Map<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -228,6 +278,8 @@ struct InDep {
     created_at: Option<Timestamp>,
     #[serde(default)]
     created_by: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
 }
 
 fn default_dep_type() -> String {
@@ -307,11 +359,23 @@ impl WriteCtx<'_> {
                     memories_in.push(m);
                 }
                 "issue" => {
+                    let keys: Vec<String> = v
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(k, v)| k.as_str() != RECORD_MARKER && !v.is_null())
+                        .map(|(k, _)| k.clone())
+                        .collect();
                     let raw: InIssue =
                         serde_json::from_value(v).map_err(|e| Error::invalid(format!("line {lineno}: {e}")))?;
-                    match self.convert_issue(raw, opts, &actor, now, &mut summary, lineno)? {
+                    match self.convert_issue(raw, &keys, opts, &actor, now, &mut summary, lineno)? {
                         Some(entry) => issues_in.push(entry),
-                        None => summary.skipped += 1,
+                        None => {
+                            for k in &keys {
+                                count(&mut summary, k, Category::Dropped);
+                            }
+                            summary.skipped += 1;
+                        }
                     }
                 }
                 other => {
@@ -371,7 +435,19 @@ impl WriteCtx<'_> {
                         .push(format!("{}: kept parent {p}, skipped second parent {}", issue.id, d.depends_on_id));
                     continue;
                 }
-                let metadata = object_metadata(d.metadata.clone());
+                let mut metadata = object_metadata(d.metadata.clone());
+                if let Some(thread) = d.thread_id.as_deref().filter(|t| !t.is_empty())
+                    && let Some(obj) = metadata.as_object_mut()
+                {
+                    let kept = match obj.entry("beads").or_insert_with(empty_object).as_object_mut() {
+                        Some(m) if !m.contains_key("thread_id") => {
+                            m.insert("thread_id".into(), json!(thread));
+                            Category::Kept
+                        }
+                        _ => Category::Dropped,
+                    };
+                    count(&mut summary, "dependencies.thread_id", kept);
+                }
                 let existing = graph::load_edge(self.conn(), &issue.id, &d.depends_on_id)?;
                 if existing.as_ref().is_some_and(|e| e.dep_type == dep_type && e.metadata == metadata) {
                     continue;
@@ -471,9 +547,11 @@ impl WriteCtx<'_> {
         Ok(summary)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn convert_issue(
         &mut self,
-        raw: InIssue,
+        mut raw: InIssue,
+        keys: &[String],
         opts: &ImportOptions,
         actor: &str,
         now: Timestamp,
@@ -536,7 +614,40 @@ impl WriteCtx<'_> {
         };
         let mut labels = issues::normalize_labels(&raw.labels.clone().unwrap_or_default())?;
         labels.sort();
-        let mut metadata = object_metadata(raw.metadata);
+        let mut metadata = object_metadata(raw.metadata.take());
+        // Every key starts as mapped; the ones with no column move to `beads`.
+        let mut cats: BTreeMap<String, Category> = keys.iter().map(|k| (k.clone(), Category::Mapped)).collect();
+        let mut beads = std::mem::take(&mut raw.extra);
+        beads.retain(|k, v| !v.is_null() && k != RECORD_MARKER);
+        let mut ephemeral = raw.ephemeral;
+        for k in beads.keys().cloned().collect::<Vec<_>>() {
+            let category = if DERIVED_FIELDS.contains(&k.as_str()) {
+                Category::Dropped
+            } else if k == "wisp" {
+                // The old spelling of `ephemeral`.
+                match beads[&k].as_bool() {
+                    Some(b) => {
+                        ephemeral |= b;
+                        Category::Mapped
+                    }
+                    None => Category::Kept,
+                }
+            } else if k == "parent" {
+                let parent = beads[&k].as_str();
+                let backed = raw.dependencies.iter().flatten().any(|d| {
+                    DepType::parse(&d.dep_type).is_ok_and(|t| t == DepType::ParentChild)
+                        && Some(d.depends_on_id.as_str()) == parent
+                });
+                if backed { Category::Mapped } else { Category::Kept }
+            } else {
+                Category::Kept
+            };
+            if category != Category::Kept {
+                beads.remove(&k);
+            }
+            cats.insert(k, category);
+        }
+        let mut gate_formed = false;
         if let Some(kind) = raw.await_type.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
             let mut gate = Map::new();
             let kind = GateKind::parse(kind).map(|k| k.as_str().to_string()).unwrap_or_else(|_| kind.to_string());
@@ -550,18 +661,56 @@ impl WriteCtx<'_> {
             if let Some(w) = raw.waiters.as_ref().filter(|w| !w.is_empty()) {
                 gate.insert("waiters".into(), json!(w));
             }
-            if let Some(obj) = metadata.as_object_mut() {
-                obj.entry("gate").or_insert(Value::Object(gate));
+            if let Some(obj) = metadata.as_object_mut()
+                && !obj.contains_key("gate")
+            {
+                obj.insert("gate".into(), Value::Object(gate));
+                gate_formed = true;
             }
         }
-        let beads: Map<String, Value> = [("mol_type", &raw.mol_type), ("wisp_type", &raw.wisp_type)]
-            .into_iter()
-            .filter_map(|(k, v)| v.as_ref().filter(|s| !s.is_empty()).map(|s| (k.to_string(), json!(s))))
-            .collect();
+        let mut keep = |beads: &mut Map<String, Value>, k: &str, v: Option<Value>| {
+            if let Some(v) = v {
+                beads.insert(k.to_string(), v);
+                cats.insert(k.to_string(), Category::Kept);
+            }
+        };
+        if !gate_formed {
+            keep(&mut beads, "await_type", raw.await_type.as_ref().map(|s| json!(s)));
+            keep(&mut beads, "await_id", raw.await_id.as_ref().map(|s| json!(s)));
+            keep(&mut beads, "timeout", raw.timeout.map(|n| json!(n)));
+            keep(&mut beads, "waiters", raw.waiters.as_ref().map(|w| json!(w)));
+        }
+        keep(&mut beads, "mol_type", raw.mol_type.as_ref().filter(|s| !s.is_empty()).map(|s| json!(s)));
+        keep(&mut beads, "wisp_type", raw.wisp_type.as_ref().filter(|s| !s.is_empty()).map(|s| json!(s)));
         if !beads.is_empty()
             && let Some(obj) = metadata.as_object_mut()
         {
-            obj.entry("beads").or_insert(Value::Object(beads));
+            match obj.entry("beads").or_insert_with(empty_object) {
+                Value::Object(existing) => {
+                    // Metadata the line carries itself wins over a top-level field.
+                    for (k, v) in beads {
+                        if existing.contains_key(&k) {
+                            summary
+                                .warnings
+                                .push(format!("{}: kept metadata.beads.{k}, dropped top-level {k}", raw.id));
+                            cats.insert(k, Category::Dropped);
+                        } else {
+                            existing.insert(k, v);
+                        }
+                    }
+                }
+                _ => {
+                    summary
+                        .warnings
+                        .push(format!("{}: metadata.beads is not an object; beads fields not kept", raw.id));
+                    for k in beads.keys() {
+                        cats.insert(k.clone(), Category::Dropped);
+                    }
+                }
+            }
+        }
+        for (k, c) in &cats {
+            count(summary, k, *c);
         }
         let issue = Issue {
             id: raw.id.trim().to_string(),
@@ -586,7 +735,7 @@ impl WriteCtx<'_> {
             close_outcome,
             due_at: raw.due_at,
             defer_until: raw.defer_until,
-            ephemeral: raw.ephemeral,
+            ephemeral,
             is_blocked: false,
             revision: 0,
             labels,
@@ -595,6 +744,8 @@ impl WriteCtx<'_> {
     }
 
     fn write_imported_issue(&mut self, issue: &Issue, exists: bool, claim_override: Option<Value>) -> Result<()> {
+        // What an update replaces, so the history can restore it (see `asof`).
+        let previous = if exists { Some(issues::snapshot(self.conn(), &issue.id)?) } else { None };
         let conn = self.conn();
         if exists {
             conn.prepare_cached(
@@ -655,6 +806,9 @@ impl WriteCtx<'_> {
         let snapshot = issues::snapshot(self.conn(), &issue.id)?;
         let mode = if exists { "update" } else { "create" };
         let mut data = json!({ "mode": mode, "issue": snapshot });
+        if let Some(p) = previous {
+            data["previous"] = p;
+        }
         if let Some(o) = claim_override {
             data["claim_override"] = o;
         }

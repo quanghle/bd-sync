@@ -56,6 +56,14 @@ wait on through `waits-for`: it may close before the children it spawned.
 | `related`, `discovered-from`, `tracks`, `caused-by`, `validates`, `supersedes`, `duplicates`, `replies-to` | informational only |
 | custom (`[a-z][a-z0-9-]{0,31}`) | informational only |
 
+`duplicates` and `supersedes` edges point from the closed issue to the one
+that replaces it, as in beads: `X duplicates Y` means X is a duplicate of Y,
+and `X supersedes Y` means X is superseded by Y. `bd duplicate X --of Y` and
+`bd supersede X --with Y` add the edge and close X (outcome `done`, reason
+`duplicate of Y` or `superseded by Y`) in one transaction, leaving everything
+else of X and Y as it is; `bd dep add X Y -t duplicates` writes the same edge
+without closing.
+
 Only the first four affect readiness. Cycles of `blocks`,
 `conditional-blocks` and `parent-child` edges are refused when the edge is
 written, with the cycle's path in the error; `bd dep cycles` checks a whole
@@ -85,10 +93,13 @@ recompute.
   `--include-epics` or `-t epic`. **Gates** are left out too (`-t gate`
   lists the open, unblocked ones), and can never be claimed.
 - **Filters**: `-l/--label` (all of), `--label-any`, `--exclude-label`,
-  `-t/--type`, `--exclude-type`, `-a/--assignee`, `--unassigned`,
-  `-p/--priority`, `--max-priority` and `--parent` (alias `--run`), which
-  `claim --next` shares with `--sort`; plus `--include-deferred` and
-  `-n/--limit` (default 50, `0` for all).
+  `-t/--type`, `--exclude-type`, `-a/--assignee`, `--unassigned` (alias
+  `--no-assignee`), `-p/--priority`, `--max-priority` and `--parent` (alias
+  `--run`), which `claim --next` shares with `--sort`; plus
+  `--include-deferred` and `-n/--limit` (default 50, `0` for all). `bd ready`
+  also takes the time and title filters of `bd list` (`--created-after`,
+  `--updated-before`, `--overdue`, `--stale`, `--title-contains`, …; see
+  [Commands](commands.md#issues)) and keeps its queue order.
 
 ## Claims, leases and recovery
 
@@ -169,11 +180,12 @@ commit-ordered; `tx` groups the events of one transaction.
 
 | group | ops |
 |---|---|
-| issues | `created`, `updated` (field-level old/new), `closed`, `reopened`, `deleted` (with a snapshot) |
+| issues | `created`, `updated` (field-level old/new), `closed`, `reopened` (with the close fields it cleared), `deleted` (with a snapshot), `compacted` ([Compaction](#compaction): old/new like `updated`) |
 | claims | `claimed`, `released`, `reclaimed`, `lease_granted` |
 | graph | `dep_added`, `dep_removed`, `dep_updated`, `blocked`, `unblocked` |
-| other | `commented`, `memory_set`, `memory_deleted`, `config_set`, `config_unset`, `prefix_renamed` ([Renaming the prefix](commands.md#renaming-the-prefix)), `imported`, `pruned` |
-| playbooks and gates | `run_started`, `run_compacted`, `purged`, `gate_escalated`, `gate_updated` |
+| other | `commented`, `memory_set`, `memory_deleted`, `config_set`, `config_unset`, `prefix_renamed` and `references_renamed` ([Renaming the prefix](commands.md#renaming-the-prefix)), `imported` (an update with the issue's `previous` snapshot), `pruned` |
+| playbooks and gates | `run_started`, `run_compacted`, `purged`, `gate_armed`, `gate_escalated`, `gate_updated` (the gate's metadata old/new) |
+| GitHub sync | `github_synced`: one per [`bd github`](github.md) run that changed anything, with the repository, direction, counts and the ids pushed, created and linked |
 | agent assets | `agents_changed` (written by `bd serve`; see [Agent assets](agents.md#serving-sets)) |
 
 ```bash
@@ -193,6 +205,99 @@ Retention can also be automatic: `events.retain_days`, `events.retain_rows`.
 
 To mirror a workspace elsewhere, load a `bd export` snapshot (its header
 carries `head_seq`), then tail `bd events --since <head_seq>`.
+
+Deleting an issue (`delete --force` or `--cascade`, a purge, a run's
+compaction) drops the edges other issues had to it: each such issue gets a
+`dep_removed` event of its own, with `dropped_by` naming the deleted issue.
+`bd history ID --diff` prints, under each event that records changes, every
+changed field: text as a line diff, labels as `+a -b`, others as
+`old -> new`.
+
+### Reading an issue as of a past moment
+
+```bash
+bd show demo-xyz --as-of '#1200'               # just after event 1200 (also: 1200)
+bd show demo-xyz --as-of 2026-01-15            # as of a time; also -2h (two hours ago)
+```
+
+`--as-of` rebuilds the title, text fields, status, priority, type,
+assignee, labels, dependencies (target, type and metadata), metadata,
+external reference, estimate, due and defer times, `ephemeral` and the
+close reason, outcome and time, from the issue's retained events: forward
+from its creation, and backward from its current row (or its deletion) by
+undoing later events, so it works after older events were pruned too. It
+does not rebuild `started_at`, the revision, the blocked flag, comments,
+children or dependents. A gate's `metadata.gate.armed_at` follows its
+`unblocked`, `blocked` and `gate_armed` events. A deleted issue resolves
+by its id; before its creation (or after its deletion) it did not exist,
+which is an answer, not an error.
+
+Anything the events cannot tell is left out and listed as unknown
+(`unknown` in JSON, `! key: not recorded (reason)` in text), never
+guessed: a value an event written before bd recorded it lacks (a reopen's
+previous close reason, an import's previous fields, a gate's escalation),
+or one that changed without any event ("changed without a recorded event
+between #a and #b"). Schema v4 records `history_complete_from`, the seq
+from which every change is recorded; before it, an older bd made three
+kinds of writes without an event: gate arming, the text rewrites of
+`rename-prefix`, and the edges a deletion dropped. Values those writes
+could have changed, where the evidence spans that older history, are
+listed as unknown, and the answer says history is incomplete
+(`incomplete: true`). Older bd binaries refuse a v4 workspace, so none can
+write such events after the marker.
+
+A point older than retention exits 6 (`history_pruned`), unless the
+issue's retained creation shows it did not exist yet. A seq just below the
+oldest retained event (`floor - 1`) still answers, as the state before
+that event; a time before the oldest retained event does not, since what
+happened between the last pruned event and it is gone.
+
+## Compaction
+
+Two different things compact:
+
+- **`bd compact`** summarises the text of old closed issues, one issue at a
+  time, with a summary an agent writes. bd calls no model and needs no API
+  key.
+- **`bd playbook compact RUN`** folds a finished playbook run's steps into
+  its run issue and deletes them ([Playbooks](playbooks.md)).
+
+`bd compact --apply ID --if-revision N --summary TEXT|@FILE|-` replaces the
+description, design, acceptance criteria and notes of a closed issue with
+the summary, which must be shorter, and records `metadata.compaction`:
+`level` (1, then 2 when compacted again), `compacted_at` and
+`original_size` (the bytes of the original text, kept from the first
+compaction). The title, close reason, labels, dependencies and comments
+stay. The revision guard is required: the summary describes one revision
+of the text, so an edit since then exits 13 and nothing is written. Open
+issues are refused (exit 2).
+
+The original text is kept in the `compacted` event (its `changes`, old and
+new, as for `updated`): `bd history ID --diff` shows it, and `bd show ID
+--as-of '#<seq before the compaction>'` rebuilds the issue with it, for as
+long as retention keeps that event. After a prune that keeps the
+`compacted` event but drops everything older, that seq point (the oldest
+kept event's seq minus one) still shows the original, while a time before
+the compaction is before retention. The database shrinks once
+`events.retain_days`, `events.retain_rows` or `bd events prune` drop the
+event.
+
+An agent's loop:
+
+```bash
+bd compact --analyze --older-than 90d -n 10 --json > candidates.json
+jq -c '.[]' candidates.json | while read -r c; do
+  id=$(jq -r .id <<<"$c"); rev=$(jq -r .revision <<<"$c")
+  summary=$(summarise "$c")   # the agent writes a short summary of the four texts
+  printf '%s' "$summary" | bd compact --apply "$id" --if-revision "$rev" --summary - \
+    || [ $? -eq 13 ]          # changed meanwhile: it shows up again in the next --analyze
+done
+bd compact --stats
+```
+
+`--analyze` lists only issues never compacted, so the loop ends.
+`--analyze` and `--stats` are reads, `--apply` a write (a write token
+through `bd serve`).
 
 ## Comments and memory
 

@@ -132,6 +132,9 @@ pub struct PruneArgs {
 pub struct HistoryArgs {
     /// Issue id (a deleted issue keeps its history)
     pub id: String,
+    /// Print each changed field's old and new value, text as a line diff
+    #[arg(long)]
+    pub diff: bool,
 }
 
 pub const PRIME_LONG_ABOUT: &str = "\
@@ -141,7 +144,7 @@ Prints what an agent session needs to start: the bd workflow, the actor it
 acts as, its claims and those of the user's other sessions, the head of the
 ready queue, gates waiting on a person, playbooks and the workspace's
 memories. Session-start hooks run it (with --hook); run it again after the
-session's context was cleared.";
+session's context was cleared or compacted.";
 
 const PRIME_EXAMPLES: &str = "\
 Examples:
@@ -303,8 +306,10 @@ Import a JSONL snapshot (bd or beads format), all or nothing
 Upserts issues by id, with their labels, dependencies and comments, and
 memories by key, in one transaction: on any error nothing is imported. Reads
 `bd export` output and the beads export format. An import that would end
-another actor's live claim is refused without --take-over. Through bd serve,
-import always needs an admin token.";
+another actor's live claim is refused without --take-over. Beads fields bd
+has no column for are kept in metadata.beads, and --dry-run reports, per
+field, what is mapped, kept or dropped. Through bd serve, import always needs
+an admin token.";
 
 const IMPORT_EXAMPLES: &str = "\
 Examples:
@@ -368,7 +373,7 @@ Reads one operation per line: a bd subcommand without the leading `bd`, with
 the same flags as on the command line. $N stands for the id that operation N
 produced (counting operations from 1, not lines), $$ for a literal $, and
 lines starting with # are comments. The operations: create, update, close,
-reopen, defer, undefer, delete, dep, label, comment add, claim, release,
+duplicate, supersede, reopen, defer, undefer, delete, dep, label, comment add, claim, release,
 heartbeat, remember, forget, config set and config unset. If one fails, none
 is applied.";
 
@@ -391,4 +396,54 @@ pub struct BatchArgs {
     pub file: Option<PathBuf>,
     #[arg(long, help = DRY_RUN_HELP)]
     pub dry_run: bool,
+}
+
+pub const COMPLETION_LONG_ABOUT: &str = "\
+Print a shell completion script
+
+Writes a completion script for the shell named to stdout, generated from bd's
+command grammar: subcommands, flags and fixed values complete, issue ids do
+not. It needs no workspace and never reaches a bd server. Save the script
+where the shell loads completions from (see docs/install.md), and generate it
+again after upgrading bd.";
+
+const COMPLETION_EXAMPLES: &str = "\
+Examples:
+  bd completion bash
+  bd completion zsh";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = COMPLETION_EXAMPLES)]
+pub struct CompletionArgs {
+    /// Shell to print the script for
+    #[arg(value_enum)]
+    pub shell: ShellArg,
+}
+
+/// The shells `bd completion` writes scripts for.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+pub enum ShellArg {
+    /// Bash
+    Bash,
+    /// Zsh
+    Zsh,
+    /// Fish
+    Fish,
+    /// PowerShell
+    Powershell,
+    /// Elvish
+    Elvish,
+}
+
+impl ShellArg {
+    /// The generator clap_complete uses for this shell.
+    pub fn generator(self) -> clap_complete::Shell {
+        match self {
+            ShellArg::Bash => clap_complete::Shell::Bash,
+            ShellArg::Zsh => clap_complete::Shell::Zsh,
+            ShellArg::Fish => clap_complete::Shell::Fish,
+            ShellArg::Powershell => clap_complete::Shell::PowerShell,
+            ShellArg::Elvish => clap_complete::Shell::Elvish,
+        }
+    }
 }

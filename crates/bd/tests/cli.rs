@@ -154,6 +154,281 @@ fn show_list_and_short_ids() {
 }
 
 #[test]
+fn list_and_ready_time_filters() {
+    let ws = Ws::new();
+    let a = ws.id(&["create", "Alpha 50%", "-p", "2"]);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let b = ws.id(&["create", "Beta 50x", "-p", "1", "--due", "2020-01-01T00:00:00Z"]);
+    let c = ws.id(&["create", "Gamma", "-a", "bob"]);
+    ws.ok(&["close", &c]);
+    let since_b = ws.json(&["show", &b])["created_at"].as_str().unwrap().to_string();
+    let ids = |args: &[&str]| -> Vec<String> {
+        let mut ids: Vec<String> =
+            ws.json(args).as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(ids(&["list", "--created-after", &since_b]), [b.as_str()], "closed issues stay hidden");
+    assert_eq!(ids(&["list", "--created-after", &since_b, "--all"]), [b.as_str(), c.as_str()]);
+    assert_eq!(ids(&["list", "--created-before", &since_b]), [a.as_str()]);
+    let year_2000 = ["list", "--created-after", "2000-01-01T00:00:00Z", "--created-before", "2000-01-02T00:00:00Z"];
+    assert!(ids(&year_2000).is_empty());
+    assert_eq!(ids(&["list", "--created-after", "1h", "--updated-before", "+1h"]), [a.as_str(), b.as_str()]);
+    assert!(ids(&["list", "--updated-after", "+1h"]).is_empty());
+    // A closed bound alone lists closed issues, without --all.
+    assert_eq!(ids(&["list", "--closed-after", "2000-01-01"]), [c.as_str()]);
+    assert!(ids(&["list", "--closed-after", "1h", "--status", "open"]).is_empty());
+    assert!(ids(&["list", "--closed-before", "1h"]).is_empty());
+    assert_eq!(ids(&["list", "--overdue"]), [b.as_str()]);
+    assert!(ids(&["list", "--stale", "1h"]).is_empty());
+    assert_eq!(ids(&["list", "--title-contains", "50%"]), [a.as_str()]);
+    assert_eq!(ids(&["list", "--no-assignee", "--all"]), [a.as_str(), b.as_str()]);
+    assert_eq!(ids(&["list", "--no-assignee", "--all"]), ids(&["list", "--unassigned", "--all"]));
+    assert!(ws.ok(&["list", "--help"]).contains("--no-assignee"));
+    // ready keeps its queue order.
+    let queue =
+        |args: &[&str]| -> Vec<Value> { ws.json(args).as_array().unwrap().iter().map(|i| i["id"].clone()).collect() };
+    assert_eq!(queue(&["ready", "--created-after", "1h"]), [b.as_str(), a.as_str()]);
+    assert_eq!(queue(&["ready", "--created-before", &since_b]), [a.as_str()]);
+    assert_eq!(queue(&["ready", "--overdue"]), [b.as_str()]);
+    // Bad input names the flag and the value.
+    let out = ws.run_as("tester", &["list", "--created-after", "7x"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("--created-after") && err.contains("\"7x\""), "{err}");
+    assert_eq!(ws.code_as("tester", &["list", "--stale", "soon"]), 2);
+    assert_eq!(ws.code_as("tester", &["ready", "--closed-after", "1h"]), 2, "ready has no closed bounds");
+}
+
+#[test]
+fn query_filters_sorts_and_reports_positions() {
+    let ws = Ws::new();
+    let a = ws.id(&["create", "Alpha", "-p", "2"]);
+    let b = ws.id(&["create", "Beta", "-p", "1", "-l", "urgent"]);
+    let c = ws.id(&["create", "Gamma", "-p", "0"]);
+    ws.ok(&["close", &c]);
+    let d = ws.id(&["create", "Delta", "-p", "0", "--parent", &a]);
+    let ids = |args: &[&str]| -> Vec<String> {
+        let mut argv = vec!["query"];
+        argv.extend_from_slice(args);
+        ws.json(&argv).as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect()
+    };
+    // Priority order by default, and every status unless the expression says otherwise.
+    assert_eq!(ids(&["status = open AND priority <= 1"]), [d.as_str(), b.as_str()]);
+    assert_eq!(ids(&["priority = 0"]), [c.as_str(), d.as_str()]);
+    assert_eq!(ids(&["status != closed"]), [d.as_str(), b.as_str(), a.as_str()]);
+    assert_eq!(ids(&["label = urgent OR parent =", &a]), [d.as_str(), b.as_str()], "words are joined");
+    assert_eq!(ids(&["title ~ 'ALP' OR id = t-3*"]), [c.as_str(), a.as_str()]);
+    assert_eq!(ids(&["status != closed", "-n", "1"]), [d.as_str()]);
+    assert_eq!(ids(&["status != closed", "--sort", "id", "--reverse"]), [b.as_str(), d.as_str(), a.as_str()]);
+    // An unknown parent matches nothing, and is no error.
+    assert!(ids(&["parent = t-99"]).is_empty());
+    assert_eq!(ids(&["NOT parent = t-99"]).len(), 4);
+    // Text output nests children under their listed parents, like list.
+    let text = ws.ok(&["query", "status = open"]);
+    assert!(text.lines().any(|l| l.starts_with("  ") && l.contains(&d)), "{text}");
+    assert!(text.trim_end().ends_with("-- 3 issue(s)"), "{text}");
+    assert!(ws.ok(&["query", "parent = t-99"]).contains("No issues"));
+
+    // --parse-only reads no workspace.
+    let empty = tempfile::tempdir().unwrap();
+    let dir = empty.path().to_str().unwrap();
+    let parse_only = |args: &[&str]| -> Output {
+        let mut argv = vec!["-C", dir];
+        argv.extend_from_slice(args);
+        Ws::cmd_in(empty.path(), "tester", &argv).output().unwrap()
+    };
+    let out = parse_only(&["query", "--parse-only", "status = open and priority <= P1"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), r#"status = "open" AND priority <= "1""#);
+    let out = parse_only(&["query", "--parse-only", "NOT (title = x OR notes = y) AND type = z"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim_end(), r#"NOT (title = "x" OR notes = "y") AND type = "z""#);
+    let out = parse_only(&["--json", "query", "--parse-only", "status = open AND assignee = none"]);
+    let tree: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        tree,
+        serde_json::json!({"and": [
+            {"field": "status", "op": "=", "value": "open"},
+            {"field": "assignee", "op": "=", "value": null}
+        ]})
+    );
+    assert!(!empty.path().join(".bd").exists());
+
+    // Errors give the column, and a caret under it.
+    let out = ws.run_as("tester", &["query", "status = open AND bogus = 1"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("column 19") && err.contains("unknown field"), "{err}");
+    assert!(err.lines().any(|l| l == format!("  {}^", " ".repeat(18))), "{err}");
+    // A run of NOTs past the nesting limit is a positioned error, never one of SQLite.
+    let nots = format!("{}status = open", "NOT ".repeat(1000));
+    let out = ws.run_as("tester", &["query", &nots]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("column 129") && err.contains("nesting"), "{err}");
+    assert!(!err.to_lowercase().contains("sqlite") && !err.contains("Expression tree"), "{err}");
+    assert_eq!(ws.code_as("tester", &["query", "status = open", "--sort", "size"]), 2);
+}
+
+/// Epic progress counts the whole subtree; closing the eligible epics is all or none,
+/// and another actor's live claim needs --take-over, which --force never implies.
+#[test]
+fn epic_status_and_close_eligible() {
+    let ws = Ws::new();
+    let e1 = ws.id(&["create", "Epic one", "-t", "epic"]);
+    let a = ws.id(&["create", "A", "--parent", &e1]);
+    let a1 = ws.id(&["create", "A1", "--parent", &a]);
+    let a2 = ws.id(&["create", "A2", "--parent", &a]);
+    let b = ws.id(&["create", "B", "--parent", &e1]);
+    let blocker = ws.id(&["create", "Blocker"]);
+    ws.ok(&["dep", "add", &a2, &blocker]);
+    ws.json_as("worker", &["claim", &a1]);
+    ws.ok(&["close", &b]);
+
+    let status = ws.json(&["epic", "status", &e1]);
+    let counts: Vec<_> =
+        ["total", "closed", "open", "in_progress", "blocked"].iter().map(|k| status[k].as_i64().unwrap()).collect();
+    assert_eq!(counts, [4, 1, 2, 1, 1], "{status}");
+    assert_eq!(status["percent"], 25);
+    assert_eq!(status["close_eligible"], false);
+    assert_eq!(status["issue_type"], "epic");
+    // Any issue's subtree, and none without descendants.
+    assert_eq!(ws.json(&["epic", "status", &a])["total"], 2);
+    assert_eq!(ws.json(&["epic", "status", &b])["percent"], Value::Null);
+    let text = ws.ok(&["epic", "status"]);
+    assert!(text.contains(&format!("{e1} [epic] Epic one  1/4 closed (25%), 1 in progress, 1 blocked")), "{text}");
+
+    // Two eligible epics, one of them claimed by another actor.
+    let e2 = ws.id(&["create", "Epic two", "-t", "epic"]);
+    let c2 = ws.id(&["create", "C2", "--parent", &e2]);
+    let e3 = ws.id(&["create", "Epic three", "-t", "epic"]);
+    let c3 = ws.id(&["create", "C3", "--parent", &e3]);
+    ws.ok(&["close", &c2, &c3]);
+    ws.json_as("worker", &["claim", &e3]);
+    let listed = ws.json(&["epic", "close-eligible"]);
+    let ids: Vec<_> = listed.as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [e2.as_str(), e3.as_str()]);
+    assert_eq!(ws.json(&["epic", "status", &e2])["close_eligible"], true);
+    let all: Vec<_> = ws.json(&["epic", "status"]).as_array().unwrap().iter().map(|e| e["id"].clone()).collect();
+    assert_eq!(all, [Value::from(e1.as_str()), e2.as_str().into(), e3.as_str().into()]);
+
+    for args in [&["epic", "close-eligible", "--close"][..], &["epic", "close-eligible", "--close", "--force"]] {
+        let (code, err) = refusal(&ws, "coord", args);
+        assert_eq!(code, 4, "bd {args:?}: {err}");
+        assert!(err.contains(&e3) && err.contains("held by worker"), "{err}");
+        assert_eq!(ws.json(&["show", &e2])["status"], "open", "all or none");
+    }
+    let closed = ws.json_as("coord", &["epic", "close-eligible", "--close", "--take-over", "-r", "Done done"]);
+    let ids: Vec<_> = closed.as_array().unwrap().iter().map(|o| o["issue"]["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [e2.as_str(), e3.as_str()]);
+    assert_eq!(ws.json(&["show", &e2])["close_reason"], "Done done");
+    assert_eq!(ws.last_event("closed", &e3)["claim_override"]["holder"], "worker");
+    assert!(ws.json(&["epic", "close-eligible"]).as_array().unwrap().is_empty());
+    assert!(ws.ok(&["epic", "close-eligible", "--close"]).contains("No epics eligible to close"));
+    let shown: Vec<_> = ws.json(&["epic", "status"]).as_array().unwrap().iter().map(|e| e["id"].clone()).collect();
+    assert_eq!(shown, [Value::from(e1.as_str())], "closed epics only with --all");
+    assert_eq!(ws.json(&["epic", "status", "--all"]).as_array().unwrap().len(), 3);
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn children_and_stale_and_orphans() {
+    let ws = Ws::new();
+    let root = ws.id(&["create", "Root"]);
+    let kid = ws.id(&["create", "Kid", "--parent", &root]);
+    let grandkid = ws.id(&["create", "Grandkid", "--parent", &kid]);
+    let second = ws.id(&["create", "Second kid", "--parent", &root]);
+    ws.ok(&["close", &second]);
+    let ids = |args: &[&str]| -> Vec<String> {
+        ws.json(args).as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap().to_string()).collect()
+    };
+    assert_eq!(ids(&["children", &root]), [kid.as_str(), second.as_str()], "direct, closed ones too");
+    assert_eq!(ids(&["children", &root, "--recursive"]), [kid.as_str(), grandkid.as_str(), second.as_str()]);
+    let text = ws.ok(&["children", &root, "--recursive"]);
+    assert!(text.lines().any(|l| l.starts_with("  ") && l.contains(&grandkid)), "{text}");
+    assert!(text.trim_end().ends_with("-- 3 issue(s)"), "{text}");
+    assert!(ws.ok(&["children", &grandkid]).contains("No children"));
+    assert_eq!(ws.code_as("tester", &["children", "t-99"]), 3);
+
+    // Nothing is a month old; with --days 0 every open issue is.
+    assert!(ws.json(&["stale"]).as_array().unwrap().is_empty());
+    let stale = ws.json(&["stale", "--days", "0"]);
+    let rows = stale.as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{stale}");
+    assert!(rows.iter().all(|r| r["stale"] == true && r.get("lease_holder").is_none()), "{stale}");
+    assert_eq!(ids(&["stale", "--days", "0", "-n", "1"]), [root.as_str()], "least recently updated first");
+    assert!(ws.ok(&["stale", "--days", "0"]).contains("idle "));
+
+    // A reference to an issue that does not exist.
+    let talker = ws.id(&["create", "Talker", "-d", &format!("after {root} and t-99, see {kid}.")]);
+    let orphans = ws.json(&["orphans"]);
+    assert_eq!(
+        orphans,
+        serde_json::json!([{"id": talker, "title": "Talker", "references": [{"id": "t-99", "field": "description"}]}])
+    );
+    let text = ws.ok(&["orphans"]);
+    assert!(text.contains(&format!("{talker} Talker")) && text.contains("    → t-99 (description)"), "{text}");
+    assert!(ws.ok(&["orphans", "--prefix", "zz"]).contains("No dangling references"));
+    assert_eq!(ws.code_as("tester", &["orphans", "--prefix", "a b"]), 2);
+}
+
+#[test]
+fn graph_formats_and_output_file() {
+    let ws = Ws::new();
+    let a = ws.id(&["create", "First"]);
+    let b = ws.id(&["create", "Second", "--dep", &a]);
+    let c = ws.id(&["create", "Third \"quoted\"", "--dep", &b]);
+    let done = ws.id(&["create", "Done already"]);
+    ws.ok(&["close", &done]);
+
+    let text = ws.ok(&["graph", &b]);
+    assert_eq!(text.lines().next(), Some(format!("○ {a} [open P2] First").as_str()), "{text}");
+    assert!(text.contains(&format!("└─ [blocks] ○ {b} [open P2] Second (blocked)")), "{text}");
+    assert!(text.contains(&format!("   └─ [blocks] ○ {c} [open P2] Third \"quoted\" (blocked)")), "{text}");
+    assert!(text.trim_end().ends_with("-- 3 issues, 2 edges"), "{text}");
+
+    let out = ws.ok(&["graph", &a, "--format", "dot", "-o", "deps.dot"]);
+    assert!(out.contains("✓ Wrote graph (3 issues, 2 edges) to deps.dot"), "{out}");
+    let dot = std::fs::read_to_string(ws.dir.path().join("deps.dot")).unwrap();
+    assert!(dot.starts_with("digraph bd {"), "{dot}");
+    assert!(dot.contains(&format!("\"{a}\" -> \"{b}\" [label=\"blocks\"")), "{dot}");
+    assert!(dot.contains("Third \\\"quoted\\\""), "{dot}");
+    assert!(!ws.dir.path().join("deps.dot.tmp").exists());
+    let summary = ws.json(&["graph", &a, "--format", "html", "-o", "g.html"]);
+    assert_eq!(summary, serde_json::json!({"output": "g.html", "nodes": 3, "edges": 2, "truncated": false}));
+    let html = std::fs::read_to_string(ws.dir.path().join("g.html")).unwrap();
+    assert!(html.starts_with("<!doctype html>") && html.contains("<svg") && !html.contains("<script"));
+
+    let g = ws.json(&["graph", &c, "--max-nodes", "2"]);
+    assert_eq!(g["root"], c.as_str());
+    assert_eq!(g["max_nodes"], 2);
+    assert_eq!(g["truncated"], true);
+    assert_eq!(g["nodes"].as_array().unwrap().len(), 2);
+    assert_eq!(g["edges"], serde_json::json!([{"issue": c, "depends_on": b, "type": "blocks"}]));
+    assert!(ws.ok(&["graph", &c, "--max-nodes", "2"]).contains("-- truncated: only the first 2 issues"));
+
+    // --all: every open issue, closed ones left out.
+    let all = ws.json(&["graph", "--all"]);
+    assert_eq!(all["root"], Value::Null);
+    let ids: Vec<&str> = all["nodes"].as_array().unwrap().iter().map(|n| n["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [a.as_str(), b.as_str(), c.as_str()]);
+    assert_eq!(ws.json(&["graph", &b, "--edges", "parent-child"])["nodes"].as_array().unwrap().len(), 1);
+    assert_eq!(ws.json(&["graph", &b, "--edges", "all"])["edges"].as_array().unwrap().len(), 2);
+
+    // Refusals: neither id nor --all, both, an invalid edge type, a bound out of range, an unknown id.
+    let out = ws.run_as("tester", &["graph"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--all"));
+    assert_eq!(ws.code_as("tester", &["graph", &a, "--all"]), 2);
+    let out = ws.run_as("tester", &["graph", &a, "--edges", "blocks,Not A Type"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--edges"), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ws.code_as("tester", &["graph", &a, "--max-nodes", "0"]), 2);
+    assert_eq!(ws.code_as("tester", &["graph", &a, "--max-nodes", "2001"]), 2);
+    assert_eq!(ws.code_as("tester", &["graph", "t-99"]), 3);
+}
+
+#[test]
 fn list_nests_children_under_listed_parents() {
     let ws = Ws::new();
     let epic = ws.id(&["create", "Epic", "-t", "epic", "-p", "3"]);
@@ -173,6 +448,235 @@ fn list_nests_children_under_listed_parents() {
     assert_eq!(rows(&["list", "--search", "Child"]), [at(0, "t-1.1"), at(2, "t-1.1.1")]);
     let ids: Vec<Value> = ws.json(&["list"]).as_array().unwrap().iter().map(|i| i["id"].clone()).collect();
     assert_eq!(ids, ["t-2", "t-1.1", "t-1.1.1", "t-1"], "JSON keeps the sort order");
+}
+
+fn keys(v: &Value) -> Vec<String> {
+    let mut k: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+    k.sort();
+    k
+}
+
+#[test]
+fn brief_output_keeps_only_the_key_fields() {
+    let ws = Ws::new();
+    let epic = ws.id(&["create", "Epic", "-t", "epic", "-d", "Long epic text"]);
+    let child = ws.id(&["create", "Child task", "--parent", &epic, "-l", "ui,web", "-p", "1", "-d", "Do it"]);
+    let lone = ws.id(&["create", "Lone", "-p", "2"]);
+    ws.ok(&["update", &lone, "--assignee", "alice"]);
+    let base = ["id", "issue_type", "priority", "status", "title"];
+    let with = |extra: &[&str]| {
+        let mut k: Vec<String> = base.iter().chain(extra).map(|s| s.to_string()).collect();
+        k.sort();
+        k
+    };
+
+    let ready = ws.json(&["ready", "--brief"]);
+    let items = ready.as_array().unwrap();
+    let child_item = items.iter().find(|i| i["id"] == child.as_str()).unwrap();
+    assert_eq!(keys(child_item), with(&["labels", "parent"]));
+    assert_eq!(child_item["parent"], epic.as_str());
+    let lone_item = items.iter().find(|i| i["id"] == lone.as_str()).unwrap();
+    assert_eq!(keys(lone_item), with(&["assignee"]));
+
+    let list = ws.json(&["list", "--brief"]);
+    let epic_item = list.as_array().unwrap().iter().find(|i| i["id"] == epic.as_str()).unwrap();
+    assert_eq!(keys(epic_item), with(&[]), "no description, metadata or timestamps");
+    assert_eq!(list.as_array().unwrap().len(), 3);
+
+    let shown = ws.json(&["show", &child, "--brief"]);
+    assert_eq!(keys(&shown), with(&["comments_total", "description", "labels", "parent"]));
+    assert_eq!(shown["description"], "Do it");
+
+    // Blockers by id, a cut description.
+    let long = "x".repeat(600);
+    let blocked = ws.id(&["create", "Blocked", "-d", &long, "--dep", &lone]);
+    let shown = ws.json(&["show", &blocked, "--brief"]);
+    assert_eq!(shown["blockers"], serde_json::json!([lone]));
+    assert_eq!(shown["description_truncated"], true);
+    assert_eq!(shown["description"].as_str().unwrap().chars().count(), 501);
+
+    // Text: one line per issue, the title last.
+    let text = ws.ok(&["list", "--brief"]);
+    assert!(text.lines().any(|l| l == format!("{child} P1 task open parent:{epic} [ui,web] — Child task")), "{text}");
+    assert!(text.lines().any(|l| l == format!("{lone} P2 task open @alice — Lone")), "{text}");
+    let text = ws.ok(&["ready", "--brief"]);
+    assert!(text.contains(&format!("{child} P1 task open parent:{epic} [ui,web] — Child task")), "{text}");
+    let text = ws.ok(&["show", &blocked, "--brief"]);
+    assert!(text.starts_with(&format!("{blocked} P2 task open — Blocked\n  blocked by: {lone}\n")), "{text}");
+}
+
+#[test]
+fn show_keeps_the_last_comments() {
+    let ws = Ws::new();
+    let id = ws.id(&["create", "Talked about"]);
+    for n in 1..=5 {
+        ws.ok(&["comment", "add", &id, &format!("note {n}")]);
+    }
+    let texts = |v: &Value| -> Vec<String> {
+        v["comments"]
+            .as_array()
+            .map(|a| a.iter().map(|c| c["text"].as_str().unwrap().to_string()).collect())
+            .unwrap_or_default()
+    };
+    let brief = ws.json(&["show", &id, "--brief"]);
+    assert_eq!(texts(&brief), ["note 3", "note 4", "note 5"]);
+    assert_eq!(brief["comments_total"], 5);
+    let one = ws.json(&["show", &id, "--comments-tail", "1"]);
+    assert_eq!(texts(&one), ["note 5"]);
+    assert_eq!(one["comments_total"], 5);
+    assert!(one.get("description").is_some(), "the full issue otherwise");
+    let none = ws.json(&["show", &id, "--comments-tail", "0"]);
+    assert!(texts(&none).is_empty());
+    assert_eq!(none["comments_total"], 5);
+    let brief_none = ws.json(&["show", &id, "--brief", "--comments-tail", "0"]);
+    assert!(brief_none.get("comments").is_none());
+    let all = ws.json(&["show", &id]);
+    assert_eq!(texts(&all).len(), 5);
+    assert!(all.get("comments_total").is_none(), "plain show keeps its shape");
+
+    let text = ws.ok(&["show", &id, "--comments-tail", "2"]);
+    assert!(text.contains("Comments (2 of 5):") && !text.contains("note 3") && text.contains("note 4"), "{text}");
+    let text = ws.ok(&["show", &id]);
+    assert!(text.contains("Comments (5):"), "{text}");
+    let text = ws.ok(&["show", &id, "--brief"]);
+    assert!(text.contains("Comments (3 of 5):") && text.contains("note 5"), "{text}");
+}
+
+#[test]
+fn ready_says_when_it_cut_the_list() {
+    let ws = Ws::new();
+    for n in 1..=3 {
+        ws.id(&["create", &format!("Task {n}")]);
+    }
+    let footer = "-- more ready issues not shown: raise -n (-n 0 for all)";
+    let text = ws.ok(&["ready", "-n", "2"]);
+    assert_eq!(text.lines().last(), Some(footer), "{text}");
+    assert!(text.contains("Ready work (2 shown"), "{text}");
+    let text = ws.ok(&["ready", "-n", "3"]);
+    assert!(!text.contains("more ready issues"), "{text}");
+    let text = ws.ok(&["ready", "-n", "0"]);
+    assert!(!text.contains("more ready issues") && text.contains("(3 shown"), "{text}");
+    assert_eq!(ws.json(&["ready", "-n", "2"]).as_array().unwrap().len(), 2);
+    assert_eq!(ws.json(&["ready", "-n", "2", "--brief"]).as_array().unwrap().len(), 2);
+    assert_eq!(ws.ok(&["-q", "ready", "-n", "2"]).lines().count(), 2);
+}
+
+/// The `kind`s of an explained issue's reasons.
+fn reason_kinds(item: &Value) -> Vec<String> {
+    item["reasons"].as_array().unwrap().iter().map(|r| r["kind"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn ready_explain_lists_what_is_not_ready_and_why() {
+    let ws = Ws::new();
+    let parent = ws.id(&["create", "Parent", "-p", "1"]);
+    let child = ws.id(&["create", "Child", "--parent", &parent, "-p", "3"]);
+    let blocker = ws.id(&["create", "Blocker", "-p", "2"]);
+    let blocked = ws.id(&["create", "Blocked", "--dep", &blocker, "-p", "0"]);
+    let deferred = ws.id(&["create", "Later", "--defer", "+2d", "-p", "2"]);
+    ws.id(&["create", "Epic", "-t", "epic"]);
+
+    let v = ws.json(&["ready", "--explain"]);
+    assert_eq!(keys(&v), ["more_not_ready", "more_ready", "not_ready", "ready", "sort"]);
+    assert_eq!(v["sort"], "priority");
+    assert_eq!((v["more_ready"].as_bool(), v["more_not_ready"].as_bool()), (Some(false), Some(false)));
+    let ready = v["ready"].as_array().unwrap();
+    let ids: Vec<&str> = ready.iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [blocker.as_str(), child.as_str()], "queue order");
+    assert_eq!(ready[0]["rank"], 1);
+    assert!(ready[0]["order"].as_str().unwrap().starts_with("P2, created "), "{}", ready[0]);
+    assert_eq!(ready[1]["parent"], parent.as_str(), "brief fields");
+    assert!(ready[0].get("description").is_none());
+
+    // Open issues the queue leaves out, epics not among them (ready's own rules).
+    let not_ready = v["not_ready"].as_array().unwrap();
+    let ids: Vec<&str> = not_ready.iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [blocked.as_str(), parent.as_str(), deferred.as_str()], "by priority");
+    assert_eq!(reason_kinds(&not_ready[0]), ["blocked"]);
+    assert_eq!(not_ready[0]["reasons"][0]["id"], blocker.as_str());
+    assert_eq!(not_ready[0]["reasons"][0]["via"], "blocks");
+    assert_eq!(reason_kinds(&not_ready[1]), ["waits_on_children"]);
+    assert_eq!(not_ready[1]["reasons"][0]["children"][0]["id"], child.as_str());
+    assert_eq!(reason_kinds(&not_ready[2]), ["deferred"]);
+    assert!(not_ready[2]["reasons"][0]["until"].is_string());
+    // --include-deferred counts deferral as no reason, so the deferred issue is ready.
+    let v = ws.json(&["ready", "--explain", "--include-deferred"]);
+    assert!(v["ready"].as_array().unwrap().iter().any(|i| i["id"] == deferred.as_str()));
+    assert!(!v["not_ready"].as_array().unwrap().iter().any(|i| i["id"] == deferred.as_str()));
+
+    // -n bounds each list.
+    let v = ws.json(&["ready", "--explain", "-n", "1"]);
+    assert_eq!(v["ready"].as_array().unwrap().len(), 1);
+    assert_eq!(v["not_ready"].as_array().unwrap().len(), 1);
+    assert_eq!((v["more_ready"].as_bool(), v["more_not_ready"].as_bool()), (Some(true), Some(true)));
+
+    // Text: both sections, an order key under each ready issue, reasons under the rest.
+    let text = ws.ok(&["ready", "--explain"]);
+    assert!(text.starts_with("Ready work (2 shown, queue order):\n"), "{text}");
+    assert!(text.contains(&format!("  1. {blocker} P2 task open — Blocker\n       order: P2, created ")), "{text}");
+    assert!(text.contains("Not ready (3 shown):\n"), "{text}");
+    assert!(
+        text.contains(&format!("  {blocked} P0 task open — Blocked\n    - blocked by {blocker} (blocker is open)\n")),
+        "{text}"
+    );
+    assert!(text.contains("    - its children come first"), "{text}");
+    let text = ws.ok(&["ready", "--explain", "-n", "1"]);
+    assert!(text.contains("-- more ready issues not shown"), "{text}");
+    assert!(text.ends_with("-- more issues that are not ready not shown: raise -n (-n 0 for all)\n"), "{text}");
+    // Quiet: the ready ids only.
+    assert_eq!(ws.ok(&["-q", "ready", "--explain"]), format!("{blocker}\n{child}\n"));
+}
+
+#[test]
+fn show_why_says_whether_an_issue_is_ready() {
+    let ws = Ws::new();
+    let open = ws.id(&["create", "Open"]);
+    let claimed = ws.id(&["create", "Claimed"]);
+    let epic = ws.id(&["create", "Epic", "-t", "epic"]);
+    let closed = ws.id(&["create", "Closed"]);
+    let blocked = ws.id(&["create", "Blocked", "--dep", &open]);
+    ws.ok(&["claim", &claimed]);
+    ws.ok(&["close", &closed, "-r", "done"]);
+
+    let v = ws.json(&["show", &open, "--why"]);
+    assert_eq!(v["why"], serde_json::json!({"ready": true, "reasons": []}));
+    assert_eq!(v["title"], "Open", "the full show object");
+    assert!(ws.json(&["show", &open]).get("why").is_none(), "only with --why");
+
+    let v = ws.json(&["show", &claimed, "--why"]);
+    assert_eq!(v["why"]["ready"], false);
+    assert_eq!(reason_kinds(&v["why"]), ["status", "claimed"]);
+    assert_eq!(v["why"]["reasons"][0]["status"], "in_progress");
+    assert_eq!(v["why"]["reasons"][1]["holder"], "tester");
+    assert_eq!(v["why"]["reasons"][1]["live"], true);
+    assert!(v["why"]["reasons"][1].get("token").is_none(), "never the lease token");
+
+    let v = ws.json(&["show", &epic, "--why", "--brief"]);
+    assert_eq!(reason_kinds(&v["why"]), ["excluded_type"]);
+    assert_eq!(v["why"]["reasons"][0]["issue_type"], "epic");
+    assert!(v.get("design").is_none(), "the brief object");
+
+    let v = ws.json(&["show", &closed, "--why"]);
+    assert_eq!(reason_kinds(&v["why"]), ["status"]);
+    assert_eq!(v["why"]["reasons"][0]["status"], "closed");
+
+    // Several ids: one why each.
+    let v = ws.json(&["show", &open, &closed, "--why"]);
+    assert_eq!(v[0]["why"]["ready"], true);
+    assert_eq!(v[1]["why"]["ready"], false);
+
+    // Text: after the status lines, or at the end of the brief form.
+    let text = ws.ok(&["show", &open, "--why"]);
+    assert!(text.contains("\n  Ready: yes\n"), "{text}");
+    let text = ws.ok(&["show", &blocked, "--why"]);
+    let why = format!("\n  Not ready:\n    - blocked by {open} (blocker is open)\n");
+    assert!(text.contains(&why), "{text}");
+    assert!(text.find(&why) < text.find("Blocked by:"), "{text}");
+    let text = ws.ok(&["show", &claimed, "--why", "--brief"]);
+    assert!(
+        text.contains("\n\nNot ready:\n  - status is in_progress\n  - claimed by tester (lease expires "),
+        "{text}"
+    );
 }
 
 #[test]
@@ -757,6 +1261,40 @@ fn export_import_round_trip_via_cli() {
 }
 
 #[test]
+fn import_dry_run_reports_what_happens_to_each_beads_field() {
+    let ws = Ws::new();
+    let beads = [
+        r#"{"id":"t-1","title":"A","status":"open","priority":2,"issue_type":"task","owner":"a@example.com","spec_id":"s1","dependency_count":0}"#,
+        r#"{"id":"t-2","title":"B","status":"open","priority":2,"issue_type":"task","owner":"b@example.com","dependency_count":1}"#,
+        r#"{"id":"t-3","title":"Gone","status":"tombstone","priority":2,"issue_type":"task"}"#,
+    ]
+    .join("\n");
+    let file = ws.dir.path().join("beads.jsonl");
+    std::fs::write(&file, beads).unwrap();
+    let file = file.to_str().unwrap();
+
+    let text = ws.ok(&["import", file, "--dry-run"]);
+    assert!(text.contains("Dry run: would import 2 new"), "{text}");
+    assert!(text.contains("  fields kept in metadata.beads: owner 2, spec_id 1\n"), "{text}");
+    assert!(text.contains("  fields mapped: "), "{text}");
+    let dropped = text.lines().find(|l| l.starts_with("  fields dropped: ")).expect(&text);
+    assert!(dropped.contains("dependency_count 2") && dropped.contains("id 1"), "{text}");
+
+    let summary = ws.json(&["import", file, "--dry-run"]);
+    assert_eq!(summary["fields"]["owner"]["kept"], 2);
+    assert_eq!(summary["fields"]["spec_id"]["kept"], 1);
+    assert_eq!(summary["fields"]["title"]["mapped"], 2);
+    assert_eq!(summary["fields"]["dependency_count"]["dropped"], 2);
+
+    assert_eq!(ws.json(&["list", "--all"]).as_array().unwrap().len(), 0, "dry run imports nothing");
+
+    // A real import keeps the one-line text.
+    let real = ws.ok(&["import", file]);
+    assert!(!real.contains("fields "), "{real}");
+    assert_eq!(ws.json(&["show", "t-1"])["metadata"]["beads"]["owner"], "a@example.com");
+}
+
+#[test]
 fn backups_are_self_contained_copies_kept_by_count() {
     let ws = Ws::new();
     ws.ok(&["create", "Backed up"]);
@@ -828,6 +1366,32 @@ fn prime_is_silent_outside_a_workspace() {
     assert!(out.stdout.is_empty());
     let out = Ws::cmd_in(dir.path(), "x", &["ready"]).output().unwrap();
     assert_eq!(out.status.code(), Some(3));
+}
+
+#[test]
+fn completion_scripts_need_no_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let out = Ws::cmd_in(dir.path(), "x", &["completion", shell]).output().unwrap();
+        assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+        let script = String::from_utf8(out.stdout).unwrap();
+        assert!(!script.trim().is_empty(), "{shell}: empty script");
+        assert!(script.contains("claim"), "{shell}: subcommands complete");
+        match shell {
+            "bash" => assert!(script.contains("complete"), "{script}"),
+            "zsh" => assert!(script.starts_with("#compdef bd"), "{script}"),
+            _ => {}
+        }
+    }
+    assert!(!dir.path().join(".bd").exists(), "no workspace created");
+    let out = Ws::cmd_in(dir.path(), "x", &["completion", "tcsh"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    // Machine-local: a remote workspace (here unreachable) is never asked.
+    std::fs::create_dir_all(dir.path().join(".bd")).unwrap();
+    std::fs::write(dir.path().join(".bd/remote.toml"), "url = \"https://127.0.0.1:9/w/proj\"\n").unwrap();
+    let out = Ws::cmd_in(dir.path(), "x", &["completion", "bash"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!out.stdout.is_empty());
 }
 
 #[test]
@@ -3435,4 +3999,1397 @@ fn rename_prefix_moves_ids_claims_and_references() {
     assert_eq!(ws.ok(&["config", "get", "issue_prefix"]).trim(), "q");
     ws.ok(&["show", "q-1"]);
     ws.ok(&["show", &q]);
+}
+
+impl Ws {
+    fn with_stdin(&self, args: &[&str], input: &str) -> Output {
+        let mut c = Ws::cmd_in(self.dir.path(), "tester", args);
+        c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+        let mut child = c.spawn().unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    }
+
+    /// The seq of the last event of `id` with `op`.
+    fn seq_of(&self, id: &str, op: &str) -> i64 {
+        let history = self.json(&["history", id]);
+        let e = history.as_array().unwrap().iter().rev().find(|e| e["op"] == op);
+        e.unwrap_or_else(|| panic!("no {op} event of {id}: {history}"))["seq"].as_i64().unwrap()
+    }
+
+    /// The JSON error of a failing command, and its exit code.
+    fn json_error(&self, args: &[&str]) -> (i32, Value) {
+        let mut a = vec!["--json"];
+        a.extend_from_slice(args);
+        let out = self.run_as("tester", &a);
+        let err: Value = serde_json::from_slice(&out.stderr)
+            .unwrap_or_else(|_| panic!("bd {args:?}: {}", String::from_utf8_lossy(&out.stderr)));
+        (out.status.code().unwrap(), err["error"].clone())
+    }
+}
+
+#[test]
+fn show_as_of_seq_time_and_deleted() {
+    let ws = Ws::new();
+    let created = ws.json(&["create", "Work", "-d", "first", "-l", "a"]);
+    let created_at = created["created_at"].as_str().unwrap().to_string();
+    ws.ok(&["update", "t-1", "-d", "second", "--add-label", "b", "-p", "1"]);
+    let first = ws.seq_of("t-1", "created");
+    let updated = ws.seq_of("t-1", "updated");
+
+    let then = ws.json(&["show", "t-1", "--as-of", &format!("#{first}")]);
+    assert_eq!((then["exists"].as_bool(), then["fields"]["description"].as_str()), (Some(true), Some("first")));
+    assert_eq!(then["labels"], serde_json::json!(["a"]));
+    assert_eq!(then["unknown"], serde_json::json!([]));
+    assert_eq!(then["retained_from"]["seq"], 1);
+    let now = ws.json(&["show", "t-1", "--as-of", &updated.to_string()]);
+    assert_eq!((now["fields"]["description"].as_str(), now["fields"]["priority"].as_i64()), (Some("second"), Some(1)));
+    // A time: at the creation, and a second before it.
+    let at_creation = ws.json(&["show", "t-1", "--as-of", &created_at]);
+    assert_eq!(at_creation["fields"]["title"], "Work");
+    let before = bd_time(&created_at, -1000);
+    let not_yet = ws.json(&["show", "t-1", "--as-of", &before]);
+    assert_eq!((not_yet["exists"].as_bool(), not_yet["created"]["seq"].as_i64()), (Some(false), Some(first)));
+    let text = ws.ok(&["show", "t-1", "--as-of", &format!("#{first}")]);
+    assert!(text.contains(&format!("t-1 as of #{first}")) && text.contains("Description:\n  first"), "{text}");
+    assert!(ws.ok(&["show", "t-1", "--as-of", "#1"]).contains("did not exist yet (created #"));
+    assert!(ws.json(&["show", "t-1", "--as-of", "-1h"])["exists"] == false);
+
+    // A deleted issue: as it was, then gone.
+    ws.ok(&["create", "Gone"]);
+    let before_delete = ws.seq_of("t-2", "created");
+    ws.ok(&["delete", "t-2"]);
+    assert_eq!(ws.json(&["show", "t-2", "--as-of", &before_delete.to_string()])["fields"]["title"], "Gone");
+    let gone = ws.ok(&["show", "t-2", "--as-of", &ws.seq_of("t-2", "deleted").to_string()]);
+    assert!(gone.contains("deleted at #"), "{gone}");
+    // Several at once.
+    let both = ws.json(&["show", "t-1", "t-2", "--as-of", &before_delete.to_string()]);
+    assert_eq!(both.as_array().unwrap().len(), 2);
+    assert_eq!(ws.code_as("tester", &["show", "t-404", "--as-of", "#1"]), 3);
+    assert_eq!(ws.code_as("tester", &["show", "t-1", "--as-of", "#x"]), 2);
+
+    // Before what retention kept.
+    ws.ok(&["events", "prune", "--before", &(updated + 1).to_string()]);
+    let (code, err) = ws.json_error(&["show", "t-1", "--as-of", &format!("#{first}")]);
+    assert_eq!((code, err["code"].as_str()), (6, Some("history_pruned")), "{err}");
+    let out = ws.run_as("tester", &["show", "t-1", "--as-of", &before]);
+    assert_eq!(out.status.code(), Some(6));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--as-of"), "the hint names the flag");
+    // The state just before the oldest event kept is still known.
+    let floor_minus_one = ws.json(&["show", "t-1", "--as-of", &updated.to_string()]);
+    assert_eq!(floor_minus_one["fields"]["description"], "second");
+}
+
+/// `t` (RFC 3339) moved by `ms` milliseconds, in RFC 3339.
+fn bd_time(t: &str, ms: i64) -> String {
+    let parsed = chrono::DateTime::parse_from_rfc3339(t).unwrap() + chrono::Duration::milliseconds(ms);
+    parsed.with_timezone(&chrono::Utc).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+#[test]
+fn history_diff_prints_field_changes() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Work", "-d", "keep\nold line\ntail"]);
+    ws.ok(&["update", "t-1", "-d", "keep\nnew line\ntail", "-p", "1", "--add-label", "x"]);
+    let plain = ws.ok(&["history", "t-1"]);
+    assert!(!plain.contains("-old line"), "{plain}");
+    let diff = ws.ok(&["history", "t-1", "--diff"]);
+    for line in ["    description:", "      -old line", "      +new line", "    priority: 2 -> 1", "    labels: +x"] {
+        assert!(diff.lines().any(|l| l == line), "{line:?} in {diff}");
+    }
+    assert!(!diff.contains("keep"), "common lines are left out: {diff}");
+    assert_eq!(ws.json(&["history", "t-1", "--diff"]), ws.json(&["history", "t-1"]), "JSON is the events");
+}
+
+#[test]
+fn compact_analyze_apply_stats_end_to_end() {
+    let ws = Ws::new();
+    let long = "A long description of the work, with the reasons it was done this way.";
+    for title in ["Old", "Other"] {
+        ws.ok(&["create", title, "-d", long, "--notes", "Notes from the work"]);
+    }
+    ws.ok(&["create", "Open", "-d", long]);
+    ws.ok(&["create", "Scratch", "-d", long, "--ephemeral"]);
+    for id in ["t-1", "t-2", "t-4"] {
+        ws.ok(&["close", id]);
+    }
+    let created_at = ws.json(&["show", "t-1"])["created_at"].as_str().unwrap().to_string();
+
+    let candidates = ws.json(&["compact", "--analyze", "--older-than", "0s"]);
+    let ids: Vec<&str> = candidates.as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["t-1", "t-2"], "closed, persistent, with text");
+    assert_eq!(candidates[0]["description"], long);
+    let rev = candidates[0]["revision"].as_i64().unwrap().to_string();
+    assert_eq!(ws.json(&["compact", "--analyze", "--older-than", "0s", "-n", "1"]).as_array().unwrap().len(), 1);
+    assert_eq!(ws.json(&["compact", "--analyze"]), serde_json::json!([]), "none closed 30 days ago");
+    let text = ws.ok(&["compact", "--analyze", "--older-than", "0s"]);
+    assert!(text.contains(&format!("bd compact --apply t-1 --if-revision {rev} --summary -")), "{text}");
+
+    // Refusals: an open issue, a stale revision, no revision.
+    assert_eq!(ws.code_as("tester", &["compact", "--apply", "t-3", "--if-revision", "1", "--summary", "x"]), 2);
+    assert_eq!(ws.code_as("tester", &["compact", "--apply", "t-1", "--if-revision", "1", "--summary", "x"]), 13);
+    assert_eq!(ws.code_as("tester", &["compact", "--apply", "t-1", "--summary", "x"]), 2);
+    assert_eq!(ws.code_as("tester", &["compact", "--stats", "--apply", "t-1"]), 2, "one mode");
+
+    // From stdin, and from a file.
+    let out =
+        ws.with_stdin(&["--json", "compact", "--apply", "t-1", "--if-revision", &rev, "--summary", "-"], "Did it.\n");
+    let applied = json_of(out);
+    assert_eq!((applied["level"].as_i64(), applied["size"].as_i64()), (Some(1), Some(7)));
+    assert_eq!(applied["issue"]["description"], "Did it.");
+    std::fs::write(ws.dir.path().join("summary.md"), "Did the other.").unwrap();
+    let rev2 = ws.json(&["show", "t-2"])["revision"].as_i64().unwrap().to_string();
+    ws.ok(&["compact", "--apply", "t-2", "--if-revision", &rev2, "--summary", "@summary.md"]);
+    assert_eq!(ws.json(&["show", "t-2"])["description"], "Did the other.");
+    let shown = ws.ok(&["show", "t-1"]);
+    assert!(shown.contains("compacted: level 1"), "{shown}");
+
+    let stats = ws.json(&["compact", "--stats"]);
+    assert_eq!((stats["closed"].as_i64(), stats["compacted"].as_i64()), (Some(3), Some(2)));
+    assert_eq!(stats["by_level"]["1"], 2);
+    let diff = ws.ok(&["history", "t-1", "--diff"]);
+    assert!(diff.contains(&format!("      -{long}")) && diff.contains("      +Did it."), "{diff}");
+
+    // As of just before the compaction: the original text.
+    let compacted = ws.seq_of("t-1", "compacted");
+    let before = (compacted - 1).to_string();
+    assert_eq!(ws.json(&["show", "t-1", "--as-of", &before])["fields"]["description"], long);
+    // Everything older pruned: still there at that seq, but a time before the compaction is before retention.
+    ws.ok(&["events", "prune", "--before", &compacted.to_string()]);
+    let then = ws.json(&["show", "t-1", "--as-of", &before]);
+    assert_eq!(
+        (then["fields"]["description"].as_str(), then["fields"]["notes"].as_str()),
+        (Some(long), Some("Notes from the work"))
+    );
+    let (code, err) = ws.json_error(&["show", "t-1", "--as-of", &bd_time(&created_at, -1000)]);
+    assert_eq!((code, err["code"].as_str()), (6, Some("history_pruned")), "{err}");
+}
+
+#[test]
+fn close_claims_the_next_issue_siblings_first() {
+    let ws = Ws::new();
+    let parent = ws.id(&["create", "Parent", "-p", "2"]);
+    let a = ws.id(&["create", "A", "--parent", &parent]);
+    let b = ws.id(&["create", "B", "--parent", &parent]);
+    let z = ws.id(&["create", "Urgent elsewhere", "-p", "0"]);
+    let token = ws.json(&["claim", &a])["lease"]["token"].as_i64().unwrap().to_string();
+
+    // Siblings first, over a higher-priority issue elsewhere.
+    let v = ws.json(&["close", &a, "--token", &token, "-r", "done", "--claim-next"]);
+    assert_eq!(keys(&v), ["closed", "next"]);
+    assert_eq!(v["closed"]["issue"]["id"], a.as_str());
+    assert_eq!(v["next"]["from"], "siblings");
+    assert_eq!(v["next"]["parent"], parent.as_str());
+    assert_eq!(v["next"]["issue"]["id"], b.as_str());
+    assert_eq!(v["next"]["issue"]["status"], "in_progress");
+    let next = v["next"]["lease"]["token"].as_i64().unwrap().to_string();
+    ws.ok(&["heartbeat", &b, "--token", &next]);
+
+    // Nothing left ready under the parent: the queue, in text.
+    let text = ws.ok(&["close", &b, "--token", &next, "-r", "done", "--claim-next", "--ttl", "10m"]);
+    assert!(text.contains(&format!("✓ Closed {b}: B")), "{text}");
+    assert!(text.contains("→ Next (from the queue):"), "{text}");
+    assert!(text.contains(&format!("✓ Claimed {z} as tester")), "{text}");
+    let lease = ws.json(&["show", &z])["lease"]["token"].as_i64().unwrap();
+    assert!(text.contains(&format!("lease token {lease},")), "{text}");
+    assert_eq!(ws.code_as("tester", &["heartbeat", &z, "--token", &lease.to_string()]), 0);
+
+    // Sent again after it closed, it claims nothing more.
+    let again = ws.json(&["close", &b, "--claim-next"]);
+    assert!(again["next"].is_null(), "{again}");
+    assert_eq!(again["next_note"], "nothing closed: not claiming");
+    assert!(ws.ok(&["close", &b, "--claim-next"]).contains("No issue closed: not claiming next"));
+    assert_eq!(ws.json(&["leases"]).as_array().unwrap().len(), 1, "only the claim of z");
+
+    // --suggest-next names the issue and leaves it alone.
+    let v = ws.json(&["close", &z, "--token", &lease.to_string(), "--suggest-next", "--sort", "oldest"]);
+    assert_eq!(v["next"]["from"], "queue");
+    assert!(v["next"].get("lease").is_none(), "{v}");
+    let suggested = v["next"]["issue"]["id"].as_str().unwrap().to_string();
+    assert_eq!(suggested, parent, "the parent, ready once its children closed");
+    let shown = ws.json(&["show", &suggested]);
+    assert_eq!(shown["status"], "open");
+    assert!(shown["assignee"].is_null() && shown["lease"].is_null(), "{shown}");
+    assert!(ws.json(&["leases"]).as_array().unwrap().is_empty());
+    let c = ws.id(&["create", "C"]);
+    let text = ws.ok(&["close", &c, "--suggest-next"]);
+    assert!(text.contains("→ Suggested next (from the queue): "), "{text}");
+    assert!(text.contains(&format!("(bd claim {parent})")), "{text}");
+
+    // An explicit --parent searches only there.
+    let other = ws.id(&["create", "Other parent"]);
+    let d = ws.id(&["create", "D"]);
+    let v = ws.json(&["close", &d, "--claim-next", "--parent", &other]);
+    assert!(v["next"].is_null(), "{v}");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn close_claim_next_refuses_what_makes_no_sense() {
+    let ws = Ws::new();
+    let a = ws.id(&["create", "A"]);
+    for args in [
+        &["close", &a, "--claim-next", "--suggest-next"][..],
+        &["close", &a, "-l", "backend"],
+        &["close", &a, "--sort", "oldest"],
+        &["close", &a, "--unassigned"],
+        &["close", &a, "-t", "bug"],
+        &["close", &a, "--parent", &a],
+        &["close", &a, "-a", "ann"],
+        &["close", &a, "--ttl", "5m"],
+        &["close", &a, "--suggest-next", "--ttl", "5m"],
+    ] {
+        assert_eq!(ws.code_as("tester", args), 2, "{args:?}");
+    }
+    assert_eq!(ws.json(&["show", &a])["status"], "open", "nothing closed");
+
+    // Another actor's live claim: refused (exit 4), and nothing is claimed.
+    ws.id(&["create", "B"]);
+    ws.json_as("ann", &["claim", &a]);
+    assert_eq!(ws.code_as("tester", &["close", &a, "--claim-next"]), 4);
+    let leases = ws.json(&["leases"]);
+    assert_eq!(leases.as_array().unwrap().len(), 1, "{leases}");
+    assert_eq!(ws.json(&["show", &a])["assignee"], "ann");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn close_claim_next_in_a_batch() {
+    let ws = Ws::new();
+    let next = ws.id(&["create", "Next"]);
+    let out = ws.batch_as("tester", "create \"First\"\nclose $1 -r done --claim-next\n");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ws.json(&["show", &next])["assignee"], "tester");
+    ws.ok(&["release", &next]);
+
+    // A later line failing rolls back the close and the claim.
+    let out = ws.batch_as("tester", "create \"Second\"\nclose $1 --claim-next\nclose t-999\n");
+    assert_eq!(out.status.code(), Some(3));
+    assert!(ws.json(&["list", "--search", "Second"]).as_array().unwrap().is_empty(), "rolled back");
+    let shown = ws.json(&["show", &next]);
+    assert_eq!(shown["status"], "open");
+    assert!(shown["assignee"].is_null() && shown["lease"].is_null(), "{shown}");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn prime_mentions_claim_next() {
+    let ws = Ws::new();
+    assert!(ws.ok(&["prime"]).contains("--claim-next"));
+}
+
+/// The sequence number of the newest event.
+fn event_head(ws: &Ws) -> i64 {
+    let out = ws.ok(&["--json", "events", "-n", "1"]);
+    let last = out.lines().last().expect("an event");
+    serde_json::from_str::<Value>(last).unwrap()["seq"].as_i64().unwrap()
+}
+
+#[test]
+fn duplicate_and_supersede_close_with_an_edge_in_one_transaction() {
+    let ws = Ws::new();
+    for t in ["Canonical", "Repeat", "Old", "New"] {
+        ws.ok(&["create", t]);
+    }
+
+    let out = ws.json(&["duplicate", "t-2", "--of", "t-1"]);
+    assert_eq!(out["already"], false);
+    assert_eq!(out["type"], "duplicates");
+    assert_eq!(out["issue"]["status"], "closed");
+    assert_eq!(out["issue"]["close_reason"], "duplicate of t-1");
+    assert_eq!(out["issue"]["close_outcome"], "done");
+    let deps = ws.json(&["dep", "list", "t-2", "--direction", "down"]);
+    let edge = &deps["dependencies"][0];
+    assert_eq!((edge["id"].as_str(), edge["type"].as_str()), (Some("t-1"), Some("duplicates")), "{deps}");
+    let added = ws.last_event("dep_added", "t-2");
+    assert_eq!(added["target"], "t-1", "{added}");
+    // The target is untouched.
+    let canonical = ws.json(&["show", "t-1"]);
+    assert_eq!(canonical["status"], "open");
+    assert_eq!(canonical["revision"], 1);
+
+    let text = ws.ok(&["supersede", "t-3", "--with", "t-4"]);
+    assert!(text.contains("Closed t-3 as superseded by t-4"), "{text}");
+    let old = ws.json(&["show", "t-3"]);
+    assert_eq!(old["close_reason"], "superseded by t-4");
+    let deps = ws.json(&["dep", "list", "t-3", "--direction", "down"]);
+    assert_eq!(deps["dependencies"][0]["type"], "supersedes");
+    assert_eq!(deps["dependencies"][0]["id"], "t-4");
+
+    // The same command again changes nothing.
+    let before = event_head(&ws);
+    let again = ws.ok(&["duplicate", "t-2", "--of", "t-1"]);
+    assert!(again.contains("= t-2 is already closed as a duplicate of t-1"), "{again}");
+    assert_eq!(event_head(&ws), before);
+    ws.ok(&["doctor"]);
+}
+
+#[test]
+fn duplicate_refusals_use_the_usual_exit_codes() {
+    let ws = Ws::new();
+    for t in ["One", "Two", "Three"] {
+        ws.ok(&["create", t]);
+    }
+    let events = |ws: &Ws| event_head(ws);
+    let n = events(&ws);
+    assert_eq!(ws.code_as("tester", &["duplicate", "t-1", "--of", "t-1"]), 2, "itself");
+    assert_eq!(ws.code_as("tester", &["supersede", "t-1", "--with", "t-9"]), 3, "missing");
+    assert_eq!(ws.code_as("tester", &["duplicate", "t-1"]), 2, "--of is required");
+    assert_eq!(ws.code_as("tester", &["duplicate", "t-1", "--of", "t-2", "--if-revision", "9"]), 13, "stale guard");
+    assert_eq!(ws.code_as("tester", &["duplicate", "t-1", "--of", "t-2", "--if-status", "closed"]), 13);
+    assert_eq!(events(&ws), n, "guards and bad ids wrote nothing");
+    ws.ok(&["dep", "add", "t-1", "t-2"]);
+    let n = events(&ws);
+    let (code, err) = refusal(&ws, "tester", &["duplicate", "t-1", "--of", "t-2"]);
+    assert_eq!((code, err.contains("remove that edge first")), (2, true), "{err}");
+    assert_eq!(events(&ws), n, "every refusal wrote nothing");
+    assert_eq!(ws.json(&["show", "t-1"])["status"], "open");
+
+    // A target that is a duplicate itself: name its root.
+    ws.ok(&["duplicate", "t-2", "--of", "t-3"]);
+    let (code, err) = refusal(&ws, "tester", &["duplicate", "t-1", "--of", "t-2"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("t-3"), "{err}");
+
+    // Open children need --force.
+    ws.ok(&["create", "Child", "--parent", "t-3"]);
+    assert_eq!(ws.code_as("tester", &["supersede", "t-3", "--with", "t-1"]), 2);
+    ws.ok(&["supersede", "t-3", "--with", "t-1", "--force"]);
+    assert_eq!(ws.json(&["show", "t-3.1"])["status"], "open", "children stay");
+}
+
+#[test]
+fn duplicate_ends_another_actors_claim_only_with_take_over() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Canonical"]);
+    ws.ok(&["create", "Repeat"]);
+    ws.json_as("ann/s1", &["claim", "t-2"]);
+    let n = event_head(&ws);
+    for args in [&["duplicate", "t-2", "--of", "t-1"][..], &["duplicate", "t-2", "--of", "t-1", "--force"]] {
+        let (code, err) = refusal(&ws, "bob", args);
+        assert_eq!(code, 4, "{err}");
+        assert!(err.contains("t-2 is held by ann/s1, not bob"), "{err}");
+    }
+    assert_eq!(event_head(&ws), n);
+    assert_eq!(ws.json(&["show", "t-2"])["status"], "in_progress");
+    assert!(ws.json(&["dep", "list", "t-2"])["dependencies"].as_array().unwrap().is_empty());
+
+    ws.json_as("bob", &["duplicate", "t-2", "--of", "t-1", "--take-over"]);
+    let closed = ws.last_event("closed", "t-2");
+    assert_eq!(closed["claim_override"]["holder"], "ann/s1", "{closed}");
+    assert_eq!(ws.json(&["show", "t-2"])["status"], "closed");
+}
+
+#[test]
+fn duplicate_and_supersede_run_in_batches() {
+    let ws = Ws::new();
+    let f = ws.dir.path().join("ops.txt");
+    std::fs::write(&f, "create A\ncreate B\nduplicate $2 --of $1\ncreate C\nsupersede $4 --with $1\n").unwrap();
+    let out = ws.json(&["batch", "-f", f.to_str().unwrap()]);
+    assert_eq!(out["committed"], true);
+    assert_eq!(out["operations"][2]["ids"][0], "t-2", "{out}");
+    assert_eq!(ws.json(&["show", "t-2"])["close_reason"], "duplicate of t-1");
+    assert_eq!(ws.json(&["show", "t-3"])["close_reason"], "superseded by t-1");
+    let a = ws.json(&["show", "t-1"]);
+    assert_eq!(a["status"], "open");
+
+    // One failing line rolls back the lines before it.
+    let out =
+        ws.batch_as("tester", "create D\ncreate E\nduplicate $2 --of $1\nduplicate $2 --of $1\nduplicate $1 --of $1\n");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(ws.json(&["list", "--search", "E"]).as_array().unwrap().is_empty(), "rolled back");
+}
+
+#[test]
+fn find_duplicates_lists_similar_open_issues_and_writes_nothing() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Fix login timeout"]);
+    ws.ok(&["create", "Add dark mode to the settings page"]);
+    ws.ok(&["create", "Fix login timeouts"]);
+    ws.ok(&["create", "Fix login timeout", "--pinned"]);
+    ws.ok(&["create", "Fix login timeout"]);
+    ws.ok(&["close", "t-5"]);
+    let head = event_head(&ws);
+
+    let pairs = ws.json(&["find-duplicates"]);
+    let pairs = pairs.as_array().unwrap();
+    assert_eq!(pairs.len(), 1, "{pairs:?}");
+    assert_eq!(pairs[0]["a"]["id"], "t-1");
+    assert_eq!(pairs[0]["b"]["id"], "t-3");
+    let score = pairs[0]["score"].as_f64().unwrap();
+    assert!((0.8..1.0).contains(&score), "{score}");
+
+    let text = ws.ok(&["find-duplicates"]);
+    assert!(text.contains("t-1  Fix login timeout\n"), "{text}");
+    assert!(text.contains("      t-3  Fix login timeouts\n"), "{text}");
+    assert!(
+        text.contains("-- 1 likely duplicate pair(s); close one with bd duplicate <id> --of <canonical>"),
+        "{text}"
+    );
+
+    // A stricter threshold finds nothing; -n caps the list.
+    assert!(ws.json(&["find-duplicates", "--threshold", "1"]).as_array().unwrap().is_empty());
+    assert!(ws.ok(&["find-duplicates", "--threshold", "1"]).contains("No likely duplicates"));
+    ws.ok(&["create", "Fix login timeout"]);
+    assert_eq!(ws.json(&["find-duplicates", "--threshold", "0.5"]).as_array().unwrap().len(), 3);
+    assert_eq!(ws.json(&["find-duplicates", "--threshold", "0.5", "-n", "2"]).as_array().unwrap().len(), 2);
+
+    // Closing the duplicate takes it out of the report.
+    ws.ok(&["duplicate", "t-3", "--of", "t-1"]);
+    assert!(ws.json(&["find-duplicates"]).as_array().unwrap().iter().all(|p| p["b"]["id"] != "t-3"));
+
+    // Read-only: only the commands above wrote events.
+    let before = event_head(&ws);
+    ws.ok(&["find-duplicates", "--threshold", "0.3"]);
+    assert_eq!(event_head(&ws), before);
+    assert!(before > head);
+
+    for bad in ["1.5", "0", "-0.2", "abc"] {
+        assert_eq!(ws.code_as("tester", &["find-duplicates", &format!("--threshold={bad}")]), 2, "{bad}");
+    }
+}
+
+#[test]
+fn quick_capture_prints_only_the_id() {
+    let ws = Ws::new();
+    let parent = ws.id(&["create", "Parent"]);
+    let blocker = ws.id(&["create", "Blocker"]);
+    assert_eq!((parent.as_str(), blocker.as_str()), ("t-1", "t-2"));
+
+    // Text mode prints exactly the id, with or without -q.
+    let out = ws.ok(&[
+        "q",
+        "Fix",
+        "login",
+        "-p",
+        "1",
+        "-t",
+        "bug",
+        "-l",
+        "a,b",
+        "-d",
+        "text",
+        "--parent",
+        "t-1",
+        "--dep",
+        "blocks:t-2",
+    ]);
+    assert_eq!(out, "t-1.1\n");
+    assert_eq!(ws.ok(&["-q", "q", "Plain"]), "t-3\n");
+
+    let shown = ws.json(&["show", "t-1.1"]);
+    assert_eq!(shown["title"], "Fix login");
+    assert_eq!(shown["priority"], 1);
+    assert_eq!(shown["issue_type"], "bug");
+    assert_eq!(shown["description"], "text");
+    assert_eq!(shown["labels"], serde_json::json!(["a", "b"]));
+    assert_eq!(shown["is_blocked"], true);
+    let deps = ws.json(&["dep", "list", "t-1.1"]).to_string();
+    assert!(deps.contains("parent-child") && deps.contains("blocks"), "{deps}");
+
+    // --json has the shape of `bd create --json`.
+    let q = ws.json(&["q", "Json one"]);
+    let c = ws.json(&["create", "Json two"]);
+    let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+    assert_eq!(keys(&q), keys(&c));
+    assert_eq!(q["title"], "Json one");
+
+    // The title is required, and a bad flag value is a usage error.
+    assert_eq!(ws.code_as("tester", &["q"]), 2);
+    assert_eq!(ws.code_as("tester", &["q", "x", "-p", "9"]), 2);
+    assert_eq!(ws.code_as("tester", &["q", "x", "--parent", "t-404"]), 3);
+}
+
+/// `bd edit` with `editor` as $EDITOR (and no $VISUAL).
+fn edit_cmd(ws: &Ws, editor: &str, args: &[&str]) -> Command {
+    let mut cmd = Ws::cmd_in(ws.dir.path(), "tester", &[&["edit"][..], args].concat());
+    cmd.env_remove("VISUAL").env("EDITOR", editor);
+    cmd
+}
+
+#[test]
+fn edit_is_refused_without_a_terminal_and_never_starts_the_editor() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Editable", "-d", "Original"]);
+    let before = ws.json(&["show", "t-1"])["revision"].as_i64().unwrap();
+    let head = event_head(&ws);
+    let marker = ws.dir.path().join("editor-ran");
+    let editor = format!("touch {}", marker.display());
+    let out = edit_cmd(&ws, &editor, &["t-1"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("only in a terminal") && stderr.contains("bd update t-1 --description"), "{stderr}");
+    assert!(!marker.exists(), "the editor must not start");
+    assert_eq!(ws.json(&["show", "t-1"])["revision"].as_i64().unwrap(), before);
+    assert_eq!(event_head(&ws), head);
+    // The same through every field.
+    let out = edit_cmd(&ws, &editor, &["t-1", "--field", "notes"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("bd update t-1 --notes"));
+    assert_eq!(ws.code_as("tester", &["edit", "t-1", "--field", "nope"]), 2, "a clap error");
+}
+
+/// The path `bd edit` printed for the file that keeps the edited text.
+#[cfg(target_os = "linux")]
+fn kept_file(shown: &str) -> std::path::PathBuf {
+    let line = shown.lines().find(|l| l.starts_with("bd edit: the edited text is kept in ")).expect(shown);
+    std::path::PathBuf::from(line.trim_start_matches("bd edit: the edited text is kept in "))
+}
+
+/// Write the editor script `body` into the workspace: a shell script run as `sh SCRIPT FILE`.
+#[cfg(target_os = "linux")]
+fn editor_script(ws: &Ws, name: &str, body: &str) -> String {
+    let path = ws.dir.path().join(name);
+    std::fs::write(&path, body).unwrap();
+    format!("sh {}", path.display())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn edit_writes_the_edited_field_guarded_by_the_revision_it_read() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Editable", "-d", "Original"]);
+    let before = ws.json(&["show", "t-1"])["revision"].as_i64().unwrap();
+
+    // Changed text: written, one revision more.
+    let editor = editor_script(&ws, "write.sh", "printf 'Edited\\r\\nbody\\n' > \"$1\"\n");
+    let (out, shown) = pty::Terminal::spawn(edit_cmd(&ws, &editor, &["t-1"])).finish();
+    assert!(out.status.success(), "{shown}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.starts_with("✓ Updated t-1: description (revision "), "{stdout}");
+    let shown_issue = ws.json(&["show", "t-1"]);
+    assert_eq!(shown_issue["description"], "Edited\nbody", "CRLF normalized, trailing line end stripped");
+    assert_eq!(shown_issue["revision"].as_i64().unwrap(), before + 1);
+
+    // The editor sees the current text, in a private file.
+    let editor = editor_script(
+        &ws,
+        "peek.sh",
+        &format!("cp \"$1\" '{}/seen.txt'\nstat -c %a \"$1\" > '{0}/mode.txt'\n", ws.dir.path().display()),
+    );
+    let head = event_head(&ws);
+    let (out, shown) = pty::Terminal::spawn(edit_cmd(&ws, &editor, &["t-1"])).finish();
+    assert!(out.status.success(), "{shown}");
+    assert_eq!(std::fs::read_to_string(ws.dir.path().join("seen.txt")).unwrap(), "Edited\nbody\n");
+    assert_eq!(std::fs::read_to_string(ws.dir.path().join("mode.txt")).unwrap().trim(), "600");
+
+    // Unchanged text (an editor that leaves the file alone): nothing written.
+    let rev = ws.json(&["show", "t-1"])["revision"].as_i64().unwrap();
+    let (out, shown) = pty::Terminal::spawn(edit_cmd(&ws, "true", &["t-1"])).finish();
+    assert!(out.status.success(), "{shown}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(stdout, format!("= t-1 description unchanged (revision {rev})\n"));
+    assert_eq!(ws.json(&["show", "t-1"])["revision"].as_i64().unwrap(), rev);
+    assert_eq!(event_head(&ws), head);
+
+    // --json says so too.
+    let mut cmd = edit_cmd(&ws, "true", &["t-1"]);
+    cmd.arg("--json");
+    let (out, _) = pty::Terminal::spawn(cmd).finish();
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((&v["id"], &v["field"], &v["changed"]), (&"t-1".into(), &"description".into(), &false.into()));
+
+    // Another field.
+    let editor = editor_script(&ws, "notes.sh", "printf 'n1\\n' > \"$1\"\n");
+    let (out, shown) = pty::Terminal::spawn(edit_cmd(&ws, &editor, &["t-1", "--field", "notes"])).finish();
+    assert!(out.status.success(), "{shown}");
+    assert_eq!(ws.json(&["show", "t-1"])["notes"], "n1");
+
+    // An editor that fails writes nothing.
+    let editor = editor_script(&ws, "fail.sh", "printf 'lost\\n' > \"$1\"\nexit 3\n");
+    let head = event_head(&ws);
+    let (out, shown) = pty::Terminal::spawn(edit_cmd(&ws, &editor, &["t-1"])).finish();
+    assert_eq!(out.status.code(), Some(1), "{shown}");
+    assert!(shown.contains("exited with") && shown.contains("nothing changed"), "{shown}");
+    assert_eq!(ws.json(&["show", "t-1"])["description"], "Edited\nbody");
+    assert_eq!(event_head(&ws), head);
+}
+
+/// A Ctrl-C reaches the whole foreground group, bd included: bd must outlive
+/// it and still write what the editor saved (vi leaves insert mode with it).
+#[cfg(target_os = "linux")]
+#[test]
+fn edit_survives_an_interrupt_sent_to_its_process_group() {
+    use std::os::unix::process::CommandExt;
+    let ws = Ws::new();
+    ws.ok(&["create", "Editable", "-d", "Original"]);
+    let editor = editor_script(&ws, "int.sh", "trap '' INT\nkill -INT 0\nprintf 'Edited\\n' > \"$1\"\n");
+    let mut cmd = edit_cmd(&ws, &editor, &["t-1"]);
+    // Its own group, so the signal reaches bd and the editor and not the test run.
+    cmd.process_group(0);
+    let (out, shown) = pty::Terminal::spawn(cmd).finish();
+    assert_eq!(out.status.code(), Some(0), "not 130: {shown}");
+    assert_eq!(ws.json(&["show", "t-1"])["description"], "Edited");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn edit_refuses_a_concurrent_change_and_keeps_the_edited_text() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Editable", "-d", "Original"]);
+    let editor =
+        editor_script(&ws, "race.sh", "\"$BD\" update t-1 --notes theirs >/dev/null 2>&1\nprintf 'Mine\\n' > \"$1\"\n");
+    let mut cmd = edit_cmd(&ws, &editor, &["t-1"]);
+    cmd.env("BD", env!("CARGO_BIN_EXE_bd"));
+    let (out, shown) = pty::Terminal::spawn(cmd).finish();
+    assert_eq!(out.status.code(), Some(13), "{shown}");
+    let issue = ws.json(&["show", "t-1"]);
+    assert_eq!(issue["description"], "Original");
+    assert_eq!(issue["notes"], "theirs");
+    let kept = kept_file(&shown);
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "Mine\n");
+    std::fs::remove_file(kept).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn edit_refuses_a_title_that_is_empty_or_has_several_lines() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Editable"]);
+    let head = event_head(&ws);
+    for (body, name) in [("Line one\\nLine two\\n", "two.sh"), ("\\n", "empty.sh")] {
+        let editor = editor_script(&ws, name, &format!("printf '{body}' > \"$1\"\n"));
+        let (out, shown) = pty::Terminal::spawn(edit_cmd(&ws, &editor, &["t-1", "--field", "title"])).finish();
+        assert_eq!(out.status.code(), Some(2), "{shown}");
+        std::fs::remove_file(kept_file(&shown)).unwrap();
+    }
+    assert_eq!(ws.json(&["show", "t-1"])["title"], "Editable");
+    assert_eq!(event_head(&ws), head);
+
+    // A title edited to one line works.
+    let editor = editor_script(&ws, "title.sh", "printf 'Renamed\\n' > \"$1\"\n");
+    let (out, shown) = pty::Terminal::spawn(edit_cmd(&ws, &editor, &["t-1", "--field", "title"])).finish();
+    assert!(out.status.success(), "{shown}");
+    assert_eq!(ws.json(&["show", "t-1"])["title"], "Renamed");
+}
+
+/// A stateless stand-in for `gh api --include`: it logs each call (and the
+/// stdin of writes) to `gh-calls.log`, and answers `<METHOD> <endpoint>` with
+/// the file `gh/<key>` (every character but letters and digits as `_`), or
+/// a 404. `gh repo view` answers `gh/repo.json`.
+#[cfg(unix)]
+struct FakeGitHub {
+    dir: std::path::PathBuf,
+    bin: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeGitHub {
+    fn new(ws: &Ws) -> FakeGitHub {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = ws.dir.path().join("fakegh");
+        std::fs::create_dir_all(dir.join("gh")).unwrap();
+        let bin = dir.join("gh-fake");
+        std::fs::write(
+            &bin,
+            r#"#!/bin/sh
+d="$(dirname "$0")"
+echo "$*" >> "$d/gh-calls.log"
+if [ "$1" = "repo" ]; then cat "$d/gh/repo.json"; exit 0; fi
+method=GET
+for a in "$@"; do case "$a" in --method=*) method="${a#--method=}";; esac; endpoint="$a"; done
+if [ "$method" != GET ]; then cat >> "$d/gh-calls.log"; echo >> "$d/gh-calls.log"; fi
+key=$(printf '%s' "$method $endpoint" | tr -c 'A-Za-z0-9\n' '_')
+if [ -f "$d/gh/$key" ]; then cat "$d/gh/$key"; exit 0; fi
+printf 'HTTP/2.0 404 Not Found\r\n\r\n{"message":"Not Found"}'
+exit 1
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gh = FakeGitHub { dir, bin };
+        // The account gh is signed in as: only its issues' markers link.
+        gh.serve("GET", "user", 200, &[], r#"{"login":"bd-bot"}"#);
+        gh
+    }
+
+    fn serve(&self, method: &str, endpoint: &str, status: u16, headers: &[(&str, &str)], body: &str) {
+        let key: String =
+            format!("{method} {endpoint}").chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        let mut text = format!("HTTP/2.0 {status} X\r\nContent-Type: application/json\r\n");
+        for (k, v) in headers {
+            text.push_str(&format!("{k}: {v}\r\n"));
+        }
+        text.push_str("\r\n");
+        text.push_str(body);
+        std::fs::write(self.dir.join("gh").join(key), text).unwrap();
+    }
+
+    /// The listing of `state` (and `label`), in pages.
+    fn list(&self, state: &str, label: Option<&str>, pages: &[Vec<Value>]) {
+        let labels = label.map(|l| format!("&labels={l}")).unwrap_or_default();
+        for (i, page) in pages.iter().enumerate() {
+            let n = i + 1;
+            let endpoint =
+                format!("repos/acme/app/issues?state={state}{labels}&sort=created&direction=asc&per_page=100&page={n}");
+            let next = format!("<https://api.github.com/x?page={}>; rel=\"next\"", n + 1);
+            let headers: Vec<(&str, &str)> = if n < pages.len() { vec![("Link", next.as_str())] } else { vec![] };
+            self.serve("GET", &endpoint, 200, &headers, &Value::Array(page.clone()).to_string());
+        }
+    }
+
+    fn comments(&self, n: u64, list: &[Value]) {
+        let endpoint = format!("repos/acme/app/issues/{n}/comments?sort=created&per_page=100&page=1");
+        self.serve("GET", &endpoint, 200, &[], &Value::Array(list.to_vec()).to_string());
+    }
+
+    fn log(&self) -> String {
+        std::fs::read_to_string(self.dir.join("gh-calls.log")).unwrap_or_default()
+    }
+
+    fn clear_log(&self) {
+        let _ = std::fs::remove_file(self.dir.join("gh-calls.log"));
+    }
+
+    fn writes(&self) -> Vec<String> {
+        self.log()
+            .lines()
+            .filter(|l| l.starts_with("api --method=") && !l.starts_with("api --method=GET"))
+            .map(String::from)
+            .collect()
+    }
+
+    fn run(&self, ws: &Ws, args: &[&str]) -> Output {
+        ws.with_env(&[("BD_GH", self.bin.to_str().unwrap())], args)
+    }
+
+    fn json(&self, ws: &Ws, args: &[&str]) -> Value {
+        let mut a = vec!["--json"];
+        a.extend_from_slice(args);
+        let out = self.run(ws, &a);
+        assert!(
+            out.status.success(),
+            "bd {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+}
+
+#[cfg(unix)]
+fn gh_issue(n: u64, title: &str, updated: &str, extra: Value) -> Value {
+    let mut v = serde_json::json!({
+        "number": n, "node_id": format!("I_{n}"), "title": title, "body": null, "state": "open",
+        "state_reason": null, "labels": [], "assignees": [], "updated_at": updated,
+        "html_url": format!("https://github.com/acme/app/issues/{n}"), "comments": 0
+    });
+    for (k, x) in extra.as_object().unwrap() {
+        v[k] = x.clone();
+    }
+    v
+}
+
+#[cfg(unix)]
+fn gh_comment(id: i64, body: &str) -> Value {
+    serde_json::json!({"id": id, "user": {"login": "octo"}, "body": body, "created_at": "2026-10-01T10:00:00Z",
+        "updated_at": "2026-10-01T10:00:00Z", "html_url": format!("https://github.com/acme/app/issues/1#issuecomment-{id}")})
+}
+
+#[cfg(unix)]
+fn sync_actions(report: &Value) -> Vec<(u64, String)> {
+    report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["action"] != "unchanged")
+        .map(|r| (r["number"].as_u64().unwrap_or(0), r["action"].as_str().unwrap().to_string()))
+        .collect()
+}
+
+/// `bd --json events ARGS`: one event per line.
+#[cfg(unix)]
+fn event_lines(ws: &Ws, args: &[&str]) -> Vec<Value> {
+    let mut a = vec!["--json", "events"];
+    a.extend_from_slice(args);
+    ws.ok(&a).lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+#[cfg(unix)]
+fn head_seq(ws: &Ws) -> i64 {
+    event_lines(ws, &["--limit", "1"]).last().map_or(0, |e| e["seq"].as_i64().unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn github_pull_creates_and_updates() {
+    let ws = Ws::new();
+    let gh = FakeGitHub::new(&ws);
+    ws.ok(&["config", "set", "github.priority_labels", "P"]);
+    ws.ok(&["config", "set", "github.assignees", "octo=alice"]);
+    let t = "2026-10-01T10:00:00Z";
+    let one = gh_issue(
+        1,
+        "One",
+        t,
+        serde_json::json!({"labels": [{"name": "bug"}, {"name": "P1"}],
+        "assignees": [{"login": "octo"}], "comments": 2}),
+    );
+    let pr = gh_issue(2, "A PR", t, serde_json::json!({"pull_request": {"url": "x"}}));
+    let three = gh_issue(3, "Three", t, serde_json::json!({}));
+    gh.list("open", None, &[vec![one.clone(), pr.clone()], vec![three.clone()]]);
+    gh.comments(1, &[gh_comment(11, "first"), gh_comment(12, "second")]);
+    let r = gh.json(&ws, &["--actor", "syncer", "github", "pull", "--repo", "acme/app"]);
+    assert_eq!(r["counts"]["created"], 2, "{r}");
+    let issues = ws.json(&["list"]);
+    let by_ref = |n: u64| -> Value {
+        issues.as_array().unwrap().iter().find(|i| i["external_ref"] == format!("gh:acme/app#{n}")).cloned().unwrap()
+    };
+    let i1 = by_ref(1);
+    assert_eq!((i1["priority"].as_u64(), i1["assignee"].as_str()), (Some(1), Some("alice")));
+    assert_eq!(i1["labels"], serde_json::json!(["bug"]));
+    let id1 = i1["id"].as_str().unwrap().to_string();
+    assert_eq!(ws.json(&["comments", &id1]).as_array().unwrap().len(), 2);
+    let synced = event_lines(&ws, &["--op", "github_synced"]);
+    assert_eq!(synced.len(), 1);
+    assert_eq!(synced[0]["actor"], "syncer");
+    let created = event_lines(&ws, &["--op", "created"]);
+    assert!(!created.is_empty() && created.iter().all(|e| e["actor"] == "syncer"));
+
+    // A rerun changes nothing and adds no summary event.
+    let head = head_seq(&ws);
+    gh.json(&ws, &["github", "pull", "--repo", "acme/app"]);
+    assert_eq!(head_seq(&ws), head);
+
+    // An unmapped bd assignee survives a GitHub title change.
+    let id3 = by_ref(3)["id"].as_str().unwrap().to_string();
+    ws.ok(&["update", &id3, "--assignee", "carol"]);
+    gh.json(&ws, &["github", "push", "--repo", "acme/app"]);
+    let three = gh_issue(3, "Three renamed", "2026-10-02T10:00:00Z", serde_json::json!({}));
+    gh.list("open", None, &[vec![one.clone(), pr], vec![three]]);
+    gh.json(&ws, &["github", "pull", "--repo", "acme/app"]);
+    let i3 = ws.json(&["show", &id3]);
+    assert_eq!((i3["title"].as_str(), i3["assignee"].as_str()), (Some("Three renamed"), Some("carol")));
+
+    // --state all: a closed not_planned issue arrives closed failed; a later reason change follows.
+    let four = gh_issue(4, "Four", t, serde_json::json!({"state": "closed", "state_reason": "completed"}));
+    gh.list("all", None, &[vec![one.clone(), four]]);
+    gh.json(&ws, &["github", "pull", "--repo", "acme/app", "--state", "all"]);
+    let id4 =
+        ws.json(&["list", "--all"]).as_array().unwrap().iter().find(|i| i["external_ref"] == "gh:acme/app#4").unwrap()
+            ["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+    assert_eq!(ws.json(&["show", &id4])["close_outcome"], "done");
+    let four = gh_issue(
+        4,
+        "Four",
+        "2026-10-03T10:00:00Z",
+        serde_json::json!({"state": "closed", "state_reason": "not_planned"}),
+    );
+    gh.list("all", None, &[vec![one, four]]);
+    gh.json(&ws, &["github", "pull", "--repo", "acme/app", "--state", "all"]);
+    let i4 = ws.json(&["show", &id4]);
+    assert_eq!((i4["status"].as_str(), i4["close_outcome"].as_str()), (Some("closed"), Some("failed")));
+    let doctor = ws.json(&["doctor"]);
+    let drift = doctor["checks"].as_array().unwrap().iter().find(|c| c["name"] == "blocked_state").cloned();
+    assert_eq!(drift.map(|c| c["severity"].clone()), Some(Value::from("ok")), "{doctor}");
+}
+
+#[cfg(unix)]
+#[test]
+fn github_push_creates_with_label_and_is_idempotent() {
+    let ws = Ws::new();
+    let gh = FakeGitHub::new(&ws);
+    let id = ws.id(&["create", "Publish me", "-l", "sync", "-d", "Details"]);
+    ws.id(&["create", "Private"]);
+    let t = "2026-10-01T10:00:00Z";
+    gh.list("open", Some("sync"), &[vec![]]);
+    let body = format!("Details\n\n<!-- bd:{id} -->");
+    let created = gh_issue(12, "Publish me", t, serde_json::json!({"body": body, "labels": [{"name": "sync"}]}));
+    gh.serve("POST", "repos/acme/app/issues", 201, &[], &created.to_string());
+    let out = gh.run(&ws, &["github", "push", "--repo", "acme/app", "--create"]);
+    assert_eq!(out.status.code(), Some(2), "--create needs --label");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--label"));
+    let r = gh.json(&ws, &["github", "push", "--repo", "acme/app", "--create", "--label", "sync"]);
+    assert_eq!(r["counts"]["created"], 1, "{r}");
+    let log = gh.log();
+    assert!(log.contains("--method=POST") && log.contains(r#""title":"Publish me""#), "{log}");
+    assert!(log.contains(r#""labels":["sync"]"#) && log.contains(&format!("<!-- bd:{id} -->")), "{log}");
+    assert_eq!(ws.json(&["show", &id])["external_ref"], "gh:acme/app#12");
+    gh.list("open", Some("sync"), &[vec![created]]);
+    gh.clear_log();
+    gh.json(&ws, &["github", "push", "--repo", "acme/app", "--create", "--label", "sync"]);
+    assert!(gh.writes().is_empty(), "{}", gh.log());
+}
+
+#[cfg(unix)]
+#[test]
+fn github_sync_reports_and_resolves_conflicts() {
+    let ws = Ws::new();
+    let gh = FakeGitHub::new(&ws);
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-01T10:00:00Z", serde_json::json!({}))]]);
+    gh.json(&ws, &["github", "pull", "--repo", "acme/app"]);
+    let id = ws.json(&["list"])[0]["id"].as_str().unwrap().to_string();
+    ws.ok(&["update", &id, "--title", "Local"]);
+    gh.list("open", None, &[vec![gh_issue(7, "GitHub", "2026-10-01T11:00:00Z", serde_json::json!({}))]]);
+    let r = gh.json(&ws, &["github", "sync", "--repo", "acme/app"]);
+    assert_eq!(sync_actions(&r), [(7, "conflict".to_string())]);
+    assert_eq!(r["conflicts"][0]["id"], id.as_str());
+    assert_eq!(ws.json(&["show", &id])["title"], "Local");
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app", "--prefer", "github"]);
+    assert_eq!(ws.json(&["show", &id])["title"], "GitHub");
+
+    ws.ok(&["update", &id, "--title", "Local 2"]);
+    gh.list("open", None, &[vec![gh_issue(7, "GitHub 2", "2026-10-01T12:00:00Z", serde_json::json!({}))]]);
+    let after = gh_issue(7, "Local 2", "2026-10-01T12:30:00Z", serde_json::json!({}));
+    gh.serve("PATCH", "repos/acme/app/issues/7", 200, &[], &after.to_string());
+    gh.clear_log();
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app", "--prefer", "local"]);
+    let log = gh.log();
+    assert!(log.contains("--method=PATCH") && log.contains(r#"{"title":"Local 2"}"#), "{log}");
+
+    // A bd edit waits through a pull, then goes with the next push.
+    gh.list("open", None, &[vec![after]]);
+    ws.ok(&["update", &id, "--title", "Local 3"]);
+    let r = gh.json(&ws, &["github", "pull", "--repo", "acme/app"]);
+    assert_eq!(sync_actions(&r), [(7, "deferred".to_string())]);
+    gh.serve(
+        "PATCH",
+        "repos/acme/app/issues/7",
+        200,
+        &[],
+        &gh_issue(7, "Local 3", "2026-10-01T13:00:00Z", serde_json::json!({})).to_string(),
+    );
+    gh.clear_log();
+    gh.json(&ws, &["github", "push", "--repo", "acme/app"]);
+    assert!(gh.log().contains(r#"{"title":"Local 3"}"#), "{}", gh.log());
+}
+
+#[cfg(unix)]
+#[test]
+fn github_sync_rerun_is_a_noop() {
+    let ws = Ws::new();
+    let gh = FakeGitHub::new(&ws);
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-01T10:00:00Z", serde_json::json!({"comments": 1}))]]);
+    gh.comments(7, &[gh_comment(11, "hello")]);
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app"]);
+    let head = head_seq(&ws);
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-05T10:00:00Z", serde_json::json!({"comments": 1}))]]);
+    gh.clear_log();
+    let r = gh.json(&ws, &["github", "sync", "--repo", "acme/app", "--comments"]);
+    assert!(sync_actions(&r).is_empty(), "{r}");
+    assert_eq!(head_seq(&ws), head);
+    let log = gh.log();
+    assert!(gh.writes().is_empty() && !log.contains("/comments"), "{log}");
+    assert_eq!(r["counts"].as_object().unwrap().keys().collect::<Vec<_>>(), ["unchanged"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn github_pull_links_marker_instead_of_duplicating() {
+    let ws = Ws::new();
+    let gh = FakeGitHub::new(&ws);
+    let id = ws.id(&["create", "Mine", "-l", "sync"]);
+    ws.ok(&["comment", "add", &id, "a note"]);
+    let cid = ws.json(&["comments", &id])[0]["id"].as_i64().unwrap();
+    let body = format!("<!-- bd:{id} -->");
+    let issue = gh_issue(
+        12,
+        "Mine",
+        "2026-10-01T10:00:00Z",
+        serde_json::json!({"body": body, "labels": [{"name": "sync"}], "comments": 1, "user": {"login": "bd-bot"}}),
+    );
+    gh.list("open", None, &[vec![issue.clone()]]);
+    gh.list("open", Some("sync"), &[vec![issue]]);
+    gh.comments(12, &[gh_comment(50, &format!("a note\n\n<!-- bd:{id}#c{cid} -->"))]);
+    let r = gh.json(&ws, &["github", "pull", "--repo", "acme/app"]);
+    assert_eq!(sync_actions(&r), [(12, "linked".to_string())], "{r}");
+    assert_eq!(ws.json(&["list"]).as_array().unwrap().len(), 1, "nothing created");
+    assert_eq!(ws.json(&["show", &id])["external_ref"], "gh:acme/app#12");
+    assert_eq!(ws.json(&["comments", &id]).as_array().unwrap().len(), 1, "nothing imported");
+    gh.clear_log();
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app", "--create", "--label", "sync"]);
+    assert!(gh.writes().is_empty(), "{}", gh.log());
+}
+
+#[cfg(unix)]
+#[test]
+fn github_comments_flow_both_ways() {
+    let ws = Ws::new();
+    let gh = FakeGitHub::new(&ws);
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-01T10:00:00Z", serde_json::json!({}))]]);
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app"]);
+    let id = ws.json(&["list"])[0]["id"].as_str().unwrap().to_string();
+
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-01T11:00:00Z", serde_json::json!({"comments": 1}))]]);
+    gh.comments(7, &[gh_comment(11, "from GitHub")]);
+    gh.json(&ws, &["github", "pull", "--repo", "acme/app"]);
+    assert_eq!(ws.json(&["comments", &id]).as_array().unwrap().len(), 1);
+
+    ws.ok(&["comment", "add", &id, "from bd"]);
+    let posted = serde_json::json!({"id": 12, "user": {"login": "bot"}, "body": "x", "created_at": "2026-10-01T12:00:00Z",
+        "updated_at": "2026-10-01T12:00:00Z", "html_url": "u"});
+    gh.serve("POST", "repos/acme/app/issues/7/comments", 201, &[], &posted.to_string());
+    gh.clear_log();
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app", "--comments"]);
+    let log = gh.log();
+    assert_eq!(gh.writes().len(), 1, "{log}");
+    assert!(log.contains("--method=POST") && log.contains(&format!("<!-- bd:{id}#c")), "{log}");
+
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-01T12:00:00Z", serde_json::json!({"comments": 2}))]]);
+    gh.comments(7, &[gh_comment(11, "from GitHub"), posted]);
+    let head = head_seq(&ws);
+    gh.clear_log();
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app", "--comments"]);
+    assert_eq!(head_seq(&ws), head);
+    let log = gh.log();
+    assert!(gh.writes().is_empty() && !log.contains("/comments"), "{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn github_repos_outside_the_allowlist_are_refused() {
+    let ws = Ws::new();
+    let gh = FakeGitHub::new(&ws);
+    assert_eq!(ws.code_as("tester", &["config", "set", "github.repos", "not a repo"]), 2);
+    ws.ok(&["config", "set", "github.repos", "acme/*"]);
+    let out = gh.run(&ws, &["github", "pull", "--repo", "other/x"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("github.repos"));
+    assert!(gh.log().is_empty(), "no gh call: {}", gh.log());
+}
+
+/// Run a session hook in `dir` with `input` on its stdin; its exit code and stdout.
+fn hook_with_input(dir: &Path, env: &[(&str, &str)], input: &str, args: &[&str]) -> (i32, String) {
+    let mut c = Ws::cmd_in(dir, "tester", args);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    std::io::Write::write_all(&mut stdin, input.as_bytes()).unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    (out.status.code().unwrap(), String::from_utf8(out.stdout).unwrap())
+}
+
+#[test]
+fn session_start_after_compaction_says_so() {
+    let ws = Ws::new();
+    let root = ws.dir.path();
+    let input =
+        |source: &str, cwd: &Path| serde_json::json!({ "session_id": "s1", "cwd": cwd, "source": source }).to_string();
+    let codex = ["hook", "session-start", "--harness", "codex"];
+    let (code, out) = hook_with_input(root, &[], &input("compact", root), &codex);
+    assert_eq!(code, 0);
+    assert!(out.starts_with("bd: the conversation was compacted"), "{out}");
+    assert!(out.contains("lease tokens"), "{out}");
+    let (code, out) = hook_with_input(root, &[], &input("startup", root), &codex);
+    assert_eq!((code, out.as_str()), (0, ""));
+
+    // Outside a workspace, nothing.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let (code, out) = hook_with_input(elsewhere.path(), &[], &input("compact", elsewhere.path()), &codex);
+    assert_eq!((code, out.as_str()), (0, ""));
+
+    // A Claude Code hook that another harness runs says nothing (no Claude Code variables here).
+    let claude = ["hook", "session-start", "--harness", "claude"];
+    let (code, out) = hook_with_input(root, &[], &input("compact", root), &claude);
+    assert_eq!((code, out.as_str()), (0, ""));
+    // Copilot CLI's format holds the line too.
+    let copilot = ["hook", "session-start", "--harness", "copilot"];
+    let (_, out) = hook_with_input(root, &[], &input("compact", root), &copilot);
+    assert!(copilot_context(&out).unwrap().starts_with("bd: the conversation was compacted"), "{out}");
+}
+
+/// A project directory with a `.git` directory, as `git init` leaves.
+fn git_project() -> TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    dir
+}
+
+fn setup(dir: &Path, args: &[&str]) -> (i32, String) {
+    let mut a = vec!["setup"];
+    a.extend_from_slice(args);
+    let out = Ws::cmd_in(dir, "tester", &a).output().unwrap();
+    (out.status.code().unwrap(), String::from_utf8(out.stdout).unwrap() + &String::from_utf8_lossy(&out.stderr))
+}
+
+fn setup_json(dir: &Path, args: &[&str]) -> Value {
+    let mut a = vec!["--json", "setup"];
+    a.extend_from_slice(args);
+    let out = Ws::cmd_in(dir, "tester", &a).output().unwrap();
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stderr)))
+}
+
+/// Every file under `dir` but those under `skip`, with its bytes.
+fn snapshot(dir: &Path, skip: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap().flatten() {
+            let p = e.path();
+            if p.starts_with(skip) {
+                continue;
+            }
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                out.push((p.clone(), std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+const SETUP_FILES: [(&str, &str); 6] = [
+    ("claude", ".claude/settings.json"),
+    ("codex", ".codex/hooks.json"),
+    ("copilot", ".github/hooks/bd.json"),
+    ("cursor", ".cursor/rules/bd.mdc"),
+    ("gemini", "GEMINI.md"),
+    ("opencode", "AGENTS.md"),
+];
+
+#[test]
+fn setup_writes_each_harness_once() {
+    let dir = git_project();
+    let root = dir.path();
+    for (harness, file) in SETUP_FILES {
+        let v = setup_json(root, &[harness]);
+        assert_eq!(v["files"][0]["state"], "added", "{harness}: {v}");
+        assert_eq!(v["files"][0]["file"], file);
+        let first = read(root, file).unwrap();
+        let v = setup_json(root, &[harness]);
+        assert_eq!(v["files"][0]["state"], "present", "{harness}: {v}");
+        assert_eq!(read(root, file).unwrap(), first, "{harness}");
+        if !file.ends_with(".json") {
+            assert!(first.contains("`bd prime`"), "{harness}");
+        }
+    }
+    let settings: Value = serde_json::from_str(&read(root, ".claude/settings.json").unwrap()).unwrap();
+    let ours: Value = serde_json::from_str(include_str!("../../../.claude/settings.json")).unwrap();
+    assert_eq!(settings["hooks"], ours["hooks"]);
+    let codex: Value = serde_json::from_str(&read(root, ".codex/hooks.json").unwrap()).unwrap();
+    assert_eq!(codex["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact");
+    let copilot: Value = serde_json::from_str(&read(root, ".github/hooks/bd.json").unwrap()).unwrap();
+    assert_eq!(copilot["version"], 1);
+    assert_eq!(copilot["hooks"]["sessionStart"][1]["command"], "bd prime --hook copilot");
+    let cursor = read(root, ".cursor/rules/bd.mdc").unwrap();
+    assert!(cursor.starts_with("---\ndescription: Task tracking with bd\nalwaysApply: true\n---\n"), "{cursor}");
+}
+
+#[test]
+fn setup_keeps_user_content_and_removes_only_its_own() {
+    let dir = git_project();
+    let root = dir.path();
+    let settings = serde_json::json!({"permissions": {"allow": ["Bash(ls)"]}, "hooks": {"SessionStart": [
+        {"hooks": [{"type": "command", "command": "echo hi"}]},
+        {"hooks": [{"type": "command", "command": "bd prime --hook claude --ready 5"}]}]}});
+    write_file(root, ".claude/settings.json", serde_json::to_string_pretty(&settings).unwrap());
+    let agents = "# Agents\n\nKeep this text.\n";
+    write_file(root, "AGENTS.md", agents);
+
+    assert_eq!(setup(root, &["claude"]).0, 0);
+    let v: Value = serde_json::from_str(&read(root, ".claude/settings.json").unwrap()).unwrap();
+    assert_eq!(v["permissions"], settings["permissions"]);
+    assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 3);
+    assert_eq!(setup(root, &["opencode"]).0, 0);
+    let text = read(root, "AGENTS.md").unwrap();
+    assert!(text.starts_with(&format!("{agents}\n<!-- BEGIN bd setup")), "{text}");
+
+    // An older bd's section is replaced in place.
+    let older = text.replace("## Task tracking with bd", "## Old heading");
+    write_file(root, "AGENTS.md", &older);
+    assert_eq!(setup_json(root, &["opencode"])["files"][0]["state"], "updated");
+    assert_eq!(read(root, "AGENTS.md").unwrap(), text);
+
+    // --remove --dry-run writes nothing; --remove restores what was there.
+    let (code, out) = setup(root, &["claude", "--remove", "--dry-run"]);
+    assert!(code == 0 && out.contains("would remove"), "{out}");
+    let v = setup_json(root, &["claude", "--remove"]);
+    assert_eq!(v["files"][0]["state"], "removed", "{v}");
+    let back: Value = serde_json::from_str(&read(root, ".claude/settings.json").unwrap()).unwrap();
+    assert_eq!(back, settings, "the hand-written variant stays");
+    assert_eq!(setup_json(root, &["claude", "--remove"])["files"][0]["state"], "absent");
+    assert_eq!(setup(root, &["opencode", "--remove"]).0, 0);
+    assert_eq!(read(root, "AGENTS.md").unwrap(), agents);
+
+    // A file setup created goes.
+    assert_eq!(setup(root, &["gemini"]).0, 0);
+    assert_eq!(setup(root, &["gemini", "--remove"]).0, 0);
+    assert!(read(root, "GEMINI.md").is_none());
+}
+
+#[test]
+fn setup_claude_ignores_personal_settings() {
+    let dir = git_project();
+    let root = dir.path();
+    let session = serde_json::json!({"hooks": {"SessionStart": [{"hooks": [
+        {"type": "command", "command": "bd hook session-start --harness claude"},
+        {"type": "command", "command": "bd prime --hook claude"}]}]}});
+    write_file(root, ".claude/settings.local.json", session.to_string());
+    let subagent = serde_json::json!({"hooks": {"SubagentStart": [{"hooks": [{"type": "command", "command": "bd hook subagent-start"}]}]}});
+    // Where Ws::cmd_in points $CLAUDE_CONFIG_DIR.
+    write_file(root, ".home/CLAUDE_CONFIG_DIR/settings.json", subagent.to_string());
+    let v = setup_json(root, &["claude"]);
+    assert_eq!(v["files"][0]["events"], serde_json::json!(["SessionStart", "SubagentStart", "PreToolUse"]), "{v}");
+    let settings: Value = serde_json::from_str(&read(root, ".claude/settings.json").unwrap()).unwrap();
+    let ours: Value = serde_json::from_str(include_str!("../../../.claude/settings.json")).unwrap();
+    assert_eq!(settings, ours);
+
+    // Codex counts the user's hooks: the report says where they are.
+    write_file(
+        root,
+        ".home/CODEX_HOME/hooks.json",
+        serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "bd hook session-start"}]}]}})
+            .to_string(),
+    );
+    let (code, out) = setup(root, &["codex"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("already set up in .home/CODEX_HOME/hooks.json"), "{out}");
+    assert!(read(root, ".codex/hooks.json").is_none());
+}
+
+#[test]
+fn setup_claude_with_the_plugin_installed_writes_nothing() {
+    let dir = git_project();
+    let root = dir.path();
+    let plugin = serde_json::json!({"hooks": serde_json::from_str::<Value>(include_str!("../../../.claude/settings.json")).unwrap()["hooks"]});
+    write_file(root, ".home/CLAUDE_CONFIG_DIR/plugins/cache/bd/bd/abc123/hooks/hooks.json", plugin.to_string());
+    let (code, out) = setup(root, &["claude"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains("already set up in .home/CLAUDE_CONFIG_DIR/plugins/cache/bd/bd/abc123/hooks/hooks.json"),
+        "{out}"
+    );
+    assert!(!root.join(".claude").exists());
+}
+
+#[test]
+fn setup_in_a_nested_worktree_writes_the_worktree() {
+    for variant in ["remote", "init", "init with a tracked .bd"] {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        std::fs::create_dir_all(outer.join(".git")).unwrap();
+        match variant {
+            "remote" => write_file(&outer, ".bd/remote.toml", "url = \"https://bd.example.com/w/proj\"\n"),
+            _ => assert!(Ws::cmd_in(&outer, "tester", &["init", "--prefix", "t"]).output().unwrap().status.success()),
+        }
+        let inner = outer.join(".claude").join("worktrees").join("w");
+        write_file(&inner, ".git", "gitdir: ../../../.git/worktrees/w\n");
+        std::fs::create_dir_all(inner.join("src")).unwrap();
+        if variant == "init with a tracked .bd" {
+            write_file(&inner, ".bd/.gitignore", "bd.db*\n");
+            std::fs::create_dir_all(inner.join(".bd/playbooks")).unwrap();
+        }
+        let before = snapshot(&outer, &inner);
+        for harness in ["claude", "opencode"] {
+            let v = setup_json(&inner.join("src"), &[harness]);
+            assert_eq!(v["files"][0]["state"], "added", "{variant}: {v}");
+            let root = std::path::PathBuf::from(v["root"].as_str().unwrap());
+            assert!(root.ends_with(Path::new(".claude").join("worktrees").join("w")), "{variant}: {v}");
+        }
+        assert!(inner.join(".claude/settings.json").is_file() && inner.join("AGENTS.md").is_file(), "{variant}");
+        assert_eq!(snapshot(&outer, &inner), before, "{variant}: outer changed");
+        assert!(!outer.join(".bd/agents.lock.mutex").exists(), "{variant}");
+        assert!(!inner.join(".bd/agents.lock.mutex").exists(), "{variant}");
+    }
+}
+
+#[test]
+fn setup_takes_the_lock_in_pulls_checkout() {
+    let ws = Ws::new();
+    let root = ws.dir.path();
+    let (code, out) = setup(root, &["claude"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(root.join(".claude/settings.json").is_file());
+    assert!(root.join(".bd/agents.lock.mutex").exists(), "setup serializes with bd agents pull here");
+}
+
+#[test]
+fn setup_ignores_a_broken_remote_config_above() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(dir.path(), ".bd/remote.toml", "not = [valid toml");
+    let inner = dir.path().join("inner");
+    std::fs::create_dir_all(inner.join(".git")).unwrap();
+    let (code, out) = setup(&inner, &["opencode"]);
+    assert_eq!(code, 0, "{out}");
+    assert!(inner.join("AGENTS.md").is_file());
+}
+
+#[test]
+fn setup_dry_run_writes_nothing() {
+    let ws = Ws::new();
+    let root = ws.dir.path();
+    let before = snapshot(root, &root.join(".home"));
+    for (harness, _) in SETUP_FILES {
+        let v = setup_json(root, &[harness, "--dry-run"]);
+        assert_eq!((&v["files"][0]["state"], &v["dry_run"]), (&"added".into(), &true.into()), "{harness}: {v}");
+    }
+    let (_, out) = setup(root, &["claude", "--dry-run"]);
+    assert!(out.contains("would add SessionStart, SubagentStart, PreToolUse hooks") && !out.contains("next:"), "{out}");
+    assert_eq!(snapshot(root, &root.join(".home")), before);
+    assert!(!root.join(".bd/agents.lock.mutex").exists());
+}
+
+#[test]
+fn setup_reports_conflicts_and_exits_1() {
+    let dir = git_project();
+    let root = dir.path();
+    write_file(root, ".codex/hooks.json", "not json");
+    let (code, out) = setup(root, &["codex"]);
+    assert_eq!(code, 1, "{out}");
+    assert!(out.contains("✗ .codex/hooks.json: left as it is: not valid JSON"), "{out}");
+    assert_eq!(read(root, ".codex/hooks.json").unwrap(), "not json");
+    write_file(root, "GEMINI.md", "<!-- BEGIN bd setup: bd setup gemini --remove removes this section -->\nno end\n");
+    let v = {
+        let out = Ws::cmd_in(root, "tester", &["--json", "setup", "gemini"]).output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    assert_eq!(v["files"][0]["state"], "conflict", "{v}");
+    #[cfg(unix)]
+    {
+        std::fs::create_dir_all(root.join(".github/hooks")).unwrap();
+        std::fs::write(root.join("elsewhere.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(root.join("elsewhere.json"), root.join(".github/hooks/bd.json")).unwrap();
+        let (code, out) = setup(root, &["copilot"]);
+        assert!(code == 1 && out.contains("symlink"), "{out}");
+        assert_eq!(std::fs::read_to_string(root.join("elsewhere.json")).unwrap(), "{}");
+    }
+}
+
+#[test]
+fn setup_list_shows_every_recipe() {
+    let dir = git_project();
+    let root = dir.path();
+    assert_eq!(setup(root, &["opencode"]).0, 0);
+    let (code, out) = setup(root, &["--list"]);
+    assert_eq!(code, 0);
+    for (harness, file) in SETUP_FILES {
+        assert!(out.lines().any(|l| l.starts_with(harness) && l.contains(file)), "{harness}: {out}");
+    }
+    let v = setup_json(root, &["--list"]);
+    let items = v.as_array().unwrap();
+    assert_eq!(items.len(), 6);
+    for item in items {
+        for key in ["name", "kind", "files", "state"] {
+            assert!(item.get(key).is_some(), "{item}");
+        }
+    }
+    assert_eq!(items[5]["state"], "present");
+    assert_eq!(items[0]["state"], "missing");
+    for args in [&["--list", "claude"][..], &["--list", "--remove"], &["--list", "--dry-run"], &[]] {
+        assert_eq!(setup(root, args).0, 2, "{args:?}");
+    }
+}
+
+#[test]
+fn setup_refuses_outside_a_project() {
+    let dir = tempfile::tempdir().unwrap();
+    if dir.path().ancestors().any(|d| d.join(".bd").is_dir() || d.join(".git").exists()) {
+        eprintln!("skipped: {} is inside a project", dir.path().display());
+        return;
+    }
+    let out =
+        Ws::cmd_in(dir.path(), "tester", &["-C", dir.path().to_str().unwrap(), "setup", "claude"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no .bd or .git in"), "{out:?}");
+    assert!(!dir.path().join(".claude").exists());
 }

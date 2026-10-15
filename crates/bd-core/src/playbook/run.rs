@@ -736,7 +736,7 @@ impl WriteCtx<'_> {
             set_metadata: vec![("playbook".into(), pb)],
             ..Default::default()
         };
-        self.update_issue_as(run, &patch, &Guard::default(), false, true)?;
+        self.update_issue_as(run, &patch, &Guard::default(), false, true, crate::issues::UpdateEvent::UPDATED)?;
         let set: BTreeSet<String> = removed.iter().cloned().collect();
         self.delete_quietly(&set, "run_compacted", Some(run), json!({}), opts.take_over)?;
         Ok(CompactOutcome { run: issues::require(self.conn(), run)?, removed, digest, dry_run: false })

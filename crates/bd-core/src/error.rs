@@ -71,6 +71,14 @@ pub enum Error {
         floor: i64,
     },
 
+    /// `show --as-of` a point before the retained history of the issue:
+    /// events older than `floor` (recorded at `floor_ts`) were pruned.
+    HistoryPruned {
+        id: String,
+        floor: i64,
+        floor_ts: Option<crate::time::Timestamp>,
+    },
+
     Busy(String),
 
     /// Another bd process holds a lock file (not the database) past the
@@ -134,6 +142,11 @@ impl std::fmt::Display for Error {
             Error::EventsTruncated { since, floor } => write!(
                 f,
                 "event cursor {since} is behind retained history (oldest retained seq is {floor}); re-baseline from an export"
+            ),
+            Error::HistoryPruned { id, floor, floor_ts } => write!(
+                f,
+                "history of {id} before seq {floor} ({}) was pruned (events.retain_days/retain_rows, events prune)",
+                floor_ts.map(|t| t.to_rfc3339()).unwrap_or_else(|| "no events retained".into())
             ),
             Error::Busy(msg) => write!(f, "database is busy: {msg}"),
             Error::SchemaTooNew { found, supported } => {
@@ -202,6 +215,7 @@ impl Error {
             Error::Cycle { .. } => "cycle",
             Error::Refused(_) => "refused",
             Error::EventsTruncated { .. } => "events_truncated",
+            Error::HistoryPruned { .. } => "history_pruned",
             Error::Busy(_) | Error::Locked(_) => "busy",
             Error::SchemaTooNew { .. } => "schema_too_new",
             Error::NoWorkspace(_) => "no_workspace",
@@ -227,7 +241,7 @@ impl Error {
             | Error::ClaimsHeld { .. }
             | Error::LeaseLost { .. } => 4,
             Error::Busy(_) | Error::Locked(_) => 5,
-            Error::EventsTruncated { .. } => 6,
+            Error::EventsTruncated { .. } | Error::HistoryPruned { .. } => 6,
             Error::Unauthorized(_) => 7,
             Error::Remote(_) => 8,
             Error::AnswerLost(_) => 9,

@@ -352,8 +352,11 @@ Update fields of an issue
 
 Only the fields given change. --if-revision, --if-status and --if-assignee make
 the update conditional: if the issue changed meanwhile, nothing is written and
-bd exits 13. Closing and reopening go through `bd close` and `bd reopen`;
-claiming and releasing through `bd claim` and `bd release`.";
+bd exits 13. Closing and reopening go through `bd close` and `bd reopen`.
+
+Updating also claims and releases: --status in_progress (with an assignee)
+grants the assignee a lease, a new --assignee moves it, and leaving in_progress
+drops it. `bd claim` also checks that the issue is ready.";
 
 const UPDATE_EXAMPLES: &str = "\
 Examples:

@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 // The evidence for changing how complexity is judged and which model and effort each role gets: every change playbook
 // run's complexity estimate and judged complexity, its score, the findings its review filed, and who did the work with
-// which model and effort at what cost (Copilot AI credits, as USD) and for how long: agent busy time (model requests and the tools they ran,
+// which model and effort at what cost (Copilot AI credits as USD, Claude Code tokens at list prices) and for how long: agent busy time (model requests and the tools they ran,
 // per agent and step) next to cost, each step's elapsed time, and the human wait at gates (armed to resolved), apart.
 //
 //   node .github/scripts/calibrate.mjs [--root <checkout>] [--sessions <dir>] [--projects <dir>] [--json] [--write]
 //
 // Read-only unless --write, which stores a backfilled trace as the work metadata of a run that has none. Traces come from
 // the run's work metadata, else from trace-run on this machine's Copilot session logs and Claude Code transcripts. Costs are the AI credits
-// Copilot logged per request (1 credit = $0.01); a stored trace without them, and every Claude Code request, is unpriced. Timing
+// Copilot logged per request (1 credit = $0.01), else, for Claude Code requests, notional list prices from prices.json;
+// a request with neither (an older Copilot trace, a model the table lacks) is unpriced. Timing
 // (step elapsed times, gate waits) is read from the bd list at report time, not from the stored trace, which is written
 // before the run's last steps and its score gate close.
 import { execFileSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { activeMs, bdRunner, fmtDuration, logDirs, readRecord, stepFrom, timingOf, trace } from './trace-run.mjs'
 
@@ -39,8 +41,30 @@ export function roleOf(agent) {
 const USD_PER_CREDIT = 0.01
 const NANO = 1e9
 
-/** USD for a token count from the AI credits it cost (nano_aiu); null when the trace recorded none (an older trace). */
-export const costOf = (tokens) => (typeof tokens?.nano_aiu === 'number' ? (tokens.nano_aiu / NANO) * USD_PER_CREDIT : null)
+/** List prices for Claude Code requests (prices.json): USD per million tokens per model, and the cache write multipliers. */
+export const PRICES = JSON.parse(readFileSync(fileURLToPath(new URL('./prices.json', import.meta.url)), 'utf8'))
+
+/**
+ * USD for an agent's token count: the AI credits Copilot logged (nano_aiu), else the model's list prices (a Claude Code
+ * agent: input, output, cache reads, and cache writes at input x the 5-minute or, for cache_write_1h, the 1-hour
+ * multiplier); null when neither applies (an older Copilot trace, a model the table lacks). Output a transcript did not
+ * record (output_unknown) costs nothing here and is counted apart.
+ */
+export function costOf(tokens, model, prices = PRICES) {
+  if (typeof tokens?.nano_aiu === 'number') return (tokens.nano_aiu / NANO) * USD_PER_CREDIT
+  const p = model ? prices.models?.[model] : undefined
+  if (!tokens || !p) return null
+  const hour = tokens.cache_write_1h ?? 0
+  const five = Math.max(0, (tokens.cache_write ?? 0) - hour)
+  return (
+    ((tokens.input ?? 0) * p.input +
+      (tokens.output ?? 0) * p.output +
+      (tokens.cache_read ?? 0) * p.cache_read +
+      five * p.input * prices.cache_write_multiplier +
+      hour * p.input * (prices.cache_write_1h_multiplier ?? prices.cache_write_multiplier)) /
+    1e6
+  )
+}
 
 /** Why a trace can't stand for the run's work, or null when it can. */
 export function untracedWhy(work) {
@@ -145,7 +169,7 @@ export function overlaps(runs) {
 }
 
 /** The joined runs reduced to what a rules review reads. */
-export function aggregate(runs) {
+export function aggregate(runs, prices = PRICES) {
   const overlap = overlaps(runs)
   const withGap = runs.filter((r) => r.estimate != null && complexityOf(r) != null)
   const gaps = withGap.map((r) => complexityOf(r) - r.estimate)
@@ -167,18 +191,21 @@ export function aggregate(runs) {
   const runCosts = new Map()
   for (const r of runs)
     for (const a of agentsOf(r)) {
-      const c = costOf(a.tokens)
-      const rc = runCosts.get(r.id) ?? { cost: 0, unpriced: 0 }
+      const c = costOf(a.tokens, a.model, prices)
+      const unknown = a.tokens?.output_unknown ?? 0
+      const rc = runCosts.get(r.id) ?? { cost: 0, unpriced: 0, outputUnknown: 0 }
+      rc.outputUnknown += c == null ? 0 : unknown
       if (c == null) rc.unpriced += a.requests
       else rc.cost += c
       runCosts.set(r.id, rc)
       // An overlapping run's requests are already in the run kept for its group.
       if (overlap.excluded.has(r.id)) continue
       const key = `${roleOf(a)}\0${a.model}\0${a.effort}`
-      const x = roles.get(key) ?? { role: roleOf(a), model: a.model, effort: a.effort, runs: new Set(), requests: 0, cost: 0, activeMs: 0, unpriced: 0 }
+      const x = roles.get(key) ?? { role: roleOf(a), model: a.model, effort: a.effort, runs: new Set(), requests: 0, cost: 0, activeMs: 0, unpriced: 0, outputUnknown: 0 }
       x.runs.add(r.id)
       x.requests += a.requests
       x.activeMs += activeMs(a)
+      x.outputUnknown += c == null ? 0 : unknown
       if (c == null) x.unpriced += a.requests
       else x.cost += c
       roles.set(key, x)
@@ -249,17 +276,18 @@ export function aggregate(runs) {
 const n = (x, digits = 1) => (x == null ? '–' : Number.isInteger(x) ? String(x) : x.toFixed(digits))
 const usd = (x) => (x == null ? '–' : `$${x.toFixed(2)}`)
 const k = (x) => (x >= 1000 ? `${Math.round(x / 1000)}k` : String(x))
-const runCost = (c) => (c ? usd(c.cost) + (c.unpriced ? ` + ${c.unpriced} req unpriced` : '') : '–')
+const extras = (c) => (c.outputUnknown ? ` + ${c.outputUnknown} req output unknown` : '') + (c.unpriced ? ` + ${c.unpriced} req unpriced` : '')
+const runCost = (c) => (c ? usd(c.cost) + extras(c) : '–')
 const dur = fmtDuration
 const table = (head, rows) => [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`, ...rows.map((r) => `| ${r.join(' | ')} |`)].join('\n')
 
 /** The report as markdown. */
-export function render(runs, agg) {
+export function render(runs, agg, prices = PRICES) {
   const gapCell = (r) => (r.estimate != null && complexityOf(r) != null ? n(complexityOf(r) - r.estimate) : '–')
   return [
     `# Calibration report`,
     ``,
-    `${agg.runs} change playbook runs: ${agg.scored} scored, ${agg.traced} traced. Costs are Copilot AI credits as USD (1 credit = $0.01).`,
+    `${agg.runs} change playbook runs: ${agg.scored} scored, ${agg.traced} traced. Costs are Copilot AI credits as USD (1 credit = $0.01) and, for Claude Code requests, notional list prices (${prices.source}).`,
     ``,
     `## Runs`,
     ``,
@@ -328,13 +356,13 @@ export function render(runs, agg) {
             x.effort,
             x.runs,
             x.requests,
-            usd(x.cost) + (x.unpriced ? ` + ${x.unpriced} req unpriced` : ''),
+            usd(x.cost) + extras(x),
             dur(x.activeMs),
           ]),
         )
       : 'No traced runs.',
     ``,
-    `Roles come from agent labels (main thread, workflow roles, subagent descriptions); "other" is a subagent whose description names no role. A request with no logged credits (a trace stored by an older version) is unpriced, so its cost is low.`,
+    `Roles come from agent labels (main thread, workflow roles, subagent descriptions); "other" is a subagent whose description names no role. A Copilot request with no logged credits (a trace stored by an older version), or a Claude Code request whose model the price table lacks, is unpriced, so its cost is low; so is a Claude Code request whose output its transcript did not record (most subagent and workflow requests), counted as output unknown. ${prices.note}`,
     ``,
     `Agent time is the primary time figure: each agent's busy time per step, its model requests and the tools they ran, summed (parallel agents add up, like cost; time an agent sat idle between turns, waited on a person or on another agent is left out). A Copilot request's start is its record's time less its duration, a Claude Code request's its api-request entry; traces stored before version 4 hold each agent's first request to the end of its last (or, before end times were recorded, its last request's start), which includes such waits. Elapsed (a step: its claim or the previous step's close, whichever is earlier, to its close; a run: created to last close) includes idle gaps and is context only. Human wait (human gates, armed to resolved) is counted apart from both.`,
     ...(agg.overlaps.groups.length

@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { aggregate, costOf, joinRuns, overlaps, render, roleOf, untracedWhy } from './calibrate.mjs'
+import { aggregate, costOf, joinRuns, overlaps, PRICES, render, roleOf, untracedWhy } from './calibrate.mjs'
 
 // credits: the AI credits a request cost; left out, a trace stored without them.
 const tokens = (input, output, cache_read = 0, cache_write = 0, credits) => ({ input, output, cache_read, cache_write, ...(credits == null ? {} : { nano_aiu: credits * 1e9 }) })
@@ -47,6 +47,45 @@ describe('costOf', () => {
 	it('has no cost for a trace stored without credits', () => {
 		expect(costOf(tokens(1, 1))).toBeNull()
 		expect(costOf(undefined)).toBeNull()
+	})
+
+	const table = {
+		cache_write_multiplier: 1.25,
+		cache_write_1h_multiplier: 2,
+		models: { 'claude-opus-5-5': { input: 4, output: 20, cache_read: 0.2 } },
+	}
+	it("prices a Claude Code agent's tokens at the model's list prices, cache writes by their TTL", () => {
+		// 1M input $4, 1M output $20, 1M cache read $0.20, 1M 5-minute writes $5 and 1M 1-hour writes $8.
+		const t = { input: 1e6, output: 1e6, cache_read: 1e6, cache_write: 2e6, cache_write_1h: 1e6, output_unknown: 3 }
+		expect(costOf(t, 'claude-opus-5-5', table)).toBeCloseTo(37.2)
+		// Without a split by TTL, every write is a 5-minute one.
+		expect(costOf({ input: 0, output: 0, cache_read: 0, cache_write: 1e6 }, 'claude-opus-5-5', table)).toBeCloseTo(5)
+	})
+
+	it('prefers logged credits, and leaves a model the table lacks unpriced', () => {
+		expect(costOf(tokens(1e6, 1e6, 0, 0, 100), 'claude-opus-5-5', table)).toBeCloseTo(1)
+		expect(costOf(tokens(1e6, 1e6), 'claude-opus-5.5', table)).toBeNull()
+		expect(costOf(tokens(1e6, 1e6), undefined, table)).toBeNull()
+	})
+
+	it('ships list prices for the current Claude models', () => {
+		for (const m of ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'])
+			expect(Object.keys(PRICES.models[m]).toSorted()).toEqual(['cache_read', 'input', 'output'])
+		expect(PRICES).toMatchObject({ cache_write_multiplier: 1.25, cache_write_1h_multiplier: 2 })
+		expect(typeof PRICES.source).toBe('string')
+	})
+
+	it('totals list-priced Claude Code agents with credit-priced ones, counting unrecorded output apart', () => {
+		const claude = { ...agent('main', 'main', 4, { input: 1e6, output: 0, cache_read: 0, cache_write: 0, cache_write_1h: 0, output_unknown: 2 }, 'claude-opus-5-5') }
+		const copilot = agent('workflow', 'plan-implement-review:review:code:r0', 2, tokens(1, 1, 0, 0, 100))
+		const unknown = agent('subagent', 'Explore: x', 1, { input: 5, output: 0 }, 'claude-mystery-9')
+		const agg = aggregate([{ id: 'r', work: work(claude, copilot, unknown) }], { ...table, source: 'test table', note: 'test note' })
+		expect(agg.roles.find((x) => x.role === 'main')).toMatchObject({ cost: 4, outputUnknown: 2, unpriced: 0 })
+		expect(agg.roles.find((x) => x.role === 'other')).toMatchObject({ cost: 0, unpriced: 1, outputUnknown: 0 })
+		const md = render([{ id: 'r', tier: 'small', findings: { serious: 0, minor: 0, followUps: [] }, traced: 'stored', work: work(claude, copilot, unknown) }], agg, { ...table, source: 'test table', note: 'test note' })
+		expect(md).toContain('$5.00 + 2 req output unknown + 1 req unpriced')
+		expect(md).toContain('notional list prices (test table)')
+		expect(md).toContain('test note')
 	})
 })
 
@@ -341,7 +380,7 @@ describe('overlaps', () => {
 		expect(md).toContain('| nested | small |')
 		expect(md).toContain('stored, overlaps (left out of totals)')
 		expect(md).toContain('nested + wide (totals use wide)')
-		expect(md).toContain('A request with no logged credits')
+		expect(md).toContain('A Copilot request with no logged credits')
 	})
 })
 

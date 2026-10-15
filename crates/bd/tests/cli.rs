@@ -1329,8 +1329,9 @@ fn backups_are_self_contained_copies_kept_by_count() {
     let mut left: Vec<String> =
         std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     left.sort();
-    let newest: Vec<String> = files[1..].iter().map(|f| f.file_name().unwrap().to_str().unwrap().into()).collect();
-    assert_eq!(left, newest, "the oldest was deleted");
+    let mut newest: Vec<String> = files[1..].iter().map(|f| f.file_name().unwrap().to_str().unwrap().into()).collect();
+    newest.push("t.lock".into());
+    assert_eq!(left, newest, "the oldest was deleted; backups of t take turns under t.lock");
 
     // A copy is a whole workspace on its own.
     let restore = tempfile::tempdir().unwrap();
@@ -1344,7 +1345,11 @@ fn backups_are_self_contained_copies_kept_by_count() {
     assert!(text.starts_with("✓ Backed up ") && text.contains("nightly.v1-"), "{text}");
     let quiet = ws.ok(&["-q", "backup", "--to", "backups", "--name", "nightly.v1", "--keep", "0"]);
     assert!(Path::new(quiet.trim()).is_file(), "{quiet}");
-    assert_eq!(std::fs::read_dir(ws.dir.path().join("backups").join("nightly.v1")).unwrap().count(), 2);
+    assert_eq!(
+        std::fs::read_dir(ws.dir.path().join("backups").join("nightly.v1")).unwrap().count(),
+        3,
+        "2 and the lock"
+    );
     assert_eq!(ws.code_as("tester", &["backup", "--to", "backups", "--name", "../up"]), 2);
     #[cfg(unix)]
     {

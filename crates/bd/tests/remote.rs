@@ -2452,7 +2452,7 @@ fn shutdown_stops_background_jobs_without_waiting_for_gh() {
     let leftovers: Vec<String> = std::fs::read_dir(backups.path().join("proj"))
         .unwrap()
         .map(|e| e.unwrap().file_name().into_string().unwrap())
-        .filter(|n| !n.ends_with(".db"))
+        .filter(|n| !n.ends_with(".db") && n != "proj.lock")
         .collect();
     assert!(leftovers.is_empty(), "no unfinished backup: {leftovers:?}");
 }

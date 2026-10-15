@@ -361,6 +361,9 @@ workspace is copied to `/backups/<name>/<name>-<UTC time>.db` (e.g.
   complete.
 - The copy just written is never deleted, even if older copies are dated
   after it (the clock was wrong); the server warns then.
+- Backups of one name in one directory take turns, under an OS lock on
+  `<name>.lock` there, so a `bd backup` and the server can share a
+  directory; one that waits more than a minute fails and is retried.
 - On Unix, files are created 0600 and the directories bd creates 0700.
   Keep them on another disk, or ship them elsewhere.
 

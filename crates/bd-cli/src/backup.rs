@@ -3,9 +3,12 @@
 //! local one. A backup is a [`Store::snapshot`] (`VACUUM INTO`, checked and
 //! flushed) written under a temporary name and then renamed to
 //! `<backup dir>/<name>/<name>-<UTC time>.db`; the newest `keep` are kept. The
-//! next backup removes the temporary file of an unfinished one.
+//! next backup removes the temporary file of an unfinished one. Backups of one
+//! name in one directory take turns, under an OS lock on `<name>.lock` there,
+//! so one never removes another's temporary file or replaces its backup.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use bd_core::{Result, Store};
 
@@ -16,6 +19,9 @@ use crate::protocol::valid_workspace_name;
 
 /// Backup file times: UTC, sortable, and valid in file names everywhere.
 pub const STAMP: &str = "%Y%m%dT%H%M%S%.3fZ";
+
+/// How long a backup waits for another backup of its name in its directory.
+const LOCK_WAIT: Duration = Duration::from_secs(60);
 
 /// A backup just written.
 #[derive(Debug)]
@@ -45,9 +51,17 @@ pub fn take(store: &Store, base: &Path, name: &str, keep: usize) -> Result<Taken
 pub fn take_with(base: &Path, name: &str, keep: usize, snapshot: impl FnOnce(&Path) -> Result<()>) -> Result<Taken> {
     let dir = base.join(name);
     create_private_dir(&dir)?;
+    let _turn = lock(&dir, name, LOCK_WAIT)?;
     remove_unfinished(&dir, name);
-    let file_name = format!("{name}-{}.db", chrono::Utc::now().format(STAMP));
-    let (tmp, file) = (dir.join(format!("{file_name}.tmp")), dir.join(&file_name));
+    let (tmp, file) = loop {
+        let file_name = format!("{name}-{}.db", chrono::Utc::now().format(STAMP));
+        let file = dir.join(&file_name);
+        // The previous backup finished within this millisecond.
+        if !file.exists() {
+            break (dir.join(format!("{file_name}.tmp")), file);
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
     snapshot(&tmp)?;
     std::fs::rename(&tmp, &file).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
@@ -114,6 +128,30 @@ pub fn create_private_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
     builder.create(dir)
+}
+
+/// Take the OS lock on `<dir>/<name>.lock`, waiting up to `wait` for another
+/// backup of `name` there to finish. The lock is released when the file is
+/// dropped, or when its process ends however it ends; the file stays.
+fn lock(dir: &Path, name: &str, wait: Duration) -> Result<std::fs::File> {
+    let path = dir.join(format!("{name}.lock"));
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    let deadline = Instant::now() + wait;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {}
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+        if Instant::now() >= deadline {
+            return Err(bd_core::Error::Locked(format!(
+                "another backup of {name} is being written in {} ({} is locked); retry",
+                dir.display(),
+                path.display()
+            )));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// Remove what an unfinished backup left behind (the process stopped during it).
@@ -259,6 +297,40 @@ mod tests {
         let second = take(&store, out.path(), "proj", 0).unwrap();
         assert_eq!((second.removed, second.kept), (0, 3), "0 keeps all");
         assert_eq!(files(&dir, "proj").unwrap(), [first.file, second.file, future]);
+    }
+
+    #[test]
+    fn backups_of_one_name_take_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = lock(dir.path(), "proj", Duration::ZERO).unwrap();
+        let err = lock(dir.path(), "proj", Duration::from_millis(100)).unwrap_err();
+        assert!(matches!(err, bd_core::Error::Locked(_)), "{err}");
+        lock(dir.path(), "other", Duration::ZERO).unwrap();
+
+        drop(held);
+
+        // A backup waiting its turn leaves the holder's temporary file alone.
+        let base = tempfile::tempdir().unwrap();
+        let proj = base.path().join("proj");
+        create_private_dir(&proj).unwrap();
+        let held = lock(&proj, "proj", Duration::ZERO).unwrap();
+        let unfinished = proj.join("proj-20260104T000000.000Z.db.tmp");
+        std::fs::write(&unfinished, b"x").unwrap();
+        let other = {
+            let base = base.path().to_path_buf();
+            std::thread::spawn(move || {
+                take_with(&base, "proj", 0, |tmp| {
+                    std::fs::write(tmp, b"db")?;
+                    Ok(())
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(unfinished.exists() && !other.is_finished(), "waits for the holder");
+        drop(held);
+        let taken = other.join().unwrap().unwrap();
+        assert!(!unfinished.exists(), "removed once the holder is done");
+        assert_eq!(files(&proj, "proj").unwrap(), [taken.file], "the lock file is no backup");
     }
 
     #[test]

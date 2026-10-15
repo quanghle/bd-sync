@@ -92,7 +92,7 @@ pub use memory::{MemoryAction, MemoryWrite};
 pub use model::*;
 pub use policy::Policy;
 pub use queries::Queries;
-pub use ready::{BlockedIssue, ExplainOptions, NotReady, OpenChild, Readiness};
+pub use ready::{BlockedIssue, ExplainOptions, NotReady, OpenChild, Readiness, RootCause};
 pub use rename::{RenamePrefixOptions, RenamePrefixOutcome};
 pub use requests::RequestRecord;
 pub use schema::LATEST_VERSION as SCHEMA_VERSION;

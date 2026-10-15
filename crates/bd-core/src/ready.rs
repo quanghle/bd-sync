@@ -208,6 +208,10 @@ pub enum NotReady {
         detail: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         gate: Option<String>,
+        /// For a blocked parent: the ancestor, up from it, that is blocked by
+        /// something other than its own parent, and what blocks it.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        root: Option<RootCause>,
     },
     /// Deferred, itself (`source` is the issue) or through an ancestor;
     /// `until` when the deferral has an end still to come.
@@ -221,6 +225,40 @@ pub enum NotReady {
     WaitsOnChildren { open: usize, children: Vec<OpenChild> },
     /// Epics and gates are left out of the ready queue unless asked for.
     ExcludedType { issue_type: String },
+}
+
+/// The blocked ancestor a parent's block comes from: `id` (the parent itself,
+/// or one of its ancestors) and the issues blocking it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RootCause {
+    pub id: String,
+    pub blockers: Vec<String>,
+}
+
+/// How many ancestors [`root_cause`] climbs before it gives up.
+const ANCESTORS_FOLLOWED: usize = 64;
+
+/// Up from the blocked `parent` through blocked parents, to the first one
+/// blocked by something other than its parent; `None` when the climb ends
+/// before one (a damaged database: a parent cycle, or `is_blocked` drift).
+fn root_cause(conn: &Connection, parent: &str) -> Result<Option<RootCause>> {
+    let mut seen = HashSet::new();
+    let mut cur = parent.to_string();
+    for _ in 0..ANCESTORS_FOLLOWED {
+        if !seen.insert(cur.clone()) {
+            return Ok(None);
+        }
+        let (parents, others): (Vec<_>, Vec<_>) =
+            graph::blockers(conn, &cur)?.into_iter().partition(|b| b.kind == BlockerKind::Parent);
+        if !others.is_empty() {
+            return Ok(Some(RootCause { id: cur, blockers: others.into_iter().map(|b| b.id).collect() }));
+        }
+        match parents.into_iter().next() {
+            Some(p) => cur = p.id,
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 /// A child that is not closed, as a parent's [`NotReady::WaitsOnChildren`] names it.
@@ -247,6 +285,14 @@ impl NotReady {
             NotReady::Claimed { holder, expires_at, reclaimable, .. } => {
                 let then = if *reclaimable { "reclaimable" } else { "reclaimable once lease.grace passes" };
                 format!("claimed by {holder} (lease expired {expires_at}, {then})")
+            }
+            NotReady::Blocked { id: blocker, root: Some(root), .. } => {
+                let by = root.blockers.join(", ");
+                if &root.id == blocker {
+                    format!("blocked by {blocker} (parent is blocked by {by})")
+                } else {
+                    format!("blocked by {blocker} (parent is blocked: ancestor {} is blocked by {by})", root.id)
+                }
             }
             NotReady::Blocked { id: blocker, detail, .. } => format!("blocked by {blocker} ({detail})"),
             NotReady::Deferred { source, until } => {
@@ -334,6 +380,7 @@ pub fn explain(conn: &Connection, issue: &Issue, now: Timestamp, opts: ExplainOp
                 .map(|s| s.kind.as_str().to_string()),
             BlockerKind::Conditional | BlockerKind::Parent => None,
         };
+        let root = if b.kind == BlockerKind::Parent { root_cause(conn, &b.id)? } else { None };
         reasons.push(NotReady::Blocked {
             id: b.id,
             title: b.title,
@@ -341,6 +388,7 @@ pub fn explain(conn: &Connection, issue: &Issue, now: Timestamp, opts: ExplainOp
             via: b.kind,
             detail: b.detail,
             gate,
+            root,
         });
     }
     if !opts.include_deferred

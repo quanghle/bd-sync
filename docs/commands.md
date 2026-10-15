@@ -68,8 +68,9 @@ and `show` does with `brief: true`.
 `bd show ID --why` says whether the issue is ready and, if not, every reason:
 its status, a claim (holder and lease expiry, never the token), each open
 blocker with how it blocks (`blocks`, `conditional`, `waits_for` with its
-gate, `parent` for a blocked parent; `gate` also names the kind of a gate
-issue that blocks it), a deferral of the issue or an ancestor, open children
+gate, `parent` for a blocked parent, with `root`: the ancestor up from it
+that something other than its parent blocks, and those blockers; `gate`
+also names the kind of a gate issue that blocks it), a deferral of the issue or an ancestor, open children
 coming first, or a type the queue leaves out (epic, gate). Text adds
 `Ready: yes` or a `Not ready:` list after the status lines; JSON adds
 `why: {ready, reasons: [{kind, ...}]}` to each issue, brief or full.

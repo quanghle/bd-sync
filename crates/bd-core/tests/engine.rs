@@ -2268,6 +2268,7 @@ fn explain_names_blockers_with_their_gates() {
             via: BlockerKind::Blocks,
             detail: "blocker is open".into(),
             gate: None,
+            root: None,
         }]
     );
     assert_eq!(texts(&env, &blocked, &why.reasons), [format!("blocked by {blocker} (blocker is open)")]);
@@ -2279,6 +2280,23 @@ fn explain_names_blockers_with_their_gates() {
         "{why:?}"
     );
     assert_eq!(serde_json::to_value(&why.reasons[0]).unwrap()["via"], "parent");
+    let root = RootCause { id: blocked.clone(), blockers: vec![blocker.clone()] };
+    assert!(matches!(&why.reasons[..], [NotReady::Blocked { root: Some(r), .. }] if r == &root), "{why:?}");
+    assert_eq!(texts(&env, &kid, &why.reasons), [format!("blocked by {blocked} (parent is blocked by {blocker})")]);
+    // Further down, the parent is named and the ancestor actually blocked.
+    let grandkid =
+        env.create_with(NewIssue { title: "Grandkid".into(), parent: Some(kid.clone()), ..Default::default() });
+    let why = explain(&env, &grandkid, ExplainOptions::default());
+    assert!(
+        matches!(&why.reasons[..], [NotReady::Blocked { id, via: BlockerKind::Parent, root: Some(r), .. }] if id == &kid && r == &root),
+        "{why:?}"
+    );
+    assert_eq!(
+        texts(&env, &grandkid, &why.reasons),
+        [format!("blocked by {kid} (parent is blocked: ancestor {blocked} is blocked by {blocker})")]
+    );
+    let json = serde_json::to_value(&why.reasons[0]).unwrap();
+    assert_eq!(json["root"], serde_json::json!({"id": blocked, "blockers": [blocker]}));
     let why = explain(&env, &maybe, ExplainOptions::default());
     assert!(matches!(&why.reasons[..], [NotReady::Blocked { via: BlockerKind::Conditional, gate: None, .. }]));
 

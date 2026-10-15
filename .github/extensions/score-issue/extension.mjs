@@ -232,7 +232,7 @@ const scoreIssue = defineWorkflow({
             "and stores a draft score, for the playbook to accept or a person to confirm. Use for scoring finished agent work on a bd issue, epic or playbook run, e.g. from a playbook's score step. " +
             "args: { issue, range?, workdir?, base?, result?, context?, actor?, dryRun? }. The judge reads the rubric, the issue and its children, comments, history " +
             "and the change, and scores each dimension with evidence, plus the work's complexity (kept out of overall). Then .github/scripts/trace-run.mjs traces " +
-            "which agents did each step with which model and effort, and for how long, from the Copilot CLI sessions on this machine (after the judge, which is shown " +
+            "which agents did each step with which model and effort, and for how long, from the Copilot CLI sessions and Claude Code transcripts on this machine (after the judge, which is shown " +
             "neither the trace nor the estimate), into the issue's work metadata. range is the git revision range of the change (e.g. main..my-branch); without it the " +
             "judge finds the commits named in close reasons and comments, or by `git log --all --grep=<issue>`. workdir (with base, default main) points at uncommitted " +
             "work in a worktree. result is a plan-implement-review result, summarized as evidence; context is free text from the caller (e.g. what a person had to " +

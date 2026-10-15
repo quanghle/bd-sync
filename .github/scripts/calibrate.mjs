@@ -1,21 +1,19 @@
 #!/usr/bin/env node
 // The evidence for changing how complexity is judged and which model and effort each role gets: every change playbook
 // run's complexity estimate and judged complexity, its score, the findings its review filed, and who did the work with
-// which model and effort at what cost (Copilot AI credits, as USD) and for how long: agent active time (first request to the end of the last,
+// which model and effort at what cost (Copilot AI credits, as USD) and for how long: agent busy time (model requests and the tools they ran,
 // per agent and step) next to cost, each step's elapsed time, and the human wait at gates (armed to resolved), apart.
 //
-//   node .github/scripts/calibrate.mjs [--root <checkout>] [--sessions <dir>] [--json] [--write]
+//   node .github/scripts/calibrate.mjs [--root <checkout>] [--sessions <dir>] [--projects <dir>] [--json] [--write]
 //
 // Read-only unless --write, which stores a backfilled trace as the work metadata of a run that has none. Traces come from
-// the run's work metadata, else from trace-run on this machine's session logs. Costs are the AI credits Copilot logged per
-// request (1 credit = $0.01); a stored trace without them is unpriced. Timing
+// the run's work metadata, else from trace-run on this machine's Copilot session logs and Claude Code transcripts. Costs are the AI credits
+// Copilot logged per request (1 credit = $0.01); a stored trace without them, and every Claude Code request, is unpriced. Timing
 // (step elapsed times, gate waits) is read from the bd list at report time, not from the stored trace, which is written
 // before the run's last steps and its score gate close.
 import { execFileSync } from 'node:child_process'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { activeMs, bdRunner, fmtDuration, readRecord, stepFrom, timingOf, trace } from './trace-run.mjs'
+import { activeMs, bdRunner, fmtDuration, logDirs, readRecord, stepFrom, timingOf, trace } from './trace-run.mjs'
 
 // ---------- roles ----------
 // What an agent did, from its trace label: 'main', a workflow's '<workflow>:<role>[:...]', or a subagent's
@@ -338,7 +336,7 @@ export function render(runs, agg) {
     ``,
     `Roles come from agent labels (main thread, workflow roles, subagent descriptions); "other" is a subagent whose description names no role. A request with no logged credits (a trace stored by an older version) is unpriced, so its cost is low.`,
     ``,
-    `Agent time is the primary time figure: each agent's span from its first request to the end of its last, per step, summed (parallel agents add up, like cost; a main thread's span includes time it waited on its own agents or on a person). A request's start is its record's time less its duration; traces stored before end times were recorded stop at the last request's start. Elapsed (a step: its claim or the previous step's close, whichever is earlier, to its close; a run: created to last close) includes idle gaps and is context only. Human wait (human gates, armed to resolved) is counted apart from both.`,
+    `Agent time is the primary time figure: each agent's busy time per step, its model requests and the tools they ran, summed (parallel agents add up, like cost; time an agent sat idle between turns, waited on a person or on another agent is left out). A Copilot request's start is its record's time less its duration, a Claude Code request's its api-request entry; traces stored before version 4 hold each agent's first request to the end of its last (or, before end times were recorded, its last request's start), which includes such waits. Elapsed (a step: its claim or the previous step's close, whichever is earlier, to its close; a run: created to last close) includes idle gaps and is context only. Human wait (human gates, armed to resolved) is counted apart from both.`,
     ...(agg.overlaps.groups.length
       ? [
           ``,
@@ -358,7 +356,7 @@ export function render(runs, agg) {
 function main(argv) {
   const opt = (name) => (argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined)
   const root = opt('--root')
-  const sessionsDir = opt('--sessions') ?? join(process.env.COPILOT_HOME ?? join(homedir(), '.copilot'), 'session-state')
+  const dirs = logDirs(opt)
   const bd = bdRunner(root)
   const issues = bd(['list', '--all', '-n', '0'])
   // A run without a review step has no follow-ups; any other failure leaves the count unknown, not zero.
@@ -373,7 +371,7 @@ function main(argv) {
   }
   const traceOf = (id) => {
     try {
-      const work = trace(readRecord(id, bd), { sessionsDir })
+      const work = trace(readRecord(id, bd), dirs)
       const why = untracedWhy(work)
       return why ? { work: null, why } : { work, why: null }
     } catch (e) {

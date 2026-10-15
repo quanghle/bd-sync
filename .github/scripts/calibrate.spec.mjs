@@ -117,6 +117,8 @@ describe('joinRuns', () => {
 
 	it('times the run from its direct children, never from nested findings', () => {
 		expect(rows[0].timing).toEqual({
+			start: '2026-10-15T01:00:00Z',
+			start_from: 'created',
 			elapsed_ms: 50 * 60_000,
 			human_wait_ms: 5 * 60_000,
 			steps: [
@@ -276,7 +278,7 @@ describe('aggregate and render', () => {
 		expect(md).toContain('| 2 | 1 | 0 | – | – | 10m 00s | 1h 00m |')
 		expect(md).toContain('| requirements | 2 | 10m 00s | 1 | 0s |')
 		expect(md).toContain('| implement | 1 | 20m 00s | 1 | 2m 00s |')
-		for (const phrase of ['Agent time is the primary time figure', "A request's start is its record's time less its duration", 'includes idle gaps and is context only', 'Human wait (human gates, armed to resolved) is counted apart'])
+		for (const phrase of ['Agent time is the primary time figure', "A Copilot request's start is its record's time less its duration", 'waited on a person or on another agent is left out', 'includes idle gaps and is context only', 'Human wait (human gates, armed to resolved) is counted apart'])
 			expect(md).toContain(phrase)
 	})
 

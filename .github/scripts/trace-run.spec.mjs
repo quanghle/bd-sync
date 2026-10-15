@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from './expect.mjs'
-import { activeMs, findSessions, fmtDuration, readRecord, requestsOf, sessionSuffix, summarize, timingOf, trace } from './trace-run.mjs'
+import { activeMs, copilotTools, findSessions, fmtDuration, minus, readRecord, requestsOf, sessionSuffix, summarize, timingOf, trace, unionMs } from './trace-run.mjs'
 
 const SESSION = '6f26e090-4089-4a32-bdd2-c49ba9c91d0b'
 const ACTOR = 'Quang Le/copilot-a9c91d0b'
@@ -73,6 +73,7 @@ describe('trace-run', () => {
   it('maps an agent actor to its session by the last 8 hex digits', () => {
     expect(sessionSuffix(ACTOR)).toBe('a9c91d0b')
     expect(sessionSuffix('Quang Le/copilot-a9c91d0b.w1')).toBe('a9c91d0b')
+    expect(sessionSuffix('Quang Le/copilot-a9c91d0b.Worker_1.agent-x')).toBe('a9c91d0b')
     expect(sessionSuffix('Quang Le')).toBeNull()
     expect(sessionSuffix('Quang Le/claude-a9c91d0b')).toBeNull()
     expect(sessionSuffix('Quang Le/copilot-../../etc')).toBeNull()
@@ -85,6 +86,8 @@ describe('trace-run', () => {
     expect(rs).toEqual([
       {
         id: 'r1',
+        harness: 'copilot',
+        agentId: '',
         ts: '2026-10-15T10:01:01.000Z',
         end: '2026-10-15T10:01:02.500Z',
         model: MODEL,
@@ -93,6 +96,7 @@ describe('trace-run', () => {
         owned: true,
         kind: 'main',
         label: 'main',
+        tools: [],
       },
     ])
     expect(requestsOf([use('2026-10-15T10:01:02Z', 'x', { effort: null })])[0].effort).toBe('unknown')
@@ -130,6 +134,7 @@ describe('trace-run', () => {
     expect(requirements.agents).toEqual([
       {
         actor: ACTOR,
+        harness: 'copilot',
         kind: 'main',
         label: 'main',
         model: MODEL,
@@ -151,7 +156,7 @@ describe('trace-run', () => {
     expect(t.outside_requests).toBe(2)
     expect(t.open_steps).toEqual(['squid-x.1.score'])
     expect(t.totals.find((x) => x.model === MODEL && x.effort === 'medium')).toMatchObject({ requests: 1, active_ms: 1000 })
-    expect(t.version).toBe(3)
+    expect(t.version).toBe(4)
     expect(t.timing).toMatchObject({ elapsed_ms: 30 * 60_000, human_wait_ms: 0, gates: [] })
     expect(t.timing.steps.map((s) => [s.step, s.start_from, s.elapsed_ms])).toEqual([
       ['squid-x.1.requirements', 'created', 10 * 60_000],
@@ -159,7 +164,7 @@ describe('trace-run', () => {
     ])
   })
 
-  it('times an agent from its first request to the end of its last, within a step', () => {
+  it('times an agent by its requests, not the idle time between them, within a step', () => {
     writeSession(sessions, SESSION, [
       use('2026-10-15T10:21:01Z', 's1', { agentId: 'a1', duration: 1000 }),
       use('2026-10-15T10:24:05Z', 's2', { agentId: 'a1', duration: 6000 }),
@@ -168,8 +173,53 @@ describe('trace-run', () => {
     const t = trace(record, { sessionsDir: sessions })
     const agent = t.steps.find((s) => s.step === 'squid-x.1.review').agents[0]
     expect(agent).toMatchObject({ requests: 2, first: '2026-10-15T10:21:00.000Z', last: '2026-10-15T10:23:59.000Z', end: '2026-10-15T10:24:05Z' })
-    expect(agent.active_ms).toBe(185_000)
-    expect(t.totals.find((x) => x.effort === 'medium').active_ms).toBe(185_000)
+    expect(agent.active_ms).toBe(7_000)
+    expect(t.totals.find((x) => x.effort === 'medium').active_ms).toBe(7_000)
+  })
+
+  it('counts the tools a request ran as busy, but not waits on a person, a permission prompt or another agent', () => {
+    const tool = (name, id, start, end, agentId) => [
+      { type: 'tool.execution_start', timestamp: start, ...(agentId ? { agentId } : {}), data: { toolCallId: id, toolName: name, arguments: SECRET } },
+      { type: 'tool.execution_complete', timestamp: end, ...(agentId ? { agentId } : {}), data: { toolCallId: id, result: SECRET } },
+    ]
+    writeSession(sessions, SESSION, [
+      use('2026-10-15T10:21:01Z', 'm1', { duration: 1000 }),
+      ...tool('bash', 'b1', '2026-10-15T10:21:01Z', '2026-10-15T10:22:01Z'), // a 60 s build
+      { type: 'permission.requested', timestamp: '2026-10-15T10:21:11Z', data: { permissionRequest: { toolCallId: 'b1' } } },
+      { type: 'permission.completed', timestamp: '2026-10-15T10:21:31Z', data: { toolCallId: 'b1' } }, // 20 s of it a person
+      ...tool('ask_user', 'q1', '2026-10-15T10:22:02Z', '2026-10-15T10:25:00Z'),
+      started('a1', { agentName: 'general-purpose', agentDisplayName: 'review', toolCallId: 't1' }),
+      ...tool('task', 't1', '2026-10-15T10:25:01Z', '2026-10-15T10:27:00Z'), // a foreground subagent: its own agent
+      ...tool('bash', 'b2', '2026-10-15T10:25:30Z', '2026-10-15T10:25:40Z', 'a1'),
+      use('2026-10-15T10:25:30Z', 's1', { agentId: 'a1', duration: 2000 }),
+      use('2026-10-15T10:29:01Z', 'm2', { duration: 1000 }), // after ten idle minutes
+    ])
+    const t = trace(record, { sessionsDir: sessions })
+    const [main, sub] = t.steps.find((s) => s.step === 'squid-x.1.review').agents
+    expect(main).toMatchObject({ kind: 'main', requests: 2, active_ms: 1_000 + 40_000 + 1_000 })
+    expect(sub).toMatchObject({ kind: 'subagent', requests: 1, active_ms: 2_000 + 10_000 })
+    expect(JSON.stringify(t)).not.toContain(SECRET)
+  })
+
+  it('reads tool spans from the events, each for its agent', () => {
+    const ev = (type, ts, data, agentId) => ({ type, timestamp: ts, ...(agentId ? { agentId } : {}), data })
+    const ms = (t) => Date.parse(t)
+    expect(
+      copilotTools([
+        ev('tool.execution_start', '2026-10-15T10:00:00Z', { toolCallId: 'a', toolName: 'bash' }, 'w1'),
+        ev('tool.execution_start', '2026-10-15T10:00:01Z', { toolCallId: 'b', toolName: 'read_agent' }),
+        ev('tool.execution_start', '2026-10-15T10:00:02Z', { toolCallId: 'c', toolName: 'view' }), // never completes
+        ev('tool.execution_complete', '2026-10-15T10:00:05Z', { toolCallId: 'a' }, 'w1'),
+        ev('tool.execution_complete', '2026-10-15T10:00:09Z', { toolCallId: 'b' }),
+      ]),
+    ).toEqual([{ agent: 'w1', span: [ms('2026-10-15T10:00:00Z'), ms('2026-10-15T10:00:05Z')] }])
+  })
+
+  it('measures intervals once where they overlap, and cuts holes out of one', () => {
+    expect(unionMs([])).toBe(0)
+    expect(unionMs([[0, 10], [5, 20], [30, 40], [40, 41], [50, 50], [NaN, 60]])).toBe(31)
+    expect(minus([0, 100], [[10, 20], [90, 200], [-5, 1]])).toEqual([[1, 10], [20, 90]])
+    expect(minus([0, 100], [[20, Infinity]])).toEqual([[0, 20]])
   })
 
   it('lists agent actors without a session log here as missing, and ignores people', () => {
@@ -177,7 +227,7 @@ describe('trace-run', () => {
     expect(t.missing).toEqual(['Quang Le/copilot-deadbeef'])
     // A session's sub-actor is the same missing session.
     expect(trace({ ...record, actors: [...record.actors, 'Quang Le/copilot-deadbeef.w1'] }, { sessionsDir: sessions }).missing).toEqual(['Quang Le/copilot-deadbeef'])
-    expect(t.sessions).toEqual([{ actor: ACTOR, session: SESSION }])
+    expect(t.sessions).toEqual([{ actor: ACTOR, session: SESSION, harness: 'copilot' }])
     expect(trace({ ...record, actors: ['Quang Le'] }, { sessionsDir: join(sessions, 'nope') }).steps).toEqual([])
   })
 
@@ -187,7 +237,7 @@ describe('trace-run', () => {
     expect(text).toContain('open steps not traced: score')
     expect(text).toContain('- requirements (elapsed 10m 00s): main (claude-opus-5.5, medium, 1 req, 1s)')
     expect(text).toContain('score-issue:judge (gpt-6-astra, xhigh, 1 req, 1s)')
-    expect(text).toContain('- claude-opus-5.5, medium: 1 req, 1s, in 22 (cache read 5), out 300, 2.0 credits')
+    expect(text).toContain('- copilot claude-opus-5.5, medium: 1 req, 1s, in 22 (cache read 5), out 300, 2.0 credits')
     expect(text).toMatch(/^Time: agents .* \(.*approximate\), human wait .*, elapsed .*idle gaps/m)
     expect(text).not.toContain(SECRET)
   })
@@ -229,6 +279,18 @@ describe('trace-run', () => {
         delete a.active_ms
       }
     expect(summarize({ ...t, timing: undefined })).toContain('- requirements (elapsed –): main (claude-opus-5.5, medium, 1 req, 0s)')
+  })
+
+  it('lists agent actors of a harness it does not read as untraced', () => {
+    const t = trace({ ...record, actors: [...record.actors, 'Quang Le/codex-9fba3d50', 'Quang Le/codex-9fba3d50', 'bd-serve'] }, { sessionsDir: sessions })
+    expect(t.untraced).toEqual(['Quang Le/codex-9fba3d50'])
+    expect(summarize(t)).toContain('; harness not traced: Quang Le/codex-9fba3d50')
+  })
+
+  it('summarizes a stored trace before version 4 with its own definition of agent time', () => {
+    const t = trace(record, { sessionsDir: sessions })
+    expect(summarize({ ...t, version: 3 })).toContain('(first to last request per agent and step, summed; approximate)')
+    expect(summarize(t)).toContain('(busy time per agent and step: model requests and the tools they ran, summed; approximate)')
   })
 
   it('never copies session content into the result', () => {
@@ -291,8 +353,14 @@ describe('timingOf', () => {
 		expect(t.elapsed_ms).toBe(31 * 60_000)
 	})
 
+	it('times an issue without steps from its first claim', () => {
+		const t = timingOf({ createdAt: at('01:00'), startedAt: at('10:00'), startFrom: 'claim', steps: [step('r', at('10:13'), at('10:05'))] })
+		expect(t).toMatchObject({ start: at('10:00'), start_from: 'claim', elapsed_ms: 13 * 60_000 })
+		expect(t.steps).toEqual([{ step: 'r', start: at('10:00'), start_from: 'claim', closed_at: at('10:13'), elapsed_ms: 13 * 60_000 }])
+	})
+
 	it('has no elapsed time while nothing is closed, and reads records without the new step fields', () => {
-		expect(timingOf({ createdAt: at('10:00'), steps: [step('r.a', null)] })).toEqual({ elapsed_ms: null, human_wait_ms: 0, steps: [], gates: [] })
+		expect(timingOf({ createdAt: at('10:00'), steps: [step('r.a', null)] })).toEqual({ start: at('10:00'), start_from: 'created', elapsed_ms: null, human_wait_ms: 0, steps: [], gates: [] })
 		expect(timingOf({ createdAt: at('10:00'), steps: [{ id: 'r.a', closedAt: at('10:01') }] }).steps).toEqual([
 			{ step: 'r.a', start: at('10:00'), start_from: 'created', closed_at: at('10:01'), elapsed_ms: 60_000 },
 		])
@@ -363,6 +431,8 @@ describe('readRecord', () => {
 		const r = readRecord('squid-x.1', bd)
 		expect(calls).toContainEqual(['list', '--all', '-n', '0', '--parent', 'squid-x.1'])
 		expect(r.createdAt).toBe('2026-10-15T10:00:00.000Z')
+		// A run starts at its creation, whoever claimed it.
+		expect(r).toMatchObject({ startedAt: '2026-10-15T10:00:00.000Z', startFrom: 'created' })
 		expect(r.steps).toEqual([
 			{ id: 'squid-x.1.requirements', closedAt: '2026-10-15T10:05:00.000Z', startedAt: '2026-10-15T10:01:00.000Z', type: 'task', gate: null },
 			{ id: 'squid-x.1.review', closedAt: null, startedAt: null, type: null, gate: null },
@@ -382,8 +452,29 @@ describe('readRecord', () => {
 		expect(readRecord('squid-x.1', fakeBd([], 'open').bd).steps).toEqual([{ id: 'squid-x.1', closedAt: null, startedAt: null, type: null, gate: null }])
 	})
 
+	it('starts an issue without steps at its first claim, else at its creation', () => {
+		const h = [
+			{ issue_id: 'bd-sync-8gdf', op: 'created', ts: '2026-10-15T01:02:45.370Z', actor: 'Quang Le/codex-9fba3d50' },
+			{ issue_id: 'bd-sync-8gdf', op: 'claimed', ts: '2026-10-15T22:10:01.482Z', actor: 'Quang Le/claude-249b6892' },
+			{ issue_id: 'bd-sync-8gdf', op: 'released', ts: '2026-10-15T22:11:00.000Z', actor: 'Quang Le/claude-249b6892' },
+			{ issue_id: 'bd-sync-8gdf', op: 'claimed', ts: '2026-10-15T22:12:00.000Z', actor: 'Quang Le/claude-249b6892' },
+			{ issue_id: 'bd-sync-8gdf', op: 'closed', ts: '2026-10-15T22:22:59.375Z', actor: 'Quang Le/claude-249b6892' },
+		]
+		const bd = (events) => (args) => (args[0] === 'history' ? events : args[0] === 'list' ? [] : { id: args[1], status: 'closed' })
+		expect(readRecord('bd-sync-8gdf', bd(h))).toMatchObject({ createdAt: '2026-10-15T01:02:45.370Z', startedAt: '2026-10-15T22:10:01.482Z', startFrom: 'claim' })
+		expect(readRecord('bd-sync-8gdf', bd(h.filter((e) => e.op !== 'claimed')))).toMatchObject({ startedAt: '2026-10-15T01:02:45.370Z', startFrom: 'created' })
+	})
+
+	it('takes ids whose prefix has hyphens', () => {
+		for (const id of ['bd-sync-8gdf', 'bd-sync-8gdf.review', 'bd-04ei']) {
+			const bd = (args) => (args[0] === 'history' ? [{ issue_id: id, op: 'created', ts: '2026-10-15T10:00:00.000Z', actor: 'Quang Le' }] : args[0] === 'list' ? [] : { id, status: 'open' })
+			expect(readRecord(id, bd).steps[0].id).toBe(id)
+		}
+	})
+
 	it('refuses anything but a bd issue id', () => {
-		expect(() => readRecord('squid-x.1; rm -rf /', fakeBd([]).bd)).toThrow('not a bd issue id')
+		for (const id of ['squid-x.1; rm -rf /', 'squid', '-bd-x', 'bd-x-', 'bd--x', 'Bd-x', 'bd-x y'])
+			expect(() => readRecord(id, fakeBd([]).bd)).toThrow('not a bd issue id')
 	})
 })
 

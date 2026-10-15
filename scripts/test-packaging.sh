@@ -3,6 +3,9 @@
 # and that the target and asset names agree with .github/workflows/release.yml.
 # Needs bash, curl, tar and python3 (or zip). Runs on Linux and macOS (bash 3.2).
 #   bash scripts/test-packaging.sh
+# SC2016: single quotes around bash -c scripts and literal patterns are meant.
+# SC2012: ls lists directories this script made, with names it chose.
+# shellcheck disable=SC2016,SC2012
 set -u
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -190,6 +193,8 @@ setup_fixture() {
 run_install() {
     local shell=$1
     shift
+    # ENVX is split into its NAME=value words, or is nothing.
+    # shellcheck disable=SC2086
     env -u BD_VERSION -u BD_REPO -u BD_INSTALL_DIR BD_RELEASES_URL="file://$FIXTURE" BD_ATTESTATION=skip \
         BD_INSTALL_DIR="$BIN" $ENVX "$shell" "$INSTALL_SH" "$@"
 }
@@ -235,7 +240,9 @@ test_install_sh() {
     rm -rf "$WORK/other" "$BIN"
     check "install --dir" run_install "$sh_cmd" --dir "$other"
     if [ ! -e "$BIN/bd" ] && [ "$("$other/bd" --version)" = "bd $VERSION" ] && [ "$(mode_of "$other/bd")" = "-rwxr-xr-x" ]; then ok "--dir overrides BD_INSTALL_DIR"; else bad "--dir overrides BD_INSTALL_DIR"; fi
-    if ls -A "$other" | grep -q '^\.bd\.tmp'; then bad "no staging file left behind"; else ok "no staging file left behind"; fi
+    local staged=
+    for f in "$other"/.bd.tmp*; do [ -e "$f" ] && staged=$f; done
+    if [ -n "$staged" ]; then bad "no staging file left behind"; else ok "no staging file left behind"; fi
 
     # Reinstall over an existing binary replaces it.
     rm -rf "$BIN"

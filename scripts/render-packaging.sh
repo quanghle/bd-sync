@@ -79,7 +79,7 @@ esac
 printf '%s\n' "$repo" | grep -Eq '^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$' || die "invalid --repo: $repo"
 owner=${repo%%/*}
 if [ -z "$scope" ]; then
-    scope=@$(printf '%s' "$owner" | tr 'A-Z' 'a-z')
+    scope=@$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
 fi
 printf '%s\n' "$scope" | grep -Eq '^@[a-z0-9][a-z0-9._-]*$' || die "invalid --npm-scope: $scope"
 [ -d "$dist" ] || die "--dist is not a directory: $dist"
@@ -131,7 +131,7 @@ mkdir -p "$out"
 mkdir -p "$out/homebrew"
 render "$templates/homebrew/bd.rb" >"$out/homebrew/bd.rb"
 
-lower=$(printf '%s' "$owner" | tr 'A-Z' 'a-z')
+lower=$(printf '%s' "$owner" | tr '[:upper:]' '[:lower:]')
 first=$(printf '%s' "$lower" | cut -c1)
 wdir=$out/winget/manifests/$first/$owner/bd/$version
 mkdir -p "$wdir"

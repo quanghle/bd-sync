@@ -139,3 +139,6 @@ try {
 
 if ($script:failures -gt 0) { throw "$($script:failures) install.ps1 test(s) failed" }
 Write-Host 'install.ps1 tests passed'
+# The last installer run failed on purpose: its $LASTEXITCODE must not
+# become this script's exit code (GitHub's pwsh steps exit with it).
+exit 0

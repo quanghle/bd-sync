@@ -304,16 +304,22 @@ const dedupe = (fs) => {
 // The main checkout (not a worktree): bd finds its workspace there, whether a remote server or a local database.
 const ROOT_CMD = 'dirname "$(git rev-parse --path-format=absolute --git-common-dir)"';
 
-// Opt-in shadow reviewers: each real reviewer also runs at these models and efforts with the same prompt, for comparing
-// reviewer models and efforts. Their findings are only returned (shadowFindings), never acted on. The label
+// Shadow reviewers: each real reviewer also runs at these models and efforts with the same prompt, for comparing
+// reviewer models and efforts (reviewer-catch.mjs). Their findings are only returned (shadowFindings), never acted on. The label
 // review:<kind>:r<N>@shadow:<model>-<effort> must parse back, so the model has no ':' and effort is a known word.
+// On by default (recalibration bd-3u6e: no run had shadow pairs); shadowReview: false turns them off.
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"];
+const DEFAULT_SHADOWS = [
+    { model: "claude-sonnet-5.5", effort: "medium" },
+    { model: "claude-opus-5.5", effort: "high" },
+];
 const shadowsOf = (v) => {
-    if (v == null) return [];
+    if (v == null) return DEFAULT_SHADOWS;
+    if (v === false) return [];
     const list = [v].flat();
     const ok = (o) => typeof o?.model === "string" && /^[a-z0-9][a-z0-9.-]*$/.test(o.model) && EFFORTS.includes(o.effort);
     if (!list.length || !list.every(ok)) {
-        throw new Error(`args.shadowReview must be { model, effort } or an array of them (effort: ${EFFORTS.join("|")}), got ${JSON.stringify(v)}`);
+        throw new Error(`args.shadowReview must be false, { model, effort } or an array of them (effort: ${EFFORTS.join("|")}), got ${JSON.stringify(v)}`);
     }
     return list.map((o) => ({ model: o.model, effort: o.effort }));
 };
@@ -1150,7 +1156,7 @@ const planImplementReview = defineWorkflow({
             "When blockers remain after maxPlanRevisions and every one has a suggested fix, the planner applies them once and the run continues. " +
             "shadowReview ({ model, effort } or an array of them; model a Copilot model id) also runs each reviewer of every review pass at that model and effort " +
             "with the same prompt (label review:<kind>:r<N>@shadow:<model>-<effort>); its findings are returned as shadowFindings, never validated, triaged, " +
-            "fixed or filed. It is opt-in because it adds reviewer cost.",
+            "fixed or filed. Without it the shadows are claude-sonnet-5.5 at medium and claude-opus-5.5 at high, which add reviewer cost; false runs none.",
         phases: [
             { title: "Setup", detail: "claim the bd issue, worktree + baseline snapshot" },
             { title: "Plan", detail: "planner drafts, critic challenges, planner revises" },
@@ -1174,6 +1180,7 @@ const planImplementReview = defineWorkflow({
                 effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"] },
                 shadowReview: {
                     anyOf: [
+                        { type: "boolean", enum: [false] },
                         { type: "object", required: ["model", "effort"], properties: { model: { type: "string" }, effort: { type: "string" } } },
                         {
                             type: "array",

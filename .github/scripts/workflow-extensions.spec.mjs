@@ -59,7 +59,7 @@ const PLAN = {
 	decisions: [],
 }
 const FOUND = { file: 'src/a.rs', line: 4, severity: 'minor', category: 'correctness', claim: 'Handles nothing', evidence: 'e' }
-const ARGS = { requirements: 'x', issue: 'bd-1', plan: PLAN, skipImplement: true, workdir: '/w', baseline: 'abc12345abc', actor: 'me/copilot-1' }
+const ARGS = { requirements: 'x', issue: 'bd-1', plan: PLAN, skipImplement: true, workdir: '/w', baseline: 'abc12345abc', actor: 'me/copilot-1', shadowReview: false }
 
 describe('plan-implement-review', () => {
 	/** A scripted run over finished work: claim, setup, a green gate, then the reviewers. */
@@ -168,6 +168,27 @@ describe('plan-implement-review', () => {
 			expect(got.shadowFindings.find((s) => s.kind === 'code')).toMatchObject({ round: 0, model: 'gpt-6-astra', effort: 'xhigh', findings: [{ line: 5 }] })
 			// Only the real finding is validated.
 			expect(ctx.calls.filter((c) => c.label.startsWith('validate:'))).toHaveLength(1)
+		})
+
+		it('runs Sonnet medium and Opus high shadows when shadowReview is left out', async () => {
+			const wf = await load('plan-implement-review', workspace)
+			const { shadowReview, ...args } = ARGS
+			const ctx = fakeCtx(args, script({ 'review:code:r0': { findings: [] } }))
+			const got = await wf.run(ctx)
+			const shadows = ctx.calls.filter((c) => c.label.startsWith('review:code:r0@shadow:'))
+			expect(shadows.map((c) => [c.label, c.model, c.reasoningEffort])).toEqual([
+				['review:code:r0@shadow:claude-sonnet-5.5-medium', 'claude-sonnet-5.5', 'medium'],
+				['review:code:r0@shadow:claude-opus-5.5-high', 'claude-opus-5.5', 'high'],
+			])
+			expect(got.shadowFindings.length).toBeGreaterThan(0)
+		})
+
+		it('runs no shadows with shadowReview: false', async () => {
+			const wf = await load('plan-implement-review', workspace)
+			const ctx = fakeCtx(ARGS, script())
+			const got = await wf.run(ctx)
+			expect(ctx.calls.some((c) => c.label.includes('@shadow:'))).toBe(false)
+			expect(got.shadowFindings).toBeUndefined()
 		})
 
 		it('records the run, and each review and validate agent with its prompt hash and result, but no prompt', async () => {

@@ -756,7 +756,8 @@ mod tests {
     fn claude_project_entries_match_the_repositorys_settings() {
         let text = merge_entries(None, false, &all(&claude_project_entries())).unwrap();
         let settings: Value = serde_json::from_str(include_str!("../../../../.claude/settings.json")).unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), settings);
+        // The repository's settings hold more than bd's hooks (its plugins, for one); the hooks are the same.
+        assert_eq!(serde_json::from_str::<Value>(&text).unwrap(), json!({ "hooks": settings["hooks"] }));
     }
 
     #[test]

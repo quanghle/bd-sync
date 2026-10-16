@@ -1,0 +1,12 @@
+{
+	"name": "bd-web",
+	"description": "Claude Code plugins for working on bd's web UI (web/)",
+	"owner": { "name": "quanghle" },
+	"plugins": [
+		{
+			"name": "svelte-lsp",
+			"source": "./claude-plugins/svelte-lsp",
+			"description": "Svelte language server (svelte-language-server) for .svelte files"
+		}
+	]
+}

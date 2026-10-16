@@ -36,5 +36,16 @@
         ]
       }
     ]
+  },
+  "extraKnownMarketplaces": {
+    "bd-web": {
+      "source": {
+        "source": "directory",
+        "path": "./web"
+      }
+    }
+  },
+  "enabledPlugins": {
+    "svelte-lsp@bd-web": true
   }
 }

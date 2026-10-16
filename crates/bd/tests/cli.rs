@@ -5380,7 +5380,7 @@ fn setup_claude_ignores_personal_settings() {
     assert_eq!(v["files"][0]["events"], serde_json::json!(["SessionStart", "SubagentStart", "PreToolUse"]), "{v}");
     let settings: Value = serde_json::from_str(&read(root, ".claude/settings.json").unwrap()).unwrap();
     let ours: Value = serde_json::from_str(include_str!("../../../.claude/settings.json")).unwrap();
-    assert_eq!(settings, ours);
+    assert_eq!(settings, serde_json::json!({ "hooks": ours["hooks"] }));
 
     // Codex counts the user's hooks: the report says where they are.
     write_file(

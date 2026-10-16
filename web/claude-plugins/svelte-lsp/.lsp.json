@@ -1,0 +1,7 @@
+{
+	"svelte": {
+		"command": "npx",
+		"args": ["-y", "-p", "svelte-language-server@0.18.4", "svelteserver", "--stdio"],
+		"extensionToLanguage": { ".svelte": "svelte" }
+	}
+}

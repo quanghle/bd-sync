@@ -385,7 +385,7 @@ the server's name.
 |---|---|---|---|
 | `ready` | `bd ready` | `limit` (1–100, default 10), `label` (all of these), `type`, `assignee`, `unassigned`, `parent` | yes |
 | `list` | `bd list` | `status` (list of `open`, `in_progress`, `blocked`, `deferred`, `closed`, `pinned`; default hides closed and pinned), `search`, `label`, `label_any`, `type`, `assignee`, `parent`, `blocked`, `updated_after` and `created_after` (a time as `bd list --updated-after` takes it: `7d` is 7 days ago, `+2d` 2 days ahead), `overdue`, `sort` (`priority`, `created`, `updated`), `limit` (1–100, default 20) | yes |
-| `show` | `bd show` | `ids` (1–20, required), `brief` (default `false`: key fields, the description cut to 500 characters, open blocker ids, the last 3 comments) | yes |
+| `show` | `bd show` | `ids` (1–20, required), `brief` (default `false`: key fields, the description cut to 500 characters, open blocker ids, the last 3 comments), `why` (default `false`: whether each issue is ready and, if not, every reason, as `bd show --why`) | yes |
 | `create` | `bd create` | `title` (required), `description`, `type` (default task), `priority` (0–4, default 2), `labels`, `parent`, `deps` (`ID`, which blocks, or `TYPE:ID`), `assignee`, `claim` | no |
 | `update` | `bd update` | `id` (required), `title`, `description`, `design`, `acceptance`, `notes`, `append_notes`, `status` (`open`, `blocked`, `deferred`, `pinned`), `priority`, `type`, `assignee` (`""` unassigns), `add_labels`, `remove_labels`, `parent` (`""` detaches), `due`, `defer`, `if_revision` | no |
 | `claim` | `bd claim` | `id`, or `next: true` with the filters `label`, `type` and `parent` | no |
@@ -446,6 +446,10 @@ output schemas), so the model reads each thing once:
   or with `brief: true` what `bd show --brief` gives: the summary's fields,
   the description cut to 500 characters (`description_truncated: true`
   when cut), open blocker ids, the last 3 comments and `comments_total`;
+  with `why: true`, brief or not, each issue also has `why: {ready,
+  reasons}` as [`bd show --why`](commands.md#issues) gives it: a ready
+  issue is `why: {ready: true}`, and a claim's reason names its holder and
+  expiry, never its token;
 - writes return the changed issue's summary and what the change caused:
   `close` the issues it unblocked (with `claim_next`, `{closed, next}`:
   `next` has `from`, the claimed issue's summary and its lease's token and

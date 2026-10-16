@@ -168,4 +168,42 @@ mod tests {
         assert!(again.get("next").is_none(), "{again}");
         assert_eq!(again["next_note"], "nothing closed: not claiming");
     }
+
+    #[test]
+    fn show_says_why_an_issue_is_not_ready() {
+        let (_dir, global) = workspace();
+        let mut server = Server::new(Local::new(global, Resolved::new("me/mcp-1", Source::Flag, "test")), false);
+        let id = |server: &mut Server<Local>, args: Value| {
+            call(server, "create", args).1["id"].as_str().unwrap().to_string()
+        };
+        let a = id(&mut server, json!({ "title": "blocker" }));
+        let b = id(&mut server, json!({ "title": "b", "deps": [a] }));
+        let c = id(&mut server, json!({ "title": "c" }));
+        let (err, claimed) = call(&mut server, "claim", json!({ "id": c }));
+        assert!(!err, "{claimed}");
+        let has = |why: &Value, check: &dyn Fn(&Value) -> bool| why["reasons"].as_array().unwrap().iter().any(check);
+
+        let (err, shown) = call(&mut server, "show", json!({ "ids": [b, a, c], "why": true }));
+        assert!(!err, "{shown}");
+        assert_eq!(shown.as_array().unwrap().len(), 3, "{shown}");
+        assert_eq!(shown[0]["why"]["ready"], false);
+        assert!(has(&shown[0]["why"], &|r| r["kind"] == "blocked" && r["id"] == a), "{shown}");
+        assert_eq!(shown[1]["why"], json!({ "ready": true }));
+        assert_eq!(shown[2]["why"]["ready"], false);
+        assert!(has(&shown[2]["why"], &|r| r["kind"] == "claimed" && r["holder"] == "me/mcp-1"), "{shown}");
+        assert_eq!(shown[2]["lease"]["holder"], "me/mcp-1");
+        assert!(shown[2]["lease"].get("token").is_none(), "{shown}");
+        assert!(!shown.to_string().contains("\"token\""), "{shown}");
+
+        let (err, brief) = call(&mut server, "show", json!({ "ids": [b], "brief": true, "why": true }));
+        assert!(!err, "{brief}");
+        assert_eq!(brief["id"], b);
+        assert_eq!(brief["blockers"], json!([a]));
+        assert_eq!(brief["why"]["ready"], false);
+        assert_eq!(brief["why"]["reasons"][0]["id"], a);
+
+        let (err, plain) = call(&mut server, "show", json!({ "ids": [a] }));
+        assert!(!err, "{plain}");
+        assert!(plain.get("why").is_none(), "{plain}");
+    }
 }

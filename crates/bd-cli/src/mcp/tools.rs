@@ -94,7 +94,7 @@ const MAX_IDS: usize = 20;
 pub static TOOLS: &[Tool] = &[
     Tool {
         name: "ready",
-        description: "Ready issues (open, unblocked, not deferred) in queue order.",
+        description: "Open, unblocked, undeferred issues in queue order.",
         read_only: true,
         params: &[
             p("limit", Kind::Int(1, MAX_LIMIT), "Default 10"),
@@ -112,8 +112,8 @@ pub static TOOLS: &[Tool] = &[
         description: "Search and filter issues.",
         read_only: true,
         params: &[
-            p("status", Kind::EnumList(STATUSES), "Default: not closed or pinned"),
-            p("search", Kind::Str, "Text in title, description, notes"),
+            p("status", Kind::EnumList(STATUSES), "Default: not closed/pinned"),
+            p("search", Kind::Str, "In title, description, notes"),
             p("label", Kind::List(0, MAX_IDS), "All of these"),
             p("label_any", Kind::List(0, MAX_IDS), "Any of these"),
             p("type", Kind::Str, ""),
@@ -133,7 +133,11 @@ pub static TOOLS: &[Tool] = &[
         name: "show",
         description: "Issue details: texts, deps, children, blockers, comments, claim.",
         read_only: true,
-        params: &[req("ids", Kind::List(1, MAX_IDS), ""), p("brief", Kind::Bool, "Key fields and last 3 comments")],
+        params: &[
+            req("ids", Kind::List(1, MAX_IDS), ""),
+            p("brief", Kind::Bool, "Key fields, last 3 comments"),
+            p("why", Kind::Bool, "Readiness, and why not"),
+        ],
         build: build_show,
         shape: Shape::Show,
     },
@@ -183,11 +187,11 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "claim",
-        description: "Claim an issue (or the next ready one) under a lease; keep the token.",
+        description: "Claim an issue (or the next ready one); keep the lease token.",
         read_only: false,
         params: &[
             p("id", Kind::Str, "Issue to claim"),
-            p("next", Kind::Bool, "Claim the head of the ready queue"),
+            p("next", Kind::Bool, "Head of the ready queue"),
             p("label", Kind::List(0, MAX_IDS), "With next: all of these"),
             p("type", Kind::Str, "With next"),
             p("parent", Kind::Str, "With next: under this issue"),
@@ -205,14 +209,14 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "close",
-        description: "Close finished issues; returns what this unblocked.",
+        description: "Close finished issues; returns what it unblocked.",
         read_only: false,
         params: &[
             req("ids", Kind::List(1, MAX_IDS), ""),
             req("reason", Kind::Str, "What was done"),
             p("failed", Kind::Bool, "The work failed"),
             p("token", Kind::Int(0, i64::MAX), "From claim: only while held"),
-            p("claim_next", Kind::Bool, "Then claim the next ready issue"),
+            p("claim_next", Kind::Bool, "Then claim the next ready one"),
         ],
         build: build_close,
         shape: Shape::Write,
@@ -239,7 +243,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "comment",
-        description: "Comment on an issue for whoever picks it up.",
+        description: "Comment for whoever picks the issue up.",
         read_only: false,
         params: &[req("id", Kind::Str, ""), req("text", Kind::Str, "")],
         build: build_comment,
@@ -247,7 +251,7 @@ pub static TOOLS: &[Tool] = &[
     },
     Tool {
         name: "dep_add",
-        description: "issue depends on depends_on (blocks: issue waits until it closes).",
+        description: "issue depends on depends_on (blocks: waits until it closes).",
         read_only: false,
         params: &[
             req("issue", Kind::Str, ""),
@@ -524,7 +528,7 @@ fn build_list(a: &Args) -> Result<Vec<String>, String> {
 }
 
 fn build_show(a: &Args) -> Result<Vec<String>, String> {
-    Line::new(&["show"]).switch("brief", a.flag("brief")).args(a.list("ids")).done()
+    Line::new(&["show"]).switch("brief", a.flag("brief")).switch("why", a.flag("why")).args(a.list("ids")).done()
 }
 
 fn build_create(a: &Args) -> Result<Vec<String>, String> {
@@ -833,6 +837,18 @@ mod tests {
         assert_eq!(argv("show", json!({ "ids": ["a"] })), ["show", "--json", "--", "a"]);
         assert_eq!(argv("show", json!({ "ids": ["a"], "brief": false })), ["show", "--json", "--", "a"]);
         assert_eq!(argv("show", json!({ "ids": ["a"], "brief": true })), ["show", "--json", "--brief", "--", "a"]);
+    }
+
+    #[test]
+    fn show_says_why_on_request() {
+        assert_eq!(argv("show", json!({ "ids": ["a"], "why": true })), ["show", "--json", "--why", "--", "a"]);
+        assert_eq!(argv("show", json!({ "ids": ["a"], "why": false })), ["show", "--json", "--", "a"]);
+        assert_eq!(
+            argv("show", json!({ "ids": ["a", "b"], "brief": true, "why": true })),
+            ["show", "--json", "--brief", "--why", "--", "a", "b"]
+        );
+        let err = invoke("show", json!({ "ids": ["a"], "why": "yes" })).err();
+        assert_eq!(err.as_deref(), Some("why must be true or false"));
     }
 
     #[test]

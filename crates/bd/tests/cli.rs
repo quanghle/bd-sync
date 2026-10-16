@@ -223,6 +223,11 @@ fn query_filters_sorts_and_reports_positions() {
     assert_eq!(ids(&["title ~ 'ALP' OR id = t-3*"]), [c.as_str(), a.as_str()]);
     assert_eq!(ids(&["status != closed", "-n", "1"]), [d.as_str()]);
     assert_eq!(ids(&["status != closed", "--sort", "id", "--reverse"]), [b.as_str(), d.as_str(), a.as_str()]);
+    // A linked GitHub issue's bd issue, by its external reference, unquoted.
+    ws.ok(&["update", &b, "--external-ref", "gh:acme/web#5"]);
+    assert_eq!(ids(&["external_ref = gh:acme/web#5"]), [b.as_str()]);
+    assert_eq!(ids(&["external_ref ~ ACME/WEB#", "AND status = open"]), [b.as_str()]);
+    assert_eq!(ids(&["external_ref = none AND status != closed"]), [d.as_str(), a.as_str()]);
     // An unknown parent matches nothing, and is no error.
     assert!(ids(&["parent = t-99"]).is_empty());
     assert_eq!(ids(&["NOT parent = t-99"]).len(), 4);

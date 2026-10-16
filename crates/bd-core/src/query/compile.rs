@@ -124,6 +124,8 @@ impl Compiler<'_> {
             (Field::Notes, Value::Text(v)) => text_column("i.notes", false, op, v),
             (Field::Assignee, Value::Text(v)) => text_column("i.assignee", true, op, v),
             (Field::Assignee, Value::None) => ("i.assignee IS NULL".into(), vec![]),
+            (Field::ExternalRef, Value::Text(v)) => text_column("i.external_ref", true, op, v),
+            (Field::ExternalRef, Value::None) => ("i.external_ref IS NULL".into(), vec![]),
             (Field::Label, Value::None) => {
                 ("NOT EXISTS (SELECT 1 FROM labels l WHERE l.issue_id = i.id)".into(), vec![])
             }

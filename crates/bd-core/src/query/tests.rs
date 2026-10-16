@@ -88,6 +88,7 @@ fn seeded() -> Seeded {
                 parent: Some("t-1".into()),
                 assignee: Some("bob".into()),
                 labels: vec!["a%b".into()],
+                external_ref: Some("gh:Acme/web#5".into()),
                 due_at: Some(day1.minus(Duration::from_secs(86_400))),
                 ..NewIssue::titled("x' OR 1=1 --")
             })?;
@@ -109,6 +110,7 @@ fn seeded() -> Seeded {
             tx.create_issue(NewIssue {
                 id: Some("t-10".into()),
                 ephemeral: true,
+                external_ref: Some("gh:acme/api#50".into()),
                 due_at: Some(now.plus(Duration::from_secs(86_400))),
                 ..NewIssue::titled("ten")
             })?;
@@ -289,6 +291,8 @@ fn errors_name_their_column() {
         ("title = none", 9, "title is never none"),
         ("due < none", 7, "none takes = or !="),
         ("label ~ none", 9, "none takes = or !="),
+        ("external_ref < x", 14, "external_ref takes =, != or ~, not <"),
+        ("external_ref ~ none", 16, "none takes = or !="),
     ];
     for &(src, column, message) in cases {
         let e = err(src);
@@ -303,7 +307,7 @@ fn query_errors_draw_a_caret() {
     assert_eq!(e.exit_code(), 2);
     assert_eq!(
         e.to_string(),
-        "query: column 15: unknown field \"bogus\" (fields: status, priority, type, assignee, label, title, description, notes, id, parent, created, updated, closed, due, defer, pinned, ephemeral)\n  title = x AND bogus = y\n                ^"
+        "query: column 15: unknown field \"bogus\" (fields: status, priority, type, assignee, label, title, description, notes, id, parent, external_ref, created, updated, closed, due, defer, pinned, ephemeral)\n  title = x AND bogus = y\n                ^"
     );
 }
 
@@ -431,6 +435,16 @@ fn values_match_only_literally() {
         ("label ~ '%'", &["t-2"]),
         ("label ~ URG", &["t-1"]),
         ("assignee ~ '%'", &[]),
+        ("external_ref = gh:Acme/web#5", &["t-2"]),
+        ("external_ref = gh:acme/web#5", &[]),
+        ("external_ref = gh:Acme/web#", &[]),
+        ("external_ref ~ ACME/", &["t-10", "t-2"]),
+        ("external_ref ~ '#5'", &["t-10", "t-2"]),
+        ("external_ref ~ '%'", &[]),
+        ("external_ref ~ '_'", &[]),
+        ("external_ref != gh:Acme/web#5", &["t-1", "t-10", "t-11", "t-3"]),
+        ("external_ref = none", &["t-1", "t-11", "t-3"]),
+        ("external_ref != none", &["t-10", "t-2"]),
     ];
     for &(src, want) in cases {
         assert_eq!(s.ids(src), ids(want), "{src}");
@@ -563,6 +577,7 @@ const SOUP: &[&str] = &[
     "notes",
     "id",
     "parent",
+    "external_ref",
     "created",
     "updated",
     "closed",
@@ -701,7 +716,7 @@ fn gen_cmp(rng: &mut Rng) -> Expr {
         Field::Status => text(rng.pick(&Status::ALL).as_str()),
         Field::Priority => text(rng.pick(&["0", "1", "2", "3", "4"])),
         Field::Type => text(&rng.pick(&[TRICKY, &["task", "bug", "epic"]].concat()).to_ascii_lowercase()),
-        Field::Assignee | Field::Label if eq && rng.below(4) == 0 => None,
+        Field::Assignee | Field::Label | Field::ExternalRef if eq && rng.below(4) == 0 => None,
         Field::Id => text(rng.pick(&[TRICKY, &["t-*", "t-1", "*", "t-[1]*", "?*", "t-1?"]].concat())),
         Field::Parent => rng.pick(PARENT_VALUES).map(str::to_string),
         f if f.is_time() && eq => {

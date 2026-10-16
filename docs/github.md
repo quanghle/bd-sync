@@ -56,6 +56,11 @@ object:
 | `own_local_at`, `own_github_at` | when bd github last wrote each side itself |
 | `local_edit_at`, `github_edit_at` | a side's last real edit, noted while it waited to be synced |
 
+`bd query 'external_ref = gh:owner/name#N'` finds the bd issue linked to
+GitHub issue N (the repository lowercased), and
+`bd query 'external_ref ~ gh:owner/name#'` all of a github.com
+repository's.
+
 ## Mapping
 
 | GitHub | bd |

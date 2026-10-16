@@ -10,11 +10,12 @@ The expression combines comparisons FIELD OP VALUE with AND, OR and NOT (in
 any case; NOT binds tighter than AND, AND tighter than OR) and parentheses.
 Operators: = != < <= > >= and ~ (contains, ASCII case-insensitive). Fields:
 status, priority, type, assignee, label, title, description, notes, id (a
-pattern with *), parent, created, updated, closed, due, defer, pinned and
-ephemeral. Values are bare words or quoted strings ('...' or \"...\", with \\\\,
-\\' and \\\" escapes); the bare word none means absent (no assignee, parent,
-label, closed, due or defer time), and a comparison on an absent field is
-false except = none.
+pattern with *), parent, external_ref (gh:owner/name#N, the repository
+lowercased, for a linked GitHub issue), created, updated, closed, due,
+defer, pinned and ephemeral. Values are bare words or quoted strings ('...'
+or \"...\", with \\\\, \\' and \\\" escapes); the bare word none means absent
+(no assignee, parent, label, external_ref, closed, due or defer time), and a
+comparison on an absent field is false except = none.
 
 Times take the forms of the filter flags: 7d alone means 7 days ago (created >
 7d: created within the last 7 days), +3d means 3 days from now, and = with a

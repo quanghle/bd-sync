@@ -406,6 +406,7 @@ fn run_the_commands(ws: &mut Ws) {
                      AND (label = infra OR label ~ inf OR label = none) \
                      AND (title ~ wor OR description ~ x OR notes = '') AND id = t-* \
                      AND (parent = {work} OR parent = none OR parent != t-99) \
+                     AND (external_ref = none OR external_ref ~ gh: OR external_ref = 'gh:o/r#1') \
                      AND created > 7d AND updated != 2026-01-15 AND closed = none \
                      AND (due < +3d OR defer >= 2026-01-01) AND pinned = false AND ephemeral = no"
                 );

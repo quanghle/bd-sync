@@ -89,6 +89,7 @@ pub enum Field {
     Notes,
     Id,
     Parent,
+    ExternalRef,
     Created,
     Updated,
     Closed,
@@ -99,7 +100,7 @@ pub enum Field {
 }
 
 impl Field {
-    pub const ALL: [Field; 17] = [
+    pub const ALL: [Field; 18] = [
         Field::Status,
         Field::Priority,
         Field::Type,
@@ -110,6 +111,7 @@ impl Field {
         Field::Notes,
         Field::Id,
         Field::Parent,
+        Field::ExternalRef,
         Field::Created,
         Field::Updated,
         Field::Closed,
@@ -131,6 +133,7 @@ impl Field {
             Field::Notes => "notes",
             Field::Id => "id",
             Field::Parent => "parent",
+            Field::ExternalRef => "external_ref",
             Field::Created => "created",
             Field::Updated => "updated",
             Field::Closed => "closed",
@@ -164,13 +167,23 @@ impl Field {
             | Field::Title
             | Field::Description
             | Field::Notes
-            | Field::Id => &[Eq, Ne, Contains],
+            | Field::Id
+            | Field::ExternalRef => &[Eq, Ne, Contains],
         }
     }
 
     /// Whether `= none` / `!= none` apply (the field can be absent).
     pub fn takes_none(self) -> bool {
-        matches!(self, Field::Assignee | Field::Label | Field::Parent | Field::Closed | Field::Due | Field::Defer)
+        matches!(
+            self,
+            Field::Assignee
+                | Field::Label
+                | Field::Parent
+                | Field::ExternalRef
+                | Field::Closed
+                | Field::Due
+                | Field::Defer
+        )
     }
 
     pub fn is_time(self) -> bool {

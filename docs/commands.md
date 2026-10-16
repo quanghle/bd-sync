@@ -246,6 +246,7 @@ other. The bare word `none` means absent; quoted, `"none"` is the word.
 | `title`, `description`, `notes` | text: `=` the whole field, `~` a part of it | `=` `!=` `~` | |
 | `id` | an id; with `=`, `*` matches any characters (`bd-12*`) and nothing else is special | `=` `!=` `~` | |
 | `parent` | the direct parent's id, resolved like `--parent` (exact id, then `<prefix>-ID`, then a unique id prefix); an id that matches nothing matches no issue, an ambiguous one is an error | `=` `!=` | no parent |
+| `external_ref` | an external reference, such as `gh:owner/name#N` (the repository lowercased) for a linked GitHub issue: `=` the whole reference (case-sensitive), `~` a part of it | `=` `!=` `~` | no external reference |
 | `created`, `updated` | a time; with `=`/`!=` a date | `=` `!=` `<` `<=` `>` `>=` | |
 | `closed`, `due`, `defer` | a time; with `=`/`!=` a date or `none` | `=` `!=` `<` `<=` `>` `>=` | not set |
 | `pinned`, `ephemeral` | `true`/`false` (`yes`/`no`, `1`/`0`) | `=` `!=` | |

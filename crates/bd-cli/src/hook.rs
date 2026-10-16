@@ -381,6 +381,28 @@ mod tests {
     }
 
     #[test]
+    fn the_copilot_marketplace_lists_the_copilot_plugin() {
+        let market: Value = serde_json::from_str(include_str!("../../../.github/plugin/marketplace.json")).unwrap();
+        let plugin: Value = serde_json::from_str(include_str!("../../../.copilot-plugin/plugin.json")).unwrap();
+        assert_eq!(market["name"], "bd");
+        assert!(market["owner"]["name"].as_str().is_some_and(|n| !n.is_empty()));
+        let plugins = market["plugins"].as_array().unwrap();
+        assert_eq!(plugins.len(), 1, "{plugins:?}");
+        let entry = &plugins[0];
+        assert_eq!(entry["name"], plugin["name"]);
+        assert_eq!(entry["name"], "bd");
+        assert_eq!(entry["source"], "./.copilot-plugin");
+        assert!(entry.get("version").is_none(), "installs track commits");
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let dir = repo.join(entry["source"].as_str().unwrap());
+        assert!(dir.join("plugin.json").is_file(), "{}", dir.display());
+        // Copilot CLI reads the first marketplace file it finds, and these come before .github/plugin.
+        for earlier in ["marketplace.json", ".plugin/marketplace.json"] {
+            assert!(!repo.join(earlier).exists(), "Copilot CLI would read {earlier} first");
+        }
+    }
+
+    #[test]
     fn the_skills_say_to_prime_again_after_compaction() {
         for skill in [PLUGIN_SKILL, include_str!("../../../.agents/skills/bd/SKILL.md")] {
             assert!(

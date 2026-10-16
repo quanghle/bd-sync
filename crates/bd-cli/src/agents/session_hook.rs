@@ -294,7 +294,8 @@ fn checkout_and_user_files(root: &Path, h: Harness, homes: &Homes) -> Vec<PathBu
 }
 
 /// The manifests and hook files of the harness's installed plugins: Copilot
-/// CLI's (`<copilot home>/installed-plugins/<source>/<plugin>/`), and Claude
+/// CLI's (`<copilot home>/installed-plugins/<marketplace>/<plugin>/`,
+/// `_direct` for a direct install), and Claude
 /// Code's plugin cache (`<claude home>/plugins/cache/<marketplace>/<plugin>/
 /// <version>/`, leaving out versions marked `.orphaned_at`).
 fn plugin_files(h: Harness, homes: &Homes) -> Vec<PathBuf> {
@@ -737,6 +738,38 @@ mod tests {
         let r = ensure(&checkout, Harness::Claude, true, &homes).unwrap();
         assert_eq!((r.state, r.file.as_str()), (HookState::Present, ".claude/settings.json"));
         assert!(!dir.path().join(".claude/settings.local.json").exists());
+    }
+
+    #[test]
+    fn a_marketplace_installed_copilot_plugin_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".bd")).unwrap();
+        let checkout = Checkout::new(dir.path().join(".bd"));
+        let user = tempfile::tempdir().unwrap();
+        let home = user.path().to_path_buf();
+        let homes = homes(&home);
+        let plugin = under(&home, "copilot/installed-plugins/bd/bd");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("plugin.json"), include_str!("../../../../.copilot-plugin/plugin.json")).unwrap();
+        let manifest = plugin.join("plugin.json");
+
+        let r = ensure(&checkout, Harness::Copilot, true, &homes).unwrap();
+        assert_eq!(r.state, HookState::Present);
+        assert_eq!(Path::new(&r.file), manifest);
+        let o = ensure_entries(
+            &checkout.root,
+            target(Harness::Copilot),
+            Harness::Copilot,
+            &session_entries(Harness::Copilot),
+            Sources::All,
+            true,
+            &homes,
+        )
+        .unwrap();
+        assert_eq!(o.report.state, HookState::Present);
+        assert_eq!(Path::new(&o.report.file), manifest);
+        assert!(o.events.is_empty());
+        assert!(!dir.path().join(".github").exists());
     }
 
     fn all(entries: &[Entry]) -> Vec<&Entry> {

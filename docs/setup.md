@@ -175,6 +175,34 @@ This repository's own `.claude/settings.json` already has the hooks. Two
 limits: a disabled plugin still in the cache still counts, and a plugin
 loaded in place from a local-path marketplace is not seen.
 
+## The Copilot CLI plugin
+
+This repository is also a Copilot CLI plugin marketplace with one
+plugin, `.copilot-plugin`. Its manifest is `.github/plugin/marketplace.json`,
+which Copilot CLI reads before Claude Code's
+`.claude-plugin/marketplace.json`. From a shell:
+
+```text
+copilot plugin marketplace add quanghle/bd-sync
+copilot plugin install bd@bd
+```
+
+In a session: `/plugin marketplace add quanghle/bd-sync`, then
+`/plugin install bd@bd`. The plugin runs the same SessionStart hooks as
+`bd setup copilot` writes (`bd hook session-start --harness copilot` and
+`bd prime --hook copilot`), as bare `bd` commands, so `bd` must be on
+`PATH`. Its marketplace entry has no version, so installs follow the
+repository's commits (`copilot plugin marketplace update bd`, then
+`copilot plugin update bd`).
+
+Use the plugin or the hook file (`.github/hooks/bd.json`), not both:
+Copilot CLI would run both and print the context twice.
+`bd setup copilot` and `bd agents pull` skip the hook an installed plugin
+provides, found in `<copilot home>/installed-plugins` (`$COPILOT_HOME`,
+else `~/.copilot`). Two limits: a disabled plugin still installed still
+counts (uninstall it to switch to the hook file), and a plugin from a
+local-path marketplace loads live from its directory and is not seen.
+
 ## Compared with `bd agents pull`
 
 `bd agents pull` (and the session-start hook's pull) adds only the

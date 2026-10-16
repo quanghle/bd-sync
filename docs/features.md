@@ -68,8 +68,9 @@ one SQLite database in WAL mode.
 - **Harness setup**: `bd setup <harness>` writes bd's hooks (Claude Code,
   Codex, Copilot CLI) or instructions (Cursor, Gemini CLI, opencode) into
   a project, idempotently and removably; a Claude Code plugin carries the
-  same hooks and a bd skill. Sessions get their bd context back after
-  compaction ([Setting up agent harnesses](setup.md)).
+  same hooks and a bd skill, and a Copilot CLI plugin the session-start
+  hooks. Sessions get their bd context back after compaction
+  ([Setting up agent harnesses](setup.md)).
 
 **Operations**
 

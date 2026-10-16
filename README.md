@@ -69,7 +69,11 @@ To have an agent harness start each session with that context, run
 `cursor`, `gemini` or `opencode`), or install the Claude Code plugin:
 `/plugin marketplace add quanghle/bd-sync`, then `/plugin install bd@bd`
 (or, in Claude Code 2.1.275+, `/plugin install bd --marketplace
-quanghle/bd-sync`; see [Setting up agent harnesses](docs/setup.md)).
+quanghle/bd-sync`), or the
+[Copilot CLI plugin](docs/setup.md#the-copilot-cli-plugin):
+`copilot plugin marketplace add quanghle/bd-sync`, then
+`copilot plugin install bd@bd`. See
+[Setting up agent harnesses](docs/setup.md).
 
 ## Documentation
 
@@ -84,7 +88,7 @@ quanghle/bd-sync`; see [Setting up agent harnesses](docs/setup.md)).
 | [Remote server](docs/remote.md) | `bd serve`, access tokens and roles, clients, background jobs, backups, followers, the protocol |
 | [Signing in](docs/sign-in.md) | OpenID Connect providers, rules, accounts and actors, refreshing, authorizers, secrets from a command, the device flow |
 | [MCP server](docs/mcp.md) | `bd mcp` and `/w/<name>/mcp`, discovery, OAuth for MCP clients, the tool catalog |
-| [Setting up agent harnesses](docs/setup.md) | `bd setup` for Claude Code, Codex, Copilot CLI, Cursor, Gemini CLI and opencode; the Claude Code plugin |
+| [Setting up agent harnesses](docs/setup.md) | `bd setup` for Claude Code, Codex, Copilot CLI, Cursor, Gemini CLI and opencode; the Claude Code and Copilot CLI plugins |
 | [Agent assets, sessions and hooks](docs/agents.md) | serving, pulling and approving skills and MCP definitions; session-start hooks; subagents |
 | [Command reference](docs/commands.md) | commands, global options, environment variables, configuration, exit and error codes |
 | [Observability](docs/observability.md) | logs, timing, metrics, `bd doctor` |

@@ -511,7 +511,9 @@ claude` writes these hooks, and the bd plugin carries them
 ### Copilot CLI
 
 This repository's plugin, `.copilot-plugin/plugin.json`, runs both
-commands on `SessionStart`. A repository can use a hook file instead,
+commands on `SessionStart` and installs from the repository's marketplace
+([Setting up agent harnesses](setup.md#the-copilot-cli-plugin)). A
+repository can use a hook file instead,
 `.github/hooks/bd.json`:
 
 ```json

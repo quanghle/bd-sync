@@ -16,7 +16,7 @@ and error codes.
 | Ready work and claims | `ready`, `claim` (`--next`), `heartbeat` (`hb`), `release` (`unclaim`), `reclaim`, `leases` | [Ready work](concepts.md#ready-work), [Claims](concepts.md#claims-leases-and-recovery) |
 | Comments and memory | `comment add/list`, `comments`, `remember`, `recall`, `memories`, `forget`, `memory add/get/list/rm` | [Comments and memory](concepts.md#comments-and-memory) |
 | Events | `events` (`--follow`, `--wait`, `prune`), `history` (`--diff`), `show --as-of` | [Event history](concepts.md#event-history), [Reading an issue as of a past moment](concepts.md#reading-an-issue-as-of-a-past-moment) |
-| Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `setup`, `agents manifest/status/pull/approve/watch`, `mcp` | [Agent assets](agents.md), [Setup and the Claude Code plugin](setup.md), [MCP server](mcp.md) |
+| Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `setup`, `agents manifest/status/pull/approve/watch`, `mcp` | [Agent assets](agents.md), [Setup and the plugins](setup.md), [MCP server](mcp.md) |
 | Playbooks and gates | `playbook list/show/plan/run/status/runs/compact/discard/extract`, `gate list/show/check/resolve/create`, `purge` | [Playbooks](playbooks.md) |
 | Data | `export`, `import`, `batch`, `backup` | [below](#data) |
 | GitHub | `github status/pull/push/sync` | [GitHub Issues sync](github.md) |

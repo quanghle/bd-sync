@@ -1,0 +1,13 @@
+{
+  "name": "bd",
+  "owner": {
+    "name": "quanghle"
+  },
+  "plugins": [
+    {
+      "name": "bd",
+      "source": "./.copilot-plugin",
+      "description": "bd session context for Copilot CLI: SessionStart hooks running bd hook session-start and bd prime"
+    }
+  ]
+}

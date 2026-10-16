@@ -107,7 +107,7 @@ cargo clippy --workspace --all-targets && cargo fmt --all
 target/release/bd bench --workers 8   # throughput + invariant verification on a scratch DB
 ```
 
-The web UI (`web/`, SvelteKit, npm) has its own checks, run in `web/`: `npm ci && npm run check && npm run lint && npm run format:check && npm run build` (see `web/AGENTS.md`). Its Svelte AI tooling is the root `.mcp.json` (Svelte MCP server) and `.claude/skills/svelte-*`, `.claude/agents/svelte-file-editor.md`, and the Svelte language server from the project-local plugin marketplace `web/.claude-plugin/` (`svelte-lsp@bd-web`, enabled in `.claude/settings.json`).
+The web UI (`web/`, SvelteKit, npm) has its own checks, run in `web/`: `npm ci && npm run check && npm run lint && npm run format:check && npm run build` (see `web/AGENTS.md`). Its Svelte AI tooling is the root `.mcp.json` (Svelte MCP server) and `.claude/skills/svelte-*`, `.claude/agents/svelte-file-editor.md`, and the Svelte language server from the project-local plugin marketplace `web/.claude-plugin/` (`svelte-lsp@bd-web`, enabled in `.claude/settings.json`), which runs web/'s locked `svelte-language-server` from `web/node_modules` (run `npm ci` in `web/` first) and has no version, so installs follow the checkout.
 
 CI (`.github/workflows/ci.yml`) runs fmt, then clippy `-D warnings` and the tests on Linux, macOS, and Windows, plus an MSRV check, so keep all three platforms building. Releases are built by `.github/workflows/release.yml` when a `vX.Y.Z` tag is pushed; see RELEASING.md (and the `release` playbook in `.bd/playbooks/`).
 

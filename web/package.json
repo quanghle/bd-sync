@@ -28,6 +28,7 @@
 		"oxlint": "^1.88.0",
 		"svelte": "^5.57.2",
 		"svelte-check": "^4.7.6",
+		"svelte-language-server": "0.18.4",
 		"typescript": "npm:@typescript/typescript6@^6.0.2",
 		"vite": "^8.3.0"
 	},

@@ -1,6 +1,5 @@
 {
 	"name": "svelte-lsp",
-	"version": "0.1.0",
 	"description": "Svelte language server (svelte-language-server) for .svelte files: diagnostics, definitions, references and hover in Claude Code",
 	"author": { "name": "quanghle" },
 	"license": "MIT"

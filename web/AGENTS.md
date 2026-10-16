@@ -5,7 +5,7 @@
 - **Lint / format**: oxlint (`npm run lint`, `.oxlintrc.json`) and oxfmt (`npm run format`, `npm run format:check`, `.oxfmtrc.json`, `.svelte` files through its `svelte` option); no ESLint or Prettier
 - **Checks**: `npm run check` (svelte-check, then tsc 7), `npm run lint`, `npm run format:check`, `npm run build`
 - **Package manager**: npm
-- **AI tooling**: the local Svelte MCP server is registered in the repository root's `.mcp.json`; the Svelte skills and the `svelte-file-editor` agent live in the root `.claude/`; the Svelte language server comes from the `svelte-lsp` plugin of the project-local marketplace `bd-web` (`web/.claude-plugin/marketplace.json`, `web/claude-plugins/svelte-lsp/`), enabled in the root `.claude/settings.json`
+- **AI tooling**: the local Svelte MCP server is registered in the repository root's `.mcp.json`; the Svelte skills and the `svelte-file-editor` agent live in the root `.claude/`; the Svelte language server comes from the `svelte-lsp` plugin of the project-local marketplace `bd-web` (`web/.claude-plugin/marketplace.json`, `web/claude-plugins/svelte-lsp/`), enabled in the root `.claude/settings.json`, and started with `node` from `web/node_modules` (the locked `svelte-language-server` devDependency, so `npm ci` first); the plugin has no version, so it follows the checkout
 
 ---
 

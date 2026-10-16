@@ -1,7 +1,10 @@
 {
 	"svelte": {
-		"command": "npx",
-		"args": ["-y", "-p", "svelte-language-server@0.18.4", "svelteserver", "--stdio"],
+		"command": "node",
+		"args": [
+			"${CLAUDE_PROJECT_DIR}/web/node_modules/svelte-language-server/bin/server.js",
+			"--stdio"
+		],
 		"extensionToLanguage": { ".svelte": "svelte" }
 	}
 }

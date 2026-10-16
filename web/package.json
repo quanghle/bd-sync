@@ -1,0 +1,35 @@
+{
+	"name": "bd-web",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"imports": {
+		"#lib": "./src/lib/index.js",
+		"#lib/*": "./src/lib/*"
+	},
+	"scripts": {
+		"dev": "vite dev",
+		"build": "vite build",
+		"preview": "vite preview",
+		"prepare": "svelte-kit sync || echo ''",
+		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json && node node_modules/@typescript/native/bin/tsc --noEmit",
+		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+		"lint": "oxlint",
+		"format": "oxfmt",
+		"format:check": "oxfmt --check",
+		"typecheck": "node node_modules/@typescript/native/bin/tsc --noEmit"
+	},
+	"devDependencies": {
+		"@sveltejs/adapter-static": "^4.0.0",
+		"@sveltejs/kit": "^3.1.0",
+		"@sveltejs/mcp": "0.1.26",
+		"@sveltejs/vite-plugin-svelte": "^7.2.0",
+		"@typescript/native": "npm:typescript@^7.0.2",
+		"oxfmt": "^0.73.0",
+		"oxlint": "^1.88.0",
+		"svelte": "^5.57.2",
+		"svelte-check": "^4.7.6",
+		"typescript": "npm:@typescript/typescript6@^6.0.2",
+		"vite": "^8.3.0"
+	}
+}

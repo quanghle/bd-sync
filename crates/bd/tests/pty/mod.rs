@@ -1,4 +1,4 @@
-//! A pseudo-terminal for tests of interactive commands, on Linux.
+//! A pseudo-terminal for tests of interactive commands, on Linux and macOS.
 
 use std::fs::File;
 use std::io::{Read, Write};
@@ -20,7 +20,15 @@ pub struct Terminal {
 impl Terminal {
     pub fn spawn(mut cmd: Command) -> Terminal {
         use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        #[cfg(target_os = "linux")]
         let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC).unwrap();
+        // macOS posix_openpt takes no O_CLOEXEC (rustix has no OpenptFlags::CLOEXEC there), so it is set right after.
+        #[cfg(target_os = "macos")]
+        let master = {
+            let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+            rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC).unwrap();
+            master
+        };
         grantpt(&master).unwrap();
         unlockpt(&master).unwrap();
         let name = ptsname(&master, Vec::new()).unwrap();
@@ -48,6 +56,13 @@ impl Terminal {
         let text = String::from_utf8_lossy(&bytes).replace('\r', "");
         self.shown.push_str(&text);
         self.unread.push_str(&text);
+        // A BSD/macOS pty echoes each typed Ctrl-D as ^D plus two backspaces (ECHOCTL), and bd never prints that.
+        const ECHOED_EOF: &str = "^D\u{8}\u{8}";
+        for s in [&mut self.shown, &mut self.unread] {
+            while s.contains(ECHOED_EOF) {
+                *s = s.replace(ECHOED_EOF, "");
+            }
+        }
         Ok(())
     }
 
@@ -130,8 +145,14 @@ impl Terminal {
                 panic!("still running after {wait:?}, so it was killed; the terminal showed:\n{}", self.shown);
             }
             // Ctrl-D at the start of a line: a read of the terminal gets end-of-input.
+            // One Ctrl-D per 50 ms at most: macOS echoes each at once (so output cannot pace them) and blocks the write once about 1022 are queued.
             let _ = self.master.write_all(b"\x04");
-            let _ = self.receive(Duration::from_millis(50));
+            let typed = Instant::now();
+            while let Some(left) = Duration::from_millis(50).checked_sub(typed.elapsed()) {
+                if self.receive(left).is_err() {
+                    break;
+                }
+            }
         };
         let stdout = reading.join().unwrap();
         while self.receive(Duration::from_secs(5)).is_ok() {}

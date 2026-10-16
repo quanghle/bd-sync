@@ -8,7 +8,7 @@ use tempfile::TempDir;
 
 mod piped;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 mod pty;
 
 /// Variables that name an agent session (and so a per-session actor).
@@ -2384,14 +2384,14 @@ fn read(dir: &Path, rel: &str) -> Option<String> {
     std::fs::read_to_string(rel.split('/').fold(dir.to_path_buf(), |p, c| p.join(c))).ok()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn mtime(dir: &Path, rel: &str) -> std::time::SystemTime {
     std::fs::metadata(rel.split('/').fold(dir.to_path_buf(), |p, c| p.join(c))).unwrap().modified().unwrap()
 }
 
 /// Whether a mode set on a file in `dir` sticks: not where every file shows
 /// as executable and chmod is ignored (WSL's /mnt/c without metadata).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn modes_stick(dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     let probe = dir.join("mode-probe");
@@ -2403,7 +2403,7 @@ fn modes_stick(dir: &Path) -> bool {
 }
 
 /// Set a file's modification time back an hour, so a rewrite shows.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn age(dir: &Path, rel: &str) {
     let path = rel.split('/').fold(dir.to_path_buf(), |p, c| p.join(c));
     let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
@@ -2450,9 +2450,9 @@ fn agents_pull_adds_the_session_start_hook_once() {
 }
 
 /// Skills wait for `bd agents approve`, which needs a terminal: Linux
-/// only, as for the other pseudo-terminal tests; the planning and writing
+/// and macOS only, as for the other pseudo-terminal tests; the planning and writing
 /// are covered everywhere by the unit tests of `agents::sync`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn agents_pull_places_each_harness_set_in_its_own_places() {
     let (ws, agents) = agents_ws();
@@ -2580,7 +2580,7 @@ fn agents_pull_places_each_harness_set_in_its_own_places() {
     assert_eq!(ws.ok(&["agents", "status", "--harness", "claude"]), "claude: nothing served\n");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn agents_pull_keeps_local_edits_and_what_bd_did_not_write() {
     let (ws, agents) = agents_ws();
@@ -2870,7 +2870,7 @@ fn agents_pulls_started_together_take_turns() {
             assert!(applied["revision"].is_string(), "{applied}");
         }
         // Once approved, pulls restore what was deleted.
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             approve_all(root, &[]);
             for dest in [".claude", ".agents", ".github"] {
@@ -2940,7 +2940,7 @@ fn agents_pull_follows_a_rename_by_case_where_the_file_system_ignores_case() {
     assert_eq!(ws.ok(&["agents", "pull", "--harness", "claude"]), "claude: up to date\n");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn agents_approve_makes_an_adopted_script_executable() {
     use std::os::unix::fs::PermissionsExt;
@@ -2986,7 +2986,7 @@ fn agents_approve_makes_an_adopted_script_executable() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn agents_pull_says_once_that_the_file_system_keeps_no_executable_bit() {
     use std::os::unix::fs::PermissionsExt;
@@ -3054,13 +3054,13 @@ fn agents_pull_says_once_that_the_file_system_keeps_no_executable_bit() {
 
 /// `bd agents approve <args>` in `root` on a pseudo-terminal, approving
 /// everything it asks about: its stdout, and what the terminal showed.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn approve_all(root: &Path, args: &[&str]) -> (String, String) {
     approve_all_with(root, &[], args)
 }
 
 /// [`approve_all`] with `env` set.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn approve_all_with(root: &Path, env: &[(&str, &str)], args: &[&str]) -> (String, String) {
     let mut cmd = Ws::cmd_in(root, "tester", &[&["agents", "approve"][..], args].concat());
     cmd.envs(env.iter().copied());
@@ -3187,10 +3187,10 @@ fn agents_approve_names_only_what_waits_and_says_when_nothing_does() {
     assert_eq!(read(root, ".mcp.json"), before, "nothing was written");
 }
 
-/// The interactive flow, through a pseudo-terminal. Linux only: elsewhere
+/// The interactive flow, through a pseudo-terminal. Linux and macOS only: elsewhere
 /// the rendering, the answers and the checks before writing are covered by
 /// the unit tests of `agents::approve` and `agents::sync`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn agents_approve_asks_on_the_terminal_and_writes_what_was_shown() {
     let (ws, agents) = agents_ws();
@@ -3310,7 +3310,7 @@ fn agents_approve_asks_on_the_terminal_and_writes_what_was_shown() {
 
 /// A hostile server's codex definition, on a real terminal: every value
 /// stays on its line, and what it runs is shown right before the prompt.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn agents_approve_shows_hostile_definitions_escaped_on_the_terminal() {
     let (ws, agents) = agents_ws();
@@ -3345,7 +3345,7 @@ fn agents_approve_shows_hostile_definitions_escaped_on_the_terminal() {
 
 /// The terminal helper ends a command left waiting for an answer, rather
 /// than waiting with it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn pty_helper_never_waits_forever() {
     let (ws, agents) = agents_ws();
@@ -3378,7 +3378,40 @@ fn pty_helper_never_waits_forever() {
     let message = *failed.unwrap_err().downcast::<String>().unwrap();
     assert!(message.starts_with("still running after 500ms, so it was killed"), "{message}");
     assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    #[cfg(target_os = "linux")]
     assert!(!Path::new(&format!("/proc/{pid}")).exists(), "killed and reaped");
+    #[cfg(target_os = "macos")]
+    assert!(!Command::new("kill").args(["-0", &pid.to_string()]).status().unwrap().success(), "killed and reaped");
+}
+
+/// The terminal helper types end-of-input at a steady pace even when the
+/// terminal echoes it at once (as macOS does), and keeps a BSD pty's echo of
+/// it (`^D` and two backspaces) out of what the terminal showed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn pty_helper_paces_end_of_input_and_drops_its_echo() {
+    // Raw mode with echo: every Ctrl-D typed is echoed as ^D right away and
+    // queued unread for a second, then one read takes what is queued.
+    let mut sh = Command::new("sh");
+    sh.args(["-c", "stty raw echo min 0 time 0; sleep 1; dd bs=4096 count=1 2>/dev/null | wc -c"]);
+    let (out, shown) = pty::Terminal::spawn(sh).finish();
+    assert!(out.status.success(), "{shown}");
+    let typed: usize = String::from_utf8(out.stdout).unwrap().trim().parse().unwrap();
+    assert!((1..=40).contains(&typed), "{typed} Ctrl-Ds typed in about a second");
+
+    // The echo of a Ctrl-D goes, even split across two reads.
+    let mut sh = Command::new("sh");
+    sh.args(["-c", r"exec >&2; printf '^D\b\bone '; sleep 0.3; printf '^D'; sleep 0.3; printf '\b\btwo'"]);
+    let (out, shown) = pty::Terminal::spawn(sh).finish();
+    assert!(out.status.success(), "{shown}");
+    assert_eq!(shown, "one two");
+
+    // Removing a whole echo can join the halves of a split one: both go.
+    let mut sh = Command::new("sh");
+    sh.args(["-c", r"exec >&2; printf 'one ^D'; sleep 0.3; printf '^D\b\b\b\btwo'"]);
+    let (out, shown) = pty::Terminal::spawn(sh).finish();
+    assert!(out.status.success(), "{shown}");
+    assert_eq!(shown, "one two");
 }
 
 /// `bd hook session-start <args>` in `dir`, as a hook runs it: stdin not a
@@ -4679,20 +4712,21 @@ fn edit_is_refused_without_a_terminal_and_never_starts_the_editor() {
 }
 
 /// The path `bd edit` printed for the file that keeps the edited text.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn kept_file(shown: &str) -> std::path::PathBuf {
     let line = shown.lines().find(|l| l.starts_with("bd edit: the edited text is kept in ")).expect(shown);
     std::path::PathBuf::from(line.trim_start_matches("bd edit: the edited text is kept in "))
 }
 
 /// Write the editor script `body` into the workspace: a shell script run as `sh SCRIPT FILE`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn editor_script(ws: &Ws, name: &str, body: &str) -> String {
     let path = ws.dir.path().join(name);
     std::fs::write(&path, body).unwrap();
     format!("sh {}", path.display())
 }
 
+// Linux only: the editor script uses GNU stat -c.
 #[cfg(target_os = "linux")]
 #[test]
 fn edit_writes_the_edited_field_guarded_by_the_revision_it_read() {
@@ -4756,7 +4790,7 @@ fn edit_writes_the_edited_field_guarded_by_the_revision_it_read() {
 
 /// A Ctrl-C reaches the whole foreground group, bd included: bd must outlive
 /// it and still write what the editor saved (vi leaves insert mode with it).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn edit_survives_an_interrupt_sent_to_its_process_group() {
     use std::os::unix::process::CommandExt;
@@ -4771,7 +4805,7 @@ fn edit_survives_an_interrupt_sent_to_its_process_group() {
     assert_eq!(ws.json(&["show", "t-1"])["description"], "Edited");
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn edit_refuses_a_concurrent_change_and_keeps_the_edited_text() {
     let ws = Ws::new();
@@ -4790,7 +4824,7 @@ fn edit_refuses_a_concurrent_change_and_keeps_the_edited_text() {
     std::fs::remove_file(kept).unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn edit_refuses_a_title_that_is_empty_or_has_several_lines() {
     let ws = Ws::new();

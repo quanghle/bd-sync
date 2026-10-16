@@ -13,7 +13,7 @@ use tempfile::TempDir;
 
 mod piped;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[allow(dead_code, reason = "tests/cli.rs uses all of the helper, and tests the helper itself")]
 mod pty;
 
@@ -4167,7 +4167,7 @@ fn agents_pull_and_status_place_the_servers_sets_in_client_checkouts() {
     assert_eq!(lock["harnesses"]["claude"]["revision"], claude["server_revision"]);
 
     // Approved on the client, from the texts the server serves.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut t = pty::Terminal::spawn(alice.cmd(&["agents", "approve", "--harness", "claude"]));
         let shown = t.expect("Approve skill deploy? [y/N] ");
@@ -4195,9 +4195,9 @@ fn agents_pull_and_status_place_the_servers_sets_in_client_checkouts() {
     let pulled = alice.json(&["agents", "pull"]);
     assert_eq!(pulled["harnesses"].as_object().unwrap().keys().collect::<Vec<_>>(), ["claude"], "from the lock");
     let deploy_now = &pulled["harnesses"]["claude"]["skills"]["pending"]["deploy"];
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     assert_eq!(deploy_now["change"], "changed", "{pulled}");
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     assert_eq!(deploy_now["change"], "new", "{pulled}");
     let again = alice.json(&["agents", "pull"]);
     assert_eq!(again["harnesses"]["claude"]["skills"]["changed"], json!({}));
@@ -4295,7 +4295,7 @@ fn agents_approve_runs_on_the_client_with_a_read_token() {
     assert!(r["stderr"].as_str().unwrap().contains("is not available through bd serve"), "{r}");
     assert!(!alice.dir.path().join(".mcp.json").exists() && !alice.dir.path().join(".bd/agents.lock").exists());
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let mut t = pty::Terminal::spawn(alice.cmd(&approve));
         let shown = t.expect("Approve MCP server github? [y/N] ");

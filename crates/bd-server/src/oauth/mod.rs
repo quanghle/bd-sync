@@ -933,7 +933,7 @@ mod tests {
         let e = start(dir.path(), "github").unwrap_err();
         assert!(matches!(e, Error::Locked(_)), "{e:?}");
         let code = SignInPoll { device_code: "dc-1".into(), workspace: "proj".into() };
-        let e = poll(dir.path(), "github", &code).unwrap_err();
+        let e = poll(dir.path(), "github", &code, &|_| true).unwrap_err();
         assert!(matches!(e, Error::Locked(_)), "{e:?}");
         provider.set_nonblocking(true).unwrap();
         assert!(provider.accept().is_err(), "the provider was never asked");

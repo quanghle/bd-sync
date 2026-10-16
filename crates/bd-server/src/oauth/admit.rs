@@ -57,7 +57,13 @@ fn start_oidc(sign_in: &SignIn, provider: &str) -> Result<SignInCode> {
 }
 
 /// [`poll`] with an OIDC provider's device flow.
-fn poll_oidc(root: &Path, sign_in: &SignIn, provider: &str, poll: &SignInPoll) -> Result<SignInAnswer> {
+fn poll_oidc(
+    root: &Path,
+    sign_in: &SignIn,
+    provider: &str,
+    poll: &SignInPoll,
+    exists: &dyn Fn(&str) -> bool,
+) -> Result<SignInAnswer> {
     let oidc = oidc_of(sign_in, provider)?;
     let md = oidc.metadata()?;
     let form = [("grant_type", DEVICE_GRANT), ("device_code", poll.device_code.as_str())];
@@ -91,6 +97,7 @@ fn poll_oidc(root: &Path, sign_in: &SignIn, provider: &str, poll: &SignInPoll) -
         e => e,
     })?;
     let Admitted { user, grant, via, by_login, rule, .. } = admitted;
+    admitted_to_existing(provider, &user, &poll.workspace, exists)?;
     let life = auth::Lifetime { rule, ..sign_in.lifetime(Timestamp::now(), &user.provider) };
     let issued = auth::issue_sign_in_token(root, &user, grant, life, &poll.workspace, by_login)?;
     tracing::info!(
@@ -112,9 +119,26 @@ pub fn device_code_ok(code: &str) -> bool {
     !code.is_empty() && code.len() <= 2048 && code.bytes().all(|b| b.is_ascii_graphic())
 }
 
+/// Whether the workspace an admitted account signed in to exists (`exists`):
+/// asked only once the rules let the account in, so nobody learns it before.
+fn admitted_to_existing(provider: &str, user: &Identity, workspace: &str, exists: &dyn Fn(&str) -> bool) -> Result<()> {
+    if exists(workspace) {
+        return Ok(());
+    }
+    tracing::info!(
+        target: "bd::serve",
+        %provider,
+        login = %user.login,
+        %workspace,
+        "an admitted sign-in named a missing workspace: no token issued"
+    );
+    Err(Error::not_found("workspace", workspace))
+}
+
 /// What became of a sign-in: still waiting for its code, or the access
-/// token issued to the account that signed in.
-pub fn poll(root: &Path, provider: &str, poll: &SignInPoll) -> Result<SignInAnswer> {
+/// token issued to the account that signed in. Whether its workspace
+/// exists (`exists`) is told only to an account the rules let in.
+pub fn poll(root: &Path, provider: &str, poll: &SignInPoll, exists: &dyn Fn(&str) -> bool) -> Result<SignInAnswer> {
     let code = poll.device_code.as_str();
     if !device_code_ok(code) {
         return Err(Error::invalid("not a sign-in's device code"));
@@ -126,7 +150,7 @@ pub fn poll(root: &Path, provider: &str, poll: &SignInPoll) -> Result<SignInAnsw
     // Before the provider's code is redeemed (it is good once): the client polls again, as long as its retries last.
     sign_in.ready_for(provider, false)?;
     if provider != "github" {
-        return poll_oidc(root, &sign_in, provider, poll);
+        return poll_oidc(root, &sign_in, provider, poll, exists);
     }
     let github = github_of(&sign_in)?;
     let api = Api::new(github);
@@ -158,6 +182,7 @@ pub fn poll(root: &Path, provider: &str, poll: &SignInPoll) -> Result<SignInAnsw
         e => e,
     });
     let Admitted { user, grant, via, by_login, unknown, rule, .. } = admitted?;
+    admitted_to_existing("github", &user, &poll.workspace, exists)?;
     let life = auth::Lifetime { rule, ..sign_in.lifetime(Timestamp::now(), &user.provider) };
     let issued = auth::issue_sign_in_token(root, &user, grant, life, &poll.workspace, by_login)?;
     let token = &issued.token;

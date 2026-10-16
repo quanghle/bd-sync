@@ -24,10 +24,11 @@ pub(super) async fn sign_in(
                 Ok(s) => s,
                 Err(e) => return bad_body(e).response(),
             };
-            // Before anyone goes to the provider for it.
-            if server.workspace(&start.workspace).is_none() {
-                let msg = format!("workspace not found: {}", start.workspace);
-                return Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response();
+            // Before anyone goes to the provider for it, but only its shape: whether it exists is told only to an
+            // account the rules let in (`oauth::poll`).
+            if !valid_workspace_name(&start.workspace) {
+                let msg = format!("invalid workspace name {:?}", start.workspace);
+                return Reject::new(StatusCode::BAD_REQUEST, "invalid", msg, 2).response();
             }
             let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
                 return busy("signing in other accounts");
@@ -48,9 +49,9 @@ pub(super) async fn sign_in(
             if !oauth::device_code_ok(&poll.device_code) {
                 return Reject::new(StatusCode::BAD_REQUEST, "invalid", "not a sign-in's device code", 2).response();
             }
-            if server.workspace(&poll.workspace).is_none() {
-                let msg = format!("workspace not found: {}", poll.workspace);
-                return Reject::new(StatusCode::NOT_FOUND, "not_found", msg, 3).response();
+            if !valid_workspace_name(&poll.workspace) {
+                let msg = format!("invalid workspace name {:?}", poll.workspace);
+                return Reject::new(StatusCode::BAD_REQUEST, "invalid", msg, 2).response();
             }
             let key = auth::hash(&poll.device_code);
             {
@@ -72,7 +73,8 @@ pub(super) async fn sign_in(
             let srv = server.clone();
             blocking(move || {
                 let _held = (permit, completing);
-                let answer = oauth::poll(&srv.root, &provider, &poll)?;
+                let exists = |name: &str| srv.workspace(name).is_some();
+                let answer = oauth::poll(&srv.root, &provider, &poll, &exists)?;
                 let value = serde_json::to_value(&answer)?;
                 // Kept even if this client is gone: its retry gets the token GitHub will not give again.
                 if let SignInAnswer::Issued(_) = answer {
@@ -99,6 +101,7 @@ fn auth_answer(answer: Result<serde_json::Value>) -> Response<Body> {
             let status = match &e {
                 Error::Unauthorized(_) => StatusCode::FORBIDDEN,
                 Error::Invalid(_) => StatusCode::BAD_REQUEST,
+                Error::NotFound { .. } => StatusCode::NOT_FOUND,
                 Error::Remote(_) => StatusCode::BAD_GATEWAY,
                 Error::Busy(_) | Error::Locked(_) => StatusCode::SERVICE_UNAVAILABLE,
                 _ => return Reject::internal(e).response(),

@@ -6332,9 +6332,32 @@ fn oidc_rules_let_people_in_without_an_authorizer_and_refreshes_keep_to_them() {
     check(signed_in(alice.path(), &url, &["list"]), "refreshed");
     assert_ne!(saved(alice.path(), "refresh_token").unwrap(), before, "renewed by its rule");
 
-    // Another domain: kept out.
+    // Let in, to a workspace that does not exist: told so only now, and no token is issued.
+    let issued = stored(&root, "tokens").len();
+    let exchanged = || idp.log().iter().filter(|l| *l == "POST /token").count();
+    let before = exchanged();
+    idp.next("a1", json!({ "email": "alice@acme.example", "email_verified": true }));
+    let dir = tempfile::tempdir().unwrap();
+    let args = ["--json", "remote", "login", "--provider", "acme", &format!("{}/w/nope", server.base)];
+    let out = bd(dir.path()).args(args).stdin(Stdio::null()).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(3), "{stderr}");
+    assert!(stderr.contains("workspace not found: nope"), "{stderr}");
+    assert!(exchanged() > before, "told only after the provider's code was redeemed");
+    assert_eq!(stored(&root, "tokens").len(), issued, "nothing issued");
+
+    // Another domain: kept out, alike from a workspace that exists and from one that does not.
     let (_eve, out) = login("e1", "eve@evil.example");
     assert_eq!(out.status.code(), Some(7), "{}", String::from_utf8_lossy(&out.stderr));
+    let refusal = |workspace: &str| {
+        idp.next("e1", json!({ "email": "eve@evil.example", "email_verified": true }));
+        let dir = tempfile::tempdir().unwrap();
+        let args = ["--json", "remote", "login", "--provider", "acme", &format!("{}/w/{workspace}", server.base)];
+        let out = bd(dir.path()).args(args).stdin(Stdio::null()).output().unwrap();
+        assert_eq!(out.status.code(), Some(7), "{workspace}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr).replace(workspace, "<workspace>")
+    };
+    assert_eq!(refusal("nope"), refusal("proj"));
 
     // The rule changed: the sign-in ends at its next refresh (bd keeps no email to decide again).
     std::fs::write(root.join("auth.toml"), config("acme.example\", \"other.example")).unwrap();
@@ -6883,12 +6906,39 @@ fn github_sign_in_refusals() {
     assert!(github.log().is_empty(), "GitHub is not asked");
 
     let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"alice\"]\nworkspaces = [\"other\"]\n");
-    // An unknown workspace is refused before anyone goes to GitHub.
+    // Only a workspace name's shape is checked before anyone goes to GitHub.
+    let device = format!("{}/v2/auth/github/device", server.base);
+    let (status, _, answer) = post_json(&device, r#"{"workspace":"../proj"}"#);
+    assert_eq!(status, 400, "{answer}");
+    assert!(answer.to_string().contains("invalid workspace name"), "{answer}");
+    assert!(github.log().is_empty(), "GitHub is not asked: {:?}", github.log());
+    // Whether a workspace exists is told only to an account the rules let in: anyone else is refused alike for one
+    // that is missing and for one that exists.
     let dir = machine();
-    refused(github_login(dir.path(), &format!("{}/w/nope", server.base)), 3, "workspace not found: nope");
-    // Only the directory's own name: on a case-insensitive filesystem, PROJ would open proj.
-    refused(github_login(dir.path(), &format!("{}/w/PROJ", server.base)), 3, "workspace not found: PROJ");
-    assert!(github.log().is_empty());
+    let refusal = |login: &str, workspace: &str| {
+        github.next(login, 0);
+        let out = github_login(dir.path(), &format!("{}/w/{workspace}", server.base));
+        assert_eq!(out.status.code(), Some(7), "{login} at {workspace}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stderr).replace(workspace, "<workspace>")
+    };
+    for login in ["alice", "mallory"] {
+        let missing = refusal(login, "nope");
+        assert_eq!(missing, refusal(login, "proj"), "{login}");
+        if login == "alice" {
+            assert!(missing.contains("not use workspace <workspace> (only other)"), "{missing}");
+        }
+    }
+    let token = format!("{}/v2/auth/github/token", server.base);
+    let (status, _, answer) = post_json(&token, r#"{"device_code":"abc","workspace":"../proj"}"#);
+    assert_eq!(status, 400, "{answer}");
+    assert!(answer.to_string().contains("invalid workspace name"), "{answer}");
+    // Let in, to a workspace that does not exist: told so only once GitHub said who it is, and no token is issued.
+    let asked = github.log().len();
+    github.next("alice", 0);
+    refused(github_login(dir.path(), &format!("{}/w/other", server.base)), 3, "workspace not found: other");
+    assert!(github.log()[asked..].iter().any(|l| l.contains("/user")), "after GitHub: {:?}", github.log());
+    assert_eq!(saved_token(dir.path()), None);
+    assert!(stored(server.root.path(), "tokens").is_empty(), "nothing issued");
 
     // A sign-in cancelled at GitHub.
     github.next("alice", 0);
@@ -6942,6 +6992,13 @@ fn github_sign_in_refusals() {
         8,
         "GitHub would not tell this bd server whether GitHub user dana",
     );
+
+    // Only the directory's own name: on a case-insensitive filesystem, PROJ would open proj.
+    let github = FakeGithub::start();
+    let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"alice\"]\nworkspaces = [\"PROJ\"]\n");
+    github.next("alice", 0);
+    refused(github_login(dir.path(), &format!("{}/w/PROJ", server.base)), 3, "workspace not found: PROJ");
+    assert!(stored(server.root.path(), "tokens").is_empty(), "nothing issued");
 
     // A broken auth.toml keeps the server from starting.
     let root = Server::prepare();
@@ -7004,9 +7061,11 @@ fn github_sign_in_lets_anyone_in_by_an_anyone_rule() {
         (Some("github:stranger"), Some("GitHub user old-name, as anyone"))
     );
 
-    // The token step refuses a workspace the server does not have, as the device step does.
+    // The token step tells nobody the rules have not let in whether a workspace exists: an unknown code gets the
+    // same answer for a missing workspace as for one that exists.
     let (status, answer) = sign_in_post(&server, "token", json!({ "device_code": "abc", "workspace": "nope" }));
-    assert_eq!((status, answer["error"]["code"].as_str()), (404, Some("not_found")), "{answer}");
+    assert_eq!((status, answer["error"]["code"].as_str()), (400, Some("invalid")), "{answer}");
+    assert_eq!((status, answer), sign_in_post(&server, "token", json!({ "device_code": "abc", "workspace": "proj" })));
 
     // A denied account gets nothing, whatever its login.
     let config = server.root.path().join("auth.toml");

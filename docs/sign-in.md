@@ -175,7 +175,8 @@ and grants:
 
 - A rule that lets an account in, but not into this workspace, leaves it
   to the rules after it. The token a later rule then issues covers this
-  workspace only. A workspace the server does not have is refused.
+  workspace only. A workspace the server does not have is refused once
+  the account is let in, before any token is issued.
 - **`anyone = true`** names nobody else and must be the last rule. Its
   tokens read by default, may write at most (never `admin`), and are
   always `agent` tokens. A rule before it may not give a lower role, or
@@ -528,8 +529,12 @@ server and are never stored. The answer that issued a bd token is kept for
   resolve human gates too.
 - `POST /v2/auth/revoke`, sent with a token from signing in, revokes it.
   `bd remote logout` and a replacing sign-in use it.
-- The device flow tells whether a workspace exists before sending anyone
-  to the provider; the browser flow tells only after the rules let the
-  account in.
+- Whether a workspace exists is told only to an account the rules (or the
+  authorizer) let into it, in the device flow and the browser flow alike:
+  before that, a missing workspace is refused like one that exists. So a
+  mistyped workspace is reported after signing in at the provider, and an
+  account let into all workspaces (`workspaces` left out, or an authorizer
+  allowing any name) can learn which names exist. An authorizer may be
+  asked about a workspace that does not exist: deny names it does not know.
 - At most 8 sign-in requests run at once (others get 503, which clients
   retry); refreshes have 8 slots of their own.

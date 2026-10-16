@@ -26,7 +26,7 @@ Retrieves full documentation for specified sections. Use after `list-sections` t
 **Example:**
 
 ```bash
-npx -y @sveltejs/mcp@0.1.26 get-documentation "$state,$derived,$effect"
+npx -y @sveltejs/mcp@0.1.26 get-documentation '$state,$derived,$effect'
 ```
 
 ### Svelte autofixer
@@ -45,8 +45,8 @@ Analyzes Svelte code and suggests fixes for common issues.
 **Examples:**
 
 ```bash
-# Analyze inline code (escape $ as \$)
-npx -y @sveltejs/mcp@0.1.26 svelte-autofixer '<script>let count = \$state(0);</script>'
+# Analyze inline code (single quotes keep $ literal)
+npx -y @sveltejs/mcp@0.1.26 svelte-autofixer '<script>let count = $state(0);</script>'
 
 # Analyze a file
 npx -y @sveltejs/mcp@0.1.26 svelte-autofixer ./src/lib/Component.svelte
@@ -55,7 +55,7 @@ npx -y @sveltejs/mcp@0.1.26 svelte-autofixer ./src/lib/Component.svelte
 npx -y @sveltejs/mcp@0.1.26 svelte-autofixer ./Component.svelte --svelte-version 4
 ```
 
-**Important:** When passing code with runes (`$state`, `$derived`, etc.) via the terminal, escape the `$` character as `\$` to prevent shell variable substitution.
+**Important:** When passing code with runes (`$state`, `$derived`, etc.) via the terminal, put it in single quotes, or escape each `$` as `\$` inside double quotes, to prevent shell variable substitution.
 
 ## Workflow
 

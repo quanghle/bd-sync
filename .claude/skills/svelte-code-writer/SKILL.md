@@ -10,7 +10,7 @@ You have access to `@sveltejs/mcp` CLI for Svelte-specific assistance. Use these
 ### List documentation sections
 
 ```bash
-npx @sveltejs/mcp list-sections
+npx -y @sveltejs/mcp@0.1.26 list-sections
 ```
 
 Lists all available Svelte 5 and SvelteKit documentation sections with titles and paths.
@@ -18,7 +18,7 @@ Lists all available Svelte 5 and SvelteKit documentation sections with titles an
 ### Get documentation
 
 ```bash
-npx @sveltejs/mcp get-documentation "<section1>,<section2>,..."
+npx -y @sveltejs/mcp@0.1.26 get-documentation "<section1>,<section2>,..."
 ```
 
 Retrieves full documentation for specified sections. Use after `list-sections` to fetch relevant docs.
@@ -26,13 +26,13 @@ Retrieves full documentation for specified sections. Use after `list-sections` t
 **Example:**
 
 ```bash
-npx @sveltejs/mcp get-documentation "$state,$derived,$effect"
+npx -y @sveltejs/mcp@0.1.26 get-documentation "$state,$derived,$effect"
 ```
 
 ### Svelte autofixer
 
 ```bash
-npx @sveltejs/mcp svelte-autofixer "<code_or_path>" [options]
+npx -y @sveltejs/mcp@0.1.26 svelte-autofixer "<code_or_path>" [options]
 ```
 
 Analyzes Svelte code and suggests fixes for common issues.
@@ -46,13 +46,13 @@ Analyzes Svelte code and suggests fixes for common issues.
 
 ```bash
 # Analyze inline code (escape $ as \$)
-npx @sveltejs/mcp svelte-autofixer '<script>let count = \$state(0);</script>'
+npx -y @sveltejs/mcp@0.1.26 svelte-autofixer '<script>let count = \$state(0);</script>'
 
 # Analyze a file
-npx @sveltejs/mcp svelte-autofixer ./src/lib/Component.svelte
+npx -y @sveltejs/mcp@0.1.26 svelte-autofixer ./src/lib/Component.svelte
 
 # Target Svelte 4
-npx @sveltejs/mcp svelte-autofixer ./Component.svelte --svelte-version 4
+npx -y @sveltejs/mcp@0.1.26 svelte-autofixer ./Component.svelte --svelte-version 4
 ```
 
 **Important:** When passing code with runes (`$state`, `$derived`, etc.) via the terminal, escape the `$` character as `\$` to prevent shell variable substitution.

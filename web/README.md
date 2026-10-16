@@ -1,6 +1,6 @@
 # bd web UI
 
-The bd web UI: a SvelteKit 3 single-page app built to static files (`build/`) with `@sveltejs/adapter-static`.
+The bd web UI (Node 22.17 or later): a SvelteKit 3 single-page app built to static files (`build/`) with `@sveltejs/adapter-static`.
 
 ```bash
 npm install

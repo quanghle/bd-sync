@@ -1,8 +1,8 @@
 ## Project Configuration
 
 - **Framework**: SvelteKit 3 (Svelte 5 runes), `@sveltejs/adapter-static` as a single-page app (`ssr = false`, fallback `index.html`); `npm run build` writes `build/`
-- **Language**: TypeScript 7 (`@typescript/native` = `npm:typescript@^7`; `npm run typecheck`). `typescript` is aliased to `@typescript/typescript6` because svelte-check needs the 6.x JS API
-- **Lint / format**: oxlint (`npm run lint`, `.oxlintrc.json`) and oxfmt (`npm run format`, `npm run format:check`, `.oxfmtrc.json`); no ESLint or Prettier
+- **Language**: TypeScript 7 (`@typescript/native` = `npm:typescript@^7`; `npm run typecheck`) checks the `.ts` files. `typescript` is aliased to `@typescript/typescript6` because svelte-check needs the 6.x JS API, so `.svelte` files are type-checked by svelte-check on TypeScript 6
+- **Lint / format**: oxlint (`npm run lint`, `.oxlintrc.json`) and oxfmt (`npm run format`, `npm run format:check`, `.oxfmtrc.json`, `.svelte` files through its `svelte` option); no ESLint or Prettier
 - **Checks**: `npm run check` (svelte-check, then tsc 7), `npm run lint`, `npm run format:check`, `npm run build`
 - **Package manager**: npm
 - **AI tooling**: the local Svelte MCP server is registered in the repository root's `.mcp.json`; the Svelte skills and the `svelte-file-editor` agent live in the root `.claude/`

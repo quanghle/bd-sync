@@ -214,11 +214,34 @@ Evidence: a comment per review round with who reviewed and the counts; every blo
 finding a closed child issue with its fix or rejection reason."""
 
 [[steps]]
+id = "spec"
+title = "Feature spec: {{task}}"
+type = "task"
+needs = ["review"]
+description = """
+Keep the canonical requirements of the features this change touches current (AGENTS.md, Feature \
+specs), now that review has settled the behavior. <run> below is this run (the parent of this step). \
+Find the specs: `bd list --status pinned -l spec`, then `node .github/scripts/spec.mjs <area> --history` \
+for each one touched. For each user-visible behavior the change adds, changes or removes, and each thing \
+it deliberately does not do (a non-goal), single-quote the text (backticks and $ in double quotes are run \
+by the shell) and put `--` before a title:
+add: `bd create -t story --pinned --parent <spec> -l requirement --dep related:<run> -q -- '<behavior, one testable sentence>'` \
+(a non-goal: `-l requirement,non-goal`);
+change: create the new requirement as above, then `bd supersede <old> --with <new>`;
+remove: `bd close <old> --reason='<why> (<run>)'`.
+A new feature gets its spec first: \
+`bd create -t feature --pinned -l spec,area:<name> -d '<what it is>' -q -- '<feature>'`. \
+A change with no user-visible behavior (a refactor, tests, internal tooling) touches no spec: say so."""
+acceptance_criteria = """
+Evidence: the close reason lists the requirement ids added, superseded and removed per spec, or \
+'no user-visible behavior change' with why."""
+
+[[steps]]
 id = "signoff"
 title = "Sign-off and merge: {{task}}"
 type = "task"
 condition = "{{tier}} == critical"
-needs = ["review"]
+needs = ["review", "spec"]
 description = "After sign-off, merge. The records are already shared through the bd server."
 acceptance_criteria = "Evidence: the approver and the merge commit in the close reason."
 
@@ -234,7 +257,7 @@ description = "Final sign-off: check the evidence on every step of this run, the
 id = "score"
 title = "Score: {{task}}"
 type = "task"
-needs = ["review", "signoff"]
+needs = ["review", "signoff", "spec"]
 description = """
 Score how well the agent work on this run went, against .bd/rubric.md: run the `score-issue` \
 workflow with issue=<this run> (the parent of this step) and actor=<your bd actor>; pass range \

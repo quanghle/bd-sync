@@ -1,13 +1,20 @@
 //! `bd playbook ...` and `bd purge`.
 //!
 //! In a remote workspace a name is looked up in the checkout's
-//! `.bd/playbooks` first, then on the server's playbook path, then in the
-//! client's `$BD_PLAYBOOK_PATH` and user config directory; file paths are the
-//! client's. `show`, `plan` and `run` of a playbook found on the client send
-//! its files with the command (a bundle, named by `--playbook-bundle`), and
-//! the server loads it from the bundle alone. `list` shows all of them, and
-//! `extract --save` writes into the checkout. `bd prime` lists them too: the
-//! client sends the names and descriptions of its own (`--client-playbooks`).
+//! `.bd/playbooks` first, then among the server's playbooks approved on this
+//! machine (`.bd/approved/playbooks`, kept by `bd agents approve`:
+//! [`crate::agents::approved`]), then in the client's `$BD_PLAYBOOK_PATH`
+//! and user config directory; file paths are the client's. `show`, `plan`
+//! and `run` always send the files they load with the command (a bundle,
+//! named by `--playbook-bundle`), checked against the approvals first, and
+//! the server loads it from the bundle alone: it compiles exactly the bytes
+//! approved here, never its own copy. A name found nowhere here fails, saying
+//! that the server's playbooks are used once approved. `list` shows all of
+//! them and names the server's playbooks waiting for approval, and `extract
+//! --save` writes into the checkout. `bd prime` lists them too: the client
+//! sends the names and descriptions of its own and of those approved, and
+//! the paths of those waiting (`--client-playbooks`), which the server lists
+//! in place of its own.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,6 +29,7 @@ use bd_core::{Error, Queries, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::agents::checkout::Checkout;
 use crate::app::{App, Out};
 use crate::cli::*;
 use crate::fmt::rel;
@@ -52,21 +60,24 @@ fn with_user_paths(first: Option<PathBuf>) -> Vec<PathBuf> {
     paths
 }
 
-/// The playbooks a command naming `reference` reads: the bundle named by
-/// `--playbook-bundle` (sent by a remote client; under bd serve it is never
-/// read from disk), or the search path.
-fn loader(app: &App, reference: &str) -> Result<Loader> {
-    let Some(file) = &app.g.playbook_bundle else { return Ok(Loader::new(search_paths(app))) };
+/// The playbooks a command reads: the bundle named by `--playbook-bundle`
+/// (sent by a remote client; under bd serve it is never read from disk), or
+/// the search path.
+fn loader(app: &App) -> Result<Loader> {
+    let Some(file) = &app.g.playbook_bundle else { return Ok(disk_loader(search_paths(app))) };
     let bundle = Bundle::from_json(&io::read_file(file)?)?;
-    // A playbook from the client's own path gives way to the workspace's of
-    // the same name. Names only: a path a client names is never looked up here.
-    if bundle.server_first && !playbook::is_path_like(reference.trim()) {
-        let own = Loader::new(search_paths(app));
-        if own.locate(reference, None).is_ok() {
-            return Ok(own);
-        }
-    }
+    // `server_first` (set by clients that predate approving the server's
+    // playbooks) is ignored: the server's own copy never takes the place of
+    // a bundle a client sent, which holds what was approved there.
     Loader::from_bundle(bundle)
+}
+
+/// A loader of the playbook files on `paths`: under bd serve held to them
+/// ([`Loader::contained`]), so a playbook the server loads for a client
+/// cannot extend or expand files elsewhere on the server.
+fn disk_loader(paths: Vec<PathBuf>) -> Loader {
+    let loader = Loader::new(paths);
+    if io::serving() { loader.contained() } else { loader }
 }
 
 /// Under bd serve without a bundle, playbooks come from the server's own playbook path.
@@ -120,7 +131,7 @@ pub fn cmd_playbook(app: &mut App, cmd: &PlaybookCommand) -> Result<()> {
 }
 
 fn cmd_list(app: &mut App) -> Result<()> {
-    let loader = Loader::new(search_paths(app));
+    let loader = disk_loader(search_paths(app));
     let listed = loader.list();
     let json = json!({ "search_paths": loader.search_paths, "playbooks": listed });
     let entries: Vec<(Listed, bool)> = listed.into_iter().map(|l| (l, false)).collect();
@@ -130,18 +141,22 @@ fn cmd_list(app: &mut App) -> Result<()> {
 }
 
 /// What `bd playbook list` prints. Entries and searched directories marked
-/// `true` are on the server.
+/// `true` are the server's playbooks approved here.
 fn list_out(json: Value, entries: &[(Listed, bool)], searched: &[(PathBuf, bool)]) -> Out {
     let mut out = Out::new(json);
     if entries.is_empty() {
         out = out.line("No playbooks found. Searched:");
-        for (p, on_server) in searched {
-            out = out.line(format!("  {}{}", p.display(), if *on_server { " (on the server)" } else { "" }));
+        for (p, from_server) in searched {
+            out = out.line(format!(
+                "  {}{}",
+                p.display(),
+                if *from_server { " (the bd server's, approved on this machine)" } else { "" }
+            ));
         }
         out = out.line("Create one at .bd/playbooks/<name>.toml (see `bd playbook show <file>` to validate it).");
     }
-    for (l, on_server) in entries {
-        let place = if *on_server { " (on the server)" } else { "" };
+    for (l, from_server) in entries {
+        let place = if *from_server { " (the bd server's, approved here)" } else { "" };
         let mut line = format!("{:<20} {}{place}", l.name, l.path.display());
         if let Some(e) = &l.error {
             line = format!("✗ {line}\n    {}", e.replace('\n', "\n    "));
@@ -172,8 +187,35 @@ pub enum Location {
     Checkout,
     /// The playbook path of a remote workspace's server.
     Server,
+    /// A remote workspace's server's playbook, approved on the client's machine.
+    Approved,
     /// `$BD_PLAYBOOK_PATH` and the user config directory.
     User,
+}
+
+/// What a client of today sends for `bd prime` (`--client-playbooks`): its
+/// playbooks in lookup order (the checkout's, those approved, the user's),
+/// which the server lists in place of its own, and the SHA-256 of each of
+/// the server's playbook files approved on its machine, from which the
+/// server names those waiting for approval there (in the same request, so
+/// a session hook's prime makes one). A server that predates it reads no
+/// listing from it, and lists its own; a client that predates it sends a
+/// bare array of [`Summary`], read as before.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Listing {
+    pub playbooks: Vec<Summary>,
+    /// By path in the server's playbook directory. `None`: the client could
+    /// not tell (an unusable `.bd/agents.lock`).
+    #[serde(default)]
+    pub approved: Option<BTreeMap<String, String>>,
+}
+
+/// What `bd prime` lists of the playbooks.
+#[derive(Clone, Debug, Default)]
+pub struct ForPrime {
+    pub playbooks: Vec<Summary>,
+    /// The server's playbooks waiting for approval on the client's machine, as it sent them.
+    pub pending: Vec<crate::agents::approved::PendingPlaybook>,
 }
 
 /// A playbook as `bd prime` lists it.
@@ -213,18 +255,42 @@ impl Summary {
 
 /// The playbooks `bd prime` lists, in lookup order, each name once (the one
 /// a command naming it loads). `client` names the listing a remote client
-/// sent of its checkout's and its user's playbooks, which go before and
-/// after the server's own; a listing that cannot be read is left out.
-pub fn for_prime(app: &App, client: Option<&Path>) -> Vec<Summary> {
-    let client: Option<Vec<Summary>> = client.and_then(|file| {
+/// sent: of today ([`Listing`]), its playbooks, which are all it can run,
+/// listed in place of the server's own, with those waiting for approval; or,
+/// from a client that predates it, of its checkout's and its user's
+/// playbooks, which go before and after the server's own. A listing that
+/// cannot be read is left out.
+pub fn for_prime(app: &App, client: Option<&Path>) -> ForPrime {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Sent {
+        Listing(Listing),
+        Old(Vec<Summary>),
+    }
+    let client: Option<Sent> = client.and_then(|file| {
         let listing = io::read_file(file).and_then(|text| {
             serde_json::from_str(&text).map_err(|e| Error::invalid(format!("{}: {e}", file.display())))
         });
         listing.map_err(|e| tracing::debug!(target: "bd::cli", error = %e, "client playbooks left out")).ok()
     });
+    let client = match client {
+        Some(Sent::Listing(listing)) => {
+            let mut seen = std::collections::HashSet::new();
+            let playbooks = listing
+                .playbooks
+                .into_iter()
+                .map(Summary::tidy)
+                .filter(|s| s.location != Location::Server && seen.insert(s.name.clone()))
+                .collect();
+            let pending = listing.approved.map(|a| pending_against(app, &a)).unwrap_or_default();
+            return ForPrime { playbooks, pending };
+        }
+        Some(Sent::Old(old)) => Some(old),
+        None => None,
+    };
     let paths = search_paths(app);
     let remote = client.is_some() || io::serving();
-    let own = Loader::new(paths.clone()).list().into_iter().map(|l| {
+    let own = disk_loader(paths.clone()).list().into_iter().map(|l| {
         let location = if remote {
             Location::Server
         } else if l.path.parent() == paths.first().map(PathBuf::as_path) {
@@ -239,7 +305,30 @@ pub fn for_prime(app: &App, client: Option<&Path>) -> Vec<Summary> {
     let before = before.into_iter().map(|s| Summary { location: Location::Checkout, ..s.tidy() });
     let after = after.into_iter().map(Summary::tidy);
     let mut seen = std::collections::HashSet::new();
-    before.chain(own).chain(after).filter(|s| seen.insert(s.name.clone())).collect()
+    let playbooks = before.chain(own).chain(after).filter(|s| seen.insert(s.name.clone())).collect();
+    ForPrime { playbooks, pending: Vec::new() }
+}
+
+/// The workspace's playbooks a client that approved those of `approved`
+/// (path to SHA-256) has yet to approve: none if they cannot be read.
+fn pending_against(app: &App, approved: &BTreeMap<String, String>) -> Vec<crate::agents::approved::PendingPlaybook> {
+    use crate::agents::approved::{PendingPlaybook, PlaybookChange};
+    let set = crate::agents::playbooks_dir(app).and_then(|dir| bd_core::agents::PlaybookSet::load(&dir));
+    let set = match set {
+        Ok(set) => set,
+        Err(e) => {
+            tracing::debug!(target: "bd::cli", error = %e, "playbooks waiting for approval unknown");
+            return Vec::new();
+        }
+    };
+    set.files
+        .into_iter()
+        .filter_map(|(path, file)| match approved.get(&path) {
+            None => Some(PendingPlaybook { path, change: PlaybookChange::New }),
+            Some(sha) if *sha != file.sha256 => Some(PendingPlaybook { path, change: PlaybookChange::Changed }),
+            Some(_) => None,
+        })
+        .collect()
 }
 
 fn step_lines(steps: &[Arc<Step>], depth: usize, out: &mut Vec<String>) {
@@ -294,7 +383,7 @@ fn step_lines(steps: &[Arc<Step>], depth: usize, out: &mut Vec<String>) {
 }
 
 fn cmd_show(app: &mut App, a: &PlaybookRefArgs) -> Result<()> {
-    let loader = loader(app, &a.playbook)?;
+    let loader = loader(app)?;
     let pb = load(app, &loader, &a.playbook)?;
     let server = on_server(&loader);
     let mut text = vec![format!(
@@ -404,7 +493,7 @@ fn status_lines(s: &RunStatus) -> Vec<String> {
 }
 
 fn cmd_run(app: &mut App, a: &RunArgs, dry_run: bool) -> Result<()> {
-    let loader = loader(app, &a.playbook)?;
+    let loader = loader(app)?;
     let pb = load(app, &loader, &a.playbook)?;
     let req = RunRequest {
         vars: parse_vars(&a.vars)?,
@@ -679,9 +768,28 @@ pub fn client_command(app: &App, remote: &Remote, cmd: &PlaybookCommand) -> Resu
     }
 }
 
-/// `show`, `plan` and `run` of a playbook found on the client: send its
-/// files (a bundle) with the command. A name not found here is left to the
-/// server's playbook path; a path not found here is an error.
+/// The directory of the server's playbooks approved on this machine, in a
+/// remote workspace's checkout ([`crate::agents::approved`]).
+fn approved_playbooks(app: &App) -> Result<Option<Checkout>> {
+    Ok(checkout_bd(app)?.map(Checkout::new))
+}
+
+/// Where a remote workspace's client looks a playbook up: the checkout's
+/// `.bd/playbooks`, the server's approved here, then the user's own.
+fn client_paths(app: &App) -> Result<(PathBuf, Option<Checkout>, Vec<PathBuf>)> {
+    let checkout = checkout_playbooks(app)?;
+    let approved = approved_playbooks(app)?;
+    let mut paths = vec![checkout.clone()];
+    paths.extend(approved.as_ref().map(Checkout::approved_playbooks));
+    paths.extend(with_user_paths(None));
+    Ok((checkout, approved, paths))
+}
+
+/// `show`, `plan` and `run`: send the files of the playbook named, found on
+/// the client (the checkout's, those approved here, the user's own), with
+/// the command (a bundle), checked against the approvals. A name found
+/// nowhere here is an error: the server's playbooks are used only once
+/// approved on this machine.
 pub fn attach_bundle(app: &App, cmd: &Command, request: &mut ExecRequest) -> Result<()> {
     let Command::Playbook(
         PlaybookCommand::Show(PlaybookRefArgs { playbook: reference })
@@ -692,32 +800,45 @@ pub fn attach_bundle(app: &App, cmd: &Command, request: &mut ExecRequest) -> Res
         return Ok(());
     };
     if let Some(file) = &app.g.playbook_bundle {
-        // A bundle named on the command line travels like any input file.
-        request.files.insert(file.to_string_lossy().into_owned(), io::read_file(file)?);
+        // A bundle named on the command line travels like any input file, but
+        // never asks for the server's copy in place of what it holds.
+        let text = io::read_file(file)?;
+        if Bundle::from_json(&text)?.server_first {
+            return Err(Error::invalid(format!(
+                "{}: a playbook bundle asking for the bd server's copy first (server_first): the server's \
+                 playbooks are used here only once approved on this machine (`bd agents approve`)",
+                file.display()
+            )));
+        }
+        request.files.insert(file.to_string_lossy().into_owned(), text);
         return Ok(());
     }
-    // The checkout's playbooks and file paths shadow the server's; the user's
-    // own ($BD_PLAYBOOK_PATH, the config directory) only stand in for names
-    // the server lacks, which the server decides. Inside a playbook found
-    // here, references resolve on the whole client path, as locally.
-    let checkout = checkout_playbooks(app)?;
-    let loader = Loader::new(with_user_paths(Some(checkout.clone())));
+    // The checkout's playbooks and file paths come first, then the server's
+    // approved here, then the user's own ($BD_PLAYBOOK_PATH, the config
+    // directory). Inside a playbook found here, references resolve on the
+    // whole client path, as locally.
+    let (_, approved, paths) = client_paths(app)?;
+    let loader = Loader::new(paths);
     let r = reference.trim();
-    let server_first = if playbook::is_path_like(r) || Loader::new(vec![checkout]).locate(r, None).is_ok() {
-        false
-    } else {
-        match loader.locate(r, None) {
-            Ok(_) => true,
-            // Not on the client: a playbook on the server's path.
-            Err(Error::NotFound { .. }) => return Ok(()),
-            Err(e) => return Err(e),
+    match loader.locate(r, Some(&app.cwd)) {
+        Ok(_) => {}
+        Err(Error::NotFound { .. }) if !playbook::is_path_like(r) => {
+            return Err(Error::not_found(
+                "playbook",
+                format!(
+                    "{r} (looked up in this checkout's .bd/playbooks, among the bd server's playbooks approved on \
+                     this machine, and in the user's own; a playbook the server serves is used here only once a \
+                     person approves it: `bd agents status` lists those waiting, and `bd agents approve` in a \
+                     terminal approves them)"
+                ),
+            ));
         }
-    };
-    let mut bundle = match server_first {
-        true => loader.bundle_lenient(reference, Some(&app.cwd))?,
-        false => loader.bundle(reference, Some(&app.cwd))?,
-    };
-    bundle.server_first = server_first;
+        Err(e) => return Err(e),
+    }
+    let bundle = loader.bundle(reference, Some(&app.cwd))?;
+    if let Some(approved) = &approved {
+        crate::agents::approved::verify_bundle(approved, &bundle)?;
+    }
     let bundle = bundle.to_json()?;
     request.files.insert(BUNDLE_FILE.to_string(), bundle);
     request.argv.splice(0..0, [BUNDLE_FLAG.to_string(), BUNDLE_FILE.to_string()]);
@@ -729,9 +850,11 @@ const LISTING_FILE: &str = "prime.playbooks.json";
 /// Names the listing on the command line.
 const LISTING_FLAG: &str = "--client-playbooks";
 
-/// `bd prime`: send the names and descriptions of the checkout's playbooks
-/// and the user's own, which the server lists before and after its own.
-/// Never fails: without them, prime lists the server's alone.
+/// `bd prime`: send the names and descriptions of the checkout's playbooks,
+/// the server's approved here and the user's own, and what is approved
+/// here ([`Listing`]), which the server lists in place of its own, naming
+/// its playbooks waiting for approval here. Never fails, and makes no
+/// request of its own.
 pub fn attach_listing(app: &App, cmd: &Command, request: &mut ExecRequest) {
     if !matches!(cmd, Command::Prime(_)) {
         return;
@@ -743,19 +866,50 @@ pub fn attach_listing(app: &App, cmd: &Command, request: &mut ExecRequest) {
         }
         return;
     }
-    let Ok(checkout) = checkout_playbooks(app) else { return };
-    let listed = |paths: Vec<PathBuf>, location: Location| {
-        let found = Loader::new(paths).list().into_iter().filter(|l| l.shadowed_by.is_none());
-        found.map(move |l| Summary::of(&l, location))
+    let Ok((checkout, approved, paths)) = client_paths(app) else { return };
+    let approved_dir = approved.as_ref().map(Checkout::approved_playbooks);
+    let playbooks: Vec<Summary> = Loader::new(paths)
+        .list()
+        .into_iter()
+        .filter(|l| l.shadowed_by.is_none())
+        .map(|l| {
+            let location = match l.path.parent() {
+                Some(dir) if dir == checkout => Location::Checkout,
+                Some(dir) if Some(dir) == approved_dir.as_deref() => Location::Approved,
+                _ => Location::User,
+            };
+            Summary::of(&l, location)
+        })
+        .collect();
+    let approved = match &approved {
+        Some(c) => c.read_lock().ok().map(|lock| lock.playbooks.into_iter().map(|(p, a)| (p, a.sha256)).collect()),
+        None => Some(BTreeMap::new()),
     };
-    let listing: Vec<Summary> =
-        listed(vec![checkout], Location::Checkout).chain(listed(with_user_paths(None), Location::User)).collect();
-    if listing.is_empty() {
-        return;
-    }
+    let listing = Listing { playbooks, approved };
     let Ok(listing) = serde_json::to_string(&listing) else { return };
     request.files.insert(LISTING_FILE.to_string(), listing);
     request.argv.splice(0..0, [LISTING_FLAG.to_string(), LISTING_FILE.to_string()]);
+}
+
+/// The server's playbooks waiting for approval in `checkout` (none: in a
+/// directory without one, where nothing is approved); `None` if the server
+/// does not serve them. Changes nothing.
+fn pending_here(
+    app: &App,
+    remote: &Remote,
+    checkout: Option<&Checkout>,
+) -> Result<Option<Vec<crate::agents::approved::PendingPlaybook>>> {
+    let nowhere;
+    let checkout = match checkout {
+        Some(c) => c,
+        None => {
+            nowhere = Checkout::new(app.cwd.join(".bd"));
+            &nowhere
+        }
+    };
+    let lock_wait = std::time::Duration::from_millis(app.g.busy_timeout_ms);
+    let opts = crate::agents::sync::Options { apply: false, force: false, review: false, lock_wait };
+    Ok(crate::agents::sync_playbooks(app, Some(remote), checkout, opts)?.map(|o| o.report.pending))
 }
 
 /// A read the client composes (in JSON) rather than the user's command line.
@@ -777,48 +931,57 @@ fn relay_failure(app: &App, response: &ExecResponse) -> i32 {
     response.exit_code
 }
 
+/// `list` in a remote workspace: the checkout's playbooks, the server's
+/// approved here, then the user's own, as a command naming one finds them;
+/// and the server's waiting for approval here.
 fn client_list(app: &App, remote: &Remote) -> Result<i32> {
-    #[derive(Deserialize)]
-    struct ServerList {
-        search_paths: Vec<PathBuf>,
-        playbooks: Vec<Listed>,
-    }
-    let checkout = checkout_playbooks(app)?;
-    let users = with_user_paths(None);
-    let response = server_read(app, remote, vec!["--json".into(), "playbook".into(), "list".into()])?;
-    if response.exit_code != 0 {
-        return Ok(relay_failure(app, &response));
-    }
-    let theirs: ServerList = serde_json::from_str(&response.stdout)
-        .map_err(|e| Error::Remote(format!("{}: unexpected playbook list: {e}", remote.url)))?;
-    // In lookup order: the checkout's, the server's, then the user's own.
-    let mut entries: Vec<(Listed, bool)> = Vec::new();
-    let found = Loader::new(vec![checkout.clone()]).list().into_iter().map(|l| (l, false));
-    let found = found.chain(theirs.playbooks.into_iter().map(|l| (l, true)));
-    for (mut l, server) in found.chain(Loader::new(users.clone()).list().into_iter().map(|l| (l, false))) {
-        l.shadowed_by = entries.iter().find(|(m, _)| m.name == l.name).map(|(m, _)| m.path.clone());
-        entries.push((l, server));
-    }
+    let (_, approved, paths) = client_paths(app)?;
+    let approved_dir = approved.as_ref().map(Checkout::approved_playbooks);
+    let pending = pending_here(app, remote, approved.as_ref())?;
+    let entries: Vec<(Listed, bool)> = Loader::new(paths.clone())
+        .list()
+        .into_iter()
+        .map(|l| {
+            let from_server = l.path.parent().is_some_and(|d| Some(d) == approved_dir.as_deref());
+            (l, from_server)
+        })
+        .collect();
     let playbooks: Vec<Value> = entries
         .iter()
-        .map(|(l, server)| {
+        .map(|(l, approved)| {
             let mut v = json!(l);
-            if *server {
+            if *approved {
                 v["server"] = json!(true);
+                v["approved"] = json!(true);
             }
             v
         })
         .collect();
-    let mut searched = vec![(checkout.clone(), false)];
-    searched.extend(theirs.search_paths.iter().map(|p| (p.clone(), true)));
-    searched.extend(users.iter().map(|p| (p.clone(), false)));
-    let client: Vec<&PathBuf> = std::iter::once(&checkout).chain(&users).collect();
+    let searched: Vec<(PathBuf, bool)> =
+        paths.iter().map(|p| (p.clone(), Some(p.as_path()) == approved_dir.as_deref())).collect();
     let json = json!({
-        "search_paths": client,
-        "server": { "url": remote.url, "search_paths": theirs.search_paths },
+        "search_paths": paths,
+        "server": { "url": remote.url, "pending": pending },
         "playbooks": playbooks,
     });
-    app.print(list_out(json, &entries, &searched));
+    let mut out = list_out(json, &entries, &searched);
+    match pending.as_deref() {
+        Some([]) | None => {}
+        Some(pending) => {
+            out = out.line(crate::agents::show::printable(&format!(
+                "Waiting for approval on this machine (the bd server's, not usable here until approved with `bd \
+                 agents approve` in a terminal): {}",
+                crate::agents::approved::pending_list(pending)
+            )));
+        }
+    }
+    if pending.is_none() {
+        out = out.line(
+            "note: the bd server does not serve its playbooks for approval (it predates it); upgrade it to use them \
+             here",
+        );
+    }
+    app.print(out);
     Ok(0)
 }
 

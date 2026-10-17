@@ -182,6 +182,10 @@ reserved: no token acts as it or its sub-actors.
 | `write` | every command except the admin ones |
 | `admin` | also `config set/unset`, `rename-prefix`, `import`, `github`, `events prune`, `doctor`, and taking over other actors' claims |
 
+`bd publish` needs more than the role: an `admin` token of kind `human`
+(a person's). An admin agent token is refused, and MCP tool calls carry
+no admin rights at all ([Publishing](agents.md#publishing)).
+
 The server checks these in the engine, so `bd batch` and playbook runs get
 the same answer as single commands:
 
@@ -301,11 +305,34 @@ retrying. Exit codes are the same as locally, plus:
   file; `--stdin` and `-` send stdin; `export -o` and `playbook extract -o`
   write locally (as `FILE.tmp`, renamed once the command succeeds).
 - **Playbooks** are looked up in the checkout's `.bd/playbooks` first, then
-  on the server's playbook path, then in your own `$BD_PLAYBOOK_PATH` and
-  config directory. A playbook found on the client is sent with every file
-  it extends or expands (at most 256 files of 512 KiB, 8 MiB in all), and
-  the server compiles it as a local run would. `playbook list` and
-  `bd prime` show all three sources, marking the server's.
+  among the server's playbooks approved on this machine
+  (`.bd/approved/playbooks`, kept by `bd agents approve`), then in your own
+  `$BD_PLAYBOOK_PATH` and config directory. The playbook is always sent
+  with every file it extends or expands (at most 256 files of 512 KiB, 8
+  MiB in all), checked against the approvals first, and the server compiles
+  exactly that, as a local run would, never its own copy. A server
+  playbook not approved here is not found
+  ([Approving the server's playbooks](agents.md#approving-the-servers-playbooks)).
+  `playbook list` and `bd prime` show all three sources, marking the
+  server's approved ones, and name the server's waiting for approval.
+- **Publishing**: `bd publish` reads the source directory on the client
+  (`.bd/source` in the checkout, or `--from DIR`) and sends it with the
+  command (at most 1,024 files and 16 MiB, within `--max-body-mib`); the
+  server checks every path and loads every set and playbook again in a
+  private staging directory before it changes anything, and never reads a
+  path the client names. `--rollback` sends nothing. A server older than
+  the client refuses the command, and the client says to upgrade it
+  ([Publishing](agents.md#publishing)).
+- **Upgrade the server first.** Clients of today use the server's
+  playbooks only once approved, and a server that predates approving them
+  serves none for approval: with such a server a client runs only its
+  checkout's and its user's playbooks, while `bd prime` (whose listing the
+  older server makes) still names the server's own. Upgrade bd serve
+  before its clients. A client older than the server keeps working, with
+  one change: its requests without a bundle still compile the server's
+  published copy, but a bundle it sends asking for the server's copy first
+  (`server_first`, for a playbook it found only in its user's own
+  directory) now runs the copy it sent, never the server's.
 - **Waiting**: `events --follow` and `events --wait` wait on the server
   ([Followers](#followers)).
 - **Client only**: `init`, `backup`, `bench`, `serve`, `hook`, `remote` and

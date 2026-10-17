@@ -36,9 +36,13 @@
 //!
 //! `bd serve` records each set's revision and appends an
 //! [`AGENTS_CHANGED`] event when it changes ([`record_revisions`]).
+//!
+//! The workspace's playbooks are served beside the sets as an asset clients
+//! approve too ([`PlaybookSet`], [`record_all`]), one set for every harness.
 
 mod changes;
 mod mcp;
+mod playbooks;
 mod set;
 
 use std::path::{Path, PathBuf};
@@ -48,11 +52,18 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 
-pub use changes::{AGENTS_CHANGED, AgentsChanged, record_revisions};
+pub(crate) use changes::record_in;
+pub use changes::{
+    AGENTS_CHANGED, AgentsChanged, PLAYBOOKS_AREA, PlaybooksChanged, Recorded, record_all, record_revisions,
+};
 pub use mcp::{
     MAX_FIELD_NAME, McpServer, canonical_json, check_definition, check_field_name, check_server_name, mcp_digest,
     parse_mcp, toml_definition,
 };
+pub use playbooks::{
+    PLAYBOOKS_DIR, PlaybookDigest, PlaybookFile, PlaybookSet, PlaybooksManifest, check_playbook_path, is_playbook_file,
+};
+pub(crate) use set::device_name;
 pub use set::{AgentSet, FileDigest, Manifest, McpDigest, SkillFile, check_skill_name, check_skill_path};
 
 /// The directory next to the database that holds the sets, one per harness.

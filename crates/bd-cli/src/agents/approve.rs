@@ -16,6 +16,12 @@
 //! checkout's mutex is taken only for that write, never while a person
 //! reads and answers, so session hooks and pulls go on meanwhile.
 //!
+//! In a remote workspace, the server's playbooks waiting for approval come
+//! last ([`super::approved`]): a new one shown whole, a changed one as a
+//! diff against the version approved here, each line behind a gutter and
+//! escaped as a skill file's are; those approved are kept, as shown, in
+//! `.bd/approved/playbooks`, where playbook commands find them.
+//!
 //! It refuses to run inside an agent session and without a terminal on
 //! stdin, with no flag or variable to get past either, so that an agent
 //! does not approve by accident. That is not a security boundary: an agent
@@ -32,7 +38,8 @@ use serde::Serialize;
 use serde_json::Value;
 use similar::{ChangeTag, TextDiff};
 
-use super::checkout::{Checkout, Found};
+use super::approved::{self, Outcome, PendingPlaybook, PlaybookChange};
+use super::checkout::{APPROVED_PLAYBOOKS, Checkout, Found};
 use super::lock::LockFile;
 use super::mcp_file::{McpFile, changed_fields, env_refs};
 use super::show;
@@ -54,6 +61,24 @@ const MAX_FILE_LINES: usize = 200;
 pub struct Summary {
     pub checkout: PathBuf,
     pub harnesses: BTreeMap<Harness, HarnessSummary>,
+    /// A remote workspace's playbooks, when its server serves them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playbooks: Option<PlaybooksSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PlaybooksSummary {
+    /// Where the approved playbooks are kept, checkout-relative.
+    pub dir: String,
+    /// Kept there and recorded in `.bd/agents.lock`.
+    pub approved: Vec<String>,
+    /// Still waiting for approval.
+    pub declined: Vec<String>,
+    /// Not asked about or not written, with why.
+    pub skipped: Vec<Skipped>,
+    /// Whether the server serves any playbook.
+    #[serde(skip)]
+    pub served: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,17 +125,26 @@ pub fn cmd_approve(app: &App, remote: Option<&Remote>, a: &AgentsApproveArgs) ->
     io::require_local("bd agents approve")?;
     refuse_in_agent_session(&actor::env)?;
     let checkout = super::find_checkout(app, remote.is_some())?;
-    let harnesses = super::harnesses(&a.harnesses, &checkout)?;
+    let harnesses = super::harnesses_for(&a.harnesses, &checkout, remote.is_some())?;
     let lock_wait = Duration::from_millis(app.g.busy_timeout_ms);
     let opts = Options { apply: false, force: false, review: true, lock_wait };
     let report = super::sync_checkout(app, remote, &checkout, &harnesses, opts)?;
-    let mut review = Review::new(&checkout, report, &a.names)?;
+    // Playbooks the server refuses to serve keep no skill or MCP definition from being approved.
+    let playbooks = super::sync_playbooks_or_refusal(app, remote, &checkout, opts)?.unwrap_or_else(|refusal| {
+        let line = format!(
+            "bd agents approve: the bd server's playbooks were not checked (nothing about them changed here): \
+             {refusal}"
+        );
+        io::errln(show::cap_line(show::printable(&line)));
+        None
+    });
+    let mut review = Review::new(&checkout, report, playbooks, &a.names)?;
     if review.asks() {
         // The process's own terminal: approve is machine-local (require_local above).
         if !std::io::stdin().is_terminal() {
             return Err(Error::Refused(
-                "bd agents approve asks about each skill and MCP server and runs only in a terminal (stdin is not \
-                 one)"
+                "bd agents approve asks about each skill, MCP server and playbook and runs only in a terminal \
+                 (stdin is not one)"
                     .into(),
             ));
         }
@@ -133,9 +167,9 @@ fn refuse_in_agent_session(env: &dyn Fn(&str) -> Option<String>) -> Result<()> {
         return Ok(());
     }
     Err(Error::Refused(format!(
-        "bd agents approve does not run inside an agent session ({} set): approving the skills and MCP servers a \
-         checkout runs is the user's decision. An agent should ask the user to run `bd agents approve` in a separate \
-         terminal",
+        "bd agents approve does not run inside an agent session ({} set): approving the skills, MCP servers and \
+         playbooks a checkout runs is the user's decision. An agent should ask the user to run `bd agents approve` in \
+         a separate terminal",
         set.join(", ")
     )))
 }
@@ -170,6 +204,27 @@ fn ask_one(input: &mut dyn BufRead, out: &mut dyn Write, prompt: &str) -> bool {
 struct Review {
     checkout: PathBuf,
     harnesses: BTreeMap<Harness, HarnessReview>,
+    playbooks: Option<PlaybooksReview>,
+}
+
+/// The server's playbooks to ask about.
+struct PlaybooksReview {
+    asks: Vec<PlaybookReview>,
+    /// The answers given, one per playbook of `asks`.
+    answers: Vec<bool>,
+    skipped: Vec<Skipped>,
+    served: bool,
+}
+
+/// A playbook file to ask about.
+struct PlaybookReview {
+    pending: PendingPlaybook,
+    /// The server's text.
+    text: String,
+    /// The text approved here, which a change is shown against.
+    approved: Option<String>,
+    /// What `.bd/agents.lock` recorded for it.
+    recorded: Option<String>,
 }
 
 struct HarnessReview {
@@ -200,10 +255,14 @@ impl Review {
     /// What to ask about, from a status `report`: every skill and MCP entry
     /// waiting for approval, or only those of `names` (each of which must be
     /// a skill or MCP server served or recorded for one of the harnesses).
-    fn new(checkout: &Checkout, report: Report, names: &[String]) -> Result<Review> {
+    fn new(checkout: &Checkout, report: Report, playbooks: Option<Outcome>, names: &[String]) -> Result<Review> {
         let lock = checkout.read_lock()?;
         let wanted: BTreeSet<&str> = names.iter().map(String::as_str).collect();
         let mut known: BTreeSet<&str> = BTreeSet::new();
+        let playbooks = match playbooks {
+            Some(outcome) => Some(review_playbooks(checkout, outcome, &wanted, &mut known, &lock)?),
+            None => None,
+        };
         let mut harnesses = BTreeMap::new();
         let asked: Vec<Harness> = report.harnesses.keys().copied().collect();
         for (h, r) in report.harnesses {
@@ -262,20 +321,25 @@ impl Review {
         }
         let unknown: Vec<&str> = wanted.difference(&known).copied().collect();
         if !unknown.is_empty() {
-            let asked: Vec<&str> = asked.iter().map(|h| h.name()).collect();
+            let harnesses = asked.iter().map(|h| h.name()).collect::<Vec<_>>().join(" or ");
+            let (what, served) = match (playbooks.is_some(), harnesses.is_empty()) {
+                (false, _) => ("skill or MCP server", format!("to {harnesses}")),
+                (true, true) => ("skill, MCP server or playbook", "as a playbook".to_string()),
+                (true, false) => ("skill, MCP server or playbook", format!("(to {harnesses}, or as a playbook)")),
+            };
             return Err(Error::invalid(format!(
-                "no skill or MCP server named {} is served to {} or recorded in .bd/agents.lock (`bd agents status` \
-                 lists those waiting for approval)",
+                "no {what} named {} is served {served} or recorded in .bd/agents.lock (`bd agents status` lists those \
+                 waiting for approval)",
                 unknown.join(", "),
-                asked.join(" or ")
             )));
         }
-        Ok(Review { checkout: checkout.root.clone(), harnesses })
+        Ok(Review { checkout: checkout.root.clone(), harnesses, playbooks })
     }
 
     /// Whether there is anything to ask about.
     fn asks(&self) -> bool {
         self.harnesses.values().any(|hr| !hr.skills.is_empty() || !hr.pending.is_empty())
+            || self.playbooks.as_ref().is_some_and(|p| !p.asks.is_empty())
     }
 
     /// Show each skill, then each MCP entry, on `out` and read the answer to
@@ -293,6 +357,15 @@ impl Review {
                     let _ = writeln!(out, "{line}");
                 }
                 hr.answers.push(ask_one(input, out, &format!("Approve MCP server {}?", show::printable(&p.name))));
+            }
+        }
+        if let Some(pr) = &mut self.playbooks {
+            for p in &pr.asks {
+                for line in playbook_lines(p, full) {
+                    let _ = writeln!(out, "{line}");
+                }
+                let prompt = format!("Approve playbook {}?", show::printable(&p.pending.path));
+                pr.answers.push(ask_one(input, out, &prompt));
             }
         }
     }
@@ -322,6 +395,37 @@ impl Review {
         }
         let mut done =
             if approvals.is_empty() { BTreeMap::new() } else { sync::apply_approved(checkout, &approvals, lock_wait)? };
+        let playbooks = match self.playbooks {
+            None => None,
+            Some(pr) => {
+                let approvals: Vec<approved::Approval<'_>> = pr
+                    .asks
+                    .iter()
+                    .zip(&pr.answers)
+                    .filter(|(_, yes)| **yes)
+                    .map(|(p, _)| approved::Approval {
+                        path: &p.pending.path,
+                        text: &p.text,
+                        recorded: p.recorded.as_deref(),
+                    })
+                    .collect();
+                let (written, skipped) = match approvals.is_empty() {
+                    true => (Vec::new(), Vec::new()),
+                    false => approved::apply_approved(checkout, &approvals, lock_wait)?,
+                };
+                let declined =
+                    pr.asks.iter().zip(&pr.answers).filter(|(_, yes)| !**yes).map(|(p, _)| p.pending.path.clone());
+                let mut all_skipped = pr.skipped;
+                all_skipped.extend(skipped.into_iter().map(|(name, reason)| Skipped { name, reason }));
+                Some(PlaybooksSummary {
+                    dir: format!(".bd/{APPROVED_PLAYBOOKS}"),
+                    approved: written,
+                    declined: declined.collect(),
+                    skipped: all_skipped,
+                    served: pr.served,
+                })
+            }
+        };
         let mut harnesses = BTreeMap::new();
         for (h, hr) in self.harnesses {
             let done = done.remove(&h).unwrap_or_default();
@@ -348,8 +452,85 @@ impl Review {
             };
             harnesses.insert(h, HarnessSummary { skills, mcp });
         }
-        Ok(Summary { checkout: self.checkout, harnesses })
+        Ok(Summary { checkout: self.checkout, harnesses, playbooks })
     }
+}
+
+/// The playbooks of `outcome` (a status of the server's, with their texts)
+/// to ask about: every one waiting for approval, or those `wanted` names
+/// (a playbook's path or name), each of which is then `known`.
+fn review_playbooks<'a>(
+    checkout: &Checkout,
+    outcome: Outcome,
+    wanted: &BTreeSet<&'a str>,
+    known: &mut BTreeSet<&'a str>,
+    lock: &LockFile,
+) -> Result<PlaybooksReview> {
+    let report = outcome.report;
+    let mut pr = PlaybooksReview {
+        asks: Vec::new(),
+        answers: Vec::new(),
+        skipped: Vec::new(),
+        served: report.server_revision != bd_core::agents::PlaybookSet::empty().revision,
+    };
+    for &name in wanted {
+        if report.pending.iter().any(|p| approved::names(name, &p.path)) {
+            known.insert(name);
+        } else if report.removed.iter().any(|p| approved::names(name, p)) {
+            known.insert(name);
+            let reason = "removed from the server; `bd agents pull` removes it here".into();
+            pr.skipped.push(Skipped { name: name.to_string(), reason });
+        } else if lock.playbooks.keys().any(|p| approved::names(name, p)) {
+            known.insert(name);
+            let reason = "up to date: approved already, nothing waits for approval".into();
+            pr.skipped.push(Skipped { name: name.to_string(), reason });
+        }
+    }
+    let texts = approved::approved_texts(checkout, &report.pending)?;
+    for p in report.pending {
+        if !wanted.is_empty() && !wanted.iter().any(|name| approved::names(name, &p.path)) {
+            continue;
+        }
+        let Some(file) = outcome.set.as_ref().and_then(|s| s.files.get(&p.path)) else {
+            let reason = "the server's playbooks changed while being read; run `bd agents approve` again".into();
+            pr.skipped.push(Skipped { name: p.path, reason });
+            continue;
+        };
+        let recorded = lock.playbooks.get(&p.path).map(|a| a.sha256.clone());
+        let approved = texts.get(&p.path).cloned();
+        pr.asks.push(PlaybookReview { text: file.text.clone(), approved, recorded, pending: p });
+    }
+    Ok(pr)
+}
+
+/// What the user is shown of a playbook waiting for approval before being
+/// asked: a new one whole, a changed one as a diff against the version
+/// approved here, every line behind a gutter and escaped, long ones cut
+/// short unless `full`; and, right before the prompt, what changes.
+fn playbook_lines(p: &PlaybookReview, full: bool) -> Vec<String> {
+    let path = &p.pending.path;
+    let mut lines = vec![match (p.pending.change, &p.approved) {
+        (PlaybookChange::Changed, Some(_)) => format!(
+            "playbook {path}: changed on the bd server; the version approved here stays in use until this one is"
+        ),
+        _ => format!("playbook {path}: new from the bd server; agents here can run it once approved"),
+    }];
+    let mut body = Vec::new();
+    match &p.approved {
+        Some(old) => diff_lines(old, &p.text, full, &mut body),
+        None => body.extend(p.text.split_inclusive('\n').map(|l| content_line('+', l, full))),
+    }
+    if body.is_empty() {
+        body.push("(empty)".into());
+    }
+    if !full && body.len() > MAX_FILE_LINES {
+        let more = body.len() - MAX_FILE_LINES;
+        body.truncate(MAX_FILE_LINES);
+        body.push(format!("…[{more} more lines; --full shows them]"));
+    }
+    lines.extend(body.into_iter().map(|l| format!("  {l}")));
+    lines.push(show::cap_line(format!("  playbook {path}: {}", p.pending.change.as_str())));
+    lines.iter().map(|l| show::printable(l)).collect()
 }
 
 /// The text here of each of `skill`'s files, to show its changes against;
@@ -668,6 +849,28 @@ fn render(summary: &Summary) -> Out {
         }
         if !m.approved.is_empty() {
             lines.push(format!("{h}: {}", reload_step(h)));
+        }
+        out = out.lines(lines.iter().map(|l| show::printable(l)));
+    }
+    if let Some(p) = &summary.playbooks {
+        let mut lines = Vec::new();
+        if !p.approved.is_empty() {
+            lines.push(format!("approved playbook {}: kept in {}", p.approved.join(", "), p.dir));
+            for path in &p.approved {
+                out = out.id(format!("playbook {path}"));
+            }
+        }
+        if !p.declined.is_empty() {
+            lines.push(format!(
+                "declined playbook {}: still waiting for approval (a changed one keeps its approved version)",
+                p.declined.join(", ")
+            ));
+        }
+        for skipped in &p.skipped {
+            lines.push(format!("skipped playbook {}: {}", skipped.name, skipped.reason));
+        }
+        if lines.is_empty() && (p.served || summary.harnesses.is_empty()) {
+            lines.push("playbooks: nothing waiting for approval".into());
         }
         out = out.lines(lines.iter().map(|l| show::printable(l)));
     }
@@ -1062,7 +1265,8 @@ mod tests {
             skipped: Vec::new(),
             conflicts: Vec::new(),
         };
-        let mut review = Review { checkout: PathBuf::new(), harnesses: BTreeMap::from([(Harness::Claude, hr)]) };
+        let harnesses = BTreeMap::from([(Harness::Claude, hr)]);
+        let mut review = Review { checkout: PathBuf::new(), harnesses, playbooks: None };
         let mut shown = Vec::new();
         review.ask(&mut "yes\n\n".as_bytes(), &mut shown, &|_| true, false);
         assert_eq!(review.harnesses[&Harness::Claude].answers, [true, false, false], "the end of input declines");
@@ -1090,5 +1294,77 @@ mod tests {
             }
         }
         refuse_in_agent_session(&|_| None).unwrap();
+    }
+
+    fn playbook(path: &str, change: PlaybookChange, text: &str, approved: Option<&str>) -> PlaybookReview {
+        PlaybookReview {
+            pending: PendingPlaybook { path: path.into(), change },
+            text: text.into(),
+            approved: approved.map(String::from),
+            recorded: None,
+        }
+    }
+
+    #[test]
+    fn playbooks_are_shown_whole_or_as_a_diff_and_never_as_sent() {
+        let old: String = (1..=8).map(|i| format!("# {i}\n")).collect();
+        let new = old.replace("# 4\n", "# four\n");
+        let lines = playbook_lines(&playbook("change.toml", PlaybookChange::Changed, &new, Some(&old)), false);
+        assert_eq!(
+            lines,
+            [
+                "playbook change.toml: changed on the bd server; the version approved here stays in use until this \
+                 one is",
+                "  @@ -1,7 +1,7 @@",
+                "    # 1",
+                "    # 2",
+                "    # 3",
+                "  - # 4",
+                "  + # four",
+                "    # 5",
+                "    # 6",
+                "    # 7",
+                "  playbook change.toml: changed",
+            ]
+        );
+
+        let hostile = format!("{HOSTILE}\n{}", (0..500).map(|i| format!("{i}\n")).collect::<String>());
+        let lines = playbook_lines(&playbook("x.toml", PlaybookChange::New, &hostile, None), false);
+        for line in &lines {
+            assert!(!line.contains(['\n', '\r', '\u{1b}', '\u{202e}', '\u{2028}']), "{line:?}");
+            assert!(!line.starts_with("Approve"), "{line:?}");
+        }
+        assert_eq!(lines[0], "playbook x.toml: new from the bd server; agents here can run it once approved");
+        assert!(lines.join("\n").contains("  + Approve docs? [y/N] y"), "behind the gutter");
+        assert_eq!(lines.len(), MAX_FILE_LINES + 3, "cut short");
+        assert_eq!(lines.last().unwrap(), "  playbook x.toml: new");
+        assert_eq!(playbook_lines(&playbook("x.toml", PlaybookChange::New, &hostile, None), true).len(), 507 + 2);
+    }
+
+    #[test]
+    fn playbook_answers_follow_the_skills_and_entries() {
+        let mut review = Review {
+            checkout: PathBuf::new(),
+            harnesses: BTreeMap::new(),
+            playbooks: Some(PlaybooksReview {
+                asks: vec![
+                    playbook("a.toml", PlaybookChange::New, "a\n", None),
+                    playbook("b.toml", PlaybookChange::Changed, "b2\n", Some("b1\n")),
+                ],
+                answers: Vec::new(),
+                skipped: Vec::new(),
+                served: true,
+            }),
+        };
+        assert!(review.asks());
+        let mut shown = Vec::new();
+        review.ask(&mut "n\ny\n".as_bytes(), &mut shown, &|_| true, false);
+        assert_eq!(review.playbooks.as_ref().unwrap().answers, [false, true]);
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(shown.contains("  + a\n  playbook a.toml: new\nApprove playbook a.toml? [y/N] "), "{shown}");
+        assert!(
+            shown.contains("  - b1\n  + b2\n  playbook b.toml: changed\nApprove playbook b.toml? [y/N] "),
+            "{shown}"
+        );
     }
 }

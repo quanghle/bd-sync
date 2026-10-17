@@ -1048,13 +1048,12 @@ fn prime_in_session_hooks_never_fails() {
 }
 
 #[test]
-fn prime_lists_the_checkouts_the_servers_and_the_users_playbooks() {
+fn prime_lists_the_checkouts_the_approved_and_the_users_playbooks() {
     let server = Server::start();
     let alice = server.client(&server.token("alice-laptop", "alice", &[]));
     let on_server = server.root.path().join("proj").join(".bd").join("playbooks");
     write(&on_server, "deploy.toml", "description = \"server copy\"\n[[steps]]\nid = \"s\"\n");
     write(&on_server, "ops.toml", "description = \"Page \\u001b[2Jsomeone\"\n[[steps]]\nid = \"page\"\n");
-    // Without a checkout or playbooks of its own, a client sees the server's.
     let section = |text: &str| -> Vec<String> {
         text.lines()
             .skip_while(|l| !l.starts_with("## Playbooks"))
@@ -1063,9 +1062,17 @@ fn prime_lists_the_checkouts_the_servers_and_the_users_playbooks() {
             .map(String::from)
             .collect()
     };
-    let servers = ["- deploy — server copy (on the server)", "- ops — Page \\u{1b}[2Jsomeone (on the server)"];
+    let waiting = |what: &str| {
+        format!(
+            "Waiting for approval on this machine: {what}. The server's playbooks are used here only once a person \
+             approves them (a changed one keeps its approved version meanwhile): ask the user to review them and run \
+             `bd agents approve` in a separate terminal."
+        )
+    };
+    // Without a checkout or playbooks of its own, a client has none it may use: the server's wait for approval.
     let text = alice.ok(&["prime"]);
-    assert_eq!(section(&text), servers, "{text}");
+    assert_eq!(section(&text), Vec::<String>::new(), "{text}");
+    assert!(text.contains(&waiting("deploy.toml (new), ops.toml (new)")), "{text}");
 
     let mine = alice.dir.path().join(".bd").join("playbooks");
     write(&mine, "deploy.toml", "description = \"client copy\"\n[[steps]]\nid = \"c\"\n");
@@ -1077,18 +1084,30 @@ fn prime_lists_the_checkouts_the_servers_and_the_users_playbooks() {
     let listed = [
         "- broken — invalid: `bd playbook list` shows why",
         "- deploy — client copy",
-        "- ops — Page \\u{1b}[2Jsomeone (on the server)",
+        "- mine — Tidy up (user's own)",
+        "- ops — user copy (user's own)",
+    ];
+    assert_eq!(section(&text), listed, "the server's are not listed until approved: {text}");
+    assert!(text.contains(&waiting("deploy.toml (new), ops.toml (new)")), "{text}");
+
+    // Approved here: listed where a command finds them, between the checkout's and the user's own.
+    approve_playbooks(&alice, &on_server, &["deploy.toml", "ops.toml"]);
+    let text = alice.ok(&["prime"]);
+    let listed = [
+        "- broken — invalid: `bd playbook list` shows why",
+        "- deploy — client copy",
+        "- ops — Page \\u{1b}[2Jsomeone (the server's, approved here)",
         "- mine — Tidy up (user's own)",
     ];
     assert_eq!(section(&text), listed, "{text}");
-    assert!(text.contains("## Playbooks (4)"), "{text}");
+    assert!(text.contains("## Playbooks (4)") && !text.contains("Waiting for approval"), "{text}");
     let context = copilot_context(&alice.ok(&["prime", "--hook", "copilot"])).unwrap();
     assert_eq!(format!("{context}\n"), text, "the same context for Copilot CLI");
 
     let capped = alice.ok(&["prime", "--max-playbooks", "1"]);
     assert_eq!(section(&capped), [listed[0], "- … 3 more: `bd playbook list`"], "{capped}");
     let v = alice.json(&["prime"]);
-    assert_eq!(v["playbooks_total"], 4);
+    assert_eq!((v["playbooks_total"].as_i64(), &v["playbooks_pending"]), (Some(4), &json!([])));
     let found: Vec<(&str, &str, bool)> = v["playbooks"]
         .as_array()
         .unwrap()
@@ -1100,15 +1119,218 @@ fn prime_lists_the_checkouts_the_servers_and_the_users_playbooks() {
         [
             ("broken", "checkout", true),
             ("deploy", "checkout", false),
-            ("ops", "server", false),
+            ("ops", "approved", false),
             ("mine", "user", false)
         ]
     );
 
+    // A change on the server is named as waiting; the version approved stays listed.
+    write(&on_server, "ops.toml", "description = \"Page v2\"\n[[steps]]\nid = \"page\"\n");
+    let v = alice.json(&["prime"]);
+    assert_eq!(v["playbooks_pending"], json!([{"path": "ops.toml", "change": "changed"}]));
+    assert_eq!(v["playbooks"][2]["description"], "Page \\u{1b}[2Jsomeone");
+
+    // A listing from a client that predates approvals (a bare array) still reads, around the server's own.
+    let old = json!([
+        {"name": "deploy", "description": "client copy", "location": "checkout", "invalid": false},
+        {"name": "mine", "description": "Tidy up", "location": "user", "invalid": false}
+    ]);
+    write(alice.dir.path(), "old-listing.json", &old.to_string());
+    let text = alice.ok(&["--client-playbooks", "old-listing.json", "prime"]);
+    let old_listed = ["- deploy — client copy", "- ops — Page v2 (on the server)", "- mine — Tidy up (user's own)"];
+    assert_eq!(section(&text), old_listed, "{text}");
+
     // A listing the server cannot read leaves the client's playbooks out, never prime.
     write(alice.dir.path(), "listing.json", "not json");
     let text = alice.ok(&["--client-playbooks", "listing.json", "prime"]);
-    assert_eq!(section(&text), servers, "{text}");
+    assert_eq!(section(&text), ["- deploy — server copy (on the server)", "- ops — Page v2 (on the server)"], "{text}");
+}
+
+/// Approve `paths` of the server's playbooks (in `on_server`) in `client`'s
+/// checkout, as `bd agents approve` does: on a pseudo-terminal where the
+/// tests have one, else by writing what it writes (`.bd/approved/playbooks`
+/// and `.bd/agents.lock`).
+fn approve_playbooks(client: &Client, on_server: &Path, paths: &[&str]) {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut t = pty::Terminal::spawn(client.cmd(&[&["agents", "approve"][..], paths].concat()));
+        for path in paths {
+            t.expect(&format!("Approve playbook {path}? [y/N] "));
+            t.answer("y");
+        }
+        let (out, shown) = t.finish();
+        assert!(out.status.success(), "{shown}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("approved playbook ") && stdout.contains("kept in .bd/approved/playbooks"), "{stdout}");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let bd_dir = client.dir.path().join(".bd");
+        let lock_path = bd_dir.join("agents.lock");
+        let mut lock: Value = match std::fs::read_to_string(&lock_path) {
+            Ok(text) => serde_json::from_str(&text).unwrap(),
+            Err(_) => json!({"version": 1, "harnesses": {}}),
+        };
+        for path in paths {
+            let text = std::fs::read_to_string(on_server.join(path)).unwrap();
+            write(&bd_dir.join("approved").join("playbooks"), path, &text);
+            lock["playbooks"][*path] = json!({"sha256": bd_core::agents::sha256_hex(text.as_bytes())});
+        }
+        std::fs::write(lock_path, lock.to_string()).unwrap();
+    }
+    let _ = on_server;
+}
+
+#[test]
+fn server_playbooks_are_used_once_approved_on_the_client() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    std::fs::create_dir_all(alice.dir.path().join(".bd")).unwrap();
+    let on_server = server.root.path().join("proj").join(".bd").join("playbooks");
+    let v1 =
+        "description = \"v1\"\n[[steps]]\nid = \"one\"\n[[steps]]\nid = \"review\"\nexpand = \"parts/review.toml\"\n";
+    write(&on_server, "change.toml", v1);
+    write(&on_server, "parts/review.toml", "[[steps]]\nid = \"look\"\n");
+    write(&on_server, "notes.md", "not a playbook: never served");
+    let approved = alice.dir.path().join(".bd").join("approved").join("playbooks");
+
+    // Never approved here: unavailable, saying how to approve it.
+    for args in [&["playbook", "run", "change"][..], &["playbook", "show", "change"], &["playbook", "plan", "change"]] {
+        let out = alice.run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {stderr}");
+        assert!(
+            stderr.contains("used here only once a person approves it") && stderr.contains("`bd agents approve`"),
+            "{stderr}"
+        );
+    }
+    let status = alice.json(&["agents", "status"]);
+    assert_eq!(status["harnesses"], json!({}), "no harness: the playbooks alone");
+    assert_eq!(
+        status["playbooks"]["pending"],
+        json!([{"path": "change.toml", "change": "new"}, {"path": "parts/review.toml", "change": "new"}])
+    );
+    assert_eq!(
+        alice.ok(&["agents", "status"]),
+        "playbooks waiting for approval: change.toml (new), parts/review.toml (new): not used here until approved (a \
+         changed one keeps its approved version); review and approve with `bd agents approve` in a terminal\n"
+    );
+    let manifest = alice.json(&["agents", "manifest", "--playbooks"]);
+    assert_eq!(manifest["files"].as_object().unwrap().keys().collect::<Vec<_>>(), ["change.toml", "parts/review.toml"]);
+    assert_eq!(manifest["revision"], status["playbooks"]["server_revision"]);
+    let listed = alice.json(&["playbook", "list"]);
+    assert_eq!(listed["server"]["pending"].as_array().unwrap().len(), 2, "{listed}");
+    assert!(alice.ok(&["playbook", "list"]).contains("Waiting for approval on this machine (the bd server's"));
+
+    // Approval is a person's, in a terminal, outside agent sessions: no way around either.
+    let out = alice.cmd(&["agents", "approve"]).env("CLAUDE_CODE_SESSION_ID", "8e7d0c1a").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not run inside an agent session"), "{out:?}");
+    let out = alice.run(&["agents", "approve"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("runs only in a terminal"), "{out:?}");
+    let out = alice.run(&["agents", "approve", "nosuch"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no skill, MCP server or playbook named nosuch"), "{out:?}");
+    // Pulls and session hooks only report.
+    let pulled = alice.json(&["agents", "pull"]);
+    assert_eq!(pulled["playbooks"]["pending"].as_array().unwrap().len(), 2);
+    let hook = alice.cmd(&["hook", "session-start"]).stdin(Stdio::null()).output().unwrap();
+    let said = check(hook, "session-start hook");
+    assert!(
+        said.contains(
+            "bd: playbooks changed on the bd server and not approved on this machine: change.toml (new), \
+                       parts/review.toml (new)."
+        ),
+        "{said}"
+    );
+    assert!(!approved.exists(), "nothing approved");
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut t = pty::Terminal::spawn(alice.cmd(&["agents", "approve"]));
+        let shown = t.expect("Approve playbook change.toml? [y/N] ");
+        assert!(shown.contains("playbook change.toml: new from the bd server"), "{shown}");
+        assert!(shown.contains("  + description = \"v1\"\n"), "{shown}");
+        t.answer("y");
+        t.expect("Approve playbook parts/review.toml? [y/N] ");
+        t.answer("y");
+        let (out, shown) = t.finish();
+        assert!(out.status.success(), "{shown}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "approved playbook change.toml, parts/review.toml: kept in .bd/approved/playbooks\n"
+        );
+        let gitignore = std::fs::read_to_string(alice.dir.path().join(".bd/.gitignore")).unwrap();
+        assert!(gitignore.lines().any(|l| l == "approved/"), "machine-local: {gitignore}");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    approve_playbooks(&alice, &on_server, &["change.toml", "parts/review.toml"]);
+    assert_eq!(std::fs::read_to_string(approved.join("change.toml")).unwrap(), v1);
+    let lock: Value =
+        serde_json::from_str(&std::fs::read_to_string(alice.dir.path().join(".bd/agents.lock")).unwrap()).unwrap();
+    assert_eq!(lock["playbooks"]["change.toml"]["sha256"], bd_core::agents::sha256_hex(v1.as_bytes()));
+
+    // Approved: the server compiles the bytes sent from here.
+    let steps = |plan: &Value| -> Vec<String> {
+        plan["plan"]["issues"].as_array().unwrap().iter().map(|i| i["key"].as_str().unwrap().to_string()).collect()
+    };
+    let plan = alice.json(&["playbook", "plan", "change"]);
+    assert_eq!(steps(&plan), ["one", "review", "review.look"]);
+    assert!(same_file(&plan["plan"]["source"], &approved.join("change.toml")), "{plan}");
+    assert_eq!(alice.json(&["playbook", "run", "change"])["steps"], 2, "the steps of a run, its group aside");
+    assert_eq!(alice.json(&["agents", "status"])["playbooks"]["pending"], json!([]));
+
+    // The server's copy changes: the client keeps running the version approved, and says a change waits.
+    let v2 = v1.replace("id = \"one\"", "id = \"two\"");
+    write(&on_server, "change.toml", &v2);
+    assert_eq!(steps(&alice.json(&["playbook", "plan", "change"])), ["one", "review", "review.look"]);
+    let pulled = alice.json(&["agents", "pull"]);
+    assert_eq!(pulled["playbooks"]["pending"], json!([{"path": "change.toml", "change": "changed"}]));
+    assert_eq!(std::fs::read_to_string(approved.join("change.toml")).unwrap(), v1, "a pull approves nothing");
+    let said = check(alice.cmd(&["hook", "session-start"]).stdin(Stdio::null()).output().unwrap(), "hook");
+    assert!(said.contains("not approved on this machine: change.toml (changed). Playbook commands here use the version approved before"), "{said}");
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // Shown as a diff against the version approved; declined, it stays as it was.
+        let mut t = pty::Terminal::spawn(alice.cmd(&["agents", "approve", "change"]));
+        let shown = t.expect("Approve playbook change.toml? [y/N] ");
+        assert!(
+            shown.contains("the version approved here stays in use")
+                && shown.contains("  - id = \"one\"\n  + id = \"two\"\n"),
+            "{shown}"
+        );
+        t.answer("n");
+        let (out, _) = t.finish();
+        assert!(String::from_utf8_lossy(&out.stdout).contains("declined playbook change.toml: still waiting"));
+        assert_eq!(steps(&alice.json(&["playbook", "plan", "change"])), ["one", "review", "review.look"]);
+    }
+
+    // Approved bytes changed here: never sent; a pull restores them only while the server serves them.
+    std::fs::write(approved.join("parts/review.toml"), "[[steps]]\nid = \"sneaked\"\n").unwrap();
+    let out = alice.run(&["playbook", "plan", "change"]);
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("changed since it was approved on this machine"), "{out:?}");
+    let pulled = alice.json(&["agents", "pull"]);
+    assert_eq!(pulled["playbooks"]["restored"], json!(["parts/review.toml"]));
+    assert_eq!(steps(&alice.json(&["playbook", "plan", "change"])), ["one", "review", "review.look"]);
+    // A file put there by something other than bd is not approved: never sent, removed by a pull.
+    write(&approved, "planted.toml", "[[steps]]\nid = \"x\"\n");
+    let out = alice.run(&["playbook", "plan", "planted"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a playbook approved on this machine"), "{out:?}");
+    assert_eq!(alice.json(&["agents", "pull"])["playbooks"]["discarded"], json!(["planted.toml"]));
+    assert!(!approved.join("planted.toml").exists());
+
+    // Removed on the server: removed here too, without approval.
+    std::fs::remove_file(on_server.join("parts/review.toml")).unwrap();
+    let pulled = alice.json(&["agents", "pull"]);
+    assert_eq!(pulled["playbooks"]["removed"], json!(["parts/review.toml"]));
+    assert!(!approved.join("parts").exists(), "removed, with the directory it leaves empty");
+    let lock: Value =
+        serde_json::from_str(&std::fs::read_to_string(alice.dir.path().join(".bd/agents.lock")).unwrap()).unwrap();
+    assert_eq!(lock["playbooks"].as_object().unwrap().keys().collect::<Vec<_>>(), ["change.toml"]);
+    let said = check(alice.cmd(&["hook", "session-start"]).stdin(Stdio::null()).output().unwrap(), "hook");
+    assert!(!said.contains("removed"), "reported once, by the pull that removed it: {said}");
+    assert!(!server.root.path().join("proj").join(".bd").join("approved").exists(), "nothing approved on the server");
 }
 
 #[test]
@@ -3611,24 +3833,33 @@ fn a_checkouts_playbooks_come_before_the_servers() {
     write(alice.dir.path(), "pbs/custom.toml", "[[steps]]\nid = \"custom\"\n");
     std::fs::create_dir_all(bob.dir.path().join(".bd")).unwrap();
     std::fs::create_dir_all(reader.dir.path().join(".bd")).unwrap();
-    // Bob's own playbooks (user config directory) come after the server's.
+    // Bob's own playbooks (user config directory) come after the server's approved ones.
     let bobs = bob.dir.path().join(".xdg").join("bd").join("playbooks");
     write(&bobs, "deploy.toml", "description = \"bob's copy\"\n[[steps]]\nid = \"bob-step\"\n");
     write(&bobs, "ops.toml", "[[steps]]\nid = \"broken\"\nbogus = 1\n");
     write(&bobs, "mine.toml", "[[steps]]\nid = \"mine-step\"\n");
 
     let step = |plan: &Value| plan["plan"]["issues"][0]["step"].clone();
+    // Nothing of the server's approved yet: never its copy.
+    assert_eq!(step(&bob.json(&["playbook", "plan", "deploy"])), "bob-step", "the server's is not approved here");
+    assert_eq!(bob.code(&["playbook", "plan", "ops"]), 2, "the user's own broken one, not the server's");
+    assert_eq!(alice.code(&["playbook", "plan", "ops"]), 3);
+    approve_playbooks(&alice, &on_server, &["deploy.toml", "ops.toml"]);
+    approve_playbooks(&bob, &on_server, &["deploy.toml", "ops.toml"]);
+    approve_playbooks(&reader, &on_server, &["deploy.toml"]);
+    let approved = |c: &Client| c.dir.path().join(".bd").join("approved").join("playbooks");
+
     assert_eq!(step(&alice.json(&["playbook", "plan", "deploy"])), "client-step", "the checkout's playbook wins");
     assert_eq!(step(&bob.json(&["playbook", "plan", "deploy"])), "server-step", "the server's beats the user's own");
     assert_eq!(step(&bob.json(&["playbook", "plan", "ops"])), "page", "even over a broken one");
     assert_eq!(step(&bob.json(&["playbook", "plan", "mine"])), "mine-step", "the user's own fill in the rest");
-    assert_eq!(bob.json(&["playbook", "show", "deploy"])["server"], true);
+    assert_eq!(bob.json(&["playbook", "show", "deploy"]).get("server"), None, "compiled from what bob sent");
     let listed = bob.json(&["playbook", "list"]);
     let order: Vec<(&str, bool, Option<&str>)> = listed["playbooks"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|p| (p["name"].as_str().unwrap(), p["server"].as_bool().unwrap_or(false), p["error"].as_str()))
+        .map(|p| (p["name"].as_str().unwrap(), p["approved"].as_bool().unwrap_or(false), p["error"].as_str()))
         .map(|(name, server, error)| (name, server, error.map(|_| "error")))
         .collect();
     assert_eq!(
@@ -3641,15 +3872,11 @@ fn a_checkouts_playbooks_come_before_the_servers() {
             ("ops", false, Some("error"))
         ]
     );
-    assert!(same_file(&listed["playbooks"][2]["shadowed_by"], &on_server.join("deploy.toml")), "{listed}");
+    assert!(same_file(&listed["playbooks"][2]["shadowed_by"], &approved(&bob).join("deploy.toml")), "{listed}");
     let ops = alice.json(&["playbook", "plan", "ops"]);
-    assert!(same_file(&ops["plan"]["source"], &on_server.join("ops.toml")), "{ops}");
+    assert!(same_file(&ops["plan"]["source"], &approved(&alice).join("ops.toml")), "{ops}");
     let shown = reader.json(&["playbook", "show", "deploy"]);
-    assert_eq!(
-        (shown["playbook"]["description"].as_str(), shown["server"].as_bool()),
-        (Some("server copy"), Some(true))
-    );
-    assert!(reader.ok(&["playbook", "show", "deploy"]).contains("deploy.toml on the server)"));
+    assert_eq!((shown["playbook"]["description"].as_str(), shown.get("server")), (Some("server copy"), None));
 
     // File paths resolve on the client, relative to its working directory.
     let run = alice.json(&["playbook", "run", "pbs/custom.toml"]);
@@ -3659,7 +3886,7 @@ fn a_checkouts_playbooks_come_before_the_servers() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("missing.toml"));
     let out = alice.run(&["playbook", "run", "nowhere"]);
     assert_eq!(out.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("on the bd server"), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("`bd agents approve`"), "{out:?}");
 
     let listed = alice.json(&["playbook", "list"]);
     let entries: Vec<(&str, bool)> = listed["playbooks"]
@@ -3670,9 +3897,9 @@ fn a_checkouts_playbooks_come_before_the_servers() {
         .collect();
     assert_eq!(entries, [("deploy", false), ("deploy", true), ("ops", true)]);
     assert!(same_file(&listed["playbooks"][1]["shadowed_by"], &mine.join("deploy.toml")), "{listed}");
-    assert!(same_file(&listed["server"]["search_paths"][0], &on_server), "{listed}");
+    assert_eq!(listed["server"]["pending"], json!([]), "{listed}");
     let text = alice.ok(&["playbook", "list"]);
-    assert!(text.contains("(on the server)") && text.contains("shadowed by"), "{text}");
+    assert!(text.contains("(the bd server's, approved here)") && text.contains("shadowed by"), "{text}");
 
     // A read token may look at the checkout's playbooks, but not run them.
     write(
@@ -3683,7 +3910,6 @@ fn a_checkouts_playbooks_come_before_the_servers() {
     let shown = reader.json(&["playbook", "show", "deploy"]);
     assert_eq!((shown["playbook"]["description"].as_str(), shown.get("server")), (Some("reader copy"), None));
     assert_eq!(reader.code(&["playbook", "run", "deploy"]), 7);
-
     // extract --save writes into the checkout, never on the server.
     let id = run["run"]["id"].as_str().unwrap();
     alice.ok(&["playbook", "extract", id, "--save", "--name", "custom-copy"]);
@@ -3800,6 +4026,35 @@ fn hostile_playbook_bundles_are_refused() {
     // A bundle file named on the command line travels like any input file.
     std::fs::write(alice.dir.path().join("mine.json"), &ok).unwrap();
     assert_eq!(alice.json(&["--playbook-bundle", "mine.json", "playbook", "run", "a"])["steps"], 1);
+}
+
+#[test]
+fn bundles_asking_for_the_servers_copy_first_never_get_it() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let on_server = server.root.path().join("proj").join(".bd").join("playbooks");
+    // Published, and not approved by anyone.
+    write(&on_server, "deploy.toml", "[[steps]]\nid = \"server-step\"\ntitle = \"S\"\n");
+    let first = json!({
+        "version": 1,
+        "files": { "deploy.toml": { "name": "deploy", "format": "toml", "text": "[[steps]]\nid = \"client-step\"\ntitle = \"C\"\n" } },
+        "refs": { "": { "deploy": "deploy.toml" } },
+        "server_first": true,
+    })
+    .to_string();
+    // As an older client (or a hand-made request) sends it: the server compiles the bundle's copy.
+    let argv = ["--playbook-bundle", "b.json", "--json", "playbook", "plan", "deploy"];
+    let (status, r) = post(&server.url(), &secret, &json!({ "argv": argv, "files": { "b.json": first } }));
+    assert_eq!((status, &r["exit_code"]), (200, &json!(0)), "{r}");
+    let plan: Value = serde_json::from_str(r["stdout"].as_str().unwrap()).unwrap();
+    assert_eq!(plan["plan"]["issues"][0]["step"], "client-step", "{plan}");
+    // A client of today refuses to send one.
+    let alice = server.client(&secret);
+    std::fs::write(alice.dir.path().join("first.json"), &first).unwrap();
+    let out = alice.run(&["--playbook-bundle", "first.json", "playbook", "run", "deploy"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("server_first"), "{}", stderr_of(&out));
+    assert!(alice.json(&["list", "--all"]).as_array().unwrap().is_empty(), "nothing was run");
 }
 
 #[test]
@@ -4226,6 +4481,36 @@ fn agents_pull_and_status_place_the_servers_sets_in_client_checkouts() {
 }
 
 #[test]
+fn server_playbooks_that_cannot_be_read_keep_no_skill_from_status_pull_or_approve() {
+    let server = Server::start();
+    let token = server.token("laptops", "alice", &["--role", "read"]);
+    let ws = server.root.path().join("proj").join(".bd");
+    write(&ws.join("agents"), "claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nDeploy.\n");
+    std::fs::create_dir_all(ws.join("playbooks")).unwrap();
+    std::fs::write(ws.join("playbooks/bad.toml"), b"\xff not text").unwrap();
+    let alice = server.client(&token);
+    std::fs::create_dir(alice.dir.path().join(".bd")).unwrap();
+
+    let status = alice.json(&["agents", "status", "--harness", "claude"]);
+    assert_eq!(status["harnesses"]["claude"]["skills"]["pending"]["deploy"]["change"], "new", "{status}");
+    assert!(status["playbooks"]["error"].as_str().unwrap().contains("bad.toml"), "{status}");
+    let text = alice.ok(&["agents", "pull", "--harness", "claude"]);
+    assert!(text.contains("claude: skills waiting for approval: deploy (new)"), "{text}");
+    assert!(text.contains("playbooks not checked (nothing about them changed here): "), "{text}");
+    assert!(alice.dir.path().join(".bd/agents.lock").is_file(), "the pull went on");
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut t = pty::Terminal::spawn(alice.cmd(&["agents", "approve", "--harness", "claude"]));
+        let shown = t.expect("Approve skill deploy? [y/N] ");
+        assert!(shown.contains("the bd server's playbooks were not checked"), "{shown}");
+        t.answer("y");
+        let (out, shown) = t.finish();
+        assert!(out.status.success(), "{shown}");
+        assert!(alice.dir.path().join(".claude/skills/deploy/SKILL.md").is_file(), "{shown}");
+    }
+}
+
+#[test]
 fn agents_pull_refuses_server_answers_that_fail_their_checks() {
     use bd_core::agents::{AgentSet, Harness, mcp_digest};
     let sets = tempfile::tempdir().unwrap();
@@ -4265,6 +4550,28 @@ fn agents_pull_refuses_server_answers_that_fail_their_checks() {
 }
 
 #[test]
+fn a_server_that_predates_playbook_approval_serves_none_for_approval() {
+    use bd_core::agents::{AgentSet, Harness};
+    let manifest = json!({ "claude": AgentSet::empty(Harness::Claude).manifest() }).to_string();
+    // As a bd that predates `--playbooks` answers it.
+    let refused = "error: unexpected argument '--playbooks' found\n";
+    let server = FakeServer::start(move |n| match n % 2 {
+        0 => answer(&[stdout_frame(&format!("{manifest}\n")), exit_frame(0, "")], false, 0),
+        _ => answer(&[exit_frame(2, refused)], false, 0),
+    });
+    let client = server.client();
+    std::fs::create_dir(client.dir.path().join(".bd")).unwrap();
+    let status = client.json(&["agents", "status", "--harness", "claude", "--no-hook"]);
+    assert_eq!(status.get("playbooks"), None, "{status}");
+    assert_eq!(client.ok(&["agents", "status", "--harness", "claude", "--no-hook"]), "claude: nothing served\n");
+    // Its own playbooks are never run in their place: unavailable, and nothing was asked of it.
+    let before = server.requests.load(Ordering::SeqCst);
+    let out = client.run(&["playbook", "run", "change"]);
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert_eq!(server.requests.load(Ordering::SeqCst), before);
+}
+
+#[test]
 fn agents_approve_runs_on_the_client_with_a_read_token() {
     let server = Server::start();
     let token = server.token("laptops", "alice", &["--role", "read"]);
@@ -4288,7 +4595,10 @@ fn agents_approve_runs_on_the_client_with_a_read_token() {
         "does not run inside an agent session ($COPILOT_AGENT_SESSION_ID set)",
     );
     refused(alice.run(&approve), "runs only in a terminal (stdin is not one)");
-    refused(alice.run(&["agents", "approve", "nosuch", "--harness", "claude"]), "no skill or MCP server named nosuch");
+    refused(
+        alice.run(&["agents", "approve", "nosuch", "--harness", "claude"]),
+        "no skill, MCP server or playbook named nosuch is served (to claude, or as a playbook)",
+    );
     // bd serve never runs it: it writes into the client's checkout.
     let (status, r) = post(&alice.url, &token, &json!({ "argv": approve }));
     assert_eq!((status, r["exit_code"].as_i64()), (200, Some(2)), "{r}");
@@ -4859,19 +5169,21 @@ fn agents_watch_rides_out_an_unreachable_server_and_stops_on_a_refused_token() {
 
 #[test]
 fn agents_watch_starts_over_when_events_were_deleted_unread() {
-    use bd_core::agents::{AgentSet, Harness};
+    use bd_core::agents::{AgentSet, Harness, PlaybookSet};
     let manifest = json!({ "claude": AgentSet::empty(Harness::Claude).manifest() }).to_string();
+    let playbooks = serde_json::to_string(&PlaybookSet::empty().manifest()).unwrap();
     let head = |seq: i64| {
         answer(&[stdout_frame(&format!("{}\n", json!({ "events_head": seq }))), exit_frame(0, "")], false, 0)
     };
-    // Requests: the head, a pull (the manifest), a wait; then waits that end with no event, each
-    // followed by a look at the manifests (odd and even from 5 on).
+    // Requests: the head, a pull (the manifest, then the playbooks'), a wait; then waits that end with no
+    // event, each followed by a look at the manifests (a wait, the manifest and the playbooks' from 7 on).
     let server = FakeServer::start(move |n| match n {
         0 => head(5),
         // Retention deleted events after #5 before they were read.
-        2 => answer(&[exit_frame(6, &format!("{}\n", error_json("events_truncated", 6)))], false, 0),
-        3 => head(9),
-        n if n >= 5 && n % 2 == 1 => answer(&[cursor_frame(9), exit_frame(0, "")], false, 0),
+        3 => answer(&[exit_frame(6, &format!("{}\n", error_json("events_truncated", 6)))], false, 0),
+        4 => head(9),
+        n if n >= 7 && n % 3 == 1 => answer(&[cursor_frame(9), exit_frame(0, "")], false, 0),
+        n if n % 3 == 0 || n == 2 => answer(&[stdout_frame(&format!("{playbooks}\n")), exit_frame(0, "")], false, 0),
         _ => answer(&[stdout_frame(&format!("{manifest}\n")), exit_frame(0, "")], false, 0),
     });
     let client = server.client();
@@ -4880,16 +5192,19 @@ fn agents_watch_starts_over_when_events_were_deleted_unread() {
     assert_eq!(watch.line(), "claude: nothing served");
     assert_eq!(watch.err_line(), "bd agents watch: events after #5 were deleted before they were read; pulling again");
     assert_eq!(watch.line(), "claude: nothing served", "pulled again");
-    eventually("waits and looks from the new head", || server.requests.load(Ordering::SeqCst) >= 10);
+    eventually("waits and looks from the new head", || server.requests.load(Ordering::SeqCst) >= 14);
     let argv = |n: usize| -> Value {
         serde_json::from_str::<Value>(&server.bodies.lock().unwrap()[n]).unwrap()["argv"].clone()
     };
     assert_eq!(argv(0), json!(["info", "--json"]));
     let manifest = json!(["--json", "agents", "manifest", "--harness", "claude"]);
-    for n in [1, 4, 6, 8] {
+    for n in [1, 5, 8, 11] {
         assert_eq!(argv(n), manifest, "{n}");
     }
-    for (n, since) in [(2, "5"), (5, "9"), (7, "9"), (9, "9")] {
+    for n in [2, 6, 9, 12] {
+        assert_eq!(argv(n), json!(["--json", "agents", "manifest", "--playbooks"]), "{n}");
+    }
+    for (n, since) in [(3, "5"), (7, "9"), (10, "9"), (13, "9")] {
         let argv = argv(n);
         let args: Vec<&str> = argv.as_array().unwrap().iter().map(|a| a.as_str().unwrap()).collect();
         assert_eq!(args[..4], ["--json", "events", "--since", since], "{argv}");
@@ -9185,4 +9500,219 @@ fn feature_specs_through_bd_serve() {
     alice.ok(&["dep", "add", &work, &rule, "--type", "related"]);
     assert_eq!(alice.code(&["spec", "drift"]), 0);
     assert_eq!(alice.json(&["spec", "drift"])["count"], 0);
+}
+
+const PUBLISHED_PLAYBOOK: &str = "description = \"Ship it\"\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n";
+
+/// A publish source in `dir/src`: one playbook and one claude skill.
+fn publish_source(dir: &Path) -> std::path::PathBuf {
+    let src = dir.join("src");
+    write(&src, "playbooks/ship.toml", PUBLISHED_PLAYBOOK);
+    write(&src, "agents/claude/skills/deploy/SKILL.md", "---\nname: deploy\n---\nRun it.\n");
+    git_track(&src);
+    src
+}
+
+/// Make `dir` a git checkout holding its files (in the index), as a publish
+/// source of agent sets must be where the file system keeps no executable
+/// bits or symlinks (Windows): bd publish then takes them from git.
+fn git_track(dir: &Path) {
+    for args in [&["init", "-q"][..], &["add", "-A"]] {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+fn json_lines(text: &str) -> Vec<Value> {
+    text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+#[test]
+fn human_admins_publish_through_the_server() {
+    // No agents job: the revisions are recorded by the publish, never by the job between its apply and its record.
+    let server = Server::start_with(&["--agents-every", "0"]);
+    let ops = server.client(&server.token("ops-desk", "ops", &["--role", "admin", "--kind", "human"]));
+    let src = publish_source(ops.dir.path());
+    let ws = server.root.path().join("proj").join(".bd");
+
+    // A dry run shows what would change and changes nothing.
+    let dry = ops.ok(&["publish", "--from", "src", "--dry-run"]);
+    assert!(dry.contains("+ playbooks/ship.toml") && dry.contains("+ agents/claude/skills/deploy/SKILL.md"), "{dry}");
+    assert!(!ws.join("playbooks").exists());
+
+    let out = ops.json(&["publish", "--from", "src"]);
+    let revision = out["revisions"]["claude"]["revision"].as_str().unwrap().to_string();
+    assert_eq!(std::fs::read_to_string(ws.join("playbooks/ship.toml")).unwrap(), PUBLISHED_PLAYBOOK);
+    // Clients see the new set and playbook at once.
+    let reader = server.client(&server.token("reader", "reader", &["--role", "read"]));
+    assert_eq!(reader.json(&["agents", "manifest", "--harness", "claude"])["claude"]["revision"], revision.as_str());
+    let playbooks = reader.json(&["agents", "manifest", "--playbooks"]);
+    assert_eq!(playbooks["files"].as_object().unwrap().keys().collect::<Vec<_>>(), ["ship.toml"]);
+    // Served for approval: a client uses it only once a person approves it there.
+    assert_eq!(reader.code(&["playbook", "show", "ship"]), 3);
+    let changes = agents_changes(&reader);
+    assert_eq!(changes.len(), 2, "the claude set and the playbooks: {changes:?}");
+    assert_eq!((&changes[0]["actor"], &changes[0]["data"]["revision"]), (&json!("ops"), &json!(revision)));
+    assert_eq!((&changes[1]["actor"], &changes[1]["data"]["revision"]), (&json!("ops"), &playbooks["revision"]));
+    let published = json_lines(&reader.ok(&["--json", "events", "--since", "0", "--op", "published"]));
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0]["actor"], "ops");
+    assert_eq!(published[0]["tx"], changes[0]["tx"], "one transaction");
+
+    // A change, then a rollback, through the server.
+    write(&src, "playbooks/ship.toml", &format!("{PUBLISHED_PLAYBOOK}# v2\n"));
+    let dry = ops.ok(&["publish", "--from", "src", "--dry-run"]);
+    assert!(dry.contains("~ playbooks/ship.toml") && dry.contains("+# v2"), "{dry}");
+    ops.ok(&["publish", "--from", "src", "--only", "playbooks"]);
+    assert!(std::fs::read_to_string(ws.join("playbooks/ship.toml")).unwrap().ends_with("# v2\n"));
+    ops.ok(&["publish", "--rollback", "--only", "playbooks"]);
+    assert_eq!(std::fs::read_to_string(ws.join("playbooks/ship.toml")).unwrap(), PUBLISHED_PLAYBOOK);
+
+    // Only a person's admin token publishes: not a write token, not an admin agent token, not a read token.
+    for (name, extra) in [
+        ("alice-laptop", &[][..]),
+        ("ci-agent", &["--role", "admin"][..]),
+        ("carol-desk", &["--kind", "human"][..]),
+        ("viewer", &["--role", "read", "--kind", "human"][..]),
+    ] {
+        let client = server.client(&server.token(name, name, extra));
+        let src = publish_source(client.dir.path());
+        write(&src, "playbooks/other.toml", PUBLISHED_PLAYBOOK);
+        for args in
+            [&["publish", "--from", "src"][..], &["publish", "--from", "src", "--dry-run"], &["publish", "--rollback"]]
+        {
+            let out = client.run(args);
+            assert_eq!(out.status.code(), Some(7), "{name} {args:?}: {}", stderr_of(&out));
+        }
+    }
+    assert!(!ws.join("playbooks/other.toml").exists());
+}
+
+#[test]
+fn the_server_checks_what_a_client_publishes() {
+    let server = Server::start();
+    let ops = server.client(&server.token("ops-desk", "ops", &["--role", "admin", "--kind", "human"]));
+    let ws = server.root.path().join("proj").join(".bd");
+    std::fs::write(ws.join("secret.toml"), PUBLISHED_PLAYBOOK).unwrap();
+    // Bundles no client checked: the server refuses each before writing anything.
+    let skill = json!({"skills/deploy/SKILL.md": {"text": "---\nname: deploy\n---\n"}});
+    // From the staging directory, where the server checks it, this is .bd/secret.toml.
+    let extends = format!("extends = [\"../../secret.toml\"]\n{PUBLISHED_PLAYBOOK}");
+    for (bundle, why) in [
+        (json!({"version": 1, "areas": ["playbooks"], "playbooks": {"../escape.toml": "x"}}), "'..'"),
+        (json!({"version": 1, "areas": ["playbooks"], "playbooks": {"/etc/x.toml": "x"}}), "absolute"),
+        (json!({"version": 1, "areas": ["playbooks"], "playbooks": {".git/x.toml": "x"}}), "starts with '.'"),
+        (json!({"version": 1, "areas": ["playbooks"], "playbooks": {"a\\..\\..\\x.toml": "x"}}), "backslash"),
+        (json!({"version": 1, "areas": ["playbooks"], "playbooks": {"x.toml": extends}}), "outside"),
+        (
+            json!({"version": 1, "areas": ["agents"], "agents": {"claude": {"skills/x": {"symlink": "../../../../etc"}}}}),
+            "outside agents/",
+        ),
+        (
+            json!({"version": 1, "areas": ["agents"], "agents": {"claude": skill, "codex": {"skills/x": {"symlink": "../../../playbooks"}}}}),
+            "outside agents/",
+        ),
+        (
+            json!({"version": 1, "areas": ["agents"], "agents": {"claude": {"hooks.json": {"text": "{}"}}}}),
+            "unexpected here",
+        ),
+        (json!({"version": 1, "areas": ["agents"], "agents": {"cursor": {}}}), "unknown variant"),
+        (json!({"version": 1, "areas": ["agents"], "extra": true}), "unknown field"),
+    ] {
+        std::fs::write(ops.dir.path().join("evil.json"), bundle.to_string()).unwrap();
+        let out = ops.run(&["--publish-bundle", "evil.json", "publish"]);
+        assert_eq!(out.status.code(), Some(2), "{bundle}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains(why), "{bundle}: {}", stderr_of(&out));
+        assert!(!stderr_of(&out).contains(&*server.root.path().to_string_lossy()), "no server paths");
+    }
+    assert!(!ws.join("playbooks").exists() && !ws.join("agents").exists());
+    assert!(!server.root.path().join("proj").join("escape.toml").exists());
+    let staging = std::fs::read_dir(&ws)
+        .unwrap()
+        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with(".publish-"));
+    assert_eq!(staging.count(), 0, "staging removed");
+
+    // A skill shared between harnesses: a symlink to another set, inside agents/, is published.
+    let shared = json!({"version": 1, "areas": ["agents"], "agents": {
+        "claude": skill,
+        "codex": {"skills/deploy": {"symlink": "../../claude/skills/deploy"}},
+    }});
+    std::fs::write(ops.dir.path().join("shared.json"), shared.to_string()).unwrap();
+    if cfg!(unix) {
+        ops.ok(&["--publish-bundle", "shared.json", "publish"]);
+        assert!(std::fs::symlink_metadata(ws.join("agents/codex/skills/deploy")).unwrap().file_type().is_symlink());
+        let codex = ops.json(&["agents", "manifest", "--harness", "codex"]);
+        assert!(codex["codex"]["skills"].get("deploy").is_some(), "{codex}");
+    }
+
+    // An empty source is refused: it would remove every client's skills.
+    std::fs::create_dir_all(ops.dir.path().join("empty")).unwrap();
+    let out = ops.run(&["publish", "--from", "empty"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("has no playbooks"), "{}", stderr_of(&out));
+}
+
+#[test]
+fn servers_load_their_own_playbooks_held_to_their_directory() {
+    let server = Server::start();
+    let secret = server.token("reader", "reader", &["--role", "read"]);
+    let ws = server.root.path().join("proj").join(".bd");
+    std::fs::write(ws.join("secret.toml"), PUBLISHED_PLAYBOOK).unwrap();
+    write(&ws, "playbooks/evil.toml", &format!("extends = [\"../secret.toml\"]\n{PUBLISHED_PLAYBOOK}"));
+    write(&ws, "playbooks/fine.toml", PUBLISHED_PLAYBOOK);
+    // A request without a bundle (an older client's, or the MCP endpoint's) loads the server's own copy.
+    let show = |name: &str| post(&server.url(), &secret, &json!({ "argv": ["playbook", "show", name] })).1;
+    let fine = show("fine");
+    assert_eq!(fine["exit_code"], 0, "{fine}");
+    assert!(fine["stdout"].as_str().unwrap().starts_with("fine"), "{fine}");
+    let evil = show("evil");
+    assert_eq!(evil["exit_code"], 2, "{evil}");
+    assert!(evil["stderr"].as_str().unwrap().contains("outside the playbook directory"), "{evil}");
+    // On the server's own machine nothing changes.
+    check(server.local("admin", &["playbook", "show", "evil"]), "local show");
+}
+
+#[test]
+fn publishes_over_the_body_limit_are_refused() {
+    let server = Server::start_with(&["--max-body-mib", "1"]);
+    let ops = server.client(&server.token("ops-desk", "ops", &["--role", "admin", "--kind", "human"]));
+    let src = publish_source(ops.dir.path());
+    for i in 0..3 {
+        write(&src, &format!("playbooks/big{i}.toml"), &format!("{PUBLISHED_PLAYBOOK}#{}\n", "x".repeat(400 << 10)));
+    }
+    let out = ops.run(&["publish", "--from", "src"]);
+    assert_ne!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(!server.root.path().join("proj/.bd/playbooks").exists());
+}
+
+#[test]
+fn publishes_and_refusals_are_logged_and_counted_without_contents() {
+    let (server, log) = logged_server(Server::prepare(), &[]);
+    let ops = server.client(&server.token("ops-desk", "ops", &["--role", "admin", "--kind", "human"]));
+    let src = publish_source(ops.dir.path());
+    write(&src, "playbooks/ship.toml", &format!("{PUBLISHED_PLAYBOOK}# secret-marker\n"));
+    ops.ok(&["publish", "--from", "src"]);
+    write(&src, "playbooks/bad.toml", "[[steps]]\nbogus = \"refused-secret-marker\"\n");
+    assert_eq!(ops.code(&["publish", "--from", "src"]), 2);
+    let agent = server.client(&server.token("ci-agent", "ci", &["--role", "admin"]));
+    assert_eq!(agent.code(&["publish", "--rollback"]), 7);
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    let published: Vec<&str> = text.lines().filter(|l| l.contains("published") && l.contains("bd::serve")).collect();
+    assert_eq!(published.len(), 1, "{text}");
+    assert!(
+        published[0].contains("+ playbooks/ship.toml") && published[0].contains("playbooks=\"+1"),
+        "{}",
+        published[0]
+    );
+    assert_eq!(logged(&log, "publish refused"), 2, "{text}");
+    assert!(!text.contains("secret-marker"), "never file contents, not even a refused file's");
+    let refused = text.lines().find(|l| l.contains("publish refused") && l.contains("playbooks/bad.toml")).unwrap();
+    assert!(refused.contains("exit_code=2"), "{refused}");
+    let agent: ureq::Agent = ureq::Agent::config_builder().proxy(None).build().into();
+    let mut answer =
+        agent.get(format!("{}/metrics", server.base)).header("authorization", format!("Bearer {}", ops.token)).call();
+    let metrics = answer.as_mut().unwrap().body_mut().read_to_string().unwrap();
+    assert!(metrics.contains("bd_serve_publishes_total{outcome=\"applied\"} 1"), "{metrics}");
+    assert!(metrics.contains("bd_serve_publishes_total{outcome=\"refused\"} 2"), "{metrics}");
 }

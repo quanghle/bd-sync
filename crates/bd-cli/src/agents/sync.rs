@@ -54,6 +54,9 @@ pub struct Report {
     pub applied: bool,
     pub checkout: PathBuf,
     pub harnesses: BTreeMap<Harness, HarnessReport>,
+    /// A remote workspace's playbooks ([`super::playbooks`]), when its server serves them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playbooks: Option<super::approved::PlaybooksReport>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -443,7 +446,7 @@ fn pull(
 
 fn report(checkout: &Checkout, applied: bool, plans: Vec<Plan>) -> Report {
     let harnesses = plans.into_iter().map(|p| (p.harness, p.report)).collect();
-    Report { applied, checkout: checkout.root.clone(), harnesses }
+    Report { applied, checkout: checkout.root.clone(), harnesses, playbooks: None }
 }
 
 /// What a pull would do for `h`, from the server's `manifest` (with its

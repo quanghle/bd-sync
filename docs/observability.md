@@ -112,6 +112,7 @@ Prometheus text:
 | `bd_serve_connections_open` | connections open now |
 | `bd_serve_commands_total` | commands run |
 | `bd_serve_tool_calls_total` | MCP tool calls |
+| `bd_serve_publishes_total{outcome}` | `bd publish` runs (dry runs aside), `applied` or `refused` |
 | `bd_serve_panics_total` | panics |
 | `bd_serve_start_time_seconds` | when the server started |
 

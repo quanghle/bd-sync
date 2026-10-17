@@ -504,6 +504,18 @@ pub fn require_admin(what: &str) -> Result<()> {
     }
 }
 
+/// Refuse an operation only a person with an admin token may do through
+/// `bd serve`: the request's token must be role admin and kind human (an
+/// MCP tool call has neither). Locally the workspace's owner may.
+pub fn require_admin_human(what: &str) -> Result<()> {
+    match with_capture(|c| c.admin && c.human) {
+        Some(false) => {
+            Err(Error::Unauthorized(format!("{what} needs an admin access token of a person (role admin, kind human)")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Refuse an operation that only runs on the machine holding the workspace.
 pub fn require_local(what: &str) -> Result<()> {
     if serving() { Err(Error::Refused(format!("{what} is not available through bd serve"))) } else { Ok(()) }
@@ -750,6 +762,13 @@ mod tests {
         assert_eq!(local.unwrap_err().exit_code(), 2);
         let (admin, _) = capture(Capture { admin: true, ..recording().1 }, || require_admin("config set"));
         assert!(admin.is_ok());
+        assert!(require_admin_human("bd publish").is_ok(), "locally the owner may");
+        for (admin, human) in [(false, false), (true, false), (false, true)] {
+            let (e, _) = capture(Capture { admin, human, ..recording().1 }, || require_admin_human("bd publish"));
+            assert_eq!(e.unwrap_err().exit_code(), 7, "admin {admin}, human {human}");
+        }
+        let (ok, _) = capture(Capture { admin: true, human: true, ..recording().1 }, || require_admin_human("x"));
+        assert!(ok.is_ok());
     }
 
     #[test]

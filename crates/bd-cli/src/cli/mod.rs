@@ -74,6 +74,7 @@ mod hooks;
 mod issues;
 mod links;
 mod playbooks;
+mod publish;
 mod remote;
 mod serve;
 mod setup;
@@ -92,6 +93,7 @@ pub use hooks::*;
 pub use issues::*;
 pub use links::*;
 pub use playbooks::*;
+pub use publish::*;
 pub use remote::*;
 pub use serve::*;
 pub use setup::*;
@@ -226,6 +228,9 @@ pub struct Global {
     /// The checkout's and the user's playbooks for `bd prime` to list (how a remote client sends them)
     #[arg(long, global = true, hide = true, value_name = "FILE")]
     pub client_playbooks: Option<PathBuf>,
+    /// Publish this bundle (how a remote client sends `bd publish` its source)
+    #[arg(long, global = true, hide = true, value_name = "FILE")]
+    pub publish_bundle: Option<PathBuf>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -393,6 +398,9 @@ pub enum Command {
     /// Sync agent skills and MCP definitions from the workspace's .bd/agents
     #[command(subcommand)]
     Agents(AgentsCommand),
+    /// Publish playbooks and agent sets to the workspace
+    #[command(long_about = PUBLISH_LONG_ABOUT)]
+    Publish(PublishArgs),
     /// Benchmark concurrent claim throughput on a scratch database
     Bench(BenchArgs),
     #[command(hide = true)]

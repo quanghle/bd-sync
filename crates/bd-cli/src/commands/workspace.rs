@@ -37,7 +37,7 @@ pub fn write_bd_gitignore(dir: &Path) -> Result<()> {
         std::fs::write(
             &gitignore,
             format!(
-                "# SQLite database and WAL files are local state.\n# Share issues with `bd export -o .bd/issues.jsonl`.\nbd.db\nbd.db-wal\nbd.db-shm\n{AGENTS_LOCK_LINES}"
+                "# SQLite database and WAL files are local state.\n# Share issues with `bd export -o .bd/issues.jsonl`.\nbd.db\nbd.db-wal\nbd.db-shm\n{AGENTS_LOCK_LINES}{PUBLISH_LINES}"
             ),
         )?;
     }
@@ -46,18 +46,50 @@ pub fn write_bd_gitignore(dir: &Path) -> Result<()> {
 
 /// Make `.bd/.gitignore` (in `dir`) list `agents.lock`: write it if it is missing, else append the pattern if it lacks it.
 pub fn ignore_agents_lock(dir: &Path) -> Result<()> {
+    ignore_in_bd(dir, AGENTS_LOCK_IGNORE, AGENTS_LOCK_LINES)
+}
+
+/// The `.bd/.gitignore` pattern for `approved/`, what `bd agents approve` keeps of a server's playbooks.
+pub const APPROVED_IGNORE: &str = "approved/";
+const APPROVED_LINES: &str =
+    "# The server's playbooks `bd agents approve` approved on this machine are local state.\napproved/\n";
+
+/// Make `.bd/.gitignore` (in `dir`) list `approved/`: write it if it is missing, else append the pattern if it lacks it.
+pub fn ignore_approved(dir: &Path) -> Result<()> {
+    ignore_in_bd(dir, APPROVED_IGNORE, APPROVED_LINES)
+}
+
+/// The `.bd/.gitignore` patterns for what `bd publish` keeps next to a local
+/// workspace: `publish.lock`, `publish.prev/`, and its staging directories,
+/// anchored to `.bd` so files named `publish.*` elsewhere (a playbook, a
+/// skill's script) are never ignored. The first is the one looked for.
+pub const PUBLISH_IGNORE: &str = "/publish.lock";
+const PUBLISH_LINES: &str = "# What `bd publish` keeps next to a local workspace is local state.\n/publish.lock\n\
+                             /publish.prev/\n/.publish-*/\n";
+
+/// Make `.bd/.gitignore` (in `dir`) list what `bd publish` keeps there: write it if it is missing, else append the
+/// patterns if it lacks them.
+pub fn ignore_publish(dir: &Path) -> Result<()> {
+    ignore_in_bd(dir, PUBLISH_IGNORE, PUBLISH_LINES)
+}
+
+/// Make `.bd/.gitignore` (in `dir`) hold `pattern` (with its comment, `lines`).
+fn ignore_in_bd(dir: &Path, pattern: &str, lines: &str) -> Result<()> {
     let gitignore = dir.join(".gitignore");
     let text = match std::fs::read_to_string(&gitignore) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return write_bd_gitignore(dir),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            write_bd_gitignore(dir)?;
+            std::fs::read_to_string(&gitignore)?
+        }
         Err(e) => return Err(Error::invalid(format!("{}: {e}", gitignore.display()))),
     };
-    if text.lines().any(|l| l.trim() == AGENTS_LOCK_IGNORE) {
+    if text.lines().any(|l| l.trim() == pattern) {
         return Ok(());
     }
     let separator = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
     let mut file = std::fs::OpenOptions::new().append(true).open(&gitignore)?;
-    file.write_all(format!("{separator}{AGENTS_LOCK_LINES}").as_bytes())?;
+    file.write_all(format!("{separator}{lines}").as_bytes())?;
     Ok(())
 }
 

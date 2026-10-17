@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use serde::{Deserialize, Serialize};
 
-use super::bundle::{self, Bundle, Sources};
+use super::bundle::{self, Bundle, MAX_BUNDLE_FILE_BYTES, Sources};
 use super::model::{MAX_RUN_ISSUES, Playbook, Step, parse_json, parse_toml};
 use crate::error::{Error, Result};
 
@@ -39,6 +39,9 @@ pub struct Loader {
     pub search_paths: Vec<PathBuf>,
     files: Files,
     session: Arc<Mutex<Session>>,
+    /// Set by [`Loader::contained`]: the canonical search directories every
+    /// file read from disk must be inside.
+    contain: Option<Arc<Vec<PathBuf>>>,
 }
 
 /// What a loader has done for its command.
@@ -118,6 +121,29 @@ fn read_text(path: &Path) -> Result<String> {
     std::fs::read_to_string(path).map_err(|e| Error::invalid(format!("{}: {e}", path.display())))
 }
 
+/// The text of `path`, refused past [`MAX_BUNDLE_FILE_BYTES`] before more is read.
+fn read_text_capped(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let io = |e: std::io::Error| Error::invalid(format!("{}: {e}", path.display()));
+    let too_large = || {
+        Error::invalid(format!(
+            "{}: more than the {} KiB a playbook file may hold",
+            path.display(),
+            MAX_BUNDLE_FILE_BYTES >> 10
+        ))
+    };
+    let file = std::fs::File::open(path).map_err(io)?;
+    if file.metadata().map_err(io)?.len() > MAX_BUNDLE_FILE_BYTES as u64 {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BUNDLE_FILE_BYTES as u64 + 1).read_to_end(&mut bytes).map_err(io)?;
+    if bytes.len() > MAX_BUNDLE_FILE_BYTES {
+        return Err(too_large());
+    }
+    String::from_utf8(bytes).map_err(|_| Error::invalid(format!("{}: not UTF-8 text", path.display())))
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -134,17 +160,52 @@ fn entry_bytes(s: &str) -> usize {
 
 impl Loader {
     pub fn new(search_paths: Vec<PathBuf>) -> Loader {
-        Loader { search_paths, files: Files::Disk, session: Arc::default() }
+        Loader { search_paths, files: Files::Disk, session: Arc::default(), contain: None }
     }
 
     /// Reads from disk like `Loader::new`, and notes what it reads in `bundle`.
     pub(crate) fn recording(search_paths: Vec<PathBuf>, bundle: Arc<Mutex<Bundle>>) -> Loader {
-        Loader { search_paths, files: Files::Recording(bundle), session: Arc::default() }
+        Loader { search_paths, files: Files::Recording(bundle), session: Arc::default(), contain: None }
     }
 
     /// Reads only the files of a bundle.
     pub(crate) fn of_sources(sources: Sources) -> Loader {
-        Loader { search_paths: Vec::new(), files: Files::Bundle(Arc::new(sources)), session: Arc::default() }
+        Loader {
+            search_paths: Vec::new(),
+            files: Files::Bundle(Arc::new(sources)),
+            session: Arc::default(),
+            contain: None,
+        }
+    }
+
+    /// The same loader, held to its search directories: every file it reads
+    /// from disk (a playbook named or found, every file its `extends` and
+    /// `expand` reach) must be inside one of them once symlinks and `..` are
+    /// resolved, and at most [`MAX_BUNDLE_FILE_BYTES`] long. `bd serve` loads
+    /// a workspace's own playbooks this way, and `bd publish` the playbooks
+    /// it validates, so a playbook cannot reach other files on the server.
+    pub fn contained(mut self) -> Loader {
+        let roots = self.search_paths.iter().filter_map(|p| std::fs::canonicalize(p).ok()).collect();
+        self.contain = Some(Arc::new(roots));
+        self
+    }
+
+    /// Whether this loader is held to its search directories ([`Loader::contained`]).
+    pub fn is_contained(&self) -> bool {
+        self.contain.is_some()
+    }
+
+    /// Refuse `path` unless it is inside the search directories of a contained loader.
+    fn check_inside(&self, path: &Path, reference: &str) -> Result<()> {
+        let Some(roots) = &self.contain else { return Ok(()) };
+        let inside = std::fs::canonicalize(path).is_ok_and(|real| roots.iter().any(|r| real.starts_with(r)));
+        if inside {
+            return Ok(());
+        }
+        Err(Error::invalid(format!(
+            "playbook reference {reference:?} leads outside the playbook directory (a playbook may only extend or \
+             expand playbooks inside it)"
+        )))
     }
 
     /// Count `units` against [`MAX_LOAD_WORK`] and `inherited` bytes against
@@ -201,6 +262,7 @@ impl Loader {
             return sources.resolve(from, reference);
         }
         let path = self.find_on_disk(reference, dir)?;
+        self.check_inside(&path, reference)?;
         if let Files::Recording(bundle) = &self.files {
             bundle::record_ref(bundle, from, reference, &path)?;
         }
@@ -242,6 +304,10 @@ impl Loader {
     /// Parse one file this loader located, without resolving `extends`.
     fn read(&self, path: &Path) -> Result<Playbook> {
         let pb = match &self.files {
+            Files::Disk if self.contain.is_some() => {
+                self.check_inside(path, &path.display().to_string())?;
+                parse_source(&read_text_capped(path)?, path, &default_name(path), is_json(path))?
+            }
             Files::Disk => Loader::parse_file(path)?,
             Files::Bundle(sources) => sources.playbook(path)?,
             Files::Recording(bundle) => {
@@ -397,7 +463,7 @@ impl Loader {
                 }
                 let shadowed_by = out.iter().find(|l| l.name == name).map(|l| l.path.clone());
                 // Each file on its own, as if it were the one a command names.
-                let one = Loader::new(self.search_paths.clone());
+                let one = Loader { contain: self.contain.clone(), ..Loader::new(self.search_paths.clone()) };
                 let loaded = one.merged(&path, &mut Vec::new()).and_then(|pb| {
                     pb.validate()?;
                     Ok(pb)

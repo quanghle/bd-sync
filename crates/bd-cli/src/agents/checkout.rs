@@ -11,7 +11,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bd_core::agents::{Harness, SkillFile, sha256_hex, under};
 use bd_core::{Error, Result};
@@ -23,6 +23,10 @@ use crate::tokens::random_hex;
 
 /// The file whose OS lock serializes changes to `agents.lock` and to what it records.
 pub const MUTEX_FILE: &str = "agents.lock.mutex";
+
+/// Where, in the checkout's `.bd` (`/`-separated), bd keeps the server's
+/// playbook files approved on this machine, by their path on the server.
+pub const APPROVED_PLAYBOOKS: &str = "approved/playbooks";
 
 /// A checkout: the directory holding a `.bd` directory.
 #[derive(Clone, Debug)]
@@ -64,13 +68,7 @@ impl Found {
 }
 
 /// The checkout's mutex, held: released when dropped, or when the process ends.
-pub struct Mutex(File);
-
-impl Drop for Mutex {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
+pub struct Mutex(#[allow(dead_code, reason = "held for its Drop")] bd_core::lockfile::FileLock);
 
 fn path_error(path: &Path, e: std::io::Error) -> Error {
     Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.display())))
@@ -280,6 +278,136 @@ impl Checkout {
         set_executable(&file, executable).map(Some).map_err(|e| path_error(&path, e))
     }
 
+    /// The directory of the server's playbooks approved here.
+    pub fn approved_playbooks(&self) -> PathBuf {
+        under(&self.bd, APPROVED_PLAYBOOKS)
+    }
+
+    /// The bytes of approved playbook file `rel` (its path on the server),
+    /// if it is a regular file reached through no symlink below `.bd`.
+    pub fn read_approved_playbook(&self, rel: &str) -> Result<Option<Vec<u8>>> {
+        let mut path = self.bd.clone();
+        let parts: Vec<&str> = APPROVED_PLAYBOOKS.split('/').chain(rel.split('/')).collect();
+        for (i, part) in parts.iter().enumerate() {
+            path.push(part);
+            let meta = match std::fs::symlink_metadata(&path) {
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(None),
+                Err(e) => return Err(path_error(&path, e)),
+                Ok(m) => m,
+            };
+            let last = i + 1 == parts.len();
+            if (last && !meta.is_file()) || (!last && !meta.is_dir()) {
+                return Ok(None);
+            }
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(path_error(&path, e)),
+        }
+    }
+
+    /// Write `text` as approved playbook file `rel`, at once (a temp file
+    /// renamed into place, which replaces whatever file or symlink is there
+    /// rather than writing through it), creating the directories it needs
+    /// and never writing through a symlink below `.bd`. The first one
+    /// written gets `approved/` a line in `.bd/.gitignore`. Call with the
+    /// mutex held.
+    pub fn write_approved_playbook(&self, rel: &str, text: &str) -> Result<()> {
+        let approved = self.bd.join(APPROVED_PLAYBOOKS.split('/').next().unwrap_or_default());
+        if std::fs::symlink_metadata(&approved).is_err() {
+            crate::commands::ignore_approved(&self.bd)?;
+        }
+        let parts: Vec<&str> = APPROVED_PLAYBOOKS.split('/').chain(rel.split('/')).collect();
+        let (file_name, dirs) = parts.split_last().expect("a file name");
+        let mut dir = self.bd.clone();
+        for d in dirs {
+            dir.push(d);
+            ensure_dir(&dir)?;
+        }
+        let target = dir.join(file_name);
+        if std::fs::symlink_metadata(&target).is_ok_and(|m| m.is_dir()) {
+            return Err(Error::Refused(format!("{}: a directory, which bd never writes over", target.display())));
+        }
+        write_atomically(&target, text.as_bytes(), true, |_| Ok(()))
+    }
+
+    /// Delete approved playbook file `rel` (whatever file or symlink is
+    /// there; a symlink is removed, never followed), then the directories
+    /// that leaves empty below the approved playbooks directory. Returns
+    /// whether there was one. Call with the mutex held.
+    pub fn remove_approved_playbook(&self, rel: &str) -> Result<bool> {
+        let base = self.approved_playbooks();
+        let mut path = base.clone();
+        let parts: Vec<&str> = rel.split('/').collect();
+        for (i, part) in parts.iter().enumerate() {
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Err(e) if matches!(e.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => return Ok(false),
+                Err(e) => return Err(path_error(&path, e)),
+                Ok(m) if i + 1 < parts.len() && !m.is_dir() => return Ok(false),
+                Ok(m) if i + 1 == parts.len() && m.is_dir() => return Ok(false),
+                Ok(_) => {}
+            }
+        }
+        if !self.bd_holds_no_symlink_to(&base)? {
+            return Ok(false);
+        }
+        std::fs::remove_file(&path).map_err(|e| path_error(&path, e))?;
+        let mut dir = path.parent();
+        while let Some(d) = dir.filter(|d| *d != base && d.starts_with(&base)) {
+            if std::fs::remove_dir(d).is_err() {
+                break;
+            }
+            dir = d.parent();
+        }
+        Ok(true)
+    }
+
+    /// Whether the directories from `.bd` down to `dir` (below it) are real
+    /// directories, none a symlink.
+    fn bd_holds_no_symlink_to(&self, dir: &Path) -> Result<bool> {
+        let Ok(rel) = dir.strip_prefix(&self.bd) else { return Ok(false) };
+        let mut path = self.bd.clone();
+        for c in rel.components() {
+            path.push(c);
+            match std::fs::symlink_metadata(&path) {
+                Ok(m) if m.is_dir() => {}
+                Ok(_) => return Ok(false),
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(path_error(&path, e)),
+            }
+        }
+        Ok(true)
+    }
+
+    /// The path (`/`-separated, below the approved playbooks directory) of
+    /// everything in it that is not a directory: files, symlinks (never
+    /// followed), temp files left behind. Empty if it is missing or is not
+    /// a real directory.
+    pub fn approved_playbook_entries(&self) -> Result<Vec<String>> {
+        fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) -> Result<()> {
+            for entry in std::fs::read_dir(dir).map_err(|e| path_error(dir, e))? {
+                let entry = entry.map_err(|e| path_error(dir, e))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let rel = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                if entry.file_type().map_err(|e| path_error(&entry.path(), e))?.is_dir() {
+                    walk(&entry.path(), &rel, out)?;
+                } else {
+                    out.push(rel);
+                }
+            }
+            Ok(())
+        }
+        let base = self.approved_playbooks();
+        let mut out = Vec::new();
+        if self.bd_holds_no_symlink_to(&base)? {
+            walk(&base, "", &mut out)?;
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Whether the checkout-relative paths `a` and `b` reach the same file:
     /// on a file system that ignores case, two cases of one name do.
     pub fn same_file(&self, a: &str, b: &str) -> bool {
@@ -351,25 +479,13 @@ fn executable(_: &std::fs::Metadata) -> bool {
 
 /// Take `file`'s OS lock, waiting up to `wait` for its holder to release it.
 fn take(file: File, path: &Path, wait: Duration, exclusive: bool) -> Result<Mutex> {
-    let deadline = Instant::now() + wait;
-    let mut delay = Duration::from_millis(5);
-    loop {
-        let tried = if exclusive { file.try_lock() } else { file.try_lock_shared() };
-        match tried {
-            Ok(()) => return Ok(Mutex(file)),
-            Err(std::fs::TryLockError::WouldBlock) => {}
-            Err(std::fs::TryLockError::Error(e)) => return Err(path_error(path, e)),
-        }
-        let left = deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(Error::Locked(format!(
-                "another bd agents command is changing the agent assets of this checkout ({} is locked); retry",
-                path.display()
-            )));
-        }
-        std::thread::sleep(delay.min(left));
-        delay = (delay * 2).min(Duration::from_millis(50));
-    }
+    let busy = || {
+        format!(
+            "another bd agents command is changing the agent assets of this checkout ({} is locked); retry",
+            path.display()
+        )
+    };
+    bd_core::lockfile::take(file, path, wait, exclusive, busy).map(Mutex)
 }
 
 /// Make `dir` a directory unless something else is there, which is an
@@ -738,6 +854,69 @@ mod tests {
             move || c.exclusive(Duration::from_secs(5)).map(|_| ())
         });
         again.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn approved_playbooks_are_written_read_and_removed_inside_bd() {
+        let (_dir, c) = checkout();
+        std::fs::write(c.bd.join(".gitignore"), "bd.db\n").unwrap();
+        assert_eq!(c.read_approved_playbook("change.toml").unwrap(), None);
+        assert_eq!(c.approved_playbook_entries().unwrap(), Vec::<String>::new());
+        c.write_approved_playbook("change.toml", "a = 1\n").unwrap();
+        c.write_approved_playbook("parts/deep/review.json", "{}").unwrap();
+        assert_eq!(c.read_approved_playbook("change.toml").unwrap().as_deref(), Some(&b"a = 1\n"[..]));
+        assert_eq!(c.approved_playbook_entries().unwrap(), ["change.toml", "parts/deep/review.json"]);
+        let gitignore = std::fs::read_to_string(c.bd.join(".gitignore")).unwrap();
+        assert!(gitignore.ends_with("\napproved/\n"), "{gitignore}");
+        c.write_approved_playbook("change.toml", "a = 2\n").unwrap();
+        assert_eq!(c.read_approved_playbook("change.toml").unwrap().as_deref(), Some(&b"a = 2\n"[..]));
+        let gitignore_again = std::fs::read_to_string(c.bd.join(".gitignore")).unwrap();
+        assert_eq!(gitignore_again, gitignore, "listed once");
+
+        assert!(c.remove_approved_playbook("parts/deep/review.json").unwrap());
+        assert!(!c.approved_playbooks().join("parts").exists(), "emptied directories go");
+        assert!(c.approved_playbooks().is_dir(), "the approved directory stays");
+        assert!(!c.remove_approved_playbook("parts/deep/review.json").unwrap(), "gone already");
+        std::fs::create_dir_all(c.approved_playbooks().join("dir.toml")).unwrap();
+        assert!(c.write_approved_playbook("dir.toml", "x").is_err(), "a directory is never written over");
+        assert!(!c.remove_approved_playbook("dir.toml").unwrap(), "nor removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approved_playbooks_are_never_written_or_read_through_symlinks() {
+        use std::os::unix::fs::symlink;
+        let (_dir, c) = checkout();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::write(elsewhere.path().join("x.toml"), "theirs").unwrap();
+
+        // A symlinked subdirectory: never written, read or removed through.
+        std::fs::create_dir_all(c.approved_playbooks()).unwrap();
+        symlink(elsewhere.path(), c.approved_playbooks().join("parts")).unwrap();
+        assert!(c.write_approved_playbook("parts/x.toml", "ours").is_err());
+        assert_eq!(c.read_approved_playbook("parts/x.toml").unwrap(), None);
+        assert!(!c.remove_approved_playbook("parts/x.toml").unwrap());
+        assert_eq!(std::fs::read_to_string(elsewhere.path().join("x.toml")).unwrap(), "theirs");
+        assert_eq!(c.approved_playbook_entries().unwrap(), ["parts"], "listed as an entry, not followed");
+
+        // A symlink in a file's place is replaced, not written through; removed, not followed.
+        symlink(elsewhere.path().join("x.toml"), c.approved_playbooks().join("x.toml")).unwrap();
+        assert_eq!(c.read_approved_playbook("x.toml").unwrap(), None);
+        c.write_approved_playbook("x.toml", "ours").unwrap();
+        assert_eq!(std::fs::read_to_string(elsewhere.path().join("x.toml")).unwrap(), "theirs");
+        assert_eq!(c.read_approved_playbook("x.toml").unwrap().as_deref(), Some(&b"ours"[..]));
+        symlink(elsewhere.path().join("x.toml"), c.approved_playbooks().join("y.toml")).unwrap();
+        assert!(c.remove_approved_playbook("y.toml").unwrap());
+        assert!(elsewhere.path().join("x.toml").exists(), "the link went, not its target");
+
+        // The approved directory itself a symlink: nothing below it is used.
+        let (_dir, c) = checkout();
+        symlink(elsewhere.path(), c.bd.join("approved")).unwrap();
+        assert!(c.write_approved_playbook("x.toml", "ours").is_err());
+        assert_eq!(c.read_approved_playbook("x.toml").unwrap(), None);
+        assert!(!c.remove_approved_playbook("x.toml").unwrap());
+        assert_eq!(c.approved_playbook_entries().unwrap(), Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(elsewhere.path().join("x.toml")).unwrap(), "theirs");
     }
 
     #[test]

@@ -44,9 +44,12 @@ pub struct Bundle {
     /// How references resolved: by the file holding them (`""` for the
     /// command line), then by reference, the path of the file it names.
     pub refs: BTreeMap<String, BTreeMap<String, String>>,
-    /// The command line names a playbook the client found on its own path
-    /// rather than in its checkout: the server's playbook of that name, if
-    /// it has one, comes first.
+    /// Set by clients that predate approving the server's playbooks: the
+    /// command line names a playbook the client found on its own path rather
+    /// than in its checkout, and the server's of that name was to come
+    /// first. Read for those clients' bundles, and ignored: a server never
+    /// puts its own copy in place of a bundle a client sent, and a client
+    /// of today refuses to send a bundle that sets it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub server_first: bool,
 }

@@ -25,6 +25,7 @@ pub mod mcp;
 pub mod paths;
 pub mod playbooks;
 pub mod protocol;
+pub mod publish;
 pub mod remote;
 pub mod setup;
 pub mod stream;
@@ -311,6 +312,7 @@ pub fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Purge(a) => playbooks::cmd_purge(app, a).map(|_| 0),
         Command::Compact(a) => cmd_issue_compact(app, a).map(|_| 0),
         Command::Agents(c) => agents::cmd_agents(app, c).map(|_| 0),
+        Command::Publish(a) => publish::cmd_publish(app, a),
         Command::Bench(_) | Command::BenchWorker(_) | Command::Serve(_) => match HANDLER.get() {
             Some(handle) => handle(app, cmd),
             None => Err(Error::invalid(format!("bd {} is not part of this build", command_name(cmd)))),
@@ -399,6 +401,7 @@ pub fn command_name(cmd: &Command) -> &'static str {
         Command::Purge(_) => "purge",
         Command::Compact(_) => "compact",
         Command::Agents(_) => "agents",
+        Command::Publish(_) => "publish",
         Command::Bench(_) | Command::BenchWorker(_) => "bench",
         Command::Serve(_) => "serve",
         Command::Mcp(_) => "mcp",

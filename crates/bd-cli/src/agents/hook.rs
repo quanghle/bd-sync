@@ -8,7 +8,10 @@
 //! approved (none of which adds anything that runs), while new and changed
 //! skills and MCP definitions are only reported, for the user to approve
 //! with `bd agents approve` in a separate terminal. It never approves,
-//! prompts or reads the terminal.
+//! prompts or reads the terminal. In a remote workspace it does the same
+//! for the server's playbooks ([`super::approved`]), harness or not: those
+//! the server removed are removed here, and new or changed ones are named
+//! as waiting for approval.
 //!
 //! It says nothing when nothing changed, outside a checkout, and when no
 //! harness is known. A problem (the server unreachable or stalling, the
@@ -32,6 +35,7 @@ use std::time::{Duration, Instant};
 use bd_core::Result;
 use bd_core::agents::{Harness, under};
 
+use super::approved::{self, PlaybooksReport};
 use super::show;
 use super::sync::{HarnessReport, Options, PendingChange, Report, SkillChange};
 use crate::app::App;
@@ -82,7 +86,7 @@ fn check(app: &App, requested: Option<Harness>) -> Result<Vec<String>> {
             _ => checkout.read_lock()?.harnesses.into_keys().collect(),
         },
     };
-    if harnesses.is_empty() {
+    if harnesses.is_empty() && !remote {
         return Ok(Vec::new());
     }
     harnesses.sort();
@@ -95,7 +99,41 @@ fn check(app: &App, requested: Option<Harness>) -> Result<Vec<String>> {
     let opts = Options { apply: true, force: false, review: false, lock_wait };
     let report = super::sync_checkout(app, remote.as_ref(), &checkout, &harnesses, opts)?;
     let source = if remote.is_some() { Source::Server } else { Source::Workspace };
-    Ok(lines(&report, source, |h| absent.contains(&h) && skills_dir(h).is_dir()))
+    let mut said = lines(&report, source, |h| absent.contains(&h) && skills_dir(h).is_dir());
+    match super::sync_playbooks(app, remote.as_ref(), &checkout, opts) {
+        Ok(Some(outcome)) => said.extend(playbook_lines(&outcome.report)),
+        Ok(None) => {}
+        Err(e) => {
+            said.push(show::cap_line(show::printable(&format!("bd: the bd server's playbooks not checked: {e}"))))
+        }
+    }
+    Ok(said)
+}
+
+/// What to tell the session about the server's playbooks.
+fn playbook_lines(r: &PlaybooksReport) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !r.removed.is_empty() {
+        lines.push(format!(
+            "bd: playbooks removed from the bd server, so no longer available here: {}.",
+            r.removed.join(", ")
+        ));
+    }
+    if !r.discarded.is_empty() {
+        lines.push(format!(
+            "bd: approved playbooks changed here were discarded (not the server's as approved): {}.",
+            r.discarded.join(", ")
+        ));
+    }
+    if !r.pending.is_empty() {
+        lines.push(format!(
+            "bd: playbooks changed on the bd server and not approved on this machine: {}. Playbook commands here use \
+             the version approved before, and a new one is unavailable until approved: ask the user to review them \
+             and run `bd agents approve` in a separate terminal.",
+            approved::pending_list(&r.pending)
+        ));
+    }
+    lines.iter().map(|l| show::printable(l)).collect()
 }
 
 #[derive(Clone, Copy)]
@@ -269,7 +307,12 @@ mod tests {
     }
 
     fn report(harnesses: Vec<(Harness, HarnessReport)>) -> Report {
-        Report { applied: true, checkout: Default::default(), harnesses: harnesses.into_iter().collect() }
+        Report {
+            applied: true,
+            checkout: Default::default(),
+            harnesses: harnesses.into_iter().collect(),
+            playbooks: None,
+        }
     }
 
     #[test]

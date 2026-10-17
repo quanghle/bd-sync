@@ -369,7 +369,7 @@ pub fn check_skill_path(path: &str) -> Result<()> {
 
 /// `CON`, `nul.txt`, `com0`, `LPT²`, `conin$`, ...: names Windows reserves,
 /// in any case and with any extension.
-fn device_name(name: &str) -> bool {
+pub(crate) fn device_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name).trim_end().to_ascii_uppercase();
     let numbered = |prefix: &str| {
         stem.strip_prefix(prefix).is_some_and(|n| {
@@ -386,12 +386,21 @@ fn device_name(name: &str) -> bool {
 /// systems could not hold both of. The paths have passed
 /// [`check_skill_path`], so they are ASCII and comparing them in ASCII
 /// lowercase is exact.
-fn check_skill_files<'a>(paths: impl IntoIterator<Item = &'a String>) -> Result<()> {
+fn check_skill_files<'a>(paths: impl IntoIterator<Item = &'a String> + Clone) -> Result<()> {
+    check_tree(paths.clone())?;
+    if !paths.into_iter().any(|path| path == SKILL_FILE) {
+        return Err(invalid(format!("no {SKILL_FILE} (each skill directory holds one)")));
+    }
+    Ok(())
+}
+
+/// Paths of files in one tree (checked by [`check_skill_path`]): none is
+/// also a directory on the way to another, and no two paths (or directories
+/// on their way) differ only in case.
+pub(super) fn check_tree<'a>(paths: impl IntoIterator<Item = &'a String>) -> Result<()> {
     // Each path and directory on the way, by its ASCII lowercase form: as written, and whether it is a file.
     let mut seen: BTreeMap<String, (&str, bool)> = BTreeMap::new();
-    let mut has_skill_file = false;
     for path in paths {
-        has_skill_file |= path == SKILL_FILE;
         let ends = path.match_indices('/').map(|(i, _)| i).chain([path.len()]);
         for end in ends {
             let prefix = &path[..end];
@@ -416,21 +425,18 @@ fn check_skill_files<'a>(paths: impl IntoIterator<Item = &'a String>) -> Result<
             }
         }
     }
-    if !has_skill_file {
-        return Err(invalid(format!("no {SKILL_FILE} (each skill directory holds one)")));
-    }
     Ok(())
 }
 
 /// Text a set may hold: no NUL characters, which only binary files have.
-fn check_text(text: &str) -> Result<()> {
+pub(super) fn check_text(text: &str) -> Result<()> {
     if text.contains('\0') {
         return Err(invalid("holds NUL characters: not a text file (a set holds text files only)"));
     }
     Ok(())
 }
 
-fn too_large(loc: &str, bytes: u64) -> Error {
+pub(super) fn too_large(loc: &str, bytes: u64) -> Error {
     invalid(format!(
         "{loc}: {} KiB is more than the {} KiB a file in a set may hold",
         bytes.div_ceil(1024),
@@ -438,12 +444,12 @@ fn too_large(loc: &str, bytes: u64) -> Error {
     ))
 }
 
-fn io_error(loc: &str, e: &std::io::Error) -> Error {
+pub(super) fn io_error(loc: &str, e: &std::io::Error) -> Error {
     invalid(format!("{loc}: {e}"))
 }
 
 /// How errors name the agents directory: its last two components (`.bd/agents`).
-fn label_of(dir: &Path) -> String {
+pub(super) fn label_of(dir: &Path) -> String {
     let mut parts: Vec<String> =
         dir.components().rev().take(2).map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
     parts.reverse();
@@ -503,21 +509,21 @@ fn opened_path(file: &File) -> Option<PathBuf> {
 }
 
 /// One read of a set from disk, with what it has read so far.
-struct Walk {
+pub(super) struct Walk {
     /// The agents directory, canonical: nothing outside it is read.
-    root: PathBuf,
+    pub(super) root: PathBuf,
     /// How errors name it.
-    base: String,
-    files: usize,
-    dirs: usize,
-    bytes: usize,
+    pub(super) base: String,
+    pub(super) files: usize,
+    pub(super) dirs: usize,
+    pub(super) bytes: usize,
 }
 
 impl Walk {
     /// What `path` leads to (following symlinks), which must be inside the
     /// agents directory: its metadata and its canonical path, which is all
     /// the walk uses from then on.
-    fn resolve(&self, path: &Path, loc: &str) -> Result<(Metadata, PathBuf)> {
+    pub(super) fn resolve(&self, path: &Path, loc: &str) -> Result<(Metadata, PathBuf)> {
         let canon = std::fs::canonicalize(path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => invalid(format!("{loc}: a symlink to nothing")),
             _ => io_error(loc, &e),
@@ -580,7 +586,7 @@ impl Walk {
 
     /// The names in the directory `canon`, checked by [`Walk::resolve`] as
     /// `meta`, sorted, without hidden ones.
-    fn list(&self, canon: &Path, meta: &Metadata, loc: &str) -> Result<Vec<String>> {
+    pub(super) fn list(&self, canon: &Path, meta: &Metadata, loc: &str) -> Result<Vec<String>> {
         #[cfg(unix)]
         {
             let (dir, opened) = self.open(canon, meta, loc)?;
@@ -688,7 +694,7 @@ impl Walk {
 
     /// The text of the file `canon` (checked as `meta`), within the limits,
     /// and the open file's metadata.
-    fn text(&mut self, canon: &Path, loc: &str, meta: &Metadata) -> Result<(String, Metadata)> {
+    pub(super) fn text(&mut self, canon: &Path, loc: &str, meta: &Metadata) -> Result<(String, Metadata)> {
         if !meta.is_file() {
             return Err(invalid(format!("{loc}: not a regular file")));
         }

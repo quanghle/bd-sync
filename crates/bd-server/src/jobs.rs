@@ -17,8 +17,9 @@
 //! local` or `--type gh`) as actor [`ACTOR`], with their I/O captured the way
 //! a request's is, so events, checks and policies are those of the commands.
 //! The agents job reads each harness's set from the workspace's
-//! `.bd/agents` and records its revision ([`bd_core::agents::record_revisions`]),
-//! appending an `agents_changed` event for each set that changed.
+//! `.bd/agents`, and its playbooks from `.bd/playbooks`, and records their
+//! revisions ([`bd_core::agents::record_all`]), appending an
+//! `agents_changed` event for each that changed.
 //! Backups ([`bd_cli::backup`], shared with `bd backup`) are [`Store::snapshot`]s
 //! (`VACUUM INTO`) written under a temporary name and then renamed to
 //! `<backup dir>/<name>/<name>-<UTC time>.db`; the newest `keep` are kept.
@@ -35,7 +36,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bd_core::agents::{AGENTS_DIR, AgentSet, Harness};
+use bd_core::agents::{AGENTS_DIR, AgentSet, Harness, PLAYBOOKS_DIR, PlaybookSet};
 use bd_core::time::{format_duration_ms, parse_duration};
 use bd_core::{Error, OpenOptions, Result, Store};
 use clap::Parser;
@@ -563,18 +564,19 @@ fn check_gates(ws: &Workspace, open: &OpenOptions, job: Job, kind: &str, started
     Ok(())
 }
 
-/// What reading each harness's set gave when it could not be read, by
-/// workspace: a warning is logged when that changes, not on every run.
+/// What reading each harness's set (or the playbooks) gave when it could
+/// not be read, by workspace: a warning is logged when that changes, not on
+/// every run.
 #[derive(Default)]
-struct Unreadable(std::sync::Mutex<HashMap<(String, Harness), String>>);
+struct Unreadable(std::sync::Mutex<HashMap<(String, &'static str), String>>);
 
 impl Unreadable {
-    /// Note what reading `h`'s set in workspace `ws` gave: `error`, or
-    /// none. Returns whether that is news: an error other than the one
-    /// noted before, or the first read since one.
-    fn note(&self, ws: &str, h: Harness, error: Option<&str>) -> bool {
+    /// Note what reading `area` (a harness's set, or `playbooks`) in
+    /// workspace `ws` gave: `error`, or none. Returns whether that is news:
+    /// an error other than the one noted before, or the first read since one.
+    fn note(&self, ws: &str, area: &'static str, error: Option<&str>) -> bool {
         let mut seen = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = (ws.to_string(), h);
+        let key = (ws.to_string(), area);
         match error {
             Some(e) if seen.get(&key).is_some_and(|before| before == e) => false,
             Some(e) => {
@@ -602,14 +604,14 @@ fn agents(ws: &Workspace, open: &OpenOptions, started: Instant, unreadable: &Unr
     for h in Harness::ALL {
         match AgentSet::load(&dir, h) {
             Ok(set) => {
-                if unreadable.note(&ws.name, h, None) {
+                if unreadable.note(&ws.name, h.name(), None) {
                     tracing::info!(target: "bd::serve", workspace = %ws.name, job = "agents", harness = %h, "agent set readable again");
                 }
                 revisions.insert(h, set.revision);
             }
             Err(e) => {
                 let error = e.to_string();
-                if unreadable.note(&ws.name, h, Some(&error)) {
+                if unreadable.note(&ws.name, h.name(), Some(&error)) {
                     tracing::warn!(
                         target: "bd::serve",
                         workspace = %ws.name,
@@ -622,12 +624,38 @@ fn agents(ws: &Workspace, open: &OpenOptions, started: Instant, unreadable: &Unr
             }
         }
     }
+    let playbooks = match PlaybookSet::load(&ws.db.parent().unwrap_or(&ws.dir).join(PLAYBOOKS_DIR)) {
+        Ok(set) => {
+            if unreadable.note(&ws.name, PLAYBOOKS_DIR, None) {
+                tracing::info!(target: "bd::serve", workspace = %ws.name, job = "agents", "playbooks readable again");
+            }
+            Some(set.revision)
+        }
+        Err(e) => {
+            let error = e.to_string();
+            if unreadable.note(&ws.name, PLAYBOOKS_DIR, Some(&error)) {
+                tracing::warn!(
+                    target: "bd::serve",
+                    workspace = %ws.name,
+                    job = "agents",
+                    error = %error,
+                    "playbooks cannot be read; clients keep what they approved"
+                );
+            }
+            None
+        }
+    };
     let mut store = Store::open(&ws.db, open.clone())?;
-    let changed = bd_core::agents::record_revisions(&mut store, ACTOR, &revisions)?;
+    let changed = bd_core::agents::record_all(&mut store, ACTOR, &revisions, playbooks.as_ref())?;
     if changed.is_empty() {
         tracing::debug!(target: "bd::serve", workspace = %ws.name, job = "agents", ms = ms(started), "agent sets unchanged");
     } else {
-        let harnesses: Vec<&str> = changed.iter().map(|c| c.harness.name()).collect();
+        let harnesses: Vec<&str> = changed
+            .harnesses
+            .iter()
+            .map(|c| c.harness.name())
+            .chain(changed.playbooks.as_ref().map(|_| PLAYBOOKS_DIR))
+            .collect();
         tracing::info!(
             target: "bd::serve",
             workspace = %ws.name,
@@ -877,15 +905,29 @@ mod tests {
         agents(&ws, &open, Instant::now(), &unreadable).unwrap();
         let events = changes();
         assert_eq!(events.iter().map(|e| e.data["harness"].as_str().unwrap()).collect::<Vec<_>>(), ["claude"; 2]);
-        let noted = unreadable.0.lock().unwrap().get(&(ws.name.clone(), Harness::Codex)).cloned().unwrap();
+        let noted = unreadable.0.lock().unwrap().get(&(ws.name.clone(), "codex")).cloned().unwrap();
         assert!(noted.contains("codex/mcp.toml"), "{noted}");
-        assert!(!unreadable.note(&ws.name, Harness::Codex, Some(&noted)), "warned about already");
+        assert!(!unreadable.note(&ws.name, "codex", Some(&noted)), "warned about already");
+
+        // The playbooks: an event naming the area, none while they cannot be read.
+        let playbooks = ws.db.parent().unwrap().join(PLAYBOOKS_DIR);
+        std::fs::create_dir_all(&playbooks).unwrap();
+        std::fs::write(playbooks.join("change.toml"), "[[steps]]\nid = \"a\"\n").unwrap();
+        agents(&ws, &open, Instant::now(), &unreadable).unwrap();
+        let events = changes();
+        let last = events.last().unwrap();
+        assert_eq!((last.data["area"].as_str(), last.data.get("harness")), (Some("playbooks"), None), "{last:?}");
+        assert_eq!(last.data["revision"], PlaybookSet::load(&playbooks).unwrap().revision);
+        std::fs::write(playbooks.join("bad.toml"), b"\xff").unwrap();
+        agents(&ws, &open, Instant::now(), &unreadable).unwrap();
+        assert_eq!(changes().len(), events.len(), "unreadable: no event");
+        assert!(unreadable.0.lock().unwrap().contains_key(&(ws.name.clone(), PLAYBOOKS_DIR)));
     }
 
     #[test]
     fn unreadable_sets_are_news_once_per_error() {
         let u = Unreadable::default();
-        let (claude, codex) = (Harness::Claude, Harness::Codex);
+        let (claude, codex) = ("claude", "codex");
         assert!(!u.note("proj", claude, None), "readable all along");
         assert!(u.note("proj", claude, Some("a: no SKILL.md")));
         assert!(!u.note("proj", claude, Some("a: no SKILL.md")), "the same error again");

@@ -384,6 +384,7 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd agents approve",
         "bd agents watch",
         "bd agents manifest",
+        "bd publish",
         "bd hook session-start",
         "bd setup",
         "bd mcp",

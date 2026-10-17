@@ -160,6 +160,18 @@ mod tests {
     }
 
     #[test]
+    fn publish_is_a_write_through_the_server_and_no_mcp_tool() {
+        for argv in [&["bd", "publish"][..], &["bd", "publish", "--dry-run"], &["bd", "publish", "--rollback"]] {
+            let cmd = Cli::try_parse_from(argv).unwrap().command;
+            assert_eq!(access(&cmd), Access::Write, "{argv:?}");
+            assert!(!crate::always_local(&cmd));
+        }
+        let names: Vec<&str> = crate::mcp::tools::TOOLS.iter().map(|t| t.name).collect();
+        assert!(!names.iter().any(|n| n.contains("publish")), "{names:?}");
+        assert!(Cli::try_parse_from(["bd", "publish", "--rollback", "--from", "x"]).is_err());
+    }
+
+    #[test]
     fn setup_runs_only_on_the_client() {
         let cmd =
             Command::Setup(SetupArgs { harness: Some(SetupTarget::Claude), list: false, remove: false, dry_run: true });

@@ -6,6 +6,8 @@ bd works with three agent harnesses: Claude Code (`claude`), Codex
 - [serving skills and MCP definitions](#serving-sets) from a workspace to
   its checkouts, and [pulling](#pulling-into-a-checkout) and
   [approving](#approving-skills-and-mcp-definitions) them;
+- [approving a remote workspace's playbooks](#approving-the-servers-playbooks)
+  on each machine before its agents use them;
 - [session-start hooks](#session-start-hooks) that run `bd prime` and keep
   a checkout's assets current;
 - [sessions and subagents](#sessions-and-subagents): how each agent session
@@ -120,6 +122,88 @@ that moment, so change a served set atomically: write each file beside
 its place and rename it in, and build a new skill
 directory whole before moving it into `skills/`. A file written in place
 can be read half written, and its partial contents served and announced.
+`bd publish` (below) does that for you.
+
+## Publishing
+
+`bd publish` replaces a workspace's agent sets and playbooks with those of
+a source directory kept in the repository and reviewed as code, by
+default `.bd/source/` in the checkout (`--from DIR` names another):
+
+```text
+.bd/source/
+  playbooks/change.toml           # served as .bd/playbooks/change.toml
+  playbooks/lib/base.toml         # subdirectories too (extends = ["lib/base.toml"])
+  agents/claude/skills/deploy/SKILL.md
+  agents/claude/mcp.json
+  agents/codex/skills/deploy/SKILL.md
+```
+
+`agents/<harness>/` has exactly the layout of a served set; a symlink in a
+set may lead anywhere inside `agents/` (another harness's set too, to share
+one skill between harnesses), never outside it, as in a served set. Hidden
+entries (names starting with `.`) are left out. Names are ASCII, and no two
+paths of an area differ only in case.
+
+```bash
+bd publish --dry-run              # every file added, changed (with a diff) or removed; new revisions
+bd publish                        # publish both areas
+bd publish --only playbooks       # or only the agent sets: --only agents
+bd publish --rollback             # restore the areas the last publish changed
+```
+
+The workspace then mirrors the source: files the source lacks are removed,
+so clients remove them at their next pull. Everything is checked before
+anything changes: every path (relative, ASCII, no `..`, no hidden or
+Windows-reserved names), every symlink (resolved in the staged tree as
+the file system resolves it), the limits (1,024 files and 16 MiB
+in all, 512 KiB a file, and a set's own limits), each set as `bd agents
+manifest` would read it, and each playbook as `bd playbook show` would
+load it, with its `extends` and `expand` kept inside the published
+playbooks. One error refuses the whole publish (exit 2, naming the file
+and the rule). An area the source leaves empty is refused too, since it
+would remove every client's skills or every playbook: name the other one
+with `--only`, or pass `--allow-empty` to empty it on purpose.
+
+Files are written one by one, each atomically, and removals come last,
+so a client reading meanwhile never misses a file of either version (it
+may see some files new and some old for that moment; a set that does not
+read as valid is refused whole, and new or changed skills wait for
+approval anyway). Where the file system ignores case (APFS, NTFS), a file
+or directory renamed in case only is renamed in place, never removed. The
+areas a publish changes are kept as they were in `.bd/publish.prev/` (one
+generation; a publish that changes nothing keeps the earlier one), with
+the list of those areas, and `bd publish --rollback` restores those areas
+the same way (`--only` picks one area kept there; rolling back again
+returns to the publish). A publish interrupted before it is recorded
+(a crash, a failed write) leaves `.bd/publish.prev/applying` behind: the
+next publish keeps the generation from before the interrupted one rather
+than its half-written tree, and removes the temp files it left. Two
+publishes to one workspace take turns (`.bd/publish.lock`; exit 5 after
+`--busy-timeout-ms`). In a local workspace, the first publish adds
+`publish.*` and `.publish-*` to `.bd/.gitignore`.
+
+On Windows, where the file system keeps no executable bits and git may
+check symlinks out as text files, `bd publish` takes the agent sets'
+executable bits and symlinks from git (`git ls-files -s`: mode `100755`, or
+`120000` with the file's text as the target): publish them from a git
+checkout, with every file of the sets added to git (one git does not
+record is refused, as nothing says whether it is a script), or from Linux
+or macOS. The same holds on Linux and macOS for a source on a file system
+that keeps no modes: a checkout whose `core.filemode` is false (git sets it
+so there), or one where every file of the sets reports mode 0777 (WSL's
+DrvFs, `/mnt/<drive>`). Without a git checkout there, publishing the sets
+is refused. `--only playbooks` needs neither.
+
+Each publish appends one `published` event: who, the source's git commit
+and whether it had uncommitted changes (as the client reports them), each
+file's SHA-256 and the counts per area, and `rollback`. The new set
+revisions are recorded in the same transaction, so `agents_changed` events
+reach `bd agents watch` at once. Through bd serve, publishing needs an
+admin token of a person (role `admin`, kind `human`); agents cannot
+publish, even with admin tokens. Publishing changes nothing about
+[Trust](#trust): clients still approve new and changed skills and MCP
+definitions.
 
 ## Trust
 
@@ -146,6 +230,10 @@ approval. So:
 
 - Guard `.bd/agents` on the server like a code deployment: only admins
   edit it, and changes are reviewed as code is.
+- A remote workspace's playbooks steer every agent that runs them, so they
+  wait for a person too ([Approving the server's
+  playbooks](#approving-the-servers-playbooks)); guard `.bd/playbooks` on
+  the server the same way.
 - Read what `bd agents approve` shows before answering. `bd agents status`
   names what is waiting; the hidden `bd agents fetch --harness <h>` (any
   token) prints a whole set as one JSON object with strings escaped.
@@ -168,7 +256,11 @@ or comma-separated), else from the running agent session's variable
 (`$CLAUDE_CODE_SESSION_ID`, `$COPILOT_AGENT_SESSION_ID`, `$CODEX_THREAD_ID`
 or `$CODEX_SESSION_ID`; a nested session gets each), else from those
 `.bd/agents.lock` records (`approve` skips the session step). With none it
-fails (exit 2). Each harness's set goes to its own places only.
+fails (exit 2), except in a remote workspace, where the commands then work
+on the server's playbooks alone. Each harness's set goes to its own places
+only. The server's playbooks, which every harness shares, are part of
+every `status`, `pull`, `approve` and `watch` in a remote workspace,
+whatever `--harness` names.
 
 ```console
 $ bd agents status --harness claude,copilot
@@ -189,8 +281,14 @@ never from a manifest's word for them.
 each skill file bd wrote or adopted (`sha256` of its bytes, `lf_sha256`
 for CRLF text, `executable`, and `executable_not_kept` where the file
 system lost the bit); and each MCP entry bd wrote or adopted, with the
-definition approved. It is local state: the first lock written adds
-`agents.lock*` to `.bd/.gitignore` (`bd init` writes that line too).
+definition approved. In a remote workspace, `playbooks` records the
+`sha256` of each of the server's playbook files approved here, by its path
+on the server (left out while none is: a lock file of an older bd reads as
+approving none; a bd that predates it refuses a lock that records some,
+so downgrading a client drops its playbook approvals: once they are
+removed as that bd asks, they are approved again after upgrading). It is
+local state: the first lock written adds `agents.lock*` to
+`.bd/.gitignore` (`bd init` writes that line too).
 
 Changes to a checkout are serialized by `.bd/agents.lock.mutex`, an
 OS-level lock released when its process ends. `status`, `pull` and
@@ -386,6 +484,100 @@ Approve MCP server tracker? [y/N] y
   boundary, since an agent with a shell can edit the files directly.
   Agents are told to ask the user to run `bd agents approve` in a separate
   terminal.
+
+## Approving the server's playbooks
+
+In a remote workspace, a playbook the server serves (its
+`<root>/<name>/.bd/playbooks/**`, every `.toml` and `.json` file,
+subdirectories included) is used on a client machine only once a person
+approved it there, as skills and MCP definitions are. Until then the
+machine keeps using the version it approved last, and a playbook never
+approved is unavailable to it. A local workspace's `.bd/playbooks` are the
+user's own files and need no approval.
+
+```console
+$ bd agents status
+playbooks waiting for approval: change.toml (changed), triage.toml (new): not used here until approved (a changed one keeps its approved version); review and approve with `bd agents approve` in a terminal
+$ bd agents approve change
+playbook change.toml: changed on the bd server; the version approved here stays in use until this one is
+  @@ -3,7 +3,7 @@
+    ...
+  - title = "Review"
+  + title = "Independent review"
+  ...
+  playbook change.toml: changed
+Approve playbook change.toml? [y/N] y
+
+approved playbook change.toml: kept in .bd/approved/playbooks
+```
+
+- **Served for approval.** `bd agents manifest --playbooks` lists the
+  files with a SHA-256 each and a revision; the hidden `bd agents fetch
+  --playbooks` prints them whole. They are read as strictly as an agent
+  set: portable ASCII paths, no hidden files, symlinks contained in
+  `.bd/playbooks`, UTF-8 text, and the limits of what a client sends back
+  to run one (256 files, 512 KiB each, 8 MiB in all). Clients check every
+  answer (paths, hashes, the revision) before using it. A server that
+  predates this serves none for approval: its playbooks are then
+  unavailable to clients of today.
+- **Approved per file.** `bd agents approve` shows each new or changed
+  file after the skills and MCP definitions, a new one whole and a changed
+  one as a diff against the version approved here, escaped and cut short as
+  skill files are, and asks `Approve playbook <path>? [y/N]`. NAME picks one
+  by its path (`parts/review.toml`) or name (`change`). What `extends` and
+  `expand` reach are files of their own, each approved on its own.
+- **Kept by bd.** Approved files are kept byte for byte in the checkout's
+  `.bd/approved/playbooks/` (by their path on the server), with their
+  SHA-256 under `playbooks` in `.bd/agents.lock`; the first one kept adds
+  `approved/` to `.bd/.gitignore`. They are written under the checkout's
+  mutex, never through a symlink.
+- **Pulls only report.** `status`, `pull`, `watch` and the session-start
+  hook name new and changed playbooks and never approve them. What applies
+  without approval: a playbook the server removed is removed here; one
+  changed or deleted here is written again while the server still serves
+  the very bytes approved, and otherwise dropped (it waits for approval
+  again); anything else in `.bd/approved/playbooks` is removed.
+- **Runs use the approved bytes.** `bd playbook show`, `plan` and `run`
+  look a name up in the checkout's `.bd/playbooks`, then among the
+  approved, then in the user's own ([Where playbooks are
+  found](playbooks.md#where-playbooks-are-found)), and always send the
+  files they load to the server, which compiles exactly those, never its
+  own copy. Before sending, every approved file is checked against its
+  hash in the lock, and a path an approved playbook names (`extends =
+  "../x.toml"`) must stay inside `.bd/approved/playbooks`. A name found
+  nowhere fails (exit 3), saying to approve the server's playbooks.
+- **Listed with what waits.** `bd playbook list` and `bd prime` list the
+  approved ones where a command finds them (`(the server's, approved
+  here)`) and name those waiting for approval; `bd prime --json` has them
+  in `playbooks_pending` (`path`, `change`: `new` or `changed`).
+
+A fresh checkout has no playbooks of the server's until a person runs
+`bd agents approve` once; agents there are told to ask for it.
+
+`bd agents status` and `pull` with `--json` add a `playbooks` object:
+`dir` (`.bd/approved/playbooks`), `server_revision`, `pending` (`path`,
+`change`), and the paths `removed` (gone from the server), `restored`
+(written again as approved) and `discarded` (dropped or removed: changed
+here and not the server's as approved, or not written by bd). `approve
+--json` adds `playbooks`: `dir`, `approved`, `declined`, `skipped`
+(`name`, `reason`).
+
+The MCP endpoint `/w/<name>/mcp` has no client to approve with: were a
+playbook run there, it would compile the server's own copy. It offers no
+playbook tool today. Requests without a bundle, as clients that predate
+approval send, also compile the server's published copy; a bundle that
+asks for the server's copy first (`server_first`, from those clients) is
+compiled as sent, and clients of today refuse to send one.
+
+A client that predates approval and sent such a bundle got the server's
+copy of that name; it now gets the copy it sent.
+
+What approval guards against is an admin's unreviewed publish reaching
+agents through bd clients. It does not stop an agent that holds a token
+and deliberately goes around its client (a request without a bundle, or
+`bd agents fetch --playbooks`, which shows the texts), nor a compromised
+server binary, which can put any text in front of agents, its issues
+included ([Security](security.md#agent-assets)).
 
 ## Session-start hooks
 

@@ -41,6 +41,9 @@ pub static CONNECTIONS_REFUSED_TOTAL: Counter = Counter::new();
 pub static PANICS: Counter = Counter::new();
 pub static COMMANDS: Counter = Counter::new();
 pub static TOOL_CALLS: Counter = Counter::new();
+/// `bd publish` and `bd publish --rollback` runs (dry runs aside) that changed a workspace, and those refused.
+pub static PUBLISHES: Counter = Counter::new();
+pub static PUBLISHES_REFUSED: Counter = Counter::new();
 /// Connections open now.
 pub static OPEN: AtomicI64 = AtomicI64::new(0);
 
@@ -111,6 +114,11 @@ pub fn render() -> String {
     counter("panics_total", "Commands, tool calls and jobs that panicked.", &[("", PANICS.get())]);
     counter("commands_total", "Command lines run through /v2/exec.", &[("", COMMANDS.get())]);
     counter("tool_calls_total", "MCP tool calls run.", &[("", TOOL_CALLS.get())]);
+    counter(
+        "publishes_total",
+        "Runs of bd publish (dry runs aside), by outcome.",
+        &[("{outcome=\"applied\"}", PUBLISHES.get()), ("{outcome=\"refused\"}", PUBLISHES_REFUSED.get())],
+    );
     let _ = writeln!(
         out,
         "# HELP bd_serve_connections_open Connections open now.\n# TYPE bd_serve_connections_open gauge\n\

@@ -382,6 +382,21 @@ pub fn event_summary(e: &Event) -> String {
             let short = |k: &str| s(d, k).chars().take(12).collect::<String>();
             format!("{} set: revision {} (was {})", s(d, "harness"), short("revision"), short("previous"))
         }
+        "published" => {
+            let areas: Vec<String> = d["areas"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(area, a)| format!("{area} +{} ~{} -{}", s(a, "added"), s(a, "changed"), s(a, "removed")))
+                .collect();
+            let commit: String = s(&d["source"], "commit").chars().take(12).collect();
+            let from = match (commit.is_empty(), d["source"]["dirty"] == Value::Bool(true)) {
+                (true, _) => String::new(),
+                (false, dirty) => format!(" from {commit}{}", if dirty { " (dirty)" } else { "" }),
+            };
+            let rollback = if d["rollback"] == Value::Bool(true) { "rollback: " } else { "" };
+            format!("{rollback}{}{from}", areas.join(", "))
+        }
         _ => {
             if d.as_object().is_some_and(|m| m.is_empty()) {
                 String::new()

@@ -943,6 +943,12 @@ impl Server {
             // Requests waiting for events check again.
             self.feeds.committed(&ws.name);
         }
+        if let Command::Publish(a) = &cli.command
+            && !a.dry_run
+        {
+            let counter = if exit_code == 0 { &metrics::PUBLISHES } else { &metrics::PUBLISHES_REFUSED };
+            counter.add();
+        }
         let recorded = app.request.as_ref().filter(|k| k.recorded).map(|k| k.id.clone());
         self.close_app(ws, token, &mut app);
         let sent = out.borrow_mut().finish(Exit { exit_code, stderr: lossy(captured.stderr), replayed: false });

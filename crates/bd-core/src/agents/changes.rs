@@ -7,13 +7,19 @@
 //! under `agents.revision.<harness>`. A harness without one counts as
 //! having served an empty set, so a workspace that never served anything
 //! never gets an event.
+//!
+//! The workspace's playbooks ([`PlaybookSet`]) are recorded the same way,
+//! under `agents.revision.playbooks`, and their event names the area
+//! instead of a harness ([`PlaybooksChanged`]): `{"area": "playbooks",
+//! ...}` without a `harness`, which clients that predate it do not read as
+//! an [`AgentsChanged`] and so leave alone.
 
 use std::collections::BTreeMap;
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::{AgentSet, Harness};
+use super::{AgentSet, Harness, PlaybookSet};
 use crate::error::Result;
 use crate::store::{Store, WriteCtx, meta_get, meta_set};
 
@@ -31,8 +37,48 @@ pub struct AgentsChanged {
     pub previous: String,
 }
 
+/// What an [`AGENTS_CHANGED`] event holds when the workspace's playbooks
+/// changed: `{"area": "playbooks", "revision": "<sha256>", "previous": "<sha256>"}`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaybooksChanged {
+    /// [`PLAYBOOKS_AREA`].
+    pub area: String,
+    pub revision: String,
+    pub previous: String,
+}
+
+/// The `area` of a [`PlaybooksChanged`] event.
+pub const PLAYBOOKS_AREA: &str = "playbooks";
+
+const PLAYBOOKS_KEY: &str = "agents.revision.playbooks";
+
 fn meta_key(h: Harness) -> String {
     format!("agents.revision.{h}")
+}
+
+/// What [`record_all`] recorded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Recorded {
+    pub harnesses: Vec<AgentsChanged>,
+    pub playbooks: Option<PlaybooksChanged>,
+}
+
+impl Recorded {
+    pub fn is_empty(&self) -> bool {
+        self.harnesses.is_empty() && self.playbooks.is_none()
+    }
+}
+
+/// Whether the playbooks' `revision` differs from the one recorded.
+fn playbooks_change(conn: &Connection, revision: Option<&String>) -> Result<Option<PlaybooksChanged>> {
+    let Some(revision) = revision else { return Ok(None) };
+    let previous = meta_get(conn, PLAYBOOKS_KEY)?.unwrap_or_else(|| PlaybookSet::empty().revision);
+    Ok((previous != *revision).then(|| PlaybooksChanged {
+        area: PLAYBOOKS_AREA.into(),
+        revision: revision.clone(),
+        previous,
+    }))
 }
 
 /// The harnesses whose revision in `revisions` differs from the one recorded.
@@ -57,21 +103,44 @@ pub fn record_revisions(
     actor: &str,
     revisions: &BTreeMap<Harness, String>,
 ) -> Result<Vec<AgentsChanged>> {
-    if store.read(|r| changes(r.conn(), revisions))?.is_empty() {
-        return Ok(Vec::new());
-    }
-    store.write("agents.revisions", actor, |tx| record_in(tx, revisions))
+    Ok(record_all(store, actor, revisions, None)?.harnesses)
 }
 
-/// The write of [`record_revisions`], which compares again: another
-/// process may have recorded the same change since it read.
-fn record_in(tx: &mut WriteCtx<'_>, revisions: &BTreeMap<Harness, String>) -> Result<Vec<AgentsChanged>> {
+/// [`record_revisions`], and with `playbooks` the revision of the
+/// workspace's playbooks ([`PlaybookSet::load`]) too, recorded and announced
+/// the same way ([`PlaybooksChanged`]), in the same write transaction.
+pub fn record_all(
+    store: &mut Store,
+    actor: &str,
+    revisions: &BTreeMap<Harness, String>,
+    playbooks: Option<&String>,
+) -> Result<Recorded> {
+    let unchanged = store
+        .read(|r| Ok(changes(r.conn(), revisions)?.is_empty() && playbooks_change(r.conn(), playbooks)?.is_none()))?;
+    if unchanged {
+        return Ok(Recorded::default());
+    }
+    store.write("agents.revisions", actor, |tx| record_in(tx, revisions, playbooks))
+}
+
+/// The write of [`record_all`], which compares again: another process may
+/// have recorded the same change since it read.
+pub(crate) fn record_in(
+    tx: &mut WriteCtx<'_>,
+    revisions: &BTreeMap<Harness, String>,
+    playbooks: Option<&String>,
+) -> Result<Recorded> {
     let changed = changes(tx.conn(), revisions)?;
     for c in &changed {
         meta_set(tx.conn(), &meta_key(c.harness), &c.revision)?;
         tx.emit(AGENTS_CHANGED, None, serde_json::to_value(c)?)?;
     }
-    Ok(changed)
+    let playbooks = playbooks_change(tx.conn(), playbooks)?;
+    if let Some(c) = &playbooks {
+        meta_set(tx.conn(), PLAYBOOKS_KEY, &c.revision)?;
+        tx.emit(AGENTS_CHANGED, None, serde_json::to_value(c)?)?;
+    }
+    Ok(Recorded { harnesses: changed, playbooks })
 }
 
 #[cfg(test)]
@@ -165,7 +234,37 @@ mod tests {
         // Another process records the change between this one's read and its write.
         assert_eq!(store.read(|r| changes(r.conn(), &changed)).unwrap().len(), 1);
         assert_eq!(record_revisions(&mut other, "bd-serve", &changed).unwrap().len(), 1);
-        assert_eq!(store.write("agents.revisions", "bd-serve", |tx| record_in(tx, &changed)).unwrap(), []);
+        let again = store.write("agents.revisions", "bd-serve", |tx| record_in(tx, &changed, None)).unwrap();
+        assert_eq!(again, Recorded::default());
         assert_eq!(events(&store).iter().filter(|e| e.op == AGENTS_CHANGED).count(), 1);
+    }
+
+    #[test]
+    fn playbooks_changes_are_announced_without_a_harness() {
+        let (_dir, mut store) = store();
+        let empty = PlaybookSet::empty().revision;
+        let none = BTreeMap::new();
+        assert!(record_all(&mut store, "bd-serve", &none, Some(&empty)).unwrap().is_empty(), "never served");
+        assert_eq!(last_write(&store), "init");
+        let r1 = "1".repeat(64);
+        let recorded = record_all(&mut store, "bd-serve", &none, Some(&r1)).unwrap();
+        let want = PlaybooksChanged { area: "playbooks".into(), revision: r1.clone(), previous: empty.clone() };
+        assert_eq!(recorded, Recorded { harnesses: vec![], playbooks: Some(want.clone()) });
+        let e = events(&store).pop().unwrap();
+        assert_eq!((e.op.as_str(), e.issue_id.as_deref()), (AGENTS_CHANGED, None));
+        assert_eq!(e.data, serde_json::json!({"area": "playbooks", "revision": r1, "previous": empty}));
+        // Clients that predate the area read no harness change in it.
+        assert!(serde_json::from_value::<AgentsChanged>(e.data.clone()).is_err());
+        assert_eq!(serde_json::from_value::<PlaybooksChanged>(e.data).unwrap(), want);
+        // Unchanged, or left out: nothing.
+        assert!(record_all(&mut store, "bd-serve", &none, Some(&r1)).unwrap().is_empty());
+        assert!(record_all(&mut store, "bd-serve", &none, None).unwrap().is_empty());
+        // A harness and the playbooks changing together share one transaction.
+        let r2 = "2".repeat(64);
+        let both = record_all(&mut store, "bd-serve", &revs(&[(Harness::Claude, &r2)]), Some(&r2)).unwrap();
+        assert_eq!((both.harnesses.len(), both.playbooks.map(|p| p.previous)), (1, Some(r1)));
+        let all = events(&store);
+        let (a, b) = (&all[all.len() - 2], &all[all.len() - 1]);
+        assert_eq!((a.op.as_str(), b.op.as_str(), a.tx), (AGENTS_CHANGED, AGENTS_CHANGED, b.tx));
     }
 }

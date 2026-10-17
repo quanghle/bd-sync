@@ -304,6 +304,28 @@ A workspace can serve skills and MCP server definitions to agent harnesses
   it checked against the texts, never a manifest's word for them, and
   writes without approval only the very bytes approved. Guard `.bd/agents`
   on the server like a code deployment all the same ([Trust](agents.md#trust)).
+- **Playbooks wait for a person too.** A remote workspace's playbooks steer
+  every agent that runs them, so a client uses one only once a person
+  approved it on that machine (`bd agents approve`, with the same rules:
+  shown whole or as a diff, a terminal, no agent session). The approved
+  bytes are kept in `.bd/approved/playbooks` with their hashes in
+  `.bd/agents.lock`, checked before each run, and sent with the command:
+  the server compiles what the client sent, never its own copy in its
+  place (a bundle asking for it, `server_first`, from clients that predate
+  approval, is compiled as sent; clients of today refuse to send one). A
+  path an approved playbook names must stay inside the approved directory,
+  so a playbook cannot make a client send its other files.
+  What this guards against is an admin's unreviewed publish reaching
+  agents through bd clients. It does not stop an agent that holds a token
+  and deliberately goes around its client: requests without a bundle (as
+  clients that predate this send, and the MCP endpoint `/w/<name>/mcp`
+  would, which has no client to approve with and offers no playbook tool
+  today) compile the server's published copy, and `bd agents fetch
+  --playbooks` shows the texts. Nor does it stop a compromised server
+  binary, which can put any text in front of agents (the issues they read
+  included). A person approving without reading remains a risk; a local
+  process that can write the checkout can change the approved files as it
+  can the skill files.
 - **No secrets on the server.** MCP servers run and authenticate on the
   client; bd never handles MCP credentials.
 - **Strict sets.** Sets are validated on the server and again by clients
@@ -311,6 +333,69 @@ A workspace can serve skills and MCP server definitions to agent harnesses
   paths, symlinks contained in `.bd/agents`, size limits. A pull never
   follows a symlink in a skill directory and never overwrites files it did
   not write.
+
+## Publishing
+
+[`bd publish`](agents.md#publishing) replaces a workspace's playbooks and
+agent sets, which steer every agent's work and reach every checkout.
+
+- **Who.** Through bd serve, only an admin token of a person (role
+  `admin`, kind `human`), for dry runs and rollbacks too: an admin agent
+  token, a write token and an MCP tool call are refused (exit 7). It is
+  not a `bd batch` operation or an MCP tool. Locally, whoever can write the
+  workspace's `.bd`. CI that publishes needs a human-kind admin token
+  issued for the purpose.
+- **What is checked.** The server trusts nothing the client checked.
+  Before anything is written, every path must be relative, ASCII and
+  `/`-separated, with no `..`, no hidden, empty or Windows-reserved
+  components, no control characters, within the depth and length limits,
+  and no two paths of an area may differ only in case; symlinks only in
+  agent sets, leading to another place inside `agents/` (resolved once
+  staged, link by link, as the file system resolves them); 1,024 files and
+  16 MiB in all, 512 KiB a file, and each set's limits.
+  The bundle is then written into a fresh private staging directory
+  (`.bd/.publish-<random>/`, mode 0700, files created exclusively) and
+  loaded there by the loaders that serve it: each set as clients would
+  read it, each playbook with its `extends` and `expand` held inside the
+  published playbooks. Errors, from staging and applying too, name the
+  file as the source names it, never a server path. Any error refuses the whole publish and removes the
+  staging directory; one a crash leaves is swept by a later publish.
+- **How it is applied.** Under the workspace's publish lock, the areas it
+  changes are copied to `.bd/publish.prev/` first (with a marker,
+  `applying`, until the publish is recorded: a later publish keeps that
+  copy rather than a half-written tree, and sweeps the temp files an
+  interrupted one left), then each new or changed file is written to a
+  temp file and renamed over its place, entries renamed in case only are
+  renamed where the file system ignores case (never removed, which would
+  remove what was just written), and only then are files the source lacks
+  removed. Nothing is written or removed through
+  a symlink: directories written into are checked to be real ones, a
+  symlink where a file goes is replaced (never followed), and an area that
+  is itself a symlink is refused. Readers see each file whole, old or new,
+  and never fewer files than either version has. An area left empty in the
+  source is refused unless asked for (`--allow-empty`), so a mistaken
+  publish cannot remove every client's skills.
+- **Undo and audit.** `bd publish --rollback` restores, from
+  `.bd/publish.prev`, the areas the last publish changed, through the same
+  checks; the `published` event records the actor, each file's SHA-256
+  (computed by the server) and the counts, with the source's git commit as
+  the client reported it; the server logs a line per publish (counts,
+  paths, hashes) and per refusal (exit code, error code and the file
+  named, never the message, which can quote a file), never contents, and
+  `/metrics` counts them (`bd_serve_publishes_total`).
+- **Playbooks are held to their directory** whenever bd serve loads them,
+  published or not: a reference leading outside the playbook directories
+  (`../`, an absolute path, a symlink out) is refused, as is a file over
+  512 KiB.
+- **Executable bits from Windows.** Where the file system keeps none
+  (Windows; on Unix, a checkout with `core.filemode` false, or a source
+  where every file reports mode 0777, as WSL's DrvFs does), a client takes
+  the agent sets' executable bits and symlinks from git, and refuses a set
+  file git does not record, or a source git cannot read, rather than
+  publishing scripts as plain files or every file as a script.
+- **What it does not change.** Clients still approve new and changed
+  skills, executable bits and MCP definitions. A secret committed to the
+  source is published to every reader; `--dry-run` lists every file first.
 
 ## Release binaries
 

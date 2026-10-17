@@ -108,10 +108,15 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
     attach_inputs(&cli.command, &mut request)?;
     playbooks::attach_bundle(app, &cli.command, &mut request)?;
     playbooks::attach_listing(app, &cli.command, &mut request);
+    crate::publish::attach_bundle(app, &cli.command, &mut request)?;
     check_outputs(app, &cli.command)?;
     // A session hook prints `bd prime` only once it knows the command worked.
     let write = crate::cli::access(&cli.command) == crate::cli::Access::Write;
-    remote.exec_into(&request, &mut Delivery::new(output_files(app, &cli.command), hook, write))
+    let response = remote.exec_into(&request, &mut Delivery::new(output_files(app, &cli.command), hook, write))?;
+    Ok(match &cli.command {
+        Command::Publish(_) => crate::publish::from_older_server(response, app.g.json),
+        _ => response,
+    })
 }
 
 /// Send the stdin and input files the command reads; the server never reads its own files for a client.

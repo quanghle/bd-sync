@@ -17,6 +17,10 @@
 //!         "github": {"sha256": "<sha256>", "definition": {"command": "npx", "args": ["-y", "server-github"]}}
 //!       }
 //!     }
+//!   },
+//!   "playbooks": {
+//!     "change.toml": {"sha256": "<sha256>"},
+//!     "parts/review.toml": {"sha256": "<sha256>"}
 //!   }
 //! }
 //! ```
@@ -31,6 +35,14 @@
 //! changes. Only applied and approved state is recorded: skill and MCP
 //! changes that wait for approval are worked out from the server each time.
 //!
+//! `playbooks` (a remote workspace's; left out while empty) holds each of
+//! the server's playbook files approved here, by its path within the
+//! server's playbook directory, with the SHA-256 of the bytes approved,
+//! which bd keeps in `.bd/approved/playbooks` ([`super::playbooks`]). A
+//! lock file without it reads as having approved none, so lock files
+//! written before it read as they did; one that holds approved playbooks
+//! is not read by a bd that predates it (it asks to remove the file).
+//!
 //! `executable_not_kept` marks an executable file whose executable bit the
 //! file system did not keep when bd set it (vfat, an SMB mount whose fmask
 //! clears it): with the text recorded, it counts as up to date without the
@@ -41,7 +53,8 @@
 use std::collections::BTreeMap;
 
 use bd_core::agents::{
-    FileDigest, Harness, check_server_name, check_sha256, check_skill_name, check_skill_path, mcp_digest,
+    FileDigest, Harness, check_playbook_path, check_server_name, check_sha256, check_skill_name, check_skill_path,
+    mcp_digest,
 };
 use bd_core::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -57,12 +70,23 @@ pub const VERSION: u32 = 1;
 pub struct LockFile {
     pub version: u32,
     pub harnesses: BTreeMap<Harness, Applied>,
+    /// The server's playbook files approved here, by path within its playbook directory.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub playbooks: BTreeMap<String, ApprovedPlaybook>,
 }
 
 impl Default for LockFile {
     fn default() -> LockFile {
-        LockFile { version: VERSION, harnesses: BTreeMap::new() }
+        LockFile { version: VERSION, harnesses: BTreeMap::new(), playbooks: BTreeMap::new() }
     }
+}
+
+/// A playbook file approved here.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedPlaybook {
+    /// SHA-256 of the bytes approved.
+    pub sha256: String,
 }
 
 /// What a checkout holds of one harness's set.
@@ -158,6 +182,10 @@ impl LockFile {
                 }
             }
         }
+        for (path, approved) in &self.playbooks {
+            check_playbook_path(path).map_err(|e| Error::invalid(format!("playbooks: {e}")))?;
+            check_sha256(&approved.sha256).map_err(|e| Error::invalid(format!("playbooks: {path}: {e}")))?;
+        }
         Ok(())
     }
 }
@@ -243,5 +271,40 @@ mod tests {
         let mut bad = good;
         bad["harnesses"]["claude"]["pending"] = json!({});
         assert!(serde_json::from_value::<LockFile>(bad).is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn approved_playbooks_extend_the_format_compatibly() {
+        // A lock file written before playbooks were approved reads as approving none.
+        let old = json!({"version": 1, "harnesses": {"codex": {"revision": "r"}}});
+        let lock: LockFile = serde_json::from_value(old.clone()).unwrap();
+        lock.check().unwrap();
+        assert!(lock.playbooks.is_empty());
+        assert_eq!(
+            serde_json::to_value(&lock).unwrap(),
+            json!({"version": 1, "harnesses": {"codex": {"revision": "r", "skills": {}, "mcp_servers": {}}}}),
+            "none approved: written without the key, as a bd that predates it writes it"
+        );
+
+        let good = json!({
+            "version": 1,
+            "harnesses": {},
+            "playbooks": {"change.toml": {"sha256": SHA}, "parts/review.json": {"sha256": SHA}}
+        });
+        let lock: LockFile = serde_json::from_value(good.clone()).unwrap();
+        lock.check().unwrap();
+        assert_eq!(serde_json::to_value(&lock).unwrap(), good, "written as read");
+        for (path, digest, want) in [
+            ("../../.bashrc.toml", json!({"sha256": SHA}), "invalid path"),
+            ("/etc/x.toml", json!({"sha256": SHA}), "invalid path"),
+            ("run.sh", json!({"sha256": SHA}), "not a playbook file"),
+            ("x.toml", json!({"sha256": "x"}), "not a SHA-256"),
+        ] {
+            let bad = json!({"version": 1, "harnesses": {}, "playbooks": {path: digest}});
+            let e = serde_json::from_value::<LockFile>(bad).unwrap().check().unwrap_err().to_string();
+            assert!(e.contains(want), "{path}: {e}");
+        }
+        let unknown = json!({"version": 1, "harnesses": {}, "playbooks": {"x.toml": {"sha256": SHA, "text": ""}}});
+        assert!(serde_json::from_value::<LockFile>(unknown).is_err());
     }
 }

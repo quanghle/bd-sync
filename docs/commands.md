@@ -17,7 +17,8 @@ and error codes.
 | Ready work and claims | `ready`, `claim` (`--next`), `heartbeat` (`hb`), `release` (`unclaim`), `reclaim`, `leases` | [Ready work](concepts.md#ready-work), [Claims](concepts.md#claims-leases-and-recovery) |
 | Comments and memory | `comment add/list`, `comments`, `remember`, `recall`, `memories`, `forget`, `memory add/get/list/rm` | [Comments and memory](concepts.md#comments-and-memory) |
 | Events | `events` (`--follow`, `--wait`, `prune`), `history` (`--diff`), `show --as-of` | [Event history](concepts.md#event-history), [Reading an issue as of a past moment](concepts.md#reading-an-issue-as-of-a-past-moment) |
-| Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `setup`, `agents manifest/status/pull/approve/watch`, `mcp` | [Agent assets](agents.md), [Setup and the plugins](setup.md), [MCP server](mcp.md) |
+| Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `setup`, `agents manifest/status/pull/approve/watch` (`manifest --playbooks`: the playbooks a remote workspace's clients approve), `mcp` | [Agent assets](agents.md), [Setup and the plugins](setup.md), [MCP server](mcp.md) |
+| Publishing | `publish` (`--from`, `--dry-run`, `--only playbooks\|agents`, `--rollback`, `--allow-empty`) | [Publishing](agents.md#publishing) |
 | Playbooks and gates | `playbook list/show/plan/run/status/runs/compact/discard/extract`, `gate list/show/check/resolve/create`, `purge` | [Playbooks](playbooks.md) |
 | Data | `export`, `import`, `batch`, `backup` | [below](#data) |
 | GitHub | `github status/pull/push/sync` | [GitHub Issues sync](github.md) |
@@ -585,7 +586,7 @@ like `config set issue_prefix` (lowercased, a trailing `-` dropped).
 | `--log-format text\|json` | `BD_LOG_FORMAT` | diagnostics format on stderr (default text; filter with `BD_LOG`) |
 | `--timing` | `BD_TIMING=1` | per-command timing on stderr |
 | `--slow-ms MS` | `BD_SLOW_MS` | warn about operations slower than this (default 250) |
-| `--busy-timeout-ms MS` | `BD_BUSY_TIMEOUT_MS` | how long a writer waits for the database write lock, and `bd agents` for a checkout's mutex (default 10000) |
+| `--busy-timeout-ms MS` | `BD_BUSY_TIMEOUT_MS` | how long a writer waits for the database write lock, `bd agents` for a checkout's mutex, and `bd publish` for another publish to the workspace (default 10000) |
 
 ## Environment variables
 
@@ -658,7 +659,7 @@ playbook against the older server fails.
 | 2 | invalid input, a cycle, or a refusal (such as `--force` on a command that has none) |
 | 3 | not found, or no workspace |
 | 4 | claim conflict: already claimed (a live claim, even your own actor's, without its `--token`), not claimable, not ready, another actor's live claim (`--take-over` takes it over), or lease lost |
-| 5 | busy: the database write lock, a checkout's agent mutex or saved credentials stayed locked past `--busy-timeout-ms`; retry |
+| 5 | busy: the database write lock, a checkout's agent mutex, a workspace's publish lock or saved credentials stayed locked past `--busy-timeout-ms`; retry |
 | 6 | event cursor or `--as-of` point older than what retention kept |
 | 7 | access denied (remote): no token, an invalid or expired one, or one that does not allow this; a refused sign-in; a `max_claims` limit |
 | 8 | bd server unreachable, its certificate not trusted, or a server failure: the command did not take effect |

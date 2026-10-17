@@ -193,7 +193,8 @@ commit-ordered; `tx` groups the events of one transaction.
 | other | `commented`, `memory_set`, `memory_deleted`, `config_set`, `config_unset`, `prefix_renamed` and `references_renamed` ([Renaming the prefix](commands.md#renaming-the-prefix)), `imported` (an update with the issue's `previous` snapshot), `pruned` |
 | playbooks and gates | `run_started`, `run_compacted`, `purged`, `gate_armed`, `gate_escalated`, `gate_updated` (the gate's metadata old/new) |
 | GitHub sync | `github_synced`: one per [`bd github`](github.md) run that changed anything, with the repository, direction, counts and the ids pushed, created and linked |
-| agent assets | `agents_changed` (written by `bd serve`; see [Agent assets](agents.md#serving-sets)) |
+| agent assets | `agents_changed` (written by `bd serve`, and by `bd publish`; see [Agent assets](agents.md#serving-sets)) |
+| publishing | `published`: one per [`bd publish`](agents.md#publishing) (and `--rollback`), with the client-reported source commit and dirty flag, each area's counts and each file's SHA-256, the new set revisions, and `rollback` |
 
 ```bash
 bd events -n 20                                # recent events

@@ -5843,3 +5843,164 @@ fn spec_none_runs_in_a_batch() {
     assert_eq!(ws.code_as("tester", &["batch", "-f", script.to_str().unwrap()]), 2);
     assert_eq!(ws.json(&["list", "--all"]).as_array().unwrap().len(), 2);
 }
+
+const PUBLISHED_PLAYBOOK: &str = "description = \"Ship it\"\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n";
+
+fn json_lines(text: &str) -> Vec<Value> {
+    text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+}
+
+/// A publish source in the workspace's `.bd/source`: one playbook and one claude skill.
+fn publish_source(ws: &Ws) -> std::path::PathBuf {
+    let src = ws.dir.path().join(".bd").join("source");
+    std::fs::create_dir_all(src.join("playbooks")).unwrap();
+    std::fs::create_dir_all(src.join("agents/claude/skills/deploy")).unwrap();
+    std::fs::write(src.join("playbooks/ship.toml"), PUBLISHED_PLAYBOOK).unwrap();
+    std::fs::write(src.join("agents/claude/skills/deploy/SKILL.md"), "---\nname: deploy\n---\nRun it.\n").unwrap();
+    git_track(&src);
+    src
+}
+
+/// Make `dir` a git checkout holding its files (in the index), as a publish
+/// source of agent sets must be where the file system keeps no executable
+/// bits or symlinks (Windows): bd publish then takes them from git.
+fn git_track(dir: &Path) {
+    for args in [&["init", "-q"][..], &["add", "-A"]] {
+        let out = std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+#[test]
+fn publish_dry_runs_publishes_and_rolls_back_locally() {
+    let ws = Ws::new();
+    let src = publish_source(&ws);
+    let bd = ws.dir.path().join(".bd");
+
+    let dry = ws.ok(&["publish", "--dry-run"]);
+    assert!(dry.contains("Dry run") && dry.contains("+ playbooks/ship.toml"), "{dry}");
+    assert!(dry.contains("+ agents/claude/skills/deploy/SKILL.md"), "{dry}");
+    assert!(!bd.join("playbooks/ship.toml").exists(), "a dry run writes nothing");
+
+    let out = ws.json(&["publish"]);
+    assert_eq!(out["dry_run"], false);
+    assert_eq!(out["areas"][0]["area"], "playbooks");
+    assert_eq!(out["areas"][0]["added"], 1);
+    assert_eq!(out["agents_changed"].as_array().unwrap().len(), 1);
+    assert_eq!(std::fs::read_to_string(bd.join("playbooks/ship.toml")).unwrap(), PUBLISHED_PLAYBOOK);
+    assert!(ws.ok(&["playbook", "show", "ship"]).starts_with("ship — Ship it"));
+    let manifest = ws.json(&["agents", "manifest", "--harness", "claude"]);
+    let revision = out["revisions"]["claude"]["revision"].as_str().unwrap();
+    assert_eq!(manifest.to_string().matches(revision).count(), 1, "{manifest}");
+    let events = json_lines(&ws.ok(&["--json", "events", "--op", "published"]));
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["actor"], "tester");
+    let text = ws.ok(&["events", "--op", "published"]);
+    assert!(text.contains("tester published -  agents +1 ~0 -0, playbooks +1 ~0 -0"), "{text}");
+    // What a publish keeps in .bd (its lock, publish.prev, staging) is ignored by git.
+    assert!(bd.join("publish.lock").exists() && bd.join("publish.prev").is_dir());
+    let gitignore = std::fs::read_to_string(bd.join(".gitignore")).unwrap();
+    for pattern in ["/publish.lock", "/publish.prev/", "/.publish-*/"] {
+        assert!(gitignore.lines().any(|l| l == pattern), "{pattern}: {gitignore}");
+    }
+    // Anchored: what is named publish.* elsewhere is not ignored.
+    let root = tempfile::tempdir().unwrap();
+    let repo = root.path();
+    std::fs::create_dir_all(repo.join(".bd")).unwrap();
+    std::fs::write(repo.join(".bd/.gitignore"), &gitignore).unwrap();
+    let out = std::process::Command::new("git").arg("-C").arg(repo).args(["init", "-q"]).output().unwrap();
+    assert!(out.status.success());
+    let ignored = |path: &str| {
+        let out =
+            std::process::Command::new("git").arg("-C").arg(repo).args(["check-ignore", "-q", path]).output().unwrap();
+        out.status.code() == Some(0)
+    };
+    for path in [".bd/publish.lock", ".bd/publish.prev/playbooks/x.toml", ".bd/.publish-0123456789abcdef/x"] {
+        assert!(ignored(path), "{path}");
+    }
+    for path in [
+        ".bd/playbooks/publish.toml",
+        ".bd/source/playbooks/publish.toml",
+        ".bd/source/agents/claude/skills/deploy/publish.sh",
+        ".bd/agents/claude/skills/deploy/publish.sh",
+    ] {
+        assert!(!ignored(path), "{path}");
+    }
+
+    // A changed file: the dry run shows its diff.
+    std::fs::write(src.join("playbooks/ship.toml"), format!("{PUBLISHED_PLAYBOOK}# v2\n")).unwrap();
+    let dry = ws.ok(&["publish", "--dry-run"]);
+    assert!(dry.contains("~ playbooks/ship.toml") && dry.contains("+# v2"), "{dry}");
+    let json = ws.json(&["publish", "--dry-run"]);
+    let file = &json["areas"][0]["files"][0];
+    assert_eq!((&file["status"], file["diff"].as_str().unwrap().contains("+# v2")), (&"changed".into(), true));
+    ws.ok(&["publish"]);
+    assert!(std::fs::read_to_string(bd.join("playbooks/ship.toml")).unwrap().ends_with("# v2\n"));
+
+    // Rolled back, twice: back and forth.
+    let back = ws.ok(&["publish", "--rollback"]);
+    assert!(back.contains("Rolled back"), "{back}");
+    assert_eq!(std::fs::read_to_string(bd.join("playbooks/ship.toml")).unwrap(), PUBLISHED_PLAYBOOK);
+    ws.ok(&["publish", "--rollback"]);
+    assert!(std::fs::read_to_string(bd.join("playbooks/ship.toml")).unwrap().ends_with("# v2\n"));
+    let events = json_lines(&ws.ok(&["--json", "events", "--op", "published"]));
+    let rollbacks: Vec<bool> = events.iter().map(|e| e["data"]["rollback"] == true).collect();
+    assert_eq!(rollbacks, [false, false, true, true]);
+}
+
+#[test]
+fn publish_refusals_change_nothing() {
+    let ws = Ws::new();
+    let src = publish_source(&ws);
+    let bd = ws.dir.path().join(".bd");
+    let refused = |args: &[&str]| {
+        let out = ws.run_as("tester", args);
+        (out.status.code().unwrap(), String::from_utf8_lossy(&out.stderr).into_owned())
+    };
+    // Nothing kept yet to roll back to.
+    let (code, err) = refused(&["publish", "--rollback"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("nothing to roll back"), "{err}");
+
+    // A playbook that does not validate, or reaches outside the tree.
+    std::fs::write(src.join("playbooks/bad.toml"), "[[steps]]\nid = \"a\"\nbogus = 1\n").unwrap();
+    let (code, err) = refused(&["publish"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("playbooks/bad.toml"), "{err}");
+    std::fs::write(src.join("playbooks/bad.toml"), format!("extends = [\"../../bd.db\"]\n{PUBLISHED_PLAYBOOK}"))
+        .unwrap();
+    let (code, err) = refused(&["publish"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("playbooks/bad.toml") && err.contains("outside"), "{err}");
+    std::fs::remove_file(src.join("playbooks/bad.toml")).unwrap();
+    // A skill without its SKILL.md.
+    std::fs::create_dir_all(src.join("agents/claude/skills/empty")).unwrap();
+    std::fs::write(src.join("agents/claude/skills/empty/notes.md"), "x").unwrap();
+    git_track(&src);
+    let (code, err) = refused(&["publish"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("agents/claude/skills/empty: no SKILL.md"), "{err}");
+    std::fs::remove_dir_all(src.join("agents/claude/skills/empty")).unwrap();
+    // An empty area, unless asked for or left out.
+    std::fs::remove_dir_all(src.join("agents")).unwrap();
+    let (code, err) = refused(&["publish"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("has no agents"), "{err}");
+    assert!(!bd.join("playbooks").exists(), "nothing published");
+    ws.ok(&["publish", "--only", "playbooks"]);
+    assert!(bd.join("playbooks/ship.toml").exists());
+    // No source at all.
+    let (code, err) = refused(&["publish", "--from", "nowhere"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("no publish source here"), "{err}");
+    // The hidden bundle flag reads a file locally, checked like a client's.
+    std::fs::write(
+        ws.dir.path().join("evil.json"),
+        r#"{"version":1,"areas":["playbooks"],"playbooks":{"../x.toml":"x"}}"#,
+    )
+    .unwrap();
+    let (code, err) = refused(&["--publish-bundle", "evil.json", "publish"]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("'..'"), "{err}");
+    assert!(!ws.dir.path().join(".bd/x.toml").exists());
+}

@@ -99,6 +99,19 @@
 //! approval ([`hook`]). `bd agents watch` pulls each time the workspace's
 //! sets change, until interrupted, printing each pull's report ([`watch`]).
 //!
+//! # Playbooks
+//!
+//! In a remote workspace these commands also cover the server's playbooks
+//! ([`approved`]): harness-independent, so included whatever `--harness`
+//! names, and worked on alone when no harness is known. `manifest
+//! --playbooks` and `fetch --playbooks` serve them; `status` and `pull`
+//! report those waiting for approval (and apply removals and restores of
+//! the bytes approved), and `approve` asks about each, keeping those
+//! approved in `.bd/approved/playbooks`. Their JSON reports add a
+//! `playbooks` object ([`approved::PlaybooksReport`],
+//! [`approve::PlaybooksSummary`]), left out where the server does not
+//! serve playbooks for approval and in a local workspace.
+//!
 //! # Output
 //!
 //! Text output has a line per finding and harness (`claude: skills updated:
@@ -236,6 +249,7 @@
 //! and other failures are reported and tried again.
 
 pub mod approve;
+pub mod approved;
 pub mod checkout;
 pub mod hook;
 pub mod lock;
@@ -249,7 +263,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use bd_core::agents::{AGENTS_DIR, AgentSet, Harness, Manifest};
+use bd_core::agents::{AGENTS_DIR, AgentSet, Harness, Manifest, PLAYBOOKS_DIR, PlaybookSet, PlaybooksManifest};
 use bd_core::{Error, Result};
 
 use crate::actor;
@@ -295,8 +309,21 @@ pub fn client_command(app: &App, remote: &Remote, cmd: &AgentsCommand) -> Result
     }
 }
 
-/// With `--json`, `{"<harness>": <Manifest>, ...}` for each harness asked for.
+/// The workspace's playbook directory, next to its database.
+pub fn playbooks_dir(app: &App) -> Result<PathBuf> {
+    let db = app.db_path()?;
+    Ok(db.parent().map_or_else(|| PathBuf::from(PLAYBOOKS_DIR), |d| d.join(PLAYBOOKS_DIR)))
+}
+
+/// With `--json`, `{"<harness>": <Manifest>, ...}` for each harness asked
+/// for; with `--playbooks`, the [`PlaybooksManifest`] instead.
 fn cmd_manifest(app: &mut App, a: &AgentsManifestArgs) -> Result<()> {
+    if a.playbooks {
+        let m = PlaybookSet::load(&playbooks_dir(app)?)?.manifest();
+        let lines = playbooks_manifest_lines(&m);
+        app.print(Out::new(&m).id(format!("playbooks {}", m.revision)).lines(lines));
+        return Ok(());
+    }
     let dir = agents_dir(app)?;
     let harnesses = if a.harnesses.is_empty() { Harness::ALL.to_vec() } else { a.harnesses.clone() };
     let mut manifests = BTreeMap::new();
@@ -329,10 +356,26 @@ fn manifest_lines(m: &Manifest) -> Vec<String> {
     lines
 }
 
-/// Always JSON, on one line: an [`AgentSet`].
+fn playbooks_manifest_lines(m: &PlaybooksManifest) -> Vec<String> {
+    if m.files.is_empty() {
+        return vec!["playbooks: nothing served".into()];
+    }
+    let revision = m.revision.get(..12).unwrap_or(&m.revision);
+    let mut lines = vec![format!(
+        "playbooks: revision {revision} (clients of a remote workspace use them once approved with `bd agents \
+         approve`)"
+    )];
+    lines.extend(m.files.keys().map(|path| format!("  playbook {path}")));
+    lines
+}
+
+/// Always JSON, on one line: an [`AgentSet`], or with `--playbooks` a [`PlaybookSet`].
 fn cmd_fetch(app: &mut App, a: &AgentsFetchArgs) -> Result<()> {
-    let set = AgentSet::load(&agents_dir(app)?, a.harness)?;
-    io::outln(serde_json::to_string(&set)?);
+    let text = match a.harness {
+        Some(h) if !a.playbooks => serde_json::to_string(&AgentSet::load(&agents_dir(app)?, h)?)?,
+        _ => serde_json::to_string(&PlaybookSet::load(&playbooks_dir(app)?)?)?,
+    };
+    io::outln(text);
     Ok(())
 }
 
@@ -346,9 +389,10 @@ fn cmd_sync(
 ) -> Result<()> {
     io::require_local(if apply { "bd agents pull" } else { "bd agents status" })?;
     let checkout = find_checkout(app, remote.is_some())?;
-    let harnesses = harnesses(requested, &checkout)?;
+    let harnesses = harnesses_for(requested, &checkout, remote.is_some())?;
     let opts = Options { apply, force, review: false, lock_wait: Duration::from_millis(app.g.busy_timeout_ms) };
     let mut report = sync_checkout(app, remote, &checkout, &harnesses, opts)?;
+    report.playbooks = playbooks_report(app, remote, &checkout, opts)?;
     if hook {
         let _mutex = match apply {
             true => Some(checkout.exclusive(opts.lock_wait)?),
@@ -375,6 +419,15 @@ pub fn sync_checkout(
     harnesses: &[Harness],
     opts: Options,
 ) -> Result<Report> {
+    if harnesses.is_empty() {
+        // A remote workspace's playbooks alone (see `harnesses_for`).
+        return Ok(Report {
+            applied: opts.apply,
+            checkout: checkout.root.clone(),
+            harnesses: BTreeMap::new(),
+            playbooks: None,
+        });
+    }
     match remote {
         Some(remote) => sync::run(checkout, &mut RemoteSource { app, remote }, harnesses, opts),
         None => {
@@ -382,6 +435,49 @@ pub fn sync_checkout(
             sync::run(checkout, &mut source, harnesses, opts)
         }
     }
+}
+
+/// Compare the playbooks approved in `checkout` with those the server of a
+/// `remote` workspace serves and, with `opts.apply`, make the changes that
+/// need no approval ([`approved::run`]; with `opts.review`, fetching them
+/// whole when some wait for approval). `None` in a local workspace, whose
+/// playbooks are the user's own, and when the server does not serve them.
+pub fn sync_playbooks(
+    app: &App,
+    remote: Option<&Remote>,
+    checkout: &Checkout,
+    opts: Options,
+) -> Result<Option<approved::Outcome>> {
+    let Some(remote) = remote else { return Ok(None) };
+    approved::run(checkout, &mut RemoteSource { app, remote }, opts.apply, opts.review, opts.lock_wait)
+}
+
+/// [`sync_playbooks`], with the server's refusal to serve its playbooks (it
+/// cannot load them) apart, as `Ok(Err(refusal))` ([`approved::run_or_refusal`]):
+/// that keeps no skill or MCP definition from being worked on. Every other
+/// failure is an error with its exit code.
+pub fn sync_playbooks_or_refusal(
+    app: &App,
+    remote: Option<&Remote>,
+    checkout: &Checkout,
+    opts: Options,
+) -> Result<std::result::Result<Option<approved::Outcome>, Error>> {
+    let Some(remote) = remote else { return Ok(Ok(None)) };
+    approved::run_or_refusal(checkout, &mut RemoteSource { app, remote }, opts.apply, opts.review, opts.lock_wait)
+}
+
+/// The playbooks' report for `status`, `pull` and `watch`: the server's
+/// refusal to serve them is reported ([`approved::PlaybooksReport::failed`]).
+pub fn playbooks_report(
+    app: &App,
+    remote: Option<&Remote>,
+    checkout: &Checkout,
+    opts: Options,
+) -> Result<Option<approved::PlaybooksReport>> {
+    Ok(match sync_playbooks_or_refusal(app, remote, checkout, opts)? {
+        Ok(outcome) => outcome.map(|o| o.report),
+        Err(refusal) => Some(approved::PlaybooksReport::failed(&refusal)),
+    })
 }
 
 /// The checkout `status` and `pull` work on: in a `remote` workspace, the
@@ -411,6 +507,15 @@ pub fn find_checkout(app: &App, remote: bool) -> Result<Checkout> {
         }
     };
     Ok(Checkout::new(bd))
+}
+
+/// [`harnesses`], except that in a `remote` workspace none is not an error:
+/// the server's playbooks, which every harness shares, are then worked on alone.
+pub fn harnesses_for(requested: &[Harness], checkout: &Checkout, remote: bool) -> Result<Vec<Harness>> {
+    if remote && requested.is_empty() && session_harnesses().is_empty() && checkout.read_lock()?.harnesses.is_empty() {
+        return Ok(Vec::new());
+    }
+    harnesses(requested, checkout)
 }
 
 /// The harnesses to work on: those asked for; else the running agent
@@ -491,6 +596,31 @@ impl RemoteSource<'_> {
     }
 }
 
+impl approved::Source for RemoteSource<'_> {
+    fn playbooks_manifest(&mut self) -> Result<Option<bd_core::agents::PlaybooksManifest>> {
+        let argv = ["--json", "agents", "manifest", "--playbooks"];
+        let response = playbooks::server_read(self.app, self.remote, argv.iter().map(|a| a.to_string()).collect())?;
+        if response.exit_code != 0 {
+            // A server that predates serving its playbooks for approval refuses the flag.
+            if response.exit_code == 2 && response.stderr.contains("--playbooks") {
+                return Ok(None);
+            }
+            return Err(remote::response_error(&response, &self.remote.url));
+        }
+        let m: bd_core::agents::PlaybooksManifest =
+            serde_json::from_str(&response.stdout).map_err(|e| self.unusable("playbooks manifest", &e))?;
+        m.check().map_err(|e| self.unusable("playbooks manifest", &e))?;
+        Ok(Some(m))
+    }
+
+    fn playbooks(&mut self) -> Result<PlaybookSet> {
+        let stdout = self.read(&["agents", "fetch", "--playbooks"])?;
+        let set: PlaybookSet = serde_json::from_str(&stdout).map_err(|e| self.unusable("playbooks", &e))?;
+        set.check().map_err(|e| self.unusable("playbooks", &e))?;
+        Ok(set)
+    }
+}
+
 impl Source for RemoteSource<'_> {
     fn manifests(&mut self, harnesses: &[Harness]) -> Result<BTreeMap<Harness, Manifest>> {
         let list = harnesses.iter().map(|h| h.name()).collect::<Vec<_>>().join(",");
@@ -525,11 +655,18 @@ impl Source for RemoteSource<'_> {
     }
 }
 
-/// What `status` and `pull` print: a line per finding and harness.
+/// What `status` and `pull` print: a line per finding and harness, then the playbooks'.
 fn render(report: &Report) -> Out {
     let mut out = Out::new(report);
     for (h, r) in &report.harnesses {
         out = out.lines(harness_lines(*h, r, report.applied));
+    }
+    if let Some(p) = &report.playbooks {
+        let mut lines = approved::lines(p, report.applied);
+        if lines.is_empty() && report.harnesses.is_empty() {
+            lines.push("playbooks: nothing served".into());
+        }
+        out = out.lines(lines);
     }
     out
 }

@@ -54,4 +54,4 @@ When `bd prime` shows a "Feature specs" section, the workspace keeps feature spe
 
 - Use `--json` when parsing output.
 - Close an issue only when its work is actually done.
-- Never approve skill or MCP changes (`bd agents approve`) or copy skill files around approval: ask the user to review and approve them.
+- Never approve skill, MCP or playbook changes (`bd agents approve`) or copy skill or playbook files around approval (`.bd/approved/` is bd's): ask the user to review and approve them. In a remote workspace a server's playbook is found only once approved on this machine.

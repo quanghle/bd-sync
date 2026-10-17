@@ -59,7 +59,8 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     let specs = app.read(spec_state)?;
     let shown_memories: Vec<&bd_core::Memory> =
         if a.max_memories > 0 { memories.iter().take(a.max_memories).collect() } else { memories.iter().collect() };
-    let playbooks = crate::playbooks::for_prime(app, app.g.client_playbooks.as_deref());
+    let crate::playbooks::ForPrime { playbooks, pending: pending_playbooks } =
+        crate::playbooks::for_prime(app, app.g.client_playbooks.as_deref());
     let shown_playbooks =
         &playbooks[..if a.max_playbooks > 0 { a.max_playbooks.min(playbooks.len()) } else { playbooks.len() }];
     if app.g.json && a.hook.is_none() {
@@ -83,6 +84,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             "memories": shown_memories,
             "playbooks": shown_playbooks,
             "playbooks_total": playbooks.len(),
+            "playbooks_pending": pending_playbooks,
             "experimental": experimental.iter().map(|(name, about)| json!({ "name": name, "description": about })).collect::<Vec<_>>(),
             "specs": specs.json(),
         }));
@@ -179,7 +181,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             ));
         }
     }
-    if !playbooks.is_empty() {
+    if !playbooks.is_empty() || !pending_playbooks.is_empty() {
         o.push(String::new());
         let shown = if shown_playbooks.len() < playbooks.len() {
             format!("showing {} of {}", shown_playbooks.len(), playbooks.len())
@@ -202,12 +204,22 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             line.push_str(match p.location {
                 crate::playbooks::Location::Checkout => "",
                 crate::playbooks::Location::Server => " (on the server)",
+                crate::playbooks::Location::Approved => " (the server's, approved here)",
                 crate::playbooks::Location::User => " (user's own)",
             });
             o.push(line);
         }
         if shown_playbooks.len() < playbooks.len() {
             o.push(format!("- … {} more: `bd playbook list`", playbooks.len() - shown_playbooks.len()));
+        }
+        if !pending_playbooks.is_empty() {
+            // Paths the client sent, checked as playbook paths; escaped all the same.
+            o.push(crate::agents::show::printable(&format!(
+                "Waiting for approval on this machine: {}. The server's playbooks are used here only once a person \
+                 approves them (a changed one keeps its approved version meanwhile): ask the user to review them and \
+                 run `bd agents approve` in a separate terminal.",
+                crate::agents::approved::pending_list(&pending_playbooks)
+            )));
         }
     }
     if !memories.is_empty() {

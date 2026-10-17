@@ -34,19 +34,24 @@ List the skills and MCP entries the workspace serves to each harness
 
 Shows, for each harness, the skills (a SHA-256 per file), the MCP server
 entries (a SHA-256 per entry) and a revision, checking .bd/agents/<harness>
-strictly. Changes nothing.";
+strictly. With --playbooks, the playbook files under .bd/playbooks instead
+(a SHA-256 per file), which clients of a remote workspace use only once
+approved (`bd agents approve`). Changes nothing.";
 
 const AGENTS_MANIFEST_HELP: &str = "\
 Examples:
   bd agents manifest
-  bd agents manifest --harness claude --json";
+  bd agents manifest --harness claude --json
+  bd agents manifest --playbooks";
 
 const AGENTS_STATUS_LONG_ABOUT: &str = "\
 Compare this checkout's agent skills and MCP entries with the workspace's
 
 Compares with the workspace's sets (the server's in a remote workspace) and
 reports what a pull would add, update or remove, skills and MCP changes
-waiting for approval, local edits and conflicts. Changes nothing.";
+waiting for approval, local edits and conflicts. In a remote workspace, also
+the server's playbooks: new or changed ones waiting for approval, and
+approved ones the server removed. Changes nothing.";
 
 const AGENTS_PULL_LONG_ABOUT: &str = "\
 Bring this checkout's agent skills and MCP entries up to date
@@ -58,14 +63,17 @@ restored as approved; new or changed skills and MCP definitions wait for `bd
 agents approve`. Never overwrites or deletes what bd did not write, or local
 edits (without --force). Also adds the harness's session-start hook (bd hook
 session-start, then bd prime) where none is configured:
-.claude/settings.local.json, .codex/hooks.json, .github/hooks/bd.json.";
+.claude/settings.local.json, .codex/hooks.json, .github/hooks/bd.json. In a
+remote workspace, approved playbooks the server removed are removed from
+.bd/approved/playbooks, and new or changed ones wait for `bd agents approve`.";
 
 macro_rules! agents_sync_help {
     () => {
         "\
 Harnesses: --harness, else the running agent session's
 ($CLAUDE_CODE_SESSION_ID, $COPILOT_AGENT_SESSION_ID, $CODEX_THREAD_ID), else
-those .bd/agents.lock records.
+those .bd/agents.lock records. The server's playbooks are harness-independent
+and always included in a remote workspace (with no harness, they alone).
 
 Exit codes: 0 done (MCP changes waiting for approval, conflicts and local edits
 are reported, not failures); 2 no harness, no checkout or an unusable
@@ -101,19 +109,27 @@ files whole and its changed ones as a diff; what a definition runs or connects
 to, the environment variables it reads, what changed) and asks y/N, then
 writes those approved into the harness's skills directory (.claude/skills,
 .agents/skills, .github/skills) or MCP file (.mcp.json, .github/mcp.json,
-.codex/config.toml) and .bd/agents.lock. Runs only in a terminal, outside
-agent sessions.";
+.codex/config.toml) and .bd/agents.lock. In a remote workspace it also shows
+each of the server's playbooks waiting for approval (new ones whole, changed
+ones as a diff against the version approved before) and keeps those approved
+in .bd/approved/playbooks, which playbook commands send to the server to run:
+a server playbook is used on this machine only once approved here. Runs only
+in a terminal, outside agent sessions.";
 
 const AGENTS_APPROVE_HELP: &str = "\
-Harnesses: --harness, else those .bd/agents.lock records. Refused inside an
+Harnesses: --harness, else those .bd/agents.lock records. In a remote
+workspace the server's playbooks are always included, whatever --harness
+(with no harness, they alone); name one by its path (change.toml) or name
+(change) to approve only it. Refused inside an
 agent session ($CLAUDE_CODE_SESSION_ID, $COPILOT_AGENT_SESSION_ID,
 $CODEX_THREAD_ID or $CODEX_SESSION_ID set), and when there is something to ask
 about but stdin is not a terminal, with no way around either: run it in a
 separate terminal. Files and entries bd did not write (conflicts) are never
 replaced.
 
-Exit codes: 0 done (declined skills and entries stay pending); 2 refused, no
-harness, a name not served, no checkout or an unusable .bd/agents.lock; 3 no
+Exit codes: 0 done (declined skills, entries and playbooks stay pending); 2
+refused, no harness, a name not served, no checkout or an unusable
+.bd/agents.lock; 3 no
 workspace; 5 another bd process is changing this checkout's agent assets; 7
 access denied; 8 server unreachable, or its answer failed its checks (nothing
 was written).
@@ -126,8 +142,8 @@ const AGENTS_WATCH_LONG_ABOUT: &str = "\
 Keep pulling agent assets as the workspace's sets change
 
 Pulls each change to the workspace's sets as `bd agents pull` would (removals
-applied, new or changed skills and MCP definitions left for `bd agents
-approve`) and reports it, until interrupted. A remote workspace's server says
+applied, new or changed skills, MCP definitions and server playbooks left for
+`bd agents approve`) and reports it, until interrupted. A remote workspace's server says
 when its sets change (bd serve --agents-every), and its sets are compared with
 those pulled after each wait for that ends with no change; a local
 workspace's .bd/agents is checked every --interval.";
@@ -174,7 +190,8 @@ fn parse_watch_interval(s: &str) -> Result<Duration, String> {
 
 #[derive(Args, Debug, Clone)]
 pub struct AgentsApproveArgs {
-    /// Only these skills and MCP servers (default: every one waiting for approval)
+    /// Only these skills, MCP servers and playbooks (a playbook by its path or name; default: every one waiting for
+    /// approval)
     pub names: Vec<String>,
     /// Harnesses to approve for (repeatable or comma separated; default: those in .bd/agents.lock)
     #[arg(long = "harness", value_delimiter = ',', value_parser = harness_parser())]
@@ -190,6 +207,9 @@ pub struct AgentsManifestArgs {
     /// Only these harnesses (repeatable or comma separated; default: all)
     #[arg(long = "harness", value_delimiter = ',', value_parser = harness_parser())]
     pub harnesses: Vec<Harness>,
+    /// The workspace's playbooks (.bd/playbooks) instead of the harnesses' sets
+    #[arg(long, conflicts_with = "harnesses")]
+    pub playbooks: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -221,6 +241,9 @@ pub struct AgentsPullArgs {
 
 #[derive(Args, Debug, Clone)]
 pub struct AgentsFetchArgs {
-    #[arg(long, value_parser = harness_parser())]
-    pub harness: Harness,
+    #[arg(long, value_parser = harness_parser(), required_unless_present = "playbooks")]
+    pub harness: Option<Harness>,
+    /// The workspace's playbooks (.bd/playbooks), whole
+    #[arg(long, conflicts_with = "harness")]
+    pub playbooks: bool,
 }

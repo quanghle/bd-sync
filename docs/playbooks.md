@@ -149,15 +149,31 @@ By name, in this order:
    `%APPDATA%\bd\playbooks` on Windows)
 
 A file path works too. In a remote workspace, the checkout's playbooks come
-first, then the server's, then your own
-([What runs where](remote.md#what-runs-where)).
+first, then the server's that a person approved on this machine (kept in
+`.bd/approved/playbooks`), then your own
+([What runs where](remote.md#what-runs-where)). The server's playbooks are
+used only once approved here with `bd agents approve`, and then exactly as
+approved: a change on the server waits for approval while the version
+approved stays in use, and a playbook never approved is not found
+([Approving the server's playbooks](agents.md#approving-the-servers-playbooks)).
+
+A workspace's `.bd/playbooks/` is best kept by [`bd publish`](agents.md#publishing)
+from a source directory in the repository (`.bd/source/playbooks/`,
+subdirectories allowed): it validates every playbook, with its `extends`
+and `expand`, before replacing the directory, which then mirrors the
+source. A server loads its own playbooks held to their directories: a
+reference that leads outside them (`../`, an absolute path, a symlink out)
+is refused, as is a file over 512 KiB.
 
 `bd prime` lists the playbooks in that order, each name once: its name, the
 first line of its description (cut at 100 characters), where it lives when
-not in the checkout, and a flag on one that does not load. It lists 10
-(`--max-playbooks N`, `0` for all); `bd prime --json` has them under
-`playbooks` (`name`, `description`, `location`: `checkout`, `server` or
-`user`, `invalid`) with their count in `playbooks_total`.
+not in the checkout, and a flag on one that does not load; in a remote
+workspace it also names the server's playbooks waiting for approval here.
+It lists 10 (`--max-playbooks N`, `0` for all); `bd prime --json` has them
+under `playbooks` (`name`, `description`, `location`: `checkout`,
+`approved`, `user`, or `server` for a client that predates approvals,
+`invalid`) with their count in `playbooks_total`, and those waiting in
+`playbooks_pending` (`path`, `change`).
 
 ### Bootstrapping feature specs
 

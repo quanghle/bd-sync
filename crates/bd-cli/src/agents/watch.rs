@@ -45,9 +45,10 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use bd_core::agents::{AGENTS_CHANGED, AgentSet, AgentsChanged, Harness};
+use bd_core::agents::{AGENTS_CHANGED, AgentSet, AgentsChanged, Harness, PlaybooksChanged};
 use bd_core::{Error, Event, Result};
 
+use super::approved::Source as _;
 use super::checkout::Checkout;
 use super::show;
 use super::sync::{Options, Source};
@@ -64,7 +65,7 @@ const MAX_PAUSE: Duration = Duration::from_secs(30);
 pub fn cmd_watch(app: &App, remote: Option<&Remote>, a: &AgentsWatchArgs) -> Result<()> {
     io::require_local("bd agents watch")?;
     let checkout = super::find_checkout(app, remote.is_some())?;
-    let harnesses = super::harnesses(&a.harnesses, &checkout)?;
+    let harnesses = super::harnesses_for(&a.harnesses, &checkout, remote.is_some())?;
     let pulling = interrupt::on_interrupt()?;
     let mut watch = Watch {
         app,
@@ -73,6 +74,7 @@ pub fn cmd_watch(app: &App, remote: Option<&Remote>, a: &AgentsWatchArgs) -> Res
         harnesses,
         interval: a.interval,
         pulled: BTreeMap::new(),
+        pulled_playbooks: None,
         pulling,
         failing: None,
         pause: FIRST_PAUSE,
@@ -91,6 +93,8 @@ struct Watch<'a> {
     interval: Duration,
     /// The revision of each harness's set the last pull found.
     pulled: BTreeMap<Harness, String>,
+    /// The revision of a remote workspace's playbooks the last pull found.
+    pulled_playbooks: Option<String>,
     /// Held while a pull runs, so an interrupt waits for it.
     pulling: Arc<Mutex<()>>,
     /// The kind of failure reported last, while failures last.
@@ -170,22 +174,38 @@ impl Watch<'_> {
         }
     }
 
-    /// Whether `events` change a watched harness's set to a revision not pulled yet.
+    /// Whether `events` change a watched harness's set, or the playbooks, to
+    /// a revision not pulled yet.
     fn news(&self, events: &[Event]) -> bool {
-        let mut latest = BTreeMap::new();
+        let (mut latest, mut playbooks) = (BTreeMap::new(), None);
         for e in events {
             if let Ok(c) = serde_json::from_value::<AgentsChanged>(e.data.clone()) {
                 latest.insert(c.harness, c.revision);
+            } else if let Ok(c) = serde_json::from_value::<PlaybooksChanged>(e.data.clone()) {
+                playbooks = Some(c.revision);
             }
         }
         latest.iter().any(|(h, revision)| self.harnesses.contains(h) && self.pulled.get(h) != Some(revision))
+            || playbooks.is_some_and(|r| self.pulled_playbooks.as_ref() != Some(&r))
     }
 
-    /// Whether a watched set's revision on the server differs from the one
-    /// last pulled: one read of the manifests.
+    /// Whether a watched set's revision, or the playbooks', on the server
+    /// differs from the one last pulled: one read of the manifests.
     fn behind(&self, remote: &Remote) -> Result<bool> {
-        let manifests = super::RemoteSource { app: self.app, remote }.manifests(&self.harnesses)?;
-        Ok(manifests.iter().any(|(h, m)| self.pulled.get(h) != Some(&m.revision)))
+        let mut source = super::RemoteSource { app: self.app, remote };
+        if !self.harnesses.is_empty() {
+            let manifests = source.manifests(&self.harnesses)?;
+            if manifests.iter().any(|(h, m)| self.pulled.get(h) != Some(&m.revision)) {
+                return Ok(true);
+            }
+        }
+        // Playbooks the server refuses to serve keep no watched set from being pulled (each pull reports them).
+        let playbooks = match source.playbooks_manifest() {
+            Ok(m) => m.map(|m| m.revision),
+            Err(e) if e.exit_code() == 2 && !self.harnesses.is_empty() => None,
+            Err(e) => return Err(e),
+        };
+        Ok(playbooks.is_some() && playbooks != self.pulled_playbooks)
     }
 
     /// Read the workspace's own sets every interval, pulling when one changed.
@@ -218,13 +238,16 @@ impl Watch<'_> {
             review: false,
             lock_wait: Duration::from_millis(self.app.g.busy_timeout_ms),
         };
-        let report = super::sync_checkout(self.app, self.remote, &self.checkout, &self.harnesses, opts)?;
+        let mut report = super::sync_checkout(self.app, self.remote, &self.checkout, &self.harnesses, opts)?;
+        report.playbooks = super::playbooks_report(self.app, self.remote, &self.checkout, opts)?;
         if self.app.g.json {
             io::outln(serde_json::to_string(&report)?);
         } else {
             self.app.print(super::render(&report));
         }
         self.pulled = report.harnesses.iter().map(|(h, r)| (*h, r.server_revision.clone())).collect();
+        self.pulled_playbooks =
+            report.playbooks.as_ref().filter(|p| p.error.is_none()).map(|p| p.server_revision.clone());
         Ok(())
     }
 

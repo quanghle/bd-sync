@@ -157,6 +157,44 @@ approved: a change on the server waits for approval while the version
 approved stays in use, and a playbook never approved is not found
 ([Approving the server's playbooks](agents.md#approving-the-servers-playbooks)).
 
+A remote workspace can make the server's playbooks the only source:
+`bd config set playbooks.source server` (default `checkout`; an admin's
+setting through `bd serve`). Its clients then ignore the checkout's
+`.bd/playbooks/`: `bd playbook show/plan/run <name>` looks every name up,
+the one on the command line and those its playbooks `extends` or `expand`
+by name, among the server's playbooks approved on this machine, then in
+your own paths (2 and 3 above) only for a name the server does not serve.
+A name the server serves but this machine has not approved is not found
+(exit 3, saying how to approve it), even when your own paths have a copy;
+names compare ignoring case (`CHANGE` is `change.toml`). Each checkout copy
+skipped gets one warning on stderr naming it (the exit code is unchanged).
+`bd playbook list` lists the checkout's last, marked `(ignored:
+playbooks.source = server)` (`"ignored": true` in JSON), shadowing nothing,
+and marks your own of a name the server serves and this machine has not
+approved `(waiting for approval: the bd server serves this name)`
+(`"unavailable": true`); `bd prime` leaves both out, and says how many
+checkout playbooks are ignored and that [`bd publish`](agents.md#publishing)
+brings them to the server. A file path on the command line (`bd playbook
+run ./x.toml`) still works as before, to try a playbook before publishing
+it.
+
+The client asks the server's setting (one `config get`) only when the
+answer matters: `show`/`plan`/`run` when some name resolves outside the
+approved playbooks (in the checkout or your own paths), never for one
+made only of approved playbooks; `list` when the checkout holds playbooks
+or one of your own has a name the server serves unapproved, and then its
+JSON has the answer as `"source"` at the top (absent when it did not ask).
+That read fails open: a server that predates the setting, a failed read
+or an answer other than exactly `server` counts as `checkout`. In server
+mode, telling whether the server serves a name takes its playbook list
+(`bd agents manifest --playbooks`), read only when some name resolves on
+your own paths; that read fails closed: if it fails, the command stops
+saying the server's list could not be read, rather than take a name it
+may serve from elsewhere. It is a policy for bd clients, not a security
+boundary: the server runs what a client sends. In a local workspace the
+setting changes nothing (its `bd playbook list --json` shows it as
+`"source"`).
+
 A workspace's `.bd/playbooks/` is best kept by [`bd publish`](agents.md#publishing)
 from a source directory in the repository (`.bd/source/playbooks/`,
 subdirectories allowed): it validates every playbook, with its `extends`
@@ -172,8 +210,9 @@ workspace it also names the server's playbooks waiting for approval here.
 It lists 10 (`--max-playbooks N`, `0` for all); `bd prime --json` has them
 under `playbooks` (`name`, `description`, `location`: `checkout`,
 `approved`, `user`, or `server` for a client that predates approvals,
-`invalid`) with their count in `playbooks_total`, and those waiting in
-`playbooks_pending` (`path`, `change`).
+`invalid`) with their count in `playbooks_total`, those waiting in
+`playbooks_pending` (`path`, `change`), and the checkout's ignored with
+`playbooks.source = server` counted in `playbooks_ignored`.
 
 ### Bootstrapping feature specs
 

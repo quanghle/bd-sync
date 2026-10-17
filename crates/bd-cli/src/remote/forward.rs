@@ -106,7 +106,7 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
         ..Default::default()
     };
     attach_inputs(&cli.command, &mut request)?;
-    playbooks::attach_bundle(app, &cli.command, &mut request)?;
+    playbooks::attach_bundle(app, remote, &cli.command, &mut request)?;
     playbooks::attach_listing(app, &cli.command, &mut request);
     crate::publish::attach_bundle(app, &cli.command, &mut request)?;
     check_outputs(app, &cli.command)?;

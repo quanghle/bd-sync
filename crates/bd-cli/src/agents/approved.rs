@@ -11,7 +11,8 @@
 //! look a name up there after the checkout's own `.bd/playbooks`, and send
 //! what they load to the server as a bundle, checked against the lock first
 //! ([`verify_bundle`]), so the server compiles exactly the bytes approved
-//! here, never its own copy. Until a change is approved, the version
+//! here, never its own copy (with the workspace's `playbooks.source =
+//! server`, the checkout's own are skipped: [`crate::playbooks`]). Until a change is approved, the version
 //! approved before stays in use; a playbook never approved is unavailable.
 //!
 //! `status`, `pull`, `bd agents watch` and the session-start hook only

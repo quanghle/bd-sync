@@ -1334,6 +1334,272 @@ fn server_playbooks_are_used_once_approved_on_the_client() {
 }
 
 #[test]
+fn playbooks_source_server_makes_the_servers_approved_playbooks_the_only_source() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let on_server = server.root.path().join("proj").join(".bd").join("playbooks");
+    write(&on_server, "change.toml", "description = \"server change\"\n[[steps]]\nid = \"approved\"\n");
+    write(&on_server, "extra.toml", "description = \"server extra\"\n[[steps]]\nid = \"served\"\n");
+    let checkout = alice.dir.path().join(".bd").join("playbooks");
+    write(&checkout, "change.toml", "description = \"checkout change\"\n[[steps]]\nid = \"local\"\n");
+    write(&checkout, "solo.toml", "description = \"checkout only\"\n[[steps]]\nid = \"solo\"\n");
+    let users = alice.dir.path().join(".xdg").join("bd").join("playbooks");
+    write(&users, "mine.toml", "description = \"Tidy up\"\n[[steps]]\nid = \"mine\"\n");
+    write(&users, "extra.toml", "description = \"user extra\"\n[[steps]]\nid = \"users\"\n");
+    approve_playbooks(&alice, &on_server, &["change.toml"]);
+    let approved = alice.dir.path().join(".bd").join("approved").join("playbooks");
+
+    let steps = |plan: &Value| -> Vec<String> {
+        plan["plan"]["issues"].as_array().unwrap().iter().map(|i| i["key"].as_str().unwrap().to_string()).collect()
+    };
+    let plan = |name: &str| -> (Option<i32>, Option<Vec<String>>, String) {
+        let out = alice.run(&["--json", "playbook", "plan", name]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let plan = serde_json::from_slice::<Value>(&out.stdout).ok().map(|v| steps(&v));
+        (out.status.code(), plan, stderr)
+    };
+    let section = |text: &str| -> Vec<String> {
+        text.lines()
+            .skip_while(|l| !l.starts_with("## Playbooks"))
+            .skip(2)
+            .take_while(|l| l.starts_with("- "))
+            .map(String::from)
+            .collect()
+    };
+
+    // Off (the default): the checkout's first, then the approved, then the user's own, as before.
+    for (name, want) in [("change", "local"), ("solo", "solo"), ("mine", "mine"), ("extra", "users")] {
+        let (code, got, stderr) = plan(name);
+        assert_eq!((code, got), (Some(0), Some(vec![want.to_string()])), "{name}: {stderr}");
+        assert!(!stderr.contains("warning"), "{name}: {stderr}");
+    }
+    let listed = alice.json(&["playbook", "list"]);
+    assert_eq!(listed["source"], "checkout", "asked: the checkout holds playbooks");
+    assert!(listed["playbooks"].as_array().unwrap().iter().all(|p| p.get("ignored").is_none()), "{listed}");
+    let text = alice.ok(&["prime"]);
+    assert!(!text.contains("ignored"), "{text}");
+    assert_eq!(alice.json(&["prime"])["playbooks_ignored"], 0);
+
+    // On: set on the server, read there.
+    check(server.local("ops", &["config", "set", "playbooks.source", "server"]), "config set");
+    assert_eq!(alice.json(&["config", "get", "playbooks.source"])["value"], "server");
+
+    // The approved copy, with one warning naming the checkout's, ignored.
+    let (code, got, stderr) = plan("change");
+    assert_eq!((code, got), (Some(0), Some(vec!["approved".to_string()])), "{stderr}");
+    let warnings: Vec<&str> = stderr.lines().filter(|l| l.starts_with("warning: ignoring ")).collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].replace('\\', "/").contains(".bd/playbooks/change.toml"), "{stderr}");
+    assert!(warnings[0].contains("playbooks.source = server") && warnings[0].contains("`bd publish`"), "{stderr}");
+    let shown = alice.json(&["playbook", "show", "change"]);
+    assert!(same_file(&shown["source"], &approved.join("change.toml")), "{shown}");
+    // Only in the checkout: not found, warned about all the same.
+    let (code, _, stderr) = plan("solo");
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(stderr.contains("warning: ignoring ") && stderr.contains("solo.toml"), "{stderr}");
+    assert!(stderr.contains("this checkout's .bd/playbooks are not used"), "{stderr}");
+    // The user's own, for a name the server does not serve.
+    let (code, got, stderr) = plan("mine");
+    assert_eq!((code, got), (Some(0), Some(vec!["mine".to_string()])), "{stderr}");
+    assert!(!stderr.contains("warning"), "{stderr}");
+    // Served and never approved here: not found, even with a copy on the user's path.
+    for args in [&["playbook", "plan", "extra"][..], &["playbook", "run", "extra"], &["playbook", "show", "extra"]] {
+        let out = alice.run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {stderr}");
+        assert!(stderr.contains("the bd server serves a playbook of this name"), "{stderr}");
+        assert!(stderr.contains("`bd agents approve`"), "{stderr}");
+    }
+    // A file path is the client's, as before.
+    let out = alice.run(&["playbook", "plan", ".bd/playbooks/solo.toml"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("warning"), "{out:?}");
+
+    // list: the checkout's marked ignored, shadowing nothing.
+    let listed = alice.json(&["playbook", "list"]);
+    assert_eq!(listed["source"], "server");
+    let entries: Vec<(&str, bool, bool, bool)> = listed["playbooks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            let flag = |k: &str| p.get(k).and_then(Value::as_bool).unwrap_or(false);
+            (p["name"].as_str().unwrap(), flag("approved"), flag("ignored"), flag("unavailable"))
+        })
+        .collect();
+    assert_eq!(
+        entries,
+        [
+            ("change", true, false, false),
+            ("extra", false, false, true),
+            ("mine", false, false, false),
+            ("change", false, true, false),
+            ("solo", false, true, false)
+        ],
+        "the user's extra is not used: the server serves extra, unapproved here: {listed}"
+    );
+    assert!(listed["playbooks"][0]["shadowed_by"].is_null(), "{listed}");
+    let text = alice.ok(&["playbook", "list"]);
+    assert_eq!(text.matches("(ignored: playbooks.source = server)").count(), 2, "{text}");
+    assert_eq!(text.matches("(waiting for approval: the bd server serves this name)").count(), 1, "{text}");
+
+    // prime: computed on the server, the checkout's left out and counted.
+    let text = alice.ok(&["prime"]);
+    assert_eq!(
+        section(&text),
+        ["- change — server change (the server's, approved here)", "- mine — Tidy up (user's own)"],
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "2 playbook(s) in this checkout's .bd/playbooks ignored (playbooks.source = server: playbooks come from \
+             the bd server, approved on this machine): `bd publish` brings them to the server."
+        ),
+        "{text}"
+    );
+    let v = alice.json(&["prime"]);
+    assert_eq!((v["playbooks_ignored"].as_i64(), v["playbooks_total"].as_i64()), (Some(2), Some(2)), "{v}");
+
+    // Off again: as before.
+    check(server.local("ops", &["config", "set", "playbooks.source", "checkout"]), "config set");
+    let (code, got, stderr) = plan("change");
+    assert_eq!((code, got), (Some(0), Some(vec!["local".to_string()])), "{stderr}");
+    assert!(!stderr.contains("warning"), "{stderr}");
+    assert_eq!(alice.json(&["prime"])["playbooks_ignored"], 0);
+}
+
+#[test]
+fn playbooks_source_server_holds_for_the_names_a_playbook_extends_or_expands() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let on_server = server.root.path().join("proj").join(".bd").join("playbooks");
+    let expanding = |what: &str| format!("[[steps]]\nid = \"one\"\n[[steps]]\nid = \"part\"\nexpand = \"{what}\"\n");
+    write(&on_server, "change.toml", &expanding("review"));
+    write(&on_server, "review.toml", "[[steps]]\nid = \"approved-look\"\n");
+    write(&on_server, "audited.toml", &expanding("audit"));
+    write(&on_server, "audit.toml", "[[steps]]\nid = \"server-audit\"\n");
+    // Approved here: change, review and audited; audit is served and never approved.
+    write(&alice.dir.path().join(".bd").join("playbooks"), "review.toml", "[[steps]]\nid = \"checkout-look\"\n");
+    approve_playbooks(&alice, &on_server, &["audited.toml", "change.toml", "review.toml"]);
+    let users = alice.dir.path().join(".xdg").join("bd").join("playbooks");
+    write(&users, "audit.toml", "[[steps]]\nid = \"user-audit\"\n");
+    let plan = |name: &str| {
+        let out = alice.run(&["--json", "playbook", "plan", name]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let keys: Vec<String> = serde_json::from_slice::<Value>(&out.stdout)
+            .map(|v| {
+                v["plan"]["issues"].as_array().unwrap().iter().map(|i| i["key"].as_str().unwrap().into()).collect()
+            })
+            .unwrap_or_default();
+        (out.status.code(), keys, stderr)
+    };
+
+    // Off: the checkout's first and the user's own, inside an approved playbook too, as before.
+    let (code, keys, stderr) = plan("change");
+    assert_eq!((code, keys.last().map(String::as_str)), (Some(0), Some("part.checkout-look")), "{stderr}");
+    let (code, keys, stderr) = plan("audited");
+    assert_eq!((code, keys.last().map(String::as_str)), (Some(0), Some("part.user-audit")), "{stderr}");
+
+    check(server.local("ops", &["config", "set", "playbooks.source", "server"]), "config set");
+    // (a) The approved review, the checkout's warned about.
+    let (code, keys, stderr) = plan("change");
+    assert_eq!((code, keys.last().map(String::as_str)), (Some(0), Some("part.approved-look")), "{stderr}");
+    let warnings: Vec<&str> = stderr.lines().filter(|l| l.starts_with("warning: ignoring ")).collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].replace('\\', "/").contains(".bd/playbooks/review.toml"), "{stderr}");
+    // (b) audit is served and not approved here: not taken from the user's own.
+    let (code, _, stderr) = plan("audited");
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains("audit (playbooks.source = server: the bd server serves a playbook of this name"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("`bd agents approve`"), "{stderr}");
+    // A name differing only in case is the same name.
+    // (Removed first: where names ignore case, writing AUDIT.toml would replace audit.toml.)
+    std::fs::remove_file(users.join("audit.toml")).unwrap();
+    write(&users, "AUDIT.toml", "[[steps]]\nid = \"user-audit\"\n");
+    write(&on_server, "audited.toml", &expanding("AUDIT"));
+    approve_playbooks(&alice, &on_server, &["audited.toml"]);
+    let (code, _, stderr) = plan("audited");
+    assert_eq!(code, Some(3), "{stderr}");
+    assert!(
+        stderr.contains("AUDIT (playbooks.source = server: the bd server serves a playbook of this name"),
+        "{stderr}"
+    );
+
+    // A checkout copy of a parent that does not load, which server mode skips, does not stop an approved playbook.
+    write(&on_server, "based.toml", "extends = \"base\"\n[[steps]]\nid = \"own\"\n");
+    write(&on_server, "base.toml", "[[steps]]\nid = \"approved-base\"\n");
+    approve_playbooks(&alice, &on_server, &["base.toml", "based.toml"]);
+    write(&alice.dir.path().join(".bd").join("playbooks"), "base.toml", "[[steps]]\nbogus = 1\n");
+    let (code, keys, stderr) = plan("based");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(keys.iter().any(|k| k == "approved-base"), "{keys:?} {stderr}");
+
+    // list: the source is known (asked) for a user's playbook of a name the server serves, with no checkout ones.
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    write(&bob.dir.path().join(".xdg").join("bd").join("playbooks"), "audit.toml", "[[steps]]\nid = \"b\"\n");
+    let listed = bob.json(&["playbook", "list"]);
+    assert_eq!(listed["source"], "server", "{listed}");
+    assert_eq!(listed["playbooks"][0]["unavailable"], true, "{listed}");
+    // Nothing that could change: not asked, and not said.
+    let carol = server.client(&server.token("carol-laptop", "carol", &[]));
+    write(&carol.dir.path().join(".xdg").join("bd").join("playbooks"), "mine.toml", "[[steps]]\nid = \"m\"\n");
+    let listed = carol.json(&["playbook", "list"]);
+    assert!(listed.get("source").is_none(), "{listed}");
+}
+
+#[test]
+fn a_server_that_cannot_list_its_playbooks_stops_a_server_only_lookup() {
+    // playbooks.source = server; then the manifest read fails: fail closed, saying why.
+    let server = FakeServer::start(|n| match n {
+        0 => answer(&[stdout_frame(r#"{"key":"playbooks.source","value":"server"}"#), exit_frame(0, "")], false, 0),
+        _ => answer(&[exit_frame(2, &format!("{}\n", error_json("invalid", 2)))], false, 0),
+    });
+    let client = server.client();
+    write(&client.dir.path().join(".xdg").join("bd").join("playbooks"), "mine.toml", "[[steps]]\nid = \"m\"\n");
+    let out = client.run(&["playbook", "plan", "mine"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("the bd server's list of its playbooks could not be read"), "{stderr}");
+    assert!(stderr.contains("is not taken from the user's own playbooks"), "{stderr}");
+    assert_eq!(server.requests.load(Ordering::SeqCst), 2, "the command itself never sent");
+}
+
+#[test]
+fn a_server_that_cannot_say_its_playbooks_source_leaves_it_off() {
+    // An older server: the config read fails (an unknown key, exit 3); the
+    // next request is the command, with the checkout's copy as before.
+    let server = FakeServer::start(|n| match n {
+        0 => answer(&[exit_frame(3, &format!("{}\n", error_json("not_found", 3)))], false, 0),
+        _ => answer(&[stdout_frame("planned\n"), exit_frame(0, "")], false, 0),
+    });
+    let client = server.client();
+    write(&client.dir.path().join(".bd").join("playbooks"), "change.toml", "[[steps]]\nid = \"checkout-copy\"\n");
+    let out = client.run(&["playbook", "plan", "change"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "planned\n");
+    assert!(!stderr.contains("warning"), "{stderr}");
+    let bodies = server.bodies.lock().unwrap().clone();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert!(bodies[0].contains("playbooks.source"), "the setting asked first: {}", bodies[0]);
+    assert!(bodies[1].contains("checkout-copy") && bodies[1].contains("--playbook-bundle"), "{}", bodies[1]);
+
+    // An answer that does not parse as exactly `server` is off too.
+    let server = FakeServer::start(|n| match n {
+        0 => answer(&[stdout_frame(r#"{"key":"playbooks.source","value":"SERVER"}"#), exit_frame(0, "")], false, 0),
+        _ => answer(&[stdout_frame("planned\n"), exit_frame(0, "")], false, 0),
+    });
+    let client = server.client();
+    write(&client.dir.path().join(".bd").join("playbooks"), "change.toml", "[[steps]]\nid = \"checkout-copy\"\n");
+    let out = client.run(&["playbook", "plan", "change"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(server.bodies.lock().unwrap()[1].contains("checkout-copy"));
+}
+
+#[test]
 fn env_token_is_never_sent_to_a_url_from_remote_toml() {
     // A server named by a checkout (a pull request, a submodule): it must never see a connection.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

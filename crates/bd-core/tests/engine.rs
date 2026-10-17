@@ -75,9 +75,24 @@ impl Env {
     }
 
     fn assert_healthy(&mut self) {
+        self.assert_healthy_but(&[]);
+    }
+
+    /// Healthy apart from an open child under a closed parent for each of
+    /// `orphans` (`child (parent p)`), which a forced close leaves on purpose.
+    fn assert_healthy_but(&mut self, orphans: &[&str]) {
         let report = doctor::diagnose(&mut self.store, false, true).unwrap();
-        let bad: Vec<_> = report.checks.iter().filter(|c| c.severity != doctor::Severity::Ok).collect();
+        let bad: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|c| c.severity != doctor::Severity::Ok)
+            .filter(|c| c.name != "open_under_closed_parent" || orphans.is_empty())
+            .collect();
         assert!(bad.is_empty(), "doctor found problems: {bad:#?}");
+        let orphaned = report.checks.iter().find(|c| c.name == "open_under_closed_parent").unwrap();
+        for o in orphans {
+            assert!(orphaned.detail.contains(o), "{orphaned:?} should name {o}");
+        }
     }
 }
 
@@ -161,7 +176,7 @@ fn blocks_edges_gate_readiness_and_release_on_close() {
     assert!(env.issue(&c).is_blocked);
 
     // Reopen re-blocks dependents.
-    let reopened = env.store.write("reopen", "alice", |tx| tx.reopen_issue(&a, Some("regression"))).unwrap();
+    let reopened = env.store.write("reopen", "alice", |tx| tx.reopen_issue(&a, Some("regression"), false)).unwrap();
     assert!(!reopened.already_open);
     assert!(env.issue(&b).is_blocked);
     let ops: Vec<String> = env.events().into_iter().map(|e| e.op).collect();
@@ -216,7 +231,7 @@ fn conditional_blocks_runs_only_on_failure() {
     assert!(why[0].detail.contains("succeeded"), "{why:?}");
 
     // Failure: reopen and close as failed; the error path becomes ready.
-    env.store.write("reopen", "alice", |tx| tx.reopen_issue(&build, None)).unwrap();
+    env.store.write("reopen", "alice", |tx| tx.reopen_issue(&build, None, false)).unwrap();
     env.store
         .write("close", "alice", |tx| {
             tx.close_issue(
@@ -1473,7 +1488,7 @@ fn recompute_stops_at_closed_descendants() {
     assert!(env.issue(&a).is_blocked);
     assert!(!env.issue(&s1).is_blocked);
     assert!(!env.issue(&d).is_blocked);
-    env.assert_healthy();
+    env.assert_healthy_but(&[&format!("{s1} (parent {s})")]);
 }
 
 #[test]
@@ -2535,7 +2550,7 @@ fn closing_as_a_duplicate_moves_nothing_else() {
     let kinds: Vec<_> = down.iter().map(|e| (e.id.as_str(), e.dep_type.as_str())).collect();
     assert!(kinds.contains(&(other.as_str(), "related")) && kinds.contains(&(canonical.as_str(), "duplicates")));
     assert_eq!(edges_of(&env, &canonical).0.len(), 0);
-    env.assert_healthy();
+    env.assert_healthy_but(&[&format!("{child} (parent {dup})")]);
 }
 
 #[test]
@@ -2702,5 +2717,102 @@ fn closing_as_a_duplicate_ends_another_actors_claim_only_with_take_over() {
     let closed = env.store.read(|r| r.history(&x)).unwrap().into_iter().rev().find(|e| e.op == "closed").unwrap();
     assert_eq!(closed.data["claim_override"], json!({ "holder": "bob", "token": token }));
     assert!(env.store.read(|r| r.lease(&x)).unwrap().is_none(), "the lease ends with the claim");
+    env.assert_healthy();
+}
+
+#[test]
+fn reopening_under_a_closed_parent_is_refused_unless_forced() {
+    let mut env = Env::new();
+    let parent = env.create("Parent", 1);
+    let child = env.create_with(NewIssue { title: "Child".into(), parent: Some(parent.clone()), ..Default::default() });
+    env.close(&child);
+    env.close(&parent);
+    let head = env.events().len();
+
+    // As adding an open child under a closed parent is refused, so is reopening one, with nothing written.
+    let e = env.store.write("reopen", "alice", |tx| tx.reopen_issue(&child, None, false)).unwrap_err();
+    assert!(matches!(e, Error::Refused(ref m) if m.contains(&format!("parent {parent} is closed"))), "{e}");
+    assert_eq!(e.exit_code(), 2);
+    assert_eq!(env.issue(&child).status, Status::Closed);
+    assert_eq!(env.events().len(), head);
+
+    // Naming the parent too works in either order: parents are reopened first, the outcomes keep the order given.
+    let out = env
+        .store
+        .write("reopen", "alice", |tx| tx.reopen_issues(&[child.clone(), parent.clone()], None, false))
+        .unwrap();
+    assert_eq!(out.iter().map(|o| o.issue.id.as_str()).collect::<Vec<_>>(), [child.as_str(), parent.as_str()]);
+    assert!(out.iter().all(|o| !o.already_open));
+    env.assert_healthy();
+
+    // --force reopens it anyway, and doctor reports what that leaves.
+    env.close(&child);
+    env.close(&parent);
+    env.store.write("reopen", "alice", |tx| tx.reopen_issue(&child, None, true)).unwrap();
+    assert_eq!(env.issue(&child).status, Status::Open);
+    env.assert_healthy_but(&[&format!("{child} (parent {parent})")]);
+}
+
+#[test]
+fn reopening_walks_through_closed_containers_to_the_first_other_parent() {
+    let mut env = Env::new();
+    let tracked = env.create("Tracked issue", 1);
+    let group = env.create_with(NewIssue {
+        title: "Group".into(),
+        parent: Some(tracked.clone()),
+        metadata: Some(json!({ "playbook": { "role": "group" } })),
+        ..Default::default()
+    });
+    let step = env.create_with(NewIssue { title: "Step".into(), parent: Some(group.clone()), ..Default::default() });
+    env.close(&step);
+    assert_eq!(env.issue(&group).status, Status::Closed, "a group closes itself with its last step");
+
+    // Under an open parent, reopening the step reopens its group, as before.
+    let out = env.store.write("reopen", "alice", |tx| tx.reopen_issue(&step, None, false)).unwrap();
+    assert_eq!(out.reopened.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), [group.as_str()]);
+
+    // With the tracked issue closed above the closed group, the group would reopen under it: refused.
+    env.close(&step);
+    env.close(&tracked);
+    let e = env.store.write("reopen", "alice", |tx| tx.reopen_issue(&step, None, false)).unwrap_err();
+    assert!(matches!(e, Error::Refused(ref m) if m.contains(&format!("parent {tracked} is closed"))), "{e}");
+    assert_eq!(env.issue(&group).status, Status::Closed);
+    env.assert_healthy();
+}
+
+#[test]
+fn a_spawner_may_have_a_child_reopened_under_it() {
+    let mut env = Env::new();
+    let spawner = env.create("Spawner", 1);
+    let child =
+        env.create_with(NewIssue { title: "Spawned".into(), parent: Some(spawner.clone()), ..Default::default() });
+    let waiter = env.create("Waiter", 1);
+    env.dep(&waiter, &spawner, DepType::WaitsFor);
+    // A spawner closes before the work it spawned, unforced; doctor finds nothing wrong with that.
+    env.close(&spawner);
+    env.assert_healthy();
+    env.close(&child);
+    env.store.write("reopen", "alice", |tx| tx.reopen_issue(&child, None, false)).unwrap();
+    assert_eq!(env.issue(&child).status, Status::Open);
+    env.assert_healthy();
+}
+
+#[test]
+fn a_group_closing_itself_past_a_pinned_child_is_healthy() {
+    let mut env = Env::new();
+    let group = env.create_with(NewIssue {
+        title: "Group".into(),
+        metadata: Some(json!({ "playbook": { "role": "group" } })),
+        ..Default::default()
+    });
+    let step = env.create_with(NewIssue { title: "Step".into(), parent: Some(group.clone()), ..Default::default() });
+    env.create_with(NewIssue {
+        title: "Note".into(),
+        parent: Some(group.clone()),
+        status: Some(Status::Pinned),
+        ..Default::default()
+    });
+    env.close(&step);
+    assert_eq!(env.issue(&group).status, Status::Closed, "pinned children are not work: the group closes");
     env.assert_healthy();
 }

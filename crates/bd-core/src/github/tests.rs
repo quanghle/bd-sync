@@ -687,7 +687,7 @@ fn an_open_child_refuses_a_close_and_an_outcome_change() {
     let local = ws.issue(&id);
     ws.apply(&pull_apply(&local, &closed));
     assert_eq!(ws.issue(&id).close_outcome, Some(Outcome::Done));
-    ws.write("alice", |tx| tx.reopen_issue(&child.id, None));
+    ws.write("alice", |tx| tx.reopen_issue(&child.id, None, true));
     let before = ws.link(&id);
     let mut failed = closed.clone();
     failed.state_reason = Some("not_planned".into());
@@ -699,6 +699,39 @@ fn an_open_child_refuses_a_close_and_an_outcome_change() {
     assert_eq!((now.status, now.close_outcome), (Status::Closed, Some(Outcome::Done)));
     assert!(!ws.ops_since(head).iter().any(|o| o == "reopened"));
     assert_eq!(ws.link(&id).github_hash, before.github_hash);
+}
+
+#[test]
+fn a_closed_parent_refuses_a_reopen_from_github() {
+    let mut ws = Ws::new();
+    let g = gh(7, "A");
+    let id = ws.pulled(&g);
+    let parent = ws.write("alice", |tx| tx.create_issue(NewIssue::titled("parent"))).id;
+    ws.write("alice", |tx| tx.add_dependency(&id, &parent, DepType::ParentChild, None));
+    ws.write("alice", |tx| tx.close_issue(&id, &CloseOptions::default()));
+    ws.write("alice", |tx| tx.close_issue(&parent, &CloseOptions::default()));
+
+    // Reopened on GitHub, as adding an open child under a closed parent: refused for this issue alone.
+    let local = ws.issue(&id);
+    let head = ws.head();
+    let out = ws.apply(&pull_apply(&local, &g));
+    assert!(
+        matches!(out.pull_error, Some(PullError::Refused(ref m)) if m.contains(&format!("parent {parent} is closed"))),
+        "{:?}",
+        out.pull_error
+    );
+    assert_eq!(ws.issue(&id).status, Status::Closed);
+    assert!(!ws.ops_since(head).iter().any(|o| o == "reopened"));
+
+    // A close outcome changed on GitHub reopens and closes it again at once: never refused for the closed parent.
+    let mut failed = g.clone();
+    failed.open = false;
+    failed.state_reason = Some("not_planned".into());
+    let local = ws.issue(&id);
+    let out = ws.apply(&pull_apply(&local, &failed));
+    assert!(out.pull_error.is_none(), "{:?}", out.pull_error);
+    let now = ws.issue(&id);
+    assert_eq!((now.status, now.close_outcome), (Status::Closed, Some(Outcome::Failed)));
 }
 
 #[test]

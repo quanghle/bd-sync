@@ -960,7 +960,24 @@ impl WriteCtx<'_> {
         Ok((closed, freed))
     }
 
-    pub fn reopen_issue(&mut self, id: &str, reason: Option<&str>) -> Result<ReopenOutcome> {
+    /// Reopen several issues in one go: parents before their children, so
+    /// naming a closed parent beside its child works in any order. The
+    /// outcomes keep the order of `ids`.
+    pub fn reopen_issues(&mut self, ids: &[String], reason: Option<&str>, force: bool) -> Result<Vec<ReopenOutcome>> {
+        let depths = graph::depths(self.conn(), ids)?;
+        let mut order: Vec<usize> = (0..ids.len()).collect();
+        order.sort_by_key(|&i| depths[i]);
+        let mut out: Vec<Option<ReopenOutcome>> = ids.iter().map(|_| None).collect();
+        for i in order {
+            out[i] = Some(self.reopen_issue(&ids[i], reason, force)?);
+        }
+        Ok(out.into_iter().flatten().collect())
+    }
+
+    /// Reopen `id`. A closed playbook run or group above it reopens with it;
+    /// any other closed parent refuses, as adding an open child under it
+    /// does, unless `force`.
+    pub fn reopen_issue(&mut self, id: &str, reason: Option<&str>, force: bool) -> Result<ReopenOutcome> {
         let old = require(self.conn(), id)?;
         if old.status != Status::Closed {
             return Ok(ReopenOutcome {
@@ -969,6 +986,29 @@ impl WriteCtx<'_> {
                 newly_blocked: Vec::new(),
                 reopened: Vec::new(),
             });
+        }
+        if !force {
+            // The same walk as below, without writing: through the closed
+            // containers that reopen with it, to the first other parent. A
+            // spawner (others wait on its children through waits-for) may
+            // close before its children, so it may have one reopened too.
+            let mut cur = id.to_string();
+            let mut seen = HashSet::from([cur.clone()]);
+            while let Some(parent) = graph::parent_of(self.conn(), &cur)? {
+                let p = require(self.conn(), &parent)?;
+                if p.status != Status::Closed || !seen.insert(parent.clone()) {
+                    break;
+                }
+                if !is_playbook_container(&p) {
+                    if graph::waiters_on(self.conn(), &parent)?.is_empty() {
+                        return Err(Error::Refused(format!(
+                            "parent {parent} is closed; reopen it before adding open children"
+                        )));
+                    }
+                    break;
+                }
+                cur = parent;
+            }
         }
         let reason = reason.map(str::trim).filter(|r| !r.is_empty());
         let mut blocked = self.mark_reopened(id, reason.map(String::from), None)?;

@@ -272,9 +272,8 @@ fn next_json(from: NextFrom, parent: Option<String>, issue: &bd_core::Issue, cla
 pub fn exec_reopen(tx: &mut WriteCtx<'_>, a: &ReopenArgs) -> Result<Out> {
     let mut results = Vec::new();
     let mut out = Out::new(Value::Null);
-    for raw in &a.ids {
-        let id = tx.resolve_id(raw)?;
-        let r = tx.reopen_issue(&id, a.reason.as_deref())?;
+    let ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
+    for (id, r) in ids.iter().zip(tx.reopen_issues(&ids, a.reason.as_deref(), a.force)?) {
         out = out.line(if r.already_open {
             format!("= {id} is not closed")
         } else {
@@ -286,7 +285,7 @@ pub fn exec_reopen(tx: &mut WriteCtx<'_>, a: &ReopenArgs) -> Result<Out> {
         for p in &r.reopened {
             out = out.line(format!("  ↺ reopened {} {}", p.id, p.title));
         }
-        out = out.id(id);
+        out = out.id(id.clone());
         results.push(r);
     }
     out.json = one_or_many(&results);

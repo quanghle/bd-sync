@@ -47,6 +47,7 @@ bd close ID... -r "reason" [--failed] [--token T] [--force] [--take-over]   # --
 bd duplicate ID --of ID [--force] [--take-over] [--if-revision N]   # edge ID -> canonical, closes ID
 bd supersede ID --with ID [--force] [--take-over] [--if-revision N] # edge ID -> newer, closes ID
 bd find-duplicates [--threshold 0.8] [-n 50]    # likely duplicate pairs among open issues, read-only
+bd reopen ID... [-r "reason"] [--force]           # parents first; --force: despite a closed parent
 bd delete ID... [--cascade] [--force] [--dry-run] [--take-over]
 bd show ID... [--as-of SEQ|#SEQ|TIME|-DURATION]   # the issues as they were then, rebuilt from their events
 bd history ID [--diff]                            # --diff: each changed field's old and new value

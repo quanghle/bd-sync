@@ -40,6 +40,13 @@ its whole subtree from ready work until then (`bd undefer` ends it early).
 Closing an issue with open children, or one still blocked, is refused
 unless you pass `--force`. The exception is a *spawner*, an issue others
 wait on through `waits-for`: it may close before the children it spawned.
+The other way round, an open child under a closed parent is refused too:
+creating one, moving one there with `bd update --parent`, or reopening one
+(`bd reopen`, unless `--force`; a closed playbook run or group above it
+reopens with it instead, and a spawner may have its children reopened, as
+it may close before them). Reopen the parent first, or name it in the same
+`bd reopen`. `bd doctor` warns about open issues under a closed parent,
+which a forced close or reopen leaves.
 `--force` never ends another actor's live claim (see
 [Claims](#claims-leases-and-recovery)).
 

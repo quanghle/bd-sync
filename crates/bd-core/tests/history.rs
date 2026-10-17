@@ -57,7 +57,7 @@ impl Env {
     }
 
     fn reopen(&mut self, id: &str) {
-        self.w(|tx| tx.reopen_issue(id, Some("again")));
+        self.w(|tx| tx.reopen_issue(id, Some("again"), false));
     }
 
     fn issue(&self, id: &str) -> Issue {

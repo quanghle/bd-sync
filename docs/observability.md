@@ -38,10 +38,13 @@ counter.
   WAL mode and schema version;
 - the status and lease invariants;
 - blocked-flag drift against an independent full recompute;
-- dependency cycles, event-sequence continuity and stale leases.
+- dependency cycles, event-sequence continuity and stale leases;
+- open issues under a closed parent (a warning: left by `bd close --force`
+  or `bd reopen --force`; reopen the parent or close the issue).
 
 `--fix` repairs leases and blocked flags in one transaction. Problems exit
-with code 1.
+with code 1; warnings (stale leases, open issues under a closed parent) do
+not.
 
 ## Server logs
 

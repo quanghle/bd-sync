@@ -1225,7 +1225,7 @@ impl WriteCtx<'_> {
             let now = issues::require(self.conn(), &a.id)?;
             if open {
                 if now.status == Status::Closed {
-                    self.reopen_issue(&a.id, Some("reopened on GitHub"))?;
+                    self.reopen_issue(&a.id, Some("reopened on GitHub"), false)?;
                     changed.push("status".into());
                 }
             } else if now.status != Status::Closed {
@@ -1233,7 +1233,8 @@ impl WriteCtx<'_> {
                 changed.push("status".into());
             } else if now.close_outcome != Some(outcome) {
                 // close_outcome changes only by reopening and closing again.
-                self.reopen_issue(&a.id, Some("close outcome changed on GitHub"))?;
+                // Closed again at once: never an open child under a closed parent.
+                self.reopen_issue(&a.id, Some("close outcome changed on GitHub"), true)?;
                 self.close_issue(&a.id, &close)?;
                 changed.push("close_outcome".into());
             }

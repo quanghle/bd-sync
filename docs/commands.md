@@ -543,6 +543,7 @@ and unsetting need an admin token.
 | `lease.auto_reclaim` | `true` | `claim --next` reclaims dead claims first, and `bd serve` reclaims them every minute |
 | `claim.pools` | | comma-separated assignees anyone may claim from |
 | `types.custom` | | extra issue types |
+| `experimental.features` | | comma-separated [experimental features](#experimental-features) turned on in this workspace |
 | `durability` | `normal` | SQLite `synchronous`: `off`, `normal`, `full` |
 | `events.retain_days`, `events.retain_rows` | `0` | automatic event retention (`0` keeps everything) |
 | `gate.repos` | | repositories GitHub gates may name: `OWNER/REPO`, `HOST/OWNER/REPO`, `OWNER/*`, `HOST/OWNER/*`, `*` (unset: any locally, only the workspace's own through `bd serve`) |
@@ -550,6 +551,25 @@ and unsetting need an admin token.
 | `github.assignees` | | `login=actor,...`: GitHub logins mapped to bd assignees by `bd github` |
 | `github.priority_labels` | | label prefix `bd github` maps to priority, `<prefix>0`..`<prefix>4` (unset: no mapping) |
 | `custom.*` | | free-form keys for your own tools |
+
+### Experimental features
+
+Features still being tried out are off until a workspace opts in, for
+everyone using it: `bd config set experimental.features specs` (names
+comma-separated; an unknown one is refused, naming the known ones; `bd
+config unset experimental.features` turns them all off). `bd prime` lists
+the ones that are on, and playbooks can test them with
+`{{experimental.<name>}}` ([Playbooks](playbooks.md)). Turning one off
+hides its workflow, not data: issues it created stay readable.
+
+A playbook that names a feature only loads in a bd that knows it, and in a
+remote workspace the server compiles runs: upgrade `bd serve` before
+committing a playbook that tests a new feature, or every run of that
+playbook against the older server fails.
+
+| feature | what it turns on |
+|---|---|
+| `specs` | feature specs: a feature's canonical requirements as pinned spec issues with requirement children, kept current by a playbook step (this repository's `change` playbook and `.github/scripts/spec.mjs`) |
 
 ## Exit codes
 

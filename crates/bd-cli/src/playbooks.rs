@@ -417,6 +417,8 @@ fn cmd_run(app: &mut App, a: &RunArgs, dry_run: bool) -> Result<()> {
         },
         assignee: a.assignee.clone().filter(|s| !s.trim().is_empty()),
         title: a.title.clone().filter(|s| !s.trim().is_empty()),
+        // The workspace's, also under bd serve: `{{experimental.<name>}}`.
+        features: app.read(|r| bd_core::config::experimental(r.conn()))?,
     };
     let plan = playbook::compile(&pb, &req, &loader)?;
     let (started, status) = app.write("playbook.run", |tx| {

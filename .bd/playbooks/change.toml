@@ -218,6 +218,8 @@ id = "spec"
 title = "Feature spec: {{task}}"
 type = "task"
 needs = ["review"]
+# Experimental: only in workspaces with `bd config set experimental.features specs`.
+condition = "{{experimental.specs}}"
 description = """
 Keep the canonical requirements of the features this change touches current (AGENTS.md, Feature \
 specs), now that review has settled the behavior. <run> below is this run (the parent of this step). \

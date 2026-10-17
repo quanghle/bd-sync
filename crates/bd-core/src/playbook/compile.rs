@@ -14,7 +14,7 @@
 //!   carries the step's prerequisites, so it arms when the step could start.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -55,6 +55,9 @@ pub struct RunRequest {
     pub assignee: Option<String>,
     /// Overrides the run title.
     pub title: Option<String>,
+    /// The workspace's experimental features that are on: each registered
+    /// one is `{{experimental.<name>}}` in templates and conditions.
+    pub features: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -246,13 +249,18 @@ impl Budget {
 
 /// Compile `pb` with `req` into the issues and edges of a run.
 pub fn compile(pb: &Playbook, req: &RunRequest, loader: &Loader) -> Result<Plan> {
-    let vars = resolve_vars(&pb.vars, &req.vars)?;
+    let declared = resolve_vars(&pb.vars, &req.vars)?;
+    // Templates and conditions also see the built-in experimental.<name>;
+    // the plan (and the run's metadata) keeps the declared vars only.
+    let experimental = template::experimental_vars(&req.features);
+    let mut vars = declared.clone();
+    vars.extend(experimental.clone());
     let budget = Budget::new();
     let r = |what: &str, text: &str| budget.render(text, &vars).map_err(|e| Error::invalid(format!("{what}: {e}")));
     let title = match (&req.title, &pb.title) {
         (Some(t), _) => t.trim().to_string(),
         (None, Some(t)) => r("title", t)?,
-        (None, None) => default_run_title(&pb.name, &vars),
+        (None, None) => default_run_title(&pb.name, &declared),
     };
     let run = PlannedIssue {
         key: String::new(),
@@ -282,6 +290,7 @@ pub fn compile(pb: &Playbook, req: &RunRequest, loader: &Loader) -> Result<Plan>
         pairs: HashSet::new(),
         assignee: req.assignee.clone(),
         stack: vec![pb.name.clone()],
+        experimental,
     };
     b.namespace(&pb.steps, &vars, "", run.priority, pb.source.as_deref(), 1)?;
     if b.issues.is_empty() {
@@ -294,7 +303,7 @@ pub fn compile(pb: &Playbook, req: &RunRequest, loader: &Loader) -> Result<Plan>
         playbook: pb.name.clone(),
         version: pb.version,
         source: pb.source.clone(),
-        vars,
+        vars: declared,
         ephemeral: req.ephemeral.unwrap_or_else(|| pb.is_ephemeral()),
         run,
         issues: b.issues,
@@ -413,6 +422,9 @@ struct Builder<'l> {
     pairs: HashSet<(String, String)>,
     assignee: Option<String>,
     stack: Vec<String>,
+    /// `experimental.<name>` for every registered feature: in scope in
+    /// expanded playbooks too.
+    experimental: BTreeMap<String, String>,
 }
 
 impl Builder<'_> {
@@ -580,7 +592,8 @@ impl Builder<'_> {
         for (k, v) in &step.expand_vars {
             given.insert(k.clone(), self.budget.render(v, vars).map_err(at)?);
         }
-        let inner = resolve_vars(&pb.vars, &given).map_err(|e| at(e.to_string()))?;
+        let mut inner = resolve_vars(&pb.vars, &given).map_err(|e| at(e.to_string()))?;
+        inner.extend(self.experimental.clone());
         self.stack.push(pb.name.clone());
         self.namespace(&pb.steps, &inner, key, pb.priority.unwrap_or(priority), pb.source.as_deref(), depth)?;
         self.stack.pop();
@@ -888,6 +901,36 @@ mod tests {
         let p = plan(text, &[("version", "1.0")]).unwrap();
         assert_eq!(p.issues[0].title, "1.0 to staging");
         assert_eq!(p.run.title, "t (env=staging, version=1.0)");
+    }
+
+    #[test]
+    fn experimental_features_are_built_in_variables() {
+        let text = "[[steps]]\nid = \"build\"\ntitle = \"specs {{experimental.specs}}\"\n\
+            [[steps]]\nid = \"spec\"\nneeds = [\"build\"]\ncondition = \"{{experimental.specs}}\"\n\
+            [[steps]]\nid = \"review\"\nneeds = [\"build\", \"spec\"]\n";
+        let pb = parse_toml(text, "t.toml", "t").unwrap();
+        pb.validate().unwrap();
+        let with = |on: &[&str]| {
+            let req = RunRequest { features: on.iter().map(|s| s.to_string()).collect(), ..Default::default() };
+            compile(&pb, &req, &Loader::default()).unwrap()
+        };
+        let off = with(&[]);
+        assert_eq!(keys(&off), ["build", "review"]);
+        assert_eq!(off.issues[0].title, "specs false");
+        assert_eq!(edges(&off), ["review->build:blocks"], "the needs on the left-out step are dropped");
+        let on = with(&["specs"]);
+        assert_eq!(keys(&on), ["build", "spec", "review"]);
+        assert_eq!(on.issues[0].title, "specs true");
+        assert!(on.vars.is_empty(), "the plan keeps the declared vars only: {:?}", on.vars);
+
+        // Only registered features, and never as a --var.
+        let bad = "[[steps]]\nid = \"a\"\ncondition = \"{{experimental.nope}}\"\n";
+        let err = parse_toml(bad, "t.toml", "t").and_then(|pb| pb.validate()).unwrap_err().to_string();
+        assert!(err.contains("undeclared variable `experimental.nope`"), "{err}");
+        let err = plan(text, &[("experimental.specs", "true")]).unwrap_err().to_string();
+        assert!(err.contains("unknown var(s) experimental.specs"), "{err}");
+        let err = plan("[[steps]]\nid = \"a\"\ncondition = \"{{experimental.}}\"\n", &[]).unwrap_err().to_string();
+        assert!(err.contains("invalid variable"), "{err}");
     }
 
     #[test]

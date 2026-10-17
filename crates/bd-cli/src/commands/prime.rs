@@ -52,6 +52,10 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             attention,
         ))
     })?;
+    let experimental: Vec<(&str, &str)> = {
+        let on = app.read(|r| bd_core::config::experimental(r.conn()))?;
+        bd_core::config::EXPERIMENTAL.iter().filter(|(name, _)| on.contains(*name)).copied().collect()
+    };
     let shown_memories: Vec<&bd_core::Memory> =
         if a.max_memories > 0 { memories.iter().take(a.max_memories).collect() } else { memories.iter().collect() };
     let playbooks = crate::playbooks::for_prime(app, app.g.client_playbooks.as_deref());
@@ -78,6 +82,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             "memories": shown_memories,
             "playbooks": shown_playbooks,
             "playbooks_total": playbooks.len(),
+            "experimental": experimental.iter().map(|(name, about)| json!({ "name": name, "description": about })).collect::<Vec<_>>(),
         }));
         return Ok(());
     }
@@ -96,6 +101,13 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     o.push(String::new());
     o.push("## Core loop".into());
     o.extend(core_loop(&ttl));
+    if !experimental.is_empty() {
+        o.push(String::new());
+        o.push("## Experimental features on in this workspace".into());
+        for (name, about) in &experimental {
+            o.push(format!("- `{name}`: {about}"));
+        }
+    }
     o.push(String::new());
     o.push(format!(
         "## Status: {} ready · {} waiting on children · {} in progress · {} blocked · {} deferred · {} open total",

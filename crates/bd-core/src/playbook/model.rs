@@ -15,7 +15,7 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::template::{self, Condition, is_ident};
+use super::template::{self, Condition, experimental_refs, is_ident};
 use crate::error::{Error, Result};
 use crate::gates::{GateKind, GateSpec, validate_repo};
 use crate::time::parse_duration;
@@ -987,7 +987,8 @@ impl Playbook {
 
         // Variables: templates and conditions may only use declared vars and
         // the loop variables of the step and its groups.
-        let declared: BTreeSet<String> = self.vars.keys().cloned().collect();
+        // Plus `experimental.<name>` for each registered experimental feature.
+        let declared: BTreeSet<String> = self.vars.keys().cloned().chain(experimental_refs()).collect();
         let check_text = |what: &str, text: &str, scope: &BTreeSet<String>| -> std::result::Result<(), String> {
             for r in template::refs(text).map_err(|e| format!("{what}: {e}"))? {
                 if !scope.contains(&r) {

@@ -1,5 +1,6 @@
 //! Workspace configuration stored in the `config` table.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -49,6 +50,7 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("lease.auto_reclaim", "true", "claim --next and bd serve reclaim stale leases (past grace) automatically"),
     ("claim.pools", "", "Comma-separated pool assignees anyone may claim from"),
     ("types.custom", "", "Comma-separated extra issue types"),
+    ("experimental.features", "", "Comma-separated experimental features turned on in this workspace (known: specs)"),
     ("durability", "normal", "SQLite synchronous level: off | normal | full"),
     ("events.retain_days", "0", "Prune events older than N days after writes (0 = keep)"),
     ("events.retain_rows", "0", "Keep at most N events (0 = keep all)"),
@@ -65,6 +67,13 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("github.assignees", "", "GitHub logins mapped to bd assignees for bd github: login=actor,..."),
     ("github.priority_labels", "", "Label prefix bd github maps to priority: <prefix>0..4 (unset: no mapping)"),
 ];
+
+/// Experimental features a workspace can turn on with `experimental.features`:
+/// (name, description). Playbook templates and conditions read each as
+/// `{{experimental.<name>}}`, `true` or `false`.
+/// Names are lowercase; keep `experimental.features`' description in `KNOWN` listing them.
+pub const EXPERIMENTAL: &[(&str, &str)] =
+    &[("specs", "Feature specs: canonical requirements kept as pinned spec issues with requirement children")];
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ConfigEntry {
@@ -158,6 +167,18 @@ fn validate(key: &str, value: &str) -> Result<String> {
         }
         "lease.auto_reclaim" => Ok(parse_bool(v)?.to_string()),
         "claim.pools" | "types.custom" => Ok(split_list(v).join(",")),
+        "experimental.features" => {
+            let mut names = split_list(&v.to_ascii_lowercase());
+            if let Some(bad) = names.iter().find(|n| !EXPERIMENTAL.iter().any(|(k, _)| k == n)) {
+                let known: Vec<&str> = EXPERIMENTAL.iter().map(|(k, _)| *k).collect();
+                return Err(Error::invalid(format!(
+                    "unknown experimental feature {bad:?} (known: {})",
+                    known.join(", ")
+                )));
+            }
+            names.sort();
+            Ok(names.join(","))
+        }
         "gate.repos" => {
             let repos = split_list(v);
             for r in &repos {
@@ -286,6 +307,11 @@ pub fn custom_types(conn: &Connection) -> Result<Vec<String>> {
     Ok(split_list(&get_or_default(conn, "types.custom")?))
 }
 
+/// The experimental features turned on in this workspace.
+pub fn experimental(conn: &Connection) -> Result<BTreeSet<String>> {
+    Ok(split_list(&get_or_default(conn, "experimental.features")?).into_iter().collect())
+}
+
 pub fn retain_days(conn: &Connection) -> Result<u64> {
     Ok(get_or_default(conn, "events.retain_days")?.parse().unwrap_or(0))
 }
@@ -297,6 +323,14 @@ pub fn retain_rows(conn: &Connection) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn experimental_features_are_listed_in_the_key_description() {
+        let (_, _, about) = KNOWN.iter().find(|(k, _, _)| *k == "experimental.features").unwrap();
+        let names: Vec<&str> = EXPERIMENTAL.iter().map(|(name, _)| *name).collect();
+        assert!(about.ends_with(&format!("(known: {})", names.join(", "))), "{about}");
+        assert!(names.iter().all(|n| *n == n.to_ascii_lowercase()), "names are lowercase: {names:?}");
+    }
 
     #[test]
     fn github_keys_validate() {

@@ -102,7 +102,13 @@ chains the iterations. Iteration ids get a suffix: `build-linux`,
 
 **Conditions** use `==`, `!=`, `&&`, `||`, `!`, parentheses, and quoted or
 bare words. A lone value is false when it is empty, `false`, `0`, `no` or
-`off`. A condition is at most 1,024 bytes.
+`off`. A condition is at most 1,024 bytes. Besides the declared vars, templates and
+conditions may read `{{experimental.<name>}}`, `true` when the workspace
+has that [experimental feature](commands.md#experimental-features) on and
+`false` otherwise (`condition = "{{experimental.specs}}"` keeps a step only
+where feature specs are on); a name bd does not know is an error when the
+playbook loads, and none can be passed with `--var`. In a remote workspace
+the server compiles the run, so it must know the feature too.
 
 **Fan-in** (`waits_for`): `all-children` waits for its spawner step (the
 first of `needs`) to close, then for every child created below it;

@@ -685,6 +685,24 @@ fn extends_and_expand_compose_playbooks_from_files() {
     let pb = loader.load("self").unwrap();
     let err = playbook::compile(&pb, &RunRequest::default(), &loader).unwrap_err();
     assert!(err.to_string().contains("circular expand"), "{err}");
+
+    // Experimental features are in scope in an expanded playbook too.
+    write(
+        "inner.toml",
+        "[[steps]]\nid = \"x\"\ntitle = \"inner {{experimental.specs}}\"\n\
+         [[steps]]\nid = \"y\"\ncondition = \"{{experimental.specs}}\"\n",
+    );
+    write("outer.toml", "[[steps]]\nid = \"a\"\nexpand = \"inner\"\n");
+    let pb = loader.load("outer").unwrap();
+    let off = playbook::compile(&pb, &RunRequest::default(), &loader).unwrap();
+    let titles = |p: &playbook::Plan| p.issues.iter().map(|i| (i.key.clone(), i.title.clone())).collect::<Vec<_>>();
+    assert_eq!(titles(&off), [("a".into(), "a".into()), ("a.x".into(), "inner false".into())]);
+    let req = RunRequest { features: ["specs".to_string()].into(), ..Default::default() };
+    let on = playbook::compile(&pb, &req, &loader).unwrap();
+    assert_eq!(
+        titles(&on),
+        [("a".into(), "a".into()), ("a.x".into(), "inner true".into()), ("a.y".into(), "y".into())]
+    );
 }
 
 #[test]

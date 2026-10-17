@@ -1017,6 +1017,41 @@ fn config_keys_are_read_and_unset_by_name() {
 }
 
 #[test]
+fn experimental_features_are_a_workspace_opt_in() {
+    let ws = Ws::new();
+    assert_eq!(ws.json(&["config", "get", "experimental.features"])["value"], "", "off by default");
+    let out = ws.run_as("tester", &["config", "set", "experimental.features", "specs,nope"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown experimental feature \"nope\" (known: specs)"));
+    ws.playbook(
+        "change",
+        "[[steps]]\nid = \"build\"\n[[steps]]\nid = \"spec\"\nneeds = [\"build\"]\ncondition = \"{{experimental.specs}}\"\n\
+         [[steps]]\nid = \"score\"\nneeds = [\"build\", \"spec\"]\n",
+    );
+    let steps = |ws: &Ws| {
+        let run = ws.json(&["playbook", "run", "change"]);
+        let id = run["run"]["id"].as_str().unwrap().to_string();
+        let mut ids: Vec<String> = ws
+            .json(&["list", "--all", "--parent", &id])
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["id"].as_str().unwrap().trim_start_matches(&format!("{id}.")).to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(steps(&ws), ["build", "score"]);
+    assert!(!ws.ok(&["prime"]).contains("Experimental features"));
+
+    ws.ok(&["config", "set", "experimental.features", " Specs , specs "]);
+    assert_eq!(ws.json(&["config", "get", "experimental.features"])["value"], "specs");
+    assert_eq!(steps(&ws), ["build", "score", "spec"]);
+    assert!(ws.ok(&["prime"]).contains("## Experimental features on in this workspace\n- `specs`: Feature specs"));
+    assert_eq!(ws.json(&["prime"])["experimental"][0]["name"], "specs");
+}
+
+#[test]
 fn dead_claims_are_anyones() {
     let ws = Ws::new();
     for n in 1..=3 {

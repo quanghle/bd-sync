@@ -8,6 +8,7 @@
 // closed one was superseded (`bd supersede`) or removed (closed with its reason); any other status is a mistake, shown
 // in force with a warning. A requirement's `related` edges name the issues or runs it came from. A spec may be the
 // child of another spec (a sub-feature): its parent's requirements apply to it too. An area may hold several specs.
+// Feature specs are experimental: the script runs only in a workspace with `experimental.features` naming specs.
 // Only an open spec passes its requirements down. An open spec under a closed one is an error (bd refuses to close a
 // spec with open children unless forced): it is still printed, inheriting nothing, with the ways to fix it. An issue
 // that is not a spec between two specs ends the chain with a warning. Prints each spec named (by id, or every open
@@ -211,9 +212,28 @@ export function parseArgs(argv) {
   return out
 }
 
+/**
+ * Whether the workspace has feature specs on (`experimental.features`). A bd that does not know the key (not found,
+ * exit 3) has them off; any other failure (an unreachable server, a refused token) is reported as it is.
+ */
+export function specsOn(bd) {
+  let value
+  try {
+    value = bd(['config', 'get', 'experimental.features']).value
+  } catch (e) {
+    if (e.status === 3) return false
+    throw e
+  }
+  return String(value ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    .includes('specs')
+}
+
 function main(argv) {
   const { arg, root, history, json } = parseArgs(argv)
   const bd = bdRunner(root)
+  if (!specsOn(bd)) throw new Error('feature specs are experimental: enable them with `bd config set experimental.features specs`')
   const roots = findSpecs(bd(['list', '--all', '-n', '0', '-l', 'spec']), arg)
   // bd show gives the parent and edges that bd list and bd query leave out; each issue is fetched once.
   const issues = new Map()

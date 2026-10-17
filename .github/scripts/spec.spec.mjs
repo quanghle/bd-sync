@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from './expect.mjs'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -219,12 +219,20 @@ describe('spec', () => {
 		bin = mkdtempSync(join(tmpdir(), 'spec-'))
 		// A bd over issues.json: list -l spec, query 'parent = "x" OR ...' (direct children), show (one id: an object).
 		writeFileSync(join(bin, 'issues.json'), JSON.stringify([spec, ...children, ...tree]))
+		writeFileSync(join(bin, 'features'), 'specs')
 		writeFileSync(
 			join(bin, 'bd'),
 			[
 				'#!/usr/bin/env node',
 				`const all = JSON.parse(require('fs').readFileSync(${JSON.stringify(join(bin, 'issues.json'))}, 'utf8'))`,
 				"const a = process.argv.slice(2).filter((x) => x !== '--json')",
+				// config get experimental.features: the value in `features`, or not found (exit 3) without the file, as an older bd.
+				"if (a.includes('config')) {",
+				`  const f = ${JSON.stringify(join(bin, 'features'))}`,
+				"  if (!require('fs').existsSync(f)) process.exit(3)",
+				"  console.log(JSON.stringify({ key: 'experimental.features', value: require('fs').readFileSync(f, 'utf8') }))",
+				'  process.exit(0)',
+				'}',
 				'const at = (f) => a[a.indexOf(f) + 1]',
 				"const out = a.includes('show') ? a.slice(a.indexOf('show') + 1).map((id) => all.find((i) => i.id === id))",
 				"  : a.includes('query') ? all.filter((i) => [...at('query').matchAll(/parent = \"([^\"]+)\"/g)].some((m) => i.parent === m[1]))",
@@ -253,6 +261,22 @@ describe('spec', () => {
 		expect(md.match(/Saved cards/g).length).toBe(1)
 		expect(md.match(/Requires sign-in/g).length).toBe(1)
 		expect(call('c.2')).toContain('- Requires sign-in (c.9; spec c)')
+	})
+	it('runs only with feature specs on in the workspace', () => {
+		writeFileSync(join(bin, 'features'), '')
+		expect(() => call('labels')).toThrow(/feature specs are experimental: enable them with `bd config set experimental.features specs`/)
+		rmSync(join(bin, 'features'))
+		expect(() => call('labels')).toThrow(/feature specs are experimental/)
+		writeFileSync(join(bin, 'features'), 'other, specs')
+		expect(call('labels')).toContain('# Spec: labels (s)')
+	})
+	it('reports a bd failure as it is, not as feature specs being off', () => {
+		writeFileSync(join(bin, 'features'), 'specs')
+		const real = join(bin, 'bd.real')
+		writeFileSync(real, readFileSync(join(bin, 'bd')))
+		chmodSync(real, 0o755)
+		writeFileSync(join(bin, 'bd'), ['#!/bin/sh', 'echo "error: bd server unreachable" >&2', 'exit 8', ''].join('\n'))
+		expect(() => call('labels')).toThrow(/bd server unreachable/)
 	})
 	it('fails with a message for an unknown spec', () => {
 		expect(() => call('nope')).toThrow(/no spec nope/)

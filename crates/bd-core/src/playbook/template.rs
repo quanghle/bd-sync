@@ -31,6 +31,31 @@ pub(crate) fn is_ident(s: &str) -> bool {
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Prefix of the built-in variables naming experimental features.
+pub(crate) const EXPERIMENTAL_PREFIX: &str = "experimental.";
+
+/// A name a template or condition may reference: a variable, or
+/// `experimental.<name>` (which names must be registered is checked when a
+/// playbook loads).
+fn is_ref(s: &str) -> bool {
+    is_ident(s.strip_prefix(EXPERIMENTAL_PREFIX).unwrap_or(s))
+}
+
+/// `experimental.<name>` for every registered experimental feature: the
+/// built-in variables every playbook may reference.
+pub(crate) fn experimental_refs() -> impl Iterator<Item = String> {
+    crate::config::EXPERIMENTAL.iter().map(|(name, _)| format!("{EXPERIMENTAL_PREFIX}{name}"))
+}
+
+/// The built-in variables' values: `true` for the features in `on`, `false`
+/// for the other registered ones.
+pub(crate) fn experimental_vars(on: &BTreeSet<String>) -> BTreeMap<String, String> {
+    crate::config::EXPERIMENTAL
+        .iter()
+        .map(|(name, _)| (format!("{EXPERIMENTAL_PREFIX}{name}"), on.contains(*name).to_string()))
+        .collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Seg {
     Lit(String),
@@ -52,7 +77,7 @@ fn segments(text: &str) -> Result<Vec<Seg>, String> {
         let after = &rest[pos + 2..];
         let end = after.find("}}").ok_or_else(|| format!("unclosed `{{{{` in {text:?}"))?;
         let name = after[..end].trim();
-        if !is_ident(name) {
+        if !is_ref(name) {
             return Err(format!("invalid variable reference `{{{{{}}}}}` in {text:?}", &after[..end]));
         }
         if !lit.is_empty() {
@@ -172,7 +197,7 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                     return Err(format!("unclosed `{{{{` in condition {src:?}"));
                 }
                 let name = name.trim().to_string();
-                if !is_ident(&name) {
+                if !is_ref(&name) {
                     return Err(format!("invalid variable `{name}` in condition {src:?}"));
                 }
                 toks.push(Tok::Var(name));

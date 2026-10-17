@@ -11,15 +11,19 @@
 // Copilot logged per request (1 credit = $0.01), else, for Claude Code requests, notional list prices from prices.json;
 // a request with neither (an older Copilot trace, a model the table lacks) is unpriced. Timing
 // (step elapsed times, gate waits) is read from the bd list at report time, not from the stored trace, which is written
-// before the run's last steps and its score gate close.
+// before the run's last steps and its score gate close. The complexity tables (estimate vs judged, score, score by coder,
+// and cost and time by complexity) are per rubric version (.bd/rubric.md's Version, recorded with each estimate and score):
+// a run counts under its judged score's version, and an estimate/judged pair of different versions is counted apart as mixed.
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
+import { canonicalModel } from './reviewer-catch.mjs'
 import { activeMs, bdRunner, fmtDuration, logDirs, readRecord, stepFrom, timingOf, trace } from './trace-run.mjs'
 
 // ---------- roles ----------
 // What an agent did, from its trace label: 'main', a workflow's '<workflow>:<role>[:...]', or a subagent's
-// '<type>: <description>'. A heuristic over labels the callers chose, so 'other' is a real answer.
+// '<type>: <description>' (Claude Code's agentType, Copilot's agentName). A subagent's role comes from its description's
+// role prefix (AGENTS.md), else a label naming review. A heuristic over labels the callers chose, so 'other' is a real answer.
 const WORKFLOW_ROLES = [
   [/^(coder|implement)\b/, 'coder'],
   [/^review\b/, 'reviewer'],
@@ -28,13 +32,41 @@ const WORKFLOW_ROLES = [
   [/^(gate|record|heartbeat|claim|setup|bd|trace)\b/, 'mechanical'],
   [/^judge\b/, 'judge'],
 ]
+const PREFIX_ROLES = ['coder', 'reviewer', 'mechanical', 'research', 'planner', 'summary']
+// The optional group skips one agent type token: one containing '-' or ':' (general-purpose, code-review, plugin:agent) or a
+// known single-word one (Claude Code's Explore and Plan, Copilot's task and explore). So neither a role word later in the
+// description nor an ordinary leading word ('Fix: coder: x') counts.
+const SINGLE_WORD_TYPES = ['Explore', 'Plan', 'task']
+const AGENT_TYPE = `(?:[\\w.]*[-:][\\w.:-]*|${SINGLE_WORD_TYPES.join('|')})`
+const ROLE_PREFIX = new RegExp(`^(?:${AGENT_TYPE}: )?(${PREFIX_ROLES.join('|')}):`, 'i')
 export function roleOf(agent) {
   if (agent.kind === 'main') return 'main'
   if (agent.kind === 'workflow') {
     const role = agent.label.split(':')[1] ?? ''
     return WORKFLOW_ROLES.find(([re]) => re.test(role))?.[1] ?? 'other'
   }
+  const prefix = ROLE_PREFIX.exec(agent.label)?.[1]
+  if (prefix) return prefix.toLowerCase()
   return /review/i.test(agent.label) ? 'reviewer' : 'other'
+}
+
+/**
+ * A run's coder: the model and effort with the most requests among its coder-role agents (workflow coder/implement roles,
+ * `coder:` subagents), or null when untraced or none.
+ */
+export function coderOf(work) {
+  const by = new Map()
+  for (const a of (work?.steps ?? []).flatMap((s) => s.agents).filter((x) => roleOf(x) === 'coder')) {
+    // One name per model across harnesses (Claude Code's claude-opus-5-5, Copilot's claude-opus-5.5).
+    const model = canonicalModel(a.model)
+    const key = `${model}\0${a.effort}`
+    const x = by.get(key) ?? { model, effort: a.effort, requests: 0 }
+    x.requests += a.requests
+    by.set(key, x)
+  }
+  let best = null
+  for (const x of by.values()) if (!best || x.requests > best.requests) best = x
+  return best
 }
 
 // ---------- cost ----------
@@ -106,6 +138,9 @@ export function joinRuns(issues, { followUpsOf, traceOf }) {
         estimate: md.complexity_estimate?.score ?? null,
         judged: md.score_judge?.complexity ?? null,
         confirmedComplexity: confirmed?.complexity ?? null,
+        // The version of the score whose overall this row reports (no fallback to the judge's), and the estimate's.
+        rubric: versionOf((confirmed ?? md.score_judge)?.rubric),
+        estimateRubric: versionOf(md.complexity_estimate?.rubric),
         overall: confirmed?.overall ?? md.score_judge?.overall ?? null,
         // 'accepted': the judge's draft taken as the score with no person confirming it (by: judge).
         overallFrom: confirmed ? (confirmed.by === 'judge' ? 'accepted' : 'person') : md.score_judge ? 'judge' : null,
@@ -119,6 +154,9 @@ export function joinRuns(issues, { followUpsOf, traceOf }) {
         // A backfilled trace of a run still open misses the work still to come.
         traced: work ? (md.work ? 'stored' : run.status === 'closed' ? 'backfilled' : 'partial') : null,
         untraced: work ? null : why,
+        coder: coderOf(work),
+        // The coder exploration quota's marker, e.g. { coder: 'sonnet/medium', rule: 'sha1-0-3' }.
+        exploration: md.exploration ?? null,
         timing,
       }
     })
@@ -130,6 +168,39 @@ const sum = (xs) => xs.reduce((a, b) => a + b, 0)
 const mean = (xs) => (xs.length ? sum(xs) / xs.length : null)
 const agentsOf = (r) => (r.work?.steps ?? []).flatMap((s) => s.agents)
 const meanOf = (xs) => mean(xs.filter((x) => x != null))
+// A rubric version is an integer; anything else in the free-form metadata is unknown (null).
+const versionOf = (x) => (Number.isInteger(x) ? x : null)
+const rubricOf = (r) => r.rubric ?? null
+// Numeric versions ascending, unknown (null) last.
+const byVersion = (a, b) => (a === b ? 0 : a == null ? 1 : b == null ? -1 : a - b)
+// Runs grouped by (rubric version, complexity), sorted by version then complexity.
+const byBand = (rs) => {
+  const groups = new Map()
+  for (const r of rs) {
+    const key = `${rubricOf(r)}\0${complexityOf(r)}`
+    const g = groups.get(key) ?? { rubric: rubricOf(r), complexity: complexityOf(r), runs: [] }
+    g.runs.push(r)
+    groups.set(key, g)
+  }
+  return [...groups.values()].toSorted((a, b) => byVersion(a.rubric, b.rubric) || a.complexity - b.complexity)
+}
+// The estimate gap (judged minus estimate) over runs that have both.
+const gapOf = (rs) => {
+  const gaps = rs.map((r) => complexityOf(r) - r.estimate)
+  const gapBy = (key) =>
+    Object.fromEntries(
+      [...new Set(rs.map(key))].map((k) => {
+        const g = rs.filter((r) => key(r) === k).map((r) => complexityOf(r) - r.estimate)
+        return [k, { runs: g.length, mean: mean(g) }]
+      }),
+    )
+  return {
+    runs: gaps.length,
+    mean: mean(gaps),
+    distribution: [...new Set(gaps)].toSorted((a, b) => a - b).map((g) => [g, gaps.filter((x) => x === g).length]),
+    byTier: gapBy((r) => r.tier),
+  }
+}
 
 /**
  * Runs whose windows overlap in a shared session: a trace gives a run every request of its sessions inside its window, so
@@ -172,20 +243,36 @@ export function overlaps(runs) {
 export function aggregate(runs, prices = PRICES) {
   const overlap = overlaps(runs)
   const withGap = runs.filter((r) => r.estimate != null && complexityOf(r) != null)
-  const gaps = withGap.map((r) => complexityOf(r) - r.estimate)
-  const gapBy = (key) =>
-    Object.fromEntries(
-      [...new Set(withGap.map(key))].map((k) => {
-        const g = withGap.filter((r) => key(r) === k).map((r) => complexityOf(r) - r.estimate)
-        return [k, { runs: g.length, mean: mean(g) }]
-      }),
-    )
-  const bands = {}
-  for (const r of runs.filter((x) => complexityOf(x) != null && x.overall != null)) {
-    const b = (bands[complexityOf(r)] ??= { runs: 0, overall: [], serious: 0 })
-    b.runs++
-    b.overall.push(r.overall)
-    b.serious += r.findings.serious
+  // An estimate counts against its judged complexity only under one rubric version; two unknowns agree (as unknown).
+  const isMixed = (r) => (r.estimateRubric ?? null) !== rubricOf(r)
+  const sameVersion = withGap.filter((r) => !isMixed(r))
+  const gap = {
+    mixed: withGap.filter(isMixed).length,
+    byRubric: [...new Set(sameVersion.map(rubricOf))]
+      .toSorted(byVersion)
+      .map((v) => Object.assign({ rubric: v }, gapOf(sameVersion.filter((r) => rubricOf(r) === v)))),
+  }
+  // A mixed run still counts here, under its judged score's version.
+  const scored = runs.filter((x) => complexityOf(x) != null && x.overall != null)
+  const bands = byBand(scored).map((g) => ({
+    rubric: g.rubric,
+    complexity: g.complexity,
+    runs: g.runs.length,
+    overall: mean(g.runs.map((r) => r.overall)),
+    serious: sum(g.runs.map((r) => r.findings.serious)),
+  }))
+  // Recomputed from the trace (not r.coder), so hand-built rows without joinRuns fields work too.
+  const coders = new Map()
+  for (const r of scored) {
+    const c = coderOf(r.work)
+    const label = c ? `${c.model}/${c.effort}` : r.work ? 'no coder agent' : 'untraced'
+    const key = `${rubricOf(r)}\0${complexityOf(r)}\0${label}`
+    const x = coders.get(key) ?? { rubric: rubricOf(r), complexity: complexityOf(r), coder: label, model: c?.model ?? null, effort: c?.effort ?? null, runs: 0, overall: [], serious: 0, exploration: 0 }
+    x.runs++
+    x.overall.push(r.overall)
+    x.serious += r.findings.serious
+    if (r.exploration) x.exploration++
+    coders.set(key, x)
   }
   const roles = new Map()
   const runCosts = new Map()
@@ -217,11 +304,11 @@ export function aggregate(runs, prices = PRICES) {
       { agentMs: r.work ? sum(agentsOf(r).map(activeMs)) : null, humanWaitMs: r.timing?.human_wait_ms ?? null, elapsedMs: r.timing?.elapsed_ms ?? null },
     ]),
   )
-  const bandTimes = {}
-  for (const k of new Set(runs.map(complexityOf).filter((c) => c != null))) {
-    const rs = runs.filter((r) => complexityOf(r) === k)
+  const bandTimes = byBand(runs.filter((r) => complexityOf(r) != null)).map(({ rubric, complexity, runs: rs }) => {
     const tracedRuns = rs.filter((r) => r.work)
-    bandTimes[k] = {
+    return {
+      rubric,
+      complexity,
       runs: rs.length,
       traced: tracedRuns.length,
       cost: mean(tracedRuns.map((r) => runCosts.get(r.id)?.cost ?? 0)),
@@ -229,7 +316,7 @@ export function aggregate(runs, prices = PRICES) {
       humanWaitMs: meanOf(rs.map((r) => runTimes[r.id].humanWaitMs)),
       elapsedMs: meanOf(rs.map((r) => runTimes[r.id].elapsedMs)),
     }
-  }
+  })
   const stepTimes = new Map()
   for (const r of runs)
     for (const s of r.timing?.steps ?? []) {
@@ -255,13 +342,11 @@ export function aggregate(runs, prices = PRICES) {
     runs: runs.length,
     scored: runs.filter((r) => r.overall != null).length,
     traced: runs.filter((r) => r.work).length,
-    gap: {
-      runs: gaps.length,
-      mean: mean(gaps),
-      distribution: [...new Set(gaps)].toSorted((a, b) => a - b).map((g) => [g, gaps.filter((x) => x === g).length]),
-      byTier: gapBy((r) => r.tier),
-    },
-    bands: Object.fromEntries(Object.entries(bands).map(([k, b]) => [k, { runs: b.runs, overall: mean(b.overall), serious: b.serious }])),
+    gap,
+    bands,
+    coders: [...coders.values()]
+      .map((x) => Object.assign(x, { overall: mean(x.overall) }))
+      .toSorted((a, b) => byVersion(a.rubric, b.rubric) || a.complexity - b.complexity || a.coder.localeCompare(b.coder)),
     roles: [...roles.values()].map((x) => Object.assign(x, { runs: x.runs.size })).toSorted((a, b) => b.cost - a.cost),
     runCosts: Object.fromEntries(runCosts),
     runTimes,
@@ -279,6 +364,13 @@ const k = (x) => (x >= 1000 ? `${Math.round(x / 1000)}k` : String(x))
 const extras = (c) => (c.outputUnknown ? ` + ${c.outputUnknown} req output unknown` : '') + (c.unpriced ? ` + ${c.unpriced} req unpriced` : '')
 const runCost = (c) => (c ? usd(c.cost) + extras(c) : '–')
 const dur = fmtDuration
+const ver = (v) => (v == null ? 'unknown' : `v${v}`)
+const rubricCell = (r) =>
+  r.rubric == null && r.estimateRubric == null
+    ? '–'
+    : r.estimateRubric == null || r.estimateRubric === r.rubric
+      ? ver(r.rubric)
+      : `${ver(r.rubric)} (estimate ${ver(r.estimateRubric)})`
 const table = (head, rows) => [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`, ...rows.map((r) => `| ${r.join(' | ')} |`)].join('\n')
 
 /** The report as markdown. */
@@ -292,7 +384,7 @@ export function render(runs, agg, prices = PRICES) {
     `## Runs`,
     ``,
     table(
-      ['run', 'tier', 'estimate', 'complexity', 'gap', 'overall', 'serious', 'minor', 'follow-ups', 'cost', 'agent time', 'human wait', 'elapsed', 'trace'],
+      ['run', 'tier', 'estimate', 'complexity', 'gap', 'overall', 'rubric', 'serious', 'minor', 'follow-ups', 'cost', 'agent time', 'human wait', 'elapsed', 'trace'],
       runs.map((r) => [
         r.id,
         r.tier ?? '–',
@@ -300,6 +392,7 @@ export function render(runs, agg, prices = PRICES) {
         n(complexityOf(r)),
         gapCell(r),
         r.overall == null ? '–' : `${r.overall}${r.overallFrom === 'judge' ? ' (draft)' : r.overallFrom === 'accepted' ? ' (judge)' : ''}`,
+        rubricCell(r),
         r.findings.serious,
         r.findings.minor,
         r.findings.followUps ?? '?',
@@ -313,28 +406,61 @@ export function render(runs, agg, prices = PRICES) {
     ``,
     `## Complexity: estimate vs judged`,
     ``,
-    agg.gap.runs
+    agg.gap.byRubric.length || agg.gap.mixed
       ? [
-          `${agg.gap.runs} runs with both; mean gap ${n(agg.gap.mean, 2)} (judged minus estimate; positive = underestimated).`,
-          `Distribution: ${agg.gap.distribution.map(([g, c]) => `${g > 0 ? '+' : ''}${g}: ${c}`).join(', ')}.`,
-          `By tier: ${Object.entries(agg.gap.byTier).map(([t, x]) => `${t} ${n(x.mean, 2)} over ${x.runs}`).join('; ')}.`,
+          `Gap is judged minus estimate; positive = underestimated. One row per rubric version, over the runs whose estimate and judged complexity used it.`,
+          ``,
+          ...(agg.gap.byRubric.length
+            ? [
+                table(
+                  ['rubric', 'runs', 'mean gap', 'distribution', 'by tier'],
+                  agg.gap.byRubric.map((x) => [
+                    ver(x.rubric),
+                    x.runs,
+                    n(x.mean, 2),
+                    x.distribution.map(([g, c]) => `${g > 0 ? '+' : ''}${g}: ${c}`).join(', '),
+                    Object.entries(x.byTier)
+                      .map(([t, y]) => `${t} ${n(y.mean, 2)} over ${y.runs}`)
+                      .join('; '),
+                  ]),
+                ),
+                ``,
+              ]
+            : []),
+          `Mixed versions: ${agg.gap.mixed} ${agg.gap.mixed === 1 ? 'run' : 'runs'} whose estimate and judged complexity used different rubric versions, counted in neither.`,
         ].join('\n')
       : 'No run has both an estimate and a judged complexity yet.',
     ``,
     `## Score by complexity`,
     ``,
-    Object.keys(agg.bands).length
-      ? table(['complexity', 'runs', 'mean overall', 'serious findings'], Object.entries(agg.bands).map(([b, x]) => [b, x.runs, n(x.overall, 2), x.serious]))
+    agg.bands.length
+      ? table(
+          ['rubric', 'complexity', 'runs', 'mean overall', 'serious findings'],
+          agg.bands.map((x) => [ver(x.rubric), x.complexity, x.runs, n(x.overall, 2), x.serious]),
+        )
       : 'No scored run has a complexity yet.',
+    ``,
+    `## Score by coder`,
+    ``,
+    agg.coders.length
+      ? table(
+          ['rubric', 'complexity', 'coder (model/effort)', 'runs', 'mean overall', 'serious findings', 'exploration'],
+          agg.coders.map((x) => [ver(x.rubric), x.complexity, x.coder, x.runs, n(x.overall, 2), x.serious, x.exploration]),
+        )
+      : 'No scored run has a complexity yet.',
+    ``,
+    `A run's coder is the model and effort with the most requests among its coder agents (workflow coder and implement roles, \`coder:\` subagents); "no coder agent" runs were coded by the main thread or by subagents without a role prefix. exploration counts runs marked by the coder exploration quota (\`exploration\` metadata, also on each run in --json).`,
     ``,
     `## Cost and time by complexity`,
     ``,
-    Object.keys(agg.bandTimes).length
+    agg.bandTimes.length
       ? table(
-          ['complexity', 'runs', 'traced', 'mean cost (usd)', 'mean agent time', 'mean human wait', 'mean elapsed'],
-          Object.entries(agg.bandTimes).map(([b, x]) => [b, x.runs, x.traced, usd(x.cost), dur(x.agentMs), dur(x.humanWaitMs), dur(x.elapsedMs)]),
+          ['rubric', 'complexity', 'runs', 'traced', 'mean cost (usd)', 'mean agent time', 'mean human wait', 'mean elapsed'],
+          agg.bandTimes.map((x) => [ver(x.rubric), x.complexity, x.runs, x.traced, usd(x.cost), dur(x.agentMs), dur(x.humanWaitMs), dur(x.elapsedMs)]),
         )
       : 'No run has a complexity yet.',
+    ``,
+    `Bands are per rubric version (a run counts under its judged score's version): each version's complexity anchors differ, so bands of different versions are not directly comparable.`,
     ``,
     `## Time by step`,
     ``,
@@ -362,7 +488,7 @@ export function render(runs, agg, prices = PRICES) {
         )
       : 'No traced runs.',
     ``,
-    `Roles come from agent labels (main thread, workflow roles, subagent descriptions); "other" is a subagent whose description names no role. A Copilot request with no logged credits (a trace stored by an older version), or a Claude Code request whose model the price table lacks, is unpriced, so its cost is low; so is a Claude Code request whose output its transcript did not record (most subagent and workflow requests), counted as output unknown. ${prices.note}`,
+    `Roles come from agent labels: the main thread, workflow roles, and a subagent description's role prefix (\`coder:\`, \`reviewer:\`, \`mechanical:\`, \`research:\`, \`planner:\`, \`summary:\`), else a description naming review; "other" is a subagent with neither. A Copilot request with no logged credits (a trace stored by an older version), or a Claude Code request whose model the price table lacks, is unpriced, so its cost is low; so is a Claude Code request whose output its transcript did not record (most subagent and workflow requests), counted as output unknown. ${prices.note}`,
     ``,
     `Agent time is the primary time figure: each agent's busy time per step, its model requests and the tools they ran, summed (parallel agents add up, like cost; time an agent sat idle between turns, waited on a person or on another agent is left out). A Copilot request's start is its record's time less its duration, a Claude Code request's its api-request entry; traces stored before version 4 hold each agent's first request to the end of its last (or, before end times were recorded, its last request's start), which includes such waits. Elapsed (a step: its claim or the previous step's close, whichever is earlier, to its close; a run: created to last close) includes idle gaps and is context only. Human wait (human gates, armed to resolved) is counted apart from both.`,
     ...(agg.overlaps.groups.length

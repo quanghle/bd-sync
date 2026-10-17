@@ -20,11 +20,12 @@ default = "Quang Le"
 id = "judge"
 title = "Judge {{issue}}"
 description = """
-Run the score-issue workflow (the Copilot CLI extension .github/extensions/score-issue/; its judge
-is gpt-6-astra) with issue={{issue}} and actor=<your bd actor>. Pass range when the change is
-known (e.g. main..<branch>), result when a plan-implement-review run did the work, and context for
-anything a person had to correct. It stores the draft as {{issue}}'s score_judge metadata and
-comments its reasoning there. Do not score it yourself: the judge is gpt-6-astra."""
+Run the score-issue workflow (the Copilot CLI extension .github/extensions/score-issue/, judge
+gpt-6-astra; or the Claude Code workflow .claude/workflows/score-issue.js, judge fable) with
+issue={{issue}} and actor=<your bd actor>. Pass range when the change is known (e.g.
+main..<branch>), result when a plan-implement-review run did the work, and context for anything a
+person had to correct. The draft is stored as {{issue}}'s score_judge metadata, with the judge's
+reasoning as a comment there. Do not score it yourself."""
 acceptance_criteria = "{{issue}} has score_judge metadata and the judge's comment; the close reason gives the overall score and confidence."
 
 [[steps]]

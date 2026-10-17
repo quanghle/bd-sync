@@ -59,8 +59,9 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     let specs = app.read(spec_state)?;
     let shown_memories: Vec<&bd_core::Memory> =
         if a.max_memories > 0 { memories.iter().take(a.max_memories).collect() } else { memories.iter().collect() };
-    let crate::playbooks::ForPrime { playbooks, pending: pending_playbooks } =
-        crate::playbooks::for_prime(app, app.g.client_playbooks.as_deref());
+    let source = app.read(|r| bd_core::config::playbooks_source(r.conn()))?;
+    let crate::playbooks::ForPrime { playbooks, pending: pending_playbooks, ignored: ignored_playbooks } =
+        crate::playbooks::for_prime(app, app.g.client_playbooks.as_deref(), source);
     let shown_playbooks =
         &playbooks[..if a.max_playbooks > 0 { a.max_playbooks.min(playbooks.len()) } else { playbooks.len() }];
     if app.g.json && a.hook.is_none() {
@@ -85,6 +86,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             "playbooks": shown_playbooks,
             "playbooks_total": playbooks.len(),
             "playbooks_pending": pending_playbooks,
+            "playbooks_ignored": ignored_playbooks,
             "experimental": experimental.iter().map(|(name, about)| json!({ "name": name, "description": about })).collect::<Vec<_>>(),
             "specs": specs.json(),
         }));
@@ -181,7 +183,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             ));
         }
     }
-    if !playbooks.is_empty() || !pending_playbooks.is_empty() {
+    if !playbooks.is_empty() || !pending_playbooks.is_empty() || ignored_playbooks > 0 {
         o.push(String::new());
         let shown = if shown_playbooks.len() < playbooks.len() {
             format!("showing {} of {}", shown_playbooks.len(), playbooks.len())
@@ -220,6 +222,12 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
                  run `bd agents approve` in a separate terminal.",
                 crate::agents::approved::pending_list(&pending_playbooks)
             )));
+        }
+        if ignored_playbooks > 0 {
+            o.push(format!(
+                "{ignored_playbooks} playbook(s) in this checkout's .bd/playbooks ignored (playbooks.source = server: \
+                 playbooks come from the bd server, approved on this machine): `bd publish` brings them to the server."
+            ));
         }
     }
     if !memories.is_empty() {

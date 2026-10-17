@@ -71,6 +71,12 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ),
     ("github.assignees", "", "GitHub logins mapped to bd assignees for bd github: login=actor,..."),
     ("github.priority_labels", "", "Label prefix bd github maps to priority: <prefix>0..4 (unset: no mapping)"),
+    (
+        "playbooks.source",
+        "checkout",
+        "Where a remote workspace's clients find playbooks by name: checkout (.bd/playbooks first) | server (only \
+         the server's, approved on each machine, then the user's own; the checkout's are ignored)",
+    ),
 ];
 
 /// Experimental features a workspace can turn on with `experimental.features`:
@@ -79,6 +85,39 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
 /// Names are lowercase; keep `experimental.features`' description in `KNOWN` listing them.
 pub const EXPERIMENTAL: &[(&str, &str)] =
     &[("specs", "Feature specs: canonical requirements kept as pinned spec issues with requirement children")];
+
+/// `playbooks.source`: where a remote workspace's clients find a playbook
+/// by name. A policy for honest clients, not a boundary: the server compiles
+/// whatever bundle a client sends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PlaybooksSource {
+    /// The checkout's `.bd/playbooks`, then the server's approved on the
+    /// client's machine, then the user's own.
+    #[default]
+    Checkout,
+    /// The server's approved on the client's machine, then the user's own
+    /// for names the server does not serve; the checkout's are ignored.
+    Server,
+}
+
+impl PlaybooksSource {
+    pub const KEY: &'static str = "playbooks.source";
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlaybooksSource::Checkout => "checkout",
+            PlaybooksSource::Server => "server",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<PlaybooksSource> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "checkout" => Ok(PlaybooksSource::Checkout),
+            "server" => Ok(PlaybooksSource::Server),
+            other => Err(Error::invalid(format!("invalid playbooks.source {other:?} (valid: checkout, server)"))),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ConfigEntry {
@@ -192,6 +231,7 @@ fn validate(key: &str, value: &str) -> Result<String> {
             Ok(v.to_string())
         }
         "lease.auto_reclaim" => Ok(parse_bool(v)?.to_string()),
+        "playbooks.source" => Ok(PlaybooksSource::parse(v)?.as_str().to_string()),
         "claim.pools" | "types.custom" => Ok(split_list(v).join(",")),
         "experimental.features" => {
             let mut names = split_list(&v.to_ascii_lowercase());
@@ -340,6 +380,11 @@ pub fn experimental(conn: &Connection) -> Result<BTreeSet<String>> {
     Ok(split_list(&get_or_default(conn, "experimental.features")?).into_iter().collect())
 }
 
+/// The workspace's `playbooks.source` (a value that does not parse: the default).
+pub fn playbooks_source(conn: &Connection) -> Result<PlaybooksSource> {
+    Ok(PlaybooksSource::parse(&get_or_default(conn, PlaybooksSource::KEY)?).unwrap_or_default())
+}
+
 pub fn retain_days(conn: &Connection) -> Result<u64> {
     Ok(get_or_default(conn, "events.retain_days")?.parse().unwrap_or(0))
 }
@@ -358,6 +403,16 @@ mod tests {
         let names: Vec<&str> = EXPERIMENTAL.iter().map(|(name, _)| *name).collect();
         assert!(about.ends_with(&format!("(known: {})", names.join(", "))), "{about}");
         assert!(names.iter().all(|n| *n == n.to_ascii_lowercase()), "names are lowercase: {names:?}");
+    }
+
+    #[test]
+    fn playbooks_source_validates() {
+        assert_eq!(validate("playbooks.source", " Server ").unwrap(), "server");
+        assert_eq!(validate("playbooks.source", "checkout").unwrap(), "checkout");
+        for bad in ["", "both", "servers", "local"] {
+            assert!(validate("playbooks.source", bad).is_err(), "{bad}");
+        }
+        assert_eq!(default_for(PlaybooksSource::KEY), Some("checkout"));
     }
 
     #[test]

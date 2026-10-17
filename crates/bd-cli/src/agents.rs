@@ -466,6 +466,12 @@ pub fn sync_playbooks_or_refusal(
     approved::run_or_refusal(checkout, &mut RemoteSource { app, remote }, opts.apply, opts.review, opts.lock_wait)
 }
 
+/// The server's playbooks manifest, checked; `None` if the server does not
+/// serve its playbooks for approval (it predates it).
+pub fn served_playbooks(app: &App, remote: &Remote) -> Result<Option<PlaybooksManifest>> {
+    approved::Source::playbooks_manifest(&mut RemoteSource { app, remote })
+}
+
 /// The playbooks' report for `status`, `pull` and `watch`: the server's
 /// refusal to serve them is reported ([`approved::PlaybooksReport::failed`]).
 pub fn playbooks_report(

@@ -1051,6 +1051,34 @@ fn config_keys_are_read_and_unset_by_name() {
 }
 
 #[test]
+fn playbooks_source_validates_and_changes_nothing_in_a_local_workspace() {
+    let ws = Ws::new();
+    assert_eq!(ws.json(&["config", "get", "playbooks.source"])["value"], "checkout", "the default");
+    let listed = ws.json(&["config", "list"]);
+    let entry = listed.as_array().unwrap().iter().find(|e| e["key"] == "playbooks.source").unwrap().clone();
+    assert!(entry["description"].as_str().unwrap().contains("checkout") && entry["is_default"] == true, "{entry}");
+    for bad in ["both", "", "servers"] {
+        let out = ws.run_as("tester", &["config", "set", "playbooks.source", bad]);
+        assert_eq!(out.status.code(), Some(2), "{bad}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("invalid playbooks.source"), "{out:?}");
+    }
+    ws.ok(&["config", "set", "playbooks.source", " Server "]);
+    assert_eq!(ws.json(&["config", "get", "playbooks.source"])["value"], "server", "lowercased");
+
+    // A local workspace's .bd/playbooks are its own: used, listed, primed as before.
+    ws.playbook("deploy", "description = \"Ship it\"\n[[steps]]\nid = \"s\"\n");
+    assert_eq!(ws.json(&["playbook", "plan", "deploy"])["dry_run"], true);
+    let listed = ws.json(&["playbook", "list"]);
+    assert_eq!(listed["source"], "server");
+    assert!(listed["playbooks"][0].get("ignored").is_none(), "{listed}");
+    let prime = ws.ok(&["prime"]);
+    assert!(prime.contains("- deploy — Ship it") && !prime.contains("ignored"), "{prime}");
+    assert_eq!(ws.json(&["prime"])["playbooks_ignored"], 0);
+    ws.ok(&["config", "unset", "playbooks.source"]);
+    assert_eq!(ws.json(&["playbook", "list"])["source"], "checkout");
+}
+
+#[test]
 fn experimental_features_are_a_workspace_opt_in() {
     let ws = Ws::new();
     assert_eq!(ws.json(&["config", "get", "experimental.features"])["value"], "", "off by default");

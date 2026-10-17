@@ -629,6 +629,7 @@ and unsetting need an admin token.
 | `github.repos` | | repositories [`bd github`](github.md) may sync, with the syntax of `gate.repos` (unset: any locally, only the workspace's own through `bd serve`) |
 | `github.assignees` | | `login=actor,...`: GitHub logins mapped to bd assignees by `bd github` |
 | `github.priority_labels` | | label prefix `bd github` maps to priority, `<prefix>0`..`<prefix>4` (unset: no mapping) |
+| `playbooks.source` | `checkout` | where a remote workspace's clients find playbooks by name: `checkout` (the checkout's `.bd/playbooks` first) or `server` (only the server's approved on each machine, then the user's own for names the server does not serve; the checkout's ignored, with a warning). No effect in a local workspace ([Where playbooks are found](playbooks.md#where-playbooks-are-found)) |
 | `custom.*` | | free-form keys for your own tools |
 
 ### Experimental features

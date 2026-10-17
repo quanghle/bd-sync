@@ -314,7 +314,17 @@ retrying. Exit codes are the same as locally, plus:
   playbook not approved here is not found
   ([Approving the server's playbooks](agents.md#approving-the-servers-playbooks)).
   `playbook list` and `bd prime` show all three sources, marking the
-  server's approved ones, and name the server's waiting for approval.
+  server's approved ones, and name the server's waiting for approval. A
+  workspace with `playbooks.source = server` (`bd config set`, an admin's)
+  makes its clients ignore the checkout's `.bd/playbooks`: every name (the
+  command line's, and those a playbook extends or expands) resolves among
+  the approved, then in your own only for names the server does not
+  serve, with a warning for each checkout copy skipped; the client asks
+  the setting (one `config get`) only when some name resolves in the
+  checkout or your own paths, and a server that predates it, or a failed
+  read, counts as off; the server's playbook list, read in that mode when
+  a name resolves on your own paths, fails closed
+  ([Where playbooks are found](playbooks.md#where-playbooks-are-found)).
 - **Publishing**: `bd publish` reads the source directory on the client
   (`.bd/source` in the checkout, or `--from DIR`) and sends it with the
   command (at most 1,024 files and 16 MiB, within `--max-body-mib`); the

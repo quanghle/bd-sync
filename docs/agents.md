@@ -545,7 +545,16 @@ approved playbook change.toml: kept in .bd/approved/playbooks
   own copy. Before sending, every approved file is checked against its
   hash in the lock, and a path an approved playbook names (`extends =
   "../x.toml"`) must stay inside `.bd/approved/playbooks`. A name found
-  nowhere fails (exit 3), saying to approve the server's playbooks.
+  nowhere fails (exit 3), saying to approve the server's playbooks. With
+  `playbooks.source = server` set in the workspace, the checkout's
+  `.bd/playbooks` is ignored (a warning names each copy skipped): every
+  name, including those an approved playbook extends or expands, resolves
+  among the approved, then in the user's own only for names the server
+  does not serve, so one the server serves and this machine has not
+  approved is not found even with a copy of the user's; `bd playbook list`
+  marks the checkout's ignored and such user copies unavailable, and `bd
+  prime` counts the checkout's, pointing at `bd publish` ([Where playbooks are
+  found](playbooks.md#where-playbooks-are-found)).
 - **Listed with what waits.** `bd playbook list` and `bd prime` list the
   approved ones where a command finds them (`(the server's, approved
   here)`) and name those waiting for approval; `bd prime --json` has them

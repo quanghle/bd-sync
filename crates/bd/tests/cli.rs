@@ -116,6 +116,40 @@ fn lifecycle_with_exit_codes() {
 }
 
 #[test]
+fn reopen_refuses_an_open_child_under_a_closed_parent() {
+    let ws = Ws::new();
+    let p = ws.id(&["create", "Parent"]);
+    let c = ws.id(&["create", "Child", "--parent", &p]);
+    ws.ok(&["close", &c, "-r", "done"]);
+    ws.ok(&["close", &p, "-r", "done"]);
+
+    let out = ws.run_as("tester", &["reopen", &c]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("parent {p} is closed")), "{out:?}");
+    assert_eq!(ws.json(&["show", &c])["status"], "closed");
+
+    // Child first, parent second: the parent is reopened first; the output keeps the order given.
+    let both = ws.json(&["reopen", &c, &p]);
+    assert_eq!(
+        (both[0]["issue"]["id"].as_str(), both[1]["issue"]["id"].as_str()),
+        (Some(c.as_str()), Some(p.as_str()))
+    );
+    let doctor = ws.json(&["doctor"]);
+    let check =
+        |d: &Value| d["checks"].as_array().unwrap().iter().find(|k| k["name"] == "open_under_closed_parent").cloned();
+    assert_eq!(check(&doctor).unwrap()["severity"], "ok");
+
+    ws.ok(&["close", &c, "-r", "done"]);
+    ws.ok(&["close", &p, "-r", "done"]);
+    ws.ok(&["reopen", &c, "--force"]);
+    let doctor = ws.json(&["doctor"]);
+    let found = check(&doctor).unwrap();
+    assert_eq!(found["severity"], "warn");
+    assert!(found["detail"].as_str().unwrap().contains(&format!("{c} (parent {p})")), "{found}");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0, "a warning, not a failure");
+}
+
+#[test]
 fn stored_text_cannot_drive_the_terminal() {
     let ws = Ws::new();
     // OSC 52 (set the clipboard), a C1 CSI, a carriage return and a bidi override.

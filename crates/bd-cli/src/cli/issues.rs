@@ -536,6 +536,9 @@ pub struct ReopenArgs {
     /// Reason recorded with the reopen
     #[arg(short, long)]
     pub reason: Option<String>,
+    /// Reopen despite a closed parent (other than a playbook run or group, which reopens with its step)
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub const DEFER_LONG_ABOUT: &str = "\

@@ -98,7 +98,10 @@ other side cannot represent:
 ways. On bd it is applied by reopening the issue and closing it again with
 the new outcome, so the usual checks apply (open children, blockers,
 another actor's claim) and the history shows `reopened` and `closed`; a
-refusal is reported and retried by the next run. On GitHub, which applies a
+refusal is reported and retried by the next run. An issue reopened on
+GitHub under a closed bd parent is refused the same way (`bd reopen`'s
+rule); a changed outcome is not, as the issue closes again at once. On
+GitHub, which applies a
 `state_reason` only along with a change of state, bd reopens the issue and
 closes it again with the new reason.
 

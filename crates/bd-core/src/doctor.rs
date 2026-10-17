@@ -102,6 +102,37 @@ pub fn diagnose(store: &mut Store, fix: bool, full: bool) -> Result<DoctorReport
     } else {
         check("status_invariants", Severity::Error, preview(&bad_closed))
     });
+    // An open child under a closed parent: `bd close --force`, a forced
+    // reopen, or data from before `bd reopen` refused it. Nothing to repair
+    // automatically: reopen the parent or close the child. Left out, as bd
+    // allows them unforced: the children of a spawner (others wait on it
+    // through waits-for), and pinned children of a playbook run or group,
+    // which closes itself when its work does.
+    let orphaned = strings(
+        conn,
+        "SELECT c.id || ' (parent ' || p.id || ')' FROM issues p
+         CROSS JOIN dependencies d ON d.depends_on_id = p.id AND d.dep_type = 'parent-child'
+         CROSS JOIN issues c INDEXED BY sqlite_autoindex_issues_1 ON c.id = d.issue_id
+         WHERE p.status = 'closed' AND c.status <> 'closed'
+           AND NOT EXISTS (SELECT 1 FROM dependencies w WHERE w.depends_on_id = p.id AND w.dep_type = 'waits-for')
+           AND NOT (c.status = 'pinned'
+                    AND json_extract(p.metadata, '$.playbook.role') IN ('run', 'group')
+                    AND p.issue_type <> 'gate')
+         ORDER BY c.id",
+    )?;
+    checks.push(if orphaned.is_empty() {
+        check("open_under_closed_parent", Severity::Ok, "no open issue has a closed parent")
+    } else {
+        check(
+            "open_under_closed_parent",
+            Severity::Warn,
+            format!(
+                "{} open issue(s) under a closed parent (reopen the parent or close the issue): {}",
+                orphaned.len(),
+                preview(&orphaned)
+            ),
+        )
+    });
 
     let missing_leases = strings(
         conn,

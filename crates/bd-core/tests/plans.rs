@@ -286,7 +286,7 @@ fn walk_the_graph(ws: &mut Ws) {
     reads(ws);
     // Reopening the step reopens the groups closed above it, each recompute
     // leaving out the subtree reopened before.
-    let reopened = ws.write("bot", agent(), |tx| tx.reopen_issue(&first, Some("again"))).reopened;
+    let reopened = ws.write("bot", agent(), |tx| tx.reopen_issue(&first, Some("again"), false)).reopened;
     assert_eq!(reopened.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), [inner.as_str(), group.as_str()]);
     ws.write("bot", agent(), |tx| {
         let patch = IssuePatch { parent: Some(Some(run.clone())), ..Default::default() };

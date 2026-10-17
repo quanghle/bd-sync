@@ -75,9 +75,24 @@ impl Env {
     }
 
     fn assert_healthy(&mut self) {
+        self.assert_healthy_but(&[]);
+    }
+
+    /// Healthy apart from an open child under a closed parent for each of
+    /// `orphans` (`child (parent p)`), which a forced close leaves on purpose.
+    fn assert_healthy_but(&mut self, orphans: &[&str]) {
         let report = doctor::diagnose(&mut self.store, false, true).unwrap();
-        let bad: Vec<_> = report.checks.iter().filter(|c| c.severity != doctor::Severity::Ok).collect();
+        let bad: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|c| c.severity != doctor::Severity::Ok)
+            .filter(|c| c.name != "open_under_closed_parent" || orphans.is_empty())
+            .collect();
         assert!(bad.is_empty(), "doctor found problems: {bad:#?}");
+        let orphaned = report.checks.iter().find(|c| c.name == "open_under_closed_parent").unwrap();
+        for o in orphans {
+            assert!(orphaned.detail.contains(o), "{orphaned:?} should name {o}");
+        }
     }
 }
 
@@ -383,7 +398,8 @@ fn force_gets_past_structure_never_past_a_claim() {
     // update has no structural refusals: its only override is take_over.
     let reopen = patch(|p| p.status = Some(Status::Open));
     not_owner(env.as_("alice", None, |tx| tx.update_issue(&x, &reopen, &none, false)), "bob");
-    env.assert_healthy();
+    // The forced close leaves its open child under it.
+    env.assert_healthy_but(&["t-1.1 (parent t-1)"]);
 }
 
 #[test]
@@ -825,12 +841,12 @@ fn self_closing_containers_respect_the_policy() {
     env.as_("bob", agent("bob"), |tx| tx.heartbeat(&claimed, None, None)).expect("bob still holds it");
     // So it does for its holder's sub-actors, an admin, and the CLI: no step close takes over a claim.
     for (actor, policy) in [("bob/w1", agent("bob")), ("ops", admin_agent("ops")), ("carol", None)] {
-        env.as_("alice", None, |tx| tx.reopen_issue(&steps[1], None)).unwrap();
+        env.as_("alice", None, |tx| tx.reopen_issue(&steps[1], None, false)).unwrap();
         env.as_(actor, policy, |tx| tx.close_issue(&steps[1], &CloseOptions::default())).unwrap();
         assert_eq!(env.issue(&claimed).status, Status::InProgress, "{actor}");
     }
     // Its holder closes it as before.
-    env.as_("alice", None, |tx| tx.reopen_issue(&steps[1], None)).unwrap();
+    env.as_("alice", None, |tx| tx.reopen_issue(&steps[1], None, false)).unwrap();
     env.as_("bob", agent("bob"), |tx| tx.close_issue(&steps[1], &CloseOptions::default())).unwrap();
     assert_eq!(env.issue(&claimed).status, Status::Closed);
 
@@ -1052,7 +1068,8 @@ fn a_gate_with_held_work_below_it_opens_only_for_a_person() {
     env.as_("alice", None, |tx| tx.close_issue(&format!("{run}.deploy.upload"), &force)).unwrap();
     assert!(!env.issue(&inner).is_blocked);
     env.as_("bot", agent("bot"), |tx| tx.close_issue(&inner, &force)).unwrap();
-    env.assert_healthy();
+    // The forced close leaves its open child under it.
+    env.assert_healthy_but(&["t-2.2 (parent t-2)"]);
 }
 
 #[test]

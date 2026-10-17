@@ -140,7 +140,7 @@ fn a_failed_step_fails_the_run_and_reopening_reopens_it() {
     assert_eq!(done.completed.len(), 1);
     assert_eq!(env.issue(&run).close_outcome, Some(Outcome::Failed));
 
-    let r = env.store.write("reopen", "alice", |tx| tx.reopen_issue("t-1.a", Some("retry"))).unwrap();
+    let r = env.store.write("reopen", "alice", |tx| tx.reopen_issue("t-1.a", Some("retry"), false)).unwrap();
     assert_eq!(r.reopened.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), vec!["t-1"]);
     assert_eq!(env.issue(&run).status, Status::Open);
     env.close("t-1.a");
@@ -257,7 +257,7 @@ fn ad_hoc_gates_inherit_prerequisites_and_issue_gates_honor_failure() {
     assert!(matches!(env.evaluate(&gate.id), Some(Verdict::Pending(_))));
     env.close_failed(&other);
     assert!(matches!(env.evaluate(&gate.id), Some(Verdict::Escalate(d)) if d.contains("failed")));
-    env.store.write("reopen", "a", |tx| tx.reopen_issue(&other, None)).unwrap();
+    env.store.write("reopen", "a", |tx| tx.reopen_issue(&other, None, false)).unwrap();
     env.close(&other);
     assert!(matches!(env.evaluate(&gate.id), Some(Verdict::Resolve(_))));
     env.assert_healthy();
@@ -1146,7 +1146,7 @@ fn reopening_a_step_under_deep_closed_groups_reopens_them_in_linear_time() {
             for (step, prefix) in [(plain, "a"), (held, "b")] {
                 let since = env.store.read(|r| r.events(&EventQuery::default())).unwrap().head;
                 let started = std::time::Instant::now();
-                let out = env.store.write("reopen", "alice", |tx| tx.reopen_issue(&step, None)).unwrap();
+                let out = env.store.write("reopen", "alice", |tx| tx.reopen_issue(&step, None, false)).unwrap();
                 let took = started.elapsed();
                 eprintln!("reopening {step} under {LEVELS} groups took {took:?}");
                 // Quadratic, this took minutes; linear, well under a second.
@@ -1270,7 +1270,7 @@ fn reopening_up_closed_groups_blocks_what_it_should_in_order() {
             .filter(|(op, _, _)| *op == "reopened")
             .map(|(_, id, _)| ((*id).clone(), env.issue(id)))
             .collect();
-        let out = env.store.write("reopen", "alice", |tx| tx.reopen_issue(reopen, None)).unwrap();
+        let out = env.store.write("reopen", "alice", |tx| tx.reopen_issue(reopen, None, false)).unwrap();
         let ids = |refs: &[IssueRef]| refs.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
         assert_eq!(ids(&out.reopened), reopened.into_iter().cloned().collect::<Vec<_>>());
         assert_eq!(ids(&out.newly_blocked), blocked.into_iter().cloned().collect::<Vec<_>>());

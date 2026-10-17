@@ -1111,7 +1111,7 @@ fn closed_outcome_changes_reach_github() {
     let id = w.by_ref(7).id;
     let id2 = id.clone();
     w.write("alice", |tx| {
-        tx.reopen_issue(&id2, None)?;
+        tx.reopen_issue(&id2, None, false)?;
         tx.close_issue(&id2, &CloseOptions { outcome: Some(Outcome::Failed), ..Default::default() })
     });
     w.fake.take_log();

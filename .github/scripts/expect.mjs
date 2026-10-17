@@ -3,21 +3,21 @@
 // recursively, with arrays matched element by element, as in vitest.
 import assert from 'node:assert/strict'
 import { format } from 'node:util'
-import { it as test } from 'node:test'
+import { describe as suite, it as test } from 'node:test'
 
-export { afterEach, beforeEach, describe } from 'node:test'
+export { afterEach, beforeEach } from 'node:test'
 
-// it.each(rows)(title, fn): each row spread into fn (a non-array row passed alone), the title formatted with
-// printf-style placeholders (%s, %j, ...) from the row's values.
-export const it = Object.assign((...a) => test(...a), {
-  each: (rows) => (title, fn) => {
-    for (const row of rows) {
-      const args = Array.isArray(row) ? row : [row]
-      const n = (title.match(/%[sdifjoO]/g) || []).length
-      test(format(title, ...args.slice(0, n)), () => fn(...args))
-    }
-  },
-})
+// it.each(rows)(title, fn) and describe.each(rows)(title, fn): each row spread into fn (a non-array row passed alone),
+// the title formatted with printf-style placeholders (%s, %j, ...) from the row's values.
+const each = (run) => (rows) => (title, fn) => {
+  for (const row of rows) {
+    const args = Array.isArray(row) ? row : [row]
+    const n = (title.match(/%[sdifjoO]/g) || []).length
+    run(format(title, ...args.slice(0, n)), () => fn(...args))
+  }
+}
+export const it = Object.assign((...a) => test(...a), { each: each(test) })
+export const describe = Object.assign((...a) => suite(...a), { each: each(suite) })
 
 class Asymmetric {
   constructor(test, text) {
@@ -53,9 +53,10 @@ function equals(a, b, subset) {
 
 const has = (v, x) => (typeof v === 'string' ? v.includes(x) : [...v].some((y) => Object.is(y, x)))
 
-function matchers(actual, negate) {
+// note: expect's optional second argument, shown before a failure's own message.
+function matchers(actual, negate, note) {
   const check = (ok, message) => {
-    if (ok === negate) assert.fail(`expected ${show(actual)} ${negate ? 'not ' : ''}${message}`)
+    if (ok === negate) assert.fail(`${note ? `${note}: ` : ''}expected ${show(actual)} ${negate ? 'not ' : ''}${message}`)
   }
   return {
     toBe: (x) => check(Object.is(actual, x), `to be ${show(x)}`),
@@ -112,7 +113,9 @@ const settled = (promise, rejects) =>
     },
   )
 
-export function expect(actual) {
-  return { ...matchers(actual, false), not: matchers(actual, true), resolves: settled(actual, false), rejects: settled(actual, true) }
+export function expect(actual, note) {
+  return { ...matchers(actual, false, note), not: matchers(actual, true, note), resolves: settled(actual, false), rejects: settled(actual, true) }
 }
 expect.stringMatching = (re) => new Asymmetric((v) => typeof v === 'string' && re.test(v), `stringMatching(${re})`)
+expect.arrayContaining = (items) =>
+  new Asymmetric((v) => Array.isArray(v) && items.every((x) => v.some((y) => equals(y, x, false))), `arrayContaining(${show(items)})`)

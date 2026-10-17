@@ -51,10 +51,10 @@ critical: the standard criteria plus actors and data involved, compliance or pol
 constraints, rollout and rollback expectations.
 Every tier: start this run before investigating the task, and make the estimate its first \
 update: how hard the work is from the task alone, against .bd/rubric.md (Complexity: size, \
-ambiguity, novelty, risk, breadth), on the run (the parent of this step), so it measures how well \
+ambiguity, novelty, risk, breadth; count the tests and verification it will need, not just the code), on the run (the parent of this step), so it measures how well \
 work is sized up front. bd can only order it against bd events, so investigation before the run \
 started can't be checked: don't do it. \
-`bd update <run> --set-metadata 'complexity_estimate={"rubric":2,"score":3,"factors":"...","by":"<your bd actor>"}'`. \
+`bd update <run> --set-metadata 'complexity_estimate={"rubric":3,"score":3,"factors":"...","by":"<your bd actor>"}'`. \
 Keep it in that metadata only, out of comments and close reasons: the judge must score complexity \
 without seeing it."""
 acceptance_criteria = """
@@ -172,9 +172,19 @@ this run's review step as reviewStep (its planner reads this run's requirements 
 settled input, and its review-fix loop is recorded on that step) and tier={{tier}}. It comments \
 the findings whose fix a re-review confirmed and returns them as confirmedFixes, and returns filed \
 findings its triage dropped in dropped (with bdId): close those after closing this step and verify \
-(bd won't close a child of a blocked step). The controller (whoever starts the workflow) sets the \
-coding agents' model and effort with model and effort (AGENTS.md "Delegating to agents")."""
-acceptance_criteria = "Evidence: close reason names the commit(s); a comment maps each requirement (and mitigation) to its code and test."
+(bd won't close a child of a blocked step). The workflow is the Copilot CLI extension or the \
+Claude Code workflow (`.claude/workflows/plan-implement-review.js`), whichever harness runs the \
+session. Shadow review is required: every run adds reviewer-catch data. The Copilot extension runs \
+its default shadows; in Claude Code always pass shadowReview, by default { model: "sonnet", \
+effort: "medium" } (a level below the gating reviewers; pick another model and effort when \
+`node .github/scripts/reviewer-catch.mjs` flags its cell as thin). Shadow findings are data only: \
+never fix, file or triage them. Work done outside the workflow still reviews through it \
+(skipImplement with plan, workdir and baseline, plus shadowReview; see review). Keep the \
+workflow's result for the score step. The controller (whoever starts the workflow) sets the \
+coding agents' model and effort with model and effort (AGENTS.md "Delegating to agents", including \
+the coder exploration quota: record `exploration` metadata on the run before implementing when it \
+applies)."""
+acceptance_criteria = "Evidence: close reason names the commit(s); a comment maps each requirement (and mitigation) to its code and test, and names the shadow reviewer model(s) and effort(s) with the shadowFindings count per round."
 
 [[steps]]
 id = "verify"
@@ -199,6 +209,13 @@ description = """
 small: review the diff (`/code-review`).
 standard: independent review by someone other than the implementer, a fresh reviewer agent or a person.
 critical: independent code and security review (`/code-review` at high effort plus `/security-review`, or a person).
+Every tier: the gating review (the pass the tier line above names) runs on the strongest model class \
+(AGENTS.md "Delegating to agents") and needs a shadow review, and that pass and its shadow run in \
+plan-implement-review so they are journaled for `node .github/scripts/reviewer-catch.mjs`. When the \
+work was done outside the workflow, run the review through it anyway: skipImplement with plan, \
+workdir and baseline (the commit the work started from), plus shadowReview and this step as \
+reviewStep. Don't run the gating review or its shadow as plain subagents. Shadow findings are data \
+only, never filed or fixed; record the shadow model, effort and finding count in the round's comment.
 Review-fix loop, recorded on this step (the `plan-implement-review` workflow with reviewStep does it):
 1. File each blocker or serious finding as a child issue: \
 `bd create "Finding: ..." -t bug --parent <step> -l severity:<blocker|serious> -d "..."`.
@@ -210,7 +227,8 @@ Minor findings become follow-ups (`bd create ... --dep discovered-from:<step>`);
 findings go in a comment. bd refuses to close this step while a finding is open: unresolved \
 findings wait for a person, never `--force`."""
 acceptance_criteria = """
-Evidence: a comment per review round with who reviewed and the counts; every blocker/serious \
+Evidence: a comment per review round with who reviewed and the counts, the shadow reviewer's \
+model, effort and finding count included; every blocker/serious \
 finding a closed child issue with its fix or rejection reason."""
 
 [[steps]]
@@ -276,12 +294,15 @@ title = "Score: {{task}}"
 type = "task"
 needs = ["review", "signoff", "spec"]
 description = """
+Required in every tier and the last work of the run: score only once every step before it \
+(review, spec, signoff) and every finding is closed and the work is committed (critical: merged), so the judge sees the finished \
+run. No run closes unscored, and this step never closes without the run's score_judge. \
 Score how well the agent work on this run went, against .bd/rubric.md: run the `score-issue` \
 workflow with issue=<this run> (the parent of this step) and actor=<your bd actor>; pass range \
 (the commits from implement's close reason), result (when plan-implement-review did the work) and \
-context (anything a person had to correct). The judge is gpt-6-astra: do not score it yourself. It \
-stores the draft as the run's score_judge metadata (with the judged complexity) and comments its \
-reasoning on the run, with the gap from the complexity estimate; then it traces which agents did \
+context (anything a person had to correct). The judge is gpt-6-astra (Copilot CLI) or fable \
+(Claude Code): do not score it yourself. The draft is stored as the run's score_judge metadata (with the judged complexity), with the judge's comment of its \
+reasoning on the run and the gap from the complexity estimate; then the workflow traces which agents did \
 each step, with which model and effort, into the run's work metadata (.github/scripts/trace-run.mjs)."""
 acceptance_criteria = "Evidence: the run's score_judge and work metadata and the judge's comment; the close reason gives the overall score, complexity (and the estimate) and confidence, and names any session the trace could not find."
 

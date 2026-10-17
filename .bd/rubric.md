@@ -1,8 +1,8 @@
 # Agent work rubric
 
-Version: 2
+Version: 3
 
-How well an agent did on a bd issue (or a playbook run and its steps), scored 1 to 5 on each dimension below, plus an overall score, and how hard the work was (Complexity, kept apart from the score). The `score-issue` workflow has a judge (`gpt-6-astra`) judge the work against this rubric and stores a draft, which becomes the score as it is or, when a person confirms scores (`score_confirm=person` on a `change` run, `confirm=person` on a `score` run), once they confirm or adjust it. Bump the version when an anchor changes meaning, so scores stay comparable.
+How well an agent did on a bd issue (or a playbook run and its steps), scored 1 to 5 on each dimension below, plus an overall score, and how hard the work was (Complexity, kept apart from the score). The `score-issue` workflow has a judge (`gpt-6-astra` in the Copilot CLI extension, `fable` in the Claude Code workflow) judge the work against this rubric and stores a draft, which becomes the score as it is or, when a person confirms scores (`score_confirm=person` on a `change` run, `confirm=person` on a `score` run), once they confirm or adjust it. Bump the version when an anchor changes meaning, so scores stay comparable.
 
 ## Scale
 
@@ -88,13 +88,15 @@ How hard the work was, whoever did it and however it went. It is not a dimension
 
 Anchors:
 
-- 5: novel design across many parts, high risk, or research needed before it could be built.
-- 4: hard; cross-cutting, ambiguous or platform-dependent, several interacting parts, real regression risk.
-- 3: moderate; several files or a non-obvious approach, real decisions, tests beyond the happy path.
-- 2: simple; a small change in one place with clear requirements and a known pattern.
-- 1: trivial; mechanical or a one-line fix, no decisions.
+- 5: novel; a new subsystem or protocol, several bundled features across crates, high risk (stored data, security, the wire protocol), or research needed before it could be built (bd-h7oc.1.1: `bd publish`, staging, validation and client approval of server playbooks).
+- 4: hard; cross-cutting, ambiguous or platform-dependent, several interacting parts, real regression risk; or new ground (an undocumented format, a matching heuristic); or one change branching over platforms or modes that interact (Linux, macOS and Windows; local and remote workspaces; old and new clients or servers) (bd-sync-2bt.1: pseudo-terminal tests on macOS; bd-h7oc.2.1: a server-side mode every client path must honor; bd-50hs.1.1: a command group over a new engine module).
+- 3: moderate; several files or a non-obvious approach, real decisions (choosing among offered fixes counts as one), tests beyond the happy path (a new harness, end-to-end remote tests, timing, platform branches), a behavior-preserving refactor of stateful code, or transaction, event-order or readiness subtleties (bd-9373.1: reopen's hierarchy rule; bd-u6rr.1: Claude Code transcripts and honest timing; bd-sync-6rr.1: not revealing a workspace's existence).
+- 2: simple; a small change in one place with clear requirements and a known pattern, including test-only additions that copy an existing pattern, with at most one obvious decision (bd-rta8.1: hyphenated prefixes in one regex; bd-tcz6.1: one more lookup key over an existing pattern).
+- 1: trivial; no decision and nothing new to verify (a typo, a comment, a config value); rare in a change run.
 
-The agent estimates it first thing at the requirements step, from the task alone and before reading code or investigating, as the run's `complexity_estimate` metadata: `{"rubric": 2, "score": 3, "factors": "size: ...; novelty: ...", "by": "<actor>"}`. The judge scores it at the end; `score-issue` shows it the issue without the estimate (nor the work trace or earlier scores) and tells it not to look them up. The comment gives the gap (judged minus estimate). A large gap is worth reading: underestimated work tends to explain rework.
+Version 3 (2026-10-17) sharpened these anchors with real runs (adopted from the sibling squid project's v3, with bd-sync examples judged under v2); bands judged under v2 are not directly comparable, so the reports split them by version.
+
+The agent estimates it first thing at the requirements step, from the task alone and before reading code or investigating (count the tests and verification the change will need, not just the code: on bd-sync, estimates have run a band low mostly by leaving out the tests, the platforms and the remote paths), as the run's `complexity_estimate` metadata: `{"rubric": 3, "score": 3, "factors": "size: ...; novelty: ...", "by": "<actor>"}`. The judge scores it at the end; `score-issue` shows it the issue without the estimate (nor the work trace or earlier scores) and tells it not to look them up. The comment gives the gap (judged minus estimate). A large gap is worth reading: underestimated work tends to explain rework.
 
 ## Judging
 
@@ -109,7 +111,7 @@ Scores live in the scored issue's metadata (for a playbook run, the run issue), 
 
 ```json
 {
-	"rubric": 2,
+	"rubric": 3,
 	"overall": 4,
 	"dims": {
 		"correctness": 4,
@@ -124,11 +126,11 @@ Scores live in the scored issue's metadata (for a playbook run, the run issue), 
 }
 ```
 
-- `score_judge`: the judge's draft (`by` is the judge model, `gpt-6-astra`, plus `confidence`); the workflow also comments its reasoning on the issue, with the complexity gap and a summary of the work trace.
+- `score_judge`: the judge's draft (`by` is the judge model, `gpt-6-astra` or `fable`, plus `confidence`); the workflow also comments its reasoning on the issue, with the complexity gap and a summary of the work trace.
 - `score`: the confirmed score. By default the judge's draft is accepted as it is: copied without `confidence`, with `by` set to `judge`. A person may set it instead, behind a human gate when the run asks for one, or later over an accepted draft. To agree, copy the draft with `by` set to the person; to adjust, change the numbers and comment why, starting the comment with `Score adjusted:` (the judge is not shown it on a rerun):
 
   ```bash
-  bd update <issue> --set-metadata 'score={"rubric":2,"overall":4,"dims":{...},"complexity":3,"by":"Quang Le"}'
+  bd update <issue> --set-metadata 'score={"rubric":3,"overall":4,"dims":{...},"complexity":3,"by":"Quang Le"}'
   ```
 
 - `complexity_estimate`: the agent's estimate from the requirements step (Complexity).

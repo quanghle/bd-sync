@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { aggregate, costOf, joinRuns, overlaps, PRICES, render, roleOf, untracedWhy } from './calibrate.mjs'
+import { aggregate, coderOf, costOf, joinRuns, overlaps, PRICES, render, roleOf, untracedWhy } from './calibrate.mjs'
 
 // credits: the AI credits a request cost; left out, a trace stored without them.
 const tokens = (input, output, cache_read = 0, cache_write = 0, credits) => ({ input, output, cache_read, cache_write, ...(credits == null ? {} : { nano_aiu: credits * 1e9 }) })
@@ -35,7 +35,50 @@ describe('roleOf', () => {
 		[{ kind: 'workflow', label: 'score-issue:trace' }, 'mechanical'],
 		[{ kind: 'subagent', label: 'general-purpose: Independent review of scoring trace' }, 'reviewer'],
 		[{ kind: 'subagent', label: 'Explore: find the tokens file' }, 'other'],
+		// A description's role prefix, after Claude Code's agentType or Copilot's agentName.
+		[{ kind: 'subagent', label: 'general-purpose: coder: fit-all' }, 'coder'],
+		[{ kind: 'subagent', label: 'general-purpose: Reviewer: review r1 bd-x.1' }, 'reviewer'],
+		[{ kind: 'subagent', label: 'Explore: research: find the tokens file' }, 'research'],
+		[{ kind: 'subagent', label: 'summary: digest the journal' }, 'summary'],
+		[{ kind: 'subagent', label: 'general-purpose: mechanical: run the tests' }, 'mechanical'],
+		[{ kind: 'subagent', label: 'Plan: planner: z' }, 'planner'],
+		[{ kind: 'subagent', label: 'plugin:agent: coder: a' }, 'coder'],
+		[{ kind: 'subagent', label: 'task: mechanical: run cargo test' }, 'mechanical'],
+		[{ kind: 'subagent', label: 'explore: research: where is the lease' }, 'research'],
+		[{ kind: 'subagent', label: 'code-review: reviewer: diff' }, 'reviewer'],
+		// A role word anywhere else is not a prefix.
+		[{ kind: 'subagent', label: 'general-purpose: Fix the planner: bug' }, 'other'],
+		[{ kind: 'subagent', label: 'general-purpose: Fix: coder: x' }, 'other'],
+		[{ kind: 'subagent', label: 'Fix: coder: x' }, 'other'],
+		// A workflow label keeps its workflow role, whatever its agent's description.
+		[{ kind: 'workflow', label: 'plan-implement-review:coder: fix' }, 'coder'],
 	])('%o is a %s', (a, role) => expect(roleOf(a)).toBe(role))
+})
+
+describe('coderOf', () => {
+	it('picks the model and effort with the most requests among coder agents, workflow roles and prefixed subagents', () => {
+		const w = work(
+			agent('workflow', 'plan-implement-review:coder:S1', 10, tokens(1, 1), 'claude-sonnet-5.5', 'medium'),
+			agent('subagent', 'general-purpose: coder: x', 4, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('workflow', 'plan-implement-review:implement', 8, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('workflow', 'plan-implement-review:review:code:r0', 50, tokens(1, 1), 'claude-opus-5.5', 'high'),
+		)
+		expect(coderOf(w)).toEqual({ model: 'claude-opus-5.5', effort: 'high', requests: 12 })
+	})
+
+	it('counts one model named both ways (Claude Code and Copilot ids) as one coder', () => {
+		const w = work(
+			agent('subagent', 'general-purpose: coder: a', 5, tokens(1, 1), 'claude-opus-5-5', 'high'),
+			agent('workflow', 'plan-implement-review:implement', 4, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('workflow', 'plan-implement-review:coder:S1', 7, tokens(1, 1), 'claude-sonnet-5.5', 'high'),
+		)
+		expect(coderOf(w)).toEqual({ model: 'claude-opus-5.5', effort: 'high', requests: 9 })
+	})
+
+	it('is null without a coder agent or a trace', () => {
+		expect(coderOf(work(agent('main', 'main', 9, tokens(1, 1)), agent('subagent', 'Explore: find it', 3, tokens(1, 1))))).toBeNull()
+		expect(coderOf(null)).toBeNull()
+	})
 })
 
 describe('costOf', () => {
@@ -175,7 +218,53 @@ describe('joinRuns', () => {
 		expect(rows[0]).toMatchObject({ traced: null, untraced: 'sessions not on this machine' })
 		expect(traced).toEqual(['squid-a.1'])
 	})
+
+	it("carries the rubric version of the score it reports, and the estimate's", () => {
+		const byId = Object.fromEntries(
+			joinRuns(
+				[
+					// Confirmed under v3 though the judge used v2: the confirmed score's version.
+					run('bd-v.1', { score: { overall: 4, complexity: 3, rubric: 3 }, score_judge: { overall: 3, complexity: 3, rubric: 2 }, complexity_estimate: { score: 3, rubric: 3 } }),
+					// A draft only: the judge's version.
+					run('bd-v.2', { score_judge: { overall: 3, complexity: 2, rubric: 2 }, complexity_estimate: { score: 2, rubric: 1 } }),
+					// Accepted: the judge's draft copied into score, version and all.
+					run('bd-v.3', { score: { overall: 4, complexity: 2, rubric: 3, by: 'judge' }, score_judge: { overall: 4, complexity: 2, rubric: 3 } }),
+					// No version anywhere, or not an integer.
+					run('bd-v.4', { score_judge: { overall: 3, complexity: 2 }, complexity_estimate: { score: 2 } }),
+					run('bd-v.5', { score_judge: { overall: 3, complexity: 2, rubric: '2' }, complexity_estimate: { score: 2, rubric: 2.5 } }),
+					// A score without a version is unknown, with no fallback to the judge's.
+					run('bd-v.6', { score: { overall: 4, complexity: 3 }, score_judge: { overall: 3, complexity: 3, rubric: 2 } }),
+				],
+				{ followUpsOf: () => [], traceOf: () => ({ work: null, why: 'no agent sessions' }) },
+			).map((r) => [r.id, [r.rubric, r.estimateRubric, r.overallFrom]]),
+		)
+		expect(byId).toEqual({
+			'bd-v.1': [3, 3, 'person'],
+			'bd-v.2': [2, 1, 'judge'],
+			'bd-v.3': [3, null, 'accepted'],
+			'bd-v.4': [null, null, 'judge'],
+			'bd-v.5': [null, null, 'judge'],
+			'bd-v.6': [null, null, 'person'],
+		})
+	})
+
+	it("puts each run's coder and exploration marker on its row", () => {
+		expect(rows.map((r) => [r.coder, r.exploration])).toEqual([
+			[null, null],
+			[null, null],
+		])
+		const exploration = { coder: 'sonnet/medium', rule: 'sha1-0-3' }
+		const [row] = joinRuns([run('bd-e.1', { exploration, work: work(agent('workflow', 'plan-implement-review:coder:S1', 6, tokens(1, 1), 'claude-sonnet-5.5', 'medium')) })], {
+			followUpsOf: () => [],
+			traceOf: () => ({ work: null, why: 'unused' }),
+		})
+		expect(row).toMatchObject({ exploration, coder: { model: 'claude-sonnet-5.5', effort: 'medium', requests: 6 } })
+		expect(JSON.parse(JSON.stringify(row)).exploration).toEqual(exploration)
+	})
 })
+
+// A run judged complexity 2, as aggregate reads it.
+const scoredRow = (id, overall, serious, w, extra = {}) => ({ id, tier: 'small', estimate: 2, judged: 2, confirmedComplexity: null, overall, findings: { serious, minor: 0, followUps: 0 }, work: w, timing: null, ...extra })
 
 describe('aggregate and render', () => {
 	const rows = [
@@ -223,12 +312,56 @@ describe('aggregate and render', () => {
 	const agg = aggregate(rows)
 
 	it('measures the estimate gap against the confirmed complexity, else the judged one', () => {
-		expect(agg.gap).toMatchObject({ runs: 3, distribution: [[0, 1], [1, 2]], byTier: { small: { runs: 2, mean: 0.5 }, standard: { runs: 1, mean: 1 } } })
-		expect(agg.gap.mean).toBeCloseTo(2 / 3)
+		// Rows without rubric versions count under unknown.
+		expect(agg.gap).toMatchObject({
+			mixed: 0,
+			byRubric: [{ rubric: null, runs: 3, distribution: [[0, 1], [1, 2]], byTier: { small: { runs: 2, mean: 0.5 }, standard: { runs: 1, mean: 1 } } }],
+		})
+		expect(agg.gap.byRubric[0].mean).toBeCloseTo(2 / 3)
 	})
 
 	it('groups scores by complexity band', () => {
-		expect(agg.bands).toEqual({ 2: { runs: 1, overall: 4, serious: 0 }, 3: { runs: 1, overall: 4, serious: 0 }, 4: { runs: 1, overall: 3, serious: 2 } })
+		expect(agg.bands).toEqual([
+			{ rubric: null, complexity: 2, runs: 1, overall: 4, serious: 0 },
+			{ rubric: null, complexity: 3, runs: 1, overall: 4, serious: 0 },
+			{ rubric: null, complexity: 4, runs: 1, overall: 3, serious: 2 },
+		])
+	})
+
+	it('puts runs without a coder agent apart from untraced ones in the score by coder', () => {
+		expect(agg.coders).toEqual([
+			{ rubric: null, complexity: 2, coder: 'untraced', model: null, effort: null, runs: 1, overall: 4, serious: 0, exploration: 0 },
+			{ rubric: null, complexity: 3, coder: 'no coder agent', model: null, effort: null, runs: 1, overall: 4, serious: 0, exploration: 0 },
+			{ rubric: null, complexity: 4, coder: 'no coder agent', model: null, effort: null, runs: 1, overall: 3, serious: 2, exploration: 0 },
+		])
+	})
+
+	it('scores each complexity band by coder, counting exploration runs', () => {
+		const explored = [
+			scoredRow('e1', 4, 0, work(agent('workflow', 'plan-implement-review:coder:S1', 5, tokens(1, 1, 0, 0, 10), 'claude-sonnet-5.5', 'medium')), { exploration: { coder: 'sonnet/medium', rule: 'sha1-0-3' } }),
+			scoredRow('e2', 3, 1, work(agent('subagent', 'general-purpose: coder: x', 5, tokens(1, 1), 'claude-opus-5-5', 'high'))),
+			scoredRow('e3', 5, 0, null),
+		]
+		const a = aggregate(explored)
+		expect(a.coders).toEqual([
+			{ rubric: null, complexity: 2, coder: 'claude-opus-5.5/high', model: 'claude-opus-5.5', effort: 'high', runs: 1, overall: 3, serious: 1, exploration: 0 },
+			{ rubric: null, complexity: 2, coder: 'claude-sonnet-5.5/medium', model: 'claude-sonnet-5.5', effort: 'medium', runs: 1, overall: 4, serious: 0, exploration: 1 },
+			{ rubric: null, complexity: 2, coder: 'untraced', model: null, effort: null, runs: 1, overall: 5, serious: 0, exploration: 0 },
+		])
+		const md = render(explored, a)
+		expect(md).toContain('## Score by coder')
+		expect(md).toContain('| unknown | 2 | claude-sonnet-5.5/medium | 1 | 4 | 0 | 1 |')
+		expect(md).toContain('exploration counts runs marked by the coder exploration quota')
+	})
+
+	it('splits the score by coder by rubric version, so one band under v2 and v3 stays apart', () => {
+		const opus = work(agent('subagent', 'general-purpose: coder: x', 5, tokens(1, 1), 'claude-opus-5-5', 'high'))
+		const a = aggregate([scoredRow('v2', 4, 0, opus, { rubric: 2 }), scoredRow('v3', 3, 1, opus, { rubric: 3 })])
+		expect(a.coders.map((x) => [x.rubric, x.complexity, x.coder, x.runs])).toEqual([
+			[2, 2, 'claude-opus-5.5/high', 1],
+			[3, 2, 'claude-opus-5.5/high', 1],
+		])
+		expect(render([], a)).toContain('| v3 | 2 | claude-opus-5.5/high | 1 | 3 | 1 | 0 |')
 	})
 
 	it('costs roles by model and effort, keeping traces without credits apart', () => {
@@ -254,10 +387,11 @@ describe('aggregate and render', () => {
 	})
 
 	it('puts cost and time by complexity band, cost and agent time over traced runs only', () => {
-		expect(agg.bandTimes[2]).toEqual({ runs: 1, traced: 0, cost: null, agentMs: null, humanWaitMs: 10 * 60_000, elapsedMs: 60 * 60_000 })
-		expect(agg.bandTimes[3]).toMatchObject({ runs: 1, traced: 1, agentMs: 2 * 60_000, humanWaitMs: 0, elapsedMs: 30 * 60_000 })
-		expect(agg.bandTimes[3].cost).toBeCloseTo(agg.runCosts.r1.cost)
-		expect(agg.bandTimes[4]).toMatchObject({ runs: 1, traced: 1, agentMs: 4.5 * 60_000 + 45_000, humanWaitMs: null, elapsedMs: null })
+		const [two, three, four] = agg.bandTimes
+		expect(two).toEqual({ rubric: null, complexity: 2, runs: 1, traced: 0, cost: null, agentMs: null, humanWaitMs: 10 * 60_000, elapsedMs: 60 * 60_000 })
+		expect(three).toMatchObject({ complexity: 3, runs: 1, traced: 1, agentMs: 2 * 60_000, humanWaitMs: 0, elapsedMs: 30 * 60_000 })
+		expect(three.cost).toBeCloseTo(agg.runCosts.r1.cost)
+		expect(four).toMatchObject({ complexity: 4, runs: 1, traced: 1, agentMs: 4.5 * 60_000 + 45_000, humanWaitMs: null, elapsedMs: null })
 	})
 
 	it('times steps across runs: mean elapsed over runs that closed it, mean agent time over traced ones', () => {
@@ -296,6 +430,7 @@ describe('aggregate and render', () => {
 			'## Runs',
 			'## Complexity: estimate vs judged',
 			'## Score by complexity',
+			'## Score by coder',
 			'## Cost and time by complexity',
 			'## Time by step',
 			'## Cost and time by role, model and effort',
@@ -303,7 +438,9 @@ describe('aggregate and render', () => {
 		])
 			expect(md).toContain(heading)
 		expect(md).toContain('Costs are Copilot AI credits as USD (1 credit = $0.01)')
-		expect(md).toContain('| r1 | small | 2 | 3 | 1 | 4 (draft) |')
+		expect(md).toContain('| r1 | small | 2 | 3 | 1 | 4 (draft) | – |')
+		expect(md).toContain('| unknown | 2 | 1 | 4 | 0 |')
+		expect(md).toContain('Mixed versions: 0 runs')
 		expect(md).toContain('none: no agent sessions')
 		expect(md).toContain('+ 2 req unpriced')
 	})
@@ -323,8 +460,93 @@ describe('aggregate and render', () => {
 
 	it('says when there is nothing to time', () => {
 		const md = render([], aggregate([]))
+		expect(md).toContain('No run has both an estimate and a judged complexity yet.')
+		expect(md).toContain('No scored run has a complexity yet.')
 		expect(md).toContain('No run has a complexity yet.')
 		expect(md).toContain('No closed steps.')
+	})
+})
+
+// A run judged at `complexity` under rubric `rubric`, estimated at 2 under `estimateRubric`.
+const vrow = (id, rubric, estimateRubric, complexity, extra = {}) => ({
+	id,
+	tier: 'small',
+	estimate: 2,
+	judged: complexity,
+	confirmedComplexity: null,
+	overall: 4,
+	findings: { serious: 0, minor: 0, followUps: 0 },
+	work: null,
+	timing: timing(10 * 60_000, 0),
+	rubric,
+	estimateRubric,
+	...extra,
+})
+
+describe('complexity tables per rubric version', () => {
+	// Out of order on purpose: unknown and v3 first.
+	const rows = [vrow('r-unknown', null, null, 3), vrow('r-v3', 3, 3, 3, { overall: 3 }), vrow('r-mixed', 3, 2, 3, { overall: 5, findings: { serious: 1, minor: 0, followUps: 0 } }), vrow('r-v2', 2, 2, 3)]
+	const agg = aggregate(rows)
+
+	it('splits score and cost/time bands by version, sorted v2, v3, unknown, with a mixed run under its judged version', () => {
+		expect(agg.bands).toEqual([
+			{ rubric: 2, complexity: 3, runs: 1, overall: 4, serious: 0 },
+			{ rubric: 3, complexity: 3, runs: 2, overall: 4, serious: 1 },
+			{ rubric: null, complexity: 3, runs: 1, overall: 4, serious: 0 },
+		])
+		expect(agg.bandTimes.map((x) => [x.rubric, x.complexity, x.runs])).toEqual([
+			[2, 3, 1],
+			[3, 3, 2],
+			[null, 3, 1],
+		])
+	})
+
+	it('sorts bands by version, then complexity', () => {
+		const a = aggregate([vrow('a', 3, 3, 2), vrow('b', 2, 2, 4), vrow('c', null, null, 1), vrow('d', 2, 2, 2)])
+		expect(a.bands.map((x) => [x.rubric, x.complexity])).toEqual([
+			[2, 2],
+			[2, 4],
+			[3, 2],
+			[null, 1],
+		])
+	})
+
+	it("leaves a run whose estimate and judged versions differ out of every version's gap, and counts it as mixed", () => {
+		expect(agg.gap.mixed).toBe(1)
+		expect(agg.gap.byRubric.map((x) => [x.rubric, x.runs])).toEqual([
+			[2, 1],
+			[3, 1],
+			[null, 1],
+		])
+	})
+
+	it('counts an estimate of unknown version against a known judged version as mixed', () => {
+		const a = aggregate([vrow('a', 2, null, 3), vrow('b', null, 2, 3)])
+		expect(a.gap).toEqual({ mixed: 2, byRubric: [] })
+		expect(a.bands.map((x) => x.rubric)).toEqual([2, null])
+	})
+
+	it("renders a leading rubric column, the run's versions and the mixed count", () => {
+		const md = render(rows, agg)
+		expect(md).toContain('| run | tier | estimate | complexity | gap | overall | rubric | serious |')
+		expect(md).toContain('| r-mixed | small | 2 | 3 | 1 | 5 | v3 (estimate v2) |')
+		expect(md).toContain('| r-v2 | small | 2 | 3 | 1 | 4 | v2 |')
+		expect(md).toContain('| r-unknown | small | 2 | 3 | 1 | 4 | – |')
+		expect(md).toContain('| rubric | runs | mean gap | distribution | by tier |')
+		expect(md).toContain('| v2 | 1 | 1 | +1: 1 | small 1 over 1 |')
+		expect(md).toContain('| unknown | 1 | 1 | +1: 1 | small 1 over 1 |')
+		expect(md).toContain('Mixed versions: 1 run whose estimate and judged complexity used different rubric versions, counted in neither.')
+		expect(md).toContain('| rubric | complexity | runs | mean overall | serious findings |')
+		expect(md).toContain('| v3 | 3 | 2 | 4 | 1 |')
+		expect(md).toContain('| rubric | complexity | runs | traced | mean cost (usd) | mean agent time | mean human wait | mean elapsed |')
+		expect(md).toContain('| unknown | 3 | 1 | 0 | – | – | 0s | 10m 00s |')
+		expect(md).toContain('Bands are per rubric version')
+	})
+
+	it('shows the mixed count even when no run has matching versions', () => {
+		const md = render([], aggregate([vrow('a', 2, null, 3)]))
+		expect(md).toContain('Mixed versions: 1 run whose')
+		expect(md).not.toContain('| rubric | runs | mean gap |')
 	})
 })
 
@@ -423,8 +645,8 @@ describe('calibrate CLI', () => {
 			throw new Error(`exit ${e.status}: ${e.stderr}`, { cause: e })
 		}
 		expect(out).toContain('3 change playbook runs')
-		expect(out).toMatch(/\| squid-a\.1 \|(.*\|){7} 0 \|/)
-		expect(out).toMatch(/\| squid-b\.1 \|(.*\|){7} \? \|/)
+		expect(out).toMatch(/\| squid-a\.1 \|([^|]*\|){8} 0 \|/)
+		expect(out).toMatch(/\| squid-b\.1 \|([^|]*\|){8} \? \|/)
 		expect(out).toContain('none: no agent sessions')
 		const calls = readFileSync(join(bin, 'calls'), 'utf8')
 		// a.1 and b.1 have no agent sessions, and c.1 already has a stored trace: nothing to write.

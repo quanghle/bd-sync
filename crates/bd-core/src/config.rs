@@ -51,6 +51,11 @@ pub const KNOWN: &[(&str, &str, &str)] = &[
     ("claim.pools", "", "Comma-separated pool assignees anyone may claim from"),
     ("types.custom", "", "Comma-separated extra issue types"),
     ("experimental.features", "", "Comma-separated experimental features turned on in this workspace (known: specs)"),
+    (
+        "experimental.specs.since",
+        "",
+        "When feature specs were last turned on (set then; a time, to backdate): bd spec drift checks work since",
+    ),
     ("durability", "normal", "SQLite synchronous level: off | normal | full"),
     ("events.retain_days", "0", "Prune events older than N days after writes (0 = keep)"),
     ("events.retain_rows", "0", "Keep at most N events (0 = keep all)"),
@@ -100,8 +105,12 @@ pub fn get_or_default(conn: &Connection, key: &str) -> Result<String> {
 }
 
 /// Validate and store a config value; records a `config_set` event.
+/// Turning feature specs on (`experimental.features` naming `specs` where
+/// it did not) also sets `experimental.specs.since` to now, with its own
+/// event; turning them off keeps it.
 pub fn set(ctx: &mut WriteCtx<'_>, key: &str, value: &str) -> Result<()> {
-    let value = validate(key, value)?;
+    let value =
+        if key == crate::specs::SINCE_KEY { validate_time(key, value, ctx.now())? } else { validate(key, value)? };
     let previous = get(ctx.conn(), key)?;
     if previous.as_deref() == Some(value.as_str()) {
         return Ok(());
@@ -112,7 +121,24 @@ pub fn set(ctx: &mut WriteCtx<'_>, key: &str, value: &str) -> Result<()> {
         )?
         .execute(params![key, value])?;
     ctx.emit("config_set", None, json!({ "key": key, "value": value, "previous": previous }))?;
+    if key == "experimental.features" {
+        let names = |v: &str| split_list(v).into_iter().any(|n| n == crate::specs::FEATURE);
+        if names(&value) && !previous.as_deref().is_some_and(names) {
+            let now = ctx.now().to_rfc3339();
+            set(ctx, crate::specs::SINCE_KEY, &now)?;
+        }
+    }
     Ok(())
+}
+
+/// A time config value as bd parses times in filters (`2026-01-15`, RFC
+/// 3339, `30d` for 30 days ago), not in the future, stored as RFC 3339.
+fn validate_time(key: &str, value: &str, now: crate::time::Timestamp) -> Result<String> {
+    let t = crate::time::parse_filter_time(value, now).map_err(|e| Error::invalid(format!("{key}: {e}")))?;
+    if t > now {
+        return Err(Error::invalid(format!("{key}: {} is in the future", t.to_rfc3339())));
+    }
+    Ok(t.to_rfc3339())
 }
 
 pub fn unset(ctx: &mut WriteCtx<'_>, key: &str) -> Result<bool> {
@@ -204,6 +230,8 @@ fn validate(key: &str, value: &str) -> Result<String> {
             }
             Ok(v.to_string())
         }
+        // Parsed against the clock by `set`; here, only an RFC 3339 time.
+        "experimental.specs.since" => Ok(crate::time::Timestamp::parse_rfc3339(v)?.to_rfc3339()),
         "durability" => {
             Durability::parse(v)?;
             Ok(v.to_ascii_lowercase())

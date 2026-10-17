@@ -222,6 +222,27 @@ pub fn diagnose(store: &mut Store, fix: bool, full: bool) -> Result<DoctorReport
         )
     });
 
+    // Specs left behind when the experimental feature was turned off: nothing keeps them current.
+    let conn = store.connection();
+    let specs_on = crate::specs::is_on(conn)?;
+    let open_specs = if specs_on { 0 } else { crate::specs::open_count(conn)? };
+    checks.push(if open_specs == 0 {
+        check(
+            "specs_while_off",
+            Severity::Ok,
+            if specs_on { "feature specs are on" } else { "feature specs are off, and no open spec is left" },
+        )
+    } else {
+        check(
+            "specs_while_off",
+            Severity::Warn,
+            format!(
+                "feature specs are off, but {open_specs} open spec(s) exist: re-enable them \
+                 (bd config set experimental.features specs) or retire them"
+            ),
+        )
+    });
+
     let ok = checks.iter().all(|c| c.severity != Severity::Error || c.fixed);
     Ok(DoctorReport { ok, checks })
 }

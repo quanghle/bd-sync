@@ -222,11 +222,12 @@ needs = ["review"]
 condition = "{{experimental.specs}}"
 description = """
 Keep the canonical requirements of the features this change touches current (AGENTS.md, Feature \
-specs), now that review has settled the behavior. <run> below is this run (the parent of this step). \
-Find the specs: `bd list --status pinned -l spec`, then `node .github/scripts/spec.mjs <area> --history` \
-for each one touched. For each user-visible behavior the change adds, changes or removes, and each thing \
-it deliberately does not do (a non-goal), single-quote the text (backticks and $ in double quotes are run \
-by the shell) and put `--` before a title:
+specs), now that review has settled the behavior. <run> below is this run (the parent of this step) and \
+<issue> the issue it changes, if any. Find the specs: `bd spec list`, then `bd spec show <area> --history` \
+for each one touched. Link the change to every spec it touches: \
+`bd dep add <issue or run> <spec or requirement> --type related`. For each user-visible behavior the \
+change adds, changes or removes, and each thing it deliberately does not do (a non-goal), single-quote \
+the text (backticks and $ in double quotes are run by the shell) and put `--` before a title:
 add: `bd create -t story --pinned --parent <spec> -l requirement --dep related:<run> -q -- '<behavior, one testable sentence>'` \
 (a non-goal: `-l requirement,non-goal`);
 change: create the new requirement as above, then `bd supersede <old> --with <new>`;
@@ -235,7 +236,7 @@ A new feature gets its spec first: \
 `bd create -t feature --pinned -l spec,area:<name> -d '<what it is>' -q -- '<feature>'`; \
 a sub-feature's spec adds `--parent <its feature's spec>` (directly: another issue between two specs \
 ends inheritance), and an area may hold several specs. A spec's \
-requirements apply to its sub-specs (`spec.mjs <sub-spec>` lists them as inherited): put a rule shared by \
+requirements apply to its sub-specs (`bd spec show <sub-spec>` lists them as inherited): put a rule shared by \
 the sub-features on their parent once, and never contradict a parent's requirement in a sub-spec \
 (supersede the parent's instead). \
 bd refuses to close or supersede a spec while any child is open, so: \
@@ -244,8 +245,10 @@ then the spec's own requirements, then the spec; \
 replace a feature: move its sub-specs and the requirements that still hold to the new spec \
 (`bd update <id> --parent <new spec>`), supersede or close the rest, then \
 `bd supersede <old spec> --with <new spec>`. Never `--force` a spec closed: an open spec under a closed one \
-is an error `spec.mjs` reports with its fixes. \
-A change with no user-visible behavior (a refactor, tests, internal tooling) touches no spec: say so."""
+is an error `bd spec show` reports with its fixes. \
+A change with no user-visible behavior (a refactor, tests, internal tooling) touches no spec: mark the \
+issue this run sits under (the run's parent; a run with none needs no mark, runs are exempt) with \
+`bd spec none <issue> -r '<why>'`. Finally `bd spec drift` lists nothing of this change as unlinked."""
 acceptance_criteria = """
 Evidence: the close reason lists the requirement ids added, superseded and removed per spec, or \
 'no user-visible behavior change' with why."""

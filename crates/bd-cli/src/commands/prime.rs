@@ -56,6 +56,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
         let on = app.read(|r| bd_core::config::experimental(r.conn()))?;
         bd_core::config::EXPERIMENTAL.iter().filter(|(name, _)| on.contains(*name)).copied().collect()
     };
+    let specs = app.read(spec_state)?;
     let shown_memories: Vec<&bd_core::Memory> =
         if a.max_memories > 0 { memories.iter().take(a.max_memories).collect() } else { memories.iter().collect() };
     let playbooks = crate::playbooks::for_prime(app, app.g.client_playbooks.as_deref());
@@ -83,6 +84,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             "playbooks": shown_playbooks,
             "playbooks_total": playbooks.len(),
             "experimental": experimental.iter().map(|(name, about)| json!({ "name": name, "description": about })).collect::<Vec<_>>(),
+            "specs": specs.json(),
         }));
         return Ok(());
     }
@@ -108,6 +110,7 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             o.push(format!("- `{name}`: {about}"));
         }
     }
+    o.extend(specs.lines());
     o.push(String::new());
     o.push(format!(
         "## Status: {} ready · {} waiting on children · {} in progress · {} blocked · {} deferred · {} open total",
@@ -229,6 +232,79 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     Ok(())
 }
 
+/// What `bd prime` says about feature specs: counts only, cheap enough for
+/// a session hook.
+struct SpecState {
+    on: bool,
+    open: usize,
+    since: Option<bd_core::Timestamp>,
+    unlinked: usize,
+    to_link: usize,
+}
+
+fn spec_state(r: &bd_core::ReadCtx<'_>) -> Result<SpecState> {
+    use bd_core::specs;
+    let on = specs::is_on(r.conn())?;
+    let open = specs::open_count(r.conn())?;
+    if !on {
+        return Ok(SpecState { on, open, since: None, unlinked: 0, to_link: 0 });
+    }
+    let since = specs::since(r.conn())?;
+    let (unlinked, to_link) = specs::unlinked_since(r.conn(), since)?;
+    Ok(SpecState { on, open, since, unlinked: unlinked.len(), to_link: to_link.len() })
+}
+
+impl SpecState {
+    fn json(&self) -> serde_json::Value {
+        if self.on {
+            json!({ "on": true, "since": self.since, "open": self.open, "unlinked": self.unlinked, "to_link": self.to_link })
+        } else {
+            json!({ "on": false, "open": self.open })
+        }
+    }
+
+    /// The "## Feature specs" section with specs on; with them off, a
+    /// warning when open specs are left; else nothing.
+    fn lines(&self) -> Vec<String> {
+        if !self.on {
+            if self.open == 0 {
+                return Vec::new();
+            }
+            return vec![
+                String::new(),
+                format!(
+                    "Feature specs are off, but {}: re-enable them (bd config set experimental.features \
+                     specs) or retire them",
+                    if self.open == 1 {
+                        "1 open spec exists".to_string()
+                    } else {
+                        format!("{} open specs exist", self.open)
+                    }
+                ),
+            ];
+        }
+        let since = match self.since {
+            Some(t) => format!("since {}", &t.to_rfc3339()[..10]),
+            None => "since (unset: `bd config set experimental.specs.since <time>`)".to_string(),
+        };
+        vec![
+            String::new(),
+            "## Feature specs".into(),
+            format!(
+                "{} open spec{} · {} unlinked · {} to link {since}",
+                self.open,
+                if self.open == 1 { "" } else { "s" },
+                self.unlinked,
+                self.to_link
+            ),
+            "- Link each change to its spec or requirement (`bd dep add <id> <spec or requirement> --type related`) \
+             or mark it `bd spec none <id> -r '<why>'`; keep requirements current (add, `bd supersede <old> --with <new>`, close with a reason)."
+                .into(),
+            "- See `bd spec list`, `bd spec show <spec>`, `bd spec drift`.".into(),
+        ]
+    }
+}
+
 /// The lines of `bd prime`'s "## Core loop" section. Every `bd ...` command
 /// they name in backticks parses (see the tests), and they stay few: prime is
 /// injected into every agent session and again after compaction.
@@ -338,6 +414,25 @@ mod tests {
                 Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?} does not parse:\n{e}"));
             }
         }
+    }
+
+    #[test]
+    fn the_feature_specs_commands_parse() {
+        let on = SpecState { on: true, open: 2, since: Some(bd_core::Timestamp(0)), unlinked: 1, to_link: 3 };
+        let lines = on.lines().join("\n");
+        assert!(lines.contains("## Feature specs\n2 open specs · 1 unlinked · 3 to link since 1970-01-01"), "{lines}");
+        let argvs = commands_in(&lines.replace("<spec or requirement>", "<spec>"));
+        assert!(argvs.len() >= 5, "{argvs:?}");
+        for argv in argvs {
+            Cli::try_parse_from(&argv).unwrap_or_else(|e| panic!("{argv:?} does not parse:\n{e}"));
+        }
+        let off = SpecState { on: false, open: 1, since: None, unlinked: 0, to_link: 0 };
+        assert_eq!(
+            off.lines()[1],
+            "Feature specs are off, but 1 open spec exists: re-enable them (bd config set experimental.features specs) \
+             or retire them"
+        );
+        assert!(SpecState { open: 0, ..off }.lines().is_empty());
     }
 
     #[test]

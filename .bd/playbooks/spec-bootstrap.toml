@@ -1,0 +1,106 @@
+playbook = "spec-bootstrap"
+title = "Bootstrap feature specs: {{groups}}"
+description = """
+Drafts feature specs for work done before feature specs were turned on (AGENTS.md, Feature specs). \
+`bd spec candidates` groups the closed issues that no spec covers yet by epic, else label, else \
+`ungrouped`; this run drafts specs for the groups named in `groups`, one step per group, one group \
+at a time (so a later group reuses the specs an earlier one wrote), and a person reviews them before \
+the run finishes. Start it with the group keys exactly as `bd spec candidates` prints them: \
+`bd playbook run spec-bootstrap --var groups=epic:bd-12,label:auth --var reviewer=<person>`."""
+labels = ["spec-bootstrap"]
+
+[vars.groups]
+description = "Comma-separated group keys from `bd spec candidates` (e.g. epic:bd-12,label:auth,ungrouped)"
+required = true
+pattern = '^\s*(ungrouped|epic:[^,\s]+|label:[^,\s]+)(\s*,\s*(ungrouped|epic:[^,\s]+|label:[^,\s]+))*\s*$'
+
+[vars.reviewer]
+description = "The person who reviews the drafted specs (resolves the review gate)"
+required = true
+
+[[steps]]
+id = "draft"
+title = "Draft specs: {{item}}"
+type = "task"
+description = """
+Draft the feature spec(s) for the candidate group `{{item}}`. Quote text in single quotes; write a \
+single quote inside as '\\'' (don't -> 'don'\\''t'). Put `--` before a title.
+1. Check feature specs are on: `bd spec list` (if they are off, stop: a person turns them on with \
+`bd config set experimental.features specs`).
+2. Find the group: the entry of `bd spec candidates --json` whose key is `{{item}}`. If there is none \
+(already done, or a typo), close this step saying so; never pick another group. A group of more than \
+about 30 issues (`ungrouped` especially) is done in batches: take a coherent batch of about 30, finish \
+it, and record what is left in this step's close reason; the rest is done by another \
+`spec-bootstrap` run for the same key (it stays a valid key), not by a follow-up task.
+3. Read the batch: `bd show <id>` for each (title, description, close reason, comments); where the \
+repository is at hand, check what the code does.
+4. Decide which features they describe. Right before creating a spec, check `bd spec list` again: \
+reuse a spec that covers the feature (`bd spec show <spec>`), nest a sub-feature under its feature's \
+spec (`--parent <spec>`), create a new one only when none fits.
+spec: `bd create -t feature --pinned -l spec,area:<name> -d '<what it is>' -q -- '<feature>'`
+requirement: `bd create -t story --pinned --parent <spec> -l requirement --dep related:<issue>,related:<issue> -q -- '<behavior, one testable sentence>'` \
+(one requirement per behavior, its sources all the issues that shaped it; a non-goal adds `-l requirement,non-goal`).
+Take behavior only from the issues and the code; never invent it. A point you inferred or are unsure \
+of goes in a comment on the requirement (`bd comment add <req> '<question>'`) for the reviewer. Where \
+later work changed a behavior, write the behavior as it stands now.
+5. Every issue of the batch must end up covered. A requirement's sources are covered by its \
+`--dep related:` edges. Link each other issue to its spec or requirement \
+(`bd dep add <issue> <spec or requirement> --type related`), or, when it has no user-visible behavior \
+(refactors, tests, tooling, CI, releases), mark it `bd spec none <issue> -r '<why>'`. A link covers the \
+issue, everything below it and everything above it: link an epic only when its whole subtree is that \
+one feature, and remember linking one child also covers its epic. `bd spec none` covers only the issue \
+it marks, never its children.
+6. `bd spec show <spec> --history` for each spec you touched, to check it reads right."""
+acceptance_criteria = """
+Evidence: the close reason lists the spec ids created or extended with their requirement and \
+non-goal counts, the issues linked and marked none, what is left of the group (if batched), and the \
+questions left for the reviewer."""
+
+[steps.loop]
+over = "{{groups}}"
+sequential = true
+
+[[steps]]
+id = "review"
+title = "Review drafted specs: {{groups}}"
+type = "decision"
+needs = ["draft"]
+description = """
+The record of the person's review: {{reviewer}} closes this step (or an agent copies, word for word, \
+the gate's resolve reason into the close reason, adding nothing). Agents never resolve the review gate \
+and never write the review themselves."""
+acceptance_criteria = "Evidence: the reviewer and their changes, as given in the gate's resolve reason."
+
+[steps.gate]
+type = "human"
+title = "Review drafted specs: {{groups}}"
+assignee = "{{reviewer}}"
+description = """
+For a person, never an agent. Read each spec the draft steps of this run name in their close reasons \
+(`bd spec show <spec> --history`) and the questions left as comments on its requirements. Fix what is \
+wrong:
+- a wording change: create the new requirement (pinned, same spec, with the old one's sources: \
+`--dep related:<source>`), then `bd supersede <old> --with <new>`;
+- a rejected requirement: `bd close <req> --reason 'removed: <why>'`, then link its source issues to \
+the right spec or requirement, or `bd spec none <issue> -r '<why>'`: a rejected requirement still \
+covers its sources;
+- an issue on the wrong spec: `bd dep rm <issue> <spec or requirement>`, then \
+`bd dep add <issue> <right one> --type related`;
+- duplicate specs: move the duplicate's requirements and sub-specs to the kept spec \
+(`bd update <id> --parent <kept>`), re-link the issues linked to the duplicate itself \
+(`bd dep rm <issue> <dup>`, then `bd dep add <issue> <kept> --type related`), then \
+`bd supersede <dup> --with <kept>`.
+Then `bd gate resolve <this gate> -r '<what you accepted, changed or rejected>'`."""
+
+[[steps]]
+id = "finish"
+title = "Finish spec bootstrap: {{groups}}"
+type = "task"
+needs = ["review"]
+description = """
+Check the result: `bd spec candidates` no longer lists the groups {{groups}}, or only the part a \
+draft step's close reason says is left for another run. `bd spec drift` (workspace-wide, exit 1 for \
+anything anywhere) shows nothing this run made: no requirement neither pinned nor closed, no orphaned \
+spec. Report anything else in the close reason rather than fixing it here (changes after the review \
+would go unreviewed)."""
+acceptance_criteria = "Evidence: the candidates and drift results in the close reason."

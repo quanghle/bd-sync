@@ -273,6 +273,7 @@ fn duration_and_time_flags_name_their_value() {
         ("bd ready", "created-before"),
         ("bd ready", "updated-after"),
         ("bd ready", "updated-before"),
+        ("bd spec drift", "since"),
     ];
     let root = cli();
     let value_name =

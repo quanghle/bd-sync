@@ -77,6 +77,7 @@ mod playbooks;
 mod remote;
 mod serve;
 mod setup;
+mod specs;
 #[cfg(test)]
 mod tests;
 mod views;
@@ -94,6 +95,7 @@ pub use playbooks::*;
 pub use remote::*;
 pub use serve::*;
 pub use setup::*;
+pub use specs::*;
 pub use views::*;
 pub use workspace::*;
 
@@ -260,6 +262,9 @@ pub enum Command {
     /// Find issue text naming ids that do not exist
     #[command(long_about = ORPHANS_LONG_ABOUT)]
     Orphans(OrphansArgs),
+    /// Read feature specs and check work against them (experimental)
+    #[command(subcommand, long_about = SPEC_LONG_ABOUT)]
+    Spec(SpecCommand),
     /// Update fields of an issue
     #[command(long_about = UPDATE_LONG_ABOUT)]
     Update(UpdateArgs),

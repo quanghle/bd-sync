@@ -5675,3 +5675,171 @@ fn init_suggests_wiring_the_agent_harness() {
     keys.sort();
     assert_eq!(keys, ["id_mode", "path", "prefix"]);
 }
+
+#[test]
+fn feature_specs_list_show_drift_none_and_candidates() {
+    let ws = Ws::new();
+    let old = ws.id(&["create", "Old work", "-l", "ui"]);
+    ws.ok(&["close", &old, "-r", "done"]);
+    // Off: every subcommand refuses.
+    for args in [
+        &["spec", "list"][..],
+        &["spec", "show", "checkout"],
+        &["spec", "drift"],
+        &["spec", "candidates"],
+        &["spec", "none", &old, "-r", "why"],
+    ] {
+        let out = ws.run_as("tester", args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr)
+                .contains("feature specs are off in this workspace (bd config set experimental.features specs)"),
+            "{out:?}"
+        );
+    }
+
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let since = ws.json(&["config", "get", "experimental.specs.since"])["value"].as_str().unwrap().to_string();
+    assert!(since.ends_with('Z') && since.len() > 10, "{since}");
+    let spec = ws.id(&["create", "Checkout", "--pinned", "-l", "spec,area:checkout", "-d", "Paying for a cart."]);
+    let rule = ws.id(&["create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let goal = ws.id(&["create", "No guest checkout", "--pinned", "-l", "non-goal", "--parent", &spec]);
+    let old_rule = ws.id(&["create", "Guests check out", "--pinned", "-l", "requirement", "--parent", &spec]);
+    ws.ok(&["supersede", &old_rule, "--with", &rule]);
+    let sub = ws.id(&["create", "Saved cards", "--pinned", "-l", "spec,area:checkout", "--parent", &spec]);
+    ws.id(&["create", "Lists cards", "--pinned", "-l", "requirement", "--parent", &sub]);
+
+    // list
+    let list = ws.ok(&["spec", "list"]);
+    assert!(
+        list.contains(&format!("{spec} Checkout [checkout]: 1 requirement, 1 non-goal, 0 linked issues")),
+        "{list}"
+    );
+    assert!(list.contains(&format!("{sub} Saved cards [checkout] (sub-spec of {spec})")), "{list}");
+    let json = ws.json(&["spec", "list"]);
+    assert_eq!(json.as_array().unwrap().len(), 2);
+    assert_eq!(json[1]["parent"], spec.as_str());
+
+    // show
+    let md = ws.ok(&["spec", "show", "checkout"]);
+    assert!(md.starts_with(&format!("# Checkout ({spec})\n\nPaying for a cart.\n")), "{md}");
+    assert!(md.contains(&format!("## Requirements\n\n- Requires sign-in ({rule})\n")), "{md}");
+    assert!(md.contains(&format!("## Non-goals\n\n- No guest checkout ({goal})\n")), "{md}");
+    assert!(md.contains(&format!("## Sub-feature: Saved cards ({sub})")), "{md}");
+    assert!(!md.contains("History"));
+    let md = ws.ok(&["spec", "show", &sub, "--history"]);
+    assert!(md.contains(&format!("## Inherited\n\n- Requires sign-in ({rule}; spec {spec})")), "{md}");
+    let md = ws.ok(&["spec", "show", &spec, "--history"]);
+    assert!(md.contains(&format!("- ~~Guests check out~~ superseded by {rule} ({old_rule})")), "{md}");
+    let views = ws.json(&["spec", "show", "checkout"]);
+    assert_eq!(views.as_array().unwrap().len(), 1, "the sub-spec is shown inside its spec");
+    assert_eq!(views[0]["non_goals"][0]["id"], goal.as_str());
+    assert_eq!(views[0]["subspecs"][0]["inherited"][0]["spec"]["id"], spec.as_str());
+    assert_eq!(views[0]["history"][0]["outcome"], "superseded");
+    assert_eq!(ws.code_as("tester", &["spec", "show", "nope"]), 3);
+
+    // drift: unlinked work exits 1, linked or marked none exits 0
+    let work = ws.id(&["create", "Build checkout"]);
+    ws.ok(&["close", &work, "-r", "done"]);
+    let open = ws.id(&["create", "Next thing"]);
+    let out = ws.run_as("tester", &["spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("## Unlinked: work closed since then with no spec link (1)"), "{text}");
+    assert!(text.contains(&format!("- {work} [task] Build checkout (closed)")), "{text}");
+    assert!(
+        text.contains(&format!("## To link: open work since then, not linked yet (not drift) (1)\n- {open}")),
+        "{text}"
+    );
+    let out = ws.run_as("tester", &["--json", "spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1));
+    let drift: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((drift["count"].as_i64(), drift["unlinked"][0]["id"].as_str()), (Some(1), Some(work.as_str())));
+    assert_eq!(drift["since"], since.as_str());
+    assert!(!drift["unlinked"].as_array().unwrap().iter().any(|i| i["id"] == old.as_str()), "before since");
+    ws.ok(&["dep", "add", &work, &rule, "--type", "related"]);
+    assert_eq!(ws.code_as("tester", &["spec", "drift"]), 0);
+    // --since moves the window back: the old work drifts.
+    assert_eq!(ws.code_as("tester", &["spec", "drift", "--since", "2000-01-01"]), 1);
+
+    // none: refuses spec issues, marks other work without touching its status
+    let (code, err) = refusal(&ws, "tester", &["spec", "none", &rule, "-r", "x"]);
+    assert_eq!(code, 2);
+    assert!(err.contains("is part of a spec"), "{err}");
+    let claim = ws.json(&["claim", &open]);
+    let marked = ws.json(&["spec", "none", &open, "-r", "internal tooling"]);
+    assert_eq!(marked[0]["id"], open.as_str());
+    let shown = ws.json(&["show", &open]);
+    assert_eq!((shown["status"].as_str(), shown["assignee"].as_str()), (Some("in_progress"), Some("tester")));
+    assert!(shown["labels"].as_array().unwrap().iter().any(|l| l == "spec:none"));
+    assert!(ws.ok(&["comments", &open]).contains("No spec: internal tooling"));
+    // Marking it again changes nothing and says so.
+    let events = ws.json(&["history", &open]).as_array().unwrap().len();
+    let again = ws.ok(&["spec", "none", &open, "-r", "again"]);
+    assert_eq!(again.trim(), format!("= {open} is already marked spec:none"));
+    assert_eq!(ws.json(&["history", &open]).as_array().unwrap().len(), events);
+    assert!(!ws.ok(&["comments", &open]).contains("No spec: again"));
+    // A since in the future is refused.
+    assert_eq!(ws.code_as("tester", &["config", "set", "experimental.specs.since", "+1d"]), 2);
+    let token = claim["lease"]["token"].as_i64().unwrap().to_string();
+    ws.ok(&["heartbeat", &open, "--token", &token]);
+    assert!(ws.json(&["spec", "drift"])["to_link"].as_array().unwrap().is_empty());
+
+    // candidates: closed work from before since
+    let groups = ws.json(&["spec", "candidates"]);
+    assert_eq!(groups[0]["key"], "label:ui");
+    assert_eq!(groups[0]["issues"][0]["id"], old.as_str());
+    assert!(ws.ok(&["spec", "candidates"]).contains(&format!("## label:ui (1)\n- {old} Old work")));
+
+    // prime and doctor
+    let prime = ws.ok(&["prime"]);
+    assert!(prime.contains("## Feature specs\n2 open specs · 0 unlinked · 0 to link since "), "{prime}");
+    assert!(prime.contains("`bd spec none <id> -r '<why>'`"), "{prime}");
+    let specs = &ws.json(&["prime"])["specs"];
+    assert_eq!(
+        (specs["on"].as_bool(), specs["open"].as_i64(), specs["since"].as_str()),
+        (Some(true), Some(2), Some(since.as_str()))
+    );
+    let check = |ws: &Ws| {
+        ws.json(&["doctor"])["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["name"] == "specs_while_off")
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(check(&ws)["severity"], "ok");
+    ws.ok(&["config", "set", "experimental.features", ""]);
+    let prime = ws.ok(&["prime"]);
+    assert!(
+        prime.contains(
+            "Feature specs are off, but 2 open specs exist: re-enable them (bd config set experimental.features specs) or retire them"
+        ),
+        "{prime}"
+    );
+    assert!(!prime.contains("## Feature specs"));
+    assert_eq!(ws.json(&["prime"])["specs"], serde_json::json!({ "on": false, "open": 2 }));
+    assert_eq!(check(&ws)["severity"], "warn");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0, "a warning, not a failure");
+    // Off keeps since; on again resets it.
+    assert_eq!(ws.json(&["config", "get", "experimental.specs.since"])["value"], since.as_str());
+    ws.ok(&["config", "set", "experimental.specs.since", "2026-01-15T00:00:00Z"]);
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    assert_ne!(ws.json(&["config", "get", "experimental.specs.since"])["value"], "2026-01-15T00:00:00.000Z");
+}
+
+#[test]
+fn spec_none_runs_in_a_batch() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let script = ws.dir.path().join("ops.txt");
+    std::fs::write(&script, "create \"Refactor\"\nspec none $1 -r 'no behavior change'\n").unwrap();
+    ws.json(&["batch", "-f", script.to_str().unwrap()]);
+    assert!(ws.json(&["show", "t-1"])["labels"].as_array().unwrap().iter().any(|l| l == "spec:none"));
+    // One refusal undoes the whole batch.
+    let spec = ws.id(&["create", "Spec", "--pinned", "-l", "spec"]);
+    std::fs::write(&script, format!("create \"Other\"\nspec none {spec} -r x\n")).unwrap();
+    assert_eq!(ws.code_as("tester", &["batch", "-f", script.to_str().unwrap()]), 2);
+    assert_eq!(ws.json(&["list", "--all"]).as_array().unwrap().len(), 2);
+}

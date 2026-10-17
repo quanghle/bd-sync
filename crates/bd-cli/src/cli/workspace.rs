@@ -374,9 +374,10 @@ the same flags as on the command line. $N stands for the id that operation N
 produced (counting operations from 1, not lines), $$ for a literal $, and
 lines starting with # are comments. The operations: create, update, close,
 duplicate, supersede, reopen, defer, undefer, delete, dep, label, comment add, claim, release,
-heartbeat, remember, forget, config set, config unset and compact (the apply
-form of `bd compact`: `compact ID --summary TEXT --if-revision N`, the summary
-given on the line itself, never - or @FILE). If one fails, none is applied.";
+heartbeat, remember, forget, config set, config unset, spec none and compact
+(the apply form of `bd compact`: `compact ID --summary TEXT --if-revision N`,
+the summary given on the line itself, never - or @FILE). If one fails, none
+is applied.";
 
 const BATCH_EXAMPLES: &str = "\
 Example file:

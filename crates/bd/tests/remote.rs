@@ -9161,3 +9161,28 @@ fn github_sync_through_serve_is_admin_only() {
     assert_eq!((issue["title"].as_str(), issue["external_ref"].as_str()), (Some("From GitHub"), Some("gh:acme/app#1")));
     assert_eq!(issue["created_by"], "ops");
 }
+
+#[test]
+fn feature_specs_through_bd_serve() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    assert_eq!(alice.code(&["spec", "show", "checkout"]), 2, "off");
+    check(server.local("admin", &["config", "set", "experimental.features", "specs"]), "config set");
+    let spec = alice.ok(&["-q", "create", "Checkout", "--pinned", "-l", "spec,area:checkout"]).trim().to_string();
+    let rule = alice
+        .ok(&["-q", "create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec])
+        .trim()
+        .to_string();
+    let md = alice.ok(&["spec", "show", "checkout"]);
+    assert!(md.contains(&format!("# Checkout ({spec})\n\n## Requirements\n\n- Requires sign-in ({rule})\n")), "{md}");
+    assert_eq!(alice.json(&["spec", "show", &spec])[0]["requirements"][0]["id"], rule.as_str());
+
+    let work = alice.ok(&["-q", "create", "Build it"]).trim().to_string();
+    alice.ok(&["close", &work, "-r", "done"]);
+    let out = alice.run(&["spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1), "drift exits 1 through bd serve too");
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("- {work} [task] Build it (closed)")));
+    alice.ok(&["dep", "add", &work, &rule, "--type", "related"]);
+    assert_eq!(alice.code(&["spec", "drift"]), 0);
+    assert_eq!(alice.json(&["spec", "drift"])["count"], 0);
+}

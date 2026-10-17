@@ -13,6 +13,7 @@ and error codes.
 | Issues | `create`, `q`, `show` (`--as-of`), `list`, `query`, `update`, `edit`, `close`, `duplicate`, `supersede`, `find-duplicates`, `reopen`, `defer`, `undefer`, `delete`, `label add/rm/list`, `compact` (`--analyze`, `--apply`, `--stats`) | [Issues](concepts.md#issues), [Query language](#query-language), [Compaction](#compaction) |
 | Dependencies | `dep add/rm/list/tree/cycles`, `blocked`, `graph` | [Dependency types](concepts.md#dependency-types), [Graph export](#graph-export) |
 | Epics and hierarchy | `epic status/close-eligible`, `children`, `stale`, `orphans` | [Epics and hierarchy](#epics-and-hierarchy) |
+| Feature specs (experimental) | `spec list/show/drift/none/candidates` | [Feature specs](#feature-specs), [concepts](concepts.md#feature-specs) |
 | Ready work and claims | `ready`, `claim` (`--next`), `heartbeat` (`hb`), `release` (`unclaim`), `reclaim`, `leases` | [Ready work](concepts.md#ready-work), [Claims](concepts.md#claims-leases-and-recovery) |
 | Comments and memory | `comment add/list`, `comments`, `remember`, `recall`, `memories`, `forget`, `memory add/get/list/rm` | [Comments and memory](concepts.md#comments-and-memory) |
 | Events | `events` (`--follow`, `--wait`, `prune`), `history` (`--diff`), `show --as-of` | [Event history](concepts.md#event-history), [Reading an issue as of a past moment](concepts.md#reading-an-issue-as-of-a-past-moment) |
@@ -416,6 +417,81 @@ bd graph ID|--all [--format text|dot|html] [--edges TYPE,...|all] [--max-nodes N
   workspace the server sends the file and the client writes it on its own
   machine, as with `bd export -o`.
 
+### Feature specs
+
+```bash
+bd spec list                                # the open specs: areas, parent spec, requirement counts, linked issues
+bd spec show AREA|ID [--history]            # the specs of an area, or one spec, as Markdown
+bd spec drift [--since TIME]                # exit 1 when work or requirements drifted from the specs
+bd spec none ID... -r "why"                 # label spec:none and comment "No spec: why", in one write
+bd spec candidates                          # closed work from before specs, grouped, that no spec covers
+bd playbook run spec-bootstrap --var groups=KEY,KEY --var reviewer=P  # agents draft specs group by group; P reviews
+```
+
+Feature specs are an [experimental feature](#experimental-features): every
+`bd spec` command exits 2 (`feature specs are off in this workspace`) until
+`bd config set experimental.features specs`. See
+[Feature specs](concepts.md#feature-specs) for the convention.
+
+- **Show.** Takes a spec's id (or a short id) or an area: every open spec
+  labelled `area:AREA`, in id order, leaving out those shown inside another
+  one's tree (exit 3 when it names none). Each spec prints its
+  requirements in force and non-goals in creation order, each with its id
+  and its sources; the specs printed
+  at the top also list the requirements they inherit from the open specs
+  above them (`## Inherited`, outermost first); open sub-specs follow as
+  `## Sub-feature: ...`, one heading level deeper, to 8 levels.
+  `--history` adds the closed requirements: superseded (by the issue its
+  `supersedes` edge names) or removed (with its close reason, a leading
+  `removed:` dropped). An open spec under a closed one is printed with
+  `> Error:` and the fixes, inheriting nothing; an issue that is not a spec
+  between two specs, a cycle or the depth bound with `> Warning:`, as is a
+  requirement neither pinned nor closed. `--json` prints an array of views
+  `{spec, requirements, non_goals, history, errors, warnings, inherited,
+  subspecs}`, each nested view with its full `inherited`.
+- **Linked work.** An issue is linked directly when it has a `related`
+  edge, either direction, to an issue labelled `spec`, `requirement` or
+  `non-goal` (of any status: links to closed requirements and specs still
+  count). A direct link covers the issue's whole subtree (linking a feature
+  epic covers its subtasks) and its ancestors (a playbook run's link counts
+  for the issue it sits under). The `spec:none` label (`bd spec none`)
+  covers only the issue it is on. Exempt, never needing a spec: playbook
+  runs, groups and steps and everything below a step (review findings and
+  their follow-ups), gates, decisions, spec issues, ephemeral issues,
+  issues closed as failed, and issues closed with `bd duplicate` or
+  `bd supersede` (the replacement carries the work and its link).
+- **Sources.** A requirement's sources are its own outgoing `related`
+  edges (`--dep related:<run>`); work linked to it with `bd dep add <work>
+  <requirement> --type related` is linked, not a source.
+- **Drift.** Since `experimental.specs.since` (or `--since`, a time as the
+  filters take it: `30d` is 30 days ago): `unlinked`, issues closed since
+  then, neither linked nor exempt; `shaky`, requirements in force whose
+  source (an outgoing `related` edge) was reopened (closed once, not closed
+  now: a `reopened` event in its history) or closed as failed, while a
+  source still in progress, never closed, is not; `bad_status`, requirements neither pinned nor
+  closed; `orphaned`, open specs under a closed spec. `to_link`, open issues
+  created since then and not linked yet, is listed but is not drift. Exits
+  1 when `unlinked`, `shaky`, `bad_status` and `orphaned` hold anything, 0
+  otherwise, locally and through `bd serve` alike; `--json` adds `count`.
+  Without a since time, no work is checked. `shaky` reads the source's
+  history: a `reopened` event pruned by `events.retain_days` or
+  `events.retain_rows` is no longer seen, and a source reopened before it
+  was linked counts while it is open.
+- **None.** Refuses spec issues themselves (exit 2); never changes status,
+  assignee or a claim. An issue already labelled `spec:none` is left as it
+  is (`= ID is already marked spec:none`, no second comment). Also a
+  `bd batch` operation (`spec none ID -r WHY`).
+- **List.** Per open spec: its areas, its parent spec, its requirements
+  and non-goals in force, and how many distinct issues that are not spec
+  issues have a `related` edge, either direction, to it or its own
+  requirements.
+- **Candidates.** Issues closed before `experimental.specs.since` (every
+  closed issue when it is unset), neither linked nor exempt, grouped by
+  their topmost epic that is not a playbook run or group (`epic:ID`), else
+  their first label in sorted order that is not `change:*`, `severity:*`,
+  `spec:*` or `adr:*` (`label:LABEL`), else `ungrouped`; the largest groups
+  first, then by key.
+
 ### Data
 
 - **`bd export [-o FILE]`** writes JSONL: a header with `head_seq`, then
@@ -545,6 +621,7 @@ and unsetting need an admin token.
 | `claim.pools` | | comma-separated assignees anyone may claim from |
 | `types.custom` | | extra issue types |
 | `experimental.features` | | comma-separated [experimental features](#experimental-features) turned on in this workspace |
+| `experimental.specs.since` | | when feature specs were last turned on: set to now when `experimental.features` turns `specs` on (kept when they are turned off); any time the filters take (`2026-01-15`, `30d`), not in the future, stored as RFC 3339, to backdate it; [`bd spec drift`](#feature-specs) checks the work since |
 | `durability` | `normal` | SQLite `synchronous`: `off`, `normal`, `full` |
 | `events.retain_days`, `events.retain_rows` | `0` | automatic event retention (`0` keeps everything) |
 | `gate.repos` | | repositories GitHub gates may name: `OWNER/REPO`, `HOST/OWNER/REPO`, `OWNER/*`, `HOST/OWNER/*`, `*` (unset: any locally, only the workspace's own through `bd serve`) |
@@ -570,14 +647,14 @@ playbook against the older server fails.
 
 | feature | what it turns on |
 |---|---|
-| `specs` | feature specs: a feature's canonical requirements as pinned spec issues with requirement children, kept current by a playbook step (this repository's `change` playbook and `.github/scripts/spec.mjs`) |
+| `specs` | [feature specs](concepts.md#feature-specs): a feature's canonical requirements as pinned spec issues with requirement children, read and checked with [`bd spec`](#feature-specs) and kept current by a playbook step (this repository's `change` playbook). Turning it on sets `experimental.specs.since`; `bd prime` shows the open specs and the work left unlinked, and with it off `bd prime` and `bd doctor` (`specs_while_off`) warn about open specs left behind |
 
 ## Exit codes
 
 | code | meaning |
 |---|---|
 | 0 | ok |
-| 1 | internal error (SQLite, JSON, I/O), a database written by a newer bd, or `doctor` found problems |
+| 1 | internal error (SQLite, JSON, I/O), a database written by a newer bd, `doctor` found problems, or `spec drift` found drift |
 | 2 | invalid input, a cycle, or a refusal (such as `--force` on a command that has none) |
 | 3 | not found, or no workspace |
 | 4 | claim conflict: already claimed (a live claim, even your own actor's, without its `--token`), not claimable, not ready, another actor's live claim (`--take-over` takes it over), or lease lost |

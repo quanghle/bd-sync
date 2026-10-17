@@ -35,6 +35,14 @@ bd is the repository's shared task tracker: a dependency-aware work queue with l
 - `bd epic status` shows each open epic's progress.
 - `bd close <id> --reason "..." --claim-next` finishes an issue and claims the next ready one in one step.
 
+## Feature specs
+
+When `bd prime` shows a "Feature specs" section, the workspace keeps feature specs (experimental):
+
+- Link every change you close to the spec or requirement it touches (`bd dep add <id> <spec or requirement> --type related`), or mark it `bd spec none <id> -r '<why>'`.
+- Keep requirements current: add one as a pinned child of its spec labelled `requirement`, replace a changed one with `bd supersede <old> --with <new>`, and close one that no longer holds with its reason.
+- `bd spec list`, `bd spec show <spec or area>` and `bd spec drift` show the specs and what drifted.
+
 ## Claims and take-overs
 
 - Exit code 4 is a claim conflict: someone else holds it (possibly another session of your own actor), or it is not ready. Re-read with `bd show`; do not answer a 4 with `--take-over`, and `--force` never ends another actor's claim.

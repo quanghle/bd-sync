@@ -27,7 +27,7 @@ use bd_core::gates::{self, GateKind, GateSpec, NewGate};
 use bd_core::subgraph::EdgeSet;
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::*;
-use bd_core::{asof, comments, config, events, hierarchy, metrics, playbook, requests};
+use bd_core::{asof, comments, config, events, hierarchy, metrics, playbook, requests, specs};
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::{Connection, StatementStatus};
 use serde_json::json;
@@ -325,6 +325,19 @@ fn run_the_commands(ws: &mut Ws) {
     let work = ws.create(NewIssue { labels: vec!["infra".into()], ..NewIssue::titled("Work") });
     let other = ws.create(NewIssue::titled("Other"));
     ws.create(NewIssue { assignee: Some("bob".into()), ..NewIssue::titled("Bob's") });
+    // A feature spec with a requirement linked to the work, and specs turned on.
+    let spec = ws.create(NewIssue {
+        status: Some(Status::Pinned),
+        labels: vec!["spec".into(), "area:x".into()],
+        ..NewIssue::titled("Spec")
+    });
+    ws.create(NewIssue {
+        status: Some(Status::Pinned),
+        labels: vec!["requirement".into()],
+        deps: vec![(DepType::Related, work.clone())],
+        ..child("Rule", &spec)
+    });
+    ws.write("alice", None, |tx| config::set(tx, "experimental.features", "specs"));
     ws.write("alice", None, |tx| config::set(tx, "events.retain_rows", "100"));
     // Enough events for the automatic prune to run.
     for n in 0..520 {
@@ -420,6 +433,14 @@ fn run_the_commands(ws: &mut Ws) {
                 r.stale(Duration::from_secs(86_400), None)?;
                 r.stale(Duration::ZERO, Some(5))?;
                 r.orphans("t")?;
+                // Feature specs: the tree, the listing, drift, candidates and the counts prime and doctor take.
+                specs::show(r.conn(), "x")?;
+                specs::show(r.conn(), &spec)?;
+                specs::list(r.conn())?;
+                specs::drift(r.conn(), Some(Timestamp(0)))?;
+                specs::candidates(r.conn(), None)?;
+                specs::candidates(r.conn(), specs::since(r.conn())?)?;
+                specs::open_count(r.conn())?;
                 // Graph export of the open issues: the list statement, then edges per issue.
                 r.subgraph(None, &EdgeSet::Default, 10)?;
                 r.events_each(&EventQuery { limit: Some(5), ..Default::default() }, 2, &mut |_| Ok(()))?;
@@ -785,6 +806,13 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         "FROM dependencies INDEXED BY idx_deps_target WHERE depends_on_id = ?1",
         "SELECT metadata FROM issues WHERE id = ?1",
         "SELECT ts FROM events WHERE seq = ?1",
+        // Feature specs: closed and open work by status through the ready index, labels by label, edges by end.
+        "i.status = 'closed' AND i.closed_at >= ?1",
+        "i.status IN ('open','in_progress','blocked','deferred','pinned') AND i.created_at >= ?1",
+        "SELECT issue_id FROM labels WHERE label = ?1",
+        "SELECT issue_id FROM dependencies WHERE depends_on_id = ?1 AND dep_type = ?2",
+        "WHERE lb.label = 'spec'",
+        "FROM events WHERE issue_id = ?1 AND op = 'reopened'",
     ] {
         assert!(commands.iter().any(|s| s.contains(needle)), "no statement with {needle:?} ran");
     }

@@ -43,6 +43,7 @@ pub fn access(cmd: &Command) -> Access {
         | C::Children(_)
         | C::Stale(_)
         | C::Orphans(_)
+        | C::Spec(SpecCommand::List | SpecCommand::Show(_) | SpecCommand::Drift(_) | SpecCommand::Candidates)
         | C::Ready(_)
         | C::Blocked(_)
         | C::FindDuplicates(_)
@@ -141,6 +142,21 @@ mod tests {
         assert_eq!(access_of(&["bd", "orphans"]), Access::Read);
         // The close flags mean nothing without --close.
         assert!(Cli::try_parse_from(["bd", "epic", "close-eligible", "--take-over"]).is_err());
+    }
+
+    #[test]
+    fn spec_reads_but_none_writes() {
+        let access_of = |argv: &[&str]| access(&Cli::try_parse_from(argv).unwrap().command);
+        for argv in [
+            &["bd", "spec", "list"][..],
+            &["bd", "spec", "show", "checkout", "--history"],
+            &["bd", "spec", "drift", "--since", "7d"],
+            &["bd", "spec", "candidates"],
+        ] {
+            assert_eq!(access_of(argv), Access::Read, "{argv:?}");
+        }
+        assert_eq!(access_of(&["bd", "spec", "none", "t-1", "-r", "refactor"]), Access::Write);
+        assert!(Cli::try_parse_from(["bd", "spec", "none", "t-1"]).is_err(), "a reason is required");
     }
 
     #[test]

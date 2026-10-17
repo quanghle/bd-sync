@@ -51,6 +51,14 @@ enum Op {
     #[command(subcommand)]
     Config(ConfigCommand),
     Compact(BatchCompactArgs),
+    #[command(subcommand)]
+    Spec(BatchSpecCommand),
+}
+
+/// The `bd spec` subcommands that write.
+#[derive(Subcommand, Debug)]
+enum BatchSpecCommand {
+    None(SpecNoneArgs),
 }
 
 fn run(tx: &mut WriteCtx<'_>, op: &Op) -> Result<Out> {
@@ -75,6 +83,7 @@ fn run(tx: &mut WriteCtx<'_>, op: &Op) -> Result<Out> {
         Op::Forget(a) => exec_forget(tx, a),
         Op::Config(c) => exec_config(tx, c),
         Op::Compact(a) => exec_batch_compact(tx, a),
+        Op::Spec(BatchSpecCommand::None(a)) => exec_spec_none(tx, a),
     }
 }
 

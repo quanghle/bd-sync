@@ -159,6 +159,16 @@ not in the checkout, and a flag on one that does not load. It lists 10
 `playbooks` (`name`, `description`, `location`: `checkout`, `server` or
 `user`, `invalid`) with their count in `playbooks_total`.
 
+### Bootstrapping feature specs
+
+This repository's `spec-bootstrap` playbook (`.bd/playbooks/spec-bootstrap.toml`)
+is a worked example of loops and a human gate: `--var groups=` takes group
+keys from `bd spec candidates`, the loop runs one draft step per group in
+turn (`sequential = true`), and a person resolves the review gate before the
+run finishes ([Feature specs](concepts.md#feature-specs)). Another repository
+uses it by copying the file into its `.bd/playbooks` or the user playbook
+directory.
+
 ### Limits
 
 | limit | value |

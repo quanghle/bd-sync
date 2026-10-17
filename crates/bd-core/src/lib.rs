@@ -72,6 +72,7 @@ pub mod ready;
 pub mod rename;
 pub mod requests;
 mod schema;
+pub mod specs;
 pub mod store;
 pub mod subgraph;
 pub mod time;

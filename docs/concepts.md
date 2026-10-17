@@ -340,6 +340,39 @@ Memories are durable project insights, with authorship and revisions.
 person and the [playbooks](playbooks.md) available. Outside a workspace it
 prints nothing, so it is safe in session hooks.
 
+## Feature specs
+
+An experimental feature (`bd config set experimental.features specs`)
+that keeps a feature's canonical requirements in bd, beside the work that
+shaped them. A spec is a pinned issue labelled `spec` and `area:<name>`;
+its requirements are pinned children labelled `requirement` (also
+`non-goal` for what it deliberately does not do), each one testable
+sentence. A requirement that changes is replaced with `bd supersede <old>
+--with <new>`; one that no longer holds is closed with its reason. A spec
+that is the child of an open spec inherits its requirements.
+
+Work is linked to the spec it touches by a `related` edge to the spec or a
+requirement (`bd dep add <id> <spec or requirement> --type related`); a
+link covers the issue's subtree and its ancestors (linking an epic covers
+its subtasks, a run's link covers the issue it runs for). Work that touches
+no spec is marked `bd spec none <id> -r '<why>'`, which covers only that
+issue. Playbook runs and steps (and anything below a step), gates,
+decisions, ephemeral issues, work closed as failed and work closed as a
+duplicate or superseded never need a link. Turning specs on
+records when (`experimental.specs.since`): `bd spec drift` then reports the
+work closed since and left unlinked, requirements whose source reopened or
+failed, and specs in the wrong state, and `bd prime` shows the counts to
+agents. `bd spec show <area>` prints an area's specs as Markdown and
+`bd spec candidates` lists older closed work specs could be written from.
+To write those specs, this repository's `spec-bootstrap` playbook
+(`.bd/playbooks/spec-bootstrap.toml`, which another repository copies into
+its own `.bd/playbooks` or the user playbook directory) has an agent draft
+the specs for the groups you name (`bd playbook run spec-bootstrap --var
+groups=epic:bd-12,ungrouped --var reviewer=<person>`), one step per group
+in turn, and a person review them behind a human gate before the run
+finishes.
+See [Feature specs](commands.md#feature-specs).
+
 ## Actors
 
 Every write records its actor, and a live claim belongs to the actor that

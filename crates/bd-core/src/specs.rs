@@ -12,8 +12,9 @@
 //! [`render`]), the issues linked to specs ([`linked`]), drift since specs
 //! were turned on ([`drift`], and its counts for `bd prime`,
 //! [`unlinked_counts`]), spec parts not in the shape `bd spec` writes
-//! ([`malformed`], part of drift and `bd doctor`), closed work from before then that no spec covers
-//! ([`candidates`]) and the open specs ([`list`]). Lookups go by key
+//! ([`malformed`], part of drift and `bd doctor`), closed work from before
+//! then that no spec covers ([`candidates`]) and the open specs ([`list`]);
+//! [`history`] shows the spec tree as it was at a past point. Lookups go by key
 //! (labels by label, edges by either end, issues by id); the two listings of
 //! issues by status search the ready index (`idx_issues_ready`), as
 //! `bd stale` does.
@@ -25,6 +26,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::asof;
 use crate::config;
 use crate::error::{Error, Result};
 use crate::graph;
@@ -292,6 +294,20 @@ pub struct SpecView {
     pub warnings: Vec<String>,
     pub inherited: Vec<Inherited>,
     pub subspecs: Vec<SpecView>,
+    /// `--as-of` only: the children the history cannot place, or whose
+    /// listed values it cannot tell (see [`history`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unknown: Option<Vec<history::UnknownItem>>,
+    /// `--as-of` only, on a top view: the point shown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<asof::PointView>,
+    /// `--as-of` only, on a top view: whether a rebuild relied on history
+    /// written by an older bd.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<bool>,
+    /// `--as-of` only, on a top view: the oldest event retention kept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retained_from: Option<asof::Retained>,
 }
 
 /// The spec issues `arg` names among `specs` (every issue labelled spec):
@@ -363,6 +379,10 @@ pub fn spec_view(spec: &Node, children: &[Node]) -> SpecView {
         warnings,
         inherited: Vec::new(),
         subspecs: Vec::new(),
+        unknown: None,
+        as_of: None,
+        incomplete: None,
+        retained_from: None,
     }
 }
 
@@ -565,6 +585,12 @@ pub fn render(view: &SpecView, history: bool, level: usize) -> String {
         format!("{} {}{} ({})", h(level), if level > 1 { "Sub-feature: " } else { "" }, view.spec.title, view.spec.id),
         String::new(),
     ];
+    if level == 1
+        && let Some(point) = &view.as_of
+    {
+        lines.push(format!("As of {}", point.label()));
+        lines.push(String::new());
+    }
     if !view.spec.description.is_empty() {
         lines.push(view.spec.description.clone());
         lines.push(String::new());
@@ -575,6 +601,10 @@ pub fn render(view: &SpecView, history: bool, level: usize) -> String {
     }
     for w in &view.warnings {
         lines.push(format!("> Warning: {w}"));
+        lines.push(String::new());
+    }
+    for u in view.unknown.iter().flatten() {
+        lines.push(format!("> Unknown: {} {}: {}", u.id, u.key, u.reason));
         lines.push(String::new());
     }
     // (heading text, the item, the spec it is inherited from)
@@ -1414,6 +1444,8 @@ pub fn list(conn: &Connection) -> Result<Vec<SpecSummary>> {
     }
     Ok(out)
 }
+
+pub mod history;
 
 #[cfg(test)]
 mod tests;

@@ -43,7 +43,13 @@ pub fn access(cmd: &Command) -> Access {
         | C::Children(_)
         | C::Stale(_)
         | C::Orphans(_)
-        | C::Spec(SpecCommand::List | SpecCommand::Show(_) | SpecCommand::Drift(_) | SpecCommand::Candidates)
+        | C::Spec(
+            SpecCommand::List
+            | SpecCommand::Show(_)
+            | SpecCommand::Drift(_)
+            | SpecCommand::Candidates
+            | SpecCommand::Changes(_),
+        )
         | C::Ready(_)
         | C::Blocked(_)
         | C::FindDuplicates(_)
@@ -152,6 +158,8 @@ mod tests {
             &["bd", "spec", "show", "checkout", "--history"],
             &["bd", "spec", "drift", "--since", "7d"],
             &["bd", "spec", "candidates"],
+            &["bd", "spec", "changes", "--since", "7d"],
+            &["bd", "spec", "show", "x", "--as-of", "-1d"],
         ] {
             assert_eq!(access_of(argv), Access::Read, "{argv:?}");
         }

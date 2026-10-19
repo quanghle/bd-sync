@@ -274,6 +274,9 @@ fn duration_and_time_flags_name_their_value() {
         ("bd ready", "updated-after"),
         ("bd ready", "updated-before"),
         ("bd spec drift", "since"),
+        ("bd spec show", "as-of"),
+        ("bd spec changes", "since"),
+        ("bd spec changes", "until"),
     ];
     let root = cli();
     let value_name =
@@ -322,6 +325,9 @@ fn long_help_examples_parse() {
     for (path, cmd) in visible(&root) {
         for example in examples(cmd) {
             count += 1;
+            // `#` starts a comment for shlex and POSIX shells: `--since #120`
+            // would lose its value, so examples write a seq as bare digits.
+            assert!(!example.contains(" #"), "`{path}`: example {example:?} has an unquoted `#`");
             let argv =
                 shlex::split(&example).unwrap_or_else(|| panic!("`{path}`: example {example:?} has unbalanced quotes"));
             if let Err(e) = Cli::try_parse_from(&argv) {
@@ -403,6 +409,8 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd remote login",
         "bd remote logout",
         "bd completion",
+        "bd spec show",
+        "bd spec changes",
     ] {
         let cmd = command(&root, path);
         assert!(cmd.get_long_about().is_some(), "`{path}` has no long help");

@@ -49,6 +49,9 @@ pub enum SpecCommand {
     /// Link work to specs or requirements by related edges
     #[command(long_about = SPEC_LINK_LONG_ABOUT)]
     Link(SpecLinkArgs),
+    /// Report requirements added, changed and removed in a window
+    #[command(long_about = SPEC_CHANGES_LONG_ABOUT)]
+    Changes(SpecChangesArgs),
 }
 
 pub const SPEC_SHOW_LONG_ABOUT: &str = "\
@@ -63,13 +66,29 @@ requirements: superseded (by which) or removed (why). An open spec under a
 closed one is printed with an error naming the fixes; an issue that is not a
 spec between two specs ends inheritance, with a warning. --json prints an
 array of views: {spec, requirements, non_goals, history, errors, warnings,
-inherited, subspecs}, each nested view with its full inherited list.";
+inherited, subspecs}, each nested view with its full inherited list.
+
+--as-of TIME prints the specs as they were then, rebuilt from the retained
+events (the TIME forms of bd show --as-of: an event seq N, or #N quoted in a
+shell ('#120'), a date or time, or -DURATION ago): an issue was a
+requirement, non-goal or sub-spec of a spec then if it existed, its parent
+was that spec and it was labelled requirement, non-goal or spec; in force if
+it was not closed, else history (superseded if it had a supersedes edge). A
+child whose existence, parent, labels, status or title the history cannot
+tell is not placed but listed as `> Unknown: <id> <key>: <reason>`; one
+whose description or edges it cannot tell is placed, with those keys
+listed. With --json each view adds unknown [{id, key, reason}], and each
+view printed at the top adds as_of {seq, time}, incomplete and
+retained_from. A spec that did not exist then is not found (exit 3); a TIME
+before the retained history exits 6.";
 
 const SPEC_SHOW_EXAMPLES: &str = "\
 Examples:
   bd spec show checkout
   bd spec show bd-7 --history
-  bd spec show checkout --json";
+  bd spec show checkout --json
+  bd spec show checkout --as-of 2026-09-01
+  bd spec show bd-7 --as-of 120 --history";
 
 #[derive(Args, Debug, Clone)]
 #[command(after_long_help = SPEC_SHOW_EXAMPLES)]
@@ -80,6 +99,9 @@ pub struct SpecShowArgs {
     /// Also list the closed requirements: superseded or removed
     #[arg(long)]
     pub history: bool,
+    /// Show the specs as they were at TIME: an event seq (N or #N), a date or time, or -DURATION ago
+    #[arg(long, value_name = "TIME", allow_hyphen_values = true)]
+    pub as_of: Option<String>,
 }
 
 pub const SPEC_DRIFT_LONG_ABOUT: &str = "\
@@ -317,4 +339,43 @@ pub struct SpecLinkArgs {
     /// Specs, requirements or non-goals to link it to
     #[arg(required = true, num_args = 1.., value_name = "SPEC|REQUIREMENT")]
     pub targets: Vec<String>,
+}
+
+pub const SPEC_CHANGES_LONG_ABOUT: &str = "\
+Report requirements added, changed and removed in a window
+
+Rebuilds the specs from the retained events and reports what changed between
+--since and --until (the events after --since, up to and including --until;
+--until defaults to now). Each takes an event seq N (#N, quoted in a shell:
+'#120'), a date or time, -DURATION ago, or a bare duration (30d for 30 days
+ago). The scope is the named spec, or the area's specs, at either end, with
+their sub-specs; with no SPEC|AREA, every spec. Each change is listed under
+the item's own parent spec, so inherited requirements are not repeated.
+Kinds: added; superseded (by its replacement, whose own addition in the
+window is folded into it); removed (the close reason, moved to <id>, moved
+out, unlabelled <kind>, relabelled <kind>, deleted or purged); edited (the
+title or description). A membership the history cannot tell is listed as
+unknown, never as a change. --json prints {since, until, specs, changes,
+unknown, incomplete}, the changes in event order. Exits 0 with or without
+changes; a --since before the retained history exits 6, and a window needing
+more than 2000 issues rebuilt exits 2 (name a narrower window or one spec).";
+
+const SPEC_CHANGES_EXAMPLES: &str = "\
+Examples:
+  bd spec changes --since 30d
+  bd spec changes checkout --since 2026-09-01 --until 2026-10-01 --json
+  bd spec changes bd-7 --since 120";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = SPEC_CHANGES_EXAMPLES)]
+pub struct SpecChangesArgs {
+    /// A spec's id, or an area (its area:<name> label); default every spec
+    #[arg(value_name = "SPEC|AREA")]
+    pub target: Option<String>,
+    /// Start of the window, not included: an event seq (N or #N), a date or time, -DURATION or 30d ago
+    #[arg(long, value_name = "TIME", allow_hyphen_values = true, required = true)]
+    pub since: String,
+    /// End of the window, included (default now): an event seq, a date or time, -DURATION or 30d ago
+    #[arg(long, value_name = "TIME", allow_hyphen_values = true)]
+    pub until: Option<String>,
 }

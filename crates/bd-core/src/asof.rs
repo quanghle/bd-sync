@@ -660,31 +660,68 @@ impl Legacy<'_> {
 /// (`exists: false`); one with neither a row nor events is not found; a
 /// point before retained history fails with [`Error::HistoryPruned`] unless
 /// the issue's retained creation shows it did not exist yet.
+///
+/// To rebuild many issues, or one issue at many points, load a [`History`]
+/// once and use [`History::issue`] or [`History::rebuild`].
 pub fn issue_as_of(conn: &Connection, id: &str, point: Point) -> Result<IssueAsOf> {
-    let mut history = events::history(conn, id)?;
-    let head = events::head(conn)?;
-    let floor = events::floor(conn)?;
-    let floor_ts: Option<Timestamp> =
-        conn.prepare_cached("SELECT ts FROM events WHERE seq = ?1")?.query_row([floor], |r| r.get(0)).optional()?;
-    if let Point::Seq(n) = point {
-        if n < 0 {
-            return Err(Error::invalid("event seq must be >= 0"));
-        }
-        if n > head {
-            return Err(Error::invalid(format!("event seq {n} is past the newest event (#{head})")));
+    History::load(conn)?.issue(conn, id, point)
+}
+
+impl PointView {
+    /// The view of `point`.
+    pub fn of(point: Point) -> PointView {
+        match point {
+            Point::Seq(n) => PointView { seq: Some(n), time: None },
+            Point::Time(t) => PointView { seq: None, time: Some(t) },
         }
     }
 
-    // The final state: the row, or the issue's deletion.
-    let row = match issues::get(conn, id)? {
-        Some(_) => Some(issues::snapshot(conn, id)?),
-        None => None,
-    };
-    // Purges and run compactions record the issues they removed in `ids`,
-    // under the run's id or none: merged into the issue's history wherever
-    // they are retained, as the id may have been used again since (or that
-    // reuse deleted too), so both passes see every life of the id.
-    {
+    /// `#N` for a seq, else the time in RFC 3339.
+    pub fn label(&self) -> String {
+        match (self.seq, self.time) {
+            (Some(n), _) => format!("#{n}"),
+            (None, Some(t)) => t.to_rfc3339(),
+            (None, None) => String::new(),
+        }
+    }
+}
+
+/// What every rebuild in one read shares: the log's bounds, the history
+/// marker and the retained purges and run compactions, read once by
+/// [`History::load`] inside the caller's read transaction.
+#[derive(Clone, Debug)]
+pub struct History {
+    head: i64,
+    floor: i64,
+    floor_ts: Option<Timestamp>,
+    marker: i64,
+    /// Every retained `purged` and `run_compacted` event, by seq.
+    removals: Vec<Event>,
+}
+
+/// One issue's retained history and final state, loaded once by
+/// [`History::load_issue`] and replayable at any point by
+/// [`History::rebuild`].
+#[derive(Clone, Debug)]
+pub struct Loaded {
+    pub id: String,
+    /// Its own events plus the retained removals naming it, by seq.
+    pub history: Vec<Event>,
+    /// Its snapshot (the final state), or `None` when it has no row.
+    pub row: Option<Value>,
+}
+
+impl History {
+    /// Read the shared context.
+    pub fn load(conn: &Connection) -> Result<History> {
+        let head = events::head(conn)?;
+        let floor = events::floor(conn)?;
+        let floor_ts: Option<Timestamp> =
+            conn.prepare_cached("SELECT ts FROM events WHERE seq = ?1")?.query_row([floor], |r| r.get(0)).optional()?;
+        let marker: i64 = meta_get(conn, HISTORY_COMPLETE_FROM)?.and_then(|v| v.parse().ok()).unwrap_or(head + 1);
+        // Purges and run compactions record the issues they removed in `ids`,
+        // under the run's id or none: merged into each issue's history
+        // wherever they are retained (see `load_issue`).
         let mut stmt = conn.prepare_cached(
             "SELECT seq, tx, ts, actor, op, issue_id, data FROM events
              WHERE seq > ?1 AND op IN ('purged','run_compacted') ORDER BY seq",
@@ -701,29 +738,103 @@ pub fn issue_as_of(conn: &Connection, id: &str, point: Point) -> Result<IssueAsO
                 data: serde_json::from_str(&data).unwrap_or_else(|_| json!({})),
             })
         })?;
-        let own: BTreeSet<i64> = history.iter().map(|e| e.seq).collect();
-        let mut removals = Vec::new();
-        for e in rows {
-            let e = e?;
-            if !own.contains(&e.seq) && e.data["ids"].as_array().is_some_and(|ids| ids.iter().any(|x| x == id)) {
-                removals.push(e);
+        let removals = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(History { head, floor, floor_ts, marker, removals })
+    }
+
+    /// The newest event's seq.
+    pub fn head(&self) -> i64 {
+        self.head
+    }
+
+    /// The oldest retained event's seq.
+    pub fn floor(&self) -> i64 {
+        self.floor
+    }
+
+    /// The oldest retained event's time, if any event is retained.
+    pub fn floor_ts(&self) -> Option<Timestamp> {
+        self.floor_ts
+    }
+
+    /// The oldest event retention kept.
+    pub fn retained(&self) -> Retained {
+        Retained { seq: self.floor, ts: self.floor_ts }
+    }
+
+    /// Refuse a seq that is negative or past the newest event.
+    pub fn check(&self, point: Point) -> Result<()> {
+        if let Point::Seq(n) = point {
+            if n < 0 {
+                return Err(Error::invalid("event seq must be >= 0"));
+            }
+            if n > self.head {
+                return Err(Error::invalid(format!("event seq {n} is past the newest event (#{})", self.head)));
             }
         }
+        Ok(())
+    }
+
+    /// Whether `point` is before retained history.
+    pub fn before_retention(&self, point: Point) -> bool {
+        match point {
+            Point::Seq(n) => n < self.floor - 1,
+            Point::Time(t) => self.floor_ts.is_some_and(|f| t < f),
+        }
+    }
+
+    /// Load `id`'s events, the retained removals naming it (the id may
+    /// have been used again since, or that reuse removed too, so both passes
+    /// see every life of the id) and its row. Not found when it has neither
+    /// a row nor events.
+    pub fn load_issue(&self, conn: &Connection, id: &str) -> Result<Loaded> {
+        let mut history = events::history(conn, id)?;
+        // The final state: the row, or the issue's deletion.
+        let row = match issues::get(conn, id)? {
+            Some(_) => Some(issues::snapshot(conn, id)?),
+            None => None,
+        };
+        let own: BTreeSet<i64> = history.iter().map(|e| e.seq).collect();
+        let removals: Vec<Event> = self
+            .removals
+            .iter()
+            .filter(|e| {
+                !own.contains(&e.seq) && e.data["ids"].as_array().is_some_and(|ids| ids.iter().any(|x| x == id))
+            })
+            .cloned()
+            .collect();
         if !removals.is_empty() {
             history.extend(removals);
             history.sort_by_key(|e| e.seq);
         }
-    }
-    if row.is_none() && history.is_empty() {
-        return Err(Error::not_found("issue", id));
+        if row.is_none() && history.is_empty() {
+            return Err(Error::not_found("issue", id));
+        }
+        Ok(Loaded { id: id.to_string(), history, row })
     }
 
-    let marker: i64 = meta_get(conn, HISTORY_COMPLETE_FROM)?.and_then(|v| v.parse().ok()).unwrap_or(head + 1);
-    let retained_from = Retained { seq: floor, ts: floor_ts };
-    let view = match point {
-        Point::Seq(n) => PointView { seq: Some(n), time: None },
-        Point::Time(t) => PointView { seq: None, time: Some(t) },
-    };
+    /// [`issue_as_of`] over this context.
+    pub fn issue(&self, conn: &Connection, id: &str, point: Point) -> Result<IssueAsOf> {
+        self.check(point)?;
+        let loaded = self.load_issue(conn, id)?;
+        self.rebuild(conn, &loaded, point)
+    }
+
+    /// The state of `loaded` at `point` (see [`issue_as_of`]). The point is
+    /// checked first, as [`History::check`] does.
+    pub fn rebuild(&self, conn: &Connection, loaded: &Loaded, point: Point) -> Result<IssueAsOf> {
+        self.check(point)?;
+        rebuild(conn, self, loaded, point)
+    }
+}
+
+fn rebuild(conn: &Connection, hist: &History, loaded: &Loaded, point: Point) -> Result<IssueAsOf> {
+    let (head, floor, floor_ts, marker) = (hist.head, hist.floor, hist.floor_ts, hist.marker);
+    let id = loaded.id.as_str();
+    let history = &loaded.history;
+    let row = &loaded.row;
+    let retained_from = hist.retained();
+    let view = PointView::of(point);
     let is_creation = |e: &Event| e.op == "created" || (e.op == "imported" && e.data["mode"] != json!("update"));
     let is_deletion = |e: &Event| {
         e.op == "deleted"
@@ -760,11 +871,7 @@ pub fn issue_as_of(conn: &Connection, id: &str, point: Point) -> Result<IssueAsO
     };
 
     // Before retained history: only a retained creation tells.
-    let before_retention = match point {
-        Point::Seq(n) => n < floor - 1,
-        Point::Time(t) => floor_ts.is_some_and(|f| t < f),
-    };
-    if before_retention {
+    if hist.before_retention(point) {
         if history.first().is_some_and(is_creation) {
             out.created = history.first().map(EventRef::of);
             out.deleted = None;
@@ -787,7 +894,7 @@ pub fn issue_as_of(conn: &Connection, id: &str, point: Point) -> Result<IssueAsO
     if let Some(snap) = &row {
         universe.add_snapshot(snap);
     }
-    for e in &history {
+    for e in history {
         universe.add_event(e);
     }
     let run = |universe: &Universe| {
@@ -1008,5 +1115,103 @@ mod tests {
         assert_eq!(canonical("metadata", None), json!({}));
         assert!(contains_ignore_case("see T-1", "t-"));
         assert!(!contains_ignore_case("see x", "t-"));
+    }
+
+    #[test]
+    fn point_views_label_seqs_and_times() {
+        assert_eq!(PointView::of(Point::Seq(7)), PointView { seq: Some(7), time: None });
+        assert_eq!(PointView::of(Point::Seq(7)).label(), "#7");
+        let t = Timestamp::parse_rfc3339("2026-01-15T09:00:00Z").unwrap();
+        assert_eq!(PointView::of(Point::Time(t)), PointView { seq: None, time: Some(t) });
+        assert_eq!(PointView::of(Point::Time(t)).label(), t.to_rfc3339());
+    }
+
+    /// One shared context answers as `issue_as_of` does, and one loaded
+    /// history replays at every point as a fresh rebuild does.
+    #[test]
+    fn one_history_answers_as_issue_as_of_at_every_point() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use crate::issues::DeleteOptions;
+        use crate::model::{IssuePatch, NewIssue};
+        use crate::store::{InitOptions, OpenOptions, Store};
+        use crate::time::{Clock, ManualClock};
+        use crate::{CloseOptions, Guard, IdMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::new(Timestamp(1_700_000_000_000)));
+        let opts = OpenOptions { clock: clock.clone(), ..Default::default() };
+        let mut store =
+            Store::init(&dir.path().join("bd.db"), InitOptions { prefix: "t".into(), id_mode: IdMode::Counter }, opts)
+                .unwrap();
+        let mut times = Vec::new();
+        let mut write = |f: &mut dyn FnMut(&mut crate::store::WriteCtx<'_>) -> Result<()>| {
+            clock.advance(Duration::from_secs(60));
+            store.write("test", "alice", |tx| f(tx)).unwrap();
+            times.push(clock.now());
+        };
+        let mut id = String::new();
+        write(&mut |tx| {
+            id = tx.create_issue(NewIssue::titled("first"))?.id;
+            Ok(())
+        });
+        let other = id.clone();
+        write(&mut |tx| {
+            let patch = IssuePatch { title: Some("second".into()), ..Default::default() };
+            tx.update_issue(&other, &patch, &Guard::default(), false).map(|_| ())
+        });
+        write(&mut |tx| tx.close_issue(&other, &CloseOptions::default()).map(|_| ()));
+        write(&mut |tx| {
+            tx.delete_issues(std::slice::from_ref(&other), &DeleteOptions { force: true, ..Default::default() })
+                .map(|_| ())
+        });
+
+        store
+            .read(|r| {
+                let conn = r.conn();
+                let hist = History::load(conn)?;
+                let head = hist.head();
+                assert!(head >= 4);
+                let mut points: Vec<Point> = (0..=head).map(Point::Seq).collect();
+                points.extend(times.iter().map(|t| Point::Time(*t)));
+                points.push(Point::Time(times[0].minus(Duration::from_secs(1))));
+                points.push(Point::Time(clock.now().plus(Duration::from_secs(3600))));
+                let loaded = hist.load_issue(conn, &id)?;
+                let mut titles = BTreeSet::new();
+                for point in points {
+                    let fresh = issue_as_of(conn, &id, point);
+                    let shared = hist.issue(conn, &id, point);
+                    let replayed = hist.rebuild(conn, &loaded, point);
+                    match (&fresh, &shared, &replayed) {
+                        (Ok(a), Ok(b), Ok(c)) => {
+                            assert_eq!(a, b, "{point:?}");
+                            assert_eq!(b, c, "{point:?}");
+                            if let Some(t) = a.fields.get("title").and_then(Value::as_str) {
+                                titles.insert(t.to_string());
+                            }
+                        }
+                        (Err(a), Err(b), Err(c)) => {
+                            assert_eq!(a.to_string(), b.to_string(), "{point:?}");
+                            assert_eq!(b.to_string(), c.to_string(), "{point:?}");
+                        }
+                        other => panic!("{point:?}: {other:?}"),
+                    }
+                }
+                assert_eq!(titles, BTreeSet::from(["first".to_string(), "second".to_string()]));
+                // The point checks come before the lookup, as before.
+                let past = hist.issue(conn, "t-nope", Point::Seq(head + 1)).unwrap_err();
+                assert_eq!(
+                    past.to_string(),
+                    issue_as_of(conn, "t-nope", Point::Seq(head + 1)).unwrap_err().to_string()
+                );
+                assert!(past.to_string().contains("past the newest event"), "{past}");
+                assert!(hist.rebuild(conn, &loaded, Point::Seq(-1)).is_err());
+                assert_eq!(hist.issue(conn, "t-nope", Point::Seq(head)).unwrap_err().exit_code(), 3);
+                assert_eq!(hist.retained(), Retained { seq: hist.floor(), ts: hist.floor_ts() });
+                assert!(!hist.before_retention(Point::Seq(0)));
+                Ok(())
+            })
+            .unwrap();
     }
 }

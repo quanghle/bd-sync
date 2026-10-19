@@ -398,14 +398,15 @@ the server's name.
 | `remember` | `bd remember` | `text` (required), `key` (replaces that memory) | no |
 | `memories` | `bd memories` | `query` | yes |
 | `spec_list` | `bd spec list` | none | yes |
-| `spec_show` | `bd spec show` | `target` (a spec id or an area, required), `history` (default `false`: also the closed requirements) | yes |
+| `spec_show` | `bd spec show` | `target` (a spec id or an area, required), `history` (default `false`: also the closed requirements), `as_of` (the specs as they were then, as `bd spec show --as-of` takes it: an event seq `120` or `#120`, a date or time, `-7d`) | yes |
 | `spec_drift` | `bd spec drift` | `since` (a time as `bd spec drift --since` takes it: `2026-01-15`, `30d`; default `experimental.specs.since`), `limit` (1–100, default 20: items per list) | yes |
+| `spec_changes` | `bd spec changes` | `since` (required: a time as `bd spec changes --since` takes it: `120`, `#120`, `2026-09-01`, `-30d` or `30d`), `until` (the same forms; default now), `target` (a spec id or an area; default every spec), `limit` (1–100, default 20: items per list) | yes |
 | `spec_none` | `bd spec none` | `ids` (1–20) and `reason` (both required) | no |
 
 - List arguments (`label`, `label_any`, `labels`, `deps`, `add_labels`,
   `remove_labels`) take at most 20 non-blank items. `title`, `text`,
-  `target` and `reason` must not be blank. Unknown arguments are refused;
-  `null` counts as absent.
+  `target`, `reason`, `as_of`, `since` and `until` must not be blank.
+  Unknown arguments are refused; `null` counts as absent.
 - `update` needs at least one field to change besides `id` and
   `if_revision`. `claim` takes `id` or `next`, not both, and filters only
   with `next`.
@@ -486,7 +487,13 @@ output schemas), so the model reads each thing once:
   `limit`, and `more` gives each cut list's full length
   (`{"unlinked": 34}`); `count` is `bd spec drift`'s, every problem found
   (not `to_link`), before any cut.
-  Drift found (the command's exit 1) is a result, not an error.
+  Drift found (the command's exit 1) is a result, not an error. With
+  `as_of`, `spec_show`'s views also carry `as_of`, `incomplete` and
+  `retained_from` (top views) and `unknown` (what the history cannot tell,
+  left out when empty). `spec_changes` returns `{since, until, specs,
+  changes, unknown, incomplete}` as `bd spec changes --json` prints it, with
+  `changes` and `unknown` each cut to `limit` and `more` giving each cut
+  list's full length (`{"changes": 41}`);
   `spec_none` returns per issue `{id, already, labels, comment_id}`
   (`already: true` and no comment when it was marked before);
 - control and bidirectional formatting characters are escaped as `\u…`; a

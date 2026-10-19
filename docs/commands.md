@@ -13,7 +13,7 @@ and error codes.
 | Issues | `create`, `q`, `show` (`--as-of`), `list`, `query`, `update`, `edit`, `close`, `duplicate`, `supersede`, `find-duplicates`, `reopen`, `defer`, `undefer`, `delete`, `label add/rm/list`, `compact` (`--analyze`, `--apply`, `--stats`) | [Issues](concepts.md#issues), [Query language](#query-language), [Compaction](#compaction) |
 | Dependencies | `dep add/rm/list/tree/cycles`, `blocked`, `graph` | [Dependency types](concepts.md#dependency-types), [Graph export](#graph-export) |
 | Epics and hierarchy | `epic status/close-eligible`, `children`, `stale`, `orphans` | [Epics and hierarchy](#epics-and-hierarchy) |
-| Feature specs (experimental) | `spec list/show/drift/new/add/change/remove/link/none/candidates` | [Feature specs](#feature-specs), [concepts](concepts.md#feature-specs) |
+| Feature specs (experimental) | `spec list/show/changes/drift/new/add/change/remove/link/none/candidates` | [Feature specs](#feature-specs), [concepts](concepts.md#feature-specs) |
 | Ready work and claims | `ready`, `claim` (`--next`), `heartbeat` (`hb`), `release` (`unclaim`), `reclaim`, `leases` | [Ready work](concepts.md#ready-work), [Claims](concepts.md#claims-leases-and-recovery) |
 | Comments and memory | `comment add/list`, `comments`, `remember`, `recall`, `memories`, `forget`, `memory add/get/list/rm` | [Comments and memory](concepts.md#comments-and-memory) |
 | Events | `events` (`--follow`, `--wait`, `prune`), `history` (`--diff`), `show --as-of` | [Event history](concepts.md#event-history), [Reading an issue as of a past moment](concepts.md#reading-an-issue-as-of-a-past-moment) |
@@ -477,7 +477,8 @@ bd graph ID|--all [--format text|dot|html] [--edges TYPE,...|all] [--max-nodes N
 
 ```bash
 bd spec list                                # the open specs: areas, parent spec, status, requirement counts, linked issues
-bd spec show AREA|ID [--history]            # the specs of an area, or one spec, as Markdown
+bd spec show AREA|ID [--history] [--as-of TIME]  # the specs of an area, or one spec, as Markdown (as they were at TIME)
+bd spec changes [AREA|ID] --since TIME [--until TIME]  # requirements added, changed and removed in a window
 bd spec drift [--since TIME]                # exit 1 when work or requirements drifted from the specs
 bd spec new AREA [--parent SPEC] [-d TEXT] [--from ID]... -- TITLE   # a pinned feature labelled spec, area:AREA
 bd spec add SPEC --from ID... [--non-goal] [-d TEXT] -- SENTENCE     # a pinned requirement (or non-goal) of SPEC
@@ -493,9 +494,10 @@ Feature specs are an [experimental feature](#experimental-features): every
 `bd spec` command exits 2 (`feature specs are off in this workspace`) until
 `bd config set experimental.features specs`. See
 [Feature specs](concepts.md#feature-specs) for the convention. `list`,
-`show`, `drift` and `none` are also [MCP tools](mcp.md#tools)
-(`spec_list`, `spec_show`, `spec_drift`, `spec_none`); `candidates` and
-the writes `new`, `add`, `change`, `remove` and `link` are not.
+`show`, `drift`, `changes` and `none` are also [MCP tools](mcp.md#tools)
+(`spec_list`, `spec_show`, `spec_drift`, `spec_changes`, `spec_none`);
+`candidates` and the writes `new`, `add`, `change`, `remove` and `link`
+are not.
 With specs on, `bd show` and `bd claim` list the specs governing an issue,
 `bd close` hints at closed work no spec link covers, and `bd query` finds
 work by spec (`spec = ID`, `spec = none`, `area = AREA`); see
@@ -583,6 +585,70 @@ writes without the checks.
   however deep its tree. `--json` prints an array of views
   `{spec, requirements, non_goals, history, errors, warnings, inherited,
   subspecs}`, each nested view with its full `inherited`.
+- **Show as of.** `--as-of TIME` prints the specs as they were at TIME,
+  rebuilt from the retained events as [`bd show --as-of`](#issues) does,
+  in the same TIME forms (an event seq `120` or `#120`, a date or time,
+  `-7d` ago; a time in the future gives the current state) and with the
+  same Markdown, plus an `As of #N` (or RFC 3339 time) line under the top
+  heading; `--history` works with it. At TIME, an issue was a requirement,
+  non-goal or sub-spec of a spec when it existed, its parent-child edge
+  pointed at that spec and it was labelled `requirement`, `non-goal` or
+  `spec`; it was in force when it was not closed, else history (superseded
+  when it had an outgoing `supersedes` edge then, else removed), and its
+  sources are its outgoing `related` edges then. Issues that have since
+  moved to another spec, been deleted or purged, or were imported later,
+  are still found where they were. The target resolves at TIME too: an id
+  that was a spec then, then the area's open specs then, then a short id;
+  else not found, exit 3, the message naming the point (`... at #120`).
+  Nothing is guessed: a child whose existence, parent, membership label,
+  status or title the history cannot tell is not placed but listed as
+  `> Unknown: ID KEY: REASON` (the reason [`bd show --as-of`](#issues)
+  gives); one whose description, or an edge other than its parent, the
+  history cannot tell is placed, with that key listed. `--json` prints the
+  same array of views, each view (nested ones too) adding `unknown`
+  `[{id, key, reason}]` and each view printed at the top adding `as_of`
+  `{seq, time}`, `incomplete` and `retained_from` `{seq, ts}`; without
+  `--as-of` none of these keys appear. A TIME before the retained history
+  (`events.retain_days`, `events.retain_rows`) exits 6
+  (`history_pruned`); a seq past the newest event exits 2.
+- **Changes.** Reports what changed in the specs between `--since`
+  (required) and `--until` (default now): the events after `--since`, up to
+  and including `--until`, so two adjacent windows tile. Both take
+  `--as-of`'s TIME forms, plus a bare duration (`30d` is 30 days ago); bare
+  digits are an event seq (`--since 120`), as is `#120`, which a shell
+  needs quoted (`--since '#120'`: an unquoted `#` starts a comment).
+  `--since` not before `--until` exits 2. In a remote workspace relative
+  times are resolved by `bd serve`, on its clock. The scope is the named
+  spec, or the area's specs, at either end of the window, with their
+  sub-specs at either end; with no `AREA|ID`, every spec. Membership is
+  `--as-of`'s rule, checked at `--since` and after each transaction that
+  touched the item in the window, and each change is listed under the
+  item's own parent spec, so inherited requirements are not repeated under
+  sub-specs. Kinds: `added`; `superseded`, with `by` (its replacement,
+  whose own addition under the same spec in the window is folded into it);
+  `removed`, with a `reason` (the close reason, `moved to ID`, `moved out`,
+  `unlabelled KIND`, `relabelled KIND`, `deleted` or `purged`; a move
+  between specs in scope, or a relabel, is a removal then an addition at
+  the same seq); `edited`, an in-place title or description change, with
+  `old_title` and `description_changed`. An item added and removed inside
+  the window is listed twice, in order. Each change carries its item kind
+  (`requirement`, `non-goal` or `spec`) and the item's sources at that
+  moment. Markdown: `# Spec changes between SINCE and UNTIL`, then one
+  `## TITLE (ID)` per spec with changes, with `### Added`, `### Changed`
+  (`- OLD (ID) -> NEW (ID) (...)`) and `### Removed` (ending with the
+  reason), each line ending `(ID; from SOURCES; YYYY-MM-DD)`, the date in
+  UTC; with none, `No spec changes between SINCE and UNTIL.`. A membership
+  the history cannot tell, at `--since` or at a transition, is a
+  `> Unknown:` line, never a change. `--json` prints `{since, until, specs,
+  changes, unknown, incomplete}`: the points as `{seq, time}`, `specs` the
+  scope as `{id, title}`, `changes` in event order as `{seq, at, actor,
+  spec, id, item, kind, title, sources}` plus `by`, `reason`, `old_title`
+  and `description_changed` where they apply. `-q` prints each changed id
+  once. Exits 0 with or without changes; a `--since` before the retained
+  history exits 6 (one before the first event of a history nothing was
+  pruned from starts at the beginning), and a window needing more than
+  2000 issues rebuilt exits 2 (name a narrower window or one spec; the same
+  bound holds for `--as-of`).
 - **Linked work.** An issue is linked directly when it has a `related`
   edge, either direction, to an issue labelled `spec`, `requirement` or
   `non-goal` (of any status: links to closed requirements and specs still

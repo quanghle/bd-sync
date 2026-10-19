@@ -60,7 +60,8 @@ const WHOLE_TABLE: &[(&str, &str)] = &[
     ("FROM issues i WHERE i.issue_type = 'gate'", "issues"),
     // playbook runs
     ("WHERE json_extract(i.metadata, '$.playbook.role') = 'run'", "issues"),
-    // an id prefix: the ids in order, up to a few matches (bd-sync-wfr)
+    // an id prefix past the case-variant cap, or holding a NUL or too long to walk (bd-sync-wfr):
+    // the ids in order, up to a few matches
     ("SELECT id FROM issues WHERE id LIKE ?1", "issues"),
     // request records, oldest first: up to a batch (pruned hourly)
     ("SELECT rowid FROM requests WHERE created_at < ?1 ORDER BY rowid LIMIT", "requests"),
@@ -815,6 +816,9 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         "WHERE lb.label = ?1 AND i.status <> 'closed'",
         "FROM events WHERE issue_id = ?1 AND op = 'reopened'",
         "dep_type IN (?2, ?3)",
+        // Id prefixes: seeking the primary key over their case variants.
+        "SELECT 1 FROM issues WHERE id >= ?1 AND id < ?2 LIMIT 1",
+        "SELECT id FROM issues WHERE id >= ?1 AND id < ?2 ORDER BY id LIMIT 6",
     ] {
         assert!(commands.iter().any(|s| s.contains(needle)), "no statement with {needle:?} ran");
     }

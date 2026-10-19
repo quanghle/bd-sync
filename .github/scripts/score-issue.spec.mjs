@@ -1,5 +1,5 @@
 // .claude/workflows/score-issue.js end to end with a scripted agent: the rubric's caps on overall, the two bd writes the
-// record agent is handed (as the caller's actor when given one), and ops()' single escalation of a mechanical agent. A
+// record agent is handed (as the caller's actor when given one), and ops()' single escalation of a mechanical agent (setup, trace and record). A
 // workflow script isn't a module (top-level await and return), so this runs its body as an async function with the
 // workflow globals (args, agent, log, phase) stubbed.
 import { readFileSync } from 'node:fs'
@@ -86,5 +86,66 @@ describe('score-issue.js', () => {
 		const { result, calls } = await run({ issue: 'bd-1' }, { ...base, setup: null, 'setup@sonnet': null })
 		expect(result.status).toBe('failed')
 		expect(calls.filter((c) => c.label.startsWith('setup')).length).toBe(2)
+	})
+
+	const judge = judgeReply(DIMS5, 5)
+	const labelsOf = (calls, prefix) => calls.filter((c) => c.label.startsWith(prefix))
+	const escalated = (calls) => calls.some((c) => c.label.endsWith('@sonnet'))
+
+	it('escalates a failed trace once, to sonnet at medium, and keeps the escalated summary as work', async () => {
+		for (const bad of [null, { summary: 'x' }]) {
+			const { result, calls } = await run(
+				{ issue: 'bd-1', dryRun: true },
+				{ ...base, judge, trace: bad, 'trace@sonnet': { ok: true, summary: 'Work: escalated' } },
+			)
+			const traces = labelsOf(calls, 'trace')
+			expect(
+				traces.map((c) => [c.label, c.model, c.effort]),
+				JSON.stringify(bad),
+			).toEqual([
+				['trace', 'haiku', 'low'],
+				['trace@sonnet', 'sonnet', 'medium'],
+			])
+			expect(traces[1].prompt).toContain(traces[0].prompt)
+			expect(traces[1].prompt).toContain('check their effects first')
+			expect(result.work, JSON.stringify(bad)).toBe('Work: escalated')
+		}
+	})
+
+	it('gives up on the trace after one escalation', async () => {
+		const { result, calls } = await run(
+			{ issue: 'bd-1', dryRun: true },
+			{ ...base, judge, trace: null, 'trace@sonnet': { summary: 'x' } },
+		)
+		expect(labelsOf(calls, 'trace').map((c) => c.label)).toEqual(['trace', 'trace@sonnet'])
+		expect(result.work).toBe('Work trace failed: trace agent failed')
+	})
+
+	it('escalates a failed record once and records with the escalated answer', async () => {
+		const a = await run({ issue: 'bd-1' }, { ...base, judge, record: null, 'record@sonnet': { ok: true } })
+		expect(a.result).toMatchObject({ status: 'scored', recorded: true })
+		const recs = labelsOf(a.calls, 'record')
+		expect(recs.map((c) => [c.label, c.model, c.effort])).toEqual([
+			['record', 'haiku', 'low'],
+			['record@sonnet', 'sonnet', 'medium'],
+		])
+		expect(recs[1].prompt).toContain(recs[0].prompt)
+		const b = await run({ issue: 'bd-1' }, { ...base, judge, record: null, 'record@sonnet': null })
+		expect(b.result).toMatchObject({ status: 'scored', recorded: false, reason: 'could not record: record agent failed' })
+		expect(labelsOf(b.calls, 'record').map((c) => c.label)).toEqual(['record', 'record@sonnet'])
+	})
+
+	it('takes a well-formed ok:false from trace and record as their answer, without escalating', async () => {
+		const a = await run({ issue: 'bd-1' }, { ...base, judge, record: { ok: false, error: 'exit 7' } })
+		expect(a.result).toMatchObject({ status: 'scored', recorded: false, reason: 'could not record: exit 7' })
+		expect(labelsOf(a.calls, 'record').map((c) => c.label)).toEqual(['record'])
+		expect(escalated(a.calls)).toBe(false)
+		const b = await run(
+			{ issue: 'bd-1', dryRun: true },
+			{ ...base, judge, trace: { ok: false, summary: 'Work: partial', error: 'write refused' } },
+		)
+		expect(b.result.work).toBe('Work: partial\n(Not stored as work metadata: write refused)')
+		expect(labelsOf(b.calls, 'trace').map((c) => c.label)).toEqual(['trace'])
+		expect(escalated(b.calls)).toBe(false)
 	})
 })

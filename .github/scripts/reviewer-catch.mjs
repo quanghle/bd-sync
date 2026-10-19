@@ -626,9 +626,11 @@ export function render(data) {
 }
 
 // ---------- hand-run passes ----------
-// AGENTS.md role prefixes, the same list as calibrate.mjs PREFIX_ROLES (kept in step by hand: the scripts share no
-// module); no '<agentType>: ' skip group, since meta.description is the bare description.
-const ROLE_PREFIX = /^\s*(coder|reviewer|mechanical|research|planner|summary):\s*/i
+export const ROLE_PREFIXES = ['coder', 'reviewer', 'mechanical', 'research', 'planner', 'summary']
+// The AGENTS.md role prefixes: the one list, which calibrate.mjs imports for roleOf and its methodology note. The words
+// are plain lowercase letters, so they go into the regex unescaped. No '<agentType>: ' skip group here, since
+// meta.description is the bare description.
+const ROLE_PREFIX = new RegExp(`^\\s*(${ROLE_PREFIXES.join('|')}):\\s*`, 'i')
 
 /**
  * A plain subagent's review facts from its meta, or null when it is not a review pass: { label, kind, round, shadow,

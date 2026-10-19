@@ -2,7 +2,7 @@
 
 use bd_core::specs::{self, Drift};
 use bd_core::time::parse_filter_time;
-use bd_core::{Error, Guard, IssuePatch, IssueRef, Queries, Result, WriteCtx, issues};
+use bd_core::{Error, Guard, IssuePatch, IssueRef, Queries, Result, Status, WriteCtx, issues};
 use serde_json::json;
 
 use crate::app::{App, Out};
@@ -48,6 +48,11 @@ fn cmd_spec_list(app: &mut App) -> Result<()> {
         }
         if let Some(parent) = &s.parent {
             line.push_str(&format!(" (sub-spec of {parent})"));
+        } else if let Some(closed) = &s.closed_parent {
+            line.push_str(&format!(" (orphaned: parent spec {closed} is closed)"));
+        }
+        if s.status != Status::Pinned {
+            line.push_str(&format!(" ({}, not pinned)", s.status.as_str()));
         }
         line.push_str(&format!(
             ": {} requirement{}, {} non-goal{}, {} linked issue{}",
@@ -126,8 +131,11 @@ fn drift_text(d: &Drift) -> Out {
             })
             .collect(),
     );
-    out =
-        section(out, "Bad status: requirements neither pinned nor closed", d.bad_status.iter().map(ref_line).collect());
+    out = section(
+        out,
+        "Bad status: specs and requirements neither pinned nor closed",
+        d.bad_status.iter().map(ref_line).collect(),
+    );
     out = section(
         out,
         "Orphaned: open specs under a closed spec",

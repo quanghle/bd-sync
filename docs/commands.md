@@ -421,7 +421,7 @@ bd graph ID|--all [--format text|dot|html] [--edges TYPE,...|all] [--max-nodes N
 ### Feature specs
 
 ```bash
-bd spec list                                # the open specs: areas, parent spec, requirement counts, linked issues
+bd spec list                                # the open specs: areas, parent spec, status, requirement counts, linked issues
 bd spec show AREA|ID [--history]            # the specs of an area, or one spec, as Markdown
 bd spec drift [--since TIME]                # exit 1 when work or requirements drifted from the specs
 bd spec none ID... -r "why"                 # label spec:none and comment "No spec: why", in one write
@@ -436,18 +436,23 @@ Feature specs are an [experimental feature](#experimental-features): every
 
 - **Show.** Takes a spec's id (or a short id) or an area: every open spec
   labelled `area:AREA`, in id order, leaving out those shown inside another
-  one's tree (exit 3 when it names none). Each spec prints its
-  requirements in force and non-goals in creation order, each with its id
-  and its sources; the specs printed
-  at the top also list the requirements they inherit from the open specs
-  above them (`## Inherited`, outermost first); open sub-specs follow as
+  one's tree (exit 3 when it names none; an id prefix matching several
+  issues fails with `ambiguous id`, exit 2, as `bd show` does). Each spec
+  prints its requirements in force and non-goals in creation order, each
+  with its id and its sources; the specs printed at the top also list
+  the requirements they inherit from the open specs above them
+  (`## Inherited`, outermost first); open sub-specs follow as
   `## Sub-feature: ...`, one heading level deeper, to 8 levels.
   `--history` adds the closed requirements: superseded (by the issue its
   `supersedes` edge names) or removed (with its close reason, a leading
   `removed:` dropped). An open spec under a closed one is printed with
   `> Error:` and the fixes, inheriting nothing; an issue that is not a spec
   between two specs, a cycle or the depth bound with `> Warning:`, as is a
-  requirement neither pinned nor closed. `--json` prints an array of views
+  requirement neither pinned nor closed and a spec neither pinned nor
+  closed (`ID is STATUS, not pinned: pin it (bd update ID --status pinned)
+  or close it`); a spec printed at the top carries its ancestors'
+  warnings as `inherited from ID: ...`. Every spec is printed once,
+  however deep its tree. `--json` prints an array of views
   `{spec, requirements, non_goals, history, errors, warnings, inherited,
   subspecs}`, each nested view with its full `inherited`.
 - **Linked work.** An issue is linked directly when it has a `related`
@@ -469,8 +474,10 @@ Feature specs are an [experimental feature](#experimental-features): every
   then, neither linked nor exempt; `shaky`, requirements in force whose
   source (an outgoing `related` edge) was reopened (closed once, not closed
   now: a `reopened` event in its history) or closed as failed, while a
-  source still in progress, never closed, is not; `bad_status`, requirements neither pinned nor
-  closed; `orphaned`, open specs under a closed spec. `to_link`, open issues
+  source still in progress, never closed, is not; `bad_status`, specs,
+  requirements and non-goals neither pinned nor closed, in id order, each
+  once; `orphaned`, open specs under a closed spec (one that is also not
+  pinned is in both `orphaned` and `bad_status`). `to_link`, open issues
   created since then and not linked yet, is listed but is not drift. Exits
   1 when `unlinked`, `shaky`, `bad_status` and `orphaned` hold anything, 0
   otherwise, locally and through `bd serve` alike; `--json` adds `count`.
@@ -482,10 +489,14 @@ Feature specs are an [experimental feature](#experimental-features): every
   assignee or a claim. An issue already labelled `spec:none` is left as it
   is (`= ID is already marked spec:none`, no second comment). Also a
   `bd batch` operation (`spec none ID -r WHY`).
-- **List.** Per open spec: its areas, its parent spec, its requirements
-  and non-goals in force, and how many distinct issues that are not spec
+- **List.** Per open spec: its areas, its parent spec (`parent`, marked
+  `(sub-spec of P)`) when that is not closed, its requirements and
+  non-goals in force, and how many distinct issues that are not spec
   issues have a `related` edge, either direction, to it or its own
-  requirements.
+  requirements. A spec whose parent spec is closed is marked
+  `(orphaned: parent spec P is closed)`, with `parent` null and
+  `closed_parent` P in `--json` (`closed_parent` is null otherwise); a spec
+  not pinned is marked `(STATUS, not pinned)`, as `(open, not pinned)`.
 - **Candidates.** Issues closed before `experimental.specs.since` (every
   closed issue when it is unset), neither linked nor exempt, grouped by
   their topmost epic that is not a playbook run or group (`epic:ID`), else

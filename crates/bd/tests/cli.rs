@@ -5857,6 +5857,87 @@ fn feature_specs_list_show_drift_none_and_candidates() {
     assert_ne!(ws.json(&["config", "get", "experimental.specs.since"])["value"], "2026-01-15T00:00:00.000Z");
 }
 
+/// Specs neither pinned nor closed are flagged by list, show and drift; a sub-spec
+/// under a closed spec is listed as an orphan; an ambiguous id prefix is exit 2.
+#[test]
+fn feature_specs_flag_unpinned_specs_orphans_and_ambiguous_ids() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let top = ws.id(&["create", "Top", "-l", "spec,area:billing"]);
+    let r1 = ws.id(&["create", "Pays", "--pinned", "-l", "requirement", "--parent", &top]);
+    let r2 = ws.id(&["create", "Refunds", "--pinned", "-l", "requirement", "--parent", &top]);
+    let retired = ws.id(&["create", "Retired", "--pinned", "-l", "spec"]);
+    let orphan = ws.id(&["create", "Orphan", "--pinned", "-l", "spec", "--parent", &retired]);
+    ws.ok(&["close", &retired, "--force", "-r", "retired"]);
+
+    // list: the not-pinned and orphan markers, and closed_parent in JSON
+    let list = ws.ok(&["spec", "list"]);
+    assert!(
+        list.contains(&format!("{top} Top [billing] (open, not pinned): 2 requirements, 0 non-goals, 0 linked issues")),
+        "{list}"
+    );
+    assert!(
+        list.contains(&format!("{orphan} Orphan (orphaned: parent spec {retired} is closed): 0 requirements")),
+        "{list}"
+    );
+    let json = ws.json(&["spec", "list"]);
+    let entries = json.as_array().unwrap();
+    assert_eq!(entries.len(), 2, "{json}");
+    assert!(entries.iter().all(|e| e.as_object().unwrap().contains_key("closed_parent")), "{json}");
+    let entry = |id: &str| entries.iter().find(|e| e["id"] == id).unwrap().clone();
+    let o = entry(&orphan);
+    assert!(o["parent"].is_null(), "{o}");
+    assert_eq!(o["closed_parent"], retired.as_str());
+    let t = entry(&top);
+    assert!(t["parent"].is_null() && t["closed_parent"].is_null(), "{t}");
+    assert_eq!(t["status"], "open");
+
+    // show: the spec warns about itself
+    let warning = format!("{top} is open, not pinned: pin it (bd update {top} --status pinned) or close it");
+    let md = ws.ok(&["spec", "show", &top]);
+    assert!(md.contains(&format!("> Warning: {warning}")), "{md}");
+    let views = ws.json(&["spec", "show", &top]);
+    assert_eq!(views[0]["warnings"][0], warning.as_str());
+
+    // drift: the unpinned spec is bad status, the orphan orphaned
+    let out = ws.run_as("tester", &["spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!(
+            "## Bad status: specs and requirements neither pinned nor closed (1)\n- {top} [task] Top (open)"
+        )),
+        "{text}"
+    );
+    assert!(text.contains("## Orphaned: open specs under a closed spec (1)"), "{text}");
+    let out = ws.run_as("tester", &["--json", "spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1));
+    let drift: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(drift["bad_status"][0]["id"], top.as_str(), "{drift}");
+    assert_eq!(drift["count"], 2, "{drift}");
+
+    // Pinning it clears both; the orphan still drifts.
+    ws.ok(&["update", &top, "--status", "pinned"]);
+    let out = ws.run_as("tester", &["--json", "spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1));
+    let drift: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(drift["bad_status"].as_array().unwrap().is_empty(), "{drift}");
+    assert_eq!(drift["count"], 1, "{drift}");
+    let list = ws.ok(&["spec", "list"]);
+    assert!(!list.contains("not pinned"), "{list}");
+    assert!(list.contains(&format!("{top} Top [billing]: 2 requirements")), "{list}");
+
+    // show: an ambiguous prefix is exit 2, a non-spec exit 3, a short spec id shows it
+    let (code, err) = refusal(&ws, "tester", &["spec", "show", &format!("{top}.")]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains(&format!("ambiguous id \"{top}.\": matches")), "{err}");
+    assert!(err.contains(&r1) && err.contains(&r2), "{err}");
+    assert_eq!(ws.code_as("tester", &["spec", "show", &r1]), 3);
+    let short = top.strip_prefix("t-").unwrap();
+    let md = ws.ok(&["spec", "show", short]);
+    assert!(md.starts_with(&format!("# Top ({top})")), "{md}");
+}
+
 #[test]
 fn spec_none_runs_in_a_batch() {
     let ws = Ws::new();

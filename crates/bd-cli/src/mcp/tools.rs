@@ -55,6 +55,9 @@ enum Shape {
     /// `bd spec drift`'s report: issues as summaries, each list cut to the
     /// limit, and `more` naming each cut list's full length.
     Drift,
+    /// `bd spec changes`'s report: `changes` and `unknown` cut to the limit,
+    /// and `more` naming each cut list's full length.
+    Changes,
 }
 
 /// One tool of the catalog.
@@ -74,7 +77,8 @@ pub struct Invocation {
     pub argv: Vec<String>,
     shape: Shape,
     /// The number of issues asked for (`Shape::Summaries`; one more is
-    /// fetched), or the items kept per list (`Shape::Drift`).
+    /// fetched), or the items kept per list (`Shape::Drift`,
+    /// `Shape::Changes`).
     limit: usize,
     /// The call asked for closed requirements too (`Shape::SpecViews`).
     history: bool,
@@ -99,6 +103,7 @@ const DEP_TYPES: &[&str] = &[
 const READY_LIMIT: i64 = 10;
 const LIST_LIMIT: i64 = 20;
 const DRIFT_LIMIT: i64 = 20;
+const CHANGES_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
 const MAX_IDS: usize = 20;
 
@@ -301,7 +306,11 @@ pub static TOOLS: &[Tool] = &[
         name: "spec_show",
         description: "A spec, or an area's specs: requirements, non-goals, inherited ones, sub-specs.",
         read_only: true,
-        params: &[req("target", Kind::Str, "Spec id or area"), p("history", Kind::Bool, "Also closed requirements")],
+        params: &[
+            req("target", Kind::Str, "Spec id or area"),
+            p("history", Kind::Bool, "Also closed requirements"),
+            p("as_of", Kind::Str, "Event seq, date/time or -DURATION ago"),
+        ],
         build: build_spec_show,
         shape: Shape::SpecViews,
     },
@@ -315,6 +324,19 @@ pub static TOOLS: &[Tool] = &[
         ],
         build: build_spec_drift,
         shape: Shape::Drift,
+    },
+    Tool {
+        name: "spec_changes",
+        description: "Requirements added, changed and removed between two times.",
+        read_only: true,
+        params: &[
+            p("target", Kind::Str, "Spec id or area; default every spec"),
+            req("since", Kind::Str, "Event seq, date/time, -DURATION or 30d"),
+            p("until", Kind::Str, "Default now"),
+            p("limit", Kind::Int(1, MAX_LIMIT), "Default 20"),
+        ],
+        build: build_spec_changes,
+        shape: Shape::Changes,
     },
     Tool {
         name: "spec_none",
@@ -365,6 +387,7 @@ impl Tool {
                 args.int("limit").unwrap_or(if self.name == "ready" { READY_LIMIT } else { LIST_LIMIT })
             }
             Shape::Drift => args.int("limit").unwrap_or(DRIFT_LIMIT),
+            Shape::Changes => args.int("limit").unwrap_or(CHANGES_LIMIT),
             _ => 0,
         } as usize;
         let history = self.shape == Shape::SpecViews && args.flag("history");
@@ -408,6 +431,7 @@ impl Invocation {
             Shape::Specs => json!({ "specs": value }),
             Shape::SpecViews => spec_views(value, self.history),
             Shape::Drift => drift(value, self.limit),
+            Shape::Changes => changes(value, self.limit),
         };
         let text = serde_json::to_string(&prune(shaped).unwrap_or_else(|| json!({}))).expect("JSON values serialize");
         Ok(crate::io::printable(&text).into_owned())
@@ -714,12 +738,30 @@ fn build_spec_show(a: &Args) -> Result<Vec<String>, String> {
     if target.trim().is_empty() {
         return Err("target must not be empty".into());
     }
-    Line::new(&["spec", "show"]).switch("history", a.flag("history")).arg(target).done()
+    let as_of = a.str("as_of");
+    if as_of.is_some_and(|t| t.trim().is_empty()) {
+        return Err("as_of must not be empty".into());
+    }
+    Line::new(&["spec", "show"]).switch("history", a.flag("history")).opt("as-of", as_of).arg(target).done()
 }
 
 fn build_spec_drift(a: &Args) -> Result<Vec<String>, String> {
     // The limit is applied to the output: bd spec drift has none.
     Line::new(&["spec", "drift"]).opt("since", a.str("since")).done()
+}
+
+fn build_spec_changes(a: &Args) -> Result<Vec<String>, String> {
+    // The limit is applied to the output: bd spec changes has none.
+    for name in ["target", "since", "until"] {
+        if a.str(name).is_some_and(|v| v.trim().is_empty()) {
+            return Err(format!("{name} must not be empty"));
+        }
+    }
+    let line = Line::new(&["spec", "changes"]).opt("since", a.str("since")).opt("until", a.str("until"));
+    match a.str("target") {
+        Some(target) => line.arg(target).done(),
+        None => line.done(),
+    }
 }
 
 fn build_spec_none(a: &Args) -> Result<Vec<String>, String> {
@@ -820,6 +862,29 @@ fn drift(value: Value, limit: usize) -> Value {
             more.insert(key.into(), json!(items.len()));
         }
         out[key] = Value::Array(items.iter().take(limit).map(item).collect());
+    }
+    if !more.is_empty() {
+        out["more"] = Value::Object(more);
+    }
+    out
+}
+
+/// `bd spec changes`'s report with `changes` and `unknown` cut to `limit`;
+/// `more` names each cut list's full length.
+fn changes(value: Value, limit: usize) -> Value {
+    let mut out = json!({
+        "since": value["since"],
+        "until": value["until"],
+        "specs": value["specs"],
+        "incomplete": value["incomplete"],
+    });
+    let mut more = Map::new();
+    for key in ["changes", "unknown"] {
+        let items = value[key].as_array().map(Vec::as_slice).unwrap_or_default();
+        if items.len() > limit {
+            more.insert(key.into(), json!(items.len()));
+        }
+        out[key] = Value::Array(items.iter().take(limit).cloned().collect());
     }
     if !more.is_empty() {
         out["more"] = Value::Object(more);
@@ -1018,13 +1083,18 @@ mod tests {
     #[test]
     fn spec_tools_are_listed_last_in_order() {
         let names: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
-        assert_eq!(names[names.len() - 4..], ["spec_list", "spec_show", "spec_drift", "spec_none"]);
+        assert_eq!(names[names.len() - 5..], ["spec_list", "spec_show", "spec_drift", "spec_changes", "spec_none"]);
         let describe = |name: &str| TOOLS.iter().find(|t| t.name == name).unwrap().describe();
-        for read in ["spec_list", "spec_show", "spec_drift"] {
+        for read in ["spec_list", "spec_show", "spec_drift", "spec_changes"] {
             assert_eq!(describe(read)["annotations"], json!({ "readOnlyHint": true }), "{read}");
         }
         assert_eq!(describe("spec_none")["annotations"], json!({ "destructiveHint": false }));
         assert_eq!(describe("spec_show")["inputSchema"]["required"], json!(["target"]));
+        assert_eq!(describe("spec_changes")["inputSchema"]["required"], json!(["since"]));
+        assert_eq!(
+            describe("spec_changes")["inputSchema"]["properties"]["limit"],
+            json!({ "type": "integer", "minimum": 1, "maximum": 100, "description": "Default 20" })
+        );
         assert_eq!(describe("spec_none")["inputSchema"]["required"], json!(["ids", "reason"]));
         assert_eq!(describe("spec_list")["inputSchema"], json!({ "type": "object", "properties": {} }));
     }
@@ -1051,6 +1121,20 @@ mod tests {
             argv("spec_none", json!({ "ids": ["-x", "t-1"], "reason": "--force" })),
             ["spec", "none", "--json", "--reason=--force", "--", "-x", "t-1"]
         );
+        assert_eq!(
+            argv("spec_show", json!({ "target": "checkout", "as_of": "-1d" })),
+            ["spec", "show", "--json", "--as-of=-1d", "--", "checkout"]
+        );
+        assert_eq!(
+            argv("spec_show", json!({ "target": "-x", "as_of": "#12", "history": true })),
+            ["spec", "show", "--json", "--history", "--as-of=#12", "--", "-x"]
+        );
+        assert_eq!(argv("spec_changes", json!({ "since": "--all" })), ["spec", "changes", "--json", "--since=--all"]);
+        // The limit cuts the output; it is never passed.
+        assert_eq!(
+            argv("spec_changes", json!({ "target": "--history", "since": "-1d", "until": "#9", "limit": 3 })),
+            ["spec", "changes", "--json", "--since=-1d", "--until=#9", "--", "--history"]
+        );
     }
 
     #[test]
@@ -1068,6 +1152,15 @@ mod tests {
         assert_eq!(err("spec_none", json!({ "ids": many, "reason": "r" })), "ids must have 1 to 20 items");
         assert_eq!(err("spec_drift", json!({ "limit": 0 })), "limit must be between 1 and 100");
         assert_eq!(err("spec_drift", json!({ "limit": 101 })), "limit must be between 1 and 100");
+        assert_eq!(err("spec_show", json!({ "target": "a", "as_of": " " })), "as_of must not be empty");
+        assert_eq!(err("spec_show", json!({ "target": "a", "as_of": 12 })), "as_of must be a string");
+        assert_eq!(err("spec_changes", json!({})), "since is required");
+        assert_eq!(err("spec_changes", json!({ "since": "" })), "since must not be empty");
+        assert_eq!(err("spec_changes", json!({ "since": "1d", "target": " " })), "target must not be empty");
+        assert_eq!(err("spec_changes", json!({ "since": "1d", "until": "\t" })), "until must not be empty");
+        assert_eq!(err("spec_changes", json!({ "since": "1d", "limit": 0 })), "limit must be between 1 and 100");
+        assert_eq!(err("spec_changes", json!({ "since": "1d", "limit": 101 })), "limit must be between 1 and 100");
+        assert_eq!(err("spec_changes", json!({ "since": "1d", "history": true })), "unknown argument \"history\"");
     }
 
     #[test]
@@ -1149,6 +1242,76 @@ mod tests {
     }
 
     #[test]
+    fn spec_show_keeps_the_as_of_keys() {
+        let view = json!([{
+            "spec": { "id": "s-1", "title": "Top", "description": "" }, "requirements": [], "non_goals": [],
+            "errors": [], "warnings": [], "subspecs": [{ "spec": { "id": "s-2", "title": "Sub", "description": "" },
+                "requirements": [], "non_goals": [], "errors": [], "warnings": [], "subspecs": [],
+                "unknown": [{ "id": "r-9", "key": "title", "reason": "why" }] }],
+            "unknown": [], "as_of": { "seq": 4, "time": "T" }, "incomplete": false,
+            "retained_from": { "seq": 1, "ts": "T0" },
+        }])
+        .to_string();
+        let text = invoke("spec_show", json!({ "target": "s-1", "as_of": "4" })).unwrap().result(&view).unwrap();
+        let shaped: Value = serde_json::from_str(&text).unwrap();
+        let top = &shaped["specs"][0];
+        assert_eq!(top["as_of"], json!({ "seq": 4, "time": "T" }));
+        assert_eq!(top["incomplete"], json!(false));
+        assert_eq!(top["retained_from"], json!({ "seq": 1, "ts": "T0" }));
+        // An empty unknown list is left out; a non-empty one is kept.
+        assert!(top.get("unknown").is_none(), "{text}");
+        assert_eq!(top["subspecs"][0]["unknown"][0]["id"], "r-9");
+    }
+
+    #[test]
+    fn spec_changes_cuts_changes_and_unknown() {
+        let change = |seq: i64, kind: &str| {
+            json!({ "seq": seq, "at": "T", "actor": "a", "spec": "s-1", "id": format!("r-{seq}"),
+                "item": "requirement", "kind": kind, "title": "t\u{1b}[31m", "sources": [] })
+        };
+        let unknown = |id: &str| json!({ "id": id, "key": "title", "reason": "why" });
+        let out = json!({
+            "since": { "seq": 3, "time": null }, "until": { "seq": null, "time": "U" },
+            "specs": [{ "id": "s-1", "title": "Checkout" }],
+            "changes": [change(4, "added"), change(5, "removed"), change(6, "added")],
+            "unknown": [unknown("x-1")],
+            "incomplete": false,
+        })
+        .to_string();
+        let inv = invoke("spec_changes", json!({ "since": "3", "limit": 2 })).unwrap();
+        assert!(!inv.accepts_exit(1));
+        let text = inv.result(&out).unwrap();
+        assert!(text.contains(r#""title":"t\u001b[31m""#), "{text}");
+        let shaped: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(shaped["more"], json!({ "changes": 3 }));
+        let seqs: Vec<i64> = shaped["changes"].as_array().unwrap().iter().map(|c| c["seq"].as_i64().unwrap()).collect();
+        assert_eq!(seqs, [4, 5]);
+        assert_eq!(shaped["unknown"], json!([unknown("x-1")]));
+        assert_eq!(shaped["since"], json!({ "seq": 3 }));
+        assert_eq!(shaped["until"], json!({ "time": "U" }));
+        assert_eq!(shaped["specs"], json!([{ "id": "s-1", "title": "Checkout" }]));
+        assert_eq!(shaped["incomplete"], json!(false));
+
+        let text = invoke("spec_changes", json!({ "since": "3", "limit": 1 })).unwrap().result(&out).unwrap();
+        let shaped: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(shaped["more"], json!({ "changes": 3 }));
+        let text = invoke("spec_changes", json!({ "since": "3" })).unwrap().result(&out).unwrap();
+        let shaped: Value = serde_json::from_str(&text).unwrap();
+        assert!(shaped.get("more").is_none(), "{text}");
+        assert_eq!(shaped["changes"].as_array().unwrap().len(), 3);
+
+        let many: Vec<Value> = (0..3).map(|i| unknown(&format!("x-{i}"))).collect();
+        let none = json!({ "since": { "seq": 3 }, "until": { "seq": 9 }, "specs": [], "changes": [],
+            "unknown": many, "incomplete": true })
+        .to_string();
+        let text = invoke("spec_changes", json!({ "since": "3", "limit": 2 })).unwrap().result(&none).unwrap();
+        assert_eq!(
+            text,
+            r#"{"incomplete":true,"more":{"unknown":3},"since":{"seq":3},"unknown":[{"id":"x-0","key":"title","reason":"why"},{"id":"x-1","key":"title","reason":"why"}],"until":{"seq":9}}"#
+        );
+    }
+
+    #[test]
     fn spec_none_keeps_already_false() {
         let inv = invoke("spec_none", json!({ "ids": ["a"], "reason": "r" })).unwrap();
         let out = json!([{ "id": "a", "already": false, "labels": ["spec:none"], "comment_id": 7 }]);
@@ -1160,8 +1323,8 @@ mod tests {
 
     #[test]
     fn the_tool_list_stays_small() {
-        // 7,836 bytes, about 1,835 tokens; every agent connected pays this per session.
+        // 8,413 bytes, about 1,970 tokens; every agent connected pays this per session.
         let list = serde_json::to_string(&TOOLS.iter().map(Tool::describe).collect::<Vec<_>>()).unwrap();
-        assert!(list.len() < 7936, "tools/list is {} bytes", list.len());
+        assert!(list.len() < 8513, "tools/list is {} bytes", list.len());
     }
 }

@@ -193,7 +193,7 @@ fn hint(e: &Error) -> Option<&'static str> {
         }
         Error::Busy(_) => "another process holds the write lock; retry, or raise --busy-timeout-ms",
         Error::EventsTruncated { .. } => "re-baseline with `bd export` and tail from its head_seq",
-        Error::HistoryPruned { .. } => "pick a later --as-of; `bd events -n 1` shows what is retained",
+        Error::HistoryPruned { .. } => "pick a later --as-of or --since; `bd events -n 1` shows what is retained",
         Error::NoWorkspace(_) => "create one with `bd init`",
         Error::Unauthorized(_) => {
             "check the access token (BD_TOKEN, or `bd remote login`), and its role, kind, workspaces and actor (`bd remote show`; `bd serve token list` on the server)"

@@ -230,7 +230,9 @@ mod tests {
         for (name, args) in [
             ("spec_list", json!({})),
             ("spec_show", json!({ "target": "checkout" })),
+            ("spec_show", json!({ "target": "checkout", "as_of": "-1d" })),
             ("spec_drift", json!({})),
+            ("spec_changes", json!({ "since": "1d" })),
             ("spec_none", json!({ "ids": ["t-1"], "reason": "r" })),
         ] {
             let (err, off) = call(&mut server, name, args);
@@ -289,6 +291,30 @@ mod tests {
         let (err, missing) = call(&mut server, "spec_show", json!({ "target": "nope" }));
         assert!(err, "{missing}");
         assert_eq!(missing["error"]["exit_code"], 3, "{missing}");
+
+        // As of a time to come: the current views, with the as-of keys.
+        let (err, later) = call(&mut server, "spec_show", json!({ "target": spec, "as_of": "+1d" }));
+        assert!(!err, "{later}");
+        assert_eq!(later["specs"][0]["requirements"][0]["id"], rule, "{later}");
+        assert!(later["specs"][0]["as_of"]["time"].is_string(), "{later}");
+        let (err, garbage) = call(&mut server, "spec_show", json!({ "target": spec, "as_of": "nonsense" }));
+        assert!(err, "{garbage}");
+        assert_eq!(garbage["error"]["exit_code"], 2, "{garbage}");
+
+        // What changed: the supersede folds its replacement's addition.
+        let (err, changes) = call(&mut server, "spec_changes", json!({ "target": spec, "since": "1h" }));
+        assert!(!err, "{changes}");
+        let list = changes["changes"].as_array().unwrap_or_else(|| panic!("{changes}"));
+        let superseded = list.iter().find(|c| c["kind"] == "superseded").unwrap_or_else(|| panic!("{changes}"));
+        assert_eq!((&superseded["id"], &superseded["by"]["id"]), (&json!(old), &json!(rule)), "{changes}");
+        assert!(!list.iter().any(|c| c["id"] == rule.as_str() && c["kind"] == "added"), "{changes}");
+        assert!(list.iter().any(|c| c["id"] == sub.as_str() && c["item"] == "spec"), "{changes}");
+        assert!(changes.get("more").is_none(), "{changes}");
+        let full = list.len();
+        let (err, cut) = call(&mut server, "spec_changes", json!({ "target": spec, "since": "1h", "limit": 1 }));
+        assert!(!err, "{cut}");
+        assert_eq!(cut["changes"].as_array().unwrap().len(), 1, "{cut}");
+        assert_eq!(cut["more"]["changes"], full, "{cut}");
 
         // Closed work linked to no spec is drift: a result, not an error.
         let (_, task) = call(&mut server, "create", json!({ "title": "Build it" }));

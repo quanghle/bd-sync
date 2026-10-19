@@ -9765,10 +9765,23 @@ fn feature_specs_through_bd_serve() {
     assert_eq!(alice.code(&["spec", "show", "checkout"]), 2, "off");
     check(server.local("admin", &["config", "set", "experimental.features", "specs"]), "config set");
     let spec = alice.ok(&["-q", "create", "Checkout", "--pinned", "-l", "spec,area:checkout"]).trim().to_string();
+    let last = alice.ok(&["--json", "events", "-n", "1"]);
+    let before: Value = serde_json::from_str(last.lines().last().unwrap()).unwrap();
+    let before = before["seq"].as_i64().unwrap();
     let rule = alice
         .ok(&["-q", "create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec])
         .trim()
         .to_string();
+    // History: the spec before its requirement, and the requirement added since.
+    let then = alice.json(&["spec", "show", "checkout", "--as-of", &before.to_string()]);
+    assert_eq!(then[0]["as_of"]["seq"].as_i64(), Some(before), "{then}");
+    assert!(then[0]["requirements"].as_array().unwrap().is_empty(), "{then}");
+    let changes = alice.json(&["spec", "changes", "checkout", "--since", "1h"]);
+    assert_eq!(
+        (changes["changes"][0]["kind"].as_str(), changes["changes"][0]["id"].as_str()),
+        (Some("added"), Some(rule.as_str())),
+        "{changes}"
+    );
     let md = alice.ok(&["spec", "show", "checkout"]);
     assert!(md.contains(&format!("# Checkout ({spec})\n\n## Requirements\n\n- Requires sign-in ({rule})\n")), "{md}");
     assert_eq!(alice.json(&["spec", "show", &spec])[0]["requirements"][0]["id"], rule.as_str());
@@ -9810,7 +9823,7 @@ fn mcp_spec_tools_through_bd_serve() {
     let (_, _, r) = mcp_post(&server, Some(&reader), "", &[], &mcp_modern(1, "tools/list", json!({})));
     let tools: Vec<&str> =
         r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for read in ["spec_list", "spec_show", "spec_drift"] {
+    for read in ["spec_list", "spec_show", "spec_drift", "spec_changes"] {
         assert!(tools.contains(&read), "{read}: {tools:?}");
     }
     assert!(!tools.contains(&"spec_none"), "{tools:?}");
@@ -9822,6 +9835,11 @@ fn mcp_spec_tools_through_bd_serve() {
     assert_eq!(drift["unlinked"][0]["id"], work.as_str(), "{drift}");
     let shown = mcp_http_call(&server, &reader, "", "spec_show", json!({ "target": spec }));
     assert_eq!(shown["specs"][0]["requirements"][0]["id"], rule.as_str(), "{shown}");
+    let changes = mcp_http_call(&server, &reader, "", "spec_changes", json!({ "since": "1h" }));
+    assert_eq!(changes["changes"][0]["id"], rule.as_str(), "{changes}");
+    assert_eq!(changes["changes"][0]["kind"], "added", "{changes}");
+    assert_eq!(changes["specs"][0]["id"], spec.as_str(), "{changes}");
+    assert!(changes.get("more").is_none(), "{changes}");
 
     // Forwarded by a remote workspace's bd mcp.
     let answers = mcp_answers(alice.cmd(&["mcp"]), &[mcp_tool_call("spec_drift", json!({}))]);

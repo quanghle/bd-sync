@@ -4020,7 +4020,7 @@ fn mcp_serves_the_local_workspace_on_stdio() {
     assert_eq!(answers.len(), 7, "no answer to the notification: {answers:?}");
     assert_eq!(answers[0]["result"]["protocolVersion"], "2025-11-25", "{}", answers[0]);
     // Within the session, requests go without _meta (the tool calls below carry it: both are served).
-    assert_eq!(answers[1]["result"]["tools"].as_array().unwrap().len(), 18);
+    assert_eq!(answers[1]["result"]["tools"].as_array().unwrap().len(), 19);
     assert!(answers[1]["result"].get("resultType").is_none(), "{}", answers[1]);
 
     let (failed, claim) = mcp_result(&answers[2]);
@@ -4074,7 +4074,7 @@ fn mcp_serves_the_local_workspace_on_stdio() {
     );
     let names: Vec<&str> =
         answers[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["ready", "list", "show", "memories", "spec_list", "spec_show", "spec_drift"]);
+    assert_eq!(names, ["ready", "list", "show", "memories", "spec_list", "spec_show", "spec_drift", "spec_changes"]);
     assert_eq!(answers[1]["error"]["code"], -32602, "not offered: {}", answers[1]);
     let (_, ready) = mcp_result(&answers[2]);
     assert_eq!(ready["issues"][0]["id"], "t-2");
@@ -5717,6 +5717,8 @@ fn feature_specs_list_show_drift_none_and_candidates() {
         &["spec", "drift"],
         &["spec", "candidates"],
         &["spec", "none", &old, "-r", "why"],
+        &["spec", "show", "checkout", "--as-of", "-1d"],
+        &["spec", "changes", "--since", "1d"],
     ] {
         let out = ws.run_as("tester", args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
@@ -5874,6 +5876,135 @@ fn feature_specs_list_show_drift_none_and_candidates() {
     ws.ok(&["config", "set", "experimental.specs.since", "2026-01-15T00:00:00Z"]);
     ws.ok(&["config", "set", "experimental.features", "specs"]);
     assert_ne!(ws.json(&["config", "get", "experimental.specs.since"])["value"], "2026-01-15T00:00:00.000Z");
+}
+
+/// `bd spec show --as-of` prints the specs as they were at a point, and
+/// `bd spec changes` what changed in them between two: Markdown and JSON.
+#[test]
+fn feature_specs_history_show_as_of_and_changes() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let spec = ws.id(&["create", "Checkout", "--pinned", "-l", "spec,area:checkout", "-d", "Paying for a cart."]);
+    let sign_in = ws.id(&["create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let guests = ws.id(&["create", "Guests check out", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let po = ws.id(&["create", "Ships to PO boxes", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let cards = ws.id(&["create", "Card only", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let sub = ws.id(&["create", "Saved cards", "--pinned", "-l", "spec,area:checkout", "--parent", &spec]);
+    ws.id(&["create", "Lists cards", "--pinned", "-l", "requirement", "--parent", &sub]);
+    let n = event_head(&ws);
+    let at_n = format!("#{n}");
+
+    let wallets = ws.id(&["create", "Accepts wallets", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let guest_sign_in = ws.id(&["create", "Guests sign in", "--pinned", "-l", "requirement", "--parent", &spec]);
+    ws.ok(&["supersede", &guests, "--with", &guest_sign_in]);
+    ws.ok(&["close", &po, "-r", "no longer shipped"]);
+    ws.ok(&["update", &cards, "--title", "Cards and wallets"]);
+    let later = ws.id(&["create", "Later", "--pinned", "-l", "spec,area:later"]);
+    let head = event_head(&ws);
+    let at_head = format!("#{head}");
+
+    // show --as-of: the requirements in force at N, after an As of line.
+    let md = ws.ok(&["spec", "show", "checkout", "--as-of", &at_n]);
+    assert!(md.starts_with(&format!("# Checkout ({spec})\n\nAs of #{n}\n")), "{md}");
+    for (title, id) in [("Requires sign-in", &sign_in), ("Guests check out", &guests), ("Ships to PO boxes", &po)] {
+        assert!(md.contains(&format!("- {title} ({id})")), "{md}");
+    }
+    assert!(md.contains(&format!("- Card only ({cards})")), "{md}");
+    assert!(!md.contains("Accepts wallets") && !md.contains("Guests sign in"), "{md}");
+    assert!(!md.contains("History"), "{md}");
+    // The same seq as bare digits.
+    assert_eq!(ws.ok(&["spec", "show", "checkout", "--as-of", &n.to_string()]), md);
+    // --history at the head lists what was closed by then.
+    let md = ws.ok(&["spec", "show", &spec, "--history", "--as-of", &at_head]);
+    assert!(md.contains(&format!("- ~~Guests check out~~ superseded by {guest_sign_in} ({guests})")), "{md}");
+    assert!(md.contains(&format!("({po})")) && md.contains("no longer shipped"), "{md}");
+
+    // JSON: the added keys only with --as-of.
+    let views = ws.json(&["spec", "show", "checkout", "--as-of", &at_n]);
+    assert_eq!(views[0]["as_of"]["seq"].as_i64(), Some(n), "{views}");
+    assert_eq!(views[0]["incomplete"], false);
+    assert!(views[0]["retained_from"].is_object(), "{views}");
+    assert!(views[0]["unknown"].is_array(), "{views}");
+    assert!(views[0]["subspecs"][0]["unknown"].is_array(), "{views}");
+    let plain = ws.ok(&["--json", "spec", "show", "checkout"]);
+    for key in ["\"unknown\"", "\"as_of\"", "\"incomplete\"", "\"retained_from\""] {
+        assert!(!plain.contains(key), "{key} in {plain}");
+    }
+
+    // changes: one section, the supersede folding its replacement's addition.
+    let md = ws.ok(&["spec", "changes", "checkout", "--since", &at_n, "--until", &at_head]);
+    let json = ws.json(&["spec", "changes", "checkout", "--since", &at_n, "--until", &at_head]);
+    let day = json["changes"][0]["at"].as_str().unwrap()[..10].to_string();
+    assert!(md.starts_with(&format!("# Spec changes between #{n} and #{head}\n\n## Checkout ({spec})\n")), "{md}");
+    assert!(md.contains(&format!("### Added\n\n- Accepts wallets ({wallets}; {day})\n")), "{md}");
+    assert!(
+        md.contains(&format!(
+            "### Changed\n\n- Guests check out ({guests}) -> Guests sign in ({guest_sign_in}) ({day})\n"
+        )),
+        "{md}"
+    );
+    assert!(md.contains(&format!("- Card only ({cards}) -> Cards and wallets ({cards}) ({day})\n")), "{md}");
+    assert!(md.contains(&format!("### Removed\n\n- Ships to PO boxes ({po}; {day}): no longer shipped\n")), "{md}");
+    assert!(!md.contains(&format!("({guest_sign_in};")), "the replacement is folded: {md}");
+    assert!(!md.contains("Saved cards"), "a spec without changes is left out: {md}");
+    assert_eq!(ws.ok(&["spec", "changes", "checkout", "--since", &n.to_string(), "--until", &at_head]), md);
+    // JSON: the keys in order, the changes in seq order, optional keys only where they apply.
+    let raw = ws.ok(&["--json", "spec", "changes", "checkout", "--since", &at_n, "--until", &at_head]);
+    let top: Vec<&str> = raw
+        .lines()
+        .filter(|l| l.starts_with("  \"") && !l.starts_with("   "))
+        .map(|l| l.trim_start().split('"').nth(1).unwrap())
+        .collect();
+    assert_eq!(top, ["since", "until", "specs", "changes", "unknown", "incomplete"], "{raw}");
+    assert_eq!(json["since"]["seq"].as_i64(), Some(n));
+    assert_eq!(json["incomplete"], false);
+    assert!(json["unknown"].as_array().unwrap().is_empty(), "{json}");
+    let changes = json["changes"].as_array().unwrap();
+    let kinds: Vec<&str> = changes.iter().map(|c| c["kind"].as_str().unwrap()).collect();
+    assert_eq!(kinds, ["added", "superseded", "removed", "edited"], "{json}");
+    let seqs: Vec<i64> = changes.iter().map(|c| c["seq"].as_i64().unwrap()).collect();
+    assert!(seqs.windows(2).all(|w| w[0] <= w[1]) && seqs[0] > n && seqs[3] <= head, "{seqs:?}");
+    let keys = |c: &Value| c.as_object().unwrap().keys().cloned().collect::<std::collections::BTreeSet<_>>();
+    let base = ["actor", "at", "id", "item", "kind", "seq", "sources", "spec", "title"];
+    let with =
+        |extra: &[&str]| base.iter().chain(extra).map(|k| k.to_string()).collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(keys(&changes[0]), with(&[]), "{json}");
+    assert_eq!(keys(&changes[1]), with(&["by"]), "{json}");
+    assert_eq!(changes[1]["by"]["id"], guest_sign_in.as_str());
+    assert_eq!(keys(&changes[2]), with(&["reason"]), "{json}");
+    assert_eq!(keys(&changes[3]), with(&["old_title", "description_changed"]), "{json}");
+    assert_eq!(
+        (changes[3]["old_title"].as_str(), changes[3]["description_changed"].as_bool()),
+        (Some("Card only"), Some(false))
+    );
+    assert_eq!(changes[0]["item"], "requirement");
+    // -q lists each changed id once.
+    let ids = ws.ok(&["-q", "spec", "changes", "checkout", "--since", &at_n, "--until", &at_head]);
+    assert_eq!(ids.lines().collect::<Vec<_>>(), [wallets.as_str(), guests.as_str(), po.as_str(), cards.as_str()]);
+    // The default until is now.
+    let md = ws.ok(&["spec", "changes", "checkout", "--since", &at_n]);
+    assert!(md.starts_with(&format!("# Spec changes between #{n} and ")), "{md}");
+    // An empty window says so and exits 0, text and JSON.
+    let out = ws.run_as("tester", &["spec", "changes", "checkout", "--since", &at_head]);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with(&format!("No spec changes between #{head} and ")),
+        "{out:?}"
+    );
+    let empty = ws.json(&["spec", "changes", "--since", &at_head]);
+    assert!(empty["changes"].as_array().unwrap().is_empty(), "{empty}");
+
+    // Refusals: an empty or reversed window, a bad time, a spec that did not exist then.
+    let (code, err) = refusal(&ws, "tester", &["spec", "changes", "--since", &at_n, "--until", &at_n]);
+    assert_eq!(code, 2, "{err}");
+    assert!(err.contains("--since must be before --until"), "{err}");
+    assert_eq!(ws.code_as("tester", &["spec", "changes"]), 2, "--since is required");
+    assert_eq!(ws.code_as("tester", &["spec", "show", "checkout", "--as-of", "nonsense"]), 2);
+    let (code, err) = refusal(&ws, "tester", &["spec", "show", "later", "--as-of", &at_n]);
+    assert_eq!(code, 3, "{err}");
+    assert!(err.contains(&format!(" at #{n}")), "{err}");
+    assert_eq!(ws.code_as("tester", &["spec", "show", &later, "--as-of", &at_n]), 3);
+    assert!(ws.ok(&["spec", "show", "later", "--as-of", &at_head]).starts_with(&format!("# Later ({later})")));
 }
 
 /// Specs neither pinned nor closed are flagged by list, show and drift; a sub-spec

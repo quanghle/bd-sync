@@ -1,6 +1,7 @@
 //! `bd spec`: feature specs (experimental), over `bd_core::specs`.
 
-use bd_core::specs::{self, Drift};
+use bd_core::asof::Point;
+use bd_core::specs::{self, Drift, history};
 use bd_core::time::parse_filter_time;
 use bd_core::{Error, Guard, IssuePatch, IssueRef, Queries, Result, Status, WriteCtx, issues};
 use serde_json::json;
@@ -15,6 +16,7 @@ pub fn cmd_spec(app: &mut App, cmd: &SpecCommand) -> Result<i32> {
         SpecCommand::Show(a) => cmd_spec_show(app, a).map(|_| 0),
         SpecCommand::Drift(a) => cmd_spec_drift(app, a),
         SpecCommand::Candidates => cmd_spec_candidates(app).map(|_| 0),
+        SpecCommand::Changes(a) => cmd_spec_changes(app, a).map(|_| 0),
         SpecCommand::None(a) => {
             let out = app.write("spec-none", |tx| exec_spec_none(tx, a))?;
             app.print(out);
@@ -75,7 +77,13 @@ fn cmd_spec_list(app: &mut App) -> Result<()> {
 fn cmd_spec_show(app: &mut App, a: &SpecShowArgs) -> Result<()> {
     let views = app.read(|r| {
         specs::require_on(r.conn())?;
-        specs::show(r.conn(), &a.target)
+        match &a.as_of {
+            Some(when) => {
+                let point = Point::parse(when, r.now())?;
+                history::show_as_of(r.conn(), &a.target, point)
+            }
+            None => specs::show(r.conn(), &a.target),
+        }
     })?;
     if app.g.json {
         app.print_json(&views);
@@ -84,6 +92,30 @@ fn cmd_spec_show(app: &mut App, a: &SpecShowArgs) -> Result<()> {
     } else {
         let text: Vec<String> = views.iter().map(|v| specs::render(v, a.history, 1)).collect();
         io::out(p(&text.join("\n")));
+    }
+    Ok(())
+}
+
+/// `bd spec changes`: what changed in the specs between --since and
+/// --until (default now), rebuilt from the events in one read.
+fn cmd_spec_changes(app: &mut App, a: &SpecChangesArgs) -> Result<()> {
+    let changes = app.read(|r| {
+        specs::require_on(r.conn())?;
+        let now = r.now();
+        let since = history::parse_bound(&a.since, now)?;
+        let until = match &a.until {
+            Some(u) => history::parse_bound(u, now)?,
+            None => Point::Time(now),
+        };
+        history::changes(r.conn(), a.target.as_deref(), since, until)
+    })?;
+    if app.g.json {
+        app.print_json(&changes);
+    } else if app.g.quiet {
+        let mut seen = std::collections::HashSet::new();
+        changes.changes.iter().filter(|c| seen.insert(c.id.as_str())).for_each(|c| io::outln(&c.id));
+    } else {
+        io::out(p(&history::render_changes(&changes)));
     }
     Ok(())
 }

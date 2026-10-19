@@ -519,6 +519,36 @@ fn run_the_commands(ws: &mut Ws) {
     });
     commands(ws);
     history_and_compaction(ws, &work);
+    spec_history(ws, &spec);
+}
+
+/// `bd spec show --as-of` and `bd spec changes`: the events after a seq (a
+/// rowid range) and after a time (`idx_events_ts`), with the rebuilds they
+/// lead to, over a history an older bd wrote (left by
+/// [`history_and_compaction`]).
+fn spec_history(ws: &mut Ws, spec: &str) {
+    // A time inside the retained history, then a requirement added and closed after it.
+    let t = ws.clock.now();
+    let later = ws.create(NewIssue {
+        status: Some(Status::Pinned),
+        labels: vec!["requirement".into()],
+        ..child("Later rule", spec)
+    });
+    ws.write("alice", None, |tx| tx.close_issue(&later, &CloseOptions::default()));
+    let now = ws.clock.now();
+    ws.store
+        .read(|r| {
+            let head = r.event_head()?;
+            // Errors (a point before what is retained) are ignored: the statements are what is checked.
+            for point in [asof::Point::Seq(head - 3), asof::Point::Time(now.minus(Duration::from_secs(60)))] {
+                let _ = specs::history::show_as_of(r.conn(), spec, point);
+            }
+            let _ = specs::history::show_as_of(r.conn(), "x", asof::Point::Seq(head));
+            let _ = specs::history::changes(r.conn(), None, asof::Point::Seq(head - 10), asof::Point::Time(now));
+            let _ = specs::history::changes(r.conn(), Some(spec), asof::Point::Time(t), asof::Point::Seq(head));
+            Ok(())
+        })
+        .unwrap();
 }
 
 /// Issues as of past points (live, deleted, purged; before and after a prune;
@@ -808,6 +838,9 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         "FROM dependencies INDEXED BY idx_deps_target WHERE depends_on_id = ?1",
         "SELECT metadata FROM issues WHERE id = ?1",
         "SELECT ts FROM events WHERE seq = ?1",
+        // Spec history: the events after a time through their index, after a seq by rowid.
+        "FROM events INDEXED BY idx_events_ts WHERE ts > ?1 AND ts <= ?2",
+        "FROM events WHERE seq > ?1 AND seq <= ?2 AND op IN",
         // Feature specs: closed and open work by status through the ready index, labels by label, edges by end.
         "i.status = 'closed' AND i.closed_at >= ?1",
         "i.status IN ('open','in_progress','blocked','deferred','pinned') AND i.created_at >= ?1",

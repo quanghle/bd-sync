@@ -355,9 +355,19 @@ fn run_the_commands(ws: &mut Ws) {
     ws.write("alice", None, |tx| tx.spec_new("x", &from("Sub", &other), Some(&top)));
     let top_rule = ws.write("alice", None, |tx| tx.spec_add(&top, &from("Rule", &work), false)).requirement.id;
     let goal = ws.write("alice", None, |tx| tx.spec_add(&top, &from("Goal", &work), true)).requirement.id;
-    ws.write("alice", None, |tx| tx.spec_change(&top_rule, &from("New rule", &other)));
+    let new_rule = ws.write("alice", None, |tx| tx.spec_change(&top_rule, &from("New rule", &other))).requirement.id;
     ws.write("alice", None, |tx| tx.spec_remove(&goal, "obsolete", std::slice::from_ref(&other)));
     ws.write("alice", None, |tx| tx.spec_link(&work, &[top.clone(), spec.clone()]));
+    // A requirement of the hand-made spec superseded by one under `top`, which supersedes it: the
+    // shape check walks from spec to spec.
+    let moved = ws.create(NewIssue {
+        status: Some(Status::Pinned),
+        labels: vec!["requirement".into()],
+        deps: vec![(DepType::Related, work.clone())],
+        ..child("Moved rule", &spec)
+    });
+    ws.write("alice", None, |tx| tx.close_as(&moved, &new_rule, Replacement::Supersede, &CloseAsOptions::default()));
+    ws.write("alice", None, |tx| tx.add_dependency(&spec, &top, DepType::Supersedes, None));
     ws.write("alice", None, |tx| config::set(tx, "events.retain_rows", "100"));
     // Enough events for the automatic prune to run.
     for n in 0..520 {
@@ -460,6 +470,7 @@ fn run_the_commands(ws: &mut Ws) {
                 specs::show(r.conn(), &spec)?;
                 specs::list(r.conn())?;
                 specs::drift(r.conn(), Some(Timestamp(0)))?;
+                specs::malformed(r.conn())?;
                 specs::unlinked_counts(r.conn(), Some(Timestamp(0)))?;
                 specs::candidates(r.conn(), None)?;
                 specs::candidates(r.conn(), specs::since(r.conn())?)?;

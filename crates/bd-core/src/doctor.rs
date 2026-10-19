@@ -243,6 +243,23 @@ pub fn diagnose(store: &mut Store, fix: bool, full: bool) -> Result<DoctorReport
         )
     });
 
+    // Spec parts not in the shape `bd spec` writes (the list `bd spec drift` reports as
+    // malformed): advisory, so a warning, and not scanned while specs are off.
+    let malformed = if specs_on { crate::specs::malformed(conn)? } else { Vec::new() };
+    let mut parts: Vec<String> = malformed.iter().map(|m| m.issue.id.clone()).collect();
+    parts.dedup(); // the list is sorted by id, so this leaves distinct ids
+    checks.push(if !specs_on {
+        check("malformed_specs", Severity::Ok, "feature specs are off")
+    } else if parts.is_empty() {
+        check("malformed_specs", Severity::Ok, "no malformed specs or requirements")
+    } else {
+        check(
+            "malformed_specs",
+            Severity::Warn,
+            format!("{} malformed spec part(s) (see bd spec drift): {}", parts.len(), preview(&parts)),
+        )
+    });
+
     let ok = checks.iter().all(|c| c.severity != Severity::Error || c.fixed);
     Ok(DoctorReport { ok, checks })
 }

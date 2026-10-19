@@ -170,6 +170,16 @@ fn drift_text(d: &Drift) -> Out {
             .map(|o| format!("- {} {} (parent spec {} is closed)", o.spec.id, p(&o.spec.title), o.parent))
             .collect(),
     );
+    if !d.malformed.is_empty() {
+        out = section(
+            out,
+            "Malformed: specs and requirements not in the shape bd spec writes",
+            d.malformed
+                .iter()
+                .map(|m| format!("- {} {} — {}", m.issue.id, p(&m.issue.title), specs::clean(&m.detail)))
+                .collect(),
+        );
+    }
     out = section(
         out,
         "To link: open work since then, not linked yet (not drift)",
@@ -201,6 +211,14 @@ fn cmd_spec_drift(app: &mut App, a: &SpecDriftArgs) -> Result<i32> {
         .chain(drift.bad_status.iter().map(|i| i.id.clone()))
         .chain(drift.orphaned.iter().map(|o| o.spec.id.clone()))
         .collect();
+    // Malformed is id-sorted with one entry per (part, problem): one id per part.
+    let mut malformed: Vec<String> = drift.malformed.iter().map(|m| m.issue.id.clone()).collect();
+    malformed.dedup();
+    for id in malformed {
+        if !out.ids.contains(&id) {
+            out.ids.push(id);
+        }
+    }
     app.print(out);
     Ok(if count > 0 { 1 } else { 0 })
 }

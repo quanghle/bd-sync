@@ -245,22 +245,55 @@ mod tests {
         store.write("config_set", "tester", |tx| bd_core::config::set(tx, "experimental.features", "specs")).unwrap();
         drop(store);
 
-        let spec =
-            id_of(&bd(&mut server, &["create", "--json", "--pinned", "-l", "spec,area:checkout", "--", "Checkout"]));
-        let rule = id_of(&bd(
+        // In the shape `bd spec` writes: feature specs with an area, story
+        // requirements with a source (closed work, linked through them).
+        let design = id_of(&bd(&mut server, &["create", "--json", "--", "Design checkout"]));
+        bd(&mut server, &["close", "--json", &design, "--reason", "designed"]);
+        let source = format!("related:{design}");
+        let spec = id_of(&bd(
             &mut server,
-            &["create", "--json", "--pinned", "-l", "requirement", "--parent", &spec, "--", "Requires sign-in"],
+            &["create", "--json", "--pinned", "-t", "feature", "-l", "spec,area:checkout", "--", "Checkout"],
         ));
-        let old = id_of(&bd(
-            &mut server,
-            &["create", "--json", "--pinned", "-l", "requirement", "--parent", &spec, "--", "Guests check out"],
-        ));
+        let requirement = |server: &mut Server<Local>, parent: &str, title: &str| {
+            id_of(&bd(
+                server,
+                &[
+                    "create",
+                    "--json",
+                    "--pinned",
+                    "-t",
+                    "story",
+                    "-l",
+                    "requirement",
+                    "--dep",
+                    &source,
+                    "--parent",
+                    parent,
+                    "--",
+                    title,
+                ],
+            ))
+        };
+        let rule = requirement(&mut server, &spec, "Requires sign-in");
+        let old = requirement(&mut server, &spec, "Guests check out");
         bd(&mut server, &["supersede", "--json", &old, "--with", &rule]);
         let sub = id_of(&bd(
             &mut server,
-            &["create", "--json", "--pinned", "-l", "spec,area:checkout", "--parent", &spec, "--", "Saved cards"],
+            &[
+                "create",
+                "--json",
+                "--pinned",
+                "-t",
+                "feature",
+                "-l",
+                "spec,area:checkout",
+                "--parent",
+                &spec,
+                "--",
+                "Saved cards",
+            ],
         ));
-        bd(&mut server, &["create", "--json", "--pinned", "-l", "requirement", "--parent", &sub, "--", "Lists cards"]);
+        requirement(&mut server, &sub, "Lists cards");
 
         let (err, listed) = call(&mut server, "spec_list", json!({}));
         assert!(!err, "{listed}");
@@ -315,6 +348,7 @@ mod tests {
         assert!(!err, "{drift}");
         assert_eq!(drift["count"], 0, "{drift}");
         assert!(drift.get("unlinked").is_none(), "{drift}");
+        assert!(drift.get("malformed").is_none(), "{drift}");
         assert!(drift["since"].is_string(), "{drift}");
 
         // A spec's own issues are never marked spec:none.

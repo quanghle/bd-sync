@@ -479,11 +479,13 @@ output schemas), so the model reads each thing once:
   [views]}` as `bd spec show --json` does, without `history` unless
   `history: true` and without `inherited` on nested sub-specs (they inherit
   from the views above them, which carry it). `spec_drift` returns `{since,
-  count, unlinked, shaky, bad_status, orphaned, to_link}`: issues as
-  summaries, `shaky` items as `{requirement, source, why}`, `orphaned` ones
-  as `{spec, parent}`; each list is cut to `limit`, and `more` gives each
-  cut list's full length (`{"unlinked": 34}`); `count` is
-  `bd spec drift`'s, every problem found (not `to_link`), before any cut.
+  count, unlinked, shaky, bad_status, orphaned, malformed, to_link}`:
+  issues as summaries, `shaky` items as `{requirement, source, why}`,
+  `orphaned` ones as `{spec, parent}`, `malformed` ones as `{issue,
+  problem, detail}`; an empty list is left out; each list is cut to
+  `limit`, and `more` gives each cut list's full length
+  (`{"unlinked": 34}`); `count` is `bd spec drift`'s, every problem found
+  (not `to_link`), before any cut.
   Drift found (the command's exit 1) is a result, not an error.
   `spec_none` returns per issue `{id, already, labels, comment_id}`
   (`already: true` and no comment when it was marked before);

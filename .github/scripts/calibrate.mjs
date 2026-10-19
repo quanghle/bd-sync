@@ -17,13 +17,14 @@
 import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { canonicalModel } from './reviewer-catch.mjs'
+import { canonicalModel, ROLE_PREFIXES } from './reviewer-catch.mjs'
 import { activeMs, bdRunner, fmtDuration, logDirs, readRecord, stepFrom, timingOf, trace } from './trace-run.mjs'
 
 // ---------- roles ----------
 // What an agent did, from its trace label: 'main', a workflow's '<workflow>:<role>[:...]', or a subagent's
 // '<type>: <description>' (Claude Code's agentType, Copilot's agentName). A subagent's role comes from its description's
-// role prefix (AGENTS.md), else a label naming review. A heuristic over labels the callers chose, so 'other' is a real answer.
+// role prefix (AGENTS.md; the words are reviewer-catch.mjs's ROLE_PREFIXES), else a label naming review. A heuristic over
+// labels the callers chose, so 'other' is a real answer.
 const WORKFLOW_ROLES = [
   [/^(coder|implement)\b/, 'coder'],
   [/^review\b/, 'reviewer'],
@@ -32,13 +33,12 @@ const WORKFLOW_ROLES = [
   [/^(gate|record|heartbeat|claim|setup|bd|trace)\b/, 'mechanical'],
   [/^judge\b/, 'judge'],
 ]
-const PREFIX_ROLES = ['coder', 'reviewer', 'mechanical', 'research', 'planner', 'summary']
 // The optional group skips one agent type token: one containing '-' or ':' (general-purpose, code-review, plugin:agent) or a
 // known single-word one (Claude Code's Explore and Plan, Copilot's task and explore). So neither a role word later in the
 // description nor an ordinary leading word ('Fix: coder: x') counts.
 const SINGLE_WORD_TYPES = ['Explore', 'Plan', 'task']
 const AGENT_TYPE = `(?:[\\w.]*[-:][\\w.:-]*|${SINGLE_WORD_TYPES.join('|')})`
-const ROLE_PREFIX = new RegExp(`^(?:${AGENT_TYPE}: )?(${PREFIX_ROLES.join('|')}):`, 'i')
+const ROLE_PREFIX = new RegExp(`^(?:${AGENT_TYPE}: )?(${ROLE_PREFIXES.join('|')}):`, 'i')
 export function roleOf(agent) {
   if (agent.kind === 'main') return 'main'
   if (agent.kind === 'workflow') {
@@ -488,7 +488,7 @@ export function render(runs, agg, prices = PRICES) {
         )
       : 'No traced runs.',
     ``,
-    `Roles come from agent labels: the main thread, workflow roles, and a subagent description's role prefix (\`coder:\`, \`reviewer:\`, \`mechanical:\`, \`research:\`, \`planner:\`, \`summary:\`), else a description naming review; "other" is a subagent with neither. A Copilot request with no logged credits (a trace stored by an older version), or a Claude Code request whose model the price table lacks, is unpriced, so its cost is low; so is a Claude Code request whose output its transcript did not record (most subagent and workflow requests), counted as output unknown. ${prices.note}`,
+    `Roles come from agent labels: the main thread, workflow roles, and a subagent description's role prefix (${ROLE_PREFIXES.map((r) => `\`${r}:\``).join(', ')}), else a description naming review; "other" is a subagent with neither. A Copilot request with no logged credits (a trace stored by an older version), or a Claude Code request whose model the price table lacks, is unpriced, so its cost is low; so is a Claude Code request whose output its transcript did not record (most subagent and workflow requests), counted as output unknown. ${prices.note}`,
     ``,
     `Agent time is the primary time figure: each agent's busy time per step, its model requests and the tools they ran, summed (parallel agents add up, like cost; time an agent sat idle between turns, waited on a person or on another agent is left out). A Copilot request's start is its record's time less its duration, a Claude Code request's its api-request entry; traces stored before version 4 hold each agent's first request to the end of its last (or, before end times were recorded, its last request's start), which includes such waits. Elapsed (a step: its claim or the previous step's close, whichever is earlier, to its close; a run: created to last close) includes idle gaps and is context only. Human wait (human gates, armed to resolved) is counted apart from both.`,
     ...(agg.overlaps.groups.length

@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { aggregate, coderOf, costOf, joinRuns, overlaps, PRICES, render, roleOf, untracedWhy } from './calibrate.mjs'
+import { ROLE_PREFIXES } from './reviewer-catch.mjs'
 
 // credits: the AI credits a request cost; left out, a trace stored without them.
 const tokens = (input, output, cache_read = 0, cache_write = 0, credits) => ({ input, output, cache_read, cache_write, ...(credits == null ? {} : { nano_aiu: credits * 1e9 }) })
@@ -53,6 +54,8 @@ describe('roleOf', () => {
 		// A workflow label keeps its workflow role, whatever its agent's description.
 		[{ kind: 'workflow', label: 'plan-implement-review:coder: fix' }, 'coder'],
 	])('%o is a %s', (a, role) => expect(roleOf(a)).toBe(role))
+	// Every shared role prefix (reviewer-catch.mjs's ROLE_PREFIXES) is classified as its role.
+	it.each(ROLE_PREFIXES)('%s: y is that role', (r) => expect(roleOf({ kind: 'subagent', label: `${r}: y` })).toBe(r))
 })
 
 describe('coderOf', () => {

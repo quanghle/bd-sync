@@ -376,7 +376,7 @@ The server's `instructions`:
 
 ## Tools
 
-Each tool runs the bd command of the same name in-process, with the same
+Each tool runs the bd command its row names in-process, with the same
 validation, claim rules, policy checks and events as the command line.
 Tool names are plain (`ready`, not `bd_ready`); clients prefix them with
 the server's name.
@@ -397,16 +397,24 @@ the server's name.
 | `dep_add` | `bd dep add` | `issue`, `depends_on` (both required), `type` (default `blocks`; any [dependency type](concepts.md#dependency-types) but custom ones) | no |
 | `remember` | `bd remember` | `text` (required), `key` (replaces that memory) | no |
 | `memories` | `bd memories` | `query` | yes |
+| `spec_list` | `bd spec list` | none | yes |
+| `spec_show` | `bd spec show` | `target` (a spec id or an area, required), `history` (default `false`: also the closed requirements) | yes |
+| `spec_drift` | `bd spec drift` | `since` (a time as `bd spec drift --since` takes it: `2026-01-15`, `30d`; default `experimental.specs.since`), `limit` (1–100, default 20: items per list) | yes |
+| `spec_none` | `bd spec none` | `ids` (1–20) and `reason` (both required) | no |
 
 - List arguments (`label`, `label_any`, `labels`, `deps`, `add_labels`,
-  `remove_labels`) take at most 20 non-blank items. `title` and `text` must
-  not be blank. Unknown arguments are refused; `null` counts as absent.
+  `remove_labels`) take at most 20 non-blank items. `title`, `text`,
+  `target` and `reason` must not be blank. Unknown arguments are refused;
+  `null` counts as absent.
 - `update` needs at least one field to change besides `id` and
   `if_revision`. `claim` takes `id` or `next`, not both, and filters only
   with `next`.
 - Read-only tools carry `readOnlyHint`; the others `destructiveHint:
   false`, since none deletes anything. `--read-only` offers only the
   read-only tools; with a read token every write fails anyway.
+- The `spec_*` tools are listed whatever `experimental.features` says, and
+  refuse unless the workspace has [feature specs](commands.md#feature-specs)
+  on.
 
 **Left out**, as they belong to people or administrators, or would let a
 model get past what the CLI asks of agents: taking over or ending other
@@ -420,7 +428,9 @@ gate.
 The reporting views `query`, `epic`, `children`, `stale`, `orphans` and
 `graph` are not tools either, to keep the tool list small: an agent that
 needs one runs the command (`bd query '...' --json`); `list` takes the
-time filters agents use most.
+time filters agents use most. Nor are `spec candidates` or writing specs
+and requirements themselves (`bd create --pinned`, `bd supersede`); a
+change is linked to a spec with `dep_add` and `type: "related"`.
 
 ### Leases and tokens
 
@@ -456,6 +466,19 @@ output schemas), so the model reads each thing once:
   expiry, and is left out when nothing was ready), `claim` the token and
   expiry, `dep_add` whether the issue is now blocked. Nothing to claim is
   `{"message": "nothing matched"}`;
+- `spec_list` returns `{"specs": [...]}`, each open spec as
+  `bd spec list --json` prints it; `spec_show` returns `{"specs":
+  [views]}` as `bd spec show --json` does, without `history` unless
+  `history: true` and without `inherited` on nested sub-specs (they inherit
+  from the views above them, which carry it). `spec_drift` returns `{since,
+  count, unlinked, shaky, bad_status, orphaned, to_link}`: issues as
+  summaries, `shaky` items as `{requirement, source, why}`, `orphaned` ones
+  as `{spec, parent}`; each list is cut to `limit`, and `more` gives each
+  cut list's full length (`{"unlinked": 34}`); `count` is
+  `bd spec drift`'s, every problem found (not `to_link`), before any cut.
+  Drift found (the command's exit 1) is a result, not an error.
+  `spec_none` returns per issue `{id, already, labels, comment_id}`
+  (`already: true` and no comment when it was marked before);
 - control and bidirectional formatting characters are escaped as `\u…`; a
   call may print at most 4 MiB.
 
@@ -473,7 +496,11 @@ can act on it. Its text is the CLI's JSON error (`{"code", "message",
   token's own actor or another of its sub-actors (another `?session`);
 - a stale `if_revision`: exit 13;
 - invalid arguments (unknown, missing, wrong type or out of range):
-  `invalid`, exit 2, so the model can correct the call.
+  `invalid`, exit 2, so the model can correct the call;
+- a `spec_*` tool in a workspace with feature specs off: `invalid`, exit 2,
+  `feature specs are off in this workspace (bd config set
+  experimental.features specs)`; `spec_none` on a spec issue: `invalid`,
+  exit 2.
 
 Unknown tools, a write tool on a read-only server, malformed requests and
 unsupported protocol versions are JSON-RPC errors instead.
@@ -499,7 +526,7 @@ server are safe.)
 ### Context cost
 
 The tool list (names, descriptions and input schemas) is written by hand,
-with one-line descriptions and no output schemas, and costs about 1,550
-tokens (6.6 KB; a test keeps it under 6,656 bytes). The `instructions` add
+with one-line descriptions and no output schemas, and costs about 1,835
+tokens (7,836 bytes; a test keeps it under 7,936). The `instructions` add
 about 120 tokens. Most of a session's MCP context is results, which is why
 lists return summaries and results leave out empty fields.

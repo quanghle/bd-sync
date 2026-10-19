@@ -9783,6 +9783,61 @@ fn feature_specs_through_bd_serve() {
     assert_eq!(alice.json(&["spec", "drift"])["count"], 0);
 }
 
+#[test]
+fn mcp_spec_tools_through_bd_serve() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    let reader = server.token("dashboard", "dash", &["--role", "read"]);
+
+    // Off: the CLI's refusal, as a tool error.
+    let (status, _, answer) = mcp_post(&server, Some(&secret), "", &[], &mcp_tool_call("spec_list", json!({})));
+    assert_eq!(status, 200, "{answer}");
+    let error = mcp_tool_error(&answer).unwrap_or_else(|| panic!("specs are off: {answer}"));
+    assert_eq!((&error["code"], &error["exit_code"]), (&json!("invalid"), &json!(2)), "{error}");
+    assert_eq!(error["message"], bd_core::specs::OFF, "{error}");
+
+    check(server.local("admin", &["config", "set", "experimental.features", "specs"]), "config set");
+    let spec = alice.ok(&["-q", "create", "Checkout", "--pinned", "-l", "spec,area:checkout"]).trim().to_string();
+    let rule = alice
+        .ok(&["-q", "create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec])
+        .trim()
+        .to_string();
+    let work = alice.ok(&["-q", "create", "Build it"]).trim().to_string();
+    alice.ok(&["close", &work, "-r", "done"]);
+
+    // A read token is offered the spec reads, and not spec_none.
+    let (_, _, r) = mcp_post(&server, Some(&reader), "", &[], &mcp_modern(1, "tools/list", json!({})));
+    let tools: Vec<&str> =
+        r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    for read in ["spec_list", "spec_show", "spec_drift"] {
+        assert!(tools.contains(&read), "{read}: {tools:?}");
+    }
+    assert!(!tools.contains(&"spec_none"), "{tools:?}");
+    let none = mcp_tool_call("spec_none", json!({ "ids": [work], "reason": "refactor" }));
+    let (status, _, r) = mcp_post(&server, Some(&reader), "", &[], &none);
+    assert_eq!((status, &r["error"]["code"]), (200, &json!(-32602)), "{r}");
+    let drift = mcp_http_call(&server, &reader, "", "spec_drift", json!({}));
+    assert_eq!(drift["count"], 1, "drift found (exit 1) is a result: {drift}");
+    assert_eq!(drift["unlinked"][0]["id"], work.as_str(), "{drift}");
+    let shown = mcp_http_call(&server, &reader, "", "spec_show", json!({ "target": spec }));
+    assert_eq!(shown["specs"][0]["requirements"][0]["id"], rule.as_str(), "{shown}");
+
+    // Forwarded by a remote workspace's bd mcp.
+    let answers = mcp_answers(alice.cmd(&["mcp"]), &[mcp_tool_call("spec_drift", json!({}))]);
+    assert!(mcp_tool_error(&answers[0]).is_none(), "{}", answers[0]);
+    let text: Value = serde_json::from_str(answers[0]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(text["count"], 1, "{text}");
+
+    // A write token marks the work as touching no spec, as a session of its actor.
+    let marked = mcp_http_call(&server, &secret, "", "spec_none", json!({ "ids": [work], "reason": "refactor" }));
+    assert_eq!(marked[0]["already"], false, "{marked}");
+    let comments = alice.json(&["show", &work])["comments"].clone();
+    let last = comments.as_array().and_then(|c| c.last()).unwrap_or_else(|| panic!("a comment: {comments}"));
+    assert_eq!(last["author"], "alice/mcp", "{comments}");
+    assert_eq!(mcp_http_call(&server, &secret, "", "spec_drift", json!({}))["count"], 0);
+}
+
 const PUBLISHED_PLAYBOOK: &str = "description = \"Ship it\"\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n";
 
 /// A publish source in `dir/src`: one playbook and one claude skill.

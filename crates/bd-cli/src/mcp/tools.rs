@@ -47,6 +47,14 @@ enum Shape {
     Show,
     /// What a write returns: issues as summaries, leases as token and expiry.
     Write,
+    /// `bd spec list`'s specs, as `{"specs": [...]}`.
+    Specs,
+    /// `bd spec show`'s views, as `{"specs": [...]}`: without `history` unless
+    /// asked, and without `inherited` on nested sub-specs.
+    SpecViews,
+    /// `bd spec drift`'s report: issues as summaries, each list cut to the
+    /// limit, and `more` naming each cut list's full length.
+    Drift,
 }
 
 /// One tool of the catalog.
@@ -65,8 +73,11 @@ pub struct Invocation {
     /// The command line, without the leading `bd`.
     pub argv: Vec<String>,
     shape: Shape,
-    /// The number of issues asked for (`Shape::Summaries`; one more is fetched).
+    /// The number of issues asked for (`Shape::Summaries`; one more is
+    /// fetched), or the items kept per list (`Shape::Drift`).
     limit: usize,
+    /// The call asked for closed requirements too (`Shape::SpecViews`).
+    history: bool,
 }
 
 const STATUSES: &[&str] = &["open", "in_progress", "blocked", "deferred", "closed", "pinned"];
@@ -87,6 +98,7 @@ const DEP_TYPES: &[&str] = &[
 ];
 const READY_LIMIT: i64 = 10;
 const LIST_LIMIT: i64 = 20;
+const DRIFT_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
 const MAX_IDS: usize = 20;
 
@@ -277,6 +289,41 @@ pub static TOOLS: &[Tool] = &[
         build: build_memories,
         shape: Shape::Write,
     },
+    Tool {
+        name: "spec_list",
+        description: "Open feature specs with their areas and counts.",
+        read_only: true,
+        params: &[],
+        build: build_spec_list,
+        shape: Shape::Specs,
+    },
+    Tool {
+        name: "spec_show",
+        description: "A spec, or an area's specs: requirements, non-goals, inherited ones, sub-specs.",
+        read_only: true,
+        params: &[req("target", Kind::Str, "Spec id or area"), p("history", Kind::Bool, "Also closed requirements")],
+        build: build_spec_show,
+        shape: Shape::SpecViews,
+    },
+    Tool {
+        name: "spec_drift",
+        description: "Closed work linked to no spec, and specs out of order.",
+        read_only: true,
+        params: &[
+            p("since", Kind::Str, "2026-01-15 or 30d; default: when specs turned on"),
+            p("limit", Kind::Int(1, MAX_LIMIT), "Default 20, per list"),
+        ],
+        build: build_spec_drift,
+        shape: Shape::Drift,
+    },
+    Tool {
+        name: "spec_none",
+        description: "Mark issues as touching no spec, with the reason.",
+        read_only: false,
+        params: &[req("ids", Kind::List(1, MAX_IDS), ""), req("reason", Kind::Str, "Why no spec")],
+        build: build_spec_none,
+        shape: Shape::Write,
+    },
 ];
 
 impl Tool {
@@ -317,13 +364,21 @@ impl Tool {
             Shape::Summaries => {
                 args.int("limit").unwrap_or(if self.name == "ready" { READY_LIMIT } else { LIST_LIMIT })
             }
+            Shape::Drift => args.int("limit").unwrap_or(DRIFT_LIMIT),
             _ => 0,
         } as usize;
-        Ok(Invocation { argv, shape: self.shape, limit })
+        let history = self.shape == Shape::SpecViews && args.flag("history");
+        Ok(Invocation { argv, shape: self.shape, limit, history })
     }
 }
 
 impl Invocation {
+    /// Whether a non-zero exit with output is still a result: `bd spec
+    /// drift` exits 1 when it finds drift, and still prints its JSON.
+    pub fn accepts_exit(&self, code: i32) -> bool {
+        self.shape == Shape::Drift && code == 1
+    }
+
     /// The tool's result text for the command's `--json` output.
     pub fn result(&self, output: &str) -> Result<String, String> {
         let value: Value = if output.trim().is_empty() {
@@ -350,6 +405,9 @@ impl Invocation {
                 Value::Null => json!({ "message": "nothing matched" }),
                 v => compact(v),
             },
+            Shape::Specs => json!({ "specs": value }),
+            Shape::SpecViews => spec_views(value, self.history),
+            Shape::Drift => drift(value, self.limit),
         };
         let text = serde_json::to_string(&prune(shaped).unwrap_or_else(|| json!({}))).expect("JSON values serialize");
         Ok(crate::io::printable(&text).into_owned())
@@ -647,6 +705,31 @@ fn build_memories(a: &Args) -> Result<Vec<String>, String> {
     }
 }
 
+fn build_spec_list(_a: &Args) -> Result<Vec<String>, String> {
+    Line::new(&["spec", "list"]).done()
+}
+
+fn build_spec_show(a: &Args) -> Result<Vec<String>, String> {
+    let target = a.str("target").unwrap_or_default();
+    if target.trim().is_empty() {
+        return Err("target must not be empty".into());
+    }
+    Line::new(&["spec", "show"]).switch("history", a.flag("history")).arg(target).done()
+}
+
+fn build_spec_drift(a: &Args) -> Result<Vec<String>, String> {
+    // The limit is applied to the output: bd spec drift has none.
+    Line::new(&["spec", "drift"]).opt("since", a.str("since")).done()
+}
+
+fn build_spec_none(a: &Args) -> Result<Vec<String>, String> {
+    let reason = a.str("reason").unwrap_or_default();
+    if reason.trim().is_empty() {
+        return Err("reason must not be empty".into());
+    }
+    Line::new(&["spec", "none"]).opt("reason", Some(reason)).args(a.list("ids")).done()
+}
+
 /// Whether `v` is an issue as the CLI prints it.
 fn is_issue(v: &Map<String, Value>) -> bool {
     ["id", "title", "status", "issue_type"].iter().all(|k| v.contains_key(*k))
@@ -684,6 +767,64 @@ fn compact(v: Value) -> Value {
         Value::Array(a) => Value::Array(a.into_iter().map(compact).collect()),
         v => v,
     }
+}
+
+/// `bd spec show`'s views as `{"specs": [...]}`, trimmed (see `trim_view`).
+fn spec_views(value: Value, history: bool) -> Value {
+    let views = match value {
+        Value::Array(a) => a,
+        _ => Vec::new(),
+    };
+    json!({ "specs": views.into_iter().map(|v| trim_view(v, history, true)).collect::<Vec<_>>() })
+}
+
+/// A spec view without its `history` unless asked, and, nested (`top`
+/// false), without `inherited`: a sub-spec inherits from the views above it.
+fn trim_view(mut view: Value, history: bool, top: bool) -> Value {
+    if let Some(m) = view.as_object_mut() {
+        if !history {
+            m.remove("history");
+        }
+        if !top {
+            m.remove("inherited");
+        }
+        if let Some(Value::Array(subs)) = m.remove("subspecs") {
+            let subs: Vec<Value> = subs.into_iter().map(|v| trim_view(v, history, false)).collect();
+            m.insert("subspecs".into(), Value::Array(subs));
+        }
+    }
+    view
+}
+
+/// How one item of a drift list is shaped.
+type ItemShape = fn(&Value) -> Value;
+
+/// `bd spec drift`'s report with its issues as summaries and each list cut to
+/// `limit`; `more` names each cut list's full length. `count` stays the
+/// CLI's, over the whole lists.
+fn drift(value: Value, limit: usize) -> Value {
+    let mut out = json!({ "since": value["since"], "count": value["count"] });
+    let mut more = Map::new();
+    let shaky = |i: &Value| json!({ "requirement": summary(&i["requirement"]), "source": summary(&i["source"]), "why": i["why"] });
+    let orphaned = |i: &Value| json!({ "spec": summary(&i["spec"]), "parent": i["parent"] });
+    let lists: [(&str, ItemShape); 5] = [
+        ("unlinked", summary),
+        ("shaky", shaky),
+        ("bad_status", summary),
+        ("orphaned", orphaned),
+        ("to_link", summary),
+    ];
+    for (key, item) in lists {
+        let items = value[key].as_array().map(Vec::as_slice).unwrap_or_default();
+        if items.len() > limit {
+            more.insert(key.into(), json!(items.len()));
+        }
+        out[key] = Value::Array(items.iter().take(limit).map(item).collect());
+    }
+    if !more.is_empty() {
+        out["more"] = Value::Object(more);
+    }
+    out
 }
 
 /// `show`'s output without the lease tokens: a claim's token is its
@@ -875,9 +1016,152 @@ mod tests {
     }
 
     #[test]
+    fn spec_tools_are_listed_last_in_order() {
+        let names: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
+        assert_eq!(names[names.len() - 4..], ["spec_list", "spec_show", "spec_drift", "spec_none"]);
+        let describe = |name: &str| TOOLS.iter().find(|t| t.name == name).unwrap().describe();
+        for read in ["spec_list", "spec_show", "spec_drift"] {
+            assert_eq!(describe(read)["annotations"], json!({ "readOnlyHint": true }), "{read}");
+        }
+        assert_eq!(describe("spec_none")["annotations"], json!({ "destructiveHint": false }));
+        assert_eq!(describe("spec_show")["inputSchema"]["required"], json!(["target"]));
+        assert_eq!(describe("spec_none")["inputSchema"]["required"], json!(["ids", "reason"]));
+        assert_eq!(describe("spec_list")["inputSchema"], json!({ "type": "object", "properties": {} }));
+    }
+
+    #[test]
+    fn spec_tool_arguments_never_become_flags() {
+        assert_eq!(argv("spec_list", json!({})), ["spec", "list", "--json"]);
+        assert_eq!(argv("spec_show", json!({ "target": "--history" })), ["spec", "show", "--json", "--", "--history"]);
+        assert_eq!(
+            argv("spec_show", json!({ "target": "checkout", "history": true })),
+            ["spec", "show", "--json", "--history", "--", "checkout"]
+        );
+        assert_eq!(
+            argv("spec_show", json!({ "target": "checkout", "history": false })),
+            ["spec", "show", "--json", "--", "checkout"]
+        );
+        assert_eq!(argv("spec_drift", json!({})), ["spec", "drift", "--json"]);
+        // The limit cuts the output; it is never passed.
+        assert_eq!(
+            argv("spec_drift", json!({ "since": "--all", "limit": 5 })),
+            ["spec", "drift", "--json", "--since=--all"]
+        );
+        assert_eq!(
+            argv("spec_none", json!({ "ids": ["-x", "t-1"], "reason": "--force" })),
+            ["spec", "none", "--json", "--reason=--force", "--", "-x", "t-1"]
+        );
+    }
+
+    #[test]
+    fn invalid_spec_arguments_are_refused() {
+        let err = |tool, args| invoke(tool, args).err().unwrap();
+        assert_eq!(err("spec_show", json!({})), "target is required");
+        assert_eq!(err("spec_show", json!({ "target": "  " })), "target must not be empty");
+        assert_eq!(err("spec_show", json!({ "target": "a", "history": "yes" })), "history must be true or false");
+        assert_eq!(err("spec_show", json!({ "target": "a", "limit": 3 })), "unknown argument \"limit\"");
+        assert_eq!(err("spec_list", json!({ "x": 1 })), "unknown argument \"x\"");
+        assert_eq!(err("spec_none", json!({ "ids": ["a"] })), "reason is required");
+        assert_eq!(err("spec_none", json!({ "ids": ["a"], "reason": " \n" })), "reason must not be empty");
+        assert_eq!(err("spec_none", json!({ "ids": [], "reason": "r" })), "ids must have 1 to 20 items");
+        let many: Vec<String> = (0..21).map(|i| format!("t-{i}")).collect();
+        assert_eq!(err("spec_none", json!({ "ids": many, "reason": "r" })), "ids must have 1 to 20 items");
+        assert_eq!(err("spec_drift", json!({ "limit": 0 })), "limit must be between 1 and 100");
+        assert_eq!(err("spec_drift", json!({ "limit": 101 })), "limit must be between 1 and 100");
+    }
+
+    #[test]
+    fn spec_list_wraps_specs() {
+        let inv = invoke("spec_list", json!({})).unwrap();
+        assert_eq!(inv.result("[]").unwrap(), "{}");
+        let out = json!([{ "id": "s-1", "title": "Checkout", "status": "pinned", "areas": ["checkout"],
+            "parent": null, "closed_parent": null, "requirements": 0, "non_goals": 0, "linked": 2 }]);
+        assert_eq!(
+            inv.result(&out.to_string()).unwrap(),
+            r#"{"specs":[{"areas":["checkout"],"id":"s-1","linked":2,"non_goals":0,"requirements":0,"status":"pinned","title":"Checkout"}]}"#
+        );
+    }
+
+    #[test]
+    fn spec_show_trims_history_and_nested_inherited() {
+        let item = |id: &str| json!({ "id": id, "title": "r", "description": "", "sources": [] });
+        let spec = |id: &str, title: &str| json!({ "id": id, "title": title, "description": "" });
+        let inherited = |id: &str| json!([{ "spec": spec(id, "up"), "requirements": [item("u-1")], "non_goals": [] }]);
+        let history = json!([{ "id": "h-1", "title": "old", "description": "", "sources": [],
+            "outcome": "superseded", "by": "r-1", "reason": "", "closed_at": "T" }]);
+        let view = json!([{
+            "spec": spec("s-1", "Top\u{1b}[31m"), "requirements": [item("r-1")], "non_goals": [],
+            "history": history, "errors": [], "warnings": [], "inherited": inherited("p-1"),
+            "subspecs": [{ "spec": spec("s-2", "Sub"), "requirements": [item("r-2")], "non_goals": [],
+                "history": history, "errors": [], "warnings": [], "inherited": inherited("s-1"), "subspecs": [] }],
+        }])
+        .to_string();
+
+        let text = invoke("spec_show", json!({ "target": "s-1" })).unwrap().result(&view).unwrap();
+        assert!(text.contains(r#""title":"Top\u001b[31m""#), "{text}");
+        let shaped: Value = serde_json::from_str(&text).unwrap();
+        assert!(!text.contains("\"history\""), "{text}");
+        let top = &shaped["specs"][0];
+        assert_eq!(top["inherited"][0]["spec"]["id"], "p-1");
+        assert_eq!(top["subspecs"][0]["spec"]["id"], "s-2");
+        assert!(top["subspecs"][0].get("inherited").is_none(), "{text}");
+
+        let text = invoke("spec_show", json!({ "target": "s-1", "history": true })).unwrap().result(&view).unwrap();
+        let shaped: Value = serde_json::from_str(&text).unwrap();
+        let top = &shaped["specs"][0];
+        assert_eq!(top["history"][0]["outcome"], "superseded");
+        assert_eq!(top["subspecs"][0]["history"][0]["id"], "h-1");
+        assert_eq!(top["inherited"][0]["spec"]["id"], "p-1");
+        assert!(top["subspecs"][0].get("inherited").is_none(), "{text}");
+    }
+
+    #[test]
+    fn spec_drift_cuts_each_list() {
+        let issue = |id: &str, ty: &str| json!({ "id": id, "title": "t", "status": "closed", "priority": 2, "issue_type": ty, "assignee": null });
+        let out = json!({
+            "since": "T", "count": 4,
+            "unlinked": [issue("a", "task"), issue("b", "bug")],
+            "shaky": [{ "requirement": issue("r", "story"), "source": issue("w", "task"), "why": "failed" }],
+            "bad_status": [],
+            "orphaned": [{ "spec": issue("s", "feature"), "parent": "p" }],
+            "to_link": [],
+        })
+        .to_string();
+        let inv = invoke("spec_drift", json!({ "limit": 1 })).unwrap();
+        assert!(inv.accepts_exit(1));
+        assert!(!inv.accepts_exit(2));
+        assert_eq!(
+            inv.result(&out).unwrap(),
+            concat!(
+                r#"{"count":4,"more":{"unlinked":2},"orphaned":[{"parent":"p","spec":{"id":"s","priority":2,"status":"closed","title":"t","type":"feature"}}],"#,
+                r#""shaky":[{"requirement":{"id":"r","priority":2,"status":"closed","title":"t","type":"story"},"source":{"id":"w","priority":2,"status":"closed","title":"t","type":"task"},"why":"failed"}],"#,
+                r#""since":"T","unlinked":[{"id":"a","priority":2,"status":"closed","title":"t","type":"task"}]}"#
+            )
+        );
+        let text = invoke("spec_drift", json!({})).unwrap().result(&out).unwrap();
+        let shaped: Value = serde_json::from_str(&text).unwrap();
+        assert!(shaped.get("more").is_none(), "{text}");
+        assert_eq!(shaped["unlinked"].as_array().unwrap().len(), 2);
+        let none = json!({ "since": "T", "count": 0, "unlinked": [], "shaky": [], "bad_status": [], "orphaned": [], "to_link": [] });
+        assert_eq!(inv.result(&none.to_string()).unwrap(), r#"{"count":0,"since":"T"}"#);
+        // Only spec drift has a findings exit.
+        assert!(!invoke("spec_list", json!({})).unwrap().accepts_exit(1));
+    }
+
+    #[test]
+    fn spec_none_keeps_already_false() {
+        let inv = invoke("spec_none", json!({ "ids": ["a"], "reason": "r" })).unwrap();
+        let out = json!([{ "id": "a", "already": false, "labels": ["spec:none"], "comment_id": 7 }]);
+        assert_eq!(
+            inv.result(&out.to_string()).unwrap(),
+            r#"[{"already":false,"comment_id":7,"id":"a","labels":["spec:none"]}]"#
+        );
+    }
+
+    #[test]
     fn the_tool_list_stays_small() {
-        // About 1,550 tokens at 6.6 KB; every agent connected pays this per session.
+        // 7,836 bytes, about 1,835 tokens; every agent connected pays this per session.
         let list = serde_json::to_string(&TOOLS.iter().map(Tool::describe).collect::<Vec<_>>()).unwrap();
-        assert!(list.len() < 6656, "tools/list is {} bytes", list.len());
+        assert!(list.len() < 7936, "tools/list is {} bytes", list.len());
     }
 }

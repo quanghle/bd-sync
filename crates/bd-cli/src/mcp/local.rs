@@ -206,4 +206,121 @@ mod tests {
         assert!(!err, "{plain}");
         assert!(plain.get("why").is_none(), "{plain}");
     }
+
+    /// Runs a command line through the server's own runner (for what no tool
+    /// does: pinned spec issues, `supersede`), as the model's calls run.
+    fn bd(server: &mut Server<Local>, argv: &[&str]) -> Value {
+        let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        let ran = server.runner.run(&argv, true).unwrap();
+        assert_eq!(ran.exit_code, 0, "{argv:?}: {}", ran.stderr);
+        serde_json::from_str(&ran.stdout).unwrap_or_else(|e| panic!("{argv:?}: {e}: {}", ran.stdout))
+    }
+
+    fn id_of(created: &Value) -> String {
+        created["id"].as_str().unwrap_or_else(|| panic!("{created}")).to_string()
+    }
+
+    #[test]
+    fn spec_tools_end_to_end() {
+        let (_dir, global) = workspace();
+        let db = global.db.clone().unwrap();
+        let mut server = Server::new(Local::new(global, Resolved::new("me/mcp-1", Source::Flag, "test")), false);
+
+        // Specs off: every spec tool is refused with the CLI's own error.
+        for (name, args) in [
+            ("spec_list", json!({})),
+            ("spec_show", json!({ "target": "checkout" })),
+            ("spec_drift", json!({})),
+            ("spec_none", json!({ "ids": ["t-1"], "reason": "r" })),
+        ] {
+            let (err, off) = call(&mut server, name, args);
+            assert!(err, "{name}: {off}");
+            assert_eq!(off["error"]["code"], "invalid", "{name}: {off}");
+            assert_eq!(off["error"]["exit_code"], 2, "{name}: {off}");
+            assert_eq!(off["error"]["message"], bd_core::specs::OFF, "{name}: {off}");
+        }
+
+        // `config set` is admin-only inside a capture: turn specs on directly.
+        let mut store = Store::open(&db, Default::default()).unwrap();
+        store.write("config_set", "tester", |tx| bd_core::config::set(tx, "experimental.features", "specs")).unwrap();
+        drop(store);
+
+        let spec =
+            id_of(&bd(&mut server, &["create", "--json", "--pinned", "-l", "spec,area:checkout", "--", "Checkout"]));
+        let rule = id_of(&bd(
+            &mut server,
+            &["create", "--json", "--pinned", "-l", "requirement", "--parent", &spec, "--", "Requires sign-in"],
+        ));
+        let old = id_of(&bd(
+            &mut server,
+            &["create", "--json", "--pinned", "-l", "requirement", "--parent", &spec, "--", "Guests check out"],
+        ));
+        bd(&mut server, &["supersede", "--json", &old, "--with", &rule]);
+        let sub = id_of(&bd(
+            &mut server,
+            &["create", "--json", "--pinned", "-l", "spec,area:checkout", "--parent", &spec, "--", "Saved cards"],
+        ));
+        bd(&mut server, &["create", "--json", "--pinned", "-l", "requirement", "--parent", &sub, "--", "Lists cards"]);
+
+        let (err, listed) = call(&mut server, "spec_list", json!({}));
+        assert!(!err, "{listed}");
+        assert_eq!(listed["specs"].as_array().unwrap().len(), 2, "{listed}");
+        assert_eq!(listed["specs"][0]["areas"], json!(["checkout"]), "{listed}");
+        assert_eq!(listed["specs"][0]["requirements"], 1, "{listed}");
+
+        let (err, area) = call(&mut server, "spec_show", json!({ "target": "checkout" }));
+        assert!(!err, "{area}");
+        assert_eq!(area["specs"].as_array().unwrap().len(), 1, "{area}");
+        assert_eq!(area["specs"][0]["requirements"][0]["id"], rule, "{area}");
+        assert!(!area.to_string().contains("\"history\""), "{area}");
+        assert_eq!(area["specs"][0]["subspecs"][0]["spec"]["id"], sub, "{area}");
+        assert!(area["specs"][0]["subspecs"][0].get("inherited").is_none(), "{area}");
+
+        // A sub-spec shown on its own keeps what it inherits.
+        let (err, shown) = call(&mut server, "spec_show", json!({ "target": sub }));
+        assert!(!err, "{shown}");
+        assert_eq!(shown["specs"][0]["inherited"][0]["spec"]["id"], spec, "{shown}");
+
+        let (err, history) = call(&mut server, "spec_show", json!({ "target": spec, "history": true }));
+        assert!(!err, "{history}");
+        assert_eq!(history["specs"][0]["history"][0]["outcome"], "superseded", "{history}");
+        assert_eq!(history["specs"][0]["history"][0]["id"], old, "{history}");
+
+        let (err, missing) = call(&mut server, "spec_show", json!({ "target": "nope" }));
+        assert!(err, "{missing}");
+        assert_eq!(missing["error"]["exit_code"], 3, "{missing}");
+
+        // Closed work linked to no spec is drift: a result, not an error.
+        let (_, task) = call(&mut server, "create", json!({ "title": "Build it" }));
+        let task = id_of(&task);
+        let (err, closed) = call(&mut server, "close", json!({ "ids": [task], "reason": "done" }));
+        assert!(!err, "{closed}");
+        let (err, drift) = call(&mut server, "spec_drift", json!({}));
+        assert!(!err, "{drift}");
+        assert_eq!(drift["count"], 1, "{drift}");
+        assert_eq!(drift["unlinked"][0]["id"], task, "{drift}");
+        assert_eq!(drift["unlinked"][0]["type"], "task", "{drift}");
+
+        let (err, none) =
+            call(&mut server, "spec_none", json!({ "ids": [task], "reason": "refactor, no behavior change" }));
+        assert!(!err, "{none}");
+        assert_eq!(none[0]["already"], false, "{none}");
+        assert!(none[0]["labels"].as_array().unwrap().contains(&json!("spec:none")), "{none}");
+        let (err, shown) = call(&mut server, "show", json!({ "ids": [task] }));
+        assert!(!err, "{shown}");
+        assert_eq!(shown["comments"][0]["author"], "me/mcp-1", "{shown}");
+        assert!(shown["comments"][0]["text"].as_str().unwrap().starts_with("No spec: "), "{shown}");
+
+        let (err, drift) = call(&mut server, "spec_drift", json!({}));
+        assert!(!err, "{drift}");
+        assert_eq!(drift["count"], 0, "{drift}");
+        assert!(drift.get("unlinked").is_none(), "{drift}");
+        assert!(drift["since"].is_string(), "{drift}");
+
+        // A spec's own issues are never marked spec:none.
+        let (err, refused) = call(&mut server, "spec_none", json!({ "ids": [spec], "reason": "x" }));
+        assert!(err, "{refused}");
+        assert_eq!(refused["error"]["code"], "invalid", "{refused}");
+        assert_eq!(refused["error"]["exit_code"], 2, "{refused}");
+    }
 }

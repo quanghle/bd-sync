@@ -85,7 +85,7 @@ When delegating work (Agent tool, workflow `agent()` calls), pick the model and 
 
 1. Close finished issues; create issues for remaining work.
 2. When code changed, run the quality gates under Build & Test.
-3. Report `git status`. Do not commit or push unless explicitly asked.
+3. Report `git status`. Do not push unless explicitly asked.
 
 ## Non-Interactive Shell Commands
 

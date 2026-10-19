@@ -657,6 +657,8 @@ async function gateUntilGreen(tag, round) {
 // step is blocked (by verify, then implement) while this runs, and bd refuses to close a child of a blocked step, so
 // confirmed findings are returned as confirmedFixes for the caller to close once implement and verify are closed.
 // bd refuses to close the step while any is open.
+// The record agent's answer counts only when ok and every FILE was filed, so a failed or short filing escalates once and
+// the error names the last real failure.
 const confirmedFixes = []
 // A follow-up's key: FNV-1a of its file and claim. Finding ids restart at F1 each run, so an id alone would match another
 // run's follow-up on the same step; the claim is the same on resume (cached agents) and differs between findings.
@@ -699,6 +701,7 @@ async function record(round, { file = [], close = [], drop = [], followUps = [],
     ...(note ? [`COMMENT: bd comment add ${step} <Text>${bdFlags()}` + text(note)] : []),
   ]
   if (!lines.length) return
+  let failed = null
   const r = await ops(
     `Record review results in bd. Run each command below, in order, exactly as given except that <Text> is the "Text" under it, ` +
       `passed verbatim as one shell argument (use a quoted heredoc, e.g. "$(cat <<'EOF' ... EOF)", so quotes and backticks survive). ` +
@@ -706,11 +709,16 @@ async function record(round, { file = [], close = [], drop = [], followUps = [],
       `\`bd list --all --parent ${step} --search "Finding <id>:" --json${bdFlags()}\` and reuse its id instead of creating a duplicate; ` +
       `likewise before each FOLLOW-UP, with \`bd list --all -l <its followup: label> --json${bdFlags()}\`; ` +
       `a CONFIRM or DROP already commented counts as done. Do nothing else.\n\n${lines.join('\n\n')}\n\n` +
+      'The single-quoted title after each `bd create` is final: pass it character for character, never rebuilt or reworded from the Text or the finding (bd rejects titles over 500 characters). ' +
       `Return ok=true, filed (one entry per FILE) and followedUp (one entry per FOLLOW-UP) if every command succeeded; otherwise ok=false and the error. ` +
       `A failed FOLLOW-UP is the exception: leave it out of followedUp and keep going; it does not make ok false.`,
     { label: `record:r${round}`, phase: 'Record', schema: RECORD },
+    (x) => (x?.ok === true && (x.filed || []).length === file.length) || ((failed = x ?? failed), false),
   )
-  if (!r || !r.ok || (r.filed || []).length !== file.length) throw new Error(`Could not record review round ${round} on ${step} (${r ? r.error : 'record agent failed'}); stopping. Work so far is in ${DIR}.`)
+  if (!r)
+    throw new Error(
+      `Could not record review round ${round} on ${step} (${failed?.error || (failed ? `filed ${(failed.filed || []).length} of ${file.length}` : 'record agent failed')}); stopping. Work so far is in ${DIR}.`,
+    )
   for (const m of r.filed || []) {
     const f = file.find((x) => x.id === m.id)
     if (f) f.bdId = m.bdId

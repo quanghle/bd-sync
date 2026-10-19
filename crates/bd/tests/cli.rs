@@ -5730,20 +5730,36 @@ fn feature_specs_list_show_drift_none_and_candidates() {
     ws.ok(&["config", "set", "experimental.features", "specs"]);
     let since = ws.json(&["config", "get", "experimental.specs.since"])["value"].as_str().unwrap().to_string();
     assert!(since.ends_with('Z') && since.len() > 10, "{since}");
-    let spec = ws.id(&["create", "Checkout", "--pinned", "-l", "spec,area:checkout", "-d", "Paying for a cart."]);
-    let rule = ws.id(&["create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec]);
-    let goal = ws.id(&["create", "No guest checkout", "--pinned", "-l", "non-goal", "--parent", &spec]);
-    let old_rule = ws.id(&["create", "Guests check out", "--pinned", "-l", "requirement", "--parent", &spec]);
+    // Spec parts in the shape `bd spec` writes: a feature spec with an area,
+    // story requirements with a source (closed after since, so linked).
+    let design = ws.id(&["create", "Design checkout"]);
+    ws.ok(&["close", &design, "-r", "done"]);
+    let from = format!("related:{design}");
+    let spec = ws.id(&[
+        "create",
+        "Checkout",
+        "--pinned",
+        "-t",
+        "feature",
+        "-l",
+        "spec,area:checkout",
+        "-d",
+        "Paying for a cart.",
+    ]);
+    let part = |title: &str, labels: &str, parent: &str| {
+        ws.id(&["create", title, "--pinned", "-t", "story", "-l", labels, "--parent", parent, "--dep", &from])
+    };
+    let rule = part("Requires sign-in", "requirement", &spec);
+    let goal = part("No guest checkout", "requirement,non-goal", &spec);
+    let old_rule = part("Guests check out", "requirement", &spec);
     ws.ok(&["supersede", &old_rule, "--with", &rule]);
-    let sub = ws.id(&["create", "Saved cards", "--pinned", "-l", "spec,area:checkout", "--parent", &spec]);
-    ws.id(&["create", "Lists cards", "--pinned", "-l", "requirement", "--parent", &sub]);
+    let sub =
+        ws.id(&["create", "Saved cards", "--pinned", "-t", "feature", "-l", "spec,area:checkout", "--parent", &spec]);
+    part("Lists cards", "requirement", &sub);
 
     // list
     let list = ws.ok(&["spec", "list"]);
-    assert!(
-        list.contains(&format!("{spec} Checkout [checkout]: 1 requirement, 1 non-goal, 0 linked issues")),
-        "{list}"
-    );
+    assert!(list.contains(&format!("{spec} Checkout [checkout]: 1 requirement, 1 non-goal, 1 linked issue")), "{list}");
     assert!(list.contains(&format!("{sub} Saved cards [checkout] (sub-spec of {spec})")), "{list}");
     let json = ws.json(&["spec", "list"]);
     assert_eq!(json.as_array().unwrap().len(), 2);
@@ -5752,14 +5768,14 @@ fn feature_specs_list_show_drift_none_and_candidates() {
     // show
     let md = ws.ok(&["spec", "show", "checkout"]);
     assert!(md.starts_with(&format!("# Checkout ({spec})\n\nPaying for a cart.\n")), "{md}");
-    assert!(md.contains(&format!("## Requirements\n\n- Requires sign-in ({rule})\n")), "{md}");
-    assert!(md.contains(&format!("## Non-goals\n\n- No guest checkout ({goal})\n")), "{md}");
+    assert!(md.contains(&format!("## Requirements\n\n- Requires sign-in ({rule}; from {design})\n")), "{md}");
+    assert!(md.contains(&format!("## Non-goals\n\n- No guest checkout ({goal}; from {design})\n")), "{md}");
     assert!(md.contains(&format!("## Sub-feature: Saved cards ({sub})")), "{md}");
     assert!(!md.contains("History"));
     let md = ws.ok(&["spec", "show", &sub, "--history"]);
-    assert!(md.contains(&format!("## Inherited\n\n- Requires sign-in ({rule}; spec {spec})")), "{md}");
+    assert!(md.contains(&format!("## Inherited\n\n- Requires sign-in ({rule}; spec {spec}; from {design})")), "{md}");
     let md = ws.ok(&["spec", "show", &spec, "--history"]);
-    assert!(md.contains(&format!("- ~~Guests check out~~ superseded by {rule} ({old_rule})")), "{md}");
+    assert!(md.contains(&format!("- ~~Guests check out~~ superseded by {rule} ({old_rule}; from {design})")), "{md}");
     let views = ws.json(&["spec", "show", "checkout"]);
     assert_eq!(views.as_array().unwrap().len(), 1, "the sub-spec is shown inside its spec");
     assert_eq!(views[0]["non_goals"][0]["id"], goal.as_str());
@@ -5882,21 +5898,30 @@ fn feature_specs_list_show_drift_none_and_candidates() {
 fn feature_specs_flag_unpinned_specs_orphans_and_ambiguous_ids() {
     let ws = Ws::new();
     ws.ok(&["config", "set", "experimental.features", "specs"]);
-    let top = ws.id(&["create", "Top", "-l", "spec,area:billing"]);
-    let r1 = ws.id(&["create", "Pays", "--pinned", "-l", "requirement", "--parent", &top]);
-    let r2 = ws.id(&["create", "Refunds", "--pinned", "-l", "requirement", "--parent", &top]);
+    // Otherwise in the shape `bd spec` writes, so only status and orphans drift.
+    let w = ws.id(&["create", "Billing work"]);
+    ws.ok(&["close", &w, "-r", "done"]);
+    let from = format!("related:{w}");
+    let top = ws.id(&["create", "Top", "-t", "feature", "-l", "spec,area:billing"]);
+    let r1 =
+        ws.id(&["create", "Pays", "--pinned", "-t", "story", "-l", "requirement", "--parent", &top, "--dep", &from]);
+    let r2 =
+        ws.id(&["create", "Refunds", "--pinned", "-t", "story", "-l", "requirement", "--parent", &top, "--dep", &from]);
     let retired = ws.id(&["create", "Retired", "--pinned", "-l", "spec"]);
-    let orphan = ws.id(&["create", "Orphan", "--pinned", "-l", "spec", "--parent", &retired]);
+    let orphan =
+        ws.id(&["create", "Orphan", "--pinned", "-t", "feature", "-l", "spec,area:billing", "--parent", &retired]);
     ws.ok(&["close", &retired, "--force", "-r", "retired"]);
 
     // list: the not-pinned and orphan markers, and closed_parent in JSON
     let list = ws.ok(&["spec", "list"]);
     assert!(
-        list.contains(&format!("{top} Top [billing] (open, not pinned): 2 requirements, 0 non-goals, 0 linked issues")),
+        list.contains(&format!("{top} Top [billing] (open, not pinned): 2 requirements, 0 non-goals, 1 linked issue")),
         "{list}"
     );
     assert!(
-        list.contains(&format!("{orphan} Orphan (orphaned: parent spec {retired} is closed): 0 requirements")),
+        list.contains(&format!(
+            "{orphan} Orphan [billing] (orphaned: parent spec {retired} is closed): 0 requirements"
+        )),
         "{list}"
     );
     let json = ws.json(&["spec", "list"]);
@@ -5924,7 +5949,7 @@ fn feature_specs_flag_unpinned_specs_orphans_and_ambiguous_ids() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
         text.contains(&format!(
-            "## Bad status: specs and requirements neither pinned nor closed (1)\n- {top} [task] Top (open)"
+            "## Bad status: specs and requirements neither pinned nor closed (1)\n- {top} [feature] Top (open)"
         )),
         "{text}"
     );
@@ -5955,6 +5980,108 @@ fn feature_specs_flag_unpinned_specs_orphans_and_ambiguous_ids() {
     let short = top.strip_prefix("t-").unwrap();
     let md = ws.ok(&["spec", "show", short]);
     assert!(md.starts_with(&format!("# Top ({top})")), "{md}");
+}
+
+/// A spec part in a shape `bd spec` never writes is listed by drift (exit 1,
+/// escaped, once per part with `-q`) and warned about by doctor (exit 0).
+#[test]
+fn spec_drift_reports_malformed_parts_and_doctor_warns() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let src = ws.id(&["create", "Design billing"]);
+    ws.ok(&["close", &src, "-r", "done"]);
+    let spec =
+        ws.json(&["spec", "new", "billing", "Billing", "--from", &src])["spec"]["id"].as_str().unwrap().to_string();
+    ws.ok(&["spec", "add", &spec, "Sends", "invoices", "--from", &src]);
+    let check = |ws: &Ws| {
+        ws.json(&["doctor"])["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["name"] == "malformed_specs")
+            .cloned()
+            .unwrap()
+    };
+
+    // What bd spec writes: nothing to report.
+    let out = ws.run_as("tester", &["spec", "drift"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("Malformed"), "{out:?}");
+    let k = check(&ws);
+    assert_eq!(
+        (k["severity"].as_str(), k["detail"].as_str()),
+        (Some("ok"), Some("no malformed specs or requirements"))
+    );
+
+    // A non-goal not labelled requirement, with a title holding ESC and U+202E.
+    let from = format!("related:{src}");
+    let loose = ws.id(&[
+        "create",
+        "Loose\u{1b}[31m\u{202e}",
+        "--pinned",
+        "-t",
+        "story",
+        "-l",
+        "non-goal",
+        "--parent",
+        &spec,
+        "--dep",
+        &from,
+    ]);
+    let out = ws.run_as("tester", &["spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let text = String::from_utf8(out.stdout).unwrap();
+    let heading = "## Malformed: specs and requirements not in the shape bd spec writes (1)";
+    let at = text.find(heading).unwrap_or_else(|| panic!("{text}"));
+    assert!(text.find("## Orphaned:").unwrap() < at, "{text}");
+    assert!(at < text.find("## To link:").unwrap(), "{text}");
+    let line = text.lines().find(|l| l.starts_with(&format!("- {loose} "))).unwrap_or_else(|| panic!("{text}"));
+    assert!(line.starts_with(&format!("- {loose} Loose")), "{line}");
+    assert!(
+        line.ends_with(&format!(" — labelled non-goal but not requirement (bd label add {loose} requirement)")),
+        "{line}"
+    );
+    assert!(!text.contains('\u{1b}') && !text.contains('\u{202e}'), "{text:?}");
+    let out = ws.run_as("tester", &["--json", "spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1));
+    let drift: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(drift["count"], 1, "{drift}");
+    assert_eq!(drift["malformed"][0]["problem"], "non_goal_only", "{drift}");
+    assert_eq!(drift["malformed"][0]["issue"]["id"], loose.as_str(), "{drift}");
+
+    // Two problems, one id with -q.
+    ws.ok(&["update", &loose, "-t", "task"]);
+    let out = ws.run_as("tester", &["-q", "spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), format!("{loose}\n"));
+    let drift: Value = serde_json::from_slice(&ws.run_as("tester", &["--json", "spec", "drift"]).stdout).unwrap();
+    let problems: Vec<&str> =
+        drift["malformed"].as_array().unwrap().iter().map(|m| m["problem"].as_str().unwrap()).collect();
+    assert_eq!(problems, ["non_goal_only", "requirement_type"], "{drift}");
+
+    // doctor warns, naming the part and drift, and still exits 0.
+    let k = check(&ws);
+    assert_eq!(k["severity"], "warn", "{k}");
+    let detail = k["detail"].as_str().unwrap();
+    assert!(detail.contains(&loose) && detail.contains("bd spec drift"), "{detail}");
+    assert!(detail.starts_with("1 malformed spec part(s)"), "{detail}");
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0, "a warning, not a failure");
+
+    // Fixed: drift and doctor are clean again.
+    ws.ok(&["label", "add", &loose, "requirement"]);
+    ws.ok(&["update", &loose, "-t", "story"]);
+    assert_eq!(ws.code_as("tester", &["spec", "drift"]), 0);
+    let k = check(&ws);
+    assert_eq!(
+        (k["severity"].as_str(), k["detail"].as_str()),
+        (Some("ok"), Some("no malformed specs or requirements"))
+    );
+
+    // Off: the scan does not run.
+    ws.ok(&["update", &loose, "-t", "task"]);
+    ws.ok(&["config", "set", "experimental.features", ""]);
+    let k = check(&ws);
+    assert_eq!((k["severity"].as_str(), k["detail"].as_str()), (Some("ok"), Some("feature specs are off")));
 }
 
 #[test]

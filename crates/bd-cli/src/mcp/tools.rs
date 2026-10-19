@@ -52,8 +52,9 @@ enum Shape {
     /// `bd spec show`'s views, as `{"specs": [...]}`: without `history` unless
     /// asked, and without `inherited` on nested sub-specs.
     SpecViews,
-    /// `bd spec drift`'s report: issues as summaries, each list cut to the
-    /// limit, and `more` naming each cut list's full length.
+    /// `bd spec drift`'s report: issues as summaries (`malformed` items as
+    /// `{issue, problem, detail}`), each list cut to the limit, and `more`
+    /// naming each cut list's full length.
     Drift,
 }
 
@@ -801,17 +802,21 @@ type ItemShape = fn(&Value) -> Value;
 
 /// `bd spec drift`'s report with its issues as summaries and each list cut to
 /// `limit`; `more` names each cut list's full length. `count` stays the
-/// CLI's, over the whole lists.
+/// CLI's, over the whole lists. A list an older server leaves out (such as
+/// `malformed`) is empty, and pruned like any other empty list.
 fn drift(value: Value, limit: usize) -> Value {
     let mut out = json!({ "since": value["since"], "count": value["count"] });
     let mut more = Map::new();
     let shaky = |i: &Value| json!({ "requirement": summary(&i["requirement"]), "source": summary(&i["source"]), "why": i["why"] });
     let orphaned = |i: &Value| json!({ "spec": summary(&i["spec"]), "parent": i["parent"] });
-    let lists: [(&str, ItemShape); 5] = [
+    let malformed =
+        |i: &Value| json!({ "issue": summary(&i["issue"]), "problem": i["problem"], "detail": i["detail"] });
+    let lists: [(&str, ItemShape); 6] = [
         ("unlinked", summary),
         ("shaky", shaky),
         ("bad_status", summary),
         ("orphaned", orphaned),
+        ("malformed", malformed),
         ("to_link", summary),
     ];
     for (key, item) in lists {
@@ -1119,11 +1124,15 @@ mod tests {
     fn spec_drift_cuts_each_list() {
         let issue = |id: &str, ty: &str| json!({ "id": id, "title": "t", "status": "closed", "priority": 2, "issue_type": ty, "assignee": null });
         let out = json!({
-            "since": "T", "count": 4,
+            "since": "T", "count": 6,
             "unlinked": [issue("a", "task"), issue("b", "bug")],
             "shaky": [{ "requirement": issue("r", "story"), "source": issue("w", "task"), "why": "failed" }],
             "bad_status": [],
             "orphaned": [{ "spec": issue("s", "feature"), "parent": "p" }],
+            "malformed": [
+                { "issue": issue("m", "epic"), "problem": "no_area", "detail": "no area:<name> label" },
+                { "issue": issue("m", "epic"), "problem": "spec_type", "detail": "type epic, not feature" },
+            ],
             "to_link": [],
         })
         .to_string();
@@ -1133,7 +1142,8 @@ mod tests {
         assert_eq!(
             inv.result(&out).unwrap(),
             concat!(
-                r#"{"count":4,"more":{"unlinked":2},"orphaned":[{"parent":"p","spec":{"id":"s","priority":2,"status":"closed","title":"t","type":"feature"}}],"#,
+                r#"{"count":6,"malformed":[{"detail":"no area:<name> label","issue":{"id":"m","priority":2,"status":"closed","title":"t","type":"epic"},"problem":"no_area"}],"#,
+                r#""more":{"malformed":2,"unlinked":2},"orphaned":[{"parent":"p","spec":{"id":"s","priority":2,"status":"closed","title":"t","type":"feature"}}],"#,
                 r#""shaky":[{"requirement":{"id":"r","priority":2,"status":"closed","title":"t","type":"story"},"source":{"id":"w","priority":2,"status":"closed","title":"t","type":"task"},"why":"failed"}],"#,
                 r#""since":"T","unlinked":[{"id":"a","priority":2,"status":"closed","title":"t","type":"task"}]}"#
             )
@@ -1142,7 +1152,8 @@ mod tests {
         let shaped: Value = serde_json::from_str(&text).unwrap();
         assert!(shaped.get("more").is_none(), "{text}");
         assert_eq!(shaped["unlinked"].as_array().unwrap().len(), 2);
-        let none = json!({ "since": "T", "count": 0, "unlinked": [], "shaky": [], "bad_status": [], "orphaned": [], "to_link": [] });
+        assert_eq!(shaped["malformed"][1]["problem"], "spec_type");
+        let none = json!({ "since": "T", "count": 0, "unlinked": [], "shaky": [], "bad_status": [], "orphaned": [], "malformed": [], "to_link": [] });
         assert_eq!(inv.result(&none.to_string()).unwrap(), r#"{"count":0,"since":"T"}"#);
         // Only spec drift has a findings exit.
         assert!(!invoke("spec_list", json!({})).unwrap().accepts_exit(1));

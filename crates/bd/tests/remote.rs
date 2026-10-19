@@ -9788,6 +9788,34 @@ fn feature_specs_through_bd_serve() {
     assert_eq!(linked[0]["already"], false, "{linked}");
     assert_eq!(alice.code(&["spec", "drift"]), 0);
     assert_eq!(alice.json(&["spec", "drift"])["count"], 0);
+
+    // A part not in the shape bd spec writes drifts too, until it is fixed.
+    let from = format!("related:{design}");
+    let loose = alice
+        .ok(&[
+            "-q",
+            "create",
+            "Works offline",
+            "--pinned",
+            "-t",
+            "story",
+            "-l",
+            "non-goal",
+            "--parent",
+            &spec,
+            "--dep",
+            &from,
+        ])
+        .trim()
+        .to_string();
+    let out = alice.run(&["--json", "spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1), "malformed exits 1 through bd serve too");
+    let drift: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!((&drift["count"], &drift["malformed"][0]["problem"]), (&json!(1), &json!("non_goal_only")), "{drift}");
+    assert_eq!(drift["malformed"][0]["issue"]["id"], loose.as_str(), "{drift}");
+    alice.ok(&["label", "add", &loose, "requirement"]);
+    assert_eq!(alice.code(&["spec", "drift"]), 0);
+    assert_eq!(alice.json(&["spec", "drift"])["count"], 0);
 }
 
 #[test]
@@ -9805,9 +9833,29 @@ fn mcp_spec_tools_through_bd_serve() {
     assert_eq!(error["message"], bd_core::specs::OFF, "{error}");
 
     check(server.local("admin", &["config", "set", "experimental.features", "specs"]), "config set");
-    let spec = alice.ok(&["-q", "create", "Checkout", "--pinned", "-l", "spec,area:checkout"]).trim().to_string();
+    // In the shape bd spec writes, so only the work below drifts.
+    let design = alice.ok(&["-q", "create", "Design it"]).trim().to_string();
+    alice.ok(&["close", &design, "-r", "done"]);
+    let from = format!("related:{design}");
+    let spec = alice
+        .ok(&["-q", "create", "Checkout", "--pinned", "-t", "feature", "-l", "spec,area:checkout"])
+        .trim()
+        .to_string();
     let rule = alice
-        .ok(&["-q", "create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec])
+        .ok(&[
+            "-q",
+            "create",
+            "Requires sign-in",
+            "--pinned",
+            "-t",
+            "story",
+            "-l",
+            "requirement",
+            "--parent",
+            &spec,
+            "--dep",
+            &from,
+        ])
         .trim()
         .to_string();
     let work = alice.ok(&["-q", "create", "Build it"]).trim().to_string();

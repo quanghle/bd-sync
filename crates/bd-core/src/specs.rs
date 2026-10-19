@@ -11,7 +11,8 @@
 //! Everything here reads: the spec tree ([`show`], [`spec_views`],
 //! [`render`]), the issues linked to specs ([`linked`]), drift since specs
 //! were turned on ([`drift`], and its counts for `bd prime`,
-//! [`unlinked_counts`]), closed work from before then that no spec covers
+//! [`unlinked_counts`]), spec parts not in the shape `bd spec` writes
+//! ([`malformed`], part of drift and `bd doctor`), closed work from before then that no spec covers
 //! ([`candidates`]) and the open specs ([`list`]). Lookups go by key
 //! (labels by label, edges by either end, issues by id); the two listings of
 //! issues by status search the ready index (`idx_issues_ready`), as
@@ -30,6 +31,7 @@ use crate::graph;
 use crate::hierarchy;
 use crate::issues;
 use crate::model::{DepType, GATE_TYPE, Issue, IssueRef, Outcome, Status};
+use crate::spec_edit::check_area;
 use crate::time::Timestamp;
 
 /// The experimental feature's name in `experimental.features`.
@@ -960,6 +962,42 @@ pub struct Orphaned {
     pub parent: String,
 }
 
+/// What is wrong with the shape of a spec part ([`malformed`]). The
+/// declaration order is the order a part's problems are listed in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Problem {
+    /// (a) A requirement or non-goal, not closed, whose parent is missing or not a spec.
+    NotUnderSpec,
+    /// (b) A spec, not closed, with no valid `area:<name>` label.
+    NoArea,
+    /// (c) A requirement or non-goal in force (pinned) with no `related`
+    /// edge to an issue that is not itself a spec part.
+    NoSource,
+    /// (d) Labelled `non-goal` but not `requirement`, not closed.
+    NonGoalOnly,
+    /// (e) A spec, not closed, of a type other than `feature`.
+    SpecType,
+    /// (f) A requirement or non-goal, not closed, of a type other than `story`.
+    RequirementType,
+    /// (g) Labelled `spec` and also `requirement` or `non-goal`, not closed.
+    SpecAndRequirement,
+    /// (h) A requirement or non-goal (of any status) superseded by an issue
+    /// that is not a requirement, or by one not under its own parent spec
+    /// or a spec that spec was superseded by.
+    SupersededElsewhere,
+}
+
+/// A spec part not in the shape `bd spec` writes, and the fix.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Malformed {
+    pub issue: IssueRef,
+    pub problem: Problem,
+    /// What is wrong and how to fix it: ids, fixed text and the issue's
+    /// cleaned type only, never titles or label values.
+    pub detail: String,
+}
+
 /// What `bd spec drift` reports.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Drift {
@@ -974,14 +1012,17 @@ pub struct Drift {
     pub bad_status: Vec<IssueRef>,
     /// Open specs whose parent spec is closed.
     pub orphaned: Vec<Orphaned>,
+    /// Spec parts not in the shape `bd spec` writes, whenever written; not
+    /// gated by since ([`malformed`]).
+    pub malformed: Vec<Malformed>,
     /// Open work created since then, not linked yet (not drift).
     pub to_link: Vec<IssueRef>,
 }
 
 impl Drift {
-    /// How many problems: everything but `to_link`.
+    /// How many problems: everything but `to_link` (`malformed` included).
     pub fn count(&self) -> usize {
-        self.unlinked.len() + self.shaky.len() + self.bad_status.len() + self.orphaned.len()
+        self.unlinked.len() + self.shaky.len() + self.bad_status.len() + self.orphaned.len() + self.malformed.len()
     }
 }
 
@@ -1039,7 +1080,197 @@ pub fn drift(conn: &Connection, since: Option<Timestamp>) -> Result<Drift> {
     // String order, as the requirements' set; an issue labelled both spec and requirement once.
     bad_status.sort_by(|a, b| a.id.cmp(&b.id));
     bad_status.dedup_by(|a, b| a.id == b.id);
-    Ok(Drift { since, unlinked, shaky, bad_status, orphaned, to_link })
+    let malformed = malformed(conn)?;
+    Ok(Drift { since, unlinked, shaky, bad_status, orphaned, malformed, to_link })
+}
+
+// Shape: what bd spec writes.
+
+/// The issues, parents and spec successors [`malformed`] reads, each once.
+struct ShapeScan<'c> {
+    conn: &'c Connection,
+    issues: HashMap<String, Option<Issue>>,
+    parents: HashMap<String, Option<String>>,
+    successors: HashMap<String, HashSet<String>>,
+}
+
+impl<'c> ShapeScan<'c> {
+    fn new(conn: &'c Connection) -> Self {
+        ShapeScan { conn, issues: HashMap::new(), parents: HashMap::new(), successors: HashMap::new() }
+    }
+
+    /// The issue `id`, if it exists.
+    fn issue(&mut self, id: &str) -> Result<Option<Issue>> {
+        if let Some(i) = self.issues.get(id) {
+            return Ok(i.clone());
+        }
+        let issue = issues::get(self.conn, id)?;
+        self.issues.insert(id.to_string(), issue.clone());
+        Ok(issue)
+    }
+
+    /// The parent of `id`, if it has one.
+    fn parent(&mut self, id: &str) -> Result<Option<String>> {
+        if let Some(p) = self.parents.get(id) {
+            return Ok(p.clone());
+        }
+        let parent = graph::parent_of(self.conn, id)?;
+        self.parents.insert(id.to_string(), parent.clone());
+        Ok(parent)
+    }
+
+    /// Whether `id` exists and is labelled spec.
+    fn is_spec(&mut self, id: &str) -> Result<bool> {
+        Ok(self.issue(id)?.is_some_and(|i| has(&i.labels, SPEC)))
+    }
+
+    /// The specs the spec `spec` was superseded by, directly or through
+    /// other specs (`supersedes` edges from old to new between issues
+    /// labelled spec), to [`MAX_DEPTH`] steps; never `spec` itself. Empty
+    /// unless `spec` exists and is labelled spec. Cycles end at specs seen.
+    fn successors(&mut self, spec: &str) -> Result<HashSet<String>> {
+        if let Some(s) = self.successors.get(spec) {
+            return Ok(s.clone());
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        if self.is_spec(spec)? {
+            seen.insert(spec.to_string());
+            let mut frontier = vec![spec.to_string()];
+            for _ in 0..MAX_DEPTH {
+                let mut next = Vec::new();
+                for s in &frontier {
+                    for t in edges_out(self.conn, s, "supersedes")? {
+                        if !seen.contains(&t) && self.is_spec(&t)? {
+                            seen.insert(t.clone());
+                            next.push(t);
+                        }
+                    }
+                }
+                if next.is_empty() {
+                    break;
+                }
+                frontier = next;
+            }
+            seen.remove(spec);
+        }
+        self.successors.insert(spec.to_string(), seen.clone());
+        Ok(seen)
+    }
+}
+
+/// Whether `labels` hold `label`.
+fn has(labels: &[String], label: &str) -> bool {
+    labels.iter().any(|l| l == label)
+}
+
+/// Whether `labels` mark a requirement or non-goal (and not a spec).
+fn is_requirement(labels: &[String]) -> bool {
+    (has(labels, REQUIREMENT) || has(labels, NON_GOAL)) && !has(labels, SPEC)
+}
+
+/// Every spec part (labelled spec, requirement or non-goal) not in the
+/// shape `bd spec` writes, whenever it was written: one entry per issue
+/// and [`Problem`], in id order, then [`Problem`] order. A spec is checked
+/// for b, e and g only; a requirement or non-goal for a, c, d, f and h.
+/// Reads only.
+pub fn malformed(conn: &Connection) -> Result<Vec<Malformed>> {
+    let mut ids: BTreeSet<String> = labelled(conn, SPEC)?.into_iter().collect();
+    ids.extend(labelled(conn, REQUIREMENT)?);
+    ids.extend(labelled(conn, NON_GOAL)?);
+    let mut scan = ShapeScan::new(conn);
+    let mut out = Vec::new();
+    for id in &ids {
+        let Some(issue) = scan.issue(id)? else { continue };
+        let open = issue.status != Status::Closed;
+        let labels = &issue.labels;
+        let mut found: Vec<(Problem, String)> = Vec::new();
+        if has(labels, SPEC) {
+            if open && !labels.iter().any(|l| l.strip_prefix("area:").is_some_and(|a| check_area(a).is_ok())) {
+                found.push((Problem::NoArea, format!("no area:<name> label (bd label add {id} area:<name>)")));
+            }
+            if open && issue.issue_type != "feature" {
+                let t = clean(&issue.issue_type);
+                found.push((Problem::SpecType, format!("type {t}, not feature (bd update {id} --type feature)")));
+            }
+            if open && (has(labels, REQUIREMENT) || has(labels, NON_GOAL)) {
+                found.push((Problem::SpecAndRequirement, "labelled spec and requirement/non-goal: keep one".into()));
+            }
+        } else {
+            let parent = scan.parent(id)?;
+            let parent_spec = match &parent {
+                Some(p) if scan.is_spec(p)? => Some(p.clone()),
+                _ => None,
+            };
+            if open && parent_spec.is_none() {
+                let detail = match &parent {
+                    Some(p) => {
+                        format!("parent {p} is not a spec: move it under its spec (bd update {id} --parent <spec>)")
+                    }
+                    None => format!("no parent: move it under its spec (bd update {id} --parent <spec>)"),
+                };
+                found.push((Problem::NotUnderSpec, detail));
+            }
+            if issue.status == Status::Pinned {
+                let mut sourced = false;
+                for src in edges_out(conn, id, "related")? {
+                    if scan.issue(&src)?.is_some_and(|s| !is_spec_part(&s.labels)) {
+                        sourced = true;
+                        break;
+                    }
+                }
+                if !sourced {
+                    found.push((
+                        Problem::NoSource,
+                        format!("in force with no source (bd dep add {id} <issue or run> --type related)"),
+                    ));
+                }
+            }
+            if open && has(labels, NON_GOAL) && !has(labels, REQUIREMENT) {
+                found.push((
+                    Problem::NonGoalOnly,
+                    format!("labelled non-goal but not requirement (bd label add {id} requirement)"),
+                ));
+            }
+            if open && issue.issue_type != "story" {
+                let t = clean(&issue.issue_type);
+                found.push((Problem::RequirementType, format!("type {t}, not story (bd update {id} --type story)")));
+            }
+            let mut offenders: Vec<String> = Vec::new();
+            for x in edges_out(conn, id, "supersedes")? {
+                // A dangling edge is a damaged database, which `bd doctor` reports.
+                let Some(target) = scan.issue(&x)? else { continue };
+                if !is_requirement(&target.labels) {
+                    offenders.push(format!("superseded by {x}, which is not a requirement"));
+                    continue;
+                }
+                let px = scan.parent(&x)?;
+                let allowed = match (&parent_spec, &px) {
+                    (Some(p), Some(q)) => p == q || scan.successors(p)?.contains(q),
+                    _ => false,
+                };
+                if !allowed {
+                    let under = match &px {
+                        Some(q) => format!("under {q}"),
+                        None => "with no parent".to_string(),
+                    };
+                    let why = match (&parent_spec, &parent) {
+                        (Some(p), _) => format!("not under its spec {p} or a spec it was superseded by"),
+                        (None, Some(p)) => format!("and its parent {p} is not a spec"),
+                        (None, None) => "and it has no parent spec".to_string(),
+                    };
+                    offenders.push(format!("superseded by {x} {under}, {why}"));
+                }
+            }
+            if let Some(first) = offenders.first() {
+                let more = offenders.len() - 1;
+                let detail = if more > 0 { format!("{first} (and {more} more)") } else { first.clone() };
+                found.push((Problem::SupersededElsewhere, detail));
+            }
+        }
+        found.sort_by_key(|(problem, _)| *problem);
+        out.extend(found.into_iter().map(|(problem, detail)| Malformed { issue: issue.to_ref(), problem, detail }));
+    }
+    Ok(out)
 }
 
 /// An issue in a group of candidates.

@@ -547,10 +547,34 @@ writes without the checks.
   source still in progress, never closed, is not; `bad_status`, specs,
   requirements and non-goals neither pinned nor closed, in id order, each
   once; `orphaned`, open specs under a closed spec (one that is also not
-  pinned is in both `orphaned` and `bad_status`). `to_link`, open issues
-  created since then and not linked yet, is listed but is not drift. Exits
-  1 when `unlinked`, `shaky`, `bad_status` and `orphaned` hold anything, 0
-  otherwise, locally and through `bd serve` alike; `--json` adds `count`.
+  pinned is in both `orphaned` and `bad_status`); `malformed`, spec parts
+  not in the shape `bd spec` writes, each `{issue, problem, detail}` with a
+  detail that names the fix:
+  - `not_under_spec`: an open requirement or non-goal whose parent is not a
+    spec, or that has no parent;
+  - `no_area`: an open spec without a valid `area:<name>` label;
+  - `no_source`: a pinned requirement or non-goal with no `related` edge
+    to an issue that is not itself a spec part;
+  - `non_goal_only`: an open part labelled `non-goal` but not
+    `requirement`;
+  - `spec_type`: an open spec not of type `feature`;
+  - `requirement_type`: an open requirement or non-goal not of type
+    `story`;
+  - `spec_and_requirement`: an open spec also labelled `requirement` or
+    `non-goal` (it gets only the spec checks);
+  - `superseded_elsewhere`: a requirement or non-goal, open or closed,
+    superseded by something that is not one, or by one outside its spec
+    (one entry naming the first, with how many more): the old requirement's
+    parent must be a spec, and its successor must sit under that spec or a
+    spec it was superseded by (`supersedes` edges between specs).
+
+  `malformed` is sorted by id, then code in the order above, with one entry
+  per part and problem; it covers every spec part whenever written, not
+  only since then, and may repeat a part that is in `bad_status` or
+  `orphaned`. `to_link`, open issues created since then and not linked
+  yet, is listed but is not drift. Exits 1 when `unlinked`, `shaky`,
+  `bad_status`, `orphaned` and `malformed` hold anything, 0 otherwise,
+  locally and through `bd serve` alike; `--json` adds `count`.
   Without a since time, no work is checked. `shaky` reads the source's
   history: a `reopened` event pruned by `events.retain_days` or
   `events.retain_rows` is no longer seen, and a source reopened before it
@@ -732,7 +756,7 @@ playbook against the older server fails.
 
 | feature | what it turns on |
 |---|---|
-| `specs` | [feature specs](concepts.md#feature-specs): a feature's canonical requirements as pinned spec issues with requirement children, read and checked with [`bd spec`](#feature-specs) and kept current by a playbook step (this repository's `change` playbook). Turning it on sets `experimental.specs.since`; `bd prime` shows the open specs and the work left unlinked, and with it off `bd prime` and `bd doctor` (`specs_while_off`) warn about open specs left behind |
+| `specs` | [feature specs](concepts.md#feature-specs): a feature's canonical requirements as pinned spec issues with requirement children, read and checked with [`bd spec`](#feature-specs) and kept current by a playbook step (this repository's `change` playbook). Turning it on sets `experimental.specs.since`; `bd prime` shows the open specs and the work left unlinked, and with it off `bd prime` and `bd doctor` (`specs_while_off`) warn about open specs left behind; with it on `bd doctor` warns about malformed spec parts (`malformed_specs`, see [`bd spec drift`](#feature-specs)) |
 
 ## Exit codes
 

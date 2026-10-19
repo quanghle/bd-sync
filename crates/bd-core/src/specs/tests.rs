@@ -718,7 +718,9 @@ fn drift_reports_each_kind_and_partitions_work_at_since() {
         [(sub.as_str(), retired.as_str())]
     );
     assert_eq!(ref_ids(&d.to_link), [open.as_str()], "open since, unlinked: the reopened one is linked");
-    assert_eq!(d.count(), 1 + 2 + 1 + 1);
+    // The fixture is hand-made, not in the shape `bd spec` writes: those problems count too.
+    assert!(!d.malformed.is_empty());
+    assert_eq!(d.count(), 1 + 2 + 1 + 1 + d.malformed.len());
 
     // Without since, nothing is in the window.
     let none = ws.read(|c| drift(c, None));
@@ -739,7 +741,26 @@ fn drift_lists_specs_neither_pinned_nor_closed_in_id_order_once() {
     let d = ws.read(|c| drift(c, Some(Timestamp(0))));
     assert_eq!(ref_ids(&d.bad_status), [draft.as_str(), loose.as_str(), both.as_str()], "sorted by id, each once");
     assert!(d.orphaned.is_empty());
-    assert_eq!(d.count(), 3);
+    // Hand-made in a shape `bd spec` never writes: tasks, no areas, one labelled both.
+    let shape: Vec<(&str, Problem)> = d.malformed.iter().map(|m| (m.issue.id.as_str(), m.problem)).collect();
+    assert_eq!(
+        shape,
+        [
+            ("t-1", Problem::NoArea),
+            ("t-1", Problem::SpecType),
+            ("t-1.1", Problem::RequirementType),
+            ("t-2", Problem::NoArea),
+            ("t-2", Problem::SpecType),
+            ("t-3", Problem::NoArea),
+            ("t-3", Problem::SpecType),
+            ("t-3", Problem::SpecAndRequirement),
+        ]
+    );
+    assert_eq!(d.count(), 3 + d.malformed.len());
+    // An open requirement not pinned is in both lists, and is not in force, so needs no source.
+    assert!(ref_ids(&d.bad_status).contains(&loose.as_str()));
+    assert!(shape.contains(&(loose.as_str(), Problem::RequirementType)));
+    assert!(!shape.contains(&(loose.as_str(), Problem::NoSource)));
 
     // An open orphan not pinned is both: two problems, two fixes.
     let retired = ws.create(pinned("Retired", &["spec"], None));
@@ -1200,4 +1221,367 @@ fn linked_ends_on_a_parent_cycle() {
     });
     let set = ws.read(linked);
     assert!(set.contains(&x) && set.contains(&y), "{set:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Shape: what `bd spec` writes ([`malformed`]).
+
+/// A spec as `bd spec new` writes it: a pinned feature labelled spec and,
+/// when given, `area:<area>`.
+fn feature_spec(title: &str, area: Option<&str>, parent: Option<&str>) -> NewIssue {
+    let mut labels = vec![SPEC.to_string()];
+    if let Some(a) = area {
+        labels.push(format!("area:{a}"));
+    }
+    NewIssue { issue_type: Some("feature".into()), labels, ..pinned(title, &[], parent) }
+}
+
+/// A requirement as `bd spec add` writes it: a pinned story with a
+/// `related` edge to each source.
+fn story(title: &str, labels: &[&str], parent: Option<&str>, sources: &[String]) -> NewIssue {
+    NewIssue {
+        issue_type: Some("story".into()),
+        deps: sources.iter().map(|s| (DepType::Related, s.clone())).collect(),
+        ..pinned(title, labels, parent)
+    }
+}
+
+/// The (issue, problem) pairs [`malformed`] reports, in its order.
+fn shape(ws: &Ws) -> Vec<(String, Problem)> {
+    ws.read(malformed).into_iter().map(|m| (m.issue.id, m.problem)).collect()
+}
+
+fn problems_of(ws: &Ws, id: &str) -> Vec<Problem> {
+    shape(ws).into_iter().filter(|(i, _)| i == id).map(|(_, p)| p).collect()
+}
+
+fn detail_of(ws: &Ws, id: &str, problem: Problem) -> String {
+    ws.read(malformed)
+        .into_iter()
+        .find(|m| m.issue.id == id && m.problem == problem)
+        .map(|m| m.detail)
+        .unwrap_or_else(|| panic!("no {problem:?} for {id}"))
+}
+
+/// Closed work a requirement can name as its source.
+fn closed_work(ws: &mut Ws) -> String {
+    let w = ws.create(NewIssue::titled("Work"));
+    ws.close(&w);
+    w
+}
+
+/// `old` closed as superseded by `new`, as `bd supersede` and `bd spec change` do.
+fn superseded_by(ws: &mut Ws, old: &str, new: &str) {
+    let (o, n) = (old.to_string(), new.to_string());
+    ws.write(|tx| tx.close_as(&o, &n, crate::Replacement::Supersede, &Default::default()));
+}
+
+/// A `supersedes` edge `old -> new` and nothing else.
+fn supersedes_edge(ws: &mut Ws, old: &str, new: &str) {
+    let (o, n) = (old.to_string(), new.to_string());
+    ws.write(|tx| tx.add_dependency(&o, &n, DepType::Supersedes, None));
+}
+
+#[test]
+fn malformed_flags_a_requirement_not_under_a_spec() {
+    let mut ws = Ws::new();
+    let src = closed_work(&mut ws);
+    let spec = ws.create(feature_spec("Checkout", Some("checkout"), None));
+    let epic = ws.create(NewIssue { issue_type: Some("epic".into()), ..NewIssue::titled("Epic") });
+    let under_epic = ws.create(story("Under an epic", &[REQUIREMENT], Some(&epic), std::slice::from_ref(&src)));
+    let no_parent = ws.create(story("No parent", &[REQUIREMENT], None, std::slice::from_ref(&src)));
+    let fine = ws.create(story("Under the spec", &[REQUIREMENT], Some(&spec), std::slice::from_ref(&src)));
+    let gone = ws.create(story("Closed, no parent", &[REQUIREMENT], None, std::slice::from_ref(&src)));
+    ws.close(&gone);
+
+    assert_eq!(problems_of(&ws, &under_epic), [Problem::NotUnderSpec]);
+    assert_eq!(
+        detail_of(&ws, &under_epic, Problem::NotUnderSpec),
+        format!("parent {epic} is not a spec: move it under its spec (bd update {under_epic} --parent <spec>)")
+    );
+    assert_eq!(problems_of(&ws, &no_parent), [Problem::NotUnderSpec]);
+    assert_eq!(
+        detail_of(&ws, &no_parent, Problem::NotUnderSpec),
+        format!("no parent: move it under its spec (bd update {no_parent} --parent <spec>)")
+    );
+    assert!(problems_of(&ws, &fine).is_empty());
+    assert!(problems_of(&ws, &gone).is_empty(), "a closed requirement may sit anywhere");
+    assert!(problems_of(&ws, &spec).is_empty());
+    assert!(problems_of(&ws, &epic).is_empty(), "not a spec part");
+}
+
+#[test]
+fn malformed_flags_an_open_spec_without_a_valid_area() {
+    let mut ws = Ws::new();
+    let none = ws.create(feature_spec("No area", None, None));
+    let spaced = ws.create(feature_spec("Spaced", Some("bad name"), None));
+    let empty = ws.create(feature_spec("Empty", Some(""), None));
+    let ok = ws.create(feature_spec("Ok", Some("ok"), None));
+    let gone = ws.create(feature_spec("Closed", None, None));
+    ws.close(&gone);
+
+    for id in [&none, &spaced, &empty] {
+        assert_eq!(problems_of(&ws, id), [Problem::NoArea], "{id}");
+        assert_eq!(
+            detail_of(&ws, id, Problem::NoArea),
+            format!("no area:<name> label (bd label add {id} area:<name>)")
+        );
+    }
+    assert!(problems_of(&ws, &ok).is_empty());
+    assert!(problems_of(&ws, &gone).is_empty(), "a closed spec needs no area");
+}
+
+#[test]
+fn malformed_flags_a_requirement_in_force_without_a_source() {
+    let mut ws = Ws::new();
+    let src = closed_work(&mut ws);
+    let spec = ws.create(feature_spec("Checkout", Some("checkout"), None));
+    let other = ws.create(feature_spec("Receipts", Some("receipts"), None));
+    let none = ws.create(story("No source", &[REQUIREMENT], Some(&spec), &[]));
+    let to_spec = ws.create(story("From a spec", &[REQUIREMENT], Some(&spec), std::slice::from_ref(&other)));
+    let sourced = ws.create(story("From work", &[REQUIREMENT], Some(&spec), std::slice::from_ref(&src)));
+    let gone = ws.create(story("Closed", &[REQUIREMENT], Some(&spec), &[]));
+    ws.close(&gone);
+    let draft = ws.create(NewIssue { status: Some(Status::Open), ..story("Draft", &[REQUIREMENT], Some(&spec), &[]) });
+
+    for id in [&none, &to_spec] {
+        assert_eq!(problems_of(&ws, id), [Problem::NoSource], "{id}");
+        assert_eq!(
+            detail_of(&ws, id, Problem::NoSource),
+            format!("in force with no source (bd dep add {id} <issue or run> --type related)")
+        );
+    }
+    assert!(problems_of(&ws, &sourced).is_empty());
+    assert!(problems_of(&ws, &gone).is_empty(), "no longer in force");
+    assert!(problems_of(&ws, &draft).is_empty(), "not in force: its status is drift's bad_status");
+    assert_eq!(ref_ids(&ws.read(|c| drift(c, None)).bad_status), [draft.as_str()]);
+}
+
+#[test]
+fn malformed_flags_a_non_goal_not_labelled_requirement() {
+    let mut ws = Ws::new();
+    let src = closed_work(&mut ws);
+    let spec = ws.create(feature_spec("Checkout", Some("checkout"), None));
+    let only = ws.create(story("No guests", &[NON_GOAL], Some(&spec), std::slice::from_ref(&src)));
+    let both = ws.create(story("No coupons", &[REQUIREMENT, NON_GOAL], Some(&spec), std::slice::from_ref(&src)));
+    assert_eq!(problems_of(&ws, &only), [Problem::NonGoalOnly]);
+    assert_eq!(
+        detail_of(&ws, &only, Problem::NonGoalOnly),
+        format!("labelled non-goal but not requirement (bd label add {only} requirement)")
+    );
+    assert!(problems_of(&ws, &both).is_empty());
+}
+
+#[test]
+fn malformed_flags_specs_not_features_and_requirements_not_stories() {
+    let mut ws = Ws::new();
+    let src = closed_work(&mut ws);
+    let epic_spec =
+        ws.create(NewIssue { issue_type: Some("epic".into()), ..feature_spec("Checkout", Some("checkout"), None) });
+    let spec = ws.create(feature_spec("Receipts", Some("receipts"), None));
+    let task = ws.create(NewIssue {
+        issue_type: Some("task".into()),
+        ..story("Prints a total", &[REQUIREMENT], Some(&spec), std::slice::from_ref(&src))
+    });
+    let fine = ws.create(story("Emails a copy", &[REQUIREMENT], Some(&spec), std::slice::from_ref(&src)));
+    let gone_spec = ws.create(NewIssue { issue_type: Some("epic".into()), ..feature_spec("Old", Some("old"), None) });
+    ws.close(&gone_spec);
+
+    assert_eq!(problems_of(&ws, &epic_spec), [Problem::SpecType]);
+    assert_eq!(
+        detail_of(&ws, &epic_spec, Problem::SpecType),
+        format!("type epic, not feature (bd update {epic_spec} --type feature)")
+    );
+    assert_eq!(problems_of(&ws, &task), [Problem::RequirementType]);
+    assert_eq!(
+        detail_of(&ws, &task, Problem::RequirementType),
+        format!("type task, not story (bd update {task} --type story)")
+    );
+    assert!(problems_of(&ws, &spec).is_empty());
+    assert!(problems_of(&ws, &fine).is_empty());
+    assert!(problems_of(&ws, &gone_spec).is_empty(), "a closed spec may be of any type");
+}
+
+#[test]
+fn malformed_flags_a_spec_labelled_requirement_with_only_the_spec_checks() {
+    let mut ws = Ws::new();
+    // No parent and no source: a requirement's checks (a, c) would flag it; a spec's do not.
+    let both = ws.create(NewIssue {
+        labels: vec![SPEC.into(), "area:x".into(), REQUIREMENT.into()],
+        ..feature_spec("Both", None, None)
+    });
+    let goal = ws.create(NewIssue {
+        labels: vec![SPEC.into(), "area:x".into(), NON_GOAL.into()],
+        ..feature_spec("Spec and non-goal", None, None)
+    });
+    assert_eq!(shape(&ws), [(both.clone(), Problem::SpecAndRequirement), (goal.clone(), Problem::SpecAndRequirement)]);
+    assert_eq!(detail_of(&ws, &both, Problem::SpecAndRequirement), "labelled spec and requirement/non-goal: keep one");
+    // The spec checks still run: no area and the wrong type join it.
+    let bare = ws.create(NewIssue {
+        issue_type: Some("task".into()),
+        labels: vec![SPEC.into(), REQUIREMENT.into()],
+        ..feature_spec("Bare", None, None)
+    });
+    assert_eq!(problems_of(&ws, &bare), [Problem::NoArea, Problem::SpecType, Problem::SpecAndRequirement]);
+}
+
+#[test]
+fn superseded_requirements_stay_with_their_spec_or_its_successor() {
+    let mut ws = Ws::new();
+    let src = closed_work(&mut ws);
+    let from = std::slice::from_ref(&src);
+    let a = ws.create(feature_spec("A", Some("a"), None));
+    let b = ws.create(feature_spec("B", Some("b"), None));
+    let c = ws.create(feature_spec("C", Some("c"), None));
+    let d = ws.create(feature_spec("D", Some("d"), None));
+
+    // Within one spec.
+    let old = ws.create(story("Old", &[REQUIREMENT], Some(&a), from));
+    let new = ws.create(story("New", &[REQUIREMENT], Some(&a), from));
+    superseded_by(&mut ws, &old, &new);
+    assert!(problems_of(&ws, &old).is_empty());
+    assert!(problems_of(&ws, &new).is_empty());
+
+    // Into another spec A was never superseded by; then fine once it is.
+    let moved = ws.create(story("Moved", &[REQUIREMENT], Some(&a), from));
+    let in_b = ws.create(story("In B", &[REQUIREMENT], Some(&b), from));
+    superseded_by(&mut ws, &moved, &in_b);
+    assert_eq!(problems_of(&ws, &moved), [Problem::SupersededElsewhere]);
+    let detail = detail_of(&ws, &moved, Problem::SupersededElsewhere);
+    assert_eq!(
+        detail,
+        format!("superseded by {in_b} under {b}, not under its spec {a} or a spec it was superseded by")
+    );
+    supersedes_edge(&mut ws, &a, &b);
+    assert!(problems_of(&ws, &moved).is_empty(), "B supersedes A");
+
+    // Two steps on: A -> B -> C.
+    supersedes_edge(&mut ws, &b, &c);
+    let far = ws.create(story("Far", &[REQUIREMENT], Some(&a), from));
+    let in_c = ws.create(story("In C", &[REQUIREMENT], Some(&c), from));
+    superseded_by(&mut ws, &far, &in_c);
+    assert!(problems_of(&ws, &far).is_empty(), "C supersedes B, which supersedes A");
+
+    // By something that is not a requirement.
+    let plain = ws.create(NewIssue::titled("Plain task"));
+    let dropped = ws.create(story("Dropped", &[REQUIREMENT], Some(&a), from));
+    superseded_by(&mut ws, &dropped, &plain);
+    assert_eq!(problems_of(&ws, &dropped), [Problem::SupersededElsewhere]);
+    assert_eq!(
+        detail_of(&ws, &dropped, Problem::SupersededElsewhere),
+        format!("superseded by {plain}, which is not a requirement")
+    );
+
+    // Siblings under an epic, not a spec: the old one is closed, so only h names it.
+    let epic = ws.create(NewIssue { issue_type: Some("epic".into()), ..NewIssue::titled("Epic") });
+    let e_old = ws.create(story("Epic old", &[REQUIREMENT], Some(&epic), from));
+    let e_new = ws.create(story("Epic new", &[REQUIREMENT], Some(&epic), from));
+    superseded_by(&mut ws, &e_old, &e_new);
+    assert_eq!(problems_of(&ws, &e_old), [Problem::SupersededElsewhere]);
+    assert_eq!(
+        detail_of(&ws, &e_old, Problem::SupersededElsewhere),
+        format!("superseded by {e_new} under {epic}, and its parent {epic} is not a spec")
+    );
+    assert_eq!(problems_of(&ws, &e_new), [Problem::NotUnderSpec]);
+    // Neither has a parent.
+    let n_old = ws.create(story("Loose old", &[REQUIREMENT], None, from));
+    let n_new = ws.create(story("Loose new", &[REQUIREMENT], None, from));
+    superseded_by(&mut ws, &n_old, &n_new);
+    assert_eq!(
+        detail_of(&ws, &n_old, Problem::SupersededElsewhere),
+        format!("superseded by {n_new} with no parent, and it has no parent spec")
+    );
+
+    // A cycle among specs ends: P <-> Q reaches Q from P, never D.
+    let p = ws.create(feature_spec("P", Some("p"), None));
+    let q = ws.create(feature_spec("Q", Some("q"), None));
+    supersedes_edge(&mut ws, &p, &q);
+    supersedes_edge(&mut ws, &q, &p);
+    let p_old = ws.create(story("P old", &[REQUIREMENT], Some(&p), from));
+    let in_d = ws.create(story("In D", &[REQUIREMENT], Some(&d), from));
+    superseded_by(&mut ws, &p_old, &in_d);
+    let p_kept = ws.create(story("P kept", &[REQUIREMENT], Some(&p), from));
+    let in_q = ws.create(story("In Q", &[REQUIREMENT], Some(&q), from));
+    superseded_by(&mut ws, &p_kept, &in_q);
+    assert_eq!(problems_of(&ws, &p_old), [Problem::SupersededElsewhere]);
+    assert!(problems_of(&ws, &p_kept).is_empty());
+
+    // Two offending edges from one requirement: one entry, the first in id order, and a count.
+    let twice = ws.create(story("Twice", &[REQUIREMENT], Some(&a), from));
+    let x1 = ws.create(story("X1", &[REQUIREMENT], Some(&d), from));
+    let x2 = ws.create(story("X2", &[REQUIREMENT], Some(&d), from));
+    assert!(x1 < x2, "{x1} < {x2}");
+    supersedes_edge(&mut ws, &twice, &x2);
+    supersedes_edge(&mut ws, &twice, &x1);
+    ws.close(&twice);
+    assert_eq!(problems_of(&ws, &twice), [Problem::SupersededElsewhere]);
+    assert_eq!(
+        detail_of(&ws, &twice, Problem::SupersededElsewhere),
+        format!("superseded by {x1} under {d}, not under its spec {a} or a spec it was superseded by (and 1 more)")
+    );
+
+    for spec in [&a, &b, &c, &d, &p, &q] {
+        assert!(problems_of(&ws, spec).is_empty(), "{spec}");
+    }
+}
+
+#[test]
+fn malformed_is_ordered_by_id_then_problem_and_counted_whatever_the_window() {
+    let mut ws = Ws::new();
+    let spec = ws.create(feature_spec("Checkout", Some("checkout"), None));
+    ws.create(story("No source", &[REQUIREMENT], Some(&spec), &[]));
+    let many = ws.create(NewIssue { issue_type: Some("task".into()), ..story("Many", &[NON_GOAL], None, &[]) });
+    ws.create(NewIssue { issue_type: Some("epic".into()), ..feature_spec("Bad", None, None) });
+    ws.config("experimental.features", "specs");
+    let unlinked = ws.create(NewIssue::titled("Unlinked since"));
+    ws.close(&unlinked);
+
+    let list = shape(&ws);
+    assert_eq!(
+        problems_of(&ws, &many),
+        [Problem::NotUnderSpec, Problem::NoSource, Problem::NonGoalOnly, Problem::RequirementType]
+    );
+    assert_eq!(list.len(), 1 + 4 + 2, "{list:?}");
+    let mut sorted = list.clone();
+    sorted.sort();
+    assert_eq!(list, sorted, "by id, then problem");
+    assert_eq!(list.iter().collect::<HashSet<_>>().len(), list.len(), "one entry per issue and problem");
+
+    let windows = [None, Some(Timestamp(0)), Some(ws.read(since).unwrap()), Some(Timestamp(i64::MAX))];
+    for window in windows {
+        let d = ws.read(|c| drift(c, window));
+        assert_eq!(d.malformed, ws.read(malformed), "{window:?}");
+        assert_eq!(
+            d.count(),
+            d.unlinked.len() + d.shaky.len() + d.bad_status.len() + d.orphaned.len() + d.malformed.len()
+        );
+    }
+    let since_at = ws.read(since);
+    let at_since = ws.read(|c| drift(c, since_at));
+    assert_eq!(ref_ids(&at_since.unlinked), [unlinked.as_str()]);
+    assert_eq!(at_since.count(), 1 + list.len(), "the unlinked work and every malformed entry");
+}
+
+#[test]
+fn what_bd_spec_writes_is_never_malformed() {
+    let mut ws = Ws::new();
+    ws.config("experimental.features", "specs");
+    let w1 = closed_work(&mut ws);
+    let w2 = closed_work(&mut ws);
+    let from = |title: &str, id: &str| crate::spec_edit::Sentence {
+        title: title.into(),
+        from: vec![id.into()],
+        ..Default::default()
+    };
+    let top = ws.write(|tx| tx.spec_new("checkout", &from("Checkout", &w1), None)).spec.id;
+    let sub = ws.write(|tx| tx.spec_new("checkout/payment", &from("Payment", &w1), Some(&top))).spec.id;
+    let rule = ws.write(|tx| tx.spec_add(&top, &from("Requires sign-in", &w1), false)).requirement.id;
+    let goal = ws.write(|tx| tx.spec_add(&top, &from("No guests", &w1), true)).requirement.id;
+    let card = ws.write(|tx| tx.spec_add(&sub, &from("Accepts cards", &w1), false)).requirement.id;
+    ws.write(|tx| tx.spec_change(&rule, &from("Requires an account", &w2)));
+    ws.write(|tx| tx.spec_change(&goal, &from("No anonymous orders", &w2)));
+    ws.write(|tx| tx.spec_remove(&card, "obsolete", std::slice::from_ref(&w2)));
+    let found = ws.read(malformed);
+    assert!(found.is_empty(), "{found:?}");
+    assert!(ws.read(|c| drift(c, None)).malformed.is_empty());
 }

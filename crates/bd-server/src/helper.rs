@@ -747,14 +747,43 @@ pub(crate) mod forbid_tests {
 
     /// Run the test named `test` (`concat!(module_path!(), "::<name>")`) again, alone, in a child process of this
     /// test binary, with `dir` as its [`child_dir`]; it must pass, and run (a name matching none passes nothing).
+    /// The child runs [`this_binary`].
     pub(crate) fn rerun(test: &str, dir: &Path) {
         let (_crate, name) = test.split_once("::").expect("a path within the crate");
-        let out = Command::new(std::env::current_exe().unwrap())
+        let exe = this_binary();
+        let out = run_alone(&exe, name, &[(CHILD, dir.as_os_str())]).unwrap_or_else(|e| {
+            panic!(
+                "{name} in a child process: running {} failed: {e}; a test binary rebuilt meanwhile (another build in \
+                 this target directory) is the likely cause",
+                exe.display()
+            )
+        });
+        assert_passed(name, &out);
+    }
+
+    /// The binary this process runs, to start again. On Linux, `/proc/self/exe`: the kernel resolves that magic
+    /// link to the running inode at exec, even once the file at its path has been deleted or replaced (by a
+    /// concurrent build in the same target directory, say). Other Unix have no such link, so they use the path and
+    /// keep the race.
+    fn this_binary() -> std::path::PathBuf {
+        if cfg!(target_os = "linux") {
+            std::path::PathBuf::from("/proc/self/exe")
+        } else {
+            std::env::current_exe().expect("this test binary's path")
+        }
+    }
+
+    /// Run the test `name` (its path within the crate) of the test binary `exe`, alone, with `env` set.
+    fn run_alone(exe: &Path, name: &str, env: &[(&str, &std::ffi::OsStr)]) -> std::io::Result<std::process::Output> {
+        Command::new(exe)
             .args([name, "--exact", "--test-threads=1", "--nocapture"])
-            .env(CHILD, dir)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .output()
-            .unwrap();
+    }
+
+    /// `out`, of [`run_alone`] for the test `name`, succeeded and ran that one test.
+    fn assert_passed(name: &str, out: &std::process::Output) {
         let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         assert!(
             out.status.success() && stdout.contains("1 passed"),
@@ -789,5 +818,49 @@ pub(crate) mod forbid_tests {
         let control = tempfile::tempdir().unwrap();
         run(control.path(), &marking(), b"{}", 1024, &|e| e.to_string()).unwrap();
         assert!(control.path().join("marker").exists(), "the control command ran");
+    }
+
+    /// Set, to the copy's path, only in the copy of the test binary
+    /// [`a_rerun_runs_this_binary_once_its_file_is_replaced`] runs.
+    #[cfg(target_os = "linux")]
+    const COPY: &str = "BD_TEST_RERUN_COPY";
+
+    /// A concurrent build that unlinks the test binary and links a new one at its path leaves `current_exe()`
+    /// reading `<path> (deleted)`; [`rerun`] must still start the code this process runs. A copy of this binary,
+    /// run for this one test, deletes its own file, puts a file that is no program in its place, then reruns; its
+    /// child must pass. The parent is a top-level test, so it never has [`child_dir`] set.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rerun_runs_this_binary_once_its_file_is_replaced() {
+        const TEST: &str = concat!(module_path!(), "::a_rerun_runs_this_binary_once_its_file_is_replaced");
+        // Checked first: rerun's child inherits the copy's environment, COPY included.
+        if child_dir().is_some() {
+            return;
+        }
+        if let Some(copy) = std::env::var_os(COPY) {
+            let copy = std::path::PathBuf::from(copy);
+            std::fs::remove_file(&copy).unwrap();
+            std::fs::write(&copy, "not a test binary\n").unwrap();
+            std::fs::set_permissions(&copy, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+            rerun(TEST, copy.parent().unwrap());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("copy");
+        std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+        let (_crate, name) = TEST.split_once("::").unwrap();
+        // A child another test thread forks while the copy is open for writing holds it until its exec, and the
+        // copy cannot be run meanwhile ("text file busy"): wait that out, up to about 5 s.
+        let mut tries = 0;
+        let out = loop {
+            match run_alone(&copy, name, &[(COPY, copy.as_os_str())]) {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && tries < 250 => {
+                    tries += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                ran => break ran.unwrap_or_else(|e| panic!("running the copy {} failed: {e}", copy.display())),
+            }
+        };
+        assert_passed(name, &out);
     }
 }

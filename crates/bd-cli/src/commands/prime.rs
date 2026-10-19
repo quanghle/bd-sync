@@ -270,8 +270,8 @@ fn spec_state(r: &bd_core::ReadCtx<'_>) -> Result<SpecState> {
         return Ok(SpecState { on, open, since: None, unlinked: 0, to_link: 0 });
     }
     let since = specs::since(r.conn())?;
-    let (unlinked, to_link) = specs::unlinked_since(r.conn(), since)?;
-    Ok(SpecState { on, open, since, unlinked: unlinked.len(), to_link: to_link.len() })
+    let (unlinked, to_link) = specs::unlinked_counts(r.conn(), since)?;
+    Ok(SpecState { on, open, since, unlinked, to_link })
 }
 
 impl SpecState {

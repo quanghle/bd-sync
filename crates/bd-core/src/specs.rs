@@ -10,8 +10,9 @@
 //!
 //! Everything here reads: the spec tree ([`show`], [`spec_views`],
 //! [`render`]), the issues linked to specs ([`linked`]), drift since specs
-//! were turned on ([`drift`]), closed work from before then that no spec
-//! covers ([`candidates`]) and the open specs ([`list`]). Lookups go by key
+//! were turned on ([`drift`], and its counts for `bd prime`,
+//! [`unlinked_counts`]), closed work from before then that no spec covers
+//! ([`candidates`]) and the open specs ([`list`]). Lookups go by key
 //! (labels by label, edges by either end, issues by id); the two listings of
 //! issues by status search the ready index (`idx_issues_ready`), as
 //! `bd stale` does.
@@ -176,8 +177,13 @@ impl Source for DbSource<'_> {
         if let Some(k) = self.kids.borrow().get(id) {
             return Ok(k.clone());
         }
+        let cached = self.nodes.borrow().get(id).map(Option::is_some);
+        let exists = match cached {
+            Some(known) => known,
+            None => issues::get(self.conn, id)?.is_some(),
+        };
         let mut ids = Vec::new();
-        if issues::get(self.conn, id)?.is_some() {
+        if exists {
             for child in hierarchy::child_issues(self.conn, id, false)? {
                 ids.push(child.id.clone());
                 if !self.nodes.borrow().contains_key(&child.id) {
@@ -228,9 +234,9 @@ pub fn open_count(conn: &Connection) -> Result<usize> {
     let n: i64 = conn
         .prepare_cached(
             "SELECT COUNT(*) FROM labels lb CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = lb.issue_id
-             WHERE lb.label = 'spec' AND i.status <> 'closed'",
+             WHERE lb.label = ?1 AND i.status <> 'closed'",
         )?
-        .query_row([], |r| r.get(0))?;
+        .query_row([SPEC], |r| r.get(0))?;
     Ok(n as usize)
 }
 
@@ -663,15 +669,14 @@ pub fn linked(conn: &Connection) -> Result<HashSet<String>> {
         }
     }
     // Up: once an issue is in, so is everything above it.
+    // `above` stays closed upward, so an id already in it has its chain in.
     let mut above: HashSet<String> = HashSet::new();
     for id in direct {
-        let mut at = id;
-        while above.insert(at.clone()) {
-            match graph::parent_of(conn, &at)? {
-                Some(p) => at = p,
-                None => break,
-            }
+        if above.contains(&id) {
+            continue;
         }
+        above.extend(graph::ancestors(conn, &id)?);
+        above.insert(id);
     }
     out.extend(below);
     out.extend(above);
@@ -695,29 +700,66 @@ fn role_of(conn: &Connection, id: &str) -> Result<Option<String>> {
 /// duplicate or superseded (`bd duplicate`, `bd supersede`: its
 /// replacement carries the work, and its link).
 pub fn is_exempt(conn: &Connection, issue: &Issue) -> Result<bool> {
-    if issue.metadata.pointer("/playbook/role").is_some()
-        || issue.issue_type == GATE_TYPE
-        || issue.issue_type == "decision"
-        || issue.ephemeral
-        || is_spec_part(&issue.labels)
-        || issue.close_outcome == Some(Outcome::Failed)
-        || !edges_out(conn, &issue.id, "duplicates")?.is_empty()
-        || !edges_out(conn, &issue.id, "supersedes")?.is_empty()
-    {
-        return Ok(true);
+    Exempt::new(conn).check(issue)
+}
+
+/// [`is_exempt`] for many issues read in one transaction: each ancestor's
+/// step role is read once per checker, however many issues sit under it.
+struct Exempt<'c> {
+    conn: &'c Connection,
+    /// Whether an ancestor's `playbook.role` is `step`, by id.
+    step: HashMap<String, bool>,
+}
+
+impl<'c> Exempt<'c> {
+    fn new(conn: &'c Connection) -> Self {
+        Exempt { conn, step: HashMap::new() }
     }
-    let mut seen = HashSet::from([issue.id.clone()]);
-    let mut at = graph::parent_of(conn, &issue.id)?;
-    while let Some(p) = at {
-        if !seen.insert(p.clone()) {
-            break;
-        }
-        if role_of(conn, &p)?.as_deref() == Some("step") {
+
+    fn check(&mut self, issue: &Issue) -> Result<bool> {
+        if issue.metadata.pointer("/playbook/role").is_some()
+            || issue.issue_type == GATE_TYPE
+            || issue.issue_type == "decision"
+            || issue.ephemeral
+            || is_spec_part(&issue.labels)
+            || issue.close_outcome == Some(Outcome::Failed)
+            || replaced(self.conn, &issue.id)?
+        {
             return Ok(true);
         }
-        at = graph::parent_of(conn, &p)?;
+        // The issue's own id can only come back as the last of a (refused)
+        // parent cycle.
+        for p in graph::ancestors(self.conn, &issue.id)? {
+            if p == issue.id {
+                break;
+            }
+            if self.is_step(&p)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
-    Ok(false)
+
+    fn is_step(&mut self, id: &str) -> Result<bool> {
+        if let Some(step) = self.step.get(id) {
+            return Ok(*step);
+        }
+        let step = role_of(self.conn, id)?.as_deref() == Some("step");
+        self.step.insert(id.to_string(), step);
+        Ok(step)
+    }
+}
+
+/// Whether the issue `id` was closed as a duplicate or superseded: an
+/// outgoing `duplicates` or `supersedes` edge (read by source, through
+/// `idx_deps_source`). The strings are `DepType::Duplicates` and
+/// `DepType::Supersedes`' `as_str`.
+fn replaced(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT EXISTS (SELECT 1 FROM dependencies WHERE issue_id = ?1 AND dep_type IN ('duplicates','supersedes'))",
+        )?
+        .query_row([id], |r| r.get(0))?)
 }
 
 /// Closed issues closed in `[from, to)`, in id order.
@@ -731,26 +773,58 @@ fn closed_between(conn: &Connection, from: Timestamp, to: Timestamp) -> Result<V
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Every status but closed as an SQL list, `'open','in_progress',...` in
+/// `Status::ALL` order, so a new status joins it without editing the SQL and
+/// the text (`prepare_cached`'s key) stays the same from call to call. The
+/// values are `as_str`'s static identifiers, which hold no quote, never input.
+fn not_closed_list() -> String {
+    Status::ALL
+        .iter()
+        .filter(|s| **s != Status::Closed)
+        .map(|s| format!("'{}'", s.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Issues not closed created at or after `since`, in id order.
 fn open_created_since(conn: &Connection, since: Timestamp) -> Result<Vec<Issue>> {
     let sql = format!(
         "SELECT {ISSUE_COLUMNS} FROM issues i INDEXED BY idx_issues_ready
-         WHERE i.status IN ('open','in_progress','blocked','deferred','pinned') AND i.created_at >= ?1 ORDER BY i.id"
+         WHERE i.status IN ({}) AND i.created_at >= ?1 ORDER BY i.id",
+        not_closed_list()
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map([since], issue_from_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// The issues of `all` neither exempt nor in `linked`.
-fn unlinked_of(conn: &Connection, all: Vec<Issue>, linked: &HashSet<String>) -> Result<Vec<IssueRef>> {
-    let mut out = Vec::new();
-    for issue in all {
-        if !linked.contains(&issue.id) && !is_exempt(conn, &issue)? {
-            out.push(issue.to_ref());
+/// Which window of [`scan_unlinked`] an issue came from.
+#[derive(Clone, Copy)]
+enum Window {
+    /// Closed at or after `since`.
+    Closed,
+    /// Not closed, created at or after `since`.
+    Open,
+}
+
+/// Calls `each` with every issue of the two windows since `since` (the
+/// closed first, then the open, each in id order) that is neither linked
+/// nor exempt: the one filter behind [`unlinked_since`] and
+/// [`unlinked_counts`].
+fn scan_unlinked(conn: &Connection, since: Timestamp, mut each: impl FnMut(Window, &Issue)) -> Result<()> {
+    let linked = linked(conn)?;
+    let mut exempt = Exempt::new(conn);
+    for (window, issues) in [
+        (Window::Closed, closed_between(conn, since, Timestamp(i64::MAX))?),
+        (Window::Open, open_created_since(conn, since)?),
+    ] {
+        for issue in issues {
+            if !linked.contains(&issue.id) && !exempt.check(&issue)? {
+                each(window, &issue);
+            }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Work since specs were turned on that no spec accounts for: closed at or
@@ -758,9 +832,23 @@ fn unlinked_of(conn: &Connection, all: Vec<Issue>, linked: &HashSet<String>) -> 
 /// Both empty without `since`.
 pub fn unlinked_since(conn: &Connection, since: Option<Timestamp>) -> Result<(Vec<IssueRef>, Vec<IssueRef>)> {
     let Some(since) = since else { return Ok((Vec::new(), Vec::new())) };
-    let linked = linked(conn)?;
-    let closed = unlinked_of(conn, closed_between(conn, since, Timestamp(i64::MAX))?, &linked)?;
-    let open = unlinked_of(conn, open_created_since(conn, since)?, &linked)?;
+    let (mut closed, mut open) = (Vec::new(), Vec::new());
+    scan_unlinked(conn, since, |window, issue| match window {
+        Window::Closed => closed.push(issue.to_ref()),
+        Window::Open => open.push(issue.to_ref()),
+    })?;
+    Ok((closed, open))
+}
+
+/// The lengths of [`unlinked_since`]'s two lists, without building them:
+/// what `bd prime` prints. `(0, 0)` without `since`.
+pub fn unlinked_counts(conn: &Connection, since: Option<Timestamp>) -> Result<(usize, usize)> {
+    let Some(since) = since else { return Ok((0, 0)) };
+    let (mut closed, mut open) = (0, 0);
+    scan_unlinked(conn, since, |window, _| match window {
+        Window::Closed => closed += 1,
+        Window::Open => open += 1,
+    })?;
     Ok((closed, open))
 }
 
@@ -906,17 +994,14 @@ pub fn candidates(conn: &Connection, since: Option<Timestamp>) -> Result<Vec<Can
     let closed = closed_between(conn, Timestamp(i64::MIN), since.unwrap_or(Timestamp(i64::MAX)))?;
     let mut issues_by_id: HashMap<String, Option<Issue>> = HashMap::new();
     let mut groups: BTreeMap<String, CandidateGroup> = BTreeMap::new();
+    let mut exempt = Exempt::new(conn);
     for issue in closed {
-        if linked.contains(&issue.id) || is_exempt(conn, &issue)? {
+        if linked.contains(&issue.id) || exempt.check(&issue)? {
             continue;
         }
         let mut epic: Option<(String, String)> = None;
-        let mut seen = HashSet::new();
-        let mut at = Some(issue.id.clone());
-        while let Some(id) = at {
-            if !seen.insert(id.clone()) {
-                break;
-            }
+        let above = graph::ancestors(conn, &issue.id)?.into_iter().filter(|a| *a != issue.id);
+        for id in std::iter::once(issue.id.clone()).chain(above) {
             let node = match issues_by_id.get(&id) {
                 Some(n) => n.clone(),
                 None => {
@@ -929,7 +1014,6 @@ pub fn candidates(conn: &Connection, since: Option<Timestamp>) -> Result<Vec<Can
             if node.issue_type == "epic" && !issues::is_playbook_container(&node) {
                 epic = Some((node.id.clone(), node.title.clone()));
             }
-            at = graph::parent_of(conn, &id)?;
         }
         let (key, title) = match epic {
             Some((id, title)) => (format!("epic:{id}"), Some(title)),
@@ -972,6 +1056,12 @@ pub struct SpecSummary {
 /// Every open spec (labelled spec, not closed), in id order.
 pub fn list(conn: &Connection) -> Result<Vec<SpecSummary>> {
     let src = DbSource::new(conn);
+    // Every spec part, read once per listing. Edges end at issues that exist
+    // (the dependencies' foreign keys cascade), so no other check is needed.
+    let mut parts: HashSet<String> = HashSet::new();
+    for label in [SPEC, REQUIREMENT, NON_GOAL] {
+        parts.extend(labelled(conn, label)?);
+    }
     let mut out = Vec::new();
     for spec in spec_nodes(&src)? {
         if spec.status == Status::Closed {
@@ -982,7 +1072,7 @@ pub fn list(conn: &Connection) -> Result<Vec<SpecSummary>> {
         let mut linked: BTreeSet<String> = BTreeSet::new();
         for id in reqs.iter().map(|r| r.id.as_str()).chain([spec.id.as_str()]) {
             for other in related_of(conn, id)? {
-                if !linked.contains(&other) && src.node(&other)?.is_some_and(|n| !is_spec_part(&n.labels)) {
+                if !parts.contains(&other) {
                     linked.insert(other);
                 }
             }

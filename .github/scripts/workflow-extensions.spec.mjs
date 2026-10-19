@@ -298,6 +298,67 @@ describe('score-issue', () => {
 		expect(ctx.calls.map((c) => c.label)).toEqual(['setup', 'setup@escalated'])
 	})
 
+	const callsOf = (ctx, prefix) => ctx.calls.filter((c) => c.label.startsWith(prefix))
+	const shape = (calls) => calls.map((c) => [c.label, c.agent, c.model, c.reasoningEffort])
+
+	it('escalates a failed trace once, to general-purpose at medium, and keeps the escalated summary as work', async () => {
+		const wf = await load('score-issue', undefined)
+		for (const bad of [null, { summary: 'x' }]) {
+			const note = JSON.stringify(bad)
+			const ctx = fakeCtx({ issue: 'bd-1', dryRun: true }, script({ trace: bad, 'trace@escalated': { ok: true, summary: 'Work: escalated' } }))
+			const got = await wf.run(ctx)
+			const traces = callsOf(ctx, 'trace')
+			expect(shape(traces), note).toEqual([
+				['trace', 'task', undefined, 'low'],
+				['trace@escalated', 'general-purpose', undefined, 'medium'],
+			])
+			expect(traces[1].prompt, note).toContain(traces[0].prompt)
+			expect(traces[1].prompt, note).toContain('check their effects first')
+			expect(got.work, note).toBe('Work: escalated')
+		}
+	})
+
+	it('gives up on the trace after one escalation', async () => {
+		const wf = await load('score-issue', undefined)
+		const ctx = fakeCtx({ issue: 'bd-1', dryRun: true }, script({ trace: null, 'trace@escalated': { summary: 'x' } }))
+		const got = await wf.run(ctx)
+		expect(callsOf(ctx, 'trace').map((c) => c.label)).toEqual(['trace', 'trace@escalated'])
+		expect(got.work).toBe('Work trace failed: trace agent failed')
+	})
+
+	it('escalates a failed record once and records with the escalated answer', async () => {
+		const wf = await load('score-issue', undefined)
+		const ctx = fakeCtx({ issue: 'bd-1' }, script({ record: null, 'record@escalated': { ok: true } }))
+		const got = await wf.run(ctx)
+		expect(got).toMatchObject({ status: 'scored', recorded: true })
+		const recs = callsOf(ctx, 'record')
+		expect(shape(recs)).toEqual([
+			['record', 'task', undefined, 'low'],
+			['record@escalated', 'general-purpose', undefined, 'medium'],
+		])
+		expect(recs[1].prompt).toContain(recs[0].prompt)
+
+		const ctx2 = fakeCtx({ issue: 'bd-1' }, script({ record: null }))
+		const got2 = await wf.run(ctx2)
+		expect(got2).toMatchObject({ status: 'scored', recorded: false, reason: 'could not record: record agent failed' })
+		expect(callsOf(ctx2, 'record').map((c) => c.label)).toEqual(['record', 'record@escalated'])
+	})
+
+	it('takes a well-formed ok:false from trace and record as their answer, without escalating', async () => {
+		const wf = await load('score-issue', undefined)
+		const ctx = fakeCtx({ issue: 'bd-1' }, script({ record: { ok: false, error: 'exit 7' } }))
+		const got = await wf.run(ctx)
+		expect(got).toMatchObject({ status: 'scored', recorded: false, reason: 'could not record: exit 7' })
+		expect(callsOf(ctx, 'record').map((c) => c.label)).toEqual(['record'])
+		expect(ctx.calls.some((c) => c.label.endsWith('@escalated'))).toBe(false)
+
+		const ctx2 = fakeCtx({ issue: 'bd-1', dryRun: true }, script({ trace: { ok: false, summary: 'Work: partial', error: 'write refused' } }))
+		const got2 = await wf.run(ctx2)
+		expect(got2.work).toBe('Work: partial\n(Not stored as work metadata: write refused)')
+		expect(callsOf(ctx2, 'trace').map((c) => c.label)).toEqual(['trace'])
+		expect(ctx2.calls.some((c) => c.label.endsWith('@escalated'))).toBe(false)
+	})
+
 	it('applies the rubric caps: overall at most correctness, and 2 when any dimension is 1', async () => {
 		const wf = await load('score-issue', undefined)
 		const capped = await wf.run(fakeCtx({ issue: 'bd-1', dryRun: true }, script({ judge: judgement({ dims: { correctness: { score: 3 } }, top: { overall: 5 } }) })))

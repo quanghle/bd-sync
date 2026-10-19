@@ -1044,3 +1044,160 @@ fn unlinked_counts_equal_drifts_lengths_in_every_window() {
         Ok(())
     });
 }
+
+/// The window scans' rows ([`SCAN_COLUMNS`]) equal the same fields of the
+/// full rows (`ISSUE_COLUMNS`) for every kind the filter looks at, on both
+/// sides of since.
+#[test]
+fn lean_rows_equal_full_rows() {
+    use crate::issues::{ISSUE_COLUMNS, issue_from_row};
+
+    let mut ws = Ws::new();
+    // Before since: a plain closed issue with labels, priority 0 and an assignee; a null role.
+    let plain_old = ws.create(NewIssue {
+        priority: Some(0),
+        assignee: Some("bob".into()),
+        description: "Long text the scan leaves out.".into(),
+        ..titled("Old plain", &["zeta", "alpha"], None)
+    });
+    ws.close(&plain_old);
+    let null_role = ws
+        .create(NewIssue { metadata: Some(json!({ "playbook": { "role": null } })), ..NewIssue::titled("Null role") });
+    ws.close(&null_role);
+    ws.config("experimental.features", "specs");
+    let since_at = ws.read(since).unwrap();
+
+    // After since: every exemption kind, and plain work open and closed.
+    let run = ws.create(NewIssue {
+        issue_type: Some("epic".into()),
+        metadata: Some(json!({ "playbook": { "role": "run" } })),
+        ..NewIssue::titled("Run")
+    });
+    let step = ws.create(NewIssue {
+        metadata: Some(json!({ "playbook": { "role": "step" } })),
+        ..titled("Step", &[], Some(&run))
+    });
+    let found = ws.create(titled("Finding closed", &["severity:high"], Some(&step)));
+    ws.close(&found);
+    ws.create(titled("Finding open", &[], Some(&step)));
+    let gate = ws.create(NewIssue { issue_type: Some(GATE_TYPE.into()), ..NewIssue::titled("Gate") });
+    ws.close(&gate);
+    ws.create(NewIssue { issue_type: Some("decision".into()), ..NewIssue::titled("Decision") });
+    ws.create(NewIssue { ephemeral: true, ..NewIssue::titled("Scratch") });
+    let failed = ws.create(NewIssue::titled("Failed"));
+    let f = failed.clone();
+    ws.write(|tx| tx.close_issue(&f, &CloseOptions { outcome: Some(Outcome::Failed), ..Default::default() }));
+    let canonical = ws.create(NewIssue::titled("Canonical"));
+    let dup = ws.create(NewIssue::titled("Dup"));
+    let old = ws.create(NewIssue::titled("Superseded"));
+    let (d, o, c) = (dup.clone(), old.clone(), canonical.clone());
+    ws.write(|tx| {
+        tx.close_as(&d, &c, crate::Replacement::Duplicate, &Default::default())?;
+        tx.close_as(&o, &c, crate::Replacement::Supersede, &Default::default())
+    });
+    ws.create(pinned("Rule", &["requirement"], None));
+    ws.create(NewIssue { assignee: Some("carol".into()), priority: Some(4), ..NewIssue::titled("Plain open") });
+    let plain = ws.create(NewIssue::titled("Plain closed"));
+    ws.close(&plain);
+
+    let (min, max) = (Timestamp(i64::MIN), Timestamp(i64::MAX));
+    let closed_where = "i.status = 'closed' AND i.closed_at >= ?1 AND i.closed_at < ?2";
+    let open_where = format!("i.status IN ({}) AND i.created_at >= ?1", not_closed_list());
+    ws.read(|c| {
+        let full = |filter: &str, args: &[&dyn rusqlite::ToSql]| -> Result<Vec<Issue>> {
+            let sql = format!("SELECT {ISSUE_COLUMNS} FROM issues i WHERE {filter} ORDER BY i.id");
+            let mut stmt = c.prepare(&sql)?;
+            let rows = stmt.query_map(args, issue_from_row)?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        };
+        let windows = [
+            ("closed, all", closed_between(c, min, max)?, full(closed_where, &[&min, &max])?, 7),
+            ("closed before since", closed_between(c, min, since_at)?, full(closed_where, &[&min, &since_at])?, 2),
+            ("closed since", closed_between(c, since_at, max)?, full(closed_where, &[&since_at, &max])?, 5),
+            ("open, all", open_created_since(c, min)?, full(&open_where, &[&min])?, 8),
+            ("open since", open_created_since(c, since_at)?, full(&open_where, &[&since_at])?, 8),
+        ];
+        for (name, lean, full, at_least) in windows {
+            assert!(full.len() >= at_least, "{name}: {} rows, the fixture puts {at_least} there", full.len());
+            assert_eq!(lean, full.iter().map(Scanned::from).collect::<Vec<_>>(), "{name}");
+            for (l, f) in lean.iter().zip(&full) {
+                assert_eq!(l.to_ref(), f.to_ref(), "{name}");
+            }
+        }
+        Ok(())
+    });
+}
+
+thread_local! {
+    /// How many times this thread ran `graph::parent_of`'s statement.
+    static PARENT_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts `graph::parent_of`'s statement (the parent-child type written in
+/// its SQL, by source); `edges_in` binds its type, so it is not counted.
+fn count_parent_lookups(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+        && sql.contains("dep_type = 'parent-child'")
+        && sql.contains("WHERE issue_id = ?1")
+    {
+        PARENT_LOOKUPS.with(|n| n.set(n.get() + 1));
+    }
+}
+
+/// Linked issues sharing a parent chain read each link's parent once: the
+/// up walk stops at the first ancestor already in.
+#[test]
+fn linked_reads_each_shared_ancestor_once() {
+    use rusqlite::trace::TraceEventCodes;
+
+    let mut ws = Ws::new();
+    let root = ws.create(NewIssue::titled("Root"));
+    let a = ws.create(titled("A", &[], Some(&root)));
+    let b = ws.create(titled("B", &[], Some(&a)));
+    let c = ws.create(titled("C", &[], Some(&b)));
+    let d = ws.create(titled("D", &[], Some(&c)));
+    let siblings: Vec<String> = ["S1", "S2", "S3"].iter().map(|t| ws.create(titled(t, &[], Some(&d)))).collect();
+    let spec = ws.create(pinned("Spec", &["spec"], None));
+    ws.create(NewIssue {
+        deps: siblings.iter().map(|s| (DepType::Related, s.clone())).collect(),
+        ..pinned("Rule", &["requirement"], Some(&spec))
+    });
+
+    PARENT_LOOKUPS.with(|n| n.set(0));
+    ws.store.connection().trace_v2(TraceEventCodes::SQLITE_TRACE_STMT, Some(count_parent_lookups));
+    let set = ws.read(linked);
+    ws.store.connection().trace_v2(TraceEventCodes::empty(), None);
+    let lookups = PARENT_LOOKUPS.with(|n| n.get());
+    assert_eq!(
+        lookups, 8,
+        "each of the 5 chain issues' parent read once (the root's answers none) plus each of the 3 siblings' own, \
+         not 3 x 6 = 18"
+    );
+    for id in [&root, &a, &b, &c, &d].into_iter().chain(&siblings) {
+        assert!(set.contains(id), "{id} in {set:?}");
+    }
+}
+
+/// A parent cycle (refused by add_dependency, possible in a damaged
+/// database) still ends linked()'s up walk.
+#[test]
+fn linked_ends_on_a_parent_cycle() {
+    let mut ws = Ws::new();
+    let spec = ws.create(pinned("Spec", &["spec"], None));
+    let req = ws.create(pinned("Rule", &["requirement"], Some(&spec)));
+    let x = ws.create(NewIssue::titled("X"));
+    let y = ws.create(NewIssue::titled("Y"));
+    let (q, xr) = (req.clone(), x.clone());
+    ws.write(|tx| tx.add_dependency(&q, &xr, DepType::Related, None));
+    let at = ws.clock.now().0;
+    let (xr, yr) = (x.clone(), y.clone());
+    ws.write(|tx| {
+        let insert = "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+                      VALUES (?1, ?2, 'parent-child', ?3)";
+        tx.conn().execute(insert, params![xr, yr, at])?;
+        tx.conn().execute(insert, params![yr, xr, at])?;
+        Ok(())
+    });
+    let set = ws.read(linked);
+    assert!(set.contains(&x) && set.contains(&y), "{set:?}");
+}

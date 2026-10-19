@@ -814,7 +814,7 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         "SELECT issue_id FROM dependencies WHERE depends_on_id = ?1 AND dep_type = ?2",
         "WHERE lb.label = ?1 AND i.status <> 'closed'",
         "FROM events WHERE issue_id = ?1 AND op = 'reopened'",
-        "dep_type IN ('duplicates','supersedes')",
+        "dep_type IN (?2, ?3)",
     ] {
         assert!(commands.iter().any(|s| s.contains(needle)), "no statement with {needle:?} ran");
     }

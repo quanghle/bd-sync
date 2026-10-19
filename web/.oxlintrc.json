@@ -16,6 +16,54 @@
 			"rules": {
 				"unicorn/require-module-specifiers": "off"
 			}
+		},
+		{
+			"files": ["src/**"],
+			"rules": {
+				"no-restricted-globals": [
+					"error",
+					{
+						"name": "process",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					},
+					{
+						"name": "Buffer",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					},
+					{
+						"name": "global",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					},
+					{
+						"name": "require",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					},
+					{
+						"name": "module",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					},
+					{
+						"name": "exports",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					},
+					{
+						"name": "__dirname",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					},
+					{
+						"name": "__filename",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					},
+					{
+						"name": "setImmediate",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					},
+					{
+						"name": "clearImmediate",
+						"message": "Node-only global: it does not exist in the browser SPA."
+					}
+				]
+			}
 		}
 	]
 }

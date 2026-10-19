@@ -438,6 +438,7 @@ fn run_the_commands(ws: &mut Ws) {
                 specs::show(r.conn(), &spec)?;
                 specs::list(r.conn())?;
                 specs::drift(r.conn(), Some(Timestamp(0)))?;
+                specs::unlinked_counts(r.conn(), Some(Timestamp(0)))?;
                 specs::candidates(r.conn(), None)?;
                 specs::candidates(r.conn(), specs::since(r.conn())?)?;
                 specs::open_count(r.conn())?;
@@ -811,8 +812,9 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         "i.status IN ('open','in_progress','blocked','deferred','pinned') AND i.created_at >= ?1",
         "SELECT issue_id FROM labels WHERE label = ?1",
         "SELECT issue_id FROM dependencies WHERE depends_on_id = ?1 AND dep_type = ?2",
-        "WHERE lb.label = 'spec'",
+        "WHERE lb.label = ?1 AND i.status <> 'closed'",
         "FROM events WHERE issue_id = ?1 AND op = 'reopened'",
+        "dep_type IN ('duplicates','supersedes')",
     ] {
         assert!(commands.iter().any(|s| s.contains(needle)), "no statement with {needle:?} ran");
     }

@@ -5785,6 +5785,18 @@ fn feature_specs_list_show_drift_none_and_candidates() {
     assert_eq!((drift["count"].as_i64(), drift["unlinked"][0]["id"].as_str()), (Some(1), Some(work.as_str())));
     assert_eq!(drift["since"], since.as_str());
     assert!(!drift["unlinked"].as_array().unwrap().iter().any(|i| i["id"] == old.as_str()), "before since");
+    // prime counts what drift lists, text and JSON.
+    let p = ws.json(&["prime"]);
+    assert_eq!(
+        (p["specs"]["unlinked"].as_u64(), p["specs"]["to_link"].as_u64()),
+        (
+            Some(drift["unlinked"].as_array().unwrap().len() as u64),
+            Some(drift["to_link"].as_array().unwrap().len() as u64)
+        ),
+        "{p}"
+    );
+    let prime = ws.ok(&["prime"]);
+    assert!(prime.contains("2 open specs · 1 unlinked · 1 to link since "), "{prime}");
     ws.ok(&["dep", "add", &work, &rule, "--type", "related"]);
     assert_eq!(ws.code_as("tester", &["spec", "drift"]), 0);
     // --since moves the window back: the old work drifts.
@@ -5812,6 +5824,12 @@ fn feature_specs_list_show_drift_none_and_candidates() {
     let token = claim["lease"]["token"].as_i64().unwrap().to_string();
     ws.ok(&["heartbeat", &open, "--token", &token]);
     assert!(ws.json(&["spec", "drift"])["to_link"].as_array().unwrap().is_empty());
+    // An id named twice is marked once: one entry, one comment.
+    let twice = ws.id(&["create", "Twice"]);
+    let v = ws.json(&["spec", "none", &twice, &twice, "-r", "once"]);
+    assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(v[0]["already"], false);
+    assert_eq!(ws.ok(&["comments", &twice]).matches("No spec: once").count(), 1);
 
     // candidates: closed work from before since
     let groups = ws.json(&["spec", "candidates"]);

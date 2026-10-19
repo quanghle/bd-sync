@@ -210,7 +210,9 @@ pub fn exec_spec_none(tx: &mut WriteCtx<'_>, a: &SpecNoneArgs) -> Result<Out> {
     if reason.is_empty() {
         return Err(Error::invalid("give the reason the work touches no spec (-r)"));
     }
-    let mut ids: Vec<String> = Vec::new();
+    // Each issue is read once: (id, already marked spec:none). The ids are
+    // distinct, so marking one in the loop below never changes another's labels.
+    let mut ids: Vec<(String, bool)> = Vec::new();
     for raw in &a.ids {
         let id = tx.resolve_id(raw)?;
         let issue = issues::require(tx.conn(), &id)?;
@@ -219,14 +221,15 @@ pub fn exec_spec_none(tx: &mut WriteCtx<'_>, a: &SpecNoneArgs) -> Result<Out> {
                 "{id} is part of a spec (labelled spec, requirement or non-goal): only other work is marked spec:none"
             )));
         }
-        if !ids.contains(&id) {
-            ids.push(id);
+        if !ids.iter().any(|(i, _)| *i == id) {
+            let already = issue.labels.iter().any(|l| l == specs::NONE);
+            ids.push((id, already));
         }
     }
     let mut out = Out::default();
     let mut done = Vec::new();
-    for id in &ids {
-        if issues::require(tx.conn(), id)?.labels.iter().any(|l| l == specs::NONE) {
+    for (id, already) in &ids {
+        if *already {
             out = out.line(format!("= {id} is already marked spec:none")).id(id.clone());
             done.push(json!({ "id": id, "already": true }));
             continue;

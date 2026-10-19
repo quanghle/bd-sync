@@ -129,6 +129,22 @@ fn item_ids(items: &[Item]) -> Vec<&str> {
 }
 
 #[test]
+fn not_closed_list_is_every_status_but_closed() {
+    let list = not_closed_list();
+    let parsed: Vec<Status> = list
+        .split(',')
+        .map(|v| {
+            let inner = v.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')).expect("single-quoted");
+            assert!(!inner.contains('\''), "{v:?} holds a quote");
+            Status::parse(inner).unwrap()
+        })
+        .collect();
+    let want: Vec<Status> = Status::ALL.into_iter().filter(|s| *s != Status::Closed).collect();
+    assert_eq!(parsed, want);
+    assert_eq!(list, "'open','in_progress','blocked','deferred','pinned'");
+}
+
+#[test]
 fn finds_a_spec_by_id_or_every_open_spec_of_an_area_in_id_order() {
     let spec = labels_spec();
     let other = Node { id: "o".into(), labels: vec!["spec".into(), "area:query".into()], ..spec.clone() };
@@ -927,4 +943,104 @@ fn list_counts_distinct_linked_issues_that_are_not_spec_parts() {
     let list = ws.read(list);
     assert_eq!(list[0].id, spec);
     assert_eq!(list[0].linked, 2, "a (twice) and b; the other spec is a spec part");
+}
+
+#[test]
+fn unlinked_counts_equal_drifts_lengths_in_every_window() {
+    let mut ws = Ws::new();
+    let epic =
+        |title: &str, parent: Option<&str>| NewIssue { issue_type: Some("epic".into()), ..titled(title, &[], parent) };
+    let role = |title: &str, role: &str, parent: Option<&str>| NewIssue {
+        issue_type: Some("epic".into()),
+        metadata: Some(json!({ "playbook": { "role": role } })),
+        ..titled(title, &[], parent)
+    };
+    // Before since: a plain closed issue, one under nested epics, a finding under a step.
+    let old = ws.create(NewIssue::titled("Old"));
+    ws.close(&old);
+    let outer = ws.create(epic("Outer", None));
+    let inner = ws.create(epic("Inner", Some(&outer)));
+    let nested = ws.create(titled("Nested", &[], Some(&inner)));
+    ws.close(&nested);
+    let old_step = ws.create(role("Old step", "step", None));
+    let old_finding = ws.create(titled("Old finding", &[], Some(&old_step)));
+    ws.close(&old_finding);
+    ws.config("experimental.features", "specs");
+    let since_at = ws.read(since).unwrap();
+
+    // After since: a run with a step, two findings under the step and a follow-up.
+    let run = ws.create(role("Run", "run", None));
+    let step = ws.create(role("Step", "step", Some(&run)));
+    let found = ws.create(titled("Finding closed", &[], Some(&step)));
+    let found_open = ws.create(titled("Finding open", &[], Some(&step)));
+    let follow_up = ws.create(titled("Follow-up", &[], Some(&found)));
+    ws.close(&follow_up);
+    ws.close(&found);
+    // Under the run, not under a step: work like any other.
+    let under_run = ws.create(titled("Under the run", &[], Some(&run)));
+    ws.close(&under_run);
+    let mid = ws.clock.now();
+    let plain = ws.create(NewIssue::titled("Plain closed"));
+    ws.close(&plain);
+    let open = ws.create(NewIssue::titled("Plain open"));
+    // Linked: a subtree under a linked epic, and the task above a linked run.
+    let spec = ws.create(pinned("Spec", &["spec"], None));
+    let linked_epic = ws.create(epic("Linked epic", None));
+    let in_linked = ws.create(titled("In linked", &[], Some(&linked_epic)));
+    ws.close(&in_linked);
+    let task = ws.create(NewIssue::titled("Task"));
+    let linked_run = ws.create(role("Linked run", "run", Some(&task)));
+    ws.create(NewIssue {
+        deps: vec![(DepType::Related, linked_epic.clone()), (DepType::Related, linked_run.clone())],
+        ..pinned("Rule", &["requirement"], Some(&spec))
+    });
+    let none = ws.create(titled("None", &[NONE], None));
+    ws.close(&none);
+    // Exempt in their own right.
+    let dup = ws.create(NewIssue::titled("Dup"));
+    let old_one = ws.create(NewIssue::titled("Superseded"));
+    let (d, s, o) = (dup.clone(), old_one.clone(), open.clone());
+    ws.write(|tx| {
+        tx.close_as(&d, &o, crate::Replacement::Duplicate, &Default::default())?;
+        tx.close_as(&s, &o, crate::Replacement::Supersede, &Default::default())
+    });
+    let failed = ws.create(NewIssue::titled("Failed"));
+    let f = failed.clone();
+    ws.write(|tx| tx.close_issue(&f, &CloseOptions { outcome: Some(Outcome::Failed), ..Default::default() }));
+    ws.create(NewIssue { ephemeral: true, ..NewIssue::titled("Scratch") });
+    let gate = ws.create(NewIssue { issue_type: Some(GATE_TYPE.into()), ..NewIssue::titled("Gate") });
+    ws.close(&gate);
+    ws.create(NewIssue { issue_type: Some("decision".into()), ..NewIssue::titled("Decision") });
+
+    let at = ws.read(|c| unlinked_since(c, Some(since_at)));
+    assert_eq!(ref_ids(&at.0), [under_run.as_str(), plain.as_str()]);
+    assert_eq!(ref_ids(&at.1), [open.as_str()]);
+    for window in [None, Some(Timestamp(0)), Some(since_at), Some(mid), Some(Timestamp(i64::MAX))] {
+        let counts = ws.read(|c| unlinked_counts(c, window));
+        let (u, o) = ws.read(|c| unlinked_since(c, window));
+        let d = ws.read(|c| drift(c, window));
+        assert_eq!(counts, (u.len(), o.len()), "{window:?}");
+        assert_eq!(counts, (d.unlinked.len(), d.to_link.len()), "{window:?}");
+    }
+    assert_eq!(ws.read(|c| unlinked_counts(c, Some(since_at))), (2, 1));
+    assert_eq!(ws.read(|c| unlinked_counts(c, None)), (0, 0));
+    assert_eq!(ws.read(|c| unlinked_counts(c, Some(Timestamp(i64::MAX)))), (0, 0));
+    // Before since, the old plain issue and the nested one count, the old finding does not.
+    let all = ws.read(|c| unlinked_since(c, Some(Timestamp(0))));
+    assert!(ref_ids(&all.0).contains(&old.as_str()) && ref_ids(&all.0).contains(&nested.as_str()));
+    assert!(!ref_ids(&all.0).contains(&old_finding.as_str()));
+    ws.read(|c| {
+        for id in [&found, &found_open, &follow_up] {
+            assert!(is_exempt(c, &issues::require(c, id)?)?, "{id}");
+        }
+        assert!(!is_exempt(c, &issues::require(c, &under_run)?)?);
+        // One checker reads the shared step's role once for both findings.
+        let mut exempt = Exempt::new(c);
+        for id in [&found, &found_open, &follow_up] {
+            assert!(exempt.check(&issues::require(c, id)?)?, "{id}");
+        }
+        assert_eq!(exempt.step.get(&step), Some(&true));
+        assert_eq!(exempt.step.len(), 2, "the step and the closed finding, each once: {:?}", exempt.step);
+        Ok(())
+    });
 }

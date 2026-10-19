@@ -217,7 +217,7 @@ under `playbooks` (`name`, `description`, `location`: `checkout`,
 
 ### Bootstrapping feature specs
 
-This repository's `spec-bootstrap` playbook (`.bd/playbooks/spec-bootstrap.toml`)
+This repository's `spec-bootstrap` playbook (`.bd/source/playbooks/spec-bootstrap.toml`)
 is a worked example of loops and a human gate: `--var groups=` takes group
 keys from `bd spec candidates`, the loop runs one draft step per group in
 turn (`sequential = true`), and a person resolves the review gate before the

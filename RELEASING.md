@@ -6,7 +6,8 @@ Releases are built and published by
 `Cargo.toml`. A tag with a SemVer pre-release suffix (`v0.2.0-rc.1`) is
 published as a GitHub pre-release; `+build` metadata is rejected.
 
-The [`release` playbook](.bd/playbooks/release.toml) turns the steps below
+The [`release` playbook](.bd/source/playbooks/release.toml), published to the
+workspace and run once `bd agents approve` has approved it, turns the steps below
 into bd issues, with a human approval gate before tagging and a `gh:run` gate
 that waits for the release workflow:
 

@@ -1,2 +1,6 @@
 # Rust build output
 /target
+
+# Agent skills bd agents approve places from the workspace (source: .bd/source)
+/.claude/skills/
+/.agents/skills/

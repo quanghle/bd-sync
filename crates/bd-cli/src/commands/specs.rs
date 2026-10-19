@@ -1,5 +1,6 @@
 //! `bd spec`: feature specs (experimental), over `bd_core::specs`.
 
+use bd_core::spec_edit::Sentence;
 use bd_core::specs::{self, Drift};
 use bd_core::time::parse_filter_time;
 use bd_core::{Error, Guard, IssuePatch, IssueRef, Queries, Result, Status, WriteCtx, issues};
@@ -17,6 +18,31 @@ pub fn cmd_spec(app: &mut App, cmd: &SpecCommand) -> Result<i32> {
         SpecCommand::Candidates => cmd_spec_candidates(app).map(|_| 0),
         SpecCommand::None(a) => {
             let out = app.write("spec-none", |tx| exec_spec_none(tx, a))?;
+            app.print(out);
+            Ok(0)
+        }
+        SpecCommand::New(a) => {
+            let out = app.write("spec-new", |tx| exec_spec_new(tx, a))?;
+            app.print(out);
+            Ok(0)
+        }
+        SpecCommand::Add(a) => {
+            let out = app.write("spec-add", |tx| exec_spec_add(tx, a))?;
+            app.print(out);
+            Ok(0)
+        }
+        SpecCommand::Change(a) => {
+            let out = app.write("spec-change", |tx| exec_spec_change(tx, a))?;
+            app.print(out);
+            Ok(0)
+        }
+        SpecCommand::Remove(a) => {
+            let out = app.write("spec-remove", |tx| exec_spec_remove(tx, a))?;
+            app.print(out);
+            Ok(0)
+        }
+        SpecCommand::Link(a) => {
+            let out = app.write("spec-link", |tx| exec_spec_link(tx, a))?;
             app.print(out);
             Ok(0)
         }
@@ -149,9 +175,8 @@ fn drift_text(d: &Drift) -> Out {
         "To link: open work since then, not linked yet (not drift)",
         d.to_link.iter().map(ref_line).collect(),
     );
-    out.line(String::new()).line(
-        "Link work with `bd dep add <id> <spec or requirement> --type related`, or mark it `bd spec none <id> -r '<why>'`.",
-    )
+    out.line(String::new())
+        .line("Link work with `bd spec link <id> <spec or requirement>`, or mark it `bd spec none <id> -r '<why>'`.")
 }
 
 fn cmd_spec_drift(app: &mut App, a: &SpecDriftArgs) -> Result<i32> {
@@ -242,4 +267,91 @@ pub fn exec_spec_none(tx: &mut WriteCtx<'_>, a: &SpecNoneArgs) -> Result<Out> {
     }
     out.json = json!(done);
     Ok(out)
+}
+
+/// Each non-blank `--from`, resolved to its full id (the engine dedupes them).
+fn resolve_from(tx: &WriteCtx<'_>, from: &[String]) -> Result<Vec<String>> {
+    from.iter().filter(|f| !f.trim().is_empty()).map(|f| tx.resolve_id(f)).collect()
+}
+
+fn sentence(tx: &WriteCtx<'_>, words: &[String], description: &Option<String>, from: &[String]) -> Result<Sentence> {
+    Ok(Sentence {
+        title: words.join(" "),
+        description: description.clone().unwrap_or_default(),
+        from: resolve_from(tx, from)?,
+    })
+}
+
+fn kind(non_goal: bool) -> &'static str {
+    if non_goal { "non-goal" } else { "requirement" }
+}
+
+/// `bd spec new`: a pinned feature labelled `spec` and `area:AREA`, under
+/// `--parent` (a spec in force) when given, with related edges to `--from`.
+pub fn exec_spec_new(tx: &mut WriteCtx<'_>, a: &SpecNewArgs) -> Result<Out> {
+    specs::require_on(tx.conn())?;
+    let parent = a.parent.as_deref().map(|p| tx.resolve_id(p)).transpose()?;
+    let s = sentence(tx, &a.title, &a.description, &a.from)?;
+    let made = tx.spec_new(&a.area, &s, parent.as_deref())?;
+    let id = made.spec.id.clone();
+    let mut out =
+        Out::new(&made).line(format!("✓ Created spec {id}: {} [area:{}]", p(&made.spec.title), p(&made.area)));
+    if let Some(parent) = &made.parent {
+        out = out.line(format!("  sub-spec of {parent}"));
+    }
+    Ok(out.id(id))
+}
+
+/// `bd spec add`: a pinned requirement (or non-goal) under a spec in force,
+/// with related edges to `--from`.
+pub fn exec_spec_add(tx: &mut WriteCtx<'_>, a: &SpecAddArgs) -> Result<Out> {
+    specs::require_on(tx.conn())?;
+    let spec = tx.resolve_id(&a.spec)?;
+    let s = sentence(tx, &a.sentence, &a.description, &a.from)?;
+    let made = tx.spec_add(&spec, &s, a.non_goal)?;
+    let id = made.requirement.id.clone();
+    let line = format!("✓ Added {} {id} to {}: {}", kind(made.non_goal), made.spec, p(&made.requirement.title));
+    Ok(Out::new(&made).line(line).id(id))
+}
+
+/// `bd spec change`: the new requirement under the old one's spec, then the
+/// old one superseded by it, all or nothing.
+pub fn exec_spec_change(tx: &mut WriteCtx<'_>, a: &SpecChangeArgs) -> Result<Out> {
+    specs::require_on(tx.conn())?;
+    let old = tx.resolve_id(&a.req)?;
+    let s = sentence(tx, &a.sentence, &a.description, &a.from)?;
+    let made = tx.spec_change(&old, &s)?;
+    let id = made.requirement.id.clone();
+    let line = format!("✓ Changed {} -> {id} in {}: {}", made.superseded.id, made.spec, p(&made.requirement.title));
+    Ok(Out::new(&made).line(line).id(id))
+}
+
+/// `bd spec remove`: close a requirement with the reason `removed: WHY`,
+/// after related edges to `--from`.
+pub fn exec_spec_remove(tx: &mut WriteCtx<'_>, a: &SpecRemoveArgs) -> Result<Out> {
+    specs::require_on(tx.conn())?;
+    let req = tx.resolve_id(&a.req)?;
+    let from = resolve_from(tx, &a.from)?;
+    let done = tx.spec_remove(&req, &a.reason, &from)?;
+    let id = done.requirement.id.clone();
+    let line = format!("✓ Removed {id} from {}: {}", done.spec, p(&done.why));
+    Ok(Out::new(&done).line(line).id(id))
+}
+
+/// `bd spec link`: related edges from the work to each spec or requirement
+/// in force, those already linked left as they are.
+pub fn exec_spec_link(tx: &mut WriteCtx<'_>, a: &SpecLinkArgs) -> Result<Out> {
+    specs::require_on(tx.conn())?;
+    let issue = tx.resolve_id(&a.issue)?;
+    let targets = a.targets.iter().map(|t| tx.resolve_id(t)).collect::<Result<Vec<_>>>()?;
+    let links = tx.spec_link(&issue, &targets)?;
+    let mut out = Out::new(&links);
+    for l in &links {
+        out = out.line(if l.already {
+            format!("= {} is already linked to {}", l.issue, l.target)
+        } else {
+            format!("✓ {} linked to {}", l.issue, l.target)
+        });
+    }
+    Ok(out.id(issue))
 }

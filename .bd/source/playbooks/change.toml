@@ -243,15 +243,18 @@ Keep the canonical requirements of the features this change touches current (AGE
 specs), now that review has settled the behavior. <run> below is this run (the parent of this step) and \
 <issue> the issue it changes, if any. Find the specs: `bd spec list`, then `bd spec show <area> --history` \
 for each one touched. Link the change to every spec it touches: \
-`bd dep add <issue or run> <spec or requirement> --type related`. For each user-visible behavior the \
+`bd spec link <issue or run> <spec or requirement>`. For each user-visible behavior the \
 change adds, changes or removes, and each thing it deliberately does not do (a non-goal), single-quote \
-the text (backticks and $ in double quotes are run by the shell) and put `--` before a title:
-add: `bd create -t story --pinned --parent <spec> -l requirement --dep related:<run> -q -- '<behavior, one testable sentence>'` \
-(a non-goal: `-l requirement,non-goal`);
-change: create the new requirement as above, then `bd supersede <old> --with <new>`;
-remove: `bd close <old> --reason='<why> (<run>)'`.
+the text (backticks and $ in double quotes are run by the shell) and put `--` before it, with every \
+option before `--` (everything after it is the text):
+add: `bd spec add <spec> --from <run> -- '<behavior, one testable sentence>'` \
+(a non-goal: add `--non-goal`);
+change: `bd spec change <old> --from <run> -- '<new wording>'` (creates the new requirement and supersedes the old);
+remove: `bd spec remove <old> -r '<why>' --from <run>`.
+These check the spec and requirement and print the new id (`-q` prints only it); they do what a \
+pinned `bd create` under the spec, `bd supersede` and `bd close` do by hand (docs/commands.md).
 A new feature gets its spec first: \
-`bd create -t feature --pinned -l spec,area:<name> -d '<what it is>' -q -- '<feature>'`; \
+`bd spec new <area> -d '<what it is>' -- '<feature>'`; \
 a sub-feature's spec adds `--parent <its feature's spec>` (directly: another issue between two specs \
 ends inheritance), and an area may hold several specs. A spec's \
 requirements apply to its sub-specs (`bd spec show <sub-spec>` lists them as inherited): put a rule shared by \

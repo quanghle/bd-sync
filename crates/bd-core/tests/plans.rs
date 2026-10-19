@@ -339,6 +339,20 @@ fn run_the_commands(ws: &mut Ws) {
         ..child("Rule", &spec)
     });
     ws.write("alice", None, |tx| config::set(tx, "experimental.features", "specs"));
+    // The spec writes (`bd spec new/add/change/remove/link`): built from the
+    // operations planned elsewhere, run here so a statement added to them is planned too.
+    let from = |title: &str, id: &str| spec_edit::Sentence {
+        title: title.into(),
+        from: vec![id.into()],
+        ..Default::default()
+    };
+    let top = ws.write("alice", None, |tx| tx.spec_new("x", &from("Top", &work), None)).spec.id;
+    ws.write("alice", None, |tx| tx.spec_new("x", &from("Sub", &other), Some(&top)));
+    let rule = ws.write("alice", None, |tx| tx.spec_add(&top, &from("Rule", &work), false)).requirement.id;
+    let goal = ws.write("alice", None, |tx| tx.spec_add(&top, &from("Goal", &work), true)).requirement.id;
+    ws.write("alice", None, |tx| tx.spec_change(&rule, &from("New rule", &other)));
+    ws.write("alice", None, |tx| tx.spec_remove(&goal, "obsolete", std::slice::from_ref(&other)));
+    ws.write("alice", None, |tx| tx.spec_link(&work, &[top.clone(), spec.clone()]));
     ws.write("alice", None, |tx| config::set(tx, "events.retain_rows", "100"));
     // Enough events for the automatic prune to run.
     for n in 0..520 {

@@ -9764,13 +9764,15 @@ fn feature_specs_through_bd_serve() {
     let alice = server.client(&server.token("alice-laptop", "alice", &[]));
     assert_eq!(alice.code(&["spec", "show", "checkout"]), 2, "off");
     check(server.local("admin", &["config", "set", "experimental.features", "specs"]), "config set");
-    let spec = alice.ok(&["-q", "create", "Checkout", "--pinned", "-l", "spec,area:checkout"]).trim().to_string();
-    let rule = alice
-        .ok(&["-q", "create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec])
-        .trim()
-        .to_string();
+    // The rule's source is not the work below, which stays unlinked until `spec link`.
+    let design = alice.ok(&["-q", "create", "Design it"]).trim().to_string();
+    let spec = alice.ok(&["-q", "spec", "new", "checkout", "Checkout"]).trim().to_string();
+    let rule = alice.ok(&["-q", "spec", "add", &spec, "Requires sign-in", "--from", &design]).trim().to_string();
     let md = alice.ok(&["spec", "show", "checkout"]);
-    assert!(md.contains(&format!("# Checkout ({spec})\n\n## Requirements\n\n- Requires sign-in ({rule})\n")), "{md}");
+    assert!(
+        md.contains(&format!("# Checkout ({spec})\n\n## Requirements\n\n- Requires sign-in ({rule}; from {design})\n")),
+        "{md}"
+    );
     assert_eq!(alice.json(&["spec", "show", &spec])[0]["requirements"][0]["id"], rule.as_str());
 
     let work = alice.ok(&["-q", "create", "Build it"]).trim().to_string();
@@ -9778,7 +9780,12 @@ fn feature_specs_through_bd_serve() {
     let out = alice.run(&["spec", "drift"]);
     assert_eq!(out.status.code(), Some(1), "drift exits 1 through bd serve too");
     assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("- {work} [task] Build it (closed)")));
-    alice.ok(&["dep", "add", &work, &rule, "--type", "related"]);
+    // Writing a spec needs a writer token.
+    let reader = server.client(&server.token("dashboard", "dash", &["--role", "read"]));
+    assert_eq!(reader.code(&["spec", "link", &work, &rule]), 7, "read-only");
+    assert_eq!(alice.code(&["spec", "drift"]), 1, "the reader linked nothing");
+    let linked = alice.json(&["spec", "link", &work, &rule]);
+    assert_eq!(linked[0]["already"], false, "{linked}");
     assert_eq!(alice.code(&["spec", "drift"]), 0);
     assert_eq!(alice.json(&["spec", "drift"])["count"], 0);
 }

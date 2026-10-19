@@ -317,8 +317,9 @@ impl SpecState {
                 self.unlinked,
                 self.to_link
             ),
-            "- Link each change to its spec or requirement (`bd dep add <id> <spec or requirement> --type related`) \
-             or mark it `bd spec none <id> -r '<why>'`; keep requirements current (add, `bd supersede <old> --with <new>`, close with a reason)."
+            "- Link each change to its spec or requirement (`bd spec link <id> <spec or requirement>`) or mark it \
+             `bd spec none <id> -r '<why>'`; keep requirements current (`bd spec add <spec> --from <id> -- '<sentence>'`, \
+             `bd spec change <req> --from <id> -- '<sentence>'`, `bd spec remove <req> -r '<why>'`)."
                 .into(),
             "- See `bd spec list`, `bd spec show <spec>`, `bd spec drift`.".into(),
         ]

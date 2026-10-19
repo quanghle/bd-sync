@@ -5972,6 +5972,293 @@ fn spec_none_runs_in_a_batch() {
     assert_eq!(ws.json(&["list", "--all"]).as_array().unwrap().len(), 2);
 }
 
+/// What a refused write must leave as it was: every issue (with its labels,
+/// status and counts) and the event log, which records every edge added.
+fn spec_snapshot(ws: &Ws) -> (Value, usize) {
+    (ws.json(&["list", "--all"]), ws.ok(&["--json", "events", "--since", "0"]).lines().count())
+}
+
+/// `bd args` exits `code` with `needle` on stderr, and writes nothing.
+fn spec_refused(ws: &Ws, actor: &str, args: &[&str], code: i32, needle: &str) {
+    let before = spec_snapshot(ws);
+    let (c, err) = refusal(ws, actor, args);
+    assert_eq!(c, code, "bd {args:?}: {err}");
+    assert!(err.contains(needle), "bd {args:?}: {needle:?} not in {err}");
+    assert_eq!(spec_snapshot(ws), before, "bd {args:?} wrote nothing");
+}
+
+/// The spec write commands build a spec and keep it current: new (and a
+/// sub-spec), add (a requirement, `-- -x`, a non-goal), change, remove and
+/// link, in text, JSON and `-q`, as `bd spec show --history` and drift see them.
+#[test]
+fn spec_write_commands_build_a_spec() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let w1 = ws.id(&["create", "Design checkout"]);
+    let w2 = ws.id(&["create", "Rework checkout"]);
+    for w in [&w1, &w2] {
+        ws.ok(&["close", w, "-r", "done"]);
+    }
+
+    // new: a pinned feature labelled spec and area:AREA, with its sources
+    let made = ws.json(&["spec", "new", "checkout", "Checkout", "-d", "Paying for a cart.", "--from", &w1]);
+    assert_eq!(keys(&made), ["area", "parent", "sources", "spec"], "{made}");
+    let spec = made["spec"]["id"].as_str().unwrap().to_string();
+    assert_eq!(
+        (&made["spec"]["status"], &made["spec"]["issue_type"], &made["spec"]["description"]),
+        (&Value::from("pinned"), &Value::from("feature"), &Value::from("Paying for a cart.")),
+        "{made}"
+    );
+    let mut labels: Vec<&str> =
+        made["spec"]["labels"].as_array().unwrap().iter().map(|l| l.as_str().unwrap()).collect();
+    labels.sort();
+    assert_eq!(labels, ["area:checkout", "spec"]);
+    assert_eq!((&made["area"], &made["parent"]), (&Value::from("checkout"), &Value::Null));
+    assert_eq!(made["sources"], serde_json::json!([w1]));
+    let text = ws.ok(&["spec", "new", "checkout", "Payments", "--parent", &spec]);
+    let sub = text.split_whitespace().nth(3).unwrap().trim_end_matches(':').to_string();
+    assert_eq!(text, format!("✓ Created spec {sub}: Payments [area:checkout]\n  sub-spec of {spec}\n"));
+    assert!(ws.ok(&["spec", "list"]).contains(&format!("{sub} Payments [checkout] (sub-spec of {spec})")));
+
+    // add: a pinned story labelled requirement, a source per --from
+    let added = ws.json(&["spec", "add", &spec, "Requires", "sign-in", "--from", &format!("{w1},{w2}")]);
+    assert_eq!(keys(&added), ["non_goal", "requirement", "sources", "spec"], "{added}");
+    let rule = added["requirement"]["id"].as_str().unwrap().to_string();
+    assert_eq!(added["requirement"]["title"], "Requires sign-in");
+    assert_eq!(added["requirement"]["labels"], serde_json::json!(["requirement"]));
+    assert_eq!(
+        (&added["requirement"]["status"], &added["requirement"]["issue_type"]),
+        (&Value::from("pinned"), &Value::from("story"))
+    );
+    assert_eq!((&added["spec"], &added["non_goal"]), (&Value::from(spec.as_str()), &Value::from(false)));
+    assert_eq!(added["sources"], serde_json::json!([w1, w2]));
+    // Options before `--`: the sentence may start with a dash.
+    let dash = ws.id(&["spec", "add", &spec, "--from", &w1, "--", "-x"]);
+    assert_eq!(ws.json(&["show", &dash])["title"], "-x");
+    let text = ws.ok(&["spec", "add", &spec, "--non-goal", "No", "guest", "checkout", "--from", &w1]);
+    let goal = text.split_whitespace().nth(3).unwrap().to_string();
+    assert_eq!(text, format!("✓ Added non-goal {goal} to {spec}: No guest checkout\n"));
+    assert_eq!(ws.json(&["spec", "show", &spec])[0]["non_goals"][0]["id"], goal.as_str());
+
+    // change: the new requirement under the same spec, the old one superseded by it
+    let changed = ws.json(&["spec", "change", &rule, "Requires", "sign-in", "or", "a", "passkey", "--from", &w2]);
+    assert_eq!(keys(&changed), ["non_goal", "requirement", "sources", "spec", "superseded"], "{changed}");
+    let new = changed["requirement"]["id"].as_str().unwrap().to_string();
+    assert_eq!(changed["requirement"]["status"], "pinned");
+    assert_eq!(changed["superseded"]["id"], rule.as_str());
+    assert_eq!(changed["superseded"]["status"], "closed");
+    assert_eq!(changed["superseded"]["close_reason"], format!("superseded by {new}").as_str());
+    assert_eq!((&changed["spec"], &changed["sources"]), (&Value::from(spec.as_str()), &serde_json::json!([w2])));
+    let shown = ws.json(&["spec", "show", &spec]);
+    let reqs: Vec<&str> =
+        shown[0]["requirements"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
+    assert_eq!(reqs, [dash.as_str(), new.as_str()], "the new requirement comes last: {shown}");
+
+    // remove: the reason normalized to `removed: <why>`, the removing work a source
+    let removed = ws.json(&["spec", "remove", &dash, "-r", "Removed: obsolete", "--from", &w2]);
+    assert_eq!(keys(&removed), ["reason", "requirement", "sources", "spec"], "{removed}");
+    assert_eq!(removed["reason"], "removed: obsolete");
+    assert_eq!(removed["requirement"]["close_reason"], "removed: obsolete");
+    assert_eq!((&removed["spec"], &removed["sources"]), (&Value::from(spec.as_str()), &serde_json::json!([w2])));
+    assert_eq!(ws.ok(&["-q", "spec", "remove", &goal, "-r", "out of scope"]), format!("{goal}\n"));
+    let md = ws.ok(&["spec", "show", &spec, "--history"]);
+    assert!(md.contains(&format!("- Requires sign-in or a passkey ({new}; from {w2})\n")), "{md}");
+    assert!(md.contains(&format!("- ~~Requires sign-in~~ superseded by {new} ({rule}; from {w1}, {w2})\n")), "{md}");
+    assert!(md.contains(&format!("- ~~-x~~ removed: obsolete ({dash}; from {w1}, {w2})\n")), "{md}");
+    assert!(md.contains(&format!("- ~~No guest checkout~~ removed: out of scope ({goal}; from {w1})\n")), "{md}");
+
+    // link: unlinked work drifts until it is linked; linking again writes nothing
+    let w3 = ws.id(&["create", "Build checkout"]);
+    ws.ok(&["close", &w3, "-r", "done"]);
+    let out = ws.run_as("tester", &["--json", "spec", "drift"]);
+    assert_eq!(out.status.code(), Some(1));
+    let drift: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(drift["unlinked"][0]["id"], w3.as_str(), "{drift}");
+    assert_eq!(ws.ok(&["spec", "link", &w3, &spec]), format!("✓ {w3} linked to {spec}\n"));
+    let events = spec_snapshot(&ws).1;
+    assert_eq!(ws.ok(&["spec", "link", &w3, &spec]), format!("= {w3} is already linked to {spec}\n"));
+    assert_eq!(spec_snapshot(&ws).1, events, "already linked: no event");
+    let linked = ws.json(&["spec", "link", &w3, &spec, &new, &spec]);
+    assert_eq!(
+        linked,
+        serde_json::json!([
+            { "issue": w3, "target": spec, "already": true },
+            { "issue": w3, "target": new, "already": false },
+        ])
+    );
+    assert_eq!(ws.ok(&["-q", "spec", "link", &w3, &new]), format!("{w3}\n"));
+    assert_eq!(ws.code_as("tester", &["spec", "drift"]), 0);
+    assert_eq!(ws.json(&["spec", "drift"])["count"], 0);
+    assert_eq!(ws.json(&["show", &w3])["status"], "closed", "linking changes nothing else");
+}
+
+/// Every refusal of the spec write commands exits 2 (3 for an unknown id),
+/// names the id and the fix, and writes nothing; with specs off each refuses
+/// first, unknown ids and batches included.
+#[test]
+fn spec_write_commands_refuse_and_write_nothing() {
+    let ws = Ws::new();
+    let off = bd_core::specs::OFF;
+    for args in [
+        &["spec", "new", "checkout", "Checkout", "--parent", "t-404", "--from", "t-405"][..],
+        &["spec", "add", "t-404", "x", "--from", "t-405"],
+        &["spec", "change", "t-404", "x", "--from", "t-405"],
+        &["spec", "remove", "t-404", "-r", "x"],
+        &["spec", "link", "t-404", "t-405"],
+    ] {
+        spec_refused(&ws, "tester", args, 2, off);
+    }
+    let before = spec_snapshot(&ws);
+    let out = ws.batch_as("tester", "create \"First\"\nspec add t-404 x --from t-405\n");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains(off));
+    assert_eq!(spec_snapshot(&ws), before, "the batch rolled back");
+
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let work = ws.id(&["create", "Work"]);
+    let done = ws.id(&["create", "Done"]);
+    ws.ok(&["close", &done, "-r", "done"]);
+    let spec = ws.id(&["spec", "new", "checkout", "Checkout"]);
+    let loose = ws.id(&["create", "Loose", "-l", "spec,area:checkout"]);
+    let loose_rule = ws.id(&["create", "Loose rule", "--pinned", "-l", "requirement", "--parent", &loose]);
+    let retired = ws.id(&["spec", "new", "billing", "Billing"]);
+    ws.ok(&["close", &retired, "-r", "retired"]);
+    let rule = ws.id(&["spec", "add", &spec, "Rule", "--from", &work]);
+    let gone = ws.id(&["spec", "add", &spec, "Old", "--from", &work]);
+    ws.ok(&["spec", "remove", &gone, "-r", "obsolete"]);
+    let older = ws.id(&["spec", "add", &spec, "Older", "--from", &work]);
+    let newer = ws.id(&["spec", "change", &older, "Newer", "--from", &work]);
+    let stray = ws.id(&["create", "Stray", "--pinned", "-l", "requirement"]);
+    let epic = ws.id(&["create", "Epic", "-t", "epic"]);
+    let under = ws.id(&["create", "Under", "--pinned", "-l", "requirement", "--parent", &epic]);
+
+    let refused = |args: &[&str], code: i32, needle: &str| spec_refused(&ws, "tester", args, code, needle);
+    // Spec targets: a spec, pinned, not closed.
+    let pin = format!("bd update {loose} --status pinned");
+    refused(&["spec", "add", &work, "x", "--from", &done], 2, &format!("{work} is not a spec"));
+    refused(&["spec", "add", &loose, "x", "--from", &done], 2, &pin);
+    refused(&["spec", "add", &retired, "x", "--from", &done], 2, &format!("{retired} is a closed spec"));
+    refused(&["spec", "new", "checkout", "X", "--parent", &work], 2, &format!("{work} is not a spec"));
+    refused(&["spec", "new", "checkout", "X", "--parent", &loose], 2, &pin);
+    refused(&["spec", "new", "checkout", "X", "--parent", &retired], 2, "is a closed spec");
+    refused(&["spec", "add", "t-404", "x", "--from", &done], 3, "t-404");
+    refused(&["spec", "new", "checkout", "X", "--parent", "t-404"], 3, "t-404");
+    // Requirement targets: labelled, not closed, a direct child of a spec (pinned, for change).
+    refused(&["spec", "change", &work, "x", "--from", &done], 2, &format!("{work} is not a requirement"));
+    refused(&["spec", "remove", &work, "-r", "x"], 2, &format!("{work} is not a requirement"));
+    refused(&["spec", "change", &gone, "x", "--from", &done], 2, "already closed (removed: obsolete)");
+    refused(&["spec", "remove", &gone, "-r", "again"], 2, &format!("{gone} is already closed (removed: obsolete)"));
+    refused(&["spec", "remove", &stray, "-r", "x"], 2, &format!("{stray} is not a direct child of a spec"));
+    refused(&["spec", "change", &under, "x", "--from", &done], 2, &format!("{under} is not a direct child of a spec"));
+    refused(&["spec", "change", &loose_rule, "x", "--from", &done], 2, &pin);
+    refused(&["spec", "change", "t-404", "x", "--from", &done], 3, "t-404");
+    // Sources: existing issues, not spec parts.
+    refused(&["spec", "add", &spec, "x", "--from", "t-404"], 3, "t-404");
+    refused(&["spec", "add", &spec, "x", "--from", &rule], 2, &format!("--from {rule} is part of a spec"));
+    refused(&["spec", "remove", &rule, "-r", "x", "--from", &spec], 2, &format!("--from {spec} is part of a spec"));
+    // Areas and reasons.
+    for area in ["", "a b", "a,b", "a\u{7}b", &"a".repeat(65)] {
+        refused(&["spec", "new", area, "X"], 2, "invalid area");
+    }
+    for why in ["  ", "removed:", "REMOVED:  "] {
+        refused(&["spec", "remove", &rule, "-r", why], 2, "give the reason");
+    }
+    // Links: work to specs and requirements in force.
+    refused(&["spec", "link", &rule, &spec], 2, &format!("{rule} is part of a spec"));
+    refused(&["spec", "link", &work, &done], 2, &format!("{done} is not a spec or requirement"));
+    refused(&["spec", "link", &work, &older], 2, &format!("{older} is superseded by {newer}: link that"));
+    refused(&["spec", "link", &work, &gone], 2, &format!("{gone} is closed (removed: obsolete)"));
+    refused(&["spec", "link", &work, &spec, &retired], 2, &format!("{retired} is closed (retired)"));
+    refused(&["spec", "link", &work, "t-404"], 3, "t-404");
+    // The grammar: --from on add and change, options before `--`.
+    refused(&["spec", "add", &spec, "x"], 2, "--from");
+    refused(&["spec", "change", &rule, "x"], 2, "--from");
+    refused(&["spec", "remove", &rule], 2, "--reason");
+    refused(&["spec", "add", &spec, "--", "-x", "--from", &work], 2, "--from");
+    refused(&["spec", "add", &spec, "Rule", "--from", ""], 2, "--from");
+    refused(&["spec", "add", &spec, "Rule", "--from", ","], 2, "--from");
+    refused(&["spec", "change", &rule, "Rule", "--from", ""], 2, "--from");
+    refused(&["spec", "add", &spec, "--from", &work, "--", &"x".repeat(501)], 2, "500");
+
+    // remove takes a requirement under a spec that is not pinned.
+    let removed = ws.json(&["spec", "remove", &loose_rule, "-r", "  obsolete "]);
+    assert_eq!(removed["reason"], "removed: obsolete");
+}
+
+/// T3: `bd spec change` is all or nothing: when the old requirement cannot be
+/// superseded (an open child), the new one is not created either.
+#[test]
+fn spec_change_rolls_back_when_the_supersede_fails() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let work = ws.id(&["create", "Work"]);
+    let spec = ws.id(&["spec", "new", "checkout", "Checkout"]);
+    let rule = ws.id(&["spec", "add", &spec, "Rule", "--from", &work]);
+    ws.ok(&["create", "Follow-up", "--parent", &rule]);
+    spec_refused(&ws, "tester", &["spec", "change", &rule, "New rule", "--from", &work], 2, &rule);
+    let shown = ws.json(&["spec", "show", &spec]);
+    let reqs = shown[0]["requirements"].as_array().unwrap();
+    assert_eq!(reqs.len(), 1, "{shown}");
+    assert_eq!(reqs[0]["id"], rule.as_str());
+    assert_eq!(ws.json(&["show", &rule])["status"], "pinned");
+}
+
+/// Another actor's live claim on a requirement refuses `bd spec remove` and
+/// `bd spec change` (exit 4, naming the holder) before anything is written.
+#[test]
+fn spec_remove_and_change_refuse_another_actors_claim() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let work = ws.id(&["create", "Work"]);
+    let spec = ws.id(&["spec", "new", "checkout", "Checkout"]);
+    let rule = ws.id(&["spec", "add", &spec, "Rule", "--from", &work]);
+    ws.ok(&["update", &rule, "--status", "open"]);
+    assert_eq!(ws.json_as("bob", &["claim", &rule])["issue"]["assignee"], "bob");
+    spec_refused(&ws, "alice", &["spec", "remove", &rule, "-r", "obsolete", "--from", &work], 4, "bob");
+    spec_refused(&ws, "alice", &["spec", "change", &rule, "New rule", "--from", &work], 4, "bob");
+    assert_eq!(ws.json(&["show", &rule])["status"], "in_progress");
+}
+
+/// T4: the spec write commands are batch ops whose `$N` is the id each
+/// produces (the spec, the requirement, the new requirement, the linked
+/// issue); a refusal on the last line rolls the whole batch back.
+#[test]
+fn spec_write_commands_run_in_a_batch() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let done = ws.id(&["create", "Done work"]);
+    ws.ok(&["close", &done, "-r", "done"]);
+    let ops = format!(
+        "create \"Work\"\nspec new checkout Checkout --from $1\nspec add $2 Rule --from $1\n\
+         spec change $3 'New rule' --from $1\nspec link {done} $4\n"
+    );
+    let script = ws.dir.path().join("ops.txt");
+    std::fs::write(&script, &ops).unwrap();
+    let batch = ws.json(&["batch", "-f", script.to_str().unwrap()]);
+    assert_eq!(batch["committed"], true);
+    let ops = batch["operations"].as_array().unwrap();
+    let id = |n: usize| ops[n]["ids"][0].as_str().unwrap().to_string();
+    assert_eq!(ops[1]["result"]["spec"]["id"], id(1).as_str());
+    assert_eq!(ops[1]["result"]["sources"], serde_json::json!([id(0)]));
+    assert_eq!(ops[2]["result"]["requirement"]["id"], id(2).as_str());
+    assert_eq!(ops[2]["result"]["spec"], id(1).as_str());
+    assert_eq!(ops[3]["result"]["requirement"]["id"], id(3).as_str());
+    assert_eq!(ops[3]["result"]["superseded"]["id"], id(2).as_str());
+    assert_eq!(ops[4]["result"], serde_json::json!([{ "issue": done, "target": id(3), "already": false }]));
+    assert_eq!(id(4), done);
+    assert_eq!(ws.json(&["show", &id(2)])["close_reason"], format!("superseded by {}", id(3)).as_str());
+
+    // A refused last line (a link to a superseded requirement) undoes it all.
+    let before = spec_snapshot(&ws);
+    let out = ws.batch_as(
+        "tester",
+        &format!("create \"More\"\nspec add {} Another --from {done}\nspec link {done} {}\n", id(1), id(2)),
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("superseded by"));
+    assert_eq!(spec_snapshot(&ws), before, "rolled back");
+}
+
 const PUBLISHED_PLAYBOOK: &str = "description = \"Ship it\"\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n";
 
 fn json_lines(text: &str) -> Vec<Value> {

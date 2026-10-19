@@ -24,7 +24,8 @@ title = "Draft specs: {{item}}"
 type = "task"
 description = """
 Draft the feature spec(s) for the candidate group `{{item}}`. Quote text in single quotes; write a \
-single quote inside as '\\'' (don't -> 'don'\\''t'). Put `--` before a title.
+single quote inside as '\\'' (don't -> 'don'\\''t'). Put `--` before a title or sentence, with every \
+option before `--` (everything after it is the text).
 1. Check feature specs are on: `bd spec list` (if they are off, stop: a person turns them on with \
 `bd config set experimental.features specs`).
 2. Find the group: the entry of `bd spec candidates --json` whose key is `{{item}}`. If there is none \
@@ -37,15 +38,16 @@ repository is at hand, check what the code does.
 4. Decide which features they describe. Right before creating a spec, check `bd spec list` again: \
 reuse a spec that covers the feature (`bd spec show <spec>`), nest a sub-feature under its feature's \
 spec (`--parent <spec>`), create a new one only when none fits.
-spec: `bd create -t feature --pinned -l spec,area:<name> -d '<what it is>' -q -- '<feature>'`
-requirement: `bd create -t story --pinned --parent <spec> -l requirement --dep related:<issue>,related:<issue> -q -- '<behavior, one testable sentence>'` \
-(one requirement per behavior, its sources all the issues that shaped it; a non-goal adds `-l requirement,non-goal`).
+spec: `bd spec new <area> -d '<what it is>' -- '<feature>'` (a sub-feature adds `--parent <spec>`)
+requirement: `bd spec add <spec> --from <issue>,<issue> -- '<behavior, one testable sentence>'` \
+(one requirement per behavior, its sources all the issues that shaped it; a non-goal adds `--non-goal`). \
+Each prints the new id (`-q` prints only it).
 Take behavior only from the issues and the code; never invent it. A point you inferred or are unsure \
 of goes in a comment on the requirement (`bd comment add <req> '<question>'`) for the reviewer. Where \
 later work changed a behavior, write the behavior as it stands now.
 5. Every issue of the batch must end up covered. A requirement's sources are covered by its \
-`--dep related:` edges. Link each other issue to its spec or requirement \
-(`bd dep add <issue> <spec or requirement> --type related`), or, when it has no user-visible behavior \
+`--from` edges. Link each other issue to its spec or requirement \
+(`bd spec link <issue> <spec or requirement>`), or, when it has no user-visible behavior \
 (refactors, tests, tooling, CI, releases), mark it `bd spec none <issue> -r '<why>'`. A link covers the \
 issue, everything below it and everything above it: link an epic only when its whole subtree is that \
 one feature, and remember linking one child also covers its epic. `bd spec none` covers only the issue \
@@ -79,16 +81,16 @@ description = """
 For a person, never an agent. Read each spec the draft steps of this run name in their close reasons \
 (`bd spec show <spec> --history`) and the questions left as comments on its requirements. Fix what is \
 wrong:
-- a wording change: create the new requirement (pinned, same spec, with the old one's sources: \
-`--dep related:<source>`), then `bd supersede <old> --with <new>`;
-- a rejected requirement: `bd close <req> --reason 'removed: <why>'`, then link its source issues to \
+- a wording change: `bd spec change <old> --from <source>,<source> -- '<new>'` (the old one's sources; \
+it creates the new requirement in the same spec and supersedes the old);
+- a rejected requirement: `bd spec remove <req> -r '<why>'`, then link its source issues to \
 the right spec or requirement, or `bd spec none <issue> -r '<why>'`: a rejected requirement still \
 covers its sources;
 - an issue on the wrong spec: `bd dep rm <issue> <spec or requirement>`, then \
-`bd dep add <issue> <right one> --type related`;
+`bd spec link <issue> <right one>`;
 - duplicate specs: move the duplicate's requirements and sub-specs to the kept spec \
 (`bd update <id> --parent <kept>`), re-link the issues linked to the duplicate itself \
-(`bd dep rm <issue> <dup>`, then `bd dep add <issue> <kept> --type related`), then \
+(`bd dep rm <issue> <dup>`, then `bd spec link <issue> <kept>`), then \
 `bd supersede <dup> --with <kept>`.
 Then `bd gate resolve <this gate> -r '<what you accepted, changed or rejected>'`."""
 

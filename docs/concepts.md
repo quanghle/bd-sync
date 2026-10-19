@@ -348,12 +348,21 @@ that keeps a feature's canonical requirements in bd, beside the work that
 shaped them. A spec is a pinned issue labelled `spec` and `area:<name>`;
 its requirements are pinned children labelled `requirement` (also
 `non-goal` for what it deliberately does not do), each one testable
-sentence. A requirement that changes is replaced with `bd supersede <old>
---with <new>`; one that no longer holds is closed with its reason. A spec
-that is the child of an open spec inherits its requirements.
+sentence, its sources the issues it came from. `bd spec new <area> --
+'<feature>'` creates a spec and `bd spec add <spec> --from <id> --
+'<sentence>'` a requirement (`--non-goal` for a non-goal). A requirement
+that changes is replaced: `bd spec change <old> --from <id> -- '<new>'`
+creates the new one and supersedes the old (as `bd supersede <old> --with
+<new>` does); one that no longer holds is closed with its reason by
+`bd spec remove <old> -r '<why>'` (as `bd close <old> --reason 'removed:
+<why>'` does). These check the targets and write nothing when a check
+fails; the raw `bd create`, `bd supersede` and `bd close` forms are
+equivalent. A spec that is the child of an open spec inherits its
+requirements.
 
 Work is linked to the spec it touches by a `related` edge to the spec or a
-requirement (`bd dep add <id> <spec or requirement> --type related`); a
+requirement (`bd spec link <id> <spec or requirement>`, or `bd dep add
+<id> <spec or requirement> --type related`); a
 link covers the issue's subtree and its ancestors (linking an epic covers
 its subtasks, a run's link covers the issue it runs for). Work that touches
 no spec is marked `bd spec none <id> -r '<why>'`, which covers only that

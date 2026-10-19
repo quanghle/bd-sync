@@ -142,6 +142,8 @@ crates/bd-server/src/ serve/ (bd serve: listen, routes, exec, sign-in endpoints,
                       documents, pages)
 crates/bd/src/        main (the binary; hands bd serve and bd bench to bd-cli) · bench
 crates/bd/tests/      end-to-end CLI tests; remote.rs runs real bd serve and client processes
+                      · bin/ (a private copy of the bd binary per build, so a rebuild during a run does
+                      not swap it)
                       · piped/ (input written while output drains)
                       · pty/ (a pseudo-terminal, Linux and macOS)
 ```

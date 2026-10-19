@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+mod bin;
 mod piped;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -19,7 +20,7 @@ mod pty;
 
 /// `bd` with a clean environment, run in `dir`.
 fn bd(dir: &Path) -> Command {
-    let mut c = Command::new(env!("CARGO_BIN_EXE_bd"));
+    let mut c = Command::new(bin::bd_exe());
     // Device-flow polls a second apart take 20 ms here (debug builds only).
     c.current_dir(dir).env("BD_LOG", "error").env("XDG_CONFIG_HOME", dir.join(".xdg")).env("BD_TEST_POLL_MS", "20");
     // Where the harnesses keep user-level hooks, which `bd agents pull` looks at.

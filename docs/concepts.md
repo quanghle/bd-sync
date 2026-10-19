@@ -366,7 +366,7 @@ failed, and specs in the wrong state, and `bd prime` shows the counts to
 agents. `bd spec show <area>` prints an area's specs as Markdown and
 `bd spec candidates` lists older closed work specs could be written from.
 To write those specs, this repository's `spec-bootstrap` playbook
-(`.bd/playbooks/spec-bootstrap.toml`, which another repository copies into
+(`.bd/source/playbooks/spec-bootstrap.toml`, which another repository copies into
 its own `.bd/playbooks` or the user playbook directory) has an agent draft
 the specs for the groups you name (`bd playbook run spec-bootstrap --var
 groups=epic:bd-12,ungrouped --var reviewer=<person>`), one step per group

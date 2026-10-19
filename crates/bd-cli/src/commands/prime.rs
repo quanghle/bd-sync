@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn the_skills_working_efficiently_commands_parse() {
         for skill in [
-            include_str!("../../../../.agents/skills/bd/SKILL.md"),
+            include_str!("../../../../.bd/source/agents/codex/skills/bd/SKILL.md"),
             include_str!("../../../../plugins/bd/skills/bd/SKILL.md"),
         ] {
             let section = skill.split("## Working efficiently").nth(1).expect("a Working efficiently section");

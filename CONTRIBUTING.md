@@ -18,6 +18,23 @@ bd create "Found while working" --dep discovered-from:<id>
 bd close <id> --reason "what was done"
 ```
 
+## Playbooks and agent skills
+
+This repository's playbooks and agent skills are published to its bd
+workspace. Their source is `.bd/source/`: `playbooks/*.toml` and
+`agents/<harness>/skills/` (`claude` and `codex`). To change one:
+
+1. Edit it under `.bd/source/` and have it reviewed and merged like code.
+2. An admin runs `bd publish --dry-run`, then `bd publish` (it needs a
+   person's admin token).
+3. Each client runs `bd agents approve` in a terminal (agent sessions
+   cannot), which places the files in `.bd/approved/playbooks/`,
+   `.claude/skills/` and `.agents/skills/`.
+
+Those pulled copies are gitignored; never edit them in place. Claude Code's
+bd skill comes from `plugins/bd`. [docs/agents.md](docs/agents.md) and
+[docs/playbooks.md](docs/playbooks.md) hold the details.
+
 ## Build and test
 
 ```bash

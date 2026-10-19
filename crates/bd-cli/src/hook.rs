@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn the_skills_say_to_prime_again_after_compaction() {
-        for skill in [PLUGIN_SKILL, include_str!("../../../.agents/skills/bd/SKILL.md")] {
+        for skill in [PLUGIN_SKILL, include_str!("../../../.bd/source/agents/codex/skills/bd/SKILL.md")] {
             assert!(
                 skill.lines().any(|l| l.contains("compacted") && l.contains("bd prime") && l.contains("lease token")),
                 "{skill}"

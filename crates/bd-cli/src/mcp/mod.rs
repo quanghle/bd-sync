@@ -201,11 +201,15 @@ impl<R: Runner> Server<R> {
             Ok(ran) => ran,
             Err(e) => return Ok(tool_error(e.code(), &e.to_string(), e.exit_code())),
         };
-        if ran.exit_code != 0 {
+        // A findings exit (spec drift's 1) with its JSON on stdout is a result.
+        let findings = ran.exit_code != 0 && invocation.accepts_exit(ran.exit_code) && !ran.stdout.trim().is_empty();
+        if ran.exit_code != 0 && !findings {
             return Ok(command_error(&ran));
         }
         Ok(match invocation.result(&ran.stdout) {
             Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+            // Unreadable stdout at a findings exit: the command's own error.
+            Err(_) if findings => command_error(&ran),
             Err(message) => tool_error("internal", &message, 1),
         })
     }
@@ -411,7 +415,7 @@ mod tests {
         let r = server.handle(&modern("tools/list", json!({}))).unwrap();
         let names: Vec<&str> =
             r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["ready", "list", "show", "memories"]);
+        assert_eq!(names, ["ready", "list", "show", "memories", "spec_list", "spec_show", "spec_drift"]);
         assert_eq!(r["result"]["cacheScope"], "private");
         let call = modern("tools/call", json!({ "name": "close", "arguments": { "ids": ["a"], "reason": "r" } }));
         assert_eq!(server.handle(&call).unwrap()["error"]["code"], INVALID_PARAMS);
@@ -450,5 +454,63 @@ mod tests {
                 (vec!["claim".to_string(), "--json".into(), "--".into(), "a".into()], true),
             ]
         );
+    }
+
+    #[test]
+    fn spec_drift_findings_are_a_result() {
+        let drift = r#"{"since":"T","count":1,"unlinked":[{"id":"t-1","title":"Build it","status":"closed","priority":2,"issue_type":"task","assignee":null}],"shaky":[],"bad_status":[],"orphaned":[],"to_link":[]}"#;
+        let off = json!({ "error": { "code": "invalid", "exit_code": 2, "message": bd_core::specs::OFF } }).to_string();
+        let mut canned = Canned::default();
+        // (a) Drift found: exit 1 with its JSON on stdout.
+        canned.answers.push_back(Ran { exit_code: 1, stdout: drift.into(), ..Default::default() });
+        // (b) A failure at exit 1: its error on stderr, nothing on stdout.
+        canned.answers.push_back(Ran {
+            exit_code: 1,
+            stderr: r#"{"error":{"code":"internal","exit_code":1,"message":"boom"}}"#.into(),
+            ..Default::default()
+        });
+        // (c) Exit 1 with stdout that does not parse.
+        canned.answers.push_back(Ran { exit_code: 1, stdout: "not json".into(), ..Default::default() });
+        // (d) Specs off: exit 2.
+        canned.answers.push_back(Ran { exit_code: 2, stderr: off, ..Default::default() });
+        // (e) Another tool at exit 1, even with JSON on stdout.
+        canned.answers.push_back(Ran { exit_code: 1, stdout: "[]".into(), ..Default::default() });
+        let mut server = Server::new(&mut canned, false);
+        let drift_call = modern("tools/call", json!({ "name": "spec_drift" }));
+        let error_of = |r: &Value| -> Value {
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            serde_json::from_str::<Value>(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap()["error"].clone()
+        };
+
+        let r = server.handle(&drift_call).unwrap();
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(r#""count":1"#), "{text}");
+        assert!(
+            text.contains(r#"{"id":"t-1","priority":2,"status":"closed","title":"Build it","type":"task"}"#),
+            "{text}"
+        );
+
+        let e = error_of(&server.handle(&drift_call).unwrap());
+        assert_eq!(
+            (e["code"].as_str(), e["message"].as_str(), e["exit_code"].as_i64()),
+            (Some("internal"), Some("boom"), Some(1))
+        );
+
+        let e = error_of(&server.handle(&drift_call).unwrap());
+        assert_eq!((e["code"].as_str(), e["exit_code"].as_i64()), (Some("failed"), Some(1)));
+
+        let e = error_of(&server.handle(&drift_call).unwrap());
+        assert_eq!(
+            (e["code"].as_str(), e["message"].as_str(), e["exit_code"].as_i64()),
+            (Some("invalid"), Some(bd_core::specs::OFF), Some(2))
+        );
+
+        let e = error_of(&server.handle(&modern("tools/call", json!({ "name": "spec_list" }))).unwrap());
+        assert_eq!(e["exit_code"], 1);
+
+        let drift_line = vec!["spec".to_string(), "drift".into(), "--json".into()];
+        assert_eq!(canned.ran[0], (drift_line, false));
+        assert_eq!(canned.ran[4], (vec!["spec".to_string(), "list".into(), "--json".into()], false));
     }
 }

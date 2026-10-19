@@ -432,7 +432,9 @@ bd playbook run spec-bootstrap --var groups=KEY,KEY --var reviewer=P  # agents d
 Feature specs are an [experimental feature](#experimental-features): every
 `bd spec` command exits 2 (`feature specs are off in this workspace`) until
 `bd config set experimental.features specs`. See
-[Feature specs](concepts.md#feature-specs) for the convention.
+[Feature specs](concepts.md#feature-specs) for the convention. `list`,
+`show`, `drift` and `none` are also [MCP tools](mcp.md#tools)
+(`spec_list`, `spec_show`, `spec_drift`, `spec_none`); `candidates` is not.
 
 - **Show.** Takes a spec's id (or a short id) or an area: every open spec
   labelled `area:AREA`, in id order, leaving out those shown inside another
@@ -488,7 +490,8 @@ Feature specs are an [experimental feature](#experimental-features): every
 - **None.** Refuses spec issues themselves (exit 2); never changes status,
   assignee or a claim. An issue already labelled `spec:none` is left as it
   is (`= ID is already marked spec:none`, no second comment). Also a
-  `bd batch` operation (`spec none ID -r WHY`).
+  `bd batch` operation (`spec none ID -r WHY`) and the MCP tool
+  `spec_none`.
 - **List.** Per open spec: its areas, its parent spec (`parent`, marked
   `(sub-spec of P)`) when that is not closed, its requirements and
   non-goals in force, and how many distinct issues that are not spec

@@ -826,9 +826,10 @@ pub(crate) mod forbid_tests {
     const COPY: &str = "BD_TEST_RERUN_COPY";
 
     /// A concurrent build that unlinks the test binary and links a new one at its path leaves `current_exe()`
-    /// reading `<path> (deleted)`; [`rerun`] must still start the code this process runs. A copy of this binary,
-    /// run for this one test, deletes its own file, puts a file that is no program in its place, then reruns; its
-    /// child must pass. The parent is a top-level test, so it never has [`child_dir`] set.
+    /// reading `<path> (deleted)`; [`rerun`] must still start the code this process runs. The parent copies this
+    /// binary through [`this_binary`], so the copy survives a replaced file too; the copy, run for this one test,
+    /// deletes its own file, puts a file that is no program in its place, then reruns; its child must pass. The
+    /// parent is a top-level test, so it never has [`child_dir`] set.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_rerun_runs_this_binary_once_its_file_is_replaced() {
@@ -847,7 +848,9 @@ pub(crate) mod forbid_tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let copy = dir.path().join("copy");
-        std::fs::copy(std::env::current_exe().unwrap(), &copy).unwrap();
+        let src = this_binary();
+        std::fs::copy(&src, &copy)
+            .unwrap_or_else(|e| panic!("copying this test binary {} to {} failed: {e}", src.display(), copy.display()));
         let (_crate, name) = TEST.split_once("::").unwrap();
         // A child another test thread forks while the copy is open for writing holds it until its exec, and the
         // copy cannot be run meanwhile ("text file busy"): wait that out, up to about 5 s.

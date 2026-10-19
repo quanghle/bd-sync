@@ -341,6 +341,49 @@ describe('plan-implement-review', () => {
 			expect((await blocked.run(fakeCtx(ARGS, script()))).status).toBe('done')
 		})
 	})
+
+	describe('record', () => {
+		const SENTENCE =
+			'The single-quoted title after each `bd create` is final: pass it character for character, never rebuilt or reworded from the Text or the finding (bd rejects titles over 500 characters). '
+		// A blocking finding whose triage fails (planner:triage:r0 answers null): the run files it on the step, then escalates.
+		const filing = (over) => script({ 'review:code:r0': { findings: [FOUND] }, 'validate:r0:F1': { valid: true, blocking: true, reasoning: 'real' }, ...over })
+		const run = async (over) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx({ ...ARGS, reviewStep: 'bd-1.review' }, filing(over))
+			return { ctx, got: wf.run(ctx) }
+		}
+		const records = (ctx) => ctx.calls.filter((c) => c.label.startsWith('record:'))
+
+		it.each([
+			['fails', { ok: false, error: 'x' }],
+			['files fewer issues than it was given', { ok: true, filed: [] }],
+		])('escalates once when the record agent %s, and uses the escalated filing', async (_, first) => {
+			const { ctx, got } = await run({ 'record:r0': first, 'record:r0@escalated': { ok: true, filed: [{ id: 'F1', bdId: 'bd-9' }], followedUp: [] } })
+			const out = await got
+			expect(out.status).toBe('escalated')
+			expect(out.open[0].bdId).toBe('bd-9')
+			expect(records(ctx).map((c) => [c.label, c.agent, c.reasoningEffort])).toEqual([
+				['record:r0', 'task', 'low'],
+				['record:r0@escalated', 'general-purpose', 'medium'],
+			])
+		})
+
+		it.each([
+			['fails twice', { ok: false, error: 'bd down' }, /Could not record review round 0 on bd-1\.review \(bd down\)/],
+			['files short twice', { ok: true, filed: [] }, /\(filed 0 of 1\)/],
+			['answers nothing twice', null, /\(record agent failed\)/],
+		])('stops with the last real failure when the record agent %s', async (_, answer, error) => {
+			const { ctx, got } = await run({ 'record:r0': answer, 'record:r0@escalated': answer })
+			await expect(got).rejects.toThrow(error)
+			expect(records(ctx)).toHaveLength(2)
+		})
+
+		it('tells the agent the single-quoted title is final', async () => {
+			const { ctx, got } = await run({ 'record:r0': { ok: true, filed: [{ id: 'F1', bdId: 'bd-9' }], followedUp: [] } })
+			expect((await got).status).toBe('escalated')
+			expect(ctx.calls.find((c) => c.label === 'record:r0').prompt).toContain(`${SENTENCE}Return ok=true`)
+		})
+	})
 })
 
 describe('score-issue', () => {

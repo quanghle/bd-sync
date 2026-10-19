@@ -6,6 +6,7 @@ use std::process::{Command, Output};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod bin;
 mod piped;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -33,7 +34,7 @@ impl Ws {
     }
 
     fn cmd_in(dir: &Path, actor: &str, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_bd"));
+        let mut c = Command::new(bin::bd_exe());
         c.current_dir(dir)
             .args(args)
             .env("BD_ACTOR", actor)
@@ -4910,7 +4911,7 @@ fn edit_refuses_a_concurrent_change_and_keeps_the_edited_text() {
     let editor =
         editor_script(&ws, "race.sh", "\"$BD\" update t-1 --notes theirs >/dev/null 2>&1\nprintf 'Mine\\n' > \"$1\"\n");
     let mut cmd = edit_cmd(&ws, &editor, &["t-1"]);
-    cmd.env("BD", env!("CARGO_BIN_EXE_bd"));
+    cmd.env("BD", bin::bd_exe());
     let (out, shown) = pty::Terminal::spawn(cmd).finish();
     assert_eq!(out.status.code(), Some(13), "{shown}");
     let issue = ws.json(&["show", "t-1"]);

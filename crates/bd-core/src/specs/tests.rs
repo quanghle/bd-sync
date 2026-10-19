@@ -160,6 +160,56 @@ fn warns_about_a_requirement_neither_pinned_nor_closed_direction_controls_droppe
 }
 
 #[test]
+fn warns_about_a_spec_neither_pinned_nor_closed_first() {
+    let open = Node { status: Status::Open, ..labels_spec() };
+    let view = spec_view(&open, &labels_children());
+    assert_eq!(
+        view.warnings,
+        [
+            "s is open, not pinned: pin it (bd update s --status pinned) or close it",
+            "s.7 is open, not pinned: pin it (bd update s.7 --status pinned) or close it",
+        ]
+    );
+    assert!(render(&view, false, 1).contains("> Warning: s is open, not pinned"));
+    let busy = spec_view(&Node { status: Status::InProgress, ..labels_spec() }, &labels_children());
+    assert!(busy.warnings[0].contains("s is in_progress, not pinned"), "{:?}", busy.warnings);
+    let only_s7 = ["s.7 is open, not pinned: pin it (bd update s.7 --status pinned) or close it"];
+    assert_eq!(spec_view(&closed(labels_spec()), &labels_children()).warnings, only_s7);
+    assert_eq!(spec_view(&labels_spec(), &labels_children()).warnings, only_s7);
+}
+
+/// The checkout tree with Payment (c.2) open instead of pinned.
+fn checkout_with_payment_open() -> Vec<Node> {
+    checkout().into_iter().map(|n| if n.id == "c.2" { Node { status: Status::Open, ..n } } else { n }).collect()
+}
+
+#[test]
+fn warns_about_an_unpinned_sub_spec_in_its_nested_view() {
+    let tree = checkout_with_payment_open();
+    let views = spec_views(&[get(&tree, "c")], &Mem(tree.clone())).unwrap();
+    assert!(views[0].warnings.is_empty(), "{:?}", views[0].warnings);
+    assert_eq!(views[0].subspecs[1].spec.id, "c.2");
+    assert_eq!(
+        views[0].subspecs[1].warnings[0],
+        "c.2 is open, not pinned: pin it (bd update c.2 --status pinned) or close it"
+    );
+}
+
+#[test]
+fn carries_an_unpinned_ancestor_specs_warning() {
+    let tree = checkout_with_payment_open();
+    let views = spec_views(&[get(&tree, "c.2.1")], &Mem(tree.clone())).unwrap();
+    assert!(
+        views[0].warnings.contains(
+            &"inherited from c.2: c.2 is open, not pinned: pin it (bd update c.2 --status pinned) or close it"
+                .to_string()
+        ),
+        "{:?}",
+        views[0].warnings
+    );
+}
+
+#[test]
 fn keeps_closed_requirements_as_history_control_characters_dropped() {
     let view = spec_view(&labels_spec(), &labels_children());
     let history: Vec<(&str, &str, Option<&str>, &str)> =
@@ -303,6 +353,74 @@ fn stops_at_the_depth_bound_with_a_warning_and_shows_a_root_past_it_on_its_own()
     );
 }
 
+fn deep_chain() -> Vec<Node> {
+    (0..MAX_DEPTH + 3)
+        .map(|i| {
+            let parent = (i > 0).then(|| format!("d{}", i - 1));
+            sp(&format!("d{i}"), &format!("Level {i}"), parent.as_deref())
+        })
+        .collect()
+}
+
+fn all_spec_ids(views: &[SpecView], out: &mut Vec<String>) {
+    for v in views {
+        out.push(v.spec.id.clone());
+        all_spec_ids(&v.subspecs, out);
+    }
+}
+
+#[test]
+fn prints_every_spec_once_past_the_depth_bound_whatever_the_id_order() {
+    let deep = deep_chain();
+    let src = Mem(deep.clone());
+    let roots = find_specs(&specs_of(&deep), "checkout").unwrap();
+    // In id order d10 comes before d8 and d9, though it sits below them.
+    assert_eq!(roots[2].id, format!("d{}", MAX_DEPTH + 2));
+    let views = spec_views(&roots, &src).unwrap();
+    let mut shown = Vec::new();
+    all_spec_ids(&views, &mut shown);
+    assert_eq!(shown.len(), MAX_DEPTH + 3, "{shown:?}");
+    let mut unique = shown.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), shown.len(), "{shown:?}");
+    let mut all: Vec<String> = deep.iter().map(|n| n.id.clone()).collect();
+    all.sort();
+    assert_eq!(unique, all);
+    assert_eq!(
+        views.iter().map(|x| x.spec.id.clone()).collect::<Vec<_>>(),
+        ["d0".to_string(), format!("d{MAX_DEPTH}")]
+    );
+    let up = ancestors(&format!("d{}", MAX_DEPTH + 2), &src).unwrap();
+    assert_eq!((up.chain.len(), up.depth), (MAX_DEPTH, MAX_DEPTH + 2));
+    assert_eq!(up.warnings.len(), 1, "{:?}", up.warnings);
+    let at_bound = ancestors(&format!("d{MAX_DEPTH}"), &src).unwrap();
+    assert_eq!((at_bound.chain.len(), at_bound.depth), (MAX_DEPTH, MAX_DEPTH));
+    assert!(at_bound.warnings.is_empty(), "{:?}", at_bound.warnings);
+}
+
+#[test]
+fn records_nothing_past_the_depth_bound() {
+    // A closed spec, a cycle or a non-spec past the bound ends the count, with no error or further warning.
+    let mut deep = deep_chain();
+    deep[0] = closed(deep[0].clone());
+    let up = ancestors(&format!("d{}", MAX_DEPTH + 2), &Mem(deep.clone())).unwrap();
+    assert_eq!((up.chain.len(), up.depth), (MAX_DEPTH, MAX_DEPTH + 1));
+    assert!(up.errors.is_empty(), "{:?}", up.errors);
+    assert_eq!(up.warnings.len(), 1, "{:?}", up.warnings);
+    let mut looped = deep_chain();
+    looped[0].parent = Some(format!("d{}", MAX_DEPTH + 2));
+    let up = ancestors(&format!("d{}", MAX_DEPTH + 2), &Mem(looped)).unwrap();
+    assert_eq!((up.chain.len(), up.depth), (MAX_DEPTH, MAX_DEPTH + 2));
+    assert_eq!(up.warnings.len(), 1, "{:?}", up.warnings);
+    let mut cut = deep_chain();
+    cut[0] = node("d0", "Epic", Status::Open, &[], Some("top"));
+    cut.push(sp("top", "Top", None));
+    let up = ancestors(&format!("d{}", MAX_DEPTH + 2), &Mem(cut)).unwrap();
+    assert_eq!((up.chain.len(), up.depth), (MAX_DEPTH, MAX_DEPTH + 1));
+    assert_eq!(up.warnings.len(), 1, "{:?}", up.warnings);
+}
+
 #[test]
 fn stops_at_a_cycle_with_a_warning() {
     let lp = vec![sp("a", "A", Some("b")), sp("b", "B", Some("a"))];
@@ -313,6 +431,7 @@ fn stops_at_a_cycle_with_a_warning() {
         ancestors("a", &src).unwrap(),
         Ancestry {
             chain: vec![lp[1].clone()],
+            depth: 1,
             warnings: vec!["a is its own ancestor: the chain stops there".into()],
             errors: vec![]
         }
@@ -473,6 +592,10 @@ fn show_reads_the_tree_from_the_workspace() {
     let e = ws.store.read(|r| show(r.conn(), "nope")).unwrap_err();
     assert_eq!(e.exit_code(), 3);
     assert!(ws.store.read(|r| show(r.conn(), &work)).is_err(), "not a spec");
+    // A prefix matching several issues (the spec's children) is ambiguous, not unknown.
+    let e = ws.store.read(|r| show(r.conn(), &format!("{spec}."))).unwrap_err();
+    assert_eq!(e.exit_code(), 2, "{e}");
+    assert!(e.to_string().contains("ambiguous id"), "{e}");
 
     let list = ws.read(list);
     assert_eq!(list.len(), 2);
@@ -587,6 +710,58 @@ fn drift_reports_each_kind_and_partitions_work_at_since() {
     // A since before everything takes the old work in too.
     let all = ws.read(|c| drift(c, Some(Timestamp(0))));
     assert!(ref_ids(&all.unlinked).contains(&old.as_str()));
+}
+
+#[test]
+fn drift_lists_specs_neither_pinned_nor_closed_in_id_order_once() {
+    let mut ws = Ws::new();
+    let draft = ws.create(titled("Draft", &["spec"], None));
+    let loose = ws.create(titled("Loose", &["requirement"], Some(&draft)));
+    ws.create(pinned("Pinned spec", &["spec"], None));
+    let both = ws.create(titled("Both", &["spec", "requirement"], None));
+    assert_eq!((draft.as_str(), loose.as_str(), both.as_str()), ("t-1", "t-1.1", "t-3"));
+    let d = ws.read(|c| drift(c, Some(Timestamp(0))));
+    assert_eq!(ref_ids(&d.bad_status), [draft.as_str(), loose.as_str(), both.as_str()], "sorted by id, each once");
+    assert!(d.orphaned.is_empty());
+    assert_eq!(d.count(), 3);
+
+    // An open orphan not pinned is both: two problems, two fixes.
+    let retired = ws.create(pinned("Retired", &["spec"], None));
+    let orphan = ws.create(titled("Orphan", &["spec"], Some(&retired)));
+    ws.close(&retired);
+    let d = ws.read(|c| drift(c, Some(Timestamp(0))));
+    assert_eq!(
+        d.orphaned.iter().map(|o| (o.spec.id.as_str(), o.parent.as_str())).collect::<Vec<_>>(),
+        [(orphan.as_str(), retired.as_str())]
+    );
+    assert!(ref_ids(&d.bad_status).contains(&orphan.as_str()), "{:?}", d.bad_status);
+    assert!(!ref_ids(&d.bad_status).contains(&retired.as_str()), "a closed spec is not bad status");
+}
+
+#[test]
+fn list_names_a_closed_parent_spec_apart() {
+    let mut ws = Ws::new();
+    let p = ws.create(pinned("Parent", &["spec"], None));
+    let s = ws.create(pinned("Sub", &["spec"], Some(&p)));
+    ws.create(pinned("Other sub", &["spec"], Some(&p)));
+    let e = ws.create(NewIssue { issue_type: Some("epic".into()), ..NewIssue::titled("Epic") });
+    let x = ws.create(pinned("Under an epic", &["spec"], Some(&e)));
+    let entry = |list: &[SpecSummary], id: &str| {
+        let s = list.iter().find(|s| s.id == id).expect("listed");
+        (s.parent.clone(), s.closed_parent.clone())
+    };
+
+    let before = ws.read(list);
+    assert_eq!(entry(&before, &s), (Some(p.clone()), None), "an open parent spec");
+    assert_eq!(entry(&before, &x), (None, None), "a parent that is not a spec");
+
+    ws.close(&p);
+    let after = ws.read(list);
+    assert!(after.iter().all(|s| s.id != p), "a closed spec is not listed");
+    assert_eq!(entry(&after, &s), (None, Some(p.clone())), "an orphan names its closed parent apart");
+    assert_eq!(entry(&after, &x), (None, None));
+    let json = serde_json::to_value(&after).unwrap();
+    assert!(json.as_array().unwrap().iter().all(|s| s.as_object().unwrap().contains_key("closed_parent")));
 }
 
 #[test]

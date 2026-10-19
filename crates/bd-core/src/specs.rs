@@ -305,9 +305,19 @@ fn no_spec(arg: &str) -> Error {
     Error::not_found("spec", format!("{arg} (name a spec issue's id or its area:<name> label)"))
 }
 
+/// The warning for a spec, requirement or non-goal neither pinned nor closed.
+fn not_pinned(id: &str, status: Status) -> String {
+    format!(
+        "{id} is {status}, not pinned: pin it (bd update {id} --status pinned) or close it",
+        status = status.as_str()
+    )
+}
+
 /// The view of `spec` from its children: requirements and non-goals in
-/// creation order, closed ones as history, a warning for each one neither
-/// pinned nor closed. No errors, inheritance or sub-specs yet.
+/// creation order, closed ones as history, a warning first for the spec
+/// itself when it is neither pinned nor closed, then one for each
+/// requirement or non-goal neither pinned nor closed. No errors,
+/// inheritance or sub-specs yet.
 pub fn spec_view(spec: &Node, children: &[Node]) -> SpecView {
     let mut reqs: Vec<&Node> = children.iter().filter(|c| c.has(REQUIREMENT) || c.has(NON_GOAL)).collect();
     reqs.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
@@ -318,6 +328,11 @@ pub fn spec_view(spec: &Node, children: &[Node]) -> SpecView {
         sources: r.related.clone(),
     };
     let live: Vec<&Node> = reqs.iter().copied().filter(|r| r.status != Status::Closed).collect();
+    let mut warnings = Vec::new();
+    if !matches!(spec.status, Status::Pinned | Status::Closed) {
+        warnings.push(not_pinned(&spec.id, spec.status));
+    }
+    warnings.extend(live.iter().filter(|r| r.status != Status::Pinned).map(|r| not_pinned(&r.id, r.status)));
     SpecView {
         spec: SpecRef { id: spec.id.clone(), title: clean(&spec.title), description: clean(&spec.description) },
         requirements: live.iter().filter(|r| !r.has(NON_GOAL)).map(|r| item(r)).collect(),
@@ -337,17 +352,7 @@ pub fn spec_view(spec: &Node, children: &[Node]) -> SpecView {
             })
             .collect(),
         errors: Vec::new(),
-        warnings: live
-            .iter()
-            .filter(|r| r.status != Status::Pinned)
-            .map(|r| {
-                format!(
-                    "{id} is {status}, not pinned: pin it (bd update {id} --status pinned) or close it",
-                    id = r.id,
-                    status = r.status.as_str()
-                )
-            })
-            .collect(),
+        warnings,
         inherited: Vec::new(),
         subspecs: Vec::new(),
     }
@@ -358,42 +363,49 @@ pub fn spec_view(spec: &Node, children: &[Node]) -> SpecView {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Ancestry {
     pub chain: Vec<Node>,
+    /// How many open specs are above along the same walk, with no
+    /// [`MAX_DEPTH`] cap; equal to `chain.len()` unless the cap was hit.
+    pub depth: usize,
     pub warnings: Vec<String>,
     pub errors: Vec<String>,
 }
 
 /// The ancestor specs of `id`. Only an open spec continues the chain: a
 /// closed spec ends it with an error (an open spec under a closed one is
-/// always a mistake), an issue that is not a spec, [`MAX_DEPTH`] or a cycle
-/// with a warning.
+/// always a mistake), an issue that is not a spec or a cycle with a warning.
+/// Past [`MAX_DEPTH`] the chain stops with a warning, but the walk goes on
+/// only to count `depth`, recording nothing more.
 pub fn ancestors(id: &str, src: &dyn Source) -> Result<Ancestry> {
     let mut up = Ancestry::default();
     let mut seen: HashSet<String> = HashSet::from([id.to_string()]);
     let mut at = id.to_string();
     let mut parent = src.node(id)?.and_then(|n| n.parent);
+    let mut capped = false;
     while let Some(p) = parent {
         let issue = src.node(&p)?;
         let Some(issue) = issue.filter(Node::is_spec) else {
-            // Worth a warning only when it cuts a spec off: some spec above it would have passed requirements down.
-            let mut above = src.node(&p)?.and_then(|n| n.parent);
-            let mut n = 0;
-            while let Some(a) = above.clone() {
-                if n >= MAX_DEPTH || is_spec(src.node(&a)?.as_ref()) {
-                    break;
+            if !capped {
+                // Worth a warning only when it cuts a spec off: some spec above it would have passed requirements down.
+                let mut above = src.node(&p)?.and_then(|n| n.parent);
+                let mut n = 0;
+                while let Some(a) = above.clone() {
+                    if n >= MAX_DEPTH || is_spec(src.node(&a)?.as_ref()) {
+                        break;
+                    }
+                    above = src.node(&a)?.and_then(|x| x.parent);
+                    n += 1;
                 }
-                above = src.node(&a)?.and_then(|x| x.parent);
-                n += 1;
-            }
-            if let Some(a) = above
-                && is_spec(src.node(&a)?.as_ref())
-            {
-                up.warnings.push(format!("{at}'s parent {p} is not a spec: spec {a} above it is not inherited"));
+                if let Some(a) = above
+                    && is_spec(src.node(&a)?.as_ref())
+                {
+                    up.warnings.push(format!("{at}'s parent {p} is not a spec: spec {a} above it is not inherited"));
+                }
             }
             break;
         };
         if issue.status == Status::Closed {
             // Only an open spec under a closed one is a mistake: a closed spec under a closed one was retired with it.
-            if src.node(&at)?.map(|n| n.status) != Some(Status::Closed) {
+            if !capped && src.node(&at)?.map(|n| n.status) != Some(Status::Closed) {
                 up.errors.push(format!(
                     "{at} is open but its parent spec {p} is closed, so it inherits nothing. Fix: reopen {p} if it was \
                      closed by mistake (bd reopen {p}, then bd update {p} --status pinned); close {at} if the feature \
@@ -404,17 +416,23 @@ pub fn ancestors(id: &str, src: &dyn Source) -> Result<Ancestry> {
             break;
         }
         if seen.contains(&p) {
-            up.warnings.push(format!("{p} is its own ancestor: the chain stops there"));
+            if !capped {
+                up.warnings.push(format!("{p} is its own ancestor: the chain stops there"));
+            }
             break;
         }
-        if up.chain.len() >= MAX_DEPTH {
+        if !capped && up.chain.len() >= MAX_DEPTH {
             up.warnings.push(format!("{id} is nested deeper than {MAX_DEPTH} specs: nothing above {at} is inherited"));
-            break;
+            capped = true;
         }
+        // Past the cap the walk only counts how deep `id` is, so roots can be placed shallowest first.
         seen.insert(p.clone());
         parent = issue.parent.clone();
-        up.chain.push(issue);
-        at = p;
+        up.depth += 1;
+        if !capped {
+            up.chain.push(issue);
+            at = p;
+        }
     }
     Ok(up)
 }
@@ -467,13 +485,16 @@ fn tree(
 /// The views of the spec issues `roots`. Each nests its open sub-specs and
 /// lists in `inherited` the requirements in force of the specs above it,
 /// outermost first. A root shown inside an earlier root's tree is left out;
-/// roots are taken shallowest first, and the views kept in `roots`' order.
+/// roots are taken shallowest first by their true depth (past
+/// [`MAX_DEPTH`] too, so a root is always placed before any root its tree
+/// would show), and the views kept in `roots`' order: every spec is shown
+/// once.
 pub fn spec_views(roots: &[Node], src: &dyn Source) -> Result<Vec<SpecView>> {
     let mut placed = Vec::with_capacity(roots.len());
     for (i, r) in roots.iter().enumerate() {
         placed.push((i, src.node(&r.id)?.unwrap_or_else(|| r.clone()), ancestors(&r.id, src)?));
     }
-    placed.sort_by_key(|(_, _, up)| up.chain.len());
+    placed.sort_by_key(|(_, _, up)| up.depth);
     let mut shown = HashSet::new();
     let mut views: Vec<(usize, SpecView)> = Vec::new();
     for (i, issue, up) in placed {
@@ -510,13 +531,14 @@ fn spec_nodes(src: &DbSource<'_>) -> Result<Vec<Node>> {
 
 /// The views of the specs `arg` names: a spec's id (or an id `bd show`
 /// would resolve to one), or an area (every open spec labelled
-/// `area:<arg>`). Not found (exit 3) when it names none.
+/// `area:<arg>`). Not found (exit 3) when it names none; an id prefix
+/// matching several issues is `bd show`'s ambiguous id error (exit 2).
 pub fn show(conn: &Connection, arg: &str) -> Result<Vec<SpecView>> {
     let src = DbSource::new(conn);
     let specs = spec_nodes(&src)?;
     let roots = match find_specs(&specs, arg.trim()) {
         Ok(roots) => roots,
-        Err(e) => match issues::lookup_id(conn, arg).ok().flatten() {
+        Err(e) => match issues::lookup_id(conn, arg)? {
             Some(id) => match specs.iter().find(|s| s.id == id) {
                 Some(s) => vec![s.clone()],
                 None => return Err(e),
@@ -777,7 +799,8 @@ pub struct Drift {
     pub unlinked: Vec<IssueRef>,
     /// Requirements and non-goals in force whose source was reopened or failed.
     pub shaky: Vec<Shaky>,
-    /// Requirements and non-goals neither pinned nor closed.
+    /// Specs, requirements and non-goals neither pinned nor closed, in id
+    /// order, each once.
     pub bad_status: Vec<IssueRef>,
     /// Open specs whose parent spec is closed.
     pub orphaned: Vec<Orphaned>,
@@ -832,6 +855,9 @@ pub fn drift(conn: &Connection, since: Option<Timestamp>) -> Result<Drift> {
         if spec.status == Status::Closed {
             continue;
         }
+        if spec.status != Status::Pinned {
+            bad_status.push(spec.to_ref());
+        }
         if let Some(p) = graph::parent_of(conn, &id)?
             && let Some(parent) = issues::get(conn, &p)?
             && parent.status == Status::Closed
@@ -840,6 +866,9 @@ pub fn drift(conn: &Connection, since: Option<Timestamp>) -> Result<Drift> {
             orphaned.push(Orphaned { spec: spec.to_ref(), parent: p });
         }
     }
+    // String order, as the requirements' set; an issue labelled both spec and requirement once.
+    bad_status.sort_by(|a, b| a.id.cmp(&b.id));
+    bad_status.dedup_by(|a, b| a.id == b.id);
     Ok(Drift { since, unlinked, shaky, bad_status, orphaned, to_link })
 }
 
@@ -928,8 +957,10 @@ pub struct SpecSummary {
     pub status: Status,
     /// Its `area:<name>` labels' names.
     pub areas: Vec<String>,
-    /// The spec it is a sub-spec of.
+    /// Its parent spec, when that is not closed.
     pub parent: Option<String>,
+    /// Its parent spec when that is closed (an orphan: then `parent` is None).
+    pub closed_parent: Option<String>,
     /// Requirements in force (not closed), and non-goals.
     pub requirements: usize,
     pub non_goals: usize,
@@ -958,9 +989,13 @@ pub fn list(conn: &Connection) -> Result<Vec<SpecSummary>> {
         }
         let live =
             |non_goal: bool| reqs.iter().filter(|r| r.status != Status::Closed && r.has(NON_GOAL) == non_goal).count();
-        let parent = match &spec.parent {
-            Some(p) if is_spec(src.node(p)?.as_ref()) => Some(p.clone()),
-            _ => None,
+        let (parent, closed_parent) = match &spec.parent {
+            Some(p) => match src.node(p)? {
+                Some(n) if n.is_spec() && n.status == Status::Closed => (None, Some(p.clone())),
+                Some(n) if n.is_spec() => (Some(p.clone()), None),
+                _ => (None, None),
+            },
+            None => (None, None),
         };
         out.push(SpecSummary {
             areas: spec.labels.iter().filter_map(|l| l.strip_prefix("area:")).map(clean).collect(),
@@ -968,6 +1003,7 @@ pub fn list(conn: &Connection) -> Result<Vec<SpecSummary>> {
             non_goals: live(true),
             linked: linked.len(),
             parent,
+            closed_parent,
             title: clean(&spec.title),
             status: spec.status,
             id: spec.id,

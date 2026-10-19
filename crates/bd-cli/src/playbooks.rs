@@ -911,20 +911,25 @@ pub fn attach_bundle(app: &App, remote: &Remote, cmd: &Command, request: &mut Ex
         match lookup(&places, || client_source(app, remote)) {
             Lookup::Everywhere => built?,
             Lookup::ServerOnly => {
-                let mut skipped: Vec<&PathBuf> =
-                    targets.iter().filter(|t| t.parent() == Some(checkout.as_path())).collect();
-                skipped.sort();
-                skipped.dedup();
-                for path in skipped {
+                let rest = Loader::new(paths.into_iter().filter(|p| *p != checkout).collect());
+                let rebuilt = match rest.locate(r, cwd) {
+                    Ok(_) => rest.bundle(reference, cwd),
+                    Err(Error::NotFound { .. }) => Err(name_not_found(r, true)),
+                    Err(e) => Err(e),
+                };
+                // The checkout's copies skipped: those of the names this lookup resolved; if it
+                // failed, those of the command line's and of the names the whole path resolved.
+                let skipped = match &rebuilt {
+                    Ok(b) => checkout_copies(&checkout, by_name(b).map(|(name, _)| name)),
+                    Err(_) => checkout_copies(
+                        &checkout,
+                        std::iter::once(r).chain(built.iter().flat_map(|b| by_name(b).map(|(name, _)| name))),
+                    ),
+                };
+                for path in &skipped {
                     warn_ignored(path);
                 }
-                let rest = Loader::new(paths.into_iter().filter(|p| *p != checkout).collect());
-                match rest.locate(r, cwd) {
-                    Ok(_) => {}
-                    Err(Error::NotFound { .. }) => return Err(name_not_found(r, true)),
-                    Err(e) => return Err(e),
-                }
-                let bundle = rest.bundle(reference, cwd)?;
+                let bundle = rebuilt?;
                 refuse_served_unapproved(app, remote, &bundle, approved_dir.as_deref())?;
                 bundle
             }
@@ -972,7 +977,7 @@ enum Lookup {
     Everywhere,
     /// `playbooks.source = server`: among the server's approved here, then
     /// the user's own for names the server does not serve; the checkout's
-    /// copies are skipped (and warned about).
+    /// copies of the names it looks up are skipped (and warned about).
     ServerOnly,
 }
 
@@ -1072,6 +1077,18 @@ fn by_name(bundle: &Bundle) -> impl Iterator<Item = (&str, &Path)> {
         .flat_map(|refs| refs.iter())
         .filter(|(reference, _)| !playbook::is_path_like(reference.trim()))
         .map(|(reference, target)| (reference.trim(), Path::new(target.as_str())))
+}
+
+/// The checkout's copies (files in `checkout`, its `.bd/playbooks`) of the
+/// playbooks `names`, found as the client's lookup finds them (each extension
+/// in order, without parsing, so a copy that does not load is found too),
+/// sorted, each once.
+fn checkout_copies<'a>(checkout: &Path, names: impl IntoIterator<Item = &'a str>) -> Vec<PathBuf> {
+    let only = Loader::new(vec![checkout.to_path_buf()]);
+    let mut copies: Vec<PathBuf> = names.into_iter().filter_map(|n| only.locate(n, None).ok()).collect();
+    copies.sort();
+    copies.dedup();
+    copies
 }
 
 /// The names a bundle resolved outside the approved playbooks directory
@@ -1465,6 +1482,21 @@ mod tests {
             "{w}"
         );
         assert!(!w.chars().any(|c| c.is_control() || c == '\u{202e}'), "{w}");
+    }
+
+    #[test]
+    fn the_checkout_copies_of_the_names_looked_up_are_each_named_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        std::fs::write(dir.join("review.toml"), "[[steps]]\nid = \"review\"\n").unwrap();
+        // A copy that does not load is found all the same.
+        std::fs::write(dir.join("base.toml"), "[[steps]]\nbogus = 1\n").unwrap();
+        std::fs::write(dir.join("unused.toml"), "[[steps]]\nid = \"unused\"\n").unwrap();
+        assert_eq!(
+            checkout_copies(dir, ["review", "base", "review", "absent"]),
+            vec![dir.join("base.toml"), dir.join("review.toml")]
+        );
+        assert!(checkout_copies(dir, std::iter::empty()).is_empty());
     }
 
     #[test]

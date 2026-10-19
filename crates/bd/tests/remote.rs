@@ -1528,7 +1528,8 @@ fn playbooks_source_server_holds_for_the_names_a_playbook_extends_or_expands() {
         "{stderr}"
     );
 
-    // A checkout copy of a parent that does not load, which server mode skips, does not stop an approved playbook.
+    // A checkout copy of a parent that does not load, which server mode skips, does not stop an approved
+    // playbook, and is warned about; the checkout's review.toml, which `based` does not use, is not.
     write(&on_server, "based.toml", "extends = \"base\"\n[[steps]]\nid = \"own\"\n");
     write(&on_server, "base.toml", "[[steps]]\nid = \"approved-base\"\n");
     approve_playbooks(&alice, &on_server, &["base.toml", "based.toml"]);
@@ -1536,6 +1537,19 @@ fn playbooks_source_server_holds_for_the_names_a_playbook_extends_or_expands() {
     let (code, keys, stderr) = plan("based");
     assert_eq!(code, Some(0), "{stderr}");
     assert!(keys.iter().any(|k| k == "approved-base"), "{keys:?} {stderr}");
+    let warnings: Vec<&str> = stderr.lines().filter(|l| l.starts_with("warning: ignoring ")).collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].replace('\\', "/").contains(".bd/playbooks/base.toml"), "{stderr}");
+
+    // A parent only the checkout holds (one that loads): skipped and warned about, and not found (exit 3).
+    write(&on_server, "nested.toml", "extends = \"local\"\n[[steps]]\nid = \"own\"\n");
+    approve_playbooks(&alice, &on_server, &["nested.toml"]);
+    write(&alice.dir.path().join(".bd").join("playbooks"), "local.toml", "[[steps]]\nid = \"checkout-local\"\n");
+    let (code, _, stderr) = plan("nested");
+    assert_eq!(code, Some(3), "{stderr}");
+    let warnings: Vec<&str> = stderr.lines().filter(|l| l.starts_with("warning: ignoring ")).collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].replace('\\', "/").contains(".bd/playbooks/local.toml"), "{stderr}");
 
     // list: the source is known (asked) for a user's playbook of a name the server serves, with no checkout ones.
     let bob = server.client(&server.token("bob-laptop", "bob", &[]));

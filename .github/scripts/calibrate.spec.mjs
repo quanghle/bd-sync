@@ -375,6 +375,27 @@ describe('aggregate and render', () => {
 		expect(agg.mainPerRequest).toEqual([{ id: 'r1', requests: 4, perRequest: 100_000 }])
 	})
 
+	it('merges one model named both ways (Claude Code and Copilot ids) into one role row, priced on the raw id', () => {
+		const table = { cache_write_multiplier: 1.25, cache_write_1h_multiplier: 2, models: { 'claude-opus-5-5': { input: 4, output: 20, cache_read: 0.2 } }, source: 'test table', note: 'test note' }
+		const ta = { input: 1e6, output: 0, cache_read: 0, cache_write: 0, output_unknown: 2 }
+		const tb = tokens(1, 1, 0, 0, 100)
+		const a = agent('workflow', 'wf:review:code', 3, ta, 'claude-opus-5-5', 'high', at('00:00', '01:00', '02:00'))
+		const b = agent('workflow', 'wf:review:code', 2, tb, 'claude-opus-5.5', 'high', at('00:00', '00:30', '01:00'))
+		const wa = work(a)
+		const wb = work(b)
+		const agg2 = aggregate([{ id: 'a', work: wa }, { id: 'b', work: wb }], table)
+		const rows2 = agg2.roles.filter((x) => x.role === 'reviewer')
+		expect(rows2.length).toBe(1)
+		expect(rows2[0]).toMatchObject({ model: 'claude-opus-5.5', effort: 'high', runs: 2, requests: 5, unpriced: 0, outputUnknown: 2, activeMs: 3 * 60_000 })
+		expect(rows2[0].cost).toBeCloseTo(costOf(ta, 'claude-opus-5-5', table) + costOf(tb, 'claude-opus-5.5', table))
+		expect(rows2[0].cost).toBeCloseTo(5)
+		expect(agg2.runCosts.a.cost).toBeCloseTo(4)
+		expect(agg2.runCosts.b.cost).toBeCloseTo(1)
+		const md = render([{ id: 'a', tier: 'small', findings: { serious: 0, minor: 0, followUps: [] }, traced: 'stored', work: wa }, { id: 'b', tier: 'small', findings: { serious: 0, minor: 0, followUps: [] }, traced: 'stored', work: wb }], agg2, table)
+		expect(md).toContain('| reviewer | claude-opus-5.5 | high | 2 | 5 |')
+		expect(/\| reviewer \| claude-opus-5-5 \|/.test(md)).toBe(false)
+	})
+
 	it('times roles by model and effort: first request to the end of the last, else (v1) the last request, or a stored span', () => {
 		expect(agg.roles.find((x) => x.role === 'reviewer').activeMs).toBe(4.5 * 60_000)
 		expect(agg.roles.find((x) => x.role === 'main').activeMs).toBe(2 * 60_000)

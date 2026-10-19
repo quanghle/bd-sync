@@ -287,8 +287,10 @@ export function aggregate(runs, prices = PRICES) {
       runCosts.set(r.id, rc)
       // An overlapping run's requests are already in the run kept for its group.
       if (overlap.excluded.has(r.id)) continue
-      const key = `${roleOf(a)}\0${a.model}\0${a.effort}`
-      const x = roles.get(key) ?? { role: roleOf(a), model: a.model, effort: a.effort, runs: new Set(), requests: 0, cost: 0, activeMs: 0, unpriced: 0, outputUnknown: 0 }
+      // One name per model across harnesses (Claude Code's claude-opus-5-5, Copilot's claude-opus-5.5); prices stay on the raw id.
+      const model = canonicalModel(a.model)
+      const key = `${roleOf(a)}\0${model}\0${a.effort}`
+      const x = roles.get(key) ?? { role: roleOf(a), model, effort: a.effort, runs: new Set(), requests: 0, cost: 0, activeMs: 0, unpriced: 0, outputUnknown: 0 }
       x.runs.add(r.id)
       x.requests += a.requests
       x.activeMs += activeMs(a)

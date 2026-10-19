@@ -87,6 +87,13 @@ pub fn resolve_id(conn: &Connection, input: &str) -> Result<String> {
 /// [`resolve_id`]'s rules without its failure for an unknown id: `None` when
 /// the trimmed input is empty or matches nothing; still an error when it is
 /// ambiguous (`parent = X` in `bd query`).
+///
+/// After the exact id and `<prefix>-<input>`, each of the two is tried as a
+/// unique id prefix matched ignoring ASCII case, with `%`, `_` and `\`
+/// literal. That search seeks the primary key over the prefix's case
+/// variants ([`case_variants`]); past [`FRONTIER_CAP`] variants, or for a
+/// candidate holding a NUL or longer than [`MAX_WALK_BYTES`], it falls back
+/// to the `LIKE` query it replaced, so every input keeps that answer.
 pub fn lookup_id(conn: &Connection, input: &str) -> Result<Option<String>> {
     let input = input.trim();
     if input.is_empty() {
@@ -101,9 +108,7 @@ pub fn lookup_id(conn: &Connection, input: &str) -> Result<Option<String>> {
     }
     let mut matches: Vec<String> = Vec::new();
     for candidate in [input, prefixed.as_str()] {
-        let mut stmt = conn.prepare_cached("SELECT id FROM issues WHERE id LIKE ?1 ESCAPE '\\' ORDER BY id LIMIT 6")?;
-        for row in stmt.query_map([format!("{}%", like_escape(candidate))], |r| r.get::<_, String>(0))? {
-            let id = row?;
+        for id in prefix_matches(conn, candidate)? {
             if !matches.contains(&id) {
                 matches.push(id);
             }
@@ -114,6 +119,86 @@ pub fn lookup_id(conn: &Connection, input: &str) -> Result<Option<String>> {
         1 => Ok(Some(matches.remove(0))),
         _ => Err(Error::invalid(format!("ambiguous id {input:?}: matches {}", matches.join(", ")))),
     }
+}
+
+/// How many case variants of a prefix [`case_variants`] follows before it
+/// gives up and [`prefix_matches`] falls back to `LIKE`. Only many explicit
+/// or imported ids that differ just in case pass it.
+const FRONTIER_CAP: usize = 32;
+
+/// The length past which a candidate takes the `LIKE` fallback. No id is
+/// that long, and SQLite's `LIKE` refuses patterns past its limit ("pattern
+/// too complex"), so the fallback keeps that answer.
+const MAX_WALK_BYTES: usize = 1024;
+
+/// The exclusive upper bound of the ids starting with `prefix`. Ids are ASCII
+/// (generated base36, [`ids::validate_explicit_id`] for `--id` and imports,
+/// validated prefixes), and U+10FFFF's UTF-8 sorts after every ASCII byte, so
+/// `[prefix, above(prefix))` holds exactly the ids that start with `prefix`.
+fn above(prefix: &str) -> String {
+    format!("{prefix}{}", char::MAX)
+}
+
+/// The variants of `candidate` that differ from it only in ASCII case and
+/// that some id starts with, found one character at a time by seeking the
+/// primary key, so a typo stops at its first wrong character. `None` when
+/// more than [`FRONTIER_CAP`] variants survive a character, or for what the
+/// walk cannot model as `LIKE` does: a NUL (where SQLite's `LIKE` stops
+/// reading its pattern) or a candidate longer than [`MAX_WALK_BYTES`].
+fn case_variants(conn: &Connection, candidate: &str) -> Result<Option<Vec<String>>> {
+    if candidate.contains('\0') || candidate.len() > MAX_WALK_BYTES {
+        return Ok(None);
+    }
+    let mut stmt = conn.prepare_cached("SELECT 1 FROM issues WHERE id >= ?1 AND id < ?2 LIMIT 1")?;
+    let mut frontier = vec![String::new()];
+    for c in candidate.chars() {
+        // SQLite's built-in LIKE folds ASCII letters only.
+        let (lower, upper) = (c.to_ascii_lowercase(), c.to_ascii_uppercase());
+        let options: &[char] = if c.is_ascii_alphabetic() { &[lower, upper] } else { &[c] };
+        let mut kept = Vec::new();
+        for p in &frontier {
+            for v in options {
+                let mut q = p.clone();
+                q.push(*v);
+                if stmt.exists(params![q, above(&q)])? {
+                    kept.push(q);
+                    if kept.len() > FRONTIER_CAP {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        if kept.is_empty() {
+            return Ok(Some(kept));
+        }
+        frontier = kept;
+    }
+    Ok(Some(frontier))
+}
+
+/// The first few ids, in id order, that start with `candidate` ignoring
+/// ASCII case: the answer of `id LIKE '<candidate>%' ORDER BY id LIMIT 6`.
+fn prefix_matches(conn: &Connection, candidate: &str) -> Result<Vec<String>> {
+    if let Some(variants) = case_variants(conn, candidate)? {
+        let mut stmt = conn.prepare_cached("SELECT id FROM issues WHERE id >= ?1 AND id < ?2 ORDER BY id LIMIT 6")?;
+        let mut ids = Vec::new();
+        for v in &variants {
+            for row in stmt.query_map(params![v, above(v)], |r| r.get::<_, String>(0))? {
+                ids.push(row?);
+            }
+        }
+        // String order is SQLite's BINARY order, and the first 6 of the union
+        // are among the union of each variant's first 6.
+        ids.sort();
+        ids.dedup();
+        ids.truncate(6);
+        return Ok(ids);
+    }
+    let mut stmt = conn.prepare_cached("SELECT id FROM issues WHERE id LIKE ?1 ESCAPE '\\' ORDER BY id LIMIT 6")?;
+    let ids = stmt
+        .query_map([format!("{}%", like_escape(candidate))], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(ids)
 }
 
 pub fn list(conn: &Connection, q: &ListQuery) -> Result<Vec<Issue>> {
@@ -1380,3 +1465,6 @@ pub struct PurgeOutcome {
     pub detached: Vec<String>,
     pub dry_run: bool,
 }
+
+#[cfg(test)]
+mod tests;

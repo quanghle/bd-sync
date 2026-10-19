@@ -167,7 +167,8 @@ your own paths (2 and 3 above) only for a name the server does not serve.
 A name the server serves but this machine has not approved is not found
 (exit 3, saying how to approve it), even when your own paths have a copy;
 names compare ignoring case (`CHANGE` is `change.toml`). Each checkout copy
-skipped gets one warning on stderr naming it (the exit code is unchanged).
+of a name it looks up gets one warning on stderr naming it, even a copy that
+does not load (the exit code is unchanged).
 `bd playbook list` lists the checkout's last, marked `(ignored:
 playbooks.source = server)` (`"ignored": true` in JSON), shadowing nothing,
 and marks your own of a name the server serves and this machine has not

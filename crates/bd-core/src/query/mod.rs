@@ -63,13 +63,16 @@ pub const MAX_CANONICAL_BYTES: usize = 2 * MAX_BYTES + 16 * MAX_COMPARISONS;
 /// Height of the compiled SQL: SQLite parses a k-term `AND`/`OR` chain as a
 /// left-deep tree of height k-1, and there are at most 127 binary AND/OR
 /// nodes in all ([`MAX_COMPARISONS`] - 1). A path also crosses at most 32
-/// `NOT` nodes, one more for a `!=`, and about 7 inside the heaviest
-/// comparison (COALESCE, EXISTS, the subquery's AND, LIKE/ESCAPE, a date
-/// range); the statement's `WHERE 1=1 AND (...)` adds about 3. That is about
-/// 170 at most, against SQLITE_MAX_EXPR_DEPTH = 1000 in the bundled SQLite
-/// (whose parser stack grows on demand). Parameters number at most 2 per
-/// comparison (256), far below SQLITE_MAX_VARIABLE_NUMBER. The at-limit
-/// tests compile and run the worst cases.
+/// `NOT` nodes, one more for a `!=`, and about 8 inside the heaviest
+/// comparison: `spec`/`area`'s `IN (WITH RECURSIVE ...)` subquery (the `IN`,
+/// its compound `UNION` selects, and a recursive join's `ON ... AND ...`),
+/// ahead of the others (COALESCE, EXISTS, the subquery's AND, LIKE/ESCAPE, a
+/// date range); the statement's `WHERE 1=1 AND (...)` adds about 3. That is
+/// about 170 at most, against SQLITE_MAX_EXPR_DEPTH = 1000 in the bundled
+/// SQLite (whose parser stack grows on demand). Parameters number at most 2
+/// per comparison (256; `spec` and `area` bind 1), far below
+/// SQLITE_MAX_VARIABLE_NUMBER. The at-limit tests compile and run the worst
+/// cases.
 pub const MAX_DEPTH: usize = 32;
 
 /// The most comparisons in one query. It bounds the AND/OR chains (loops in
@@ -97,10 +100,14 @@ pub enum Field {
     Defer,
     Pinned,
     Ephemeral,
+    /// The feature spec whose links cover the issue (experimental specs).
+    Spec,
+    /// The area of a feature spec whose links cover the issue.
+    Area,
 }
 
 impl Field {
-    pub const ALL: [Field; 18] = [
+    pub const ALL: [Field; 20] = [
         Field::Status,
         Field::Priority,
         Field::Type,
@@ -119,6 +126,8 @@ impl Field {
         Field::Defer,
         Field::Pinned,
         Field::Ephemeral,
+        Field::Spec,
+        Field::Area,
     ];
 
     pub fn name(self) -> &'static str {
@@ -141,6 +150,8 @@ impl Field {
             Field::Defer => "defer",
             Field::Pinned => "pinned",
             Field::Ephemeral => "ephemeral",
+            Field::Spec => "spec",
+            Field::Area => "area",
         }
     }
 
@@ -158,7 +169,7 @@ impl Field {
     pub fn ops(self) -> &'static [Op] {
         use Op::*;
         match self {
-            Field::Status | Field::Parent | Field::Pinned | Field::Ephemeral => &[Eq, Ne],
+            Field::Status | Field::Parent | Field::Pinned | Field::Ephemeral | Field::Spec | Field::Area => &[Eq, Ne],
             Field::Priority => &[Eq, Ne, Lt, Le, Gt, Ge],
             Field::Created | Field::Updated | Field::Closed | Field::Due | Field::Defer => &[Eq, Ne, Lt, Le, Gt, Ge],
             Field::Type
@@ -179,6 +190,7 @@ impl Field {
             Field::Assignee
                 | Field::Label
                 | Field::Parent
+                | Field::Spec
                 | Field::ExternalRef
                 | Field::Closed
                 | Field::Due

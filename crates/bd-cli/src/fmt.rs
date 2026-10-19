@@ -1,13 +1,16 @@
 //! Human-readable rendering.
 
 use bd_core::asof::IssueAsOf;
+use bd_core::spec_context::{Cap, Governing, SPEC_EDGE_LIMIT, SPEC_WALK_LIMIT};
 use bd_core::time::format_duration_ms;
 use bd_core::{
     Comment, Event, Issue, IssueBrief, IssueDetails, IssueRef, Lease, NotReady, Readiness, ShowBrief, Status,
     Timestamp, TreeNode,
 };
-use serde_json::Value;
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
+
+use crate::io::printable;
 
 pub fn rel(t: Timestamp, now: Timestamp) -> String {
     let d = t.since(now);
@@ -75,12 +78,16 @@ pub fn why_lines(w: &Readiness, now: Timestamp, indent: &str) -> Vec<String> {
     out
 }
 
-/// `bd show --brief`: the brief line, open blockers, the cut description and
-/// the last comments, then `why` (`--why`).
-pub fn show_brief(b: &ShowBrief, why: Option<&Readiness>, now: Timestamp) -> Vec<String> {
+/// `bd show --brief`: the brief line, open blockers, the governing specs'
+/// ids (`specs`, with feature specs on), the cut description and the last
+/// comments, then `why` (`--why`).
+pub fn show_brief(b: &ShowBrief, why: Option<&Readiness>, now: Timestamp, specs: Option<&Governing>) -> Vec<String> {
     let mut out = vec![brief_line(&b.brief)];
     if !b.blockers.is_empty() {
         out.push(format!("  blocked by: {}", b.blockers.join(", ")));
+    }
+    if let Some(ids) = specs.map(Governing::ids).filter(|ids| !ids.is_empty()) {
+        out.push(format!("  specs: {}", ids.join(", ")));
     }
     block("Description", &b.description, &mut out);
     if b.comments_total > 0 {
@@ -181,10 +188,70 @@ pub fn text_blocks(blocks: &[(&str, &str)]) -> Vec<String> {
     out
 }
 
+/// The governing specs of an issue in a JSON object: `"specs"`, the entries
+/// (or their ids with `ids_only`), and `"specs_truncated": true` when the
+/// walk was cut short, never `false`. The one writer of both keys, so
+/// `bd show`, `--brief`, `bd claim` and `close --claim-next` agree.
+pub(crate) fn insert_specs(m: &mut Map<String, Value>, g: &Governing, ids_only: bool) {
+    let specs = if ids_only { json!(g.ids()) } else { serde_json::to_value(&g.specs).unwrap_or(Value::Null) };
+    m.insert("specs".into(), specs);
+    if g.truncated.is_some() {
+        m.insert("specs_truncated".into(), Value::Bool(true));
+    }
+}
+
+/// `bd show`'s `Specs:` section: each governing spec, the parts of it the
+/// lineage links to directly, and a note when the walk was cut short;
+/// nothing when no spec governs the issue and the walk was whole.
+pub(crate) fn spec_section(g: &Governing) -> Vec<String> {
+    if g.specs.is_empty() && g.truncated.is_none() {
+        return Vec::new();
+    }
+    let mut out = vec![String::new(), "Specs:".to_string()];
+    for e in &g.specs {
+        let mut line = format!("  {} {}", e.id, printable(&e.title));
+        if !e.areas.is_empty() {
+            line.push_str(&format!(" [{}]", printable(&e.areas.join(", "))));
+        }
+        if e.status != Status::Pinned {
+            line.push_str(&format!(" ({}, not pinned)", e.status));
+        }
+        line.push_str(&format!(" (via {})", e.via.join(", ")));
+        out.push(line);
+        for p in &e.linked {
+            let mut line = format!("    ↳ {} {}", p.id, printable(&p.title));
+            if p.non_goal {
+                line.push_str(" (non-goal)");
+            }
+            if p.status != Status::Pinned {
+                line.push_str(&format!(" ({})", p.status));
+            }
+            out.push(line);
+        }
+    }
+    match g.truncated {
+        Some(Cap::Descendants) => {
+            out.push(format!("  (first {SPEC_WALK_LIMIT} issues below looked at; bd spec drift checks all)"))
+        }
+        Some(Cap::Edges) => {
+            out.push(format!("  (first {SPEC_EDGE_LIMIT} related edges looked at; bd spec drift checks all)"))
+        }
+        None => {}
+    }
+    out
+}
+
 /// `bd show`, with `comments_total` the issue's comments in all (more than
-/// `d.comments` holds under `--comments-tail`) and `why` its readiness
-/// (`--why`), after the status lines.
-pub fn details(d: &IssueDetails, now: Timestamp, comments_total: usize, why: Option<&Readiness>) -> Vec<String> {
+/// `d.comments` holds under `--comments-tail`), `why` its readiness
+/// (`--why`), after the status lines, and `specs` the specs governing it
+/// (with feature specs on), after the relationship sections.
+pub fn details(
+    d: &IssueDetails,
+    now: Timestamp,
+    comments_total: usize,
+    why: Option<&Readiness>,
+    specs: Option<&Governing>,
+) -> Vec<String> {
     let i = &d.issue;
     let mut out = vec![format!("{} {} · {}", i.status.icon(), i.id, i.title)];
     let mut status = i.status.to_string();
@@ -288,6 +355,9 @@ pub fn details(d: &IssueDetails, now: Timestamp, comments_total: usize, why: Opt
             out.push(format!("  {}", ref_line(c)));
         }
     }
+    if let Some(g) = specs {
+        out.extend(spec_section(g));
+    }
     if comments_total > 0 {
         out.push(String::new());
         out.push(comments_heading(d.comments.len(), comments_total as i64));
@@ -314,7 +384,8 @@ fn s(v: &Value, k: &str) -> String {
     }
 }
 
-fn truncate(text: &str, max: usize) -> String {
+/// `text` on one line, cut to `max` characters with `…` when longer.
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     let one_line = text.replace('\n', " ");
     if one_line.chars().count() <= max {
         one_line
@@ -645,6 +716,128 @@ mod tests {
         assert!(diff.contains(&"    priority: 2 -> 1".to_string()), "{diff:?}");
         assert!(diff.contains(&"    labels: +x -y".to_string()), "{diff:?}");
         assert!(diff.contains(&r#"    metadata: {} -> {"compaction":{"level":1}}"#.to_string()), "{diff:?}");
+    }
+
+    use bd_core::spec_context::{LinkedPart, SpecContext};
+    use bd_core::specs::Brief;
+
+    fn spec_entry(id: &str, title: &str, status: Status) -> SpecContext {
+        SpecContext {
+            id: id.into(),
+            title: title.into(),
+            status,
+            areas: vec!["checkout".into(), "pay".into()],
+            via: vec!["t-5".into(), "t-9".into()],
+            linked: vec![
+                LinkedPart {
+                    id: "t-2".into(),
+                    title: "Requires sign-in".into(),
+                    status: Status::Pinned,
+                    non_goal: false,
+                },
+                LinkedPart { id: "t-3".into(), title: "No guest carts".into(), status: Status::Closed, non_goal: true },
+            ],
+            requirements: vec![Brief { id: "t-2".into(), title: "Requires sign-in".into() }],
+            non_goals: vec![],
+            inherits: vec!["t-0".into()],
+        }
+    }
+
+    #[test]
+    fn insert_specs_marks_truncation_only_when_cut() {
+        let mut g = Governing { specs: vec![spec_entry("t-1", "Checkout", Status::Pinned)], truncated: None };
+        for cap in [None, Some(Cap::Descendants), Some(Cap::Edges)] {
+            g.truncated = cap;
+            for ids_only in [false, true] {
+                let mut m = Map::new();
+                insert_specs(&mut m, &g, ids_only);
+                assert_eq!(m.get("specs_truncated"), cap.map(|_| &Value::Bool(true)), "{cap:?} {ids_only}");
+                assert_eq!(m.len(), if cap.is_some() { 2 } else { 1 });
+                if ids_only {
+                    assert_eq!(m["specs"], json!(["t-1"]));
+                } else {
+                    assert_eq!(m["specs"][0]["id"], "t-1");
+                    assert_eq!(m["specs"][0]["areas"], json!(["checkout", "pay"]));
+                    assert_eq!(m["specs"][0]["linked"][1]["non_goal"], true);
+                }
+            }
+        }
+        let mut m = Map::new();
+        insert_specs(&mut m, &Governing::default(), false);
+        assert_eq!(Value::Object(m), json!({"specs": []}));
+    }
+
+    #[test]
+    fn spec_section_lists_specs_and_their_linked_parts() {
+        let g = Governing { specs: vec![spec_entry("t-1", "Checkout", Status::Open)], truncated: None };
+        assert_eq!(
+            spec_section(&g),
+            [
+                "",
+                "Specs:",
+                "  t-1 Checkout [checkout, pay] (open, not pinned) (via t-5, t-9)",
+                "    ↳ t-2 Requires sign-in",
+                "    ↳ t-3 No guest carts (non-goal) (closed)",
+            ]
+        );
+        let pinned = Governing { specs: vec![spec_entry("t-1", "Checkout", Status::Pinned)], truncated: None };
+        assert_eq!(spec_section(&pinned)[2], "  t-1 Checkout [checkout, pay] (via t-5, t-9)");
+        assert!(spec_section(&Governing::default()).is_empty());
+    }
+
+    #[test]
+    fn spec_section_notes_either_cap() {
+        let cut = |cap| spec_section(&Governing { specs: vec![], truncated: Some(cap) });
+        assert_eq!(
+            cut(Cap::Descendants),
+            ["", "Specs:", "  (first 500 issues below looked at; bd spec drift checks all)"]
+        );
+        assert_eq!(cut(Cap::Edges), ["", "Specs:", "  (first 5000 related edges looked at; bd spec drift checks all)"]);
+        let g = Governing { specs: vec![spec_entry("t-1", "Checkout", Status::Pinned)], truncated: Some(Cap::Edges) };
+        assert_eq!(
+            spec_section(&g).last().unwrap(),
+            "  (first 5000 related edges looked at; bd spec drift checks all)"
+        );
+    }
+
+    #[test]
+    fn spec_section_escapes_titles_and_areas() {
+        let mut e = spec_entry("t-1", "Check\u{1b}[31mout\u{7}", Status::Pinned);
+        e.areas = vec!["a\u{202e}b".into()];
+        e.linked[0].title = "Sign\rin \u{202e}evil".into();
+        let text = spec_section(&Governing { specs: vec![e], truncated: None }).join("\n");
+        for bad in ['\u{1b}', '\u{7}', '\r', '\u{202e}'] {
+            assert!(!text.contains(bad), "{bad:?} in {text:?}");
+        }
+        assert!(text.contains("Check") && text.contains("evil"), "{text}");
+    }
+
+    #[test]
+    fn show_brief_lists_spec_ids_after_the_blockers() {
+        let b = ShowBrief {
+            brief: IssueBrief {
+                id: "t-9".into(),
+                title: "Work".into(),
+                status: Status::Open,
+                priority: 2,
+                issue_type: "task".into(),
+                assignee: None,
+                parent: None,
+                labels: vec![],
+            },
+            description: String::new(),
+            description_truncated: false,
+            blockers: vec!["t-4".into()],
+            comments: vec![],
+            comments_total: 0,
+        };
+        let g = Governing {
+            specs: vec![spec_entry("t-1", "A", Status::Pinned), spec_entry("t-7", "B", Status::Pinned)],
+            truncated: None,
+        };
+        let out = show_brief(&b, None, Timestamp(0), Some(&g));
+        assert_eq!(out[1..], ["  blocked by: t-4", "  specs: t-1, t-7"]);
+        assert_eq!(show_brief(&b, None, Timestamp(0), Some(&Governing::default())).len(), 2);
     }
 
     #[test]

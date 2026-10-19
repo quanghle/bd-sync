@@ -42,6 +42,7 @@ When `bd prime` shows a "Feature specs" section, the workspace keeps feature spe
 - Link every change you close to the spec or requirement it touches (`bd dep add <id> <spec or requirement> --type related`), or mark it `bd spec none <id> -r '<why>'`.
 - Keep requirements current: add one as a pinned child of its spec labelled `requirement`, replace a changed one with `bd supersede <old> --with <new>`, and close one that no longer holds with its reason.
 - `bd spec list`, `bd spec show <spec or area>` and `bd spec drift` show the specs and what drifted.
+- `bd show <id>` and `bd claim <id>` list the specs governing an issue with their requirements, `bd close` hints on stderr when closed work is not linked, and `bd query 'spec = none'` / `bd query 'area = <name>'` find work by spec.
 
 ## Claims and take-overs
 

@@ -466,6 +466,13 @@ output schemas), so the model reads each thing once:
   expiry, and is left out when nothing was ready), `claim` the token and
   expiry, `dep_add` whether the issue is now blocked. Nothing to claim is
   `{"message": "nothing matched"}`;
+- with [feature specs](commands.md#feature-specs) on, `show` (full or
+  brief), `claim` and `close` with `claim_next` (in `next`) also carry
+  `specs`, the specs governing the issue as
+  [`bd show --json`](commands.md#issues) gives them (ids with `brief:
+  true`), and `specs_truncated: true` when the walk was cut; the `close`
+  tool does not show `bd close`'s stderr hint about work no spec link
+  covers (bd-hj7ao), so check with `spec_drift`;
 - `spec_list` returns `{"specs": [...]}`, each open spec as
   `bd spec list --json` prints it; `spec_show` returns `{"specs":
   [views]}` as `bd spec show --json` does, without `history` unless

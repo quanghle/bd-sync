@@ -12,10 +12,12 @@ Operators: = != < <= > >= and ~ (contains, ASCII case-insensitive). Fields:
 status, priority, type, assignee, label, title, description, notes, id (a
 pattern with *), parent, external_ref (gh:owner/name#N, the repository
 lowercased, for a linked GitHub issue), created, updated, closed, due,
-defer, pinned and ephemeral. Values are bare words or quoted strings ('...'
-or \"...\", with \\\\, \\' and \\\" escapes); the bare word none means absent
-(no assignee, parent, label, external_ref, closed, due or defer time), and a
-comparison on an absent field is false except = none.
+defer, pinned, ephemeral, spec (a feature spec's id, resolved like parent,
+or none: issues no spec link covers; experimental specs on) and area (a spec
+area: issues covered by that area's specs). Values are bare words or quoted
+strings ('...' or \"...\", with \\\\, \\' and \\\" escapes); the bare word none
+means absent (no assignee, parent, label, spec link, external_ref, closed, due
+or defer time), and a comparison on an absent field is false except = none.
 
 Times take the forms of the filter flags: 7d alone means 7 days ago (created >
 7d: created within the last 7 days), +3d means 3 days from now, and = with a

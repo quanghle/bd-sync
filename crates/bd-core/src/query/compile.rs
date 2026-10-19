@@ -15,8 +15,9 @@ use crate::time::{Timestamp, local_day, parse_filter_time};
 /// Why an [`Expr`] did not compile.
 #[derive(Debug)]
 pub enum CompileError {
-    /// A value the store decides on: an ambiguous `parent` id, at the
-    /// comparison's value column (or a value no parser would let through).
+    /// A value the store decides on: an ambiguous `parent` or `spec` id, or
+    /// `spec`/`area` while feature specs are off ([`crate::specs::OFF`]), at
+    /// the comparison's value column (or a value no parser would let through).
     Query(ParseError),
     /// The database failed while resolving a value.
     Db(Error),
@@ -36,7 +37,7 @@ impl fmt::Display for CompileError {
 /// comparison yields 0 or 1, so `NOT` is an exact complement. `now` anchors
 /// relative times (`created > 7d`: within the last 7 days).
 pub fn compile(conn: &Connection, e: &Expr, now: Timestamp) -> Result<(String, Vec<SqlValue>), CompileError> {
-    let mut c = Compiler { conn, now, sql: String::new(), params: Vec::new() };
+    let mut c = Compiler { conn, now, sql: String::new(), params: Vec::new(), specs_on: None };
     c.expr(e)?;
     Ok((c.sql, c.params))
 }
@@ -46,6 +47,9 @@ struct Compiler<'a> {
     now: Timestamp,
     sql: String,
     params: Vec<SqlValue>,
+    /// Whether feature specs are on, read at the first `spec`/`area`
+    /// comparison.
+    specs_on: Option<bool>,
 }
 
 fn invalid(c: &Comparison, msg: impl Into<String>) -> CompileError {
@@ -77,7 +81,56 @@ fn maybe_null(sql: String, nullable: bool) -> String {
     if nullable { format!("COALESCE(({sql}),0)") } else { sql }
 }
 
+/// The labels that make an issue a spec part, as SQL literals.
+const PARTS: &str = "'spec', 'requirement', 'non-goal'";
+
+/// `i.id IN (...)`: the issues a link to a spec part covers, as
+/// [`crate::specs::linked`] counts them (without `spec:none`). The parts are
+/// those of the specs `specs_cte` selects (each spec and its direct
+/// requirement and non-goal children), or with `None` every issue labelled
+/// spec, requirement or non-goal. An issue on the other end of a `related`
+/// edge (either direction) of a part is linked, and so is every issue below
+/// it and above it. One uncorrelated subquery: it runs once per statement,
+/// every step an index lookup from the CTE on the left, and `UNION` ends a
+/// (damaged) parent cycle.
+fn cover(specs_cte: Option<&str>) -> String {
+    let parts = match specs_cte {
+        Some(sp) => format!(
+            "sp(id) AS ({sp}), \
+             parts(id) AS (SELECT id FROM sp UNION SELECT d.issue_id FROM sp \
+             CROSS JOIN dependencies d ON d.depends_on_id = sp.id AND d.dep_type = 'parent-child' \
+             CROSS JOIN labels r ON r.issue_id = d.issue_id AND r.label IN ('requirement', 'non-goal'))"
+        ),
+        None => format!("parts(id) AS (SELECT issue_id FROM labels WHERE label IN ({PARTS}))"),
+    };
+    format!(
+        "i.id IN (WITH RECURSIVE {parts}, \
+         direct(id) AS (SELECT d.depends_on_id FROM parts p \
+         CROSS JOIN dependencies d ON d.issue_id = p.id AND d.dep_type = 'related' \
+         UNION SELECT d.issue_id FROM parts p \
+         CROSS JOIN dependencies d ON d.depends_on_id = p.id AND d.dep_type = 'related'), \
+         down(id) AS (SELECT id FROM direct UNION SELECT d.issue_id FROM down \
+         CROSS JOIN dependencies d ON d.depends_on_id = down.id AND d.dep_type = 'parent-child'), \
+         up(id) AS (SELECT id FROM direct UNION SELECT d.depends_on_id FROM up \
+         CROSS JOIN dependencies d ON d.issue_id = up.id AND d.dep_type = 'parent-child') \
+         SELECT id FROM down UNION SELECT id FROM up)"
+    )
+}
+
 impl Compiler<'_> {
+    /// Refuse `c` (a `spec` or `area` comparison) unless feature specs are on.
+    fn require_specs(&mut self, c: &Comparison) -> Result<(), CompileError> {
+        let on = match self.specs_on {
+            Some(on) => on,
+            None => {
+                let on = crate::specs::is_on(self.conn).map_err(CompileError::Db)?;
+                self.specs_on = Some(on);
+                on
+            }
+        };
+        if on { Ok(()) } else { Err(invalid(c, crate::specs::OFF)) }
+    }
+
     fn expr(&mut self, e: &Expr) -> Result<(), CompileError> {
         match e {
             Expr::And(xs) | Expr::Or(xs) => {
@@ -111,6 +164,9 @@ impl Compiler<'_> {
         let bad = || invalid(c, format!("{} does not take {} {}", c.field, op, value_text(&c.value)));
         if !c.field.ops().contains(&c.op) {
             return Err(bad());
+        }
+        if matches!(c.field, Field::Spec | Field::Area) {
+            self.require_specs(c)?;
         }
         let (sql, params): (String, Vec<SqlValue>) = match (c.field, &c.value) {
             (Field::Status, Value::Text(v)) => ("i.status = ?".into(), vec![SqlValue::Text(v.clone())]),
@@ -161,6 +217,27 @@ impl Compiler<'_> {
                     vec![SqlValue::Text(parent)],
                 )
             }
+            (Field::Spec, Value::None) => (format!("NOT ({})", cover(None)), vec![]),
+            (Field::Spec, Value::Text(v)) => {
+                // Resolved like `parent`; an id that is not a spec has no parts.
+                let spec = match lookup_id(self.conn, v) {
+                    Ok(found) => found.unwrap_or_else(|| v.clone()),
+                    Err(Error::Invalid(msg)) => return Err(invalid(c, msg)),
+                    Err(e) => return Err(CompileError::Db(e)),
+                };
+                (
+                    cover(Some("SELECT s.issue_id FROM labels s WHERE s.issue_id = ? AND s.label = 'spec'")),
+                    vec![SqlValue::Text(spec)],
+                )
+            }
+            (Field::Area, Value::Text(v)) => (
+                // Exact and case-sensitive: the label is `area:<name>`.
+                cover(Some(
+                    "SELECT a.issue_id FROM labels a CROSS JOIN labels s ON s.issue_id = a.issue_id \
+                     AND s.label = 'spec' WHERE a.label = 'area:' || ?",
+                )),
+                vec![SqlValue::Text(v.clone())],
+            ),
             (f, value) if f.is_time() => {
                 let (col, nullable) = match f {
                     Field::Created => ("i.created_at", false),

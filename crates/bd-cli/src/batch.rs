@@ -143,6 +143,7 @@ pub fn cmd_batch(app: &mut App, a: &BatchArgs) -> Result<()> {
         let mut produced: Vec<Option<String>> = Vec::with_capacity(ops.len());
         let mut results: Vec<Value> = Vec::with_capacity(ops.len());
         let mut text = Vec::new();
+        let mut notes = Vec::new();
         for (i, (lineno, tokens)) in ops.iter().enumerate() {
             failed_at.set(*lineno);
             let tokens = tokens.iter().map(|t| substitute(t, &produced)).collect::<Result<Vec<_>>>()?;
@@ -156,15 +157,16 @@ pub fn cmd_batch(app: &mut App, a: &BatchArgs) -> Result<()> {
             let out = run(tx, &parsed.op)?;
             produced.push(out.ids.first().cloned());
             text.extend(out.text.iter().map(|l| format!("[{}] {l}", i + 1)));
+            notes.extend(out.notes.iter().map(|n| format!("[{}] {n}", i + 1)));
             results
                 .push(json!({ "op": i + 1, "line": lineno, "command": tokens[0], "ids": out.ids, "result": out.json }));
         }
         if dry {
             tx.set_rollback_only();
         }
-        Ok((results, text))
+        Ok((results, text, notes))
     });
-    let (results, text) = match result {
+    let (results, text, notes) = match result {
         Ok(r) => r,
         Err(e) => {
             io::errln(format!("bd batch: line {} failed; rolled back all {} operation(s)", failed_at.get(), ops.len()));
@@ -181,7 +183,9 @@ pub fn cmd_batch(app: &mut App, a: &BatchArgs) -> Result<()> {
         format!("✓ Committed {} operation(s) in one transaction", results.len())
     };
     let out = Out::new(json!({ "committed": !dry, "operations": results })).lines(text).line(summary);
-    app.print(Out { ids, ..out });
+    // The operations' notes print after stdout, once the batch committed
+    // (or, under --dry-run, ran to its end and rolled back).
+    app.print(Out { ids, notes, ..out });
     Ok(())
 }
 

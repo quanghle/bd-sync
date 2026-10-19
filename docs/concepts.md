@@ -365,7 +365,11 @@ work closed since and left unlinked, requirements whose source reopened or
 failed, and specs in the wrong state, and `bd prime` shows the counts to
 agents. `bd spec show <area>` prints an area's specs as Markdown and
 `bd spec candidates` lists older closed work specs could be written from.
-To write those specs, this repository's `spec-bootstrap` playbook
+While working, `bd show` and `bd claim` list the specs governing an issue
+(those linked from it, its ancestors or its descendants) with their
+requirements, `bd close` prints a hint on stderr when the work it closed is
+not linked, and `bd query 'spec = none'` (or `'area = <name>'`) finds work
+by spec. To write those specs, this repository's `spec-bootstrap` playbook
 (`.bd/source/playbooks/spec-bootstrap.toml`, which another repository copies into
 its own `.bd/playbooks` or the user playbook directory) has an agent draft
 the specs for the groups you name (`bd playbook run spec-bootstrap --var

@@ -19,6 +19,11 @@ pub struct Out {
     pub ids: Vec<String>,
     /// A list's JSON, written element by element in place of `json` (see [`Out::items`]).
     pub stream: Option<JsonStream>,
+    /// Lines for stderr, printed after the output (text and --json alike)
+    /// unless --quiet: hints about what the command did. `write_cmd` prints
+    /// only once its write committed, so a refused or rolled-back write
+    /// prints none.
+    pub notes: Vec<String>,
 }
 
 /// Writes JSON output to stdout as it goes.
@@ -26,7 +31,13 @@ pub type JsonStream = Box<dyn FnOnce(&mut dyn std::io::Write) -> std::io::Result
 
 impl Out {
     pub fn new(json: impl Serialize) -> Out {
-        Out { json: serde_json::to_value(json).unwrap_or(Value::Null), text: Vec::new(), ids: Vec::new(), stream: None }
+        Out {
+            json: serde_json::to_value(json).unwrap_or(Value::Null),
+            text: Vec::new(),
+            ids: Vec::new(),
+            stream: None,
+            notes: Vec::new(),
+        }
     }
 
     /// Make this output's JSON the list `items`, printed element by element:
@@ -50,6 +61,12 @@ impl Out {
 
     pub fn id(mut self, id: impl Into<String>) -> Out {
         self.ids.push(id.into());
+        self
+    }
+
+    /// Add a line for stderr (see [`Out::notes`]).
+    pub fn note(mut self, s: impl Into<String>) -> Out {
+        self.notes.push(s.into());
         self
     }
 }
@@ -225,7 +242,8 @@ impl App {
         self.store()?.read(f)
     }
 
-    pub fn print(&self, out: Out) {
+    pub fn print(&self, mut out: Out) {
+        let notes = std::mem::take(&mut out.notes);
         if self.g.json {
             match out.stream {
                 // Write errors (a closed pipe) are ignored, as by io::outln.
@@ -242,6 +260,11 @@ impl App {
         } else {
             for line in out.text {
                 io::outln(line);
+            }
+        }
+        if !self.g.quiet {
+            for n in notes {
+                io::errln(n);
             }
         }
     }

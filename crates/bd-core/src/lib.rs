@@ -74,6 +74,7 @@ pub mod ready;
 pub mod rename;
 pub mod requests;
 mod schema;
+pub mod spec_context;
 pub mod specs;
 pub mod store;
 pub mod subgraph;

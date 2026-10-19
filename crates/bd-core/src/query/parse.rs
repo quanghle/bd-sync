@@ -209,7 +209,7 @@ fn check_value(field: Field, op: Op, raw: Option<String>) -> Result<Value, Strin
     let Some(v) = raw else {
         if !field.takes_none() {
             return Err(format!(
-                "{field} is never none (none is for assignee, label, parent, external_ref, closed, due and defer; quote it to mean the word)"
+                "{field} is never none (none is for assignee, label, parent, spec, external_ref, closed, due and defer; quote it to mean the word)"
             ));
         }
         if !matches!(op, Op::Eq | Op::Ne) {

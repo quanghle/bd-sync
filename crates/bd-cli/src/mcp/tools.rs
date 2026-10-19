@@ -1015,6 +1015,59 @@ mod tests {
         );
     }
 
+    /// A `specs` entry as `bd show`, `bd claim` and `close --claim-next` print it.
+    fn spec_entry() -> Value {
+        json!({ "id": "s", "title": "Checkout", "status": "pinned", "areas": ["checkout"], "via": ["a"],
+                "linked": [], "requirements": [{ "id": "s.1", "title": "Requires sign-in" }],
+                "non_goals": [], "inherits": [] })
+    }
+
+    #[test]
+    fn show_keeps_spec_context() {
+        let inv = invoke("show", json!({ "ids": ["a"] })).unwrap();
+        let out = json!([{ "id": "a", "title": "t", "status": "in_progress", "issue_type": "task",
+                           "lease": { "holder": "h", "token": 3, "expires_at": "T" },
+                           "specs": [spec_entry()], "specs_truncated": true }]);
+        let shaped: Value = serde_json::from_str(&inv.result(&out.to_string()).unwrap()).unwrap();
+        assert_eq!(shaped[0]["lease"], json!({ "holder": "h", "expires_at": "T" }), "the token is stripped");
+        assert_eq!(
+            shaped[0]["specs"],
+            json!([{ "id": "s", "title": "Checkout", "status": "pinned", "areas": ["checkout"], "via": ["a"],
+                     "requirements": [{ "id": "s.1", "title": "Requires sign-in" }] }]),
+            "kept, without its empty lists"
+        );
+        assert_eq!(shaped[0]["specs_truncated"], true);
+    }
+
+    #[test]
+    fn claims_keep_spec_context_whole() {
+        let mut entry = spec_entry();
+        entry["linked"] = json!([{ "id": "s.2", "title": "No guests", "status": "pinned", "non_goal": true }]);
+        let inv = invoke("claim", json!({ "id": "a" })).unwrap();
+        let out = json!({ "already_held": false,
+            "issue": { "id": "a", "title": "t", "status": "in_progress", "priority": 1, "issue_type": "bug",
+                       "assignee": "me", "labels": [], "notes": "" },
+            "lease": { "holder": "me", "token": 9, "expires_at": "T", "issue_id": "a", "renewals": 0 },
+            "specs": [entry] });
+        assert_eq!(
+            inv.result(&out.to_string()).unwrap(),
+            r#"{"already_held":false,"issue":{"assignee":"me","id":"a","priority":1,"status":"in_progress","title":"t","type":"bug"},"lease":{"expires_at":"T","token":9},"specs":[{"areas":["checkout"],"id":"s","linked":[{"id":"s.2","non_goal":true,"status":"pinned","title":"No guests"}],"requirements":[{"id":"s.1","title":"Requires sign-in"}],"status":"pinned","title":"Checkout","via":["a"]}]}"#
+        );
+        // An ungoverned claim's empty list is pruned.
+        let bare = json!({ "already_held": false, "issue": out["issue"], "lease": out["lease"], "specs": [] });
+        let shaped: Value = serde_json::from_str(&inv.result(&bare.to_string()).unwrap()).unwrap();
+        assert!(shaped.get("specs").is_none(), "{shaped}");
+
+        let close = invoke("close", json!({ "ids": ["b"], "reason": "done", "claim_next": true })).unwrap();
+        let out = json!({ "closed": out["issue"], "next": { "from": "queue", "issue": out["issue"],
+                           "lease": out["lease"], "specs": [spec_entry()] } });
+        let shaped: Value = serde_json::from_str(&close.result(&out.to_string()).unwrap()).unwrap();
+        assert_eq!(shaped["next"]["specs"][0]["requirements"][0]["id"], "s.1", "{shaped}");
+        assert_eq!(shaped["next"]["specs"][0]["areas"], json!(["checkout"]), "{shaped}");
+        assert_eq!(shaped["next"]["issue"]["type"], "bug", "the issue is still summarized: {shaped}");
+        assert_eq!(shaped["next"]["lease"], json!({ "token": 9, "expires_at": "T" }), "{shaped}");
+    }
+
     #[test]
     fn spec_tools_are_listed_last_in_order() {
         let names: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();

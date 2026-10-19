@@ -27,7 +27,7 @@ use bd_core::gates::{self, GateKind, GateSpec, NewGate};
 use bd_core::subgraph::EdgeSet;
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::*;
-use bd_core::{asof, comments, config, events, hierarchy, metrics, playbook, requests, specs};
+use bd_core::{asof, comments, config, events, hierarchy, metrics, playbook, requests, spec_context, specs};
 use rusqlite::trace::{TraceEvent, TraceEventCodes};
 use rusqlite::{Connection, StatementStatus};
 use serde_json::json;
@@ -243,6 +243,8 @@ fn walk_the_graph(ws: &mut Ws) {
                     r.child_issues(id, false)?;
                     r.child_issues(id, true)?;
                     r.subgraph(Some(id), &EdgeSet::All, 50)?;
+                    spec_context::governing(r.conn(), id)?;
+                    spec_context::covered(r.conn(), id)?;
                 }
                 let below = WorkFilter { parent: Some(run.clone()), ..Default::default() };
                 r.ready(&ReadyQuery::default())?;
@@ -332,12 +334,15 @@ fn run_the_commands(ws: &mut Ws) {
         labels: vec!["spec".into(), "area:x".into()],
         ..NewIssue::titled("Spec")
     });
-    ws.create(NewIssue {
+    let rule = ws.create(NewIssue {
         status: Some(Status::Pinned),
         labels: vec!["requirement".into()],
         deps: vec![(DepType::Related, work.clone())],
         ..child("Rule", &spec)
     });
+    // A feature epic whose child is linked to the spec: the spec context walks down to it.
+    let feature = ws.create(NewIssue { issue_type: Some("epic".into()), ..NewIssue::titled("Feature") });
+    ws.create(NewIssue { deps: vec![(DepType::Related, spec.clone())], ..child("Part", &feature) });
     ws.write("alice", None, |tx| config::set(tx, "experimental.features", "specs"));
     ws.write("alice", None, |tx| config::set(tx, "events.retain_rows", "100"));
     // Enough events for the automatic prune to run.
@@ -414,7 +419,8 @@ fn run_the_commands(ws: &mut Ws) {
                 let closed = WorkFilter { closed_after: Some(Timestamp(0)), closed_before: Some(now), ..timed };
                 r.list(&ListQuery { all: true, filter: closed, ..Default::default() })?;
                 // A query naming every field: conditions on the same statement, with
-                // label and parent as lookups by key per issue.
+                // label and parent as lookups by key per issue, spec and area as one
+                // uncorrelated subquery each (index lookups from its CTEs).
                 let expr = format!(
                     "status = open AND priority <= 2 AND type ~ task AND NOT assignee = none \
                      AND (label = infra OR label ~ inf OR label = none) \
@@ -422,7 +428,8 @@ fn run_the_commands(ws: &mut Ws) {
                      AND (parent = {work} OR parent = none OR parent != t-99) \
                      AND (external_ref = none OR external_ref ~ gh: OR external_ref = 'gh:o/r#1') \
                      AND created > 7d AND updated != 2026-01-15 AND closed = none \
-                     AND (due < +3d OR defer >= 2026-01-01) AND pinned = false AND ephemeral = no"
+                     AND (due < +3d OR defer >= 2026-01-01) AND pinned = false AND ephemeral = no \
+                     AND (spec = {spec} OR spec != none OR area = x OR area != y)"
                 );
                 for sort in [ListSort::Priority, ListSort::Id] {
                     r.query(&QueryRequest { expr: expr.clone(), sort, reverse: false, limit: Some(10) })?;
@@ -443,6 +450,11 @@ fn run_the_commands(ws: &mut Ws) {
                 specs::candidates(r.conn(), None)?;
                 specs::candidates(r.conn(), specs::since(r.conn())?)?;
                 specs::open_count(r.conn())?;
+                // The specs governing an issue, and whether a link covers it (`bd show`, `bd claim`, `bd close`).
+                for id in [&work, &spec, &rule, &other, &feature] {
+                    spec_context::governing(r.conn(), id)?;
+                    spec_context::covered(r.conn(), id)?;
+                }
                 // Graph export of the open issues: the list statement, then edges per issue.
                 r.subgraph(None, &EdgeSet::Default, 10)?;
                 r.events_each(&EventQuery { limit: Some(5), ..Default::default() }, 2, &mut |_| Ok(()))?;
@@ -816,6 +828,15 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         "WHERE lb.label = ?1 AND i.status <> 'closed'",
         "FROM events WHERE issue_id = ?1 AND op = 'reopened'",
         "dep_type IN (?2, ?3)",
+        // Spec context: related edges by either end and children by parent, each under a bound LIMIT; labels by issue.
+        "WHERE issue_id = ?1 AND dep_type = 'related'",
+        "WHERE depends_on_id = ?1 AND dep_type = 'related'",
+        "SELECT label FROM labels WHERE issue_id = ?1 ORDER BY label",
+        "dep_type = 'parent-child'\n             ORDER BY issue_id LIMIT ?2",
+        // bd query's spec and area: the covering links, from a spec's parts, an area's specs, or every part.
+        "i.id IN (WITH RECURSIVE sp(id) AS (SELECT s.issue_id FROM labels s WHERE s.issue_id = ?",
+        "WHERE a.label = 'area:' || ?",
+        "parts(id) AS (SELECT issue_id FROM labels WHERE label IN ('spec', 'requirement', 'non-goal'))",
         // Id prefixes: seeking the primary key over their case variants.
         "SELECT 1 FROM issues WHERE id >= ?1 AND id < ?2 LIMIT 1",
         "SELECT id FROM issues WHERE id >= ?1 AND id < ?2 ORDER BY id LIMIT 6",

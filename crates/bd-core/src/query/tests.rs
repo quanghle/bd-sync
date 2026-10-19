@@ -9,9 +9,9 @@ use rusqlite::params_from_iter;
 use rusqlite::types::Value as SqlValue;
 
 use super::*;
-use crate::config::IdMode;
+use crate::config::{self, IdMode};
 use crate::issues::CloseOptions;
-use crate::model::{NewIssue, Status};
+use crate::model::{DepType, NewIssue, Status};
 use crate::store::{InitOptions, OpenOptions, Store};
 use crate::time::{Clock, ManualClock, Timestamp, local_day};
 
@@ -72,11 +72,13 @@ fn store_with(ids: &[&str]) -> (tempfile::TempDir, Store, Arc<ManualClock>) {
 /// t-1 (epic, label urgent) is t-2's parent; t-2 has a hostile title, bob,
 /// label `a%b` and a past due date; t-3 is closed. t-10 (ephemeral, due
 /// later) and t-11 (pinned) are created a day later, and prefix-match `t-1`.
+/// Feature specs are on (there are none), so every field compiles.
 fn seeded() -> Seeded {
     let (dir, mut store, clock) = store_with(&[]);
     let day1 = clock.now();
     store
         .write("seed", "alice", |tx| {
+            config::set(tx, "experimental.features", "specs")?;
             tx.create_issue(NewIssue {
                 id: Some("t-1".into()),
                 issue_type: Some("epic".into()),
@@ -293,6 +295,12 @@ fn errors_name_their_column() {
         ("label ~ none", 9, "none takes = or !="),
         ("external_ref < x", 14, "external_ref takes =, != or ~, not <"),
         ("external_ref ~ none", 16, "none takes = or !="),
+        ("spec < x", 6, "spec takes = or !=, not <"),
+        ("spec ~ t-1", 6, "spec takes = or !=, not ~"),
+        ("area ~ x", 6, "area takes = or !=, not ~"),
+        ("area = none", 8, "area is never none (none is for assignee, label, parent, spec, external_ref,"),
+        ("area = NONE", 8, "area is never none"),
+        ("spec ~ none", 6, "spec takes = or !="),
     ];
     for &(src, column, message) in cases {
         let e = err(src);
@@ -307,7 +315,7 @@ fn query_errors_draw_a_caret() {
     assert_eq!(e.exit_code(), 2);
     assert_eq!(
         e.to_string(),
-        "query: column 15: unknown field \"bogus\" (fields: status, priority, type, assignee, label, title, description, notes, id, parent, external_ref, created, updated, closed, due, defer, pinned, ephemeral)\n  title = x AND bogus = y\n                ^"
+        "query: column 15: unknown field \"bogus\" (fields: status, priority, type, assignee, label, title, description, notes, id, parent, external_ref, created, updated, closed, due, defer, pinned, ephemeral, spec, area)\n  title = x AND bogus = y\n                ^"
     );
 }
 
@@ -585,6 +593,8 @@ const SOUP: &[&str] = &[
     "defer",
     "pinned",
     "ephemeral",
+    "spec",
+    "area",
     "Status",
     "foo",
     "none",
@@ -718,7 +728,7 @@ fn gen_cmp(rng: &mut Rng) -> Expr {
         Field::Type => text(&rng.pick(&[TRICKY, &["task", "bug", "epic"]].concat()).to_ascii_lowercase()),
         Field::Assignee | Field::Label | Field::ExternalRef if eq && rng.below(4) == 0 => None,
         Field::Id => text(rng.pick(&[TRICKY, &["t-*", "t-1", "*", "t-[1]*", "?*", "t-1?"]].concat())),
-        Field::Parent => rng.pick(PARENT_VALUES).map(str::to_string),
+        Field::Parent | Field::Spec => rng.pick(PARENT_VALUES).map(str::to_string),
         f if f.is_time() && eq => {
             if f.takes_none() && rng.below(3) == 0 {
                 None
@@ -897,6 +907,8 @@ fn the_worst_cases_at_the_limits_compile_and_run() {
         "description ~ x",
         "closed != 2026-01-15",
         "parent != t-1",
+        "spec != none",
+        "area = x",
     ];
     let terms: Vec<&str> = (0..MAX_COMPARISONS).map(|n| heavy[n % heavy.len()]).collect();
     // 15 levels of `NOT (term AND ...)`, then NOT NOT on each remaining
@@ -918,5 +930,201 @@ fn the_worst_cases_at_the_limits_compile_and_run() {
         let e = gen_at_limit(&mut rng);
         assert_eq!((e.nesting(), e.comparisons()), (MAX_DEPTH, MAX_COMPARISONS), "{e}");
         check_valid(&s, &e);
+    }
+}
+
+// ---- feature specs: spec and area -------------------------------------------
+
+/// Every issue of [`spec_seeded`].
+const SPEC_ALL: [&str; 16] = [
+    "t-c", "t-e", "t-n", "t-r", "t-r2", "t-s", "t-ss", "t-t1", "t-t2", "t-t3", "t-t4", "t-t5", "t-t6", "t-t7", "t-x1",
+    "t-x2",
+];
+
+/// Feature specs on, and:
+/// - spec t-s [spec, area:checkout], pinned, with requirement t-r and
+///   non-goal t-n, and sub-spec t-ss [spec, area:sub] with requirement t-r2;
+/// - epic t-e with child t-t1, t-r related to t-e (an edge from t-e);
+/// - t-t2 related to t-r2, t-t3 related to t-n (edges to the parts);
+/// - t-t4 labelled spec:none, t-t5 plain;
+/// - a closed spec t-c [spec, area:checkout] related to t-t6;
+/// - t-t7 related to t-s itself;
+/// - t-x2, a child of t-x1, related to t-r2 (covering its parent too).
+fn spec_seeded() -> Seeded {
+    let (dir, mut store, clock) = store_with(&[]);
+    let new = |id: &str, labels: &[&str], parent: Option<&str>| NewIssue {
+        id: Some(id.into()),
+        labels: labels.iter().map(|l| l.to_string()).collect(),
+        parent: parent.map(str::to_string),
+        ..NewIssue::titled(id)
+    };
+    let related = |n: NewIssue, to: &str| NewIssue { deps: vec![(DepType::Related, to.into())], ..n };
+    let pinned = |n: NewIssue| NewIssue { status: Some(Status::Pinned), ..n };
+    store
+        .write("seed", "alice", |tx| {
+            config::set(tx, "experimental.features", "specs")?;
+            tx.create_issue(pinned(new("t-s", &["spec", "area:checkout"], None)))?;
+            tx.create_issue(pinned(new("t-r", &["requirement"], Some("t-s"))))?;
+            tx.create_issue(pinned(new("t-n", &["requirement", "non-goal"], Some("t-s"))))?;
+            tx.create_issue(pinned(new("t-ss", &["spec", "area:sub"], Some("t-s"))))?;
+            tx.create_issue(pinned(new("t-r2", &["requirement"], Some("t-ss"))))?;
+            tx.create_issue(related(NewIssue { issue_type: Some("epic".into()), ..new("t-e", &[], None) }, "t-r"))?;
+            tx.create_issue(new("t-t1", &[], Some("t-e")))?;
+            tx.create_issue(related(new("t-t2", &[], None), "t-r2"))?;
+            tx.create_issue(related(new("t-t3", &[], None), "t-n"))?;
+            tx.create_issue(new("t-t4", &["spec:none"], None))?;
+            tx.create_issue(new("t-t5", &[], None))?;
+            tx.create_issue(new("t-c", &["spec", "area:checkout"], None))?;
+            tx.create_issue(related(new("t-t6", &[], None), "t-c"))?;
+            tx.create_issue(related(new("t-t7", &[], None), "t-s"))?;
+            tx.create_issue(new("t-x1", &[], None))?;
+            tx.create_issue(related(new("t-x2", &[], Some("t-x1")), "t-r2"))?;
+            tx.close_issue("t-c", &CloseOptions { reason: Some("retired".into()), ..Default::default() })
+        })
+        .unwrap();
+    let now = clock.now();
+    Seeded { _dir: dir, store, now }
+}
+
+/// `xs` taken out of [`SPEC_ALL`].
+fn spec_all_but(xs: &[&str]) -> Vec<String> {
+    ids(&SPEC_ALL.iter().copied().filter(|id| !xs.contains(id)).collect::<Vec<_>>())
+}
+
+#[test]
+fn spec_and_area_parse_display_and_serialize() {
+    assert_eq!(parse("spec = t-1").unwrap(), cmp(Field::Spec, Op::Eq, Some("t-1")));
+    assert_eq!(parse("SPEC != none").unwrap(), cmp(Field::Spec, Op::Ne, None));
+    assert_eq!(parse("spec = 'none'").unwrap(), cmp(Field::Spec, Op::Eq, Some("none")));
+    assert_eq!(parse("Area = Checkout").unwrap(), cmp(Field::Area, Op::Eq, Some("Checkout")));
+    assert_eq!(parse("area != 'none'").unwrap(), cmp(Field::Area, Op::Ne, Some("none")));
+    let e = parse("spec = t-1 AND NOT (area = checkout OR spec = none)").unwrap();
+    let text = e.to_string();
+    assert_eq!(text, r#"spec = "t-1" AND NOT (area = "checkout" OR spec = none)"#);
+    assert_eq!(parse(&text).unwrap(), e);
+    assert_eq!(
+        serde_json::to_value(&e).unwrap(),
+        serde_json::json!({"and": [
+            {"field": "spec", "op": "=", "value": "t-1"},
+            {"not": {"or": [
+                {"field": "area", "op": "=", "value": "checkout"},
+                {"field": "spec", "op": "=", "value": null},
+            ]}},
+        ]})
+    );
+}
+
+#[test]
+fn spec_matches_what_its_parts_links_cover() {
+    let s = spec_seeded();
+    // Through t-r (t-e and its child), t-n (t-t3) and t-s itself (t-t7);
+    // not through the sub-spec's requirement (t-t2) or another spec.
+    let of_s = ["t-e", "t-t1", "t-t3", "t-t7"];
+    assert_eq!(s.ids("spec = t-s"), ids(&of_s));
+    assert_eq!(s.ids("spec != t-s"), spec_all_but(&of_s));
+    assert_eq!(s.ids("NOT spec = t-s"), spec_all_but(&of_s));
+    // Resolved like parent: the bare suffix after the prefix.
+    assert_eq!(s.ids("spec = s"), ids(&of_s));
+    // Up from a linked issue too: linking t-x2 covers its parent t-x1.
+    assert_eq!(s.ids("spec = t-ss"), ids(&["t-t2", "t-x1", "t-x2"]));
+    assert_eq!(s.ids("spec = t-c"), ids(&["t-t6"]));
+    // An id that is not a spec has no parts, and an unknown one matches nothing.
+    assert_eq!(s.ids("spec = t-r"), ids(&[]));
+    assert_eq!(s.ids("spec = t-e"), ids(&[]));
+    assert_eq!(s.ids("spec = t-zzz"), ids(&[]));
+    assert_eq!(s.ids("spec != t-zzz"), ids(&SPEC_ALL));
+
+    // An ambiguous prefix is refused at the value's column.
+    let src = "title = x OR spec = t-t";
+    match s.run(&parse(src).unwrap()) {
+        Err(CompileError::Query(q)) => {
+            assert_eq!(q.column, col(src, "t-t"));
+            assert!(q.message.contains("ambiguous id \"t-t\""), "{}", q.message);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn spec_none_is_what_no_link_covers() {
+    let s = spec_seeded();
+    let linked: Vec<String> = s.store.read(|r| crate::specs::linked(r.conn())).unwrap().into_iter().collect();
+    // `specs::linked` counts spec:none; the query does not.
+    assert!(linked.contains(&"t-t4".to_string()));
+    let mut without_none: Vec<String> = linked.into_iter().filter(|id| id != "t-t4").collect();
+    without_none.sort();
+    assert_eq!(s.ids("spec != none"), without_none);
+    let covered = ["t-e", "t-t1", "t-t2", "t-t3", "t-t6", "t-t7", "t-x1", "t-x2"];
+    assert_eq!(s.ids("spec != none"), ids(&covered));
+    assert_eq!(s.ids("spec = none"), spec_all_but(&covered));
+    assert_eq!(s.ids("NOT spec != none"), spec_all_but(&covered));
+}
+
+#[test]
+fn area_matches_its_specs_of_any_status_exactly() {
+    let s = spec_seeded();
+    // t-s and the closed t-c.
+    assert_eq!(s.ids("area = checkout"), ids(&["t-e", "t-t1", "t-t3", "t-t6", "t-t7"]));
+    assert_eq!(s.ids("area != checkout"), spec_all_but(&["t-e", "t-t1", "t-t3", "t-t6", "t-t7"]));
+    assert_eq!(s.ids("area = Checkout"), ids(&[]));
+    assert_eq!(s.ids("area = check"), ids(&[]));
+    assert_eq!(s.ids("area = sub"), ids(&["t-t2", "t-x1", "t-x2"]));
+    assert_eq!(s.ids("area = 'none'"), ids(&[]));
+}
+
+#[test]
+fn spec_and_area_values_match_only_literally() {
+    let s = spec_seeded();
+    for value in ["x' OR 1=1 --", "%", "_", ")", "area:checkout", "' OR '1'='1", "t-%", "\\"] {
+        let quoted = value.replace('\\', "\\\\").replace('\'', "\\'");
+        for src in [format!("spec = '{quoted}'"), format!("area = '{quoted}'")] {
+            let e = parse(&src).unwrap_or_else(|e| panic!("{src}: {e}"));
+            assert_eq!(s.run(&e).unwrap(), Vec::<String>::new(), "{src}");
+            let (sql, params) = compile(s.store.connection(), &e, s.now).unwrap();
+            assert!(!sql.contains(value) || value == "%" || value == "_" || value == ")", "{value} in {sql}");
+            assert_eq!(params.len(), 1, "{src}");
+        }
+    }
+    // The fixed parts set binds nothing.
+    let (_, params) = compile(s.store.connection(), &parse("spec = none").unwrap(), s.now).unwrap();
+    assert!(params.is_empty());
+}
+
+#[test]
+fn spec_and_area_are_refused_while_specs_are_off() {
+    let (_dir, store, clock) = store_with(&["t-1"]);
+    for src in ["title = x OR spec = none", "NOT area = checkout", "title = x AND spec != t-1"] {
+        let e = parse(src).unwrap();
+        match compile(store.connection(), &e, clock.now()) {
+            Err(CompileError::Query(q)) => {
+                let value = src.rsplit(' ').next().unwrap();
+                assert_eq!(q.column, src.rfind(value).unwrap() + 1, "{src}");
+                assert_eq!(q.message, crate::specs::OFF, "{src}");
+                let shown = query_error(src, q.column, &q.message);
+                assert_eq!(shown.exit_code(), 2);
+            }
+            other => panic!("{src}: {other:?}"),
+        }
+    }
+    // Other fields compile as before.
+    assert!(compile(store.connection(), &parse("title = x").unwrap(), clock.now()).is_ok());
+}
+
+#[test]
+fn spec_and_area_at_the_limits() {
+    let s = spec_seeded();
+    let heavy = ["spec = t-s", "spec != none", "area = checkout", "area != sub", "spec = none"];
+    let terms: Vec<&str> = (0..MAX_COMPARISONS).map(|n| heavy[n % heavy.len()]).collect();
+    let outer: String = terms[..15].iter().map(|t| format!("NOT ({t} AND ")).collect();
+    let inner: Vec<String> = terms[15..].iter().map(|t| format!("NOT NOT {t}")).collect();
+    let nested = format!("{outer}{}{}", inner.join(" AND "), ")".repeat(15));
+    let left = format!("{}{}", "NOT ".repeat(32), terms.join(" AND "));
+    for src in [nested, left] {
+        assert!(src.len() <= MAX_BYTES, "{}", src.len());
+        let e = parse(&src).unwrap();
+        assert_eq!((e.nesting(), e.comparisons()), (MAX_DEPTH, MAX_COMPARISONS));
+        check_valid(&s, &e);
+        let (_, params) = compile(s.store.connection(), &e, s.now).unwrap();
+        assert!(params.len() <= 2 * e.comparisons(), "{} params", params.len());
     }
 }

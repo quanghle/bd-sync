@@ -74,13 +74,12 @@ spec:none label (a link covers the issue's subtree and its ancestors: a
 playbook run's link counts for the issue it sits under; spec:none covers
 only its issue); shaky, requirements in force whose source (their own
 outgoing related edge) was reopened (closed once, open now) or closed as
-failed, a source still in progress is not;
-bad status, specs, requirements and non-goals neither pinned nor closed;
-orphaned, open specs under a closed spec. To link, open work created since
-then not linked yet, is listed but is not drift. Playbook runs, groups and
-steps and everything below a step, gates, decisions, spec issues, ephemeral
-issues, work closed as failed and work closed as a duplicate or superseded
-never need a spec.
+failed, a source still in progress is not; bad status, specs, requirements
+and non-goals neither pinned nor closed; orphaned, open specs under a
+closed spec. To link, open work created since then not linked yet, is
+listed but is not drift. Playbook runs, groups and steps and everything
+below a step, gates, decisions, spec issues, ephemeral issues, work closed
+as failed and work closed as a duplicate or superseded never need a spec.
 Exits 1 when it finds drift, 0 otherwise.";
 
 const SPEC_DRIFT_EXAMPLES: &str = "\

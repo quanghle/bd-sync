@@ -4,3 +4,7 @@ issues.jsonl
 bd.db
 bd.db-wal
 bd.db-shm
+# The server's playbooks `bd agents approve` approved on this machine are local state.
+approved/
+# What `bd agents pull` placed in this checkout is local state.
+agents.lock*

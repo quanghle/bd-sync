@@ -1,4 +1,4 @@
-// args.shadowReview in .claude/workflows/plan-implement-review.js: shadowsOf() checks it, and review() runs each real
+// args.shadowReview and args.reviewEffort in .claude/workflows/plan-implement-review.js: shadowsOf() checks it, and review() runs each real
 // reviewer once more per shadow with the same prompt, keeping shadow results out of what it returns. A workflow script isn't
 // a module (top-level await and return), so this lifts them and what they use out of the source, like the record spec,
 // and runs review() with stub agent and parallel functions.
@@ -20,7 +20,7 @@ const reviewBody = [
 	slice('async function review(', '// Controller:'),
 ].join('\n')
 
-const { shadowsOf } = new Function(`${shadowsBody}; return { shadowsOf }`)()
+const { shadowsOf, reviewEffortOf } = new Function(`${shadowsBody}; return { shadowsOf, reviewEffortOf }`)()
 
 const parallel = (thunks) => Promise.all(thunks.map((t) => t()))
 // Stands in for the workflow's reviewLogRule: one line per kind and round, with no label or model in it.
@@ -34,11 +34,11 @@ const endsWithItsLogRule = (calls) => {
 }
 
 /** review() bound to stubs: agent records each call and answers with a finding marked by its label (or null for fail). */
-function load(SHADOWS, { fail = () => false, A = {} } = {}) {
+function load(SHADOWS, { fail = () => false, A = {}, REVIEW_OPTS = {} } = {}) {
 	const calls = []
 	const shadowFindings = []
 	const agent = async (prompt, opts) => {
-		calls.push({ prompt, label: opts.label, model: opts.model, effort: opts.effort })
+		calls.push({ prompt, label: opts.label, model: opts.model, effort: opts.effort, hasEffort: 'effort' in opts })
 		return fail(opts.label) ? null : { findings: [{ file: 'a.rs', line: 1, claim: `from ${opts.label}` }], resolved: [] }
 	}
 	const plan = { summary: 's', requirements: [{ id: 'R1' }], steps: [], decisions: [] }
@@ -46,6 +46,7 @@ function load(SHADOWS, { fail = () => false, A = {} } = {}) {
 		'agent',
 		'parallel',
 		'SHADOWS',
+		'REVIEW_OPTS',
 		'shadowFindings',
 		'TASK',
 		'plan',
@@ -56,7 +57,7 @@ function load(SHADOWS, { fail = () => false, A = {} } = {}) {
 		'REVIEW',
 		'reviewLogRule',
 		`${reviewBody}; return { review }`,
-	)(agent, parallel, SHADOWS, shadowFindings, 'Requirements:\nR1', plan, { baseline: 'base0' }, '/w', A, () => 'LEDGER', {}, logRule)
+	)(agent, parallel, SHADOWS, REVIEW_OPTS, shadowFindings, 'Requirements:\nR1', plan, { baseline: 'base0' }, '/w', A, () => 'LEDGER', {}, logRule)
 	return { review, calls, shadowFindings }
 }
 const approved = [{ id: 'F1', severity: 'serious', category: 'c', file: 'a.rs', line: 3, claim: 'c', evidence: 'e' }]
@@ -190,5 +191,87 @@ describe('plan-implement-review review() with shadowReview', () => {
 		const out = await review(0, 'snap1', ['docs/x.md'], 'base0', [])
 		expect(out[0]).toBeNull()
 		expect(out.filter(Boolean)).toHaveLength(1)
+	})
+})
+
+describe('plan-implement-review reviewEffortOf()', () => {
+	it('returns no effort key without the arg', () => {
+		expect(reviewEffortOf(undefined)).toEqual({})
+		expect(reviewEffortOf(null)).toEqual({})
+		expect('effort' in reviewEffortOf(undefined)).toBe(false)
+	})
+
+	it.each([['low'], ['medium'], ['high'], ['xhigh'], ['max']])('accepts %s', (w) => {
+		expect(reviewEffortOf(w)).toEqual({ effort: w })
+	})
+
+	it.each([
+		['an unknown word', 'huge'],
+		['the wrong case', 'High'],
+		['an empty string', ''],
+		['a number', 3],
+		['an object', {}],
+		['an array', ['high']],
+	])('throws on %s', (_, v) => {
+		expect(() => reviewEffortOf(v)).toThrow(/args\.reviewEffort must be one of low\|medium\|high\|xhigh\|max, got /)
+	})
+
+	it('is checked at start, before any agent runs', () => {
+		const at = source.indexOf('reviewEffortOf(A.reviewEffort)')
+		expect(at >= 0).toBe(true)
+		expect(at < source.indexOf('await agent(')).toBe(true)
+		expect(at < source.indexOf('await ops(')).toBe(true)
+	})
+})
+
+describe('plan-implement-review review() with reviewEffort', () => {
+	const HIGH = { effort: 'high' }
+
+	it('runs the real reviewers at reviewEffort and leaves the shadows, prompts and labels alone', async () => {
+		const { review, calls } = load(SONNET, { REVIEW_OPTS: HIGH })
+		await review(0, 'snap1', ['docs/x.md'], 'base0', [])
+		expect(calls.map((c) => c.label)).toEqual([
+			'review:code:r0',
+			'review:requirements:r0',
+			'review:code:r0@shadow:sonnet-medium',
+			'review:requirements:r0@shadow:sonnet-medium',
+		])
+		const [code, reqs, shadowCode, shadowReqs] = calls
+		expect([code.model, code.effort, reqs.model, reqs.effort]).toEqual([undefined, 'high', undefined, 'high'])
+		expect([shadowCode.model, shadowCode.effort, shadowReqs.model, shadowReqs.effort]).toEqual(['sonnet', 'medium', 'sonnet', 'medium'])
+		expect(shadowCode.prompt).toBe(code.prompt)
+		expect(shadowReqs.prompt).toBe(reqs.prompt)
+		endsWithItsLogRule(calls)
+	})
+
+	it.each([
+		['invariants', 'crates/bd-core/src/graph.rs'],
+		['security', 'crates/bd-server/src/serve/mod.rs'],
+	])('runs the %s reviewer at reviewEffort, its shadow at its own', async (kind, file) => {
+		const { review, calls } = load(SONNET, { REVIEW_OPTS: HIGH })
+		await review(0, 'snap1', [file], 'base0', [])
+		const focused = calls.filter((c) => c.label.startsWith(`review:${kind}:`))
+		expect(focused.map((c) => [c.label, c.model, c.effort])).toEqual([
+			[`review:${kind}:r0`, undefined, 'high'],
+			[`review:${kind}:r0@shadow:sonnet-medium`, 'sonnet', 'medium'],
+		])
+		expect(focused[1].prompt).toBe(focused[0].prompt)
+	})
+
+	it('runs a focused re-review at reviewEffort too', async () => {
+		const { review, calls } = load(SONNET, { REVIEW_OPTS: HIGH })
+		await review(1, 'snap2', ['docs/x.md'], 'snap1', approved)
+		expect(calls.map((c) => [c.label, c.model, c.effort])).toEqual([
+			['review:code:r1', undefined, 'high'],
+			['review:code:r1@shadow:sonnet-medium', 'sonnet', 'medium'],
+		])
+	})
+
+	it('passes no effort key to the real reviewers without it', async () => {
+		const { review, calls } = load(SONNET, { A: { tier: 'critical' } })
+		await review(0, 'snap1', ['crates/bd-core/src/graph.rs'], 'base0', [])
+		const real = calls.filter((c) => !c.label.includes('@shadow:'))
+		expect(real.map((c) => c.label)).toEqual(['review:code:r0', 'review:requirements:r0', 'review:invariants:r0', 'review:security:r0'])
+		expect(real.some((c) => c.hasEffort)).toBe(false)
 	})
 })

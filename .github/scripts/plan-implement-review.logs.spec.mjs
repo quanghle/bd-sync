@@ -99,6 +99,7 @@ function load(A, replies = {}, over = {}) {
 		done: [],
 		SHADOWS: [{ model: 'sonnet', effort: 'medium' }],
 		CODER_OPTS: {},
+		REVIEW_OPTS: {},
 		MAX_GATE_FIXES: 2,
 		agent,
 		log: (m) => logs.push(m),

@@ -275,6 +275,29 @@ describe('score-issue', () => {
 		expect(record).toContain('--actor "me/copilot-1"')
 	})
 
+	it('escalates a mechanical agent that fails its schema once, to general-purpose at medium, with an @escalated label', async () => {
+		const wf = await load('score-issue', undefined)
+		const ctx = fakeCtx({ issue: 'bd-1', dryRun: true }, script({ setup: null, 'setup@escalated': SETUP }))
+		const got = await wf.run(ctx)
+		expect(got.status).toBe('scored')
+		const setups = ctx.calls.filter((c) => c.label.startsWith('setup'))
+		expect(setups.map((c) => [c.label, c.agent, c.model, c.reasoningEffort])).toEqual([
+			['setup', 'task', undefined, 'low'],
+			['setup@escalated', 'general-purpose', undefined, 'medium'],
+		])
+		expect(setups[1].prompt).toContain(setups[0].prompt)
+		expect(setups[1].prompt).toContain('check their effects first')
+		expect(ctx.logs.some((l) => l.includes('setup failed its schema'))).toBe(true)
+	})
+
+	it('fails when the escalated setup fails too, never retrying at the same level', async () => {
+		const wf = await load('score-issue', undefined)
+		const ctx = fakeCtx({ issue: 'bd-1' }, script({ setup: null }))
+		const got = await wf.run(ctx)
+		expect(got).toMatchObject({ status: 'failed', reason: 'could not find the main checkout' })
+		expect(ctx.calls.map((c) => c.label)).toEqual(['setup', 'setup@escalated'])
+	})
+
 	it('applies the rubric caps: overall at most correctness, and 2 when any dimension is 1', async () => {
 		const wf = await load('score-issue', undefined)
 		const capped = await wf.run(fakeCtx({ issue: 'bd-1', dryRun: true }, script({ judge: judgement({ dims: { correctness: { score: 3 } }, top: { overall: 5 } }) })))

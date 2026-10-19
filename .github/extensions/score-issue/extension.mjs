@@ -90,19 +90,37 @@ async function run(ctx) {
     if (!A.issue || typeof A.issue !== "string") throw new Error("args.issue is required (the bd issue or playbook run to score)");
     const { log, phase } = ctx;
 
-    // `kind` picks the built-in agent. Mechanical agents (setup, trace, record) only run commands and report output: the task agent at low effort.
+    // `kind` picks the built-in agent.
     const agent = (prompt, { label, kind = "task", effort, model, schema }) =>
         ctx.agent(prompt, { label, agent: kind, schema, ...(model ? { model } : {}), ...(effort ? { reasoningEffort: effort } : {}) });
+
+    // Mechanical agents (setup, trace, record) only run commands and report output: the task agent at low effort. One that
+    // fails its schema (null, or a result its caller rejects) is escalated once to the general-purpose agent at medium
+    // effort, never retried at the same level; the retry's label gets @escalated. Copilot model ids are not named by
+    // class, so the escalation changes the agent kind, not the model.
+    const OPS = { kind: "task", effort: "low" };
+    const OPS_ESCALATED = { kind: "general-purpose", effort: "medium" };
+    async function ops(prompt, opts, valid = (r) => r != null) {
+        const r = await agent(prompt, { ...opts, ...OPS });
+        if (valid(r)) return r;
+        log(`${opts.label} failed its schema on the ${OPS.kind} agent; escalating to ${OPS_ESCALATED.kind}`);
+        const again = await agent(
+            `${prompt}\n\nAn earlier attempt at this may have run some of these commands before failing: check their effects first and do not repeat one that already took effect.`,
+            { ...opts, ...OPS_ESCALATED, label: `${opts.label}@escalated` },
+        );
+        return valid(again) ? again : null;
+    }
 
     // ---------- Setup ----------
     phase("Setup");
     const where = A.workdir || ".";
-    const setup = await agent(
+    const setup = await ops(
         `In ${where}, run: dirname "$(git rev-parse --path-format=absolute --git-common-dir)" and return its output as root. ` +
             `Then read the "Version:" line of <root>/.bd/rubric.md and return its number as rubric. ` +
             `Then run \`bd -C <root> show ${A.issue} --json\` and return its metadata.complexity_estimate.score as estimate (null if absent). ` +
             `If the rubric file is missing, return root and set error. Do nothing else.`,
-        { label: "setup", effort: "low", schema: SETUP },
+        { label: "setup", schema: SETUP },
+        (r) => !!r?.root,
     );
     if (!setup?.root) return { status: "failed", reason: "could not find the main checkout" };
     if (setup.error || !Number.isInteger(setup.rubric)) {
@@ -177,12 +195,13 @@ async function run(ctx) {
     // ---------- Trace ----------
     // After the judge, which is shown neither the trace nor the estimate. A failed trace is reported, never fails the scoring.
     phase("Trace");
-    const traced = await agent(
+    const traced = await ops(
         `Run exactly: node ${ROOT}/.github/scripts/trace-run.mjs ${A.issue} --root ${ROOT} --summary` +
             `${A.dryRun ? "" : " --write"}${A.actor ? ` --actor "${A.actor}"` : ""}\n` +
             `Return its standard output, verbatim, as summary, even when it exits with an error; ok=true if it exited 0, ` +
             `otherwise ok=false and its standard error as error. Do nothing else.`,
-        { label: "trace", effort: "low", schema: TRACED },
+        { label: "trace", schema: TRACED },
+        (r) => typeof r?.ok === "boolean",
     );
     const traceText = traced?.summary?.trim();
     const work = traceText
@@ -210,13 +229,14 @@ async function run(ctx) {
         "",
         "Draft: accepted as the score metadata, or confirmed or adjusted by a person when the run asks for one (.bd/rubric.md, Recording).",
     ].join("\n");
-    const rec = await agent(
+    const rec = await ops(
         `Record a score in bd. Run these two commands, in order, exactly as given except that <Text> is the "Text" under it, ` +
             `passed verbatim as one shell argument (use a quoted heredoc, e.g. "$(cat <<'EOF' ... EOF)", so quotes and backticks survive). Do nothing else.\n\n` +
             `1. ${bd} update ${A.issue} --set-metadata 'score_judge=${JSON.stringify(score)}'${actorFlag}\n\n` +
             `2. ${bd} comment add ${A.issue} <Text>${actorFlag}\n  Text:\n${comment}\n\n` +
             `Return ok=true if both succeeded; otherwise ok=false and the error.`,
-        { label: "record", effort: "low", schema: RECORDED },
+        { label: "record", schema: RECORDED },
+        (r) => typeof r?.ok === "boolean",
     );
     if (!rec?.ok) {
         return { status: "scored", recorded: false, reason: `could not record: ${rec ? rec.error : "record agent failed"}`, issue: A.issue, score, judged, caps, work };

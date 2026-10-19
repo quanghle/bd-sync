@@ -43,6 +43,7 @@ When `bd prime` shows a "Feature specs" section, the workspace keeps feature spe
 - Keep requirements current: add one with `bd spec add <spec> --from <id> -- '<sentence>'` (`--non-goal` for a non-goal), replace a changed one with `bd spec change <req> --from <id> -- '<sentence>'`, and close one that no longer holds with `bd spec remove <req> -r '<why>'`. Options go before `--`: everything after it is the sentence.
 - Create a new spec with `bd spec new <area> -- '<feature>'` (`--parent <spec>` for a sub-feature).
 - `bd spec list`, `bd spec show <spec or area>` and `bd spec drift` show the specs and what drifted.
+- `bd show <id>` and `bd claim <id>` list the specs governing an issue with their requirements, `bd close` hints on stderr when closed work is not linked, and `bd query 'spec = none'` / `bd query 'area = <name>'` find work by spec.
 
 ## Claims and take-overs
 

@@ -110,6 +110,54 @@ reclaimed}` (`lease.token` is the new fencing token; `--suggest-next` has
 no lease). Text prints the claim as `bd claim` does under `→ Next (from
 siblings under ID):`, or `→ Suggested next (…): … (bd claim ID)`.
 
+With [feature specs](#feature-specs) on, `bd show`, `bd claim` and
+`bd close` carry the specs governing an issue: the specs linked by a
+`related` edge, either direction, from the issue, any of its ancestors or
+any of its descendants (breadth-first, the first 500), a linked requirement
+or non-goal counting for the issue it sits under (its spec). With specs off
+their output is unchanged.
+
+- **`bd show --json`** gives each issue `specs`, in spec id order (`[]`
+  when none governs it), each entry `{id, title, status, areas, via,
+  linked, requirements, non_goals, inherits}`: `areas` from its `area:`
+  labels, `via` the issues of the lineage that link to it, `linked` the
+  requirements and non-goals linked directly (`{id, title, status,
+  non_goal}`, of any status), `requirements` and `non_goals` the pinned
+  ones in creation order (`{id, title}`), and `inherits` the open specs
+  above it, outermost first. `specs_truncated: true` is added, and only
+  then, when the walk stopped at 500 descendants or 5000 related edges.
+  Text adds a `Specs:` section after `Children` and before the comments:
+  per spec `ID Title [areas] (via IDS)` (with `(STATUS, not pinned)` before
+  `(via …)` when it is not pinned), a `↳ ID Title` line per part linked
+  directly (marked `(non-goal)`, and its status when not pinned), and,
+  when cut, `(first 500 issues below looked at; bd spec drift checks all)`
+  or the same for 5000 related edges. `--brief` gives `specs` as ids (and
+  `specs_truncated`), and text a `  specs: ID, ID` line after the summary
+  line. `--as-of` and `-q` are unchanged.
+- **`bd claim`, `bd claim --next` and `bd close --claim-next`** add the
+  same `specs` (and `specs_truncated`) to the claim's JSON (for
+  `--claim-next`, to `next`), and after the lease line, per spec (the
+  first 5, then `… N more specs: bd show ID`): `spec ID Title [areas]: N
+  requirements, M non-goals (bd spec show ID)`, then up to 8 requirement
+  titles, cut to 100 characters (those linked directly first, then the
+  rest in force; `… K more` past 8), and `inherits from IDS` when it has
+  open specs above it. Non-goals are only counted. A re-claim with
+  `--token` prints them again; `claim --next` with nothing ready stays
+  `null`.
+- **`bd close`** prints, after a close commits, one line on stderr naming
+  the issues named on its command line that it closed and no spec link
+  covers: `hint: not linked to a feature spec: ID, ID (bd dep add <id>
+  <spec or requirement> --type related, or bd spec none <id> -r '<why>';
+  bd spec drift lists unlinked work)`, the first 5 in command-line order,
+  then `+N more`. Exempt issues (see [Linked work](#feature-specs)), issues
+  labelled `spec:none`, issues closed already, parents the close completed
+  and issues whose walk was cut before finding a link are left out. It is
+  printed in `--json` mode too (stdout is unchanged), not with `-q`, never
+  for a refused or rolled-back close, and never refuses or changes the exit
+  code. `bd batch` prints it once after the batch, as `[N] hint: …` for
+  operation N (under `--dry-run` too); through `bd serve` it reaches the
+  client on stderr, replays included.
+
 `bd q` is quick capture: it takes the title and the `create` flags `-d`, `-t`,
 `-p`, `-l`, `--parent` and `--dep`, creates the issue exactly as `bd create`
 does (same validation and events), and prints only the id, with or without
@@ -253,6 +301,13 @@ other. The bare word `none` means absent; quoted, `"none"` is the word.
 | `created`, `updated` | a time; with `=`/`!=` a date | `=` `!=` `<` `<=` `>` `>=` | |
 | `closed`, `due`, `defer` | a time; with `=`/`!=` a date or `none` | `=` `!=` `<` `<=` `>` `>=` | not set |
 | `pinned`, `ephemeral` | `true`/`false` (`yes`/`no`, `1`/`0`) | `=` `!=` | |
+| `spec` | a feature spec's id, resolved like `parent`: issues a `related` link to that spec or to its direct requirements and non-goals covers (the issue linked, its subtree and its ancestors, as [Linked work](#feature-specs) counts them); its sub-specs are not included, and an id that is not a spec matches nothing | `=` `!=` | no spec link covers it (`spec:none` does not count) |
+| `area` | a spec area: as `spec`, over every spec labelled `area:AREA` (exact and case-sensitive, of any status) | `=` `!=` | |
+
+`spec` and `area` need [feature specs](#feature-specs) on: in a workspace
+where they are off, a query naming either fails with `feature specs are off
+in this workspace` (exit 2, the caret under its value), while
+`--parse-only` accepts them.
 
 `~` ignores ASCII case only, and takes `%` and `_` literally; `=` on text
 is exact and case-sensitive.
@@ -441,6 +496,10 @@ Feature specs are an [experimental feature](#experimental-features): every
 `show`, `drift` and `none` are also [MCP tools](mcp.md#tools)
 (`spec_list`, `spec_show`, `spec_drift`, `spec_none`); `candidates` and
 the writes `new`, `add`, `change`, `remove` and `link` are not.
+With specs on, `bd show` and `bd claim` list the specs governing an issue,
+`bd close` hints at closed work no spec link covers, and `bd query` finds
+work by spec (`spec = ID`, `spec = none`, `area = AREA`); see
+[Issues](#issues) and the [query fields](#query-language).
 
 The writes check what they are given and change nothing when a check
 fails: each is one write transaction (and a [`bd batch`](#data)

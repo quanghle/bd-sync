@@ -9761,7 +9761,8 @@ fn github_sync_through_serve_is_admin_only() {
 #[test]
 fn feature_specs_through_bd_serve() {
     let server = Server::start();
-    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
     assert_eq!(alice.code(&["spec", "show", "checkout"]), 2, "off");
     check(server.local("admin", &["config", "set", "experimental.features", "specs"]), "config set");
     // The rule's source is not the work below, which stays unlinked until `spec link`.
@@ -9776,7 +9777,11 @@ fn feature_specs_through_bd_serve() {
     assert_eq!(alice.json(&["spec", "show", &spec])[0]["requirements"][0]["id"], rule.as_str());
 
     let work = alice.ok(&["-q", "create", "Build it"]).trim().to_string();
-    alice.ok(&["close", &work, "-r", "done"]);
+    // The close hint reaches the client on stderr, through the answer's captured stderr.
+    let out = alice.run(&["close", &work, "-r", "done"]);
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains(&format!("hint: not linked to a feature spec: {work} (bd dep add")), "{stderr}");
     let out = alice.run(&["spec", "drift"]);
     assert_eq!(out.status.code(), Some(1), "drift exits 1 through bd serve too");
     assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("- {work} [task] Build it (closed)")));
@@ -9788,6 +9793,23 @@ fn feature_specs_through_bd_serve() {
     assert_eq!(linked[0]["already"], false, "{linked}");
     assert_eq!(alice.code(&["spec", "drift"]), 0);
     assert_eq!(alice.json(&["spec", "drift"])["count"], 0);
+    let shown = alice.json(&["show", &work]);
+    assert_eq!(shown["specs"][0]["id"], spec.as_str(), "{shown}");
+    assert_eq!(shown["specs"][0]["linked"][0]["id"], rule.as_str(), "{shown}");
+
+    // A replayed close answers with the stderr it stored, hint included.
+    let other = alice.ok(&["-q", "create", "Unlinked"]).trim().to_string();
+    let req = json!({ "argv": ["close", &other, "-r", "x"], "request_id": "hint-1" });
+    let (status, first) = post(&server.url(), &secret, &req);
+    assert_eq!(status, 200, "{first}");
+    assert_eq!((first["exit_code"].as_i64(), first["replayed"].as_bool()), (Some(0), Some(false)), "{first}");
+    let hint = format!("hint: not linked to a feature spec: {other} (bd dep add");
+    assert!(first["stderr"].as_str().unwrap().contains(&hint), "{first}");
+    let (status, again) = post(&server.url(), &secret, &req);
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["replayed"], true, "{again}");
+    assert_eq!(again["stderr"], first["stderr"], "the stored stderr is replayed");
+    assert_eq!(again["stdout"], first["stdout"]);
 }
 
 #[test]

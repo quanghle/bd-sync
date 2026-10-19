@@ -1,6 +1,8 @@
 //! Issue lifecycle: create, update, close, reopen, defer, delete; show, list, ready, blocked.
 
 use bd_core::asof::Point;
+use bd_core::spec_context::{self, Coverage, Governing};
+use bd_core::specs;
 use bd_core::time::{parse_duration, parse_when};
 use bd_core::{
     Claim, ClaimOptions, CloseOptions, DeleteOptions, Error, ExplainOptions, Guard, IssueBrief, IssueDetails,
@@ -14,7 +16,7 @@ use crate::cli::*;
 use crate::fmt::{self, rel};
 use crate::io;
 
-use super::claims::claim_out;
+use super::claims::{claim_out, claim_specs};
 use super::events::events_issue;
 use super::{
     clearable, clearable_time, dep_spec, filter_from, filter_time, guard_from, json_object, key_value, one_or_many,
@@ -49,7 +51,7 @@ pub fn exec_create(tx: &mut WriteCtx<'_>, a: &CreateArgs) -> Result<Out> {
     let issue = tx.create_issue(new)?;
     let mut out = if a.claim {
         let claim = tx.claim(&issue.id, &ClaimOptions::default())?;
-        claim_out(&claim, now).line(String::new())
+        claim_out(&claim, now, None).line(String::new())
     } else {
         Out::new(&issue)
     };
@@ -155,6 +157,14 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         // Every claim of another actor among them, before any close is refused for something else.
         tx.check_take_over(&ids, a.take_over, &format!("closing {}", ids.join(", ")))?;
     }
+    // The issues named, in command-line order, each once: the order the
+    // unlinked-spec hint lists them in.
+    let mut named: Vec<String> = Vec::with_capacity(ids.len());
+    for id in &ids {
+        if !named.contains(id) {
+            named.push(id.clone());
+        }
+    }
     // Deepest first, so children listed alongside their parent close before it.
     let depths = tx.depths(&ids)?;
     let mut keyed: Vec<_> = depths.into_iter().map(std::cmp::Reverse).zip(ids).collect();
@@ -178,6 +188,9 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         }
         out = out.id(id);
         results.push(r);
+    }
+    if let Some(hint) = unlinked_hint(tx, &named, &results)? {
+        out = out.note(hint);
     }
     let closed = one_or_many(&results);
     let Some((q, near)) = next else {
@@ -203,8 +216,9 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         } else {
             match tx.claim_next_near(&q, near.as_deref(), &ClaimOptions { ttl, ..Default::default() })? {
                 Some((c, from)) => {
-                    json["next"] = next_json(from, searched(from), &c.issue, Some(&c));
-                    let claimed = claim_out(&c, now);
+                    let g = claim_specs(tx, &c.issue.id)?;
+                    json["next"] = next_json(from, searched(from), &c.issue, Some(&c), g.as_ref());
+                    let claimed = claim_out(&c, now, g.as_ref());
                     out = out.line(format!("→ Next ({}):", from_text(from))).lines(claimed.text).id(c.issue.id.clone());
                 }
                 None => out = out.line("No ready work to claim next"),
@@ -214,7 +228,7 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         // The issue --claim-next would claim, dead claims it would reclaim first included.
         match tx.suggest_next(&q, near.as_deref())? {
             Some((issue, from)) => {
-                json["next"] = next_json(from, searched(from), &issue, None);
+                json["next"] = next_json(from, searched(from), &issue, None, None);
                 out = out
                     .line(format!(
                         "→ Suggested next ({}): {} (bd claim {})",
@@ -229,6 +243,45 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
     }
     out.json = json;
     Ok(out)
+}
+
+/// Most issues the unlinked-spec hint names before `+N more`.
+const HINT_IDS: usize = 5;
+
+/// With feature specs on, the stderr hint naming the issues this close
+/// closed (of those named, in command-line order) that need a spec link
+/// and have none: not exempt ([`specs::is_exempt`]), not `spec:none`, and
+/// not covered by a link. A walk cut short before a link
+/// ([`Coverage::Unknown`]) counts as covered, so the hint never names work
+/// it could not look at in full. Read-only, inside the close's transaction;
+/// [`Out::note`] prints it only after commit, and it never refuses a close.
+fn unlinked_hint(tx: &WriteCtx<'_>, named: &[String], results: &[bd_core::CloseOutcome]) -> Result<Option<String>> {
+    if !specs::is_on(tx.conn())? {
+        return Ok(None);
+    }
+    let mut unlinked = Vec::new();
+    for id in named {
+        let Some(r) = results.iter().find(|r| &r.issue.id == id && !r.already_closed) else {
+            continue;
+        };
+        if specs::is_exempt(tx.conn(), &r.issue)? {
+            continue;
+        }
+        if spec_context::covered(tx.conn(), id)? == Coverage::NotLinked {
+            unlinked.push(id.as_str());
+        }
+    }
+    if unlinked.is_empty() {
+        return Ok(None);
+    }
+    let mut list = unlinked.iter().take(HINT_IDS).copied().collect::<Vec<_>>().join(", ");
+    if unlinked.len() > HINT_IDS {
+        list.push_str(&format!(" +{} more", unlinked.len() - HINT_IDS));
+    }
+    Ok(Some(format!(
+        "hint: not linked to a feature spec: {list} (bd dep add <id> <spec or requirement> --type related, \
+         or bd spec none <id> -r '<why>'; bd spec drift lists unlinked work)"
+    )))
 }
 
 /// The ready query `bd close --claim-next`/`--suggest-next` searches, from
@@ -254,8 +307,15 @@ fn next_query(tx: &WriteCtx<'_>, n: &NextArgs) -> Result<ReadyQuery> {
 }
 
 /// `next` in close's JSON: where the issue was found, the issue, and the
-/// claim's lease (and what it reclaimed) when it was claimed.
-fn next_json(from: NextFrom, parent: Option<String>, issue: &bd_core::Issue, claim: Option<&Claim>) -> Value {
+/// claim's lease (and what it reclaimed) when it was claimed, and with
+/// `specs` (a claim with feature specs on) the specs governing it.
+fn next_json(
+    from: NextFrom,
+    parent: Option<String>,
+    issue: &bd_core::Issue,
+    claim: Option<&Claim>,
+    specs: Option<&Governing>,
+) -> Value {
     let mut v = json!({ "from": from, "issue": issue });
     if let Some(p) = parent {
         v["parent"] = json!(p);
@@ -265,6 +325,9 @@ fn next_json(from: NextFrom, parent: Option<String>, issue: &bd_core::Issue, cla
         if let Some(r) = &c.reclaimed {
             v["reclaimed"] = json!(r);
         }
+    }
+    if let (Some(g), Some(m)) = (specs, v.as_object_mut()) {
+        fmt::insert_specs(m, g, false);
     }
     v
 }
@@ -340,10 +403,10 @@ pub fn cmd_show(app: &mut App, a: &ShowArgs) -> Result<()> {
     if a.brief {
         return show_brief(app, a);
     }
-    let (all, whys, now) = app.read(|r| {
+    let (all, whys, govs, now) = app.read(|r| {
         let ids = a.ids.iter().map(|raw| r.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
         let all = ids.iter().map(|id| r.details(id)).collect::<Result<Vec<_>>>()?;
-        Ok((all, whys(r, a, &ids)?, r.now()))
+        Ok((all, whys(r, a, &ids)?, governing(r, &ids)?, r.now()))
     })?;
     // --comments-tail keeps the last N comments and says how many there are.
     let all: Vec<(IssueDetails, usize)> = all
@@ -360,7 +423,8 @@ pub fn cmd_show(app: &mut App, a: &ShowArgs) -> Result<()> {
         let values: Vec<Value> = all
             .iter()
             .zip(why_values(&whys, all.len()))
-            .map(|((d, total), why)| {
+            .enumerate()
+            .map(|(n, ((d, total), why))| {
                 let mut v = serde_json::to_value(d).unwrap_or(Value::Null);
                 if let Some(m) = v.as_object_mut() {
                     if a.comments_tail.is_some() {
@@ -368,6 +432,9 @@ pub fn cmd_show(app: &mut App, a: &ShowArgs) -> Result<()> {
                     }
                     if let Some(why) = why {
                         m.insert("why".into(), why);
+                    }
+                    if let Some(g) = govs.as_ref().and_then(|v| v.get(n)) {
+                        fmt::insert_specs(m, g, false);
                     }
                 }
                 v
@@ -385,7 +452,7 @@ pub fn cmd_show(app: &mut App, a: &ShowArgs) -> Result<()> {
             if n > 0 {
                 io::outln("");
             }
-            fmt::details(d, now, *total, whys.get(n)).iter().for_each(io::outln);
+            fmt::details(d, now, *total, whys.get(n), govs.as_ref().and_then(|v| v.get(n))).iter().for_each(io::outln);
         }
     }
     Ok(())
@@ -400,6 +467,15 @@ fn whys(r: &ReadCtx<'_>, a: &ShowArgs, ids: &[String]) -> Result<Vec<Readiness>>
     ids.iter().map(|id| r.explain(id, ExplainOptions::default())).collect()
 }
 
+/// With feature specs on, the specs governing each of `ids`; nothing with
+/// them off, which reads only the config key.
+fn governing(r: &ReadCtx<'_>, ids: &[String]) -> Result<Option<Vec<Governing>>> {
+    if !specs::is_on(r.conn())? {
+        return Ok(None);
+    }
+    ids.iter().map(|id| spec_context::governing(r.conn(), id)).collect::<Result<Vec<_>>>().map(Some)
+}
+
 /// The `why` value of each of `n` JSON objects: `{ready, reasons}`, or
 /// nothing without `--why`.
 fn why_values(whys: &[Readiness], n: usize) -> Vec<Option<Value>> {
@@ -408,19 +484,25 @@ fn why_values(whys: &[Readiness], n: usize) -> Vec<Option<Value>> {
 
 fn show_brief(app: &mut App, a: &ShowArgs) -> Result<()> {
     let tail = a.comments_tail.unwrap_or(BRIEF_COMMENTS);
-    let (all, whys, now) = app.read(|r| {
+    let (all, whys, govs, now) = app.read(|r| {
         let ids = a.ids.iter().map(|raw| r.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
         let all = ids.iter().map(|id| r.show_brief(id, tail)).collect::<Result<Vec<_>>>()?;
-        Ok((all, whys(r, a, &ids)?, r.now()))
+        Ok((all, whys(r, a, &ids)?, governing(r, &ids)?, r.now()))
     })?;
     if app.g.json {
         let values: Vec<Value> = all
             .iter()
             .zip(why_values(&whys, all.len()))
-            .map(|(b, why)| {
+            .enumerate()
+            .map(|(n, (b, why))| {
                 let mut v = serde_json::to_value(b).unwrap_or(Value::Null);
-                if let (Some(why), Some(m)) = (why, v.as_object_mut()) {
-                    m.insert("why".into(), why);
+                if let Some(m) = v.as_object_mut() {
+                    if let Some(why) = why {
+                        m.insert("why".into(), why);
+                    }
+                    if let Some(g) = govs.as_ref().and_then(|v| v.get(n)) {
+                        fmt::insert_specs(m, g, true);
+                    }
                 }
                 v
             })
@@ -437,7 +519,7 @@ fn show_brief(app: &mut App, a: &ShowArgs) -> Result<()> {
             if n > 0 {
                 io::outln("");
             }
-            fmt::show_brief(b, whys.get(n), now).iter().for_each(io::outln);
+            fmt::show_brief(b, whys.get(n), now, govs.as_ref().and_then(|v| v.get(n))).iter().for_each(io::outln);
         }
     }
     Ok(())

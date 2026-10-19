@@ -6259,6 +6259,559 @@ fn spec_write_commands_run_in_a_batch() {
     assert_eq!(spec_snapshot(&ws), before, "rolled back");
 }
 
+#[test]
+fn show_lists_governing_specs() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let spec = ws.id(&["create", "Checkout", "--pinned", "-l", "spec,area:checkout"]);
+    let rule = ws.id(&["create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let goal = ws.id(&["create", "No guest carts", "--pinned", "-l", "non-goal", "--parent", &spec]);
+    let sub = ws.id(&["create", "Saved cards", "--pinned", "-l", "spec,area:sub", "--parent", &spec]);
+    let epic = ws.id(&["create", "Build checkout", "-t", "epic"]);
+    let child = ws.id(&["create", "Cart page", "--parent", &epic]);
+    let plain = ws.id(&["create", "Unrelated"]);
+    ws.ok(&["dep", "add", &child, &rule, "--type", "related"]);
+    ws.ok(&["dep", "add", &epic, &goal, "--type", "related"]);
+    ws.ok(&["comment", "add", &epic, "a note"]);
+
+    // JSON: every field of the entry, through the child and the epic itself.
+    let shown = ws.json(&["show", &epic]);
+    assert!(shown.get("specs_truncated").is_none(), "{shown}");
+    let entry = &shown["specs"][0];
+    assert_eq!(
+        keys(entry),
+        ["areas", "id", "inherits", "linked", "non_goals", "requirements", "status", "title", "via"],
+        "{entry}"
+    );
+    assert_eq!(
+        *entry,
+        serde_json::json!({
+            "id": spec, "title": "Checkout", "status": "pinned", "areas": ["checkout"],
+            "via": [epic, child],
+            "linked": [
+                {"id": rule, "title": "Requires sign-in", "status": "pinned", "non_goal": false},
+                {"id": goal, "title": "No guest carts", "status": "pinned", "non_goal": true},
+            ],
+            "requirements": [{"id": rule, "title": "Requires sign-in"}],
+            "non_goals": [{"id": goal, "title": "No guest carts"}],
+            "inherits": [],
+        })
+    );
+    assert_eq!(shown["specs"].as_array().unwrap().len(), 1, "{shown}");
+    // An issue no spec governs: an empty list, no truncation key.
+    let bare = ws.json(&["show", &plain]);
+    assert_eq!(bare["specs"], serde_json::json!([]));
+    assert!(bare.get("specs_truncated").is_none(), "{bare}");
+    // Several ids: each object its own specs.
+    let both = ws.json(&["show", &child, &plain]);
+    assert_eq!(both[0]["specs"][0]["id"], spec.as_str());
+    assert_eq!(both[0]["specs"][0]["via"], serde_json::json!([epic, child]), "its own link and its parent's");
+    assert_eq!(both[1]["specs"], serde_json::json!([]));
+
+    // Text: after the children, before the comments.
+    let text = ws.ok(&["show", &epic]);
+    let section = format!(
+        "\nSpecs:\n  {spec} Checkout [checkout] (via {epic}, {child})\n    ↳ {rule} Requires sign-in\n    ↳ {goal} No guest carts (non-goal)\n"
+    );
+    let at = text.find(&section).unwrap_or_else(|| panic!("{text}"));
+    assert!(text.find("Children (").unwrap() < at, "{text}");
+    assert!(at < text.find("Comments (").unwrap(), "{text}");
+    assert!(!ws.ok(&["show", &plain]).contains("Specs:"));
+
+    // A sub-spec inherits from its spec; a spec not pinned says so.
+    let lists = ws.id(&["create", "Lists cards", "--pinned", "-l", "requirement", "--parent", &sub]);
+    let cards = ws.id(&["create", "Cards page"]);
+    ws.ok(&["dep", "add", &cards, &lists, "--type", "related"]);
+    let draft = ws.id(&["create", "Draft feature", "-l", "spec"]);
+    ws.ok(&["dep", "add", &cards, &draft, "--type", "related"]);
+    let shown = ws.json(&["show", &cards]);
+    let ids: Vec<&str> = shown["specs"].as_array().unwrap().iter().map(|e| e["id"].as_str().unwrap()).collect();
+    let mut sorted = vec![sub.as_str(), draft.as_str()];
+    sorted.sort();
+    assert_eq!(ids, sorted, "in spec id order: {shown}");
+    let sub_entry = shown["specs"].as_array().unwrap().iter().find(|e| e["id"] == sub.as_str()).unwrap();
+    assert_eq!(sub_entry["inherits"], serde_json::json!([spec]));
+    assert_eq!(sub_entry["areas"], serde_json::json!(["sub"]));
+    let text = ws.ok(&["show", &cards]);
+    assert!(text.contains(&format!("\n  {draft} Draft feature (open, not pinned) (via {cards})\n")), "{text}");
+    assert!(
+        text.contains(&format!("\n  {sub} Saved cards [sub] (via {cards})\n    ↳ {lists} Lists cards\n")),
+        "{text}"
+    );
+
+    // Titles cannot drive the terminal.
+    let evil =
+        ws.id(&["create", "Bad\u{1b}[31m\u{7}x\ry\u{202e}z", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let tricked = ws.id(&["create", "Tricked"]);
+    ws.ok(&["dep", "add", &tricked, &evil, "--type", "related"]);
+    let out = ws.run_as("tester", &["show", &tricked]);
+    assert!(out.status.success());
+    let bytes = &out.stdout;
+    assert!(!bytes.contains(&0x1b) && !bytes.contains(&0x07) && !bytes.contains(&b'\r'), "{bytes:?}");
+    let text = String::from_utf8(out.stdout.clone()).unwrap();
+    assert!(!text.contains('\u{202e}'), "{text:?}");
+    assert!(text.contains(&format!("    ↳ {evil} Bad\\u001b[31m\\u0007x\\u000dy\\u202ez\n")), "{text}");
+
+    // --brief: one line of ids in text, the ids in JSON.
+    let brief = ws.ok(&["show", "--brief", &child]);
+    assert_eq!(brief.lines().nth(1), Some(format!("  specs: {spec}").as_str()), "{brief}");
+    assert!(!ws.ok(&["show", "--brief", &plain]).contains("specs:"));
+    let briefs = ws.json(&["show", "--brief", &cards, &plain]);
+    assert_eq!(briefs[0]["specs"], serde_json::json!(sorted));
+    assert_eq!(briefs[1]["specs"], serde_json::json!([]));
+    assert!(briefs[0].get("specs_truncated").is_none(), "{briefs}");
+    let brief = ws.ok(&["show", "--brief", &cards]);
+    assert!(brief.contains(&format!("\n  specs: {}\n", sorted.join(", "))), "{brief}");
+
+    // --quiet prints the ids only; --as-of carries no spec context.
+    assert_eq!(ws.ok(&["-q", "show", &epic, &plain]), format!("{epic}\n{plain}\n"));
+    assert_eq!(ws.ok(&["-q", "show", "--brief", &epic]), format!("{epic}\n"));
+    let seq = ws.seq_of(&epic, "created");
+    let then = ws.json(&["show", &epic, "--as-of", &format!("#{seq}")]);
+    assert!(then.get("specs").is_none(), "{then}");
+}
+
+/// The lines a claim's text prints after its lease line.
+fn after_lease(text: &str) -> Vec<&str> {
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("  lease token ")).unwrap_or_else(|| panic!("{text}"));
+    lines[at + 1..].to_vec()
+}
+
+#[test]
+fn claim_prints_spec_context() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let spec = ws.id(&["create", "Checkout", "--pinned", "-l", "spec,area:checkout"]);
+    let rule = ws.id(&["create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let cart = ws.id(&["create", "Keeps the cart", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let goal = ws.id(&["create", "No guest carts", "--pinned", "-l", "non-goal", "--parent", &spec]);
+    let work = ws.id(&["create", "Cart page"]);
+    ws.ok(&["dep", "add", &work, &cart, "--type", "related"]);
+    ws.ok(&["dep", "add", &work, &goal, "--type", "related"]);
+
+    // One spec: its counts, the linked requirement first, then the rest in force.
+    let text = ws.ok(&["claim", &work]);
+    assert!(text.starts_with(&format!("✓ Claimed {work} as tester: Cart page\n")), "{text}");
+    let block = [
+        format!("  spec {spec} Checkout [checkout]: 2 requirements, 1 non-goal (bd spec show {spec})"),
+        format!("    - {cart} Keeps the cart"),
+        format!("    - {rule} Requires sign-in"),
+    ];
+    assert_eq!(after_lease(&text), block, "{text}");
+    let token = text.lines().find_map(|l| l.strip_prefix("  lease token ")).unwrap().split(',').next().unwrap();
+
+    // JSON: the entries at the top level, beside the claim.
+    let v = ws.json(&["claim", &work, "--token", token]);
+    assert_eq!(v["already_held"], true);
+    assert_eq!(
+        keys(&v["specs"][0]),
+        ["areas", "id", "inherits", "linked", "non_goals", "requirements", "status", "title", "via"]
+    );
+    assert_eq!(v["specs"][0]["id"], spec.as_str());
+    assert_eq!(v["specs"][0]["via"], serde_json::json!([work]));
+    assert_eq!(v["specs"].as_array().unwrap().len(), 1);
+    assert!(v.get("specs_truncated").is_none(), "{v}");
+    // A re-claim under the same lease prints them again.
+    let again = ws.ok(&["claim", &work, "--token", token]);
+    assert!(again.starts_with(&format!("✓ Already holding {work}")), "{again}");
+    assert_eq!(after_lease(&again), block, "{again}");
+
+    // An issue no spec governs: no spec lines, an empty list.
+    let plain = ws.id(&["create", "Plain"]);
+    assert!(after_lease(&ws.ok(&["claim", &plain])).is_empty());
+    let other = ws.id(&["create", "Other"]);
+    let v = ws.json(&["claim", &other]);
+    assert_eq!(v["specs"], serde_json::json!([]));
+    assert!(v.get("specs_truncated").is_none(), "{v}");
+
+    // claim --next: the governed issue, the only one ready; then nothing ready is null.
+    let next = ws.id(&["create", "Sign-in page"]);
+    ws.ok(&["dep", "add", &next, &rule, "--type", "related"]);
+    let v = ws.json(&["claim", "--next"]);
+    assert_eq!(v["issue"]["id"], next.as_str());
+    assert_eq!(v["specs"][0]["id"], spec.as_str());
+    assert_eq!(v["specs"][0]["linked"][0]["id"], rule.as_str());
+    assert_eq!(ws.ok(&["--json", "claim", "--next"]), "null\n");
+    let again = ws.ok(&["claim", &next, "--token", &v["lease"]["token"].to_string()]);
+    assert_eq!(after_lease(&again)[1], format!("    - {rule} Requires sign-in"), "{again}");
+
+    // close --claim-next: the next issue's spec lines after the claim, and next.specs.
+    let parent = ws.id(&["create", "Feature"]);
+    let a = ws.id(&["create", "A", "--parent", &parent]);
+    let b = ws.id(&["create", "B", "--parent", &parent]);
+    ws.ok(&["dep", "add", &b, &rule, "--type", "related"]);
+    let text = ws.ok(&["close", &a, "-r", "done", "--claim-next"]);
+    let at = text.find("→ Next (from siblings").unwrap_or_else(|| panic!("{text}"));
+    let tail = &text[at..];
+    assert!(tail.contains(&format!("✓ Claimed {b} as tester")), "{text}");
+    assert!(
+        tail.contains(&format!(
+            "\n  spec {spec} Checkout [checkout]: 2 requirements, 1 non-goal (bd spec show {spec})\n    - {rule} Requires sign-in\n    - {cart} Keeps the cart\n"
+        )),
+        "{text}"
+    );
+    let a2 = ws.id(&["create", "A2", "--parent", &parent]);
+    let b2 = ws.id(&["create", "B2", "--parent", &parent]);
+    ws.ok(&["dep", "add", &b2, &spec, "--type", "related"]);
+    let v = ws.json(&["close", &a2, "-r", "done", "--claim-next"]);
+    assert_eq!(v["next"]["issue"]["id"], b2.as_str());
+    assert_eq!(v["next"]["specs"][0]["id"], spec.as_str());
+    assert!(v["next"].get("specs_truncated").is_none(), "{v}");
+    let token = v["next"]["lease"]["token"].to_string();
+    let again = ws.ok(&["claim", &b2, "--token", &token]);
+    assert!(again.contains(&format!("✓ Already holding {b2}")), "{again}");
+    assert!(again.contains(&format!("\n  spec {spec} Checkout [checkout]: ")), "{again}");
+    // --suggest-next carries no spec context.
+    let c = ws.id(&["create", "C", "--parent", &parent]);
+    ws.id(&["create", "D", "--parent", &parent]);
+    let v = ws.json(&["close", &c, "-r", "done", "--suggest-next"]);
+    assert!(v["next"].get("specs").is_none(), "{v}");
+}
+
+#[test]
+fn claim_caps_its_spec_lines() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let specs: Vec<String> =
+        (1..=6).map(|n| ws.id(&["create", &format!("Spec {n}"), "--pinned", "-l", "spec"])).collect();
+    // The first spec: ten requirements, the first with a 150-character title.
+    let long = format!("Long {}", "x".repeat(145));
+    let mut rules = vec![ws.id(&["create", &long, "--pinned", "-l", "requirement", "--parent", &specs[0]])];
+    for n in 2..=10 {
+        rules.push(ws.id(&["create", &format!("Rule {n}"), "--pinned", "-l", "requirement", "--parent", &specs[0]]));
+    }
+    let work = ws.id(&["create", "Everything"]);
+    for s in &specs {
+        ws.ok(&["dep", "add", &work, s, "--type", "related"]);
+    }
+
+    let text = ws.ok(&["claim", &work]);
+    let lines = after_lease(&text);
+    let heads: Vec<&&str> = lines.iter().filter(|l| l.starts_with("  spec ")).collect();
+    assert_eq!(heads.len(), 5, "{text}");
+    assert_eq!(lines.last().unwrap(), &format!("  … 1 more specs: bd show {work}"), "{text}");
+    assert_eq!(
+        lines[0],
+        format!("  spec {} Spec 1: 10 requirements, 0 non-goals (bd spec show {})", specs[0], specs[0])
+    );
+    let cut: String = long.chars().take(100).collect();
+    assert_eq!(lines[1], format!("    - {} {cut}…", rules[0]), "{text}");
+    for (k, r) in rules.iter().enumerate().take(8).skip(1) {
+        assert_eq!(lines[k + 1], format!("    - {r} Rule {}", k + 1), "{text}");
+    }
+    assert_eq!(lines[9], "    … 2 more", "{text}");
+    assert_eq!(
+        lines[10],
+        format!("  spec {} Spec 2: 0 requirements, 0 non-goals (bd spec show {})", specs[1], specs[1])
+    );
+    assert!(!text.contains(&format!("  spec {} ", specs[5])), "{text}");
+    let v = ws.json(&["show", &work]);
+    assert_eq!(v["specs"].as_array().unwrap().len(), 6, "show lists every one");
+
+    // A sub-spec's block ends with the specs it inherits from.
+    let sub = ws.id(&["create", "Sub", "--pinned", "-l", "spec", "--parent", &specs[1]]);
+    let rule = ws.id(&["create", "One rule", "--pinned", "-l", "requirement", "--parent", &sub]);
+    let deep = ws.id(&["create", "Deep work"]);
+    ws.ok(&["dep", "add", &deep, &rule, "--type", "related"]);
+    let text = ws.ok(&["claim", &deep]);
+    assert_eq!(
+        after_lease(&text),
+        [
+            format!("  spec {sub} Sub: 1 requirement, 0 non-goals (bd spec show {sub})"),
+            format!("    - {rule} One rule"),
+            format!("    inherits from {}", specs[1]),
+        ],
+        "{text}"
+    );
+}
+
+#[test]
+fn spec_context_truncation() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    // $1 the spec, $2 a parent of 501 children linked to it, then an unlinked one as big.
+    let mut ops = String::from("create \"Checkout\" -l spec\ncreate \"Big\"\n");
+    for n in 0..501 {
+        ops.push_str(&format!("create \"c{n}\" --parent $2\n"));
+    }
+    ops.push_str("dep add $2 $1 --type related\ncreate \"Bare\"\n");
+    let bare_ref = 2 + 501 + 2;
+    for n in 0..501 {
+        ops.push_str(&format!("create \"d{n}\" --parent ${bare_ref}\n"));
+    }
+    let out = ws.batch_as("tester", &ops);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let (spec, big, bare) = ("t-1", "t-2", "t-3");
+    assert_eq!(ws.json(&["show", bare])["title"], "Bare");
+    assert_eq!(ws.json(&["show", "t-2.501"])["title"], "c500");
+
+    let shown = ws.json(&["show", big]);
+    assert_eq!(shown["specs"][0]["id"], spec);
+    assert_eq!(shown["specs_truncated"], true, "{}", shown["specs"]);
+    let text = ws.ok(&["show", big]);
+    assert!(text.contains("\n  (first 500 issues below looked at; bd spec drift checks all)\n"), "{text}");
+    assert_eq!(ws.json(&["show", "--brief", big])["specs_truncated"], true);
+    let claim = ws.json(&["claim", big, "--allow-blocked"]);
+    assert_eq!(claim["specs_truncated"], true, "{claim}");
+    assert_eq!(claim["specs"][0]["id"], spec);
+
+    // A child, governed through its parent, and an ordinary issue walk whole.
+    let child = ws.json(&["show", "t-2.1"]);
+    assert_eq!(child["specs"][0]["id"], spec);
+    assert_eq!(child["specs"][0]["via"], serde_json::json!([big]));
+    assert!(child.get("specs_truncated").is_none(), "{child}");
+    let plain = ws.id(&["create", "Plain"]);
+    let v = ws.json(&["show", &plain]);
+    assert!(v.get("specs_truncated").is_none() && v["specs"] == serde_json::json!([]), "{v}");
+
+    // An unlinked parent whose walk was cut is not known to be unlinked: no hint.
+    let out = ws.run_as("tester", &["close", bare, "--force", "-r", "x"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("hint:"), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// What follows the ids in `bd close`'s unlinked-spec hint.
+const HINT_TAIL: &str = " (bd dep add <id> <spec or requirement> --type related, \
+    or bd spec none <id> -r '<why>'; bd spec drift lists unlinked work)";
+
+fn text_of(bytes: &[u8]) -> String {
+    String::from_utf8(bytes.to_vec()).unwrap()
+}
+
+/// `bd batch --dry-run` as tester, from a file holding `ops`.
+fn batch_dry_run(ws: &Ws, ops: &str) -> Output {
+    let script = ws.dir.path().join("batch.txt");
+    std::fs::write(&script, ops).unwrap();
+    ws.run_as("tester", &["batch", "--dry-run", "-f", script.to_str().unwrap()])
+}
+
+/// `v` with every `*_at` key left out, at any depth: what two workspaces
+/// doing the same things at different times still disagree on.
+fn without_times(v: &Value) -> Value {
+    match v {
+        Value::Object(m) => Value::Object(
+            m.iter().filter(|(k, _)| !k.ends_with("_at")).map(|(k, v)| (k.clone(), without_times(v))).collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(without_times).collect()),
+        v => v.clone(),
+    }
+}
+
+#[test]
+fn close_hints_unlinked_work() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let spec = ws.id(&["create", "Checkout", "--pinned", "-l", "spec"]);
+    let rule = ws.id(&["create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let close = |args: &[&str]| {
+        let out = ws.run_as("tester", args);
+        assert_eq!(out.status.code(), Some(0), "bd {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        (text_of(&out.stdout), text_of(&out.stderr))
+    };
+
+    // One unlinked issue: stdout as ever, one line on stderr.
+    let lonely = ws.id(&["create", "Lonely"]);
+    let (stdout, stderr) = close(&["close", &lonely, "-r", "done"]);
+    assert_eq!(stdout, format!("✓ Closed {lonely}: Lonely\n"));
+    assert_eq!(stderr, format!("hint: not linked to a feature spec: {lonely}{HINT_TAIL}\n"));
+
+    // Six, named last first: the first five in command-line order, then a count.
+    let six: Vec<String> = (0..6).map(|n| ws.id(&["create", &format!("u{n}")])).collect();
+    let named: Vec<&str> = six.iter().rev().map(String::as_str).collect();
+    let mut args = vec!["close", "-r", "done"];
+    args.extend(&named);
+    let (_, stderr) = close(&args);
+    assert_eq!(stderr, format!("hint: not linked to a feature spec: {} +1 more{HINT_TAIL}\n", named[..5].join(", ")));
+
+    // Covered by a link (directly, through an ancestor, through a
+    // descendant), exempt, spec:none, or already closed: no hint.
+    let direct = ws.id(&["create", "Direct"]);
+    ws.ok(&["dep", "add", &direct, &spec, "--type", "related"]);
+    let parent = ws.id(&["create", "Parent"]);
+    ws.ok(&["dep", "add", &parent, &rule, "--type", "related"]);
+    let under = ws.id(&["create", "Under", "--parent", &parent]);
+    let above = ws.id(&["create", "Above"]);
+    let below = ws.id(&["create", "Below", "--parent", &above]);
+    ws.ok(&["dep", "add", &below, &spec, "--type", "related"]);
+    let failed = ws.id(&["create", "Failed"]);
+    let decision = ws.id(&["create", "Choice", "-t", "decision"]);
+    let step = ws.id(&["create", "Step", "--metadata", r#"{"playbook":{"role":"step"}}"#]);
+    let requirement = ws.id(&["create", "Another rule", "-l", "requirement"]);
+    let scratch = ws.id(&["create", "Scratch", "--ephemeral"]);
+    let chore = ws.id(&["create", "Chore", "-l", "spec:none"]);
+    for args in [
+        vec!["close", &direct, "-r", "done"],
+        vec!["close", &under, "-r", "done"],
+        vec!["close", &below, "-r", "done"],
+        vec!["close", &above, "-r", "done"],
+        vec!["close", &failed, "--failed", "-r", "no"],
+        vec!["close", &decision, "-r", "done"],
+        vec!["close", &step, "-r", "done"],
+        vec!["close", &requirement, "-r", "done"],
+        vec!["close", &scratch, "-r", "done"],
+        vec!["close", &chore, "-r", "done"],
+        vec!["close", &lonely, "-r", "again"],
+    ] {
+        let (_, stderr) = close(&args);
+        assert_eq!(stderr, "", "bd {args:?}");
+    }
+
+    // --json: the hint on stderr, stdout as a specs-off twin's (the same
+    // issue, the same id, in a fresh pair of workspaces).
+    let (on_ws, off_ws) = (Ws::new(), Ws::new());
+    on_ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let same = on_ws.id(&["create", "Same"]);
+    assert_eq!(off_ws.id(&["create", "Same"]), same);
+    let on = on_ws.run_as("tester", &["--json", "close", &same, "-r", "done"]);
+    let off = off_ws.run_as("tester", &["--json", "close", &same, "-r", "done"]);
+    assert!(on.status.success() && off.status.success());
+    let (on_json, off_json): (Value, Value) =
+        (serde_json::from_slice(&on.stdout).unwrap(), serde_json::from_slice(&off.stdout).unwrap());
+    assert_eq!(without_times(&on_json), without_times(&off_json));
+    assert_eq!(text_of(&on.stderr), format!("hint: not linked to a feature spec: {same}{HINT_TAIL}\n"));
+    assert_eq!(text_of(&off.stderr), "");
+
+    // -q: nothing on stderr.
+    let quiet = ws.id(&["create", "Quiet"]);
+    let out = ws.run_as("tester", &["-q", "close", &quiet, "-r", "done"]);
+    assert!(out.status.success());
+    assert_eq!((text_of(&out.stdout), text_of(&out.stderr)), (format!("{quiet}\n"), String::new()));
+
+    // A refused close prints no hint: another actor's claim (exit 4), a bad flag (exit 2).
+    let held = ws.id(&["create", "Held"]);
+    ws.ok(&["--actor", "alice", "claim", &held]);
+    let out = ws.run_as("tester", &["close", &held, "-r", "done"]);
+    assert_eq!(out.status.code(), Some(4));
+    assert!(!text_of(&out.stderr).contains("hint: not linked"), "{}", text_of(&out.stderr));
+    let open = ws.id(&["create", "Open"]);
+    let out = ws.run_as("tester", &["close", &open, "--claim-next", "--ttl", "bogus", "-r", "done"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(!text_of(&out.stderr).contains("hint: not linked"), "{}", text_of(&out.stderr));
+    assert_eq!(ws.json(&["show", &open])["status"], "open");
+
+    // bd batch: once, after the batch, with the op's number; --dry-run too.
+    let ops = "create \"Batched\"\nclose $1 -r done\n";
+    for out in [ws.batch_as("tester", ops), batch_dry_run(&ws, ops)] {
+        assert!(out.status.success(), "{}", text_of(&out.stderr));
+        let stderr = text_of(&out.stderr);
+        let stdout = text_of(&out.stdout);
+        let created = stdout.lines().find_map(|l| l.strip_prefix("[2] ✓ Closed ")).unwrap();
+        let created = created.split(':').next().unwrap();
+        assert_eq!(stderr, format!("[2] hint: not linked to a feature spec: {created}{HINT_TAIL}\n"));
+    }
+    // A batch that fails at its last line prints none.
+    let out = ws.batch_as("tester", "create \"Doomed\"\nclose $1 -r done\nclose t-999 -r done\n");
+    assert!(!out.status.success());
+    assert!(!text_of(&out.stderr).contains("hint: not linked"), "{}", text_of(&out.stderr));
+}
+
+/// Whether `v` has a `specs` or `specs_truncated` key anywhere.
+fn has_spec_keys(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => m.iter().any(|(k, v)| k == "specs" || k == "specs_truncated" || has_spec_keys(v)),
+        Value::Array(a) => a.iter().any(has_spec_keys),
+        _ => false,
+    }
+}
+
+/// A specs-off workspace with a spec, its requirement, an epic of four
+/// children and a decoy, and with `linked` the epic and its fourth child
+/// related to the spec and the requirement (else to the decoy, so both
+/// workspaces write as many events); then the outputs of show, brief,
+/// claim, close and batch on the children, as (args, stdout, stderr).
+fn specs_off_outputs(linked: bool) -> Vec<(String, String, String)> {
+    let ws = Ws::new();
+    let spec = ws.id(&["create", "Checkout", "--pinned", "-l", "spec,area:checkout"]);
+    let rule = ws.id(&["create", "Requires sign-in", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let epic = ws.id(&["create", "Build checkout", "-t", "epic"]);
+    let w: Vec<String> = (1..=4).map(|n| ws.id(&["create", &format!("w{n}"), "--parent", &epic])).collect();
+    let decoy = ws.id(&["create", "Decoy"]);
+    let (to_spec, to_rule) = if linked { (&spec, &rule) } else { (&decoy, &decoy) };
+    ws.ok(&["dep", "add", &epic, to_spec, "--type", "related"]);
+    ws.ok(&["dep", "add", &w[3], to_rule, "--type", "related"]);
+    let script = ws.dir.path().join("ops.txt");
+    std::fs::write(&script, format!("close {} -r done\nclaim {decoy}\n", w[3])).unwrap();
+    let runs: Vec<Vec<&str>> = vec![
+        vec!["show", &w[0]],
+        vec!["--json", "show", &w[0]],
+        vec!["show", &w[0], &w[1]],
+        vec!["--json", "show", &w[0], &w[3]],
+        vec!["show", "--brief", &w[0]],
+        vec!["--json", "show", "--brief", &w[0], &w[3]],
+        vec!["claim", &w[3]],
+        vec!["release", &w[3]],
+        vec!["--json", "claim", &w[3]],
+        vec!["release", &w[3]],
+        vec!["--json", "claim", "--next"],
+        vec!["claim", "--next"],
+        vec!["close", &w[0], "-r", "done"],
+        vec!["--json", "close", &w[1], "-r", "done"],
+        vec!["close", &w[2], "--claim-next", "-r", "done"],
+        vec!["batch", "-f", script.to_str().unwrap()],
+        vec!["--json", "close", &epic, "--force", "--claim-next", "-r", "done"],
+    ];
+    let outputs = runs
+        .iter()
+        .map(|args| {
+            let out = ws.run_as("tester", args);
+            assert!(out.status.success(), "bd {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            (args.join(" "), text_of(&out.stdout), text_of(&out.stderr))
+        })
+        .collect();
+    // The links are real: with specs on, the spec governs the first child.
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let governed = ws.json(&["show", &w[0]])["specs"].as_array().unwrap().len();
+    assert_eq!(governed, usize::from(linked));
+    outputs
+}
+
+#[test]
+fn spec_context_off_unchanged() {
+    let unlinked = specs_off_outputs(false);
+    let linked = specs_off_outputs(true);
+    // `updated: 84ms ago` and the like differ from run to run.
+    let steady = |text: &str| {
+        text.lines().map(|l| if l.contains("  created: ") { "  created: …" } else { l }).collect::<Vec<_>>().join("\n")
+    };
+    for (a, b) in unlinked.iter().zip(&linked) {
+        for (args, stdout, stderr) in [a, b] {
+            assert_eq!(stderr, "", "bd {args}");
+            if args.starts_with("--json") {
+                let v: Value = serde_json::from_str(stdout).unwrap();
+                assert!(!has_spec_keys(&v), "bd {args}: {v}");
+            } else {
+                for l in stdout.lines() {
+                    assert!(
+                        !l.starts_with("Specs:")
+                            && !l.contains("specs:")
+                            && !l.starts_with("  spec ")
+                            && !l.contains("hint:"),
+                        "bd {args}: {stdout}"
+                    );
+                }
+            }
+        }
+        if !a.0.starts_with("--json") {
+            assert_eq!(steady(&a.1), steady(&b.1), "bd {}", a.0);
+        }
+    }
+}
+
+#[test]
+fn spec_query_fields_refuse_while_specs_are_off() {
+    let ws = Ws::new();
+    let out = ws.run_as("tester", &["query", "spec = none"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("feature specs are off in this workspace"), "{err}");
+    assert!(err.lines().any(|l| l.trim_start() == "^"), "{err}");
+    let out = ws.run_as("tester", &["query", "area = checkout"]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    // Parsing alone needs no workspace setting.
+    assert_eq!(ws.code_as("tester", &["query", "--parse-only", "spec = none AND area = x"]), 0);
+}
+
 const PUBLISHED_PLAYBOOK: &str = "description = \"Ship it\"\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n";
 
 fn json_lines(text: &str) -> Vec<Value> {

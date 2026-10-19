@@ -141,6 +141,18 @@ describe('plan-implement-review', () => {
 		await expect(wf.run(fakeCtx({ requirements: 'x', skipImplement: true }, script()))).rejects.toThrow(/skipImplement needs/)
 	})
 
+	it.each(['huge', 'High', 7])('rejects reviewEffort %j at start, before any agent runs', async (v) => {
+		const wf = await load('plan-implement-review', undefined)
+		const ctx = fakeCtx({ requirements: 'x', reviewEffort: v }, script())
+		await expect(wf.run(ctx)).rejects.toThrow(/args\.reviewEffort must be one of low\|medium\|high\|xhigh\|max/)
+		expect(ctx.calls).toHaveLength(0)
+	})
+
+	it('lists reviewEffort in its args schema with the five efforts', async () => {
+		const wf = await load('plan-implement-review', undefined)
+		expect(wf.meta.argsSchema.properties.reviewEffort.enum).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
+	})
+
 	describe('logs, the suite lock and the gate marker', () => {
 		const run = async (args, over = {}) => {
 			const wf = await load('plan-implement-review', undefined)
@@ -324,12 +336,48 @@ describe('plan-implement-review', () => {
 			const real = rows.find((r) => r.label === 'review:code:r0')
 			const shadow = rows.find((r) => r.label === 'review:code:r0@shadow:gpt-6-astra-xhigh')
 			expect(real).toMatchObject({ kind: 'code-review', model: null, effort: null, result: { findings: [FOUND] } })
+			// Without reviewEffort a real reviewer gets no effort key at all: the session's.
+			const realCalls = ctx.calls.filter((c) => /^review:[^@]+:r0$/.test(c.label))
+			expect(realCalls.length).toBeGreaterThan(0)
+			for (const c of realCalls) expect('reasoningEffort' in c).toBe(false)
+			expect(ctx.logs.some((m) => m.startsWith('Reviewers at effort'))).toBe(false)
 			expect(shadow).toMatchObject({ model: 'gpt-6-astra', effort: 'xhigh' })
 			expect(real.prompt_sha256).toMatch(/^[0-9a-f]{64}$/)
 			expect(real.prompt_sha256).toBe(shadow.prompt_sha256)
 			expect(rows.find((r) => r.label === 'validate:r0:F1')).toMatchObject({ finding: { file: 'src/a.rs', line: 4, claim: 'Handles nothing' }, result: { valid: true } })
 			expect(JSON.stringify(rows)).not.toContain('You are')
 			expect(rows.some((r) => r.label === 'claim' || r.label === 'setup')).toBe(false)
+		})
+
+		it('runs the real reviewers at reviewEffort, and nothing else', async () => {
+			const wf = await load('plan-implement-review', workspace)
+			const ctx = fakeCtx({ ...ARGS, reviewEffort: 'max', shadowReview: SHADOW, tier: 'critical' }, script({ 'review:code:r0': { findings: [FOUND] } }))
+			expect((await wf.run(ctx)).status).toBe('done')
+			const real = ctx.calls.filter((c) => /^review:[^@]+:r0$/.test(c.label))
+			expect(real.map((c) => c.label).toSorted()).toEqual(['review:code:r0', 'review:requirements:r0', 'review:security:r0'])
+			for (const c of real) {
+				expect(c).toMatchObject({ reasoningEffort: 'max', agent: 'code-review' })
+				expect(c.model).toBeUndefined()
+				const shadow = ctx.calls.find((s) => s.label === `${c.label}@shadow:gpt-6-astra-xhigh`)
+				expect(shadow).toMatchObject({ model: 'gpt-6-astra', reasoningEffort: 'xhigh', agent: 'code-review' })
+				expect(shadow.prompt).toBe(c.prompt)
+			}
+			const validators = ctx.calls.filter((c) => c.label.startsWith('validate:'))
+			expect(validators).toHaveLength(1)
+			for (const c of validators) expect(c.reasoningEffort).toBe('high')
+			for (const label of ['claim', 'setup']) expect(ctx.calls.find((c) => c.label === label)).toMatchObject({ agent: 'task', reasoningEffort: 'low' })
+			const gates = ctx.calls.filter((c) => c.label.startsWith('gate:'))
+			expect(gates.length).toBeGreaterThan(0)
+			for (const c of gates) expect(c).toMatchObject({ agent: 'task', reasoningEffort: 'low' })
+			const rows = recorded(ctx.runId).filter((r) => r.type === 'agent')
+			for (const kind of ['code', 'requirements', 'security']) {
+				const r = rows.find((x) => x.label === `review:${kind}:r0`)
+				const sh = rows.find((x) => x.label === `review:${kind}:r0@shadow:gpt-6-astra-xhigh`)
+				expect(r).toMatchObject({ model: null, effort: 'max' })
+				expect(sh).toMatchObject({ model: 'gpt-6-astra', effort: 'xhigh' })
+				expect(r.prompt_sha256).toBe(sh.prompt_sha256)
+			}
+			expect(ctx.logs).toContain('Reviewers at effort max')
 		})
 
 		it('records nothing without a session folder, and never fails the run when it cannot write', async () => {

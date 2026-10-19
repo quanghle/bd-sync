@@ -375,6 +375,12 @@ const shadowsOf = (v) => {
     }
     return list.map((o) => ({ model: o.model, effort: o.effort }));
 };
+// args.reviewEffort: {} when absent (no effort key: the session's), { effort } for a known word; anything else throws.
+const reviewEffortOf = (v) => {
+    if (v == null) return {};
+    if (!EFFORTS.includes(v)) throw new Error(`args.reviewEffort must be one of ${EFFORTS.join("|")}, got ${JSON.stringify(v)}`);
+    return { effort: v };
+};
 
 // A follow-up's key: FNV-1a of its file and claim. Finding ids restart at F1 each run, so an id alone would match another
 // run's follow-up on the same step; the claim is the same on resume (journaled agents) and differs between findings.
@@ -427,6 +433,8 @@ function parseArgs(raw) {
         SHADOWS: shadowsOf(A.shadowReview),
         // Model and effort for the coding agents (implement, gate fixes, review fixes); the others keep theirs.
         CODER_OPTS: { ...(A.model ? { model: A.model } : {}), ...(A.effort ? { effort: A.effort } : {}) },
+        // Effort for the real reviewers only (shadows keep theirs, validators stay high); absent: the session's.
+        REVIEW_OPTS: reviewEffortOf(A.reviewEffort),
         // args.logDir, checked here so a bad value throws at start; the run's log directory is named by RUN_ID.
         LOG_DIR: logDirOf(A.logDir),
         RUN_ID: A.issue ? safeId(A.issue) : `run-${fnv1a(`${reqText}\n${A.workdir ?? ""}`)}`,
@@ -452,7 +460,7 @@ const recordAgent = (run, entry) => {
 const RECORDED = /^(review|validate):/;
 
 async function run(ctx) {
-    const { A, TASK, BASE, MAX_ROUNDS, MAX_GATE_FIXES, MAX_PLAN_REVISIONS, MAX_AMENDMENTS, TTL, SHADOWS, CODER_OPTS, LOG_DIR, RUN_ID } = parseArgs(ctx.args);
+    const { A, TASK, BASE, MAX_ROUNDS, MAX_GATE_FIXES, MAX_PLAN_REVISIONS, MAX_AMENDMENTS, TTL, SHADOWS, CODER_OPTS, REVIEW_OPTS, LOG_DIR, RUN_ID } = parseArgs(ctx.args);
 
     // Workflow subagents: `kind` picks the built-in agent, `effort` its reasoning effort, `model` a Copilot model id.
     // Identical prompt + options are memoized into one subagent, so labels must be unique per call.
@@ -649,6 +657,7 @@ async function run(ctx) {
     ctx.log(`Working in ${DIR} (baseline ${setup.baseline.slice(0, 8)})`);
     ctx.log(`Logs in ${LOG_ROOT}/${RUN_ID}`);
     if (SHADOWS.length) ctx.log(`Shadow reviewers: ${SHADOWS.map((o) => `${o.model}/${o.effort}`).join(", ")}`);
+    if (REVIEW_OPTS.effort) ctx.log(`Reviewers at effort ${REVIEW_OPTS.effort}`);
 
     // ---------- Plan ----------
     ctx.phase("Plan");
@@ -922,7 +931,8 @@ async function run(ctx) {
         ].join("\n");
 
     // ---------- review ----------
-    // Reviewers run read-only. Full review on round 0; focused re-review afterwards. Shadow reviewers (args.shadowReview)
+    // Reviewers run read-only, at the session's model and at args.reviewEffort when given (REVIEW_OPTS), else the session's
+    // effort. Full review on round 0; focused re-review afterwards. Shadow reviewers (args.shadowReview), which keep their own effort,
     // start in the same parallel() call with the same prompt; their results go to shadowFindings and only the real ones return.
     // Each kind's prompt ends with its log rule (reviewLogRule), which names no label or model, so the prompts stay identical.
     async function review(round, snap, files, prevSnap, approved) {
@@ -973,7 +983,7 @@ async function run(ctx) {
                 ),
             );
         }
-        const real = reviewers.map((r) => () => agent(r.prompt, { label: `review:${r.name}:r${round}`, kind: "code-review", schema: REVIEW }));
+        const real = reviewers.map((r) => () => agent(r.prompt, { label: `review:${r.name}:r${round}`, kind: "code-review", schema: REVIEW, ...REVIEW_OPTS }));
         const shadows = reviewers.flatMap((r) => SHADOWS.map((o) => ({ r, o, label: `review:${r.name}:r${round}@shadow:${o.model}-${o.effort}` })));
         const shadow = shadows.map(({ r, o, label }) => () =>
             agent(r.prompt, { label, kind: "code-review", schema: REVIEW, model: o.model, effort: o.effort }),
@@ -1274,7 +1284,7 @@ const planImplementReview = defineWorkflow({
             "Planner turns requirements into a vetted plan, coder implements it step by step, reviewers report, controller validates, " +
             "planner triages fixes against a decision ledger to stop circular fixes. Use for requirements (often a bd issue or epic) that need a plan " +
             "before coding and an independent review loop that must not oscillate. " +
-            "args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, " +
+            "args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, reviewEffort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, " +
             "maxRounds?, maxGateFixes?, maxPlanRevisions?, maxAmendments?, planOnly?, plan?, planFile?, planIssues?, skipImplement?, shadowReview? }. " +
             "With issue, the workflow claims it (pass actor = your bd actor so you can close it later, " +
             "and token if you already hold it) and renews the lease between stages; a failed heartbeat is escalated once, then the lease shown by bd show decides. " +
@@ -1286,6 +1296,8 @@ const planImplementReview = defineWorkflow({
             "discovery (bd -C <main checkout>), never a pinned path. tier (small | standard | critical) adds the security reviewer for critical. " +
             "model (a Copilot model id) and effort set the coding agents (implement, gate fixes, review fixes); claim, heartbeat, setup, gates and bd records run " +
             "on the task agent at low effort, escalated once to the general-purpose agent at medium when one fails its schema (retry labelled <label>@escalated). " +
+            "reviewEffort (low | medium | high | xhigh | max) runs the real reviewers at that effort, at the session's model; without it they run at the " +
+            "session's effort; shadows and validators keep theirs (AGENTS.md: high for a run estimated at complexity 4-5). " +
             "Without workdir it works in a new worktree under .copilot/worktrees/. " +
             "logDir (absolute; default <os tmpdir>/plan-implement-review) holds each agent's command output as <logDir>/<run>/<label>.log " +
             "(run: the issue id, sanitized); full cargo test --workspace runs go through .github/scripts/suite-lock.mjs; a gate log whose bd-gate marker " +
@@ -1320,6 +1332,7 @@ const planImplementReview = defineWorkflow({
                 tier: { type: "string", enum: ["small", "standard", "critical"] },
                 model: { type: "string" },
                 effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"] },
+                reviewEffort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"] },
                 shadowReview: {
                     anyOf: [
                         { type: "boolean", enum: [false] },

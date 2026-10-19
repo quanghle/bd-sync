@@ -3,7 +3,7 @@ export const meta = {
   description:
     'Planner turns requirements into a vetted plan, coder implements it step by step, gates run, reviewers report, controller validates, planner triages fixes against a decision ledger to stop circular fixes',
   whenToUse:
-    "Implementing requirements (often a bd issue or a `change` playbook run) that need a plan before coding and an independent review loop that must not oscillate. args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, maxRounds?, maxGateFixes?, maxPlanRevisions?, maxAmendments?, planOnly?, plan?, planIssues?, skipImplement?, shadowReview? }. With issue, pass actor (your bd actor) so you can close it later, and run score-issue on it just before closing it. model and effort set the coding agents (implement, gate fixes, review fixes). Before passing reviewStep or any arg beyond these, read the args comment in .claude/workflows/plan-implement-review.js.",
+    "Implementing requirements (often a bd issue or a `change` playbook run) that need a plan before coding and an independent review loop that must not oscillate. args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, reviewEffort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, maxRounds?, maxGateFixes?, maxPlanRevisions?, maxAmendments?, planOnly?, plan?, planIssues?, skipImplement?, shadowReview? }. With issue, pass actor (your bd actor) so you can close it later, and run score-issue on it just before closing it. model and effort set the coding agents (implement, gate fixes, review fixes). Before passing reviewStep or any arg beyond these, read the args comment in .claude/workflows/plan-implement-review.js.",
   phases: [
     { title: 'Setup', detail: 'claim the bd issue, worktree + baseline snapshot' },
     { title: 'Plan', detail: 'planner drafts, critic challenges, planner revises' },
@@ -34,7 +34,12 @@ export const meta = {
 //   batch, app or io.
 // - model, effort: the coding agents (implement, gate fixes, review fixes); the others keep theirs: claim, heartbeat,
 //   setup, gates and bd records on haiku at low effort, escalated once to sonnet at medium when one fails its schema
-//   (retry labelled <label>@sonnet); planner, critic, triage and validators at high effort; reviewers the session's.
+//   (retry labelled <label>@sonnet); planner, critic, triage and validators at high effort; reviewers at the session's
+//   model, at reviewEffort when given, else the session's effort.
+// - reviewEffort (low|medium|high|xhigh|max): the effort every real reviewer (review:<kind>:r<N>, full and focused,
+//   every round) runs at; without it the session's. Their model stays the session's, shadows keep their own effort,
+//   validators stay at high, and prompts and labels are unchanged, so shadow pairing holds. AGENTS.md: pass high for a
+//   run estimated at complexity 4-5; anything else throws at start.
 // - workdir (with base, default main): without it the workflow works in a new worktree under .claude/worktrees/. Every
 //   cargo command runs with CARGO_TARGET_DIR=<main checkout>/target/implement-review, shared by runs so a fresh worktree
 //   reuses compiled dependencies.
@@ -95,7 +100,16 @@ const shadowsOf = (v) => {
   }
   return list.map((o) => ({ model: o.model, effort: o.effort }))
 }
+// args.reviewEffort: {} when absent (no effort key: the session's effort), { effort } for a known word, else it throws.
+const reviewEffortOf = (v) => {
+  if (v == null) return {}
+  if (!EFFORTS.includes(v)) throw new Error(`args.reviewEffort must be one of ${EFFORTS.join('|')}, got ${JSON.stringify(v)}`)
+  return { effort: v }
+}
 const SHADOWS = shadowsOf(A.shadowReview)
+// Effort for the real reviewers only: shadows keep theirs and validators stay high; absent, no effort key, so the
+// session's effort.
+const REVIEW_OPTS = reviewEffortOf(A.reviewEffort)
 // args.logDir (and the TMPDIR the setup agent reports): an absolute directory, put into prompts and shell commands, so no
 // '..' segment and no control character (a newline would split a command). Trailing slashes are dropped.
 const logDirOf = (v) => {
@@ -119,7 +133,8 @@ const TTL = A.ttl || '30m'
 
 // Model and effort for the coding agents (implement, gate fixes, review fixes); the others keep theirs: mechanical
 // agents (claim, heartbeat, setup, gates, bd records) on haiku at low effort (sonnet at medium on a schema failure; see
-// ops()), planner, critic, triage and validators high, reviewers the session's.
+// ops()), planner, critic, triage and validators high, reviewers at the session's model, at reviewEffort when given
+// (else the session's effort).
 const CODER_OPTS = { ...(A.model ? { model: A.model } : {}), ...(A.effort ? { effort: A.effort } : {}) }
 
 // Mechanical agents (claim, heartbeat, bd:root, setup, gate, bd records) only run commands and report output: haiku at low
@@ -618,6 +633,7 @@ LOG_ROOT ||= `${tmpRootOf(setup.tmpdir).replace(/\/$/, '')}/plan-implement-revie
 log(`Working in ${DIR} (baseline ${setup.baseline.slice(0, 8)})`)
 log(`Logs in ${LOG_ROOT}/${RUN_ID}`)
 if (SHADOWS.length) log(`Shadow reviewers: ${SHADOWS.map((o) => `${o.model}/${o.effort}`).join(', ')}`)
+if (REVIEW_OPTS.effort) log(`Reviewers at effort ${REVIEW_OPTS.effort}`)
 
 // ---------- Plan ----------
 phase('Plan')
@@ -940,7 +956,7 @@ async function review(round, snap, files, prevSnap, approved) {
       ),
     )
   }
-  const real = reviewers.map((s) => () => agent(s.prompt, { label: `review:${s.name}:r${round}`, phase: 'Review', schema: REVIEW, ...s.extra }))
+  const real = reviewers.map((s) => () => agent(s.prompt, { label: `review:${s.name}:r${round}`, phase: 'Review', schema: REVIEW, ...REVIEW_OPTS, ...s.extra }))
   const shadows = reviewers.flatMap((s) => SHADOWS.map((o) => ({ s, o, label: `review:${s.name}:r${round}@shadow:${o.model}-${o.effort}` })))
   const shadow = shadows.map(({ s, o, label }) => () => agent(s.prompt, { label, phase: 'Review', schema: REVIEW, ...s.extra, model: o.model, effort: o.effort }))
   const out = await parallel([...real, ...shadow])

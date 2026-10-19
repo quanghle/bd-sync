@@ -20,7 +20,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -28,8 +28,8 @@ use crate::config;
 use crate::error::{Error, Result};
 use crate::graph;
 use crate::hierarchy;
-use crate::issues::{self, ISSUE_COLUMNS, issue_from_row};
-use crate::model::{GATE_TYPE, Issue, IssueRef, Outcome, Status};
+use crate::issues;
+use crate::model::{DepType, GATE_TYPE, Issue, IssueRef, Outcome, Status};
 use crate::time::Timestamp;
 
 /// The experimental feature's name in `experimental.features`.
@@ -669,14 +669,18 @@ pub fn linked(conn: &Connection) -> Result<HashSet<String>> {
         }
     }
     // Up: once an issue is in, so is everything above it.
-    // `above` stays closed upward, so an id already in it has its chain in.
+    // `above` stays closed upward, so an id already in it has its chain in:
+    // each walk stops at the first ancestor already in it, which also ends
+    // a (refused, but possible in a damaged database) parent cycle.
     let mut above: HashSet<String> = HashSet::new();
     for id in direct {
-        if above.contains(&id) {
-            continue;
+        let mut at = id;
+        while above.insert(at.clone()) {
+            match graph::parent_of(conn, &at)? {
+                Some(p) => at = p,
+                None => break,
+            }
         }
-        above.extend(graph::ancestors(conn, &id)?);
-        above.insert(id);
     }
     out.extend(below);
     out.extend(above);
@@ -717,6 +721,11 @@ impl<'c> Exempt<'c> {
     }
 
     fn check(&mut self, issue: &Issue) -> Result<bool> {
+        self.check_scanned(&Scanned::from(issue))
+    }
+
+    /// [`Exempt::check`] over the fields a window scan reads.
+    fn check_scanned(&mut self, issue: &Scanned) -> Result<bool> {
         if issue.metadata.pointer("/playbook/role").is_some()
             || issue.issue_type == GATE_TYPE
             || issue.issue_type == "decision"
@@ -751,25 +760,97 @@ impl<'c> Exempt<'c> {
 }
 
 /// Whether the issue `id` was closed as a duplicate or superseded: an
-/// outgoing `duplicates` or `supersedes` edge (read by source, through
-/// `idx_deps_source`). The strings are `DepType::Duplicates` and
-/// `DepType::Supersedes`' `as_str`.
+/// outgoing `duplicates` or `supersedes` edge, its types bound from
+/// [`DepType`] and read by source through `idx_deps_source`.
 fn replaced(conn: &Connection, id: &str) -> Result<bool> {
     Ok(conn
-        .prepare_cached(
-            "SELECT EXISTS (SELECT 1 FROM dependencies WHERE issue_id = ?1 AND dep_type IN ('duplicates','supersedes'))",
-        )?
-        .query_row([id], |r| r.get(0))?)
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM dependencies WHERE issue_id = ?1 AND dep_type IN (?2, ?3))")?
+        .query_row(params![id, DepType::Duplicates.as_str(), DepType::Supersedes.as_str()], |r| r.get(0))?)
 }
 
-/// Closed issues closed in `[from, to)`, in id order.
-fn closed_between(conn: &Connection, from: Timestamp, to: Timestamp) -> Result<Vec<Issue>> {
+/// The fields of an issue that the window filter ([`Exempt`]) and the
+/// printed refs use: what [`closed_between`] and [`open_created_since`]
+/// read, leaving out the text fields a scan never looks at.
+#[derive(Clone, Debug, PartialEq)]
+struct Scanned {
+    id: String,
+    title: String,
+    status: Status,
+    priority: u8,
+    issue_type: String,
+    assignee: Option<String>,
+    metadata: Value,
+    ephemeral: bool,
+    close_outcome: Option<Outcome>,
+    labels: Vec<String>,
+}
+
+impl Scanned {
+    /// The same ref as [`Issue::to_ref`].
+    fn to_ref(&self) -> IssueRef {
+        IssueRef {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            status: self.status,
+            priority: self.priority,
+            issue_type: self.issue_type.clone(),
+            assignee: self.assignee.clone(),
+        }
+    }
+}
+
+impl From<&Issue> for Scanned {
+    fn from(issue: &Issue) -> Self {
+        Scanned {
+            id: issue.id.clone(),
+            title: issue.title.clone(),
+            status: issue.status,
+            priority: issue.priority,
+            issue_type: issue.issue_type.clone(),
+            assignee: issue.assignee.clone(),
+            metadata: issue.metadata.clone(),
+            ephemeral: issue.ephemeral,
+            close_outcome: issue.close_outcome,
+            labels: issue.labels.clone(),
+        }
+    }
+}
+
+/// The columns of a [`Scanned`] row, in [`scanned_from_row`]'s order. The
+/// labels subquery is `issues::ISSUE_COLUMNS`' own; the test
+/// `lean_rows_equal_full_rows` keeps the two in step.
+const SCAN_COLUMNS: &str = "i.id, i.title, i.status, i.priority, i.issue_type, i.assignee, i.metadata, i.ephemeral,
+    i.close_outcome,
+    (SELECT json_group_array(label) FROM (SELECT label FROM labels l WHERE l.issue_id = i.id ORDER BY label))";
+
+/// A [`SCAN_COLUMNS`] row, its metadata and labels decoded exactly as
+/// `issues::issue_from_row` decodes them.
+fn scanned_from_row(r: &Row<'_>) -> rusqlite::Result<Scanned> {
+    let metadata: String = r.get(6)?;
+    let labels: String = r.get(9)?;
+    Ok(Scanned {
+        id: r.get(0)?,
+        title: r.get(1)?,
+        status: r.get(2)?,
+        priority: r.get::<_, i64>(3)? as u8,
+        issue_type: r.get(4)?,
+        assignee: r.get(5)?,
+        metadata: serde_json::from_str(&metadata).unwrap_or_else(|_| crate::model::empty_object()),
+        ephemeral: r.get::<_, i64>(7)? != 0,
+        close_outcome: r.get(8)?,
+        labels: serde_json::from_str(&labels).unwrap_or_default(),
+    })
+}
+
+/// Closed issues closed in `[from, to)`, in id order, reading only
+/// [`SCAN_COLUMNS`].
+fn closed_between(conn: &Connection, from: Timestamp, to: Timestamp) -> Result<Vec<Scanned>> {
     let sql = format!(
-        "SELECT {ISSUE_COLUMNS} FROM issues i INDEXED BY idx_issues_ready
+        "SELECT {SCAN_COLUMNS} FROM issues i INDEXED BY idx_issues_ready
          WHERE i.status = 'closed' AND i.closed_at >= ?1 AND i.closed_at < ?2 ORDER BY i.id"
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map(params![from, to], issue_from_row)?;
+    let rows = stmt.query_map(params![from, to], scanned_from_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -786,15 +867,16 @@ fn not_closed_list() -> String {
         .join(",")
 }
 
-/// Issues not closed created at or after `since`, in id order.
-fn open_created_since(conn: &Connection, since: Timestamp) -> Result<Vec<Issue>> {
+/// Issues not closed created at or after `since`, in id order, reading
+/// only [`SCAN_COLUMNS`].
+fn open_created_since(conn: &Connection, since: Timestamp) -> Result<Vec<Scanned>> {
     let sql = format!(
-        "SELECT {ISSUE_COLUMNS} FROM issues i INDEXED BY idx_issues_ready
+        "SELECT {SCAN_COLUMNS} FROM issues i INDEXED BY idx_issues_ready
          WHERE i.status IN ({}) AND i.created_at >= ?1 ORDER BY i.id",
         not_closed_list()
     );
     let mut stmt = conn.prepare_cached(&sql)?;
-    let rows = stmt.query_map([since], issue_from_row)?;
+    let rows = stmt.query_map([since], scanned_from_row)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -811,7 +893,7 @@ enum Window {
 /// closed first, then the open, each in id order) that is neither linked
 /// nor exempt: the one filter behind [`unlinked_since`] and
 /// [`unlinked_counts`].
-fn scan_unlinked(conn: &Connection, since: Timestamp, mut each: impl FnMut(Window, &Issue)) -> Result<()> {
+fn scan_unlinked(conn: &Connection, since: Timestamp, mut each: impl FnMut(Window, &Scanned)) -> Result<()> {
     let linked = linked(conn)?;
     let mut exempt = Exempt::new(conn);
     for (window, issues) in [
@@ -819,7 +901,7 @@ fn scan_unlinked(conn: &Connection, since: Timestamp, mut each: impl FnMut(Windo
         (Window::Open, open_created_since(conn, since)?),
     ] {
         for issue in issues {
-            if !linked.contains(&issue.id) && !exempt.check(&issue)? {
+            if !linked.contains(&issue.id) && !exempt.check_scanned(&issue)? {
                 each(window, &issue);
             }
         }
@@ -996,7 +1078,7 @@ pub fn candidates(conn: &Connection, since: Option<Timestamp>) -> Result<Vec<Can
     let mut groups: BTreeMap<String, CandidateGroup> = BTreeMap::new();
     let mut exempt = Exempt::new(conn);
     for issue in closed {
-        if linked.contains(&issue.id) || exempt.check(&issue)? {
+        if linked.contains(&issue.id) || exempt.check_scanned(&issue)? {
             continue;
         }
         let mut epic: Option<(String, String)> = None;

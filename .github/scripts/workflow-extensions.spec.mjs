@@ -69,7 +69,7 @@ describe('plan-implement-review', () => {
 		if (base === 'claim') return CLAIM
 		if (base.startsWith('heartbeat')) return { ok: true }
 		if (base === 'setup') return { workdir: '/w', baseline: 'abc12345abc', target: '/t', branch: 'b' }
-		if (base.startsWith('gate:')) return { passed: true, failures: [], snapshot: 'snap1', changedFiles: ['README.md'] }
+		if (base.startsWith('gate:')) return { passed: true, failures: [], snapshot: 'snap1', changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
 		if (base.startsWith('review:')) return { findings: [] }
 		if (base.startsWith('record:')) return { ok: true, filed: [], followedUp: [] }
 		if (base.startsWith('validate:')) return { valid: true, blocking: false, reasoning: 'real but minor' }
@@ -139,6 +139,125 @@ describe('plan-implement-review', () => {
 		await expect(wf.run(fakeCtx({}, script()))).rejects.toThrow(/args.requirements is required/)
 		await expect(wf.run(fakeCtx({ requirements: 'x', tier: 'huge' }, script()))).rejects.toThrow(/args.tier must be/)
 		await expect(wf.run(fakeCtx({ requirements: 'x', skipImplement: true }, script()))).rejects.toThrow(/skipImplement needs/)
+	})
+
+	describe('logs, the suite lock and the gate marker', () => {
+		const run = async (args, over = {}) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx(args, script(over))
+			return { ctx, got: await wf.run(ctx) }
+		}
+		const promptOf = (ctx, label) => ctx.calls.find((c) => c.label === label).prompt
+		const GREEN = { passed: true, failures: [], snapshot: 'snap1', changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
+		const FOREIGN = { ...GREEN, marker: 'bd-gate: dir=/w/other run=bd-1' }
+		const UNMARKED = { passed: true, failures: [], snapshot: 'snap1', changedFiles: ['README.md'] }
+		const LINT = { passed: false, failures: [{ command: 'cargo clippy', excerpt: 'warning: x' }], snapshot: 'snap1', changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
+
+		it('rejects a logDir that is not an absolute directory without .. or control characters, at start', async () => {
+			const wf = await load('plan-implement-review', undefined)
+			for (const logDir of ['rel', '/a/../b', '/a\nb']) {
+				const ctx = fakeCtx({ ...ARGS, logDir }, script())
+				await expect(wf.run(ctx), JSON.stringify(logDir)).rejects.toThrow(/args\.logDir must be/)
+				expect(ctx.calls, JSON.stringify(logDir)).toHaveLength(0)
+			}
+		})
+
+		it('names each gate attempt\'s own log under logDir, or under the os tmpdir without it', async () => {
+			const { ctx } = await run({ ...ARGS, logDir: '/logs/' })
+			const gate = promptOf(ctx, 'gate:impl')
+			expect(gate).toContain(`> '/logs/bd-1/gate-impl.log' 2>&1`)
+			expect(gate).toContain(`mkdir -p '/logs/bd-1'`)
+			expect(gate).toContain('bd-gate: dir=$PWD run=bd-1')
+			expect(gate).toContain(`head -1 '/logs/bd-1/gate-impl.log'`)
+			expect(ctx.logs).toContain('Logs in /logs/bd-1')
+
+			const { ctx: dflt } = await run(ARGS)
+			expect(promptOf(dflt, 'gate:impl')).toContain(`${join(tmpdir(), 'plan-implement-review')}/bd-1/gate-impl.log`)
+		})
+
+		it('runs the full suite under the suite lock, and reruns it while the lock is busy', async () => {
+			const { ctx } = await run(ARGS)
+			const gate = promptOf(ctx, 'gate:impl')
+			expect(gate).toContain('if [ -f .github/scripts/suite-lock.mjs ]; then node .github/scripts/suite-lock.mjs --run bd-1 -- cargo test --workspace --locked; else cargo test --workspace --locked; fi')
+			expect(gate).toContain('exit[test]=75')
+			expect(gate).toContain(`grep '^exit\\[' `)
+			expect(gate).toContain('600000')
+			expect(gate).not.toContain('tee ')
+		})
+
+		it('gives validators and gate-fix coders their own files', async () => {
+			const { ctx } = await run({ ...ARGS, logDir: '/logs' }, { 'review:code:r0': { findings: [FOUND] }, 'gate:impl': LINT })
+			const validate = promptOf(ctx, 'validate:r0:F1')
+			expect(validate).toContain(`'/logs/bd-1/validate-r0-F1.log'`)
+			expect(validate).toContain('exit 75')
+			const fix = promptOf(ctx, 'coder:gate-fix:impl:1')
+			expect(fix).toContain(`> '/logs/bd-1/coder-gate-fix-impl-1.log' 2>&1; echo "exit=$?"`)
+			expect(fix).not.toContain('validate-r0-F1.log')
+			expect(promptOf(ctx, 'gate:impl:1')).toContain(`'/logs/bd-1/gate-impl-1.log'`)
+		})
+
+		it('gives real and shadow reviewers the same prompt, with a mktemp log and no label or model', async () => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx({ ...ARGS, logDir: '/logs', shadowReview: { model: 'gpt-6-astra', effort: 'xhigh' } }, script())
+			await wf.run(ctx)
+			const real = promptOf(ctx, 'review:code:r0')
+			expect(promptOf(ctx, 'review:code:r0@shadow:gpt-6-astra-xhigh')).toBe(real)
+			expect(real).toContain(`mktemp '/logs/bd-1/review-code-r0.XXXXXX'`)
+			expect(real).not.toContain('@shadow')
+			expect(real).not.toContain('gpt-6-astra')
+			expect(promptOf(ctx, 'review:requirements:r0')).toContain(`mktemp '/logs/bd-1/review-requirements-r0.XXXXXX'`)
+		})
+
+		it.each([
+			['names another directory', FOREIGN, 'its marker says "bd-gate: dir=/w/other run=bd-1"'],
+			['passes without a marker', UNMARKED, 'no bd-gate marker although the gate passed'],
+		])('escalates a gate whose log %s on both attempts, without a gate fix', async (_, report, says) => {
+			const { ctx, got } = await run(ARGS, { 'gate:impl': report, 'gate:impl@escalated': report })
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toMatch(/^gate log contaminated/)
+			expect(got.reason).toContain(says)
+			expect(got.reason).toContain('expected dir=/w run=bd-1')
+			expect(got.reason).toContain(`(log ${join(tmpdir(), 'plan-implement-review')}/bd-1/gate-impl-escalated.log)`)
+			expect(ctx.calls.filter((c) => c.label.startsWith('gate:')).map((c) => [c.label, c.agent])).toEqual([
+				['gate:impl', 'task'],
+				['gate:impl@escalated', 'general-purpose'],
+			])
+			expect(ctx.calls.some((c) => c.label.startsWith('coder:gate-fix'))).toBe(false)
+			expect(ctx.calls.some((c) => c.label.startsWith('review:'))).toBe(false)
+			expect(ctx.logs.some((l) => l.startsWith('gate gate:impl: log contaminated'))).toBe(true)
+		})
+
+		it('takes a clean escalated attempt after a contaminated one', async () => {
+			const { ctx, got } = await run(ARGS, { 'gate:impl': FOREIGN, 'gate:impl@escalated': GREEN })
+			expect(got.status).toBe('done')
+			expect(promptOf(ctx, 'gate:impl@escalated')).toContain('/bd-1/gate-impl-escalated.log')
+		})
+
+		it('escalates a contaminated gate after review fixes, keeping the open findings', async () => {
+			const { ctx, got } = await run(ARGS, {
+				'review:code:r0': { findings: [FOUND] },
+				'validate:r0:F1': { valid: true, blocking: true, reasoning: 'real', fixInstruction: 'fix it' },
+				'planner:triage:r0': { items: [{ id: 'F1', action: 'fix', reason: 'r', instruction: 'i' }], converging: true },
+				'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }] },
+				'gate:r1': FOREIGN,
+				'gate:r1@escalated': FOREIGN,
+			})
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toMatch(/^gate log contaminated/)
+			expect(got.open.map((f) => f.id)).toEqual(['F1'])
+			expect(promptOf(ctx, 'coder:fix:r1')).toContain('/bd-1/coder-fix-r1.log')
+			expect(ctx.calls.some((c) => c.label.startsWith('coder:gate-fix'))).toBe(false)
+		})
+
+		it('gives each implement coder its own file', async () => {
+			const { skipImplement, ...args } = ARGS
+			const { ctx, got } = await run({ ...args, logDir: '/logs' }, {
+				'planner:critic:0': { approved: true, issues: [] },
+				'coder:S1': { summary: 'done', filesChanged: ['a.md'] },
+			})
+			expect(got.status).toBe('done')
+			expect(promptOf(ctx, 'coder:S1')).toContain(`'/logs/bd-1/coder-S1.log'`)
+		})
 	})
 
 	describe('shadow reviewers and the recorded agents', () => {

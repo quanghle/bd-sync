@@ -31,6 +31,7 @@ const SCHEMA = { type: 'object' }
 const OPTS = { label: 'claim', phase: 'Setup', schema: SCHEMA }
 const PROMPT = 'Run exactly: bd claim bd-x --json'
 const gateValid = (r) => !!(r?.snapshot && r.passed !== r.failures.length > 0)
+const labelPrompt = (l) => `Write to ${l}.log`
 
 describe('plan-implement-review ops()', () => {
 	it('names the levels by class: haiku at low, sonnet at medium', () => {
@@ -92,6 +93,26 @@ describe('plan-implement-review ops()', () => {
 		const broken = load({ haiku: contradictory, sonnet: contradictory })
 		expect(await broken.ops(PROMPT, gate, gateValid)).toBeNull()
 		expect(broken.calls).toHaveLength(2)
+	})
+
+	it("renders a prompt function with each attempt's own label", async () => {
+		const reply = { ok: true }
+		const { ops, calls } = load({ haiku: null, sonnet: reply })
+		expect(await ops(labelPrompt, { ...OPTS, label: 'x' })).toBe(reply)
+		expect(calls[0].prompt).toBe('Write to x.log')
+		expect(calls[1].prompt.startsWith('Write to x@sonnet.log\n\nAn earlier attempt')).toBe(true)
+		expect(calls.map((c) => c.label)).toEqual(['x', 'x@sonnet'])
+	})
+
+	it("passes each attempt's label to valid", async () => {
+		const seen = []
+		const { ops } = load({ haiku: { n: 1 }, sonnet: { n: 2 } })
+		const valid = (r, l) => (seen.push([r.n, l]), r.n === 2)
+		expect(await ops(PROMPT, { ...OPTS, label: 'gate:impl' }, valid)).toEqual({ n: 2 })
+		expect(seen).toEqual([
+			[1, 'gate:impl'],
+			[2, 'gate:impl@sonnet'],
+		])
 	})
 
 	it('does not escalate a consistent failed gate (passed=false with failures)', async () => {

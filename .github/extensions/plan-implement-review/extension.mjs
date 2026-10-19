@@ -2,7 +2,8 @@
 // review → validate → triage → fix loop, with a decision ledger that stops circular fixes.
 import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { isAbsolute, join } from "node:path";
 import { defineWorkflow, joinSession } from "@github/copilot-sdk/extension";
 
 // ---------- schemas ----------
@@ -174,6 +175,8 @@ const GATE = {
         },
         snapshot: { type: "string", description: "tree id from the snapshot command" },
         changedFiles: { type: "array", items: { type: "string" } },
+        log: { type: "string", description: "the log file the gate command wrote" },
+        marker: { type: "string", description: "the first line of that log (head -1), verbatim" },
     },
     required: ["passed", "failures", "snapshot", "changedFiles"],
 };
@@ -282,6 +285,55 @@ const fmtPlan = (p) =>
     (p.outOfScope?.length ? `\n\nOut of scope:\n${p.outOfScope.map((o) => `- ${o}`).join("\n")}` : "");
 const fmtDecisions = (p) => p.decisions.map((d) => `- ${d.decision} (why: ${d.rationale})`).join("\n");
 
+// ---------- logs ----------
+// args.logDir: an absolute directory, put into prompts and shell commands, so no '..' segment and no control character (a
+// newline would split a command). Trailing separators are dropped only while what remains is still absolute, so '/' stays
+// '/' and 'C:\' stays absolute on Windows.
+const logDirOf = (v) => {
+    if (v == null) return null;
+    // Built from char codes, so the source holds no raw control characters: U+0000-U+001F and U+007F.
+    const control = new RegExp(`[${String.fromCharCode(0)}-${String.fromCharCode(31)}${String.fromCharCode(127)}]`);
+    const ok = typeof v === "string" && isAbsolute(v) && !v.split(/[\\/]/).includes("..") && !control.test(v);
+    if (!ok) throw new Error(`args.logDir must be an absolute directory without '..' or control characters (your scratchpad), got ${JSON.stringify(v)}`);
+    let s = v;
+    while (s.length > 1 && /[\\/]$/.test(s) && isAbsolute(s.slice(0, -1))) s = s.slice(0, -1);
+    return s;
+};
+// 32-bit FNV-1a of a string, as 8 hex digits (the hash followUpKey computes inline).
+const fnv1a = (s) => {
+    let h = 0x811c9dc5;
+    for (const c of s) h = Math.imul(h ^ c.codePointAt(0), 0x01000193) >>> 0;
+    return h.toString(16).padStart(8, "0");
+};
+// Per-run logs: every agent that runs cargo writes each command's output to its own file, <log root>/<run>/<label>.log
+// (reviewers to a mktemp file there, so a real reviewer and its shadows keep identical prompts), and reads results only
+// from it, so parallel runs and parallel agents never read each other's logs. Full suites (cargo test --workspace) go
+// through the suite lock (.github/scripts/suite-lock.mjs), which runs them one at a time across worktrees.
+const safeId = (s) => String(s).replace(/[^A-Za-z0-9.-]/g, "-");
+// A path as one POSIX single-quoted shell word; unlike shq, nothing is collapsed or cut.
+const shPath = (s) => `'${String(s).replaceAll("'", `'\\''`)}'`;
+// The gate's shell writes `bd-gate: dir=$PWD run=<run>` as the first line of its own log, and the gate agent returns
+// that line as "marker". A marker naming another directory or run, or one that does not parse, means the agent read
+// another run's log (or a stale one), so its verdict says nothing about this worktree; so does a pass with no marker at
+// all. Such a report never counts as a pass and never reaches the gate-fix coder. A failure without a marker (the agent
+// stopped before the log was read back) stays an ordinary failure.
+const markerOf = (line) => {
+    const m = /^bd-gate: dir=(.*) run=(\S*)$/.exec(String(line ?? "").trim());
+    return m ? { dir: m[1], run: m[2] } : null;
+};
+// macOS reports /var/... as /private/var/... from $PWD in some shells; a trailing slash is not another directory.
+const normDir = (p) => p.replace(/\/+$/, "").replace(/^\/private(?=\/)/, "");
+const sameDir = (a, b) => !!a && !!b && normDir(a) === normDir(b);
+const contamination = (r, dir, run) => {
+    const marker = String(r.marker ?? "").trim();
+    if (!marker) return r.passed ? { dir: "", run: "", marker: "" } : null;
+    const m = markerOf(marker);
+    if (m && sameDir(m.dir, dir) && m.run === run) return null;
+    return { dir: m?.dir ?? "", run: m?.run ?? "", marker };
+};
+const contaminatedReason = (g, dir, run) =>
+    `gate log contaminated: ${g.marker ? `its marker says "${g.marker}"` : "no bd-gate marker although the gate passed"}, expected dir=${dir} run=${run} (log ${g.log})`;
+
 // Areas whose rules in AGENTS.md are easy to break without a failing test.
 const touchesEngine = (files) =>
     files.some((f) => /^crates\/bd-core\//.test(f) || /^crates\/bd-cli\/src\/(commands|batch|app|io)/.test(f));
@@ -375,6 +427,9 @@ function parseArgs(raw) {
         SHADOWS: shadowsOf(A.shadowReview),
         // Model and effort for the coding agents (implement, gate fixes, review fixes); the others keep theirs.
         CODER_OPTS: { ...(A.model ? { model: A.model } : {}), ...(A.effort ? { effort: A.effort } : {}) },
+        // args.logDir, checked here so a bad value throws at start; the run's log directory is named by RUN_ID.
+        LOG_DIR: logDirOf(A.logDir),
+        RUN_ID: A.issue ? safeId(A.issue) : `run-${fnv1a(`${reqText}\n${A.workdir ?? ""}`)}`,
     };
 }
 
@@ -397,7 +452,7 @@ const recordAgent = (run, entry) => {
 const RECORDED = /^(review|validate):/;
 
 async function run(ctx) {
-    const { A, TASK, BASE, MAX_ROUNDS, MAX_GATE_FIXES, MAX_PLAN_REVISIONS, MAX_AMENDMENTS, TTL, SHADOWS, CODER_OPTS } = parseArgs(ctx.args);
+    const { A, TASK, BASE, MAX_ROUNDS, MAX_GATE_FIXES, MAX_PLAN_REVISIONS, MAX_AMENDMENTS, TTL, SHADOWS, CODER_OPTS, LOG_DIR, RUN_ID } = parseArgs(ctx.args);
 
     // Workflow subagents: `kind` picks the built-in agent, `effort` its reasoning effort, `model` a Copilot model id.
     // Identical prompt + options are memoized into one subagent, so labels must be unique per call.
@@ -414,19 +469,48 @@ async function run(ctx) {
     // Mechanical agents (claim, heartbeat, bd:root, setup, gate, bd records) only run commands and report output: the task
     // agent at low effort. One that fails its schema (null, or a result its caller rejects) is escalated once to the
     // general-purpose agent at medium effort, never retried at the same level; the retry's label gets @escalated. Copilot
-    // model ids are not named by class, so the escalation changes the agent kind, not the model.
+    // model ids are not named by class, so the escalation changes the agent kind, not the model. prompt is a string or a
+    // function of the attempt's label (so each attempt can name its own log file); valid gets the report and that label.
     const OPS = { kind: "task", effort: "low" };
     const OPS_ESCALATED = { kind: "general-purpose", effort: "medium" };
     async function ops(prompt, opts, valid = (r) => r != null) {
-        const r = await agent(prompt, { ...opts, ...OPS });
-        if (valid(r)) return r;
+        const text = (l) => (typeof prompt === "function" ? prompt(l) : prompt);
+        const r = await agent(text(opts.label), { ...opts, ...OPS });
+        if (valid(r, opts.label)) return r;
         ctx.log(`${opts.label} failed its schema on the ${OPS.kind} agent; escalating to ${OPS_ESCALATED.kind}`);
+        const retryLabel = `${opts.label}@escalated`;
         const again = await agent(
-            `${prompt}\n\nAn earlier attempt at this may have run some of these commands before failing: check their effects first and do not repeat one that already took effect.`,
-            { ...opts, ...OPS_ESCALATED, label: `${opts.label}@escalated` },
+            `${text(retryLabel)}\n\nAn earlier attempt at this may have run some of these commands before failing: check their effects first and do not repeat one that already took effect.`,
+            { ...opts, ...OPS_ESCALATED, label: retryLabel },
         );
-        return valid(again) ? again : null;
+        return valid(again, retryLabel) ? again : null;
     }
+
+    // ---------- logs ----------
+    // args.logDir, or <os tmpdir>/plan-implement-review: this process's own temporary directory, so no agent round trip.
+    const LOG_ROOT = LOG_DIR ?? join(tmpdir(), "plan-implement-review");
+    const logFile = (label) => `${LOG_ROOT}/${RUN_ID}/${safeId(label)}.log`;
+    // The full suite under the lock, or unlocked in a worktree on an older base without the script.
+    const SUITE_TEST = `if [ -f .github/scripts/suite-lock.mjs ]; then node .github/scripts/suite-lock.mjs --run ${RUN_ID} -- cargo test --workspace --locked; else cargo test --workspace --locked; fi`;
+    const lockText =
+        `The full suite (cargo test --workspace) runs from the worktree as \`${SUITE_TEST}\` with CARGO_TARGET_DIR set; it waits while another worktree runs one, ` +
+        `and exit 75 means the lock was still busy and nothing ran: run the same command again. ` +
+        `cargo fmt, cargo clippy and single-crate tests (\`cargo test -p <crate> [filter]\`) run without the lock.`;
+    const logRule = (label) => {
+        const file = shPath(logFile(label));
+        return (
+            `Logs: write the full output of every cargo command you run to ${file} only. ` +
+            `Run \`mkdir -p ${shPath(`${LOG_ROOT}/${RUN_ID}`)}\` first, then overwrite the file per command with ` +
+            `\`<command> > ${file} 2>&1; echo "exit=$?"\` (the shell may be zsh, which has no $PIPESTATUS, so do not pipe a command into tee). ` +
+            `Read results only from that file (grep, tail), never from another log. ${lockText}`
+        );
+    };
+    // A reviewer's rule names neither its label nor its model, so a real reviewer and its shadows get byte-identical prompts
+    // (reviewer-catch.mjs pairs them by prompt hash); mktemp still gives each its own file.
+    const reviewLogRule = (kind, round) =>
+        `Logs: if you run a cargo command, give its output a file of your own (outside the worktree): ` +
+        `\`mkdir -p ${shPath(`${LOG_ROOT}/${RUN_ID}`)} && f=$(mktemp ${shPath(`${LOG_ROOT}/${RUN_ID}/review-${safeId(kind)}-r${round}.XXXXXX`)}) && <command> > "$f" 2>&1; echo "log=$f exit=$?"\`, ` +
+        `then read results only from the file it printed, never from another log. ${lockText}`;
 
     let TARGET = "";
     let DIR = "";
@@ -563,6 +647,7 @@ async function run(ctx) {
     DIR = setup.workdir;
     TARGET = setup.target;
     ctx.log(`Working in ${DIR} (baseline ${setup.baseline.slice(0, 8)})`);
+    ctx.log(`Logs in ${LOG_ROOT}/${RUN_ID}`);
     if (SHADOWS.length) ctx.log(`Shadow reviewers: ${SHADOWS.map((o) => `${o.model}/${o.effort}`).join(", ")}`);
 
     // ---------- Plan ----------
@@ -661,36 +746,79 @@ async function run(ctx) {
     if (A.planOnly) return { status: "planned", workdir: DIR, branch: setup.branch, baseline: setup.baseline, plan, ledger, lease };
 
     // ---------- gate ----------
-    // A gate report that contradicts itself counts as a failed gate agent, and is escalated.
-    const gate = (label) =>
-        ops(
-            `${inDir(DIR)}\nRun these there, in order, each even if an earlier one fails (the CI gates from .github/workflows/ci.yml):\n` +
-                `  cargo fmt --all --check\n  cargo clippy --workspace --all-targets --locked -- -D warnings\n  cargo test --workspace --locked\n` +
-                `Do NOT fix anything. For each failing command, return a trimmed excerpt with the real errors (max ~60 lines each; ` +
-                `for tests, the failing test names and their panic messages).\n` +
-                `Then run this and return its output as "snapshot":\n${SNAPSHOT_CMD}\n` +
-                `Then run \`git diff --name-only ${setup.baseline} <snapshot>\` and return the list as changedFiles.`,
-            { label, schema: GATE },
-            (r) => !!(r?.snapshot && r.passed !== r.failures.length > 0),
+    // The CI gates from .github/workflows/ci.yml as one shell line: a marker first (contamination), then fmt, clippy and the
+    // full suite (under the suite lock), each run even if an earlier one fails, all into the attempt's own log; then the
+    // exit[...] lines. gateRerunCmd runs the suite again when the lock was still busy (exit[test]=75), appending to the log.
+    const gateCmd = (label) => {
+        const file = shPath(logFile(label));
+        return (
+            `mkdir -p ${shPath(`${LOG_ROOT}/${RUN_ID}`)} && cd ${shPath(DIR)} && { echo "bd-gate: dir=$PWD run=${RUN_ID}"; ` +
+            `export CARGO_TARGET_DIR=${shPath(TARGET)}; cargo fmt --all --check; echo "exit[fmt]=$?"; ` +
+            `cargo clippy --workspace --all-targets --locked -- -D warnings; echo "exit[clippy]=$?"; ` +
+            `${SUITE_TEST}; echo "exit[test]=$?"; } > ${file} 2>&1; grep '^exit\\[' ${file}`
         );
+    };
+    const gateRerunCmd = (label) => {
+        const file = shPath(logFile(label));
+        return (
+            `cd ${shPath(DIR)} && { export CARGO_TARGET_DIR=${shPath(TARGET)}; ${SUITE_TEST}; echo "exit[test]=$?"; } >> ${file} 2>&1; ` +
+            `grep '^exit\\[test\\]' ${file} | tail -1`
+        );
+    };
+    const gatePrompt = (label) => {
+        const file = shPath(logFile(label));
+        return (
+            `${inDir(DIR)}\nRun the CI gates there (cargo fmt check, clippy -D warnings, the full test suite under the suite lock): ` +
+            `in the foreground, with the Bash tool's longest timeout (600000 ms), run exactly:\n${gateCmd(label)}\n` +
+            `While the last exit[test] line is exit[test]=75 (another worktree held the suite lock and the tests did not run), run this, as often as it takes:\n` +
+            `${gateRerunCmd(label)}\n` +
+            `Running the checks changes nothing, so run them even if an earlier attempt already did. ` +
+            `Read the results only from ${file} (grep, tail), never from another log.\n` +
+            `Do NOT fix anything. For each failing command, return a trimmed excerpt with the real errors (max ~60 lines each; ` +
+            `for tests, the failing test names and their panic messages).\n` +
+            `Return ${file} as "log", and the output of \`head -1 ${file}\` verbatim as "marker".\n` +
+            `Then run this and return its output as "snapshot":\n${SNAPSHOT_CMD}\n` +
+            `Then run \`git diff --name-only ${setup.baseline} <snapshot>\` and return the list as changedFiles.`
+        );
+    };
+    // A gate report that contradicts itself, or whose log is contaminated, counts as a failed gate agent and is escalated
+    // once. If the last attempt is still contaminated, gate() returns a { contaminated } marker instead of null; the marker
+    // reflects only that attempt.
+    const gate = async (label) => {
+        let dirty = null;
+        const r = await ops(gatePrompt, { label, schema: GATE }, (x, l) => {
+            dirty = null;
+            if (!(x?.snapshot && x.passed !== x.failures.length > 0)) return false;
+            const c = contamination(x, DIR, RUN_ID);
+            if (c) {
+                dirty = { contaminated: true, ...c, log: logFile(l) };
+                ctx.log(`gate ${l}: log contaminated (${c.marker || "no marker"})`);
+            }
+            return !c;
+        });
+        return r ?? dirty;
+    };
+
+    const gateFixPrompt = (g, label) =>
+        `${inDir(DIR)}\nThe automated checks fail for this work:\n${TASK}\n\n` +
+        g.failures.map((f) => `### ${f.command}\n${f.excerpt}`).join("\n\n") +
+        `\n\nFix the causes (not the checks: no #[allow(...)] to silence clippy, no #[ignore] or weakened assertions, no --no-verify). ` +
+        `Run \`cargo fmt --all\` after editing. Keep the change minimal and on-task.\n\n` +
+        `${ledgerBlock()}\n\nDo not undo a ledger decision to make a check pass; if one makes the checks unpassable, say so in notes and stop.\n\n` +
+        logRule(label);
 
     // Run the gate; on failure send the coder back up to MAX_GATE_FIXES times. Gate fixes are settled too,
-    // and must not undo earlier decisions to get green. Returns null if the gate agent itself failed.
+    // and must not undo earlier decisions to get green. Returns null if the gate agent itself failed, and the { contaminated }
+    // marker if its log was another run's (never sent to the gate-fix coder).
     async function gateUntilGreen(tag, round) {
         ctx.phase("Gate");
         await renew();
         let g = await gate(`gate:${tag}`);
-        for (let i = 1; g && !g.passed && i <= MAX_GATE_FIXES; i++) {
+        for (let i = 1; g && !g.passed && !g.contaminated && i <= MAX_GATE_FIXES; i++) {
             ctx.log(`Gate failed (${g.failures.map((f) => f.command).join(", ")}); coder fix ${i}/${MAX_GATE_FIXES}`);
             await renew();
-            const r = await agent(
-                `${inDir(DIR)}\nThe automated checks fail for this work:\n${TASK}\n\n` +
-                    g.failures.map((f) => `### ${f.command}\n${f.excerpt}`).join("\n\n") +
-                    `\n\nFix the causes (not the checks: no #[allow(...)] to silence clippy, no #[ignore] or weakened assertions, no --no-verify). ` +
-                    `Run \`cargo fmt --all\` after editing. Keep the change minimal and on-task.\n\n` +
-                    `${ledgerBlock()}\n\nDo not undo a ledger decision to make a check pass; if one makes the checks unpassable, say so in notes and stop.`,
-                { label: `coder:gate-fix:${tag}:${i}`, schema: CODER, ...CODER_OPTS },
-            );
+            const label = `coder:gate-fix:${tag}:${i}`;
+            const r = await agent(gateFixPrompt(g, label), { label, schema: CODER, ...CODER_OPTS });
             if (r) {
                 settle({
                     source: "gate",
@@ -789,6 +917,7 @@ async function run(ctx) {
     // ---------- review ----------
     // Reviewers run read-only. Full review on round 0; focused re-review afterwards. Shadow reviewers (args.shadowReview)
     // start in the same parallel() call with the same prompt; their results go to shadowFindings and only the real ones return.
+    // Each kind's prompt ends with its log rule (reviewLogRule), which names no label or model, so the prompts stay identical.
     async function review(round, snap, files, prevSnap, approved) {
         const focused = round > 0;
         const scope = focused
@@ -804,7 +933,7 @@ async function run(ctx) {
             `no style preferences, and no re-litigating a ledger decision unless you show it causes a defect. ` +
             `Severity: blocker/serious = must fix before merge; minor/nit = optional. Return an empty list if clean.`;
 
-        const reviewer = (name, focus) => ({ name, prompt: focus ? `${common}\n${focus}` : common });
+        const reviewer = (name, focus) => ({ name, prompt: `${focus ? `${common}\n${focus}` : common}\n\n${reviewLogRule(name, round)}` });
         const reviewers = [reviewer("code", "")];
         if (!focused) {
             reviewers.push(
@@ -853,8 +982,9 @@ async function run(ctx) {
     let nextId = 1;
     function validate(findings, round, snap) {
         const ids = findings.map(() => `F${nextId++}`);
-        return ctx.pipeline(findings, (_, f, i) =>
-            agent(
+        return ctx.pipeline(findings, (_, f, i) => {
+            const label = `validate:r${round}:${ids[i]}`;
+            return agent(
                 `You are the controller validating a code-review finding. Try to REFUTE it by reading the actual code in ${DIR} ` +
                     `(current state = \`git diff ${setup.baseline} ${snap}\` on top of ${BASE}). Do not edit files.\n\n` +
                     `${TASK}\n\nFinding:\n${fmtFinding({ ...f, id: ids[i] })}${f.reverses?.length ? `\n  Reviewer says it reverses: ${f.reverses.join(", ")}` : ""}\n\n` +
@@ -864,10 +994,10 @@ async function run(ctx) {
                     `or missing tests for new behavior. Nits, preferences, speculative risks and pre-existing issues outside the diff are not blocking. ` +
                     `If fixing it would undo or contradict a ledger entry, list that id in conflictsWith; such a finding is valid only if the entry ` +
                     `itself causes a concrete defect. A finding that restates an already decided one is valid=false. If uncertain, valid=false. ` +
-                    `If blocking, write a precise minimal fixInstruction.`,
-                { label: `validate:r${round}:${ids[i]}`, effort: "high", schema: VERDICT, finding: { file: f.file, line: f.line ?? null, claim: f.claim } },
-            ).then((v) => (v ? { ...f, id: ids[i], round, ...v } : { ...f, id: ids[i], round, unvalidated: true })),
-        );
+                    `If blocking, write a precise minimal fixInstruction.\n\n${logRule(label)}`,
+                { label, effort: "high", schema: VERDICT, finding: { file: f.file, line: f.line ?? null, claim: f.claim } },
+            ).then((v) => (v ? { ...f, id: ids[i], round, ...v } : { ...f, id: ids[i], round, unvalidated: true }));
+        });
     }
 
     // Files approved findings landed on, per round: a file in several rounds is where the loop is circling.
@@ -905,24 +1035,23 @@ async function run(ctx) {
 
     // ---------- Implement ----------
     const done = [];
+    const stepCoderPrompt = (step, label) =>
+        `${inDir(DIR)}\nYou are the coder. Implement step ${step.id} of this plan, and only that step; earlier steps are already in the worktree.\n\n` +
+        `${TASK}\n\n${fmtPlan(plan)}\n\n` +
+        `Plan decisions (settled, follow them):\n${fmtLedger()}\n\n` +
+        (done.length ? `Done so far:\n${done.map((d) => `- ${d.id}: ${d.summary}${d.deviations ? ` (deviated: ${d.deviations})` : ""}`).join("\n")}\n\n` : "") +
+        `NOW: ${step.id} ${step.title}\n${step.approach}\nTests: ${step.tests}\n\n` +
+        `Follow AGENTS.md, especially Conventions & Patterns. Add the tests the step names (unit tests in the crate, end-to-end ones in ` +
+        `crates/bd/tests/), update the docs/ or CONTRIBUTING.md page the change affects, and run \`cargo fmt --all\`. ` +
+        `Run the relevant tests (\`cargo test -p <crate> <filter>\`) before returning. If the plan is wrong for the actual code, ` +
+        `do the smallest correct thing and explain it in "deviations".\n\n` +
+        logRule(label);
     if (A.skipImplement) ctx.log(`Skipping Implement: reviewing the work already in ${DIR} against ${A.baseline}`);
     else ctx.phase("Implement");
     for (const step of A.skipImplement ? [] : plan.steps) {
         await renew();
-        const r = await agent(
-            `${inDir(DIR)}\nYou are the coder. Implement step ${step.id} of this plan, and only that step; earlier steps are already in the worktree.\n\n` +
-                `${TASK}\n\n${fmtPlan(plan)}\n\n` +
-                `Plan decisions (settled, follow them):\n${fmtLedger()}\n\n` +
-                (done.length
-                    ? `Done so far:\n${done.map((d) => `- ${d.id}: ${d.summary}${d.deviations ? ` (deviated: ${d.deviations})` : ""}`).join("\n")}\n\n`
-                    : "") +
-                `NOW: ${step.id} ${step.title}\n${step.approach}\nTests: ${step.tests}\n\n` +
-                `Follow AGENTS.md, especially Conventions & Patterns. Add the tests the step names (unit tests in the crate, end-to-end ones in ` +
-                `crates/bd/tests/), update the docs/ or CONTRIBUTING.md page the change affects, and run \`cargo fmt --all\`. ` +
-                `Run the relevant tests (\`cargo test -p <crate> <filter>\`) before returning. If the plan is wrong for the actual code, ` +
-                `do the smallest correct thing and explain it in "deviations".`,
-            { label: `coder:${step.id}`, schema: CODER, ...CODER_OPTS },
-        );
+        const label = `coder:${step.id}`;
+        const r = await agent(stepCoderPrompt(step, label), { label, schema: CODER, ...CODER_OPTS });
         if (!r) return { status: "escalated", reason: `coder did not finish ${step.id}`, workdir: DIR, plan, done, ledger, lease };
         done.push({ id: step.id, ...r });
         if (r.deviations) {
@@ -950,6 +1079,7 @@ async function run(ctx) {
 
     let g = await gateUntilGreen("impl", 0);
     if (!g) return result("escalated", { reason: "gate agent failed" });
+    if (g.contaminated) return result("escalated", { reason: contaminatedReason(g, DIR, RUN_ID) });
     if (!g.passed) return result("escalated", { reason: "automated checks still failing after coder fixes", failures: g.failures });
 
     let prevSnap = setup.baseline;
@@ -992,6 +1122,21 @@ async function run(ctx) {
 
     const followUpsOf = (verdicts) => verdicts.filter((v) => !v.unvalidated && v.valid && !v.blocking && v.severity !== "nit");
     const unfiled = (fs) => fs.filter((f) => !f.bdId);
+    const fixPrompt = (work, label) =>
+        `${inDir(DIR)}\nThe planner approved these fixes for:\n${TASK}\n\n` +
+        work
+            .map(
+                (x) =>
+                    `${fmtFinding(x.f)}\n  DO: ${x.d.instruction || x.f.fixInstruction}` +
+                    (x.d.preserve?.length ? `\n  KEEP INTACT: ${x.d.preserve.join(", ")}` : ""),
+            )
+            .join("\n\n") +
+        `\n\nDECISION LEDGER (live; your fix must leave every entry true):\n${fmtLedger()}\n\n` +
+        `Fix ONLY these findings, minimally, as instructed. Do not refactor, restyle, or address anything else, even if you notice it ` +
+        `(mention it in notes instead). If an instruction cannot be done without breaking a ledger entry, skip that finding and say why in notes. ` +
+        `Add or adjust tests that prove each fix. Run \`cargo fmt --all\` and the affected tests before returning. ` +
+        `Return one "changes" entry per finding you fixed.\n\n` +
+        logRule(label);
 
     for (let round = 0; round <= MAX_ROUNDS; round++) {
         const pass = await reviewPass(round);
@@ -1087,22 +1232,8 @@ async function run(ctx) {
         ctx.phase("Fix");
         await renew();
         ctx.log(`Fixing ${work.length} finding(s): ${work.map((x) => x.f.id).join(", ")}; dropped ${drops.length}`);
-        const fixed = await agent(
-            `${inDir(DIR)}\nThe planner approved these fixes for:\n${TASK}\n\n` +
-                work
-                    .map(
-                        (x) =>
-                            `${fmtFinding(x.f)}\n  DO: ${x.d.instruction || x.f.fixInstruction}` +
-                            (x.d.preserve?.length ? `\n  KEEP INTACT: ${x.d.preserve.join(", ")}` : ""),
-                    )
-                    .join("\n\n") +
-                `\n\nDECISION LEDGER (live; your fix must leave every entry true):\n${fmtLedger()}\n\n` +
-                `Fix ONLY these findings, minimally, as instructed. Do not refactor, restyle, or address anything else, even if you notice it ` +
-                `(mention it in notes instead). If an instruction cannot be done without breaking a ledger entry, skip that finding and say why in notes. ` +
-                `Add or adjust tests that prove each fix. Run \`cargo fmt --all\` and the affected tests before returning. ` +
-                `Return one "changes" entry per finding you fixed.`,
-            { label: `coder:fix:r${round + 1}`, schema: FIXED, ...CODER_OPTS },
-        );
+        const fixLabel = `coder:fix:r${round + 1}`;
+        const fixed = await agent(fixPrompt(work, fixLabel), { label: fixLabel, schema: FIXED, ...CODER_OPTS });
         if (!fixed) return result("escalated", { reason: "fix coder failed", open: work.map((x) => x.f) });
         for (const c of fixed.changes) {
             const f = open.find((o) => o.id === c.id);
@@ -1122,6 +1253,7 @@ async function run(ctx) {
         prevSnap = g.snapshot;
         g = await gateUntilGreen(`r${round + 1}`, round + 1);
         if (!g) return result("escalated", { reason: "gate agent failed", open });
+        if (g.contaminated) return result("escalated", { reason: contaminatedReason(g, DIR, RUN_ID), open });
         if (!g.passed) return result("escalated", { reason: "checks failing after fixing findings", failures: g.failures, open });
     }
 
@@ -1135,7 +1267,7 @@ const planImplementReview = defineWorkflow({
             "Planner turns requirements into a vetted plan, coder implements it step by step, reviewers report, controller validates, " +
             "planner triages fixes against a decision ledger to stop circular fixes. Use for requirements (often a bd issue or epic) that need a plan " +
             "before coding and an independent review loop that must not oscillate. " +
-            "args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, actor?, token?, ttl?, workdir?, base?, baseline?, " +
+            "args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, " +
             "maxRounds?, maxGateFixes?, maxPlanRevisions?, maxAmendments?, planOnly?, plan?, planFile?, planIssues?, skipImplement?, shadowReview? }. " +
             "With issue, the workflow claims it (pass actor = your bd actor so you can close it later, " +
             "and token if you already hold it) and renews the lease between stages; a failed heartbeat is escalated once, then the lease shown by bd show decides. " +
@@ -1148,6 +1280,9 @@ const planImplementReview = defineWorkflow({
             "model (a Copilot model id) and effort set the coding agents (implement, gate fixes, review fixes); claim, heartbeat, setup, gates and bd records run " +
             "on the task agent at low effort, escalated once to the general-purpose agent at medium when one fails its schema (retry labelled <label>@escalated). " +
             "Without workdir it works in a new worktree under .copilot/worktrees/. " +
+            "logDir (absolute; default <os tmpdir>/plan-implement-review) holds each agent's command output as <logDir>/<run>/<label>.log " +
+            "(run: the issue id, sanitized); full cargo test --workspace runs go through .github/scripts/suite-lock.mjs; a gate log whose bd-gate marker " +
+            "names another directory or run, or a pass without one, escalates as 'gate log contaminated'. " +
             "planOnly returns the vetted plan without implementing. plan starts from a given plan (e.g. one an escalated run returned) instead of drafting one; " +
             "planIssues lists blocking issues already known against it ({ issue, evidence?, suggestion? }), handled as the first critique; " +
             "planFile (absolute path) loads either from JSON: a plan, or an escalated run's result whose blockers become planIssues. " +
@@ -1161,7 +1296,7 @@ const planImplementReview = defineWorkflow({
             { title: "Setup", detail: "claim the bd issue, worktree + baseline snapshot" },
             { title: "Plan", detail: "planner drafts, critic challenges, planner revises" },
             { title: "Implement", detail: "coder implements the plan step by step" },
-            { title: "Gate", detail: "cargo fmt --check, clippy -D warnings, cargo test; coder fixes failures" },
+            { title: "Gate", detail: "cargo fmt --check, clippy -D warnings, cargo test under the suite lock; coder fixes failures" },
             { title: "Review", detail: "independent reviewers examine the diff against the plan and ledger" },
             { title: "Validate", detail: "controller tries to refute each finding" },
             { title: "Triage", detail: "planner checks approved findings against the decision ledger: fix, drop, amend or escalate" },
@@ -1192,6 +1327,7 @@ const planImplementReview = defineWorkflow({
                 token: { type: "string" },
                 ttl: { type: "string" },
                 workdir: { type: "string" },
+                logDir: { type: "string" },
                 base: { type: "string" },
                 maxRounds: { type: "integer" },
                 maxGateFixes: { type: "integer" },

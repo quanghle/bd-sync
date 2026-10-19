@@ -23,6 +23,15 @@ const reviewBody = [
 const { shadowsOf } = new Function(`${shadowsBody}; return { shadowsOf }`)()
 
 const parallel = (thunks) => Promise.all(thunks.map((t) => t()))
+// Stands in for the workflow's reviewLogRule: one line per kind and round, with no label or model in it.
+const logRule = (kind, round) => `LOGS ${kind} r${round}`
+// Every call's prompt ends with the log rule of its own kind and round.
+const endsWithItsLogRule = (calls) => {
+	for (const c of calls) {
+		const [, kind, round] = c.label.match(/^review:([^:]+):r(\d+)/)
+		expect(c.prompt.endsWith(`\n\nLOGS ${kind} r${round}`), c.label).toBe(true)
+	}
+}
 
 /** review() bound to stubs: agent records each call and answers with a finding marked by its label (or null for fail). */
 function load(SHADOWS, { fail = () => false, A = {} } = {}) {
@@ -45,8 +54,9 @@ function load(SHADOWS, { fail = () => false, A = {} } = {}) {
 		'A',
 		'ledgerBlock',
 		'REVIEW',
+		'reviewLogRule',
 		`${reviewBody}; return { review }`,
-	)(agent, parallel, SHADOWS, shadowFindings, 'Requirements:\nR1', plan, { baseline: 'base0' }, '/w', A, () => 'LEDGER', {})
+	)(agent, parallel, SHADOWS, shadowFindings, 'Requirements:\nR1', plan, { baseline: 'base0' }, '/w', A, () => 'LEDGER', {}, logRule)
 	return { review, calls, shadowFindings }
 }
 const approved = [{ id: 'F1', severity: 'serious', category: 'c', file: 'a.rs', line: 3, claim: 'c', evidence: 'e' }]
@@ -102,6 +112,7 @@ describe('plan-implement-review review() with shadowReview', () => {
 		const [code, reqs, shadowCode, shadowReqs] = calls
 		expect(shadowCode.prompt).toBe(code.prompt)
 		expect(shadowReqs.prompt).toBe(reqs.prompt)
+		endsWithItsLogRule(calls)
 		expect([code.model, code.effort, reqs.model, reqs.effort]).toEqual([undefined, undefined, undefined, undefined])
 		expect([shadowCode.model, shadowCode.effort]).toEqual(['sonnet', 'medium'])
 		expect(out.map((r) => r.findings[0].claim)).toEqual(['from review:code:r0', 'from review:requirements:r0'])
@@ -140,6 +151,7 @@ describe('plan-implement-review review() with shadowReview', () => {
 			[`review:${kind}:r0@shadow:sonnet-medium`, 'sonnet'],
 		])
 		expect(focused[1].prompt).toBe(focused[0].prompt)
+		endsWithItsLogRule(calls)
 	})
 
 	it('adds the security reviewer for a critical tier whatever the diff touches', async () => {
@@ -155,6 +167,7 @@ describe('plan-implement-review review() with shadowReview', () => {
 		expect(calls.map((c) => c.label)).toEqual(['review:code:r1', 'review:code:r1@shadow:sonnet-medium', 'review:code:r1@shadow:haiku-low'])
 		expect(calls[0].prompt).toContain('FOCUSED RE-REVIEW')
 		expect(new Set(calls.map((c) => c.prompt)).size).toBe(1)
+		endsWithItsLogRule(calls)
 		expect(out).toHaveLength(1)
 		expect(shadowFindings.map((s) => [s.round, s.kind, s.model, s.effort])).toEqual([
 			[1, 'code', 'sonnet', 'medium'],

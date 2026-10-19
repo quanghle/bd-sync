@@ -157,6 +157,19 @@ mod tests {
         }
         assert_eq!(access_of(&["bd", "spec", "none", "t-1", "-r", "refactor"]), Access::Write);
         assert!(Cli::try_parse_from(["bd", "spec", "none", "t-1"]).is_err(), "a reason is required");
+        for argv in [
+            &["bd", "spec", "new", "checkout", "Checkout", "--parent", "s-1", "--from", "t-1"][..],
+            &["bd", "spec", "add", "s-1", "Requires", "sign-in", "--from", "t-1,t-2", "--non-goal"],
+            &["bd", "spec", "change", "s-1.1", "Requires", "a", "verified", "email", "--from", "t-3"],
+            &["bd", "spec", "remove", "s-1.2", "-r", "obsolete", "--from", "t-4"],
+            &["bd", "spec", "link", "t-5", "s-1", "s-1.3"],
+        ] {
+            assert_eq!(access_of(argv), Access::Write, "{argv:?}");
+        }
+        assert!(Cli::try_parse_from(["bd", "spec", "add", "s-1", "x"]).is_err(), "add needs --from");
+        assert!(Cli::try_parse_from(["bd", "spec", "change", "s-1.1", "x"]).is_err(), "change needs --from");
+        assert!(Cli::try_parse_from(["bd", "spec", "remove", "s-1.2"]).is_err(), "remove needs a reason");
+        assert!(Cli::try_parse_from(["bd", "spec", "link", "t-5"]).is_err(), "link needs a target");
     }
 
     #[test]

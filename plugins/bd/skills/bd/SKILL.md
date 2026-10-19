@@ -39,8 +39,9 @@ bd is the repository's shared task tracker: a dependency-aware work queue with l
 
 When `bd prime` shows a "Feature specs" section, the workspace keeps feature specs (experimental):
 
-- Link every change you close to the spec or requirement it touches (`bd dep add <id> <spec or requirement> --type related`), or mark it `bd spec none <id> -r '<why>'`.
-- Keep requirements current: add one as a pinned child of its spec labelled `requirement`, replace a changed one with `bd supersede <old> --with <new>`, and close one that no longer holds with its reason.
+- Link every change you close to the spec or requirement it touches (`bd spec link <id> <spec or requirement>`), or mark it `bd spec none <id> -r '<why>'`.
+- Keep requirements current: add one with `bd spec add <spec> --from <id> -- '<sentence>'` (`--non-goal` for a non-goal), replace a changed one with `bd spec change <req> --from <id> -- '<sentence>'`, and close one that no longer holds with `bd spec remove <req> -r '<why>'`. Options go before `--`: everything after it is the sentence.
+- Create a new spec with `bd spec new <area> -- '<feature>'` (`--parent <spec>` for a sub-feature).
 - `bd spec list`, `bd spec show <spec or area>` and `bd spec drift` show the specs and what drifted.
 
 ## Claims and take-overs

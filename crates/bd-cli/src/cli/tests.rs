@@ -356,6 +356,11 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd duplicate",
         "bd supersede",
         "bd find-duplicates",
+        "bd spec new",
+        "bd spec add",
+        "bd spec change",
+        "bd spec remove",
+        "bd spec link",
         "bd dep add",
         "bd events",
         "bd events prune",
@@ -402,6 +407,26 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         let cmd = command(&root, path);
         assert!(cmd.get_long_about().is_some(), "`{path}` has no long help");
         assert!(!examples(cmd).is_empty(), "`{path}` has no Examples: block in its long help");
+    }
+}
+
+#[test]
+fn spec_sentences_take_options_before_the_double_dash() {
+    let parsed = Cli::try_parse_from(["bd", "spec", "add", "S", "--from", "W", "--", "-x"]).unwrap();
+    let crate::cli::Command::Spec(SpecCommand::Add(a)) = parsed.command else { panic!("{:?}", parsed.command) };
+    assert_eq!((a.sentence, a.from), (vec!["-x".to_string()], vec!["W".to_string()]));
+    // Everything after `--` is the sentence, so a trailing --from is not an option.
+    let err = Cli::try_parse_from(["bd", "spec", "add", "S", "--", "-x", "--from", "W"]).unwrap_err();
+    assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument, "{err}");
+    let root = cli();
+    for path in ["bd spec new", "bd spec add", "bd spec change"] {
+        let about = command(&root, path).get_long_about().map(ToString::to_string).unwrap_or_default();
+        assert!(about.contains("Options go before `--`"), "`{path}`: {about:?}");
+        for example in examples(command(&root, path)) {
+            if let Some((_, after)) = example.split_once(" -- ") {
+                assert!(!after.contains(" --"), "`{path}`: options after `--` in {example:?}");
+            }
+        }
     }
 }
 

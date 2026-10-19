@@ -13,7 +13,7 @@ and error codes.
 | Issues | `create`, `q`, `show` (`--as-of`), `list`, `query`, `update`, `edit`, `close`, `duplicate`, `supersede`, `find-duplicates`, `reopen`, `defer`, `undefer`, `delete`, `label add/rm/list`, `compact` (`--analyze`, `--apply`, `--stats`) | [Issues](concepts.md#issues), [Query language](#query-language), [Compaction](#compaction) |
 | Dependencies | `dep add/rm/list/tree/cycles`, `blocked`, `graph` | [Dependency types](concepts.md#dependency-types), [Graph export](#graph-export) |
 | Epics and hierarchy | `epic status/close-eligible`, `children`, `stale`, `orphans` | [Epics and hierarchy](#epics-and-hierarchy) |
-| Feature specs (experimental) | `spec list/show/drift/none/candidates` | [Feature specs](#feature-specs), [concepts](concepts.md#feature-specs) |
+| Feature specs (experimental) | `spec list/show/drift/new/add/change/remove/link/none/candidates` | [Feature specs](#feature-specs), [concepts](concepts.md#feature-specs) |
 | Ready work and claims | `ready`, `claim` (`--next`), `heartbeat` (`hb`), `release` (`unclaim`), `reclaim`, `leases` | [Ready work](concepts.md#ready-work), [Claims](concepts.md#claims-leases-and-recovery) |
 | Comments and memory | `comment add/list`, `comments`, `remember`, `recall`, `memories`, `forget`, `memory add/get/list/rm` | [Comments and memory](concepts.md#comments-and-memory) |
 | Events | `events` (`--follow`, `--wait`, `prune`), `history` (`--diff`), `show --as-of` | [Event history](concepts.md#event-history), [Reading an issue as of a past moment](concepts.md#reading-an-issue-as-of-a-past-moment) |
@@ -424,6 +424,11 @@ bd graph ID|--all [--format text|dot|html] [--edges TYPE,...|all] [--max-nodes N
 bd spec list                                # the open specs: areas, parent spec, status, requirement counts, linked issues
 bd spec show AREA|ID [--history]            # the specs of an area, or one spec, as Markdown
 bd spec drift [--since TIME]                # exit 1 when work or requirements drifted from the specs
+bd spec new AREA [--parent SPEC] [-d TEXT] [--from ID]... -- TITLE   # a pinned feature labelled spec, area:AREA
+bd spec add SPEC --from ID... [--non-goal] [-d TEXT] -- SENTENCE     # a pinned requirement (or non-goal) of SPEC
+bd spec change REQ --from ID... [-d TEXT] -- SENTENCE                # a new requirement superseding REQ, in one write
+bd spec remove REQ -r "why" [--from ID]...  # close REQ with reason "removed: why"
+bd spec link ID SPEC|REQ...                 # related edges from work to specs or requirements
 bd spec none ID... -r "why"                 # label spec:none and comment "No spec: why", in one write
 bd spec candidates                          # closed work from before specs, grouped, that no spec covers
 bd playbook run spec-bootstrap --var groups=KEY,KEY --var reviewer=P  # agents draft specs group by group; P reviews
@@ -434,7 +439,69 @@ Feature specs are an [experimental feature](#experimental-features): every
 `bd config set experimental.features specs`. See
 [Feature specs](concepts.md#feature-specs) for the convention. `list`,
 `show`, `drift` and `none` are also [MCP tools](mcp.md#tools)
-(`spec_list`, `spec_show`, `spec_drift`, `spec_none`); `candidates` is not.
+(`spec_list`, `spec_show`, `spec_drift`, `spec_none`); `candidates` and
+the writes `new`, `add`, `change`, `remove` and `link` are not.
+
+The writes check what they are given and change nothing when a check
+fails: each is one write transaction (and a [`bd batch`](#data)
+operation with the same flags, where `$N` is the id it produced), a
+wrong kind or state exits 2 with the id and the fix, and an unknown id
+exits 3. `-q` prints the id produced: the new spec, the new requirement,
+the removed requirement, or the linked issue. A title or sentence is the
+positional words joined, at most 500 characters, as with `bd create`:
+put every option before `--`, since everything after it is text
+(`bd spec add bd-a1 --from bd-b2 -- '-x is refused'`; in
+`bd spec add bd-a1 -- '-x' --from bd-b2`, `--from bd-b2` is part of the
+sentence and the missing `--from` is an error). `--from ID` is
+repeatable or comma separated, deduplicated, and names the issues or
+playbook runs a spec or requirement came from (of any status, never a
+spec, requirement or non-goal): each becomes an outgoing `related` edge,
+listed as a source by `bd spec show`. The raw commands below do the same
+writes without the checks.
+
+- **New.** `bd spec new AREA TITLE` creates a pinned `feature` labelled
+  `spec` and `area:AREA` (AREA: 1-64 ASCII letters, digits, `-`, `_`,
+  `.` or `/`), a sub-spec of `--parent SPEC` when given. `--json`:
+  `{spec, area, parent, sources}`. By hand: `bd create -t feature --pinned
+  -l spec,area:AREA [--parent SPEC] -- TITLE`.
+- **Add.** `bd spec add SPEC SENTENCE --from ID` creates a pinned `story`
+  under SPEC labelled `requirement` (and `non-goal` with `--non-goal`).
+  SPEC (and `new`'s `--parent`) must be labelled `spec`, not closed, and
+  pinned: an open one is refused, naming `bd update ID --status pinned`.
+  `--json`: `{requirement, spec, non_goal, sources}`. By hand:
+  `bd create -t story --pinned --parent SPEC -l requirement --dep
+  related:ID -- SENTENCE`.
+- **Change.** `bd spec change REQ SENTENCE --from ID` creates the new
+  requirement under REQ's spec, of REQ's kind (a non-goal stays one), and
+  supersedes REQ by it (`bd supersede REQ --with NEW`: a `supersedes`
+  edge, close reason `superseded by NEW`), in one transaction: when the
+  supersede is refused (REQ has an open child, or another actor's claim,
+  exit 4) the new requirement is not created either. REQ must be labelled
+  `requirement` or `non-goal`, not closed (the refusal names how it was
+  closed), a direct child of a pinned spec. `--json`:
+  `{requirement, superseded, spec, non_goal, sources}`. By hand: the
+  pinned `bd create` of Add, then `bd supersede REQ --with NEW`.
+- **Remove.** `bd spec remove REQ -r WHY` closes a requirement that no
+  longer holds, outcome done, with the close reason `removed: WHY`: WHY is
+  trimmed and a leading `removed:` in any case dropped, so `-r 'Removed:
+  obsolete'` stores `removed: obsolete`; an empty WHY is refused. REQ
+  must be a requirement or non-goal, not closed, directly under a spec
+  (pinned or not). `--from ID` first adds a `related` edge from REQ to
+  each, so the work that removed it is among its sources in
+  `bd spec show --history`. `--json`: `{requirement, spec, reason,
+  sources}`, `sources` the edges added. By hand:
+  `bd close REQ --reason 'removed: WHY'`.
+- **Link.** `bd spec link ID TARGET...` adds a `related` edge from the
+  issue to each target, so `bd spec drift` no longer lists it. The issue
+  may have any status but must not be a spec part; each target must be a
+  spec, requirement or non-goal not closed, and a superseded one is
+  refused naming its replacement (`T is superseded by NEW: link that`).
+  Every target is checked before any edge is written. A `related` edge
+  already there, either direction, is reported (`= ID is already linked
+  to T`, `"already": true`) and left as it is. Never changes status,
+  assignee, a claim or a `spec:none` label. `--json`: an array of
+  `{issue, target, already}`. By hand: `bd dep add ID TARGET --type
+  related`; remove a wrong link with `bd dep rm`.
 
 - **Show.** Takes a spec's id (or a short id) or an area: every open spec
   labelled `area:AREA`, in id order, leaving out those shown inside another
@@ -469,8 +536,9 @@ Feature specs are an [experimental feature](#experimental-features): every
   issues closed as failed, and issues closed with `bd duplicate` or
   `bd supersede` (the replacement carries the work and its link).
 - **Sources.** A requirement's sources are its own outgoing `related`
-  edges (`--dep related:<run>`); work linked to it with `bd dep add <work>
-  <requirement> --type related` is linked, not a source.
+  edges (`--from` on `bd spec add`, `change` and `remove`, or
+  `--dep related:<run>`); work linked to it with `bd spec link <work>
+  <requirement>` is linked, not a source.
 - **Drift.** Since `experimental.specs.since` (or `--since`, a time as the
   filters take it: `30d` is 30 days ago): `unlinked`, issues closed since
   then, neither linked nor exempt; `shaky`, requirements in force whose
@@ -491,7 +559,7 @@ Feature specs are an [experimental feature](#experimental-features): every
   assignee or a claim. An issue already labelled `spec:none` is left as it
   is (`= ID is already marked spec:none`, no second comment). Also a
   `bd batch` operation (`spec none ID -r WHY`) and the MCP tool
-  `spec_none`.
+  `spec_none`. `bd spec link` is the other way to cover work.
 - **List.** Per open spec: its areas, its parent spec (`parent`, marked
   `(sub-spec of P)`) when that is not closed, its requirements and
   non-goals in force, and how many distinct issues that are not spec
@@ -520,7 +588,8 @@ Feature specs are an [experimental feature](#experimental-features): every
   `--take-over` imports over other actors' live claims.
 - **`bd batch [-f FILE]`** (default stdin) runs many writes in one
   transaction: each line is a subcommand with its usual flags (`create`,
-  `update`, `close`, `duplicate`, `supersede`, `dep add`, …), `$N` stands
+  `update`, `close`, `duplicate`, `supersede`, `dep add`, `spec
+  none|new|add|change|remove|link`, …), `$N` stands
   for the id produced by the Nth operation, and `#` starts a comment. Any
   failure rolls back everything; `--dry-run` runs everything, reports, then
   rolls back. `compact ID --summary TEXT --if-revision N` (or `compact

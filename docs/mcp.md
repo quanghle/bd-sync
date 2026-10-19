@@ -429,8 +429,9 @@ The reporting views `query`, `epic`, `children`, `stale`, `orphans` and
 `graph` are not tools either, to keep the tool list small: an agent that
 needs one runs the command (`bd query '...' --json`); `list` takes the
 time filters agents use most. Nor are `spec candidates` or writing specs
-and requirements themselves (`bd create --pinned`, `bd supersede`); a
-change is linked to a spec with `dep_add` and `type: "related"`.
+(`bd spec new/add/change/remove/link`, or by hand `bd create --pinned`,
+`bd supersede`); over MCP, link work with `dep_add` and `type: "related"`
+or mark it with `spec_none`.
 
 ### Leases and tokens
 

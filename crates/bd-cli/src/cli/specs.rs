@@ -3,17 +3,20 @@
 use super::*;
 
 pub const SPEC_LONG_ABOUT: &str = "\
-Read feature specs and check that work stays linked to them
+Write and read feature specs, and check that work stays linked to them
 
 Feature specs are experimental: every subcommand refuses (exit 2) unless the
 workspace has them on (bd config set experimental.features specs). A spec is
-an issue labelled spec (pinned while in force, with area:<name> labels); its
-requirements are its children labelled requirement (or non-goal), pinned
-while in force, closed by `bd supersede <old> --with <new>` when they change,
-closed with a reason when they no longer hold. A spec that is the child of an
-open spec inherits its requirements. Work is linked to a spec with a related
-edge to the spec or one of its requirements (bd dep add <id> <spec or
-requirement> --type related), or marked as touching none (bd spec none).";
+an issue labelled spec (pinned while in force, with area:<name> labels),
+created by bd spec new; its requirements are its children labelled
+requirement (or non-goal), pinned while in force: added by bd spec add,
+replaced by bd spec change (which supersedes the old one) and closed with a
+reason by bd spec remove when they no longer hold, or by bd supersede/close
+by hand. A spec that is the child of an open spec inherits its requirements.
+Work is linked to a spec by a related edge to the spec or one of its
+requirements (bd spec link <id> <spec or requirement>, the same as bd dep add
+<id> <spec or requirement> --type related), or marked as touching none
+(bd spec none).";
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum SpecCommand {
@@ -31,6 +34,21 @@ pub enum SpecCommand {
     /// List closed work from before specs that no spec covers, grouped
     #[command(long_about = SPEC_CANDIDATES_LONG_ABOUT)]
     Candidates,
+    /// Create a spec: a pinned feature labelled spec and area:AREA
+    #[command(long_about = SPEC_NEW_LONG_ABOUT)]
+    New(SpecNewArgs),
+    /// Add a requirement or non-goal to a spec
+    #[command(long_about = SPEC_ADD_LONG_ABOUT)]
+    Add(SpecAddArgs),
+    /// Replace a requirement by a new one, superseding it
+    #[command(long_about = SPEC_CHANGE_LONG_ABOUT)]
+    Change(SpecChangeArgs),
+    /// Close a requirement that no longer holds, with the reason
+    #[command(long_about = SPEC_REMOVE_LONG_ABOUT)]
+    Remove(SpecRemoveArgs),
+    /// Link work to specs or requirements by related edges
+    #[command(long_about = SPEC_LINK_LONG_ABOUT)]
+    Link(SpecLinkArgs),
 }
 
 pub const SPEC_SHOW_LONG_ABOUT: &str = "\
@@ -127,3 +145,176 @@ unset), neither linked to a spec nor of a kind that needs none: what specs
 could be written from. Grouped by their topmost epic (not a playbook run or
 group), else by their first label in sorted order that is not change:*,
 severity:*, spec:* or adr:*, else ungrouped; the largest groups first.";
+
+pub const SPEC_NEW_LONG_ABOUT: &str = "\
+Create a spec: a pinned feature labelled spec and area:AREA
+
+In one write, creates the spec, a pinned issue of type feature labelled spec
+and area:AREA, with a related edge to each --from (its sources). With
+--parent, the new spec is a child of that spec, a sub-spec inheriting its
+requirements; the parent must be a spec in force (labelled spec and pinned).
+AREA is 1 to 64 ASCII letters, digits, '-', '_', '.' or '/'. A --from may be
+closed but may not be part of a spec itself. Options go before `--`: every
+word after it is part of the title. Refuses (exit 2) a bad area or parent,
+exit 3 for an unknown id. --json prints {spec, area, parent, sources}; -q
+prints the new spec's id.";
+
+const SPEC_NEW_EXAMPLES: &str = "\
+Examples:
+  bd spec new checkout Checkout -d 'Paying for a cart' --from bd-12
+  bd spec new checkout --parent bd-7 -- Saved cards";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = SPEC_NEW_EXAMPLES)]
+pub struct SpecNewArgs {
+    /// Area: the spec's area:AREA label (ASCII letters, digits, - _ . /, at most 64)
+    #[arg(value_name = "AREA")]
+    pub area: String,
+    /// Title, at most 500 characters (words are joined)
+    #[arg(required = true, num_args = 1..)]
+    pub title: Vec<String>,
+    /// Parent spec: the new spec is its sub-spec
+    #[arg(long, value_name = "SPEC")]
+    pub parent: Option<String>,
+    /// Description
+    #[arg(short, long)]
+    pub description: Option<String>,
+    /// Issue or playbook run it came from (repeatable or comma separated)
+    #[arg(long, value_delimiter = ',', value_name = "ID")]
+    pub from: Vec<String>,
+}
+
+pub const SPEC_ADD_LONG_ABOUT: &str = "\
+Add a requirement or non-goal to a spec
+
+In one write, creates a pinned story under SPEC labelled requirement (plus
+non-goal with --non-goal), titled with the sentence, and a related edge to
+each --from: the issue or playbook run it came from, listed as its sources by
+bd spec show. SPEC must be a spec in force: labelled spec and pinned (an open
+spec is pinned first, bd update SPEC --status pinned). A --from may be closed
+but may not be part of a spec itself. Options go before `--`: every word
+after it is part of the sentence. Refuses (exit 2) a target that is not a
+spec in force, exit 3 for an unknown id. --json prints {requirement, spec,
+non_goal, sources}; -q prints the new requirement's id.";
+
+const SPEC_ADD_EXAMPLES: &str = "\
+Examples:
+  bd spec add bd-7 Checkout requires a signed-in account --from bd-12
+  bd spec add bd-7 --non-goal Guest checkout --from bd-12,bd-14
+  bd spec add bd-7 --from bd-12 -- '-x is refused'";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = SPEC_ADD_EXAMPLES)]
+pub struct SpecAddArgs {
+    /// The spec to add to
+    #[arg(value_name = "SPEC")]
+    pub spec: String,
+    /// The requirement, one testable sentence, at most 500 characters (words are joined)
+    #[arg(required = true, num_args = 1..)]
+    pub sentence: Vec<String>,
+    /// Issue or playbook run it came from (repeatable or comma separated)
+    #[arg(long, required = true, value_delimiter = ',', value_name = "ID")]
+    pub from: Vec<String>,
+    /// Record a non-goal: what the feature deliberately does not do
+    #[arg(long)]
+    pub non_goal: bool,
+    /// Description
+    #[arg(short, long)]
+    pub description: Option<String>,
+}
+
+pub const SPEC_CHANGE_LONG_ABOUT: &str = "\
+Replace a requirement by a new one, superseding it
+
+In one write, creates the new requirement under REQ's spec, of REQ's kind
+(a non-goal stays a non-goal), pinned, with a related edge to each --from,
+then closes REQ as superseded by it (bd supersede REQ --with NEW): a
+supersedes edge, the reason `superseded by NEW`. REQ must be a requirement
+or non-goal not closed, a direct child of a spec in force (pinned). Another
+actor's live claim on REQ is refused (exit 4), and so are open children of
+REQ (exit 2); then nothing is written. Options go before `--`: every word
+after it is part of the sentence. --json prints {requirement, superseded,
+spec, non_goal, sources}; -q prints the new requirement's id.";
+
+const SPEC_CHANGE_EXAMPLES: &str = "\
+Examples:
+  bd spec change bd-7.2 Checkout requires a verified email --from bd-31
+  bd spec change bd-7.2 --from bd-31 -- '--dry-run prints the plan'";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = SPEC_CHANGE_EXAMPLES)]
+pub struct SpecChangeArgs {
+    /// The requirement to replace
+    #[arg(value_name = "REQ")]
+    pub req: String,
+    /// The new requirement, one testable sentence, at most 500 characters (words are joined)
+    #[arg(required = true, num_args = 1..)]
+    pub sentence: Vec<String>,
+    /// Issue or playbook run it came from (repeatable or comma separated)
+    #[arg(long, required = true, value_delimiter = ',', value_name = "ID")]
+    pub from: Vec<String>,
+    /// Description
+    #[arg(short, long)]
+    pub description: Option<String>,
+}
+
+pub const SPEC_REMOVE_LONG_ABOUT: &str = "\
+Close a requirement that no longer holds, with the reason
+
+In one write, adds a related edge from REQ to each --from (the work that
+removed it, listed among its sources), then closes REQ with outcome done and
+the reason `removed: REASON`: the reason trimmed, a leading `removed:` in any
+case dropped so it is never doubled. REQ must be a requirement or non-goal
+not closed, a direct child of a spec (in any state). Refuses (exit 2) an
+empty reason, a requirement already closed, open children or blockers of
+REQ; another actor's live claim on REQ exits 4. Then nothing is written.
+bd spec show --history lists it as removed. --json prints {requirement, spec,
+reason, sources}, sources being the edges added; -q prints REQ's id.";
+
+const SPEC_REMOVE_EXAMPLES: &str = "\
+Examples:
+  bd spec remove bd-7.3 -r 'guest checkout was dropped' --from bd-40";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = SPEC_REMOVE_EXAMPLES)]
+pub struct SpecRemoveArgs {
+    /// The requirement to close
+    #[arg(value_name = "REQ")]
+    pub req: String,
+    /// Why the requirement no longer holds
+    #[arg(short, long, required = true)]
+    pub reason: String,
+    /// Issue or playbook run it came from (repeatable or comma separated)
+    #[arg(long, value_delimiter = ',', value_name = "ID")]
+    pub from: Vec<String>,
+}
+
+pub const SPEC_LINK_LONG_ABOUT: &str = "\
+Link work to specs or requirements by related edges
+
+In one write, adds a related edge from ISSUE to each target, the same as
+bd dep add ISSUE TARGET --type related, so bd spec drift stops listing ISSUE
+(a link covers its subtree and its ancestors). A target already joined to
+ISSUE by a related edge, in either direction, is reported as already linked
+and nothing is written for it. ISSUE may be in any state, closed work
+included, but may not be part of a spec; each target must be a spec,
+requirement or non-goal not closed (a superseded one names the one that
+replaced it). Every target is checked before any edge is written. Nothing
+else changes: not the status, assignee or labels of ISSUE. --json prints an
+array of {issue, target, already}; -q prints ISSUE's id.";
+
+const SPEC_LINK_EXAMPLES: &str = "\
+Examples:
+  bd spec link bd-40 bd-7.2
+  bd spec link bd-40 bd-7 bd-9.1 --json";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = SPEC_LINK_EXAMPLES)]
+pub struct SpecLinkArgs {
+    /// The work to link
+    #[arg(value_name = "ISSUE")]
+    pub issue: String,
+    /// Specs, requirements or non-goals to link it to
+    #[arg(required = true, num_args = 1.., value_name = "SPEC|REQUIREMENT")]
+    pub targets: Vec<String>,
+}

@@ -59,6 +59,11 @@ enum Op {
 #[derive(Subcommand, Debug)]
 enum BatchSpecCommand {
     None(SpecNoneArgs),
+    New(SpecNewArgs),
+    Add(SpecAddArgs),
+    Change(SpecChangeArgs),
+    Remove(SpecRemoveArgs),
+    Link(SpecLinkArgs),
 }
 
 fn run(tx: &mut WriteCtx<'_>, op: &Op) -> Result<Out> {
@@ -84,6 +89,11 @@ fn run(tx: &mut WriteCtx<'_>, op: &Op) -> Result<Out> {
         Op::Config(c) => exec_config(tx, c),
         Op::Compact(a) => exec_batch_compact(tx, a),
         Op::Spec(BatchSpecCommand::None(a)) => exec_spec_none(tx, a),
+        Op::Spec(BatchSpecCommand::New(a)) => exec_spec_new(tx, a),
+        Op::Spec(BatchSpecCommand::Add(a)) => exec_spec_add(tx, a),
+        Op::Spec(BatchSpecCommand::Change(a)) => exec_spec_change(tx, a),
+        Op::Spec(BatchSpecCommand::Remove(a)) => exec_spec_remove(tx, a),
+        Op::Spec(BatchSpecCommand::Link(a)) => exec_spec_link(tx, a),
     }
 }
 

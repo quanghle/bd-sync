@@ -304,7 +304,7 @@ the project's memories.
 - `bd create \"Title\" -d \"why and what\"` records work found on the way.
 - Add `--json` to a command whose output you parse.
 - If bd prime lists feature specs, link each change you close to its spec
-  or requirement (`bd dep add <id> <spec> --type related`) or mark it
+  or requirement (`bd spec link <id> <spec>`) or mark it
   `bd spec none <id> -r '<why>'`.
 - Track tasks in bd, not in markdown TODO lists.";
 

@@ -401,11 +401,19 @@ the server's name.
 | `spec_show` | `bd spec show` | `target` (a spec id or an area, required), `history` (default `false`: also the closed requirements), `as_of` (the specs as they were then, as `bd spec show --as-of` takes it: an event seq `120` or `#120`, a date or time, `-7d`) | yes |
 | `spec_drift` | `bd spec drift` | `since` (a time as `bd spec drift --since` takes it: `2026-01-15`, `30d`; default `experimental.specs.since`), `limit` (1–100, default 20: items per list) | yes |
 | `spec_changes` | `bd spec changes` | `since` (required: a time as `bd spec changes --since` takes it: `120`, `#120`, `2026-09-01`, `-30d` or `30d`), `until` (the same forms; default now), `target` (a spec id or an area; default every spec), `limit` (1–100, default 20: items per list) | yes |
+| `spec_candidates` | `bd spec candidates` | `limit` (1–100, default 20: groups, and issues in each) | yes |
 | `spec_none` | `bd spec none` | `ids` (1–20) and `reason` (both required) | no |
+| `spec_new` | `bd spec new` | `area` and `title` (both required), `parent` (a spec in force: the new one is its sub-spec), `description`, `from` (0–20: the issues or runs it came from) | no |
+| `spec_add` | `bd spec add` | `spec`, `sentence` and `from` (1–20) (all required), `non_goal` (default `false`), `description` | no |
+| `spec_change` | `bd spec change` | `requirement`, `sentence` and `from` (1–20) (all required), `description` | no |
+| `spec_remove` | `bd spec remove` | `requirement` and `reason` (both required), `from` (0–20) | no |
+| `spec_link` | `bd spec link` | `issue` and `targets` (1–20: specs or requirements) (both required) | no |
 
 - List arguments (`label`, `label_any`, `labels`, `deps`, `add_labels`,
-  `remove_labels`) take at most 20 non-blank items. `title`, `text`,
-  `target`, `reason`, `as_of`, `since` and `until` must not be blank.
+  `remove_labels`, `from`, `targets`) take at most 20 non-blank items; a
+  `from` item may not contain `,` (`bd spec --from` would split it).
+  `title`, `text`, `target`, `reason`, `as_of`, `since`, `until`, `area`,
+  `sentence`, `spec`, `requirement` and `issue` must not be blank.
   Unknown arguments are refused; `null` counts as absent.
 - `update` needs at least one field to change besides `id` and
   `if_revision`. `claim` takes `id` or `next`, not both, and filters only
@@ -429,10 +437,10 @@ gate.
 The reporting views `query`, `epic`, `children`, `stale`, `orphans` and
 `graph` are not tools either, to keep the tool list small: an agent that
 needs one runs the command (`bd query '...' --json`); `list` takes the
-time filters agents use most. Nor are `spec candidates` or writing specs
-(`bd spec new/add/change/remove/link`, or by hand `bd create --pinned`,
-`bd supersede`); over MCP, link work with `dep_add` and `type: "related"`
-or mark it with `spec_none`.
+time filters agents use most. Every `bd spec` subcommand is a tool: write
+specs with `spec_new`, `spec_add`, `spec_change` and `spec_remove`, link
+work with `spec_link` (or `dep_add` with `type: "related"`), or mark it
+with `spec_none`. No spec tool takes `-q`, `--take-over` or `--force`.
 
 ### Leases and tokens
 
@@ -480,10 +488,10 @@ printed hints (below), so the model reads each thing once:
   today only `close` with feature specs on, naming the closed work no spec
   link covers (`bd close`'s stderr hint, [Issues](commands.md#issues)). It
   holds at most 5 lines, and the result block before it is unchanged. Act
-  on it with `dep_add` (`type: "related"`) to a spec or requirement, or
-  with `spec_none`. The issue `claim_next` claimed is never in it, an issue
-  that was already closed and a failed call carry none, and other stderr
-  is not returned;
+  on it with `spec_link` (or `dep_add` with `type: "related"`) to a spec
+  or requirement, or with `spec_none`. The issue `claim_next` claimed is
+  never in it, an issue that was already closed and a failed call carry
+  none, and other stderr is not returned;
 - `spec_list` returns `{"specs": [...]}`, each open spec as
   `bd spec list --json` prints it; `spec_show` returns `{"specs":
   [views]}` as `bd spec show --json` does, without `history` unless
@@ -503,8 +511,20 @@ printed hints (below), so the model reads each thing once:
   changes, unknown, incomplete}` as `bd spec changes --json` prints it, with
   `changes` and `unknown` each cut to `limit` and `more` giving each cut
   list's full length (`{"changes": 41}`);
+  `spec_candidates` returns `{"groups": [{key, title, count, issues}]}`
+  as `bd spec candidates --json` groups them: the groups, and each
+  group's issues (`{id, title}`), cut to `limit`, `count` the group's full
+  size, and `more: {"groups": N}`, the full number of groups, when the
+  groups were cut; no groups at all is `{}`;
   `spec_none` returns per issue `{id, already, labels, comment_id}`
   (`already: true` and no comment when it was marked before);
+- the spec writes return what `bd spec ... --json` prints, issues as
+  summaries: `spec_new` `{spec, area, parent, sources}` (a sub-spec's
+  parent is the top-level `parent`; the summary has none), `spec_add`
+  `{requirement, spec, non_goal, sources}`, `spec_change` `{requirement,
+  superseded, spec, non_goal, sources}`, `spec_remove` `{requirement,
+  spec, reason, sources}`, and `spec_link` per target `{issue, target,
+  already}` (`already: true` when a `related` edge was there);
 - control and bidirectional formatting characters are escaped as `\u…`; a
   call may print at most 4 MiB.
 
@@ -526,7 +546,18 @@ can act on it. Its text is the CLI's JSON error (`{"code", "message",
 - a `spec_*` tool in a workspace with feature specs off: `invalid`, exit 2,
   `feature specs are off in this workspace (bd config set
   experimental.features specs)`; `spec_none` on a spec issue: `invalid`,
-  exit 2.
+  exit 2;
+- `spec_change` or `spec_remove` of a requirement another actor holds a
+  live claim on: refused as closing it is (above), `unauthorized`, exit 7,
+  naming the holder, or `not_owner`, exit 4, for another session of the
+  token's own actor; the claim is never taken over and nothing is written;
+- the spec writes' other refusals, with the id and the fix, nothing
+  written: a bad `area`, a target that is not a spec or requirement, or a
+  spec part (a spec, requirement or non-goal) in `from` or as `spec_link`'s
+  `issue`: `invalid`, exit 2; a `parent` or `spec` not in force (closed,
+  or not pinned), or a requirement or link target already closed (a
+  superseded one naming its replacement): `refused`, exit 2; an unknown
+  id: exit 3.
 
 Unknown tools, a write tool on a read-only server, malformed requests and
 unsupported protocol versions are JSON-RPC errors instead.
@@ -544,15 +575,18 @@ made is the actor's, but its token was in the lost answer, and no tool shows
 it again (`show` leaves lease tokens out): `list` with `status:
 ["in_progress"]` and `assignee` set to the actor finds the issue, which the
 actor can `close` or `release` without the token, then `claim` again for a
-new one. After a lost answer, `show` or `list` tells whether a write took
-effect. (`bd mcp` in a remote workspace
+new one. A resent `spec_new` or `spec_add` creates a second spec or
+requirement, as `create` does; a resent `spec_link` reports `already:
+true`; a resent `spec_change` or `spec_remove` is refused (`refused`,
+exit 2: the requirement is already closed). After a lost answer, `show`
+or `list` tells whether a write took effect. (`bd mcp` in a remote workspace
 forwards each call with its own request id, so its own retries to the
 server are safe.)
 
 ### Context cost
 
 The tool list (names, descriptions and input schemas) is written by hand,
-with one-line descriptions and no output schemas, and costs about 1,835
-tokens (7,836 bytes; a test keeps it under 7,936). The `instructions` add
+with one-line descriptions and no output schemas, and costs about 2,500
+tokens (10,668 bytes; a test keeps it under 10,768). The `instructions` add
 about 120 tokens. Most of a session's MCP context is results, which is why
 lists return summaries and results leave out empty fields.

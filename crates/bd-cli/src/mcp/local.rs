@@ -250,7 +250,13 @@ mod tests {
             ("spec_show", json!({ "target": "checkout", "as_of": "-1d" })),
             ("spec_drift", json!({})),
             ("spec_changes", json!({ "since": "1d" })),
+            ("spec_candidates", json!({})),
             ("spec_none", json!({ "ids": ["t-1"], "reason": "r" })),
+            ("spec_new", json!({ "area": "checkout", "title": "Checkout" })),
+            ("spec_add", json!({ "spec": "t-1", "sentence": "s", "from": ["t-1"] })),
+            ("spec_change", json!({ "requirement": "t-1", "sentence": "s", "from": ["t-1"] })),
+            ("spec_remove", json!({ "requirement": "t-1", "reason": "r" })),
+            ("spec_link", json!({ "issue": "t-1", "targets": ["t-2"] })),
         ] {
             let (err, off) = call(&mut server, name, args);
             assert!(err, "{name}: {off}");
@@ -399,6 +405,156 @@ mod tests {
         assert!(err, "{refused}");
         assert_eq!(refused["error"]["code"], "invalid", "{refused}");
         assert_eq!(refused["error"]["exit_code"], 2, "{refused}");
+    }
+
+    #[test]
+    fn spec_write_tools_end_to_end() {
+        let (_dir, global) = workspace();
+        let db = global.db.clone().unwrap();
+        let mut server = Server::new(Local::new(global, Resolved::new("me/mcp-1", Source::Flag, "test")), false);
+        let create = |server: &mut Server<Local>, args: Value| {
+            let (err, created) = call(server, "create", args);
+            assert!(!err, "{created}");
+            let id = id_of(&created);
+            let (err, closed) = call(server, "close", json!({ "ids": [id], "reason": "done" }));
+            assert!(!err, "{closed}");
+            id
+        };
+        let refused = |server: &mut Server<Local>, name: &str, args: Value| {
+            let (err, refused) = call(server, name, args);
+            assert!(err, "{name}: {refused}");
+            refused["error"].clone()
+        };
+
+        // Closed before specs turn on: what `spec_candidates` groups. The
+        // sleep puts their `closed_at` strictly before `since` (milliseconds).
+        create(&mut server, json!({ "title": "Dark mode", "labels": ["ui"] }));
+        create(&mut server, json!({ "title": "Flags", "labels": ["cli"] }));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // `config set` is admin-only inside a capture: turn specs on directly.
+        let mut store = Store::open(&db, Default::default()).unwrap();
+        store.write("config_set", "tester", |tx| bd_core::config::set(tx, "experimental.features", "specs")).unwrap();
+        drop(store);
+        let design = create(&mut server, json!({ "title": "Design checkout" }));
+
+        let (err, created) = call(
+            &mut server,
+            "spec_new",
+            json!({ "area": "checkout", "title": "Checkout", "description": "Paying", "from": [design] }),
+        );
+        assert!(!err, "{created}");
+        assert_eq!(created["spec"]["status"], "pinned", "{created}");
+        assert_eq!(created["spec"]["type"], "feature", "{created}");
+        let labels = created["spec"]["labels"].as_array().unwrap_or_else(|| panic!("{created}"));
+        assert!(labels.contains(&json!("spec")) && labels.contains(&json!("area:checkout")), "{created}");
+        assert!(created["spec"].get("description").is_none(), "{created}");
+        assert_eq!(created["area"], "checkout", "{created}");
+        assert_eq!(created["sources"], json!([design]), "{created}");
+        assert!(created.get("parent").is_none(), "{created}");
+        let spec = id_of(&created["spec"]);
+
+        let (err, sub) =
+            call(&mut server, "spec_new", json!({ "area": "checkout", "title": "Saved cards", "parent": spec }));
+        assert!(!err, "{sub}");
+        assert_eq!(sub["parent"], spec, "{sub}");
+        let sub = id_of(&sub["spec"]);
+        let (err, shown) = call(&mut server, "spec_show", json!({ "target": spec }));
+        assert!(!err, "{shown}");
+        assert_eq!(shown["specs"][0]["subspecs"][0]["spec"]["id"], sub, "{shown}");
+
+        let (err, added) =
+            call(&mut server, "spec_add", json!({ "spec": spec, "sentence": "Requires sign-in", "from": [design] }));
+        assert!(!err, "{added}");
+        assert_eq!(added["requirement"]["type"], "story", "{added}");
+        assert_eq!(added["requirement"]["status"], "pinned", "{added}");
+        assert_eq!(added["non_goal"], false, "{added}");
+        assert_eq!(added["spec"], spec, "{added}");
+        assert_eq!(added["sources"], json!([design]), "{added}");
+        let rule = id_of(&added["requirement"]);
+        let (err, ng) = call(
+            &mut server,
+            "spec_add",
+            json!({ "spec": spec, "sentence": "Guests check out", "from": [design], "non_goal": true }),
+        );
+        assert!(!err, "{ng}");
+        assert_eq!(ng["non_goal"], true, "{ng}");
+        assert!(ng["requirement"]["labels"].as_array().unwrap().contains(&json!("non-goal")), "{ng}");
+        let ng = id_of(&ng["requirement"]);
+
+        let (err, changed) = call(
+            &mut server,
+            "spec_change",
+            json!({ "requirement": rule, "sentence": "Requires a verified email", "from": [design] }),
+        );
+        assert!(!err, "{changed}");
+        assert_eq!(changed["superseded"]["id"], rule, "{changed}");
+        assert_eq!(changed["superseded"]["status"], "closed", "{changed}");
+        assert_eq!(changed["non_goal"], false, "{changed}");
+        let current = id_of(&changed["requirement"]);
+        assert_ne!(current, rule, "{changed}");
+        let (err, history) = call(&mut server, "spec_show", json!({ "target": spec, "history": true }));
+        assert!(!err, "{history}");
+        let past = history["specs"][0]["history"].as_array().unwrap_or_else(|| panic!("{history}"));
+        assert!(past.iter().any(|h| h["id"] == rule.as_str() && h["outcome"] == "superseded"), "{history}");
+
+        let args = json!({ "requirement": ng, "reason": "guests are allowed now", "from": [design] });
+        let (err, removed) = call(&mut server, "spec_remove", args.clone());
+        assert!(!err, "{removed}");
+        assert_eq!(removed["reason"], "removed: guests are allowed now", "{removed}");
+        assert_eq!(removed["requirement"]["status"], "closed", "{removed}");
+        assert_eq!(removed["spec"], spec, "{removed}");
+        // Sent again: the requirement is closed already, nothing is written.
+        let again = refused(&mut server, "spec_remove", args);
+        assert_eq!(again["code"], "refused", "{again}");
+        assert_eq!(again["exit_code"], 2, "{again}");
+
+        // Closed work drifts until a link covers it.
+        let work = create(&mut server, json!({ "title": "Build checkout" }));
+        let (err, drift) = call(&mut server, "spec_drift", json!({}));
+        assert!(!err, "{drift}");
+        assert_eq!(drift["unlinked"][0]["id"], work, "{drift}");
+        let (err, linked) = call(&mut server, "spec_link", json!({ "issue": work, "targets": [spec] }));
+        assert!(!err, "{linked}");
+        assert_eq!(linked[0]["already"], false, "{linked}");
+        assert_eq!(linked[0]["target"], spec, "{linked}");
+        assert_eq!(linked[0]["issue"], work, "{linked}");
+        let (err, linked) = call(&mut server, "spec_link", json!({ "issue": work, "targets": [spec] }));
+        assert!(!err, "{linked}");
+        assert_eq!(linked[0]["already"], true, "{linked}");
+        let (err, drift) = call(&mut server, "spec_drift", json!({}));
+        assert!(!err, "{drift}");
+        assert_eq!(drift["count"], 0, "{drift}");
+
+        // The work closed before specs turned on, grouped by label.
+        let (err, candidates) = call(&mut server, "spec_candidates", json!({}));
+        assert!(!err, "{candidates}");
+        let groups = candidates["groups"].as_array().unwrap_or_else(|| panic!("{candidates}"));
+        let keys: Vec<&str> = groups.iter().map(|g| g["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, ["label:cli", "label:ui"], "{candidates}");
+        assert!(groups.iter().all(|g| g["count"] == 1), "{candidates}");
+        assert!(candidates.get("more").is_none(), "{candidates}");
+        let (err, cut) = call(&mut server, "spec_candidates", json!({ "limit": 1 }));
+        assert!(!err, "{cut}");
+        assert_eq!(cut["groups"].as_array().unwrap().len(), 1, "{cut}");
+        assert_eq!(cut["more"], json!({ "groups": 2 }), "{cut}");
+
+        // The engine's refusals, passed through.
+        let bad = refused(&mut server, "spec_new", json!({ "area": "a b", "title": "X" }));
+        assert_eq!((&bad["code"], &bad["exit_code"]), (&json!("invalid"), &json!(2)), "{bad}");
+        let bad = refused(&mut server, "spec_add", json!({ "spec": "t-404", "sentence": "x", "from": [design] }));
+        assert_eq!(bad["exit_code"], 3, "{bad}");
+        let bad = refused(&mut server, "spec_add", json!({ "spec": spec, "sentence": "x", "from": [current] }));
+        assert_eq!((&bad["code"], &bad["exit_code"]), (&json!("invalid"), &json!(2)), "{bad}");
+        let bad = refused(&mut server, "spec_link", json!({ "issue": work, "targets": ["t-404"] }));
+        assert_eq!(bad["exit_code"], 3, "{bad}");
+
+        // Written as the session's actor.
+        for id in [&spec, &current] {
+            let (err, shown) = call(&mut server, "show", json!({ "ids": [id] }));
+            assert!(!err, "{shown}");
+            assert_eq!(shown["created_by"], "me/mcp-1", "{shown}");
+        }
     }
 
     #[test]

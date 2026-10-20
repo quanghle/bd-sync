@@ -1,7 +1,7 @@
 //! Human-readable rendering.
 
 use bd_core::asof::IssueAsOf;
-use bd_core::spec_context::{Cap, Governing, SPEC_EDGE_LIMIT, SPEC_WALK_LIMIT};
+use bd_core::spec_context::{Cap, Governing, SPEC_CHILD_LIMIT, SPEC_EDGE_LIMIT, SPEC_WALK_LIMIT};
 use bd_core::time::format_duration_ms;
 use bd_core::{
     Comment, Event, Issue, IssueBrief, IssueDetails, IssueRef, Lease, NotReady, Readiness, ShowBrief, Status,
@@ -190,7 +190,7 @@ pub fn text_blocks(blocks: &[(&str, &str)]) -> Vec<String> {
 
 /// The governing specs of an issue in a JSON object: `"specs"`, the entries
 /// (or their ids with `ids_only`), and `"specs_truncated": true` when the
-/// walk was cut short, never `false`. The one writer of both keys, so
+/// walk or the specs' children were cut short, never `false`. The one writer of both keys, so
 /// `bd show`, `--brief`, `bd claim` and `close --claim-next` agree.
 pub(crate) fn insert_specs(m: &mut Map<String, Value>, g: &Governing, ids_only: bool) {
     let specs = if ids_only { json!(g.ids()) } else { serde_json::to_value(&g.specs).unwrap_or(Value::Null) };
@@ -201,8 +201,9 @@ pub(crate) fn insert_specs(m: &mut Map<String, Value>, g: &Governing, ids_only: 
 }
 
 /// `bd show`'s `Specs:` section: each governing spec, the parts of it the
-/// lineage links to directly, and a note when the walk was cut short;
-/// nothing when no spec governs the issue and the walk was whole.
+/// lineage links to directly, and a note when the walk or the specs'
+/// children were cut short; nothing when no spec governs the issue and the
+/// walk was whole.
 pub(crate) fn spec_section(g: &Governing) -> Vec<String> {
     if g.specs.is_empty() && g.truncated.is_none() {
         return Vec::new();
@@ -236,6 +237,9 @@ pub(crate) fn spec_section(g: &Governing) -> Vec<String> {
         Some(Cap::Edges) => {
             out.push(format!("  (first {SPEC_EDGE_LIMIT} related edges looked at; bd spec drift checks all)"))
         }
+        Some(Cap::Children) => out.push(format!(
+            "  (first {SPEC_CHILD_LIMIT} spec children looked at; bd spec show lists every requirement)"
+        )),
         None => {}
     }
     out
@@ -746,7 +750,7 @@ mod tests {
     #[test]
     fn insert_specs_marks_truncation_only_when_cut() {
         let mut g = Governing { specs: vec![spec_entry("t-1", "Checkout", Status::Pinned)], truncated: None };
-        for cap in [None, Some(Cap::Descendants), Some(Cap::Edges)] {
+        for cap in [None, Some(Cap::Descendants), Some(Cap::Edges), Some(Cap::Children)] {
             g.truncated = cap;
             for ids_only in [false, true] {
                 let mut m = Map::new();
@@ -798,6 +802,13 @@ mod tests {
             spec_section(&g).last().unwrap(),
             "  (first 5000 related edges looked at; bd spec drift checks all)"
         );
+        let children = "  (first 5000 spec children looked at; bd spec show lists every requirement)";
+        assert_eq!(cut(Cap::Children), ["", "Specs:", children]);
+        let g =
+            Governing { specs: vec![spec_entry("t-1", "Checkout", Status::Pinned)], truncated: Some(Cap::Children) };
+        let lines = spec_section(&g);
+        assert_eq!(lines.last().unwrap(), children);
+        assert_eq!(lines[2], "  t-1 Checkout [checkout, pay] (via t-5, t-9)");
     }
 
     #[test]

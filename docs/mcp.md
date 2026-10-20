@@ -472,7 +472,8 @@ output schemas), so the model reads each thing once:
   brief), `claim` and `close` with `claim_next` (in `next`) also carry
   `specs`, the specs governing the issue as
   [`bd show --json`](commands.md#issues) gives them (ids with `brief:
-  true`), and `specs_truncated: true` when the walk was cut; the `close`
+  true`), and `specs_truncated: true` when the walk, or the specs'
+  children, was cut; the `close`
   tool does not show `bd close`'s stderr hint about work no spec link
   covers (bd-hj7ao), so check with `spec_drift`;
 - `spec_list` returns `{"specs": [...]}`, each open spec as

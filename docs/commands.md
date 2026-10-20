@@ -125,13 +125,16 @@ their output is unchanged.
   non_goal}`, of any status), `requirements` and `non_goals` the pinned
   ones in creation order (`{id, title}`), and `inherits` the open specs
   above it, outermost first. `specs_truncated: true` is added, and only
-  then, when the walk stopped at 500 descendants or 5000 related edges.
+  then, when the walk stopped at 500 descendants or 5000 related edges,
+  or when only the first 5000 children of the governing specs were looked
+  at (some requirements and non-goals left out).
   Text adds a `Specs:` section after `Children` and before the comments:
   per spec `ID Title [areas] (via IDS)` (with `(STATUS, not pinned)` before
   `(via …)` when it is not pinned), a `↳ ID Title` line per part linked
   directly (marked `(non-goal)`, and its status when not pinned), and,
   when cut, `(first 500 issues below looked at; bd spec drift checks all)`
-  or the same for 5000 related edges. `--brief` gives `specs` as ids (and
+  or the same for 5000 related edges, or `(first 5000 spec children
+  looked at; bd spec show lists every requirement)`. `--brief` gives `specs` as ids (and
   `specs_truncated`), and text a `  specs: ID, ID` line after the summary
   line. `--as-of` and `-q` are unchanged.
 - **`bd claim`, `bd claim --next` and `bd close --claim-next`** add the

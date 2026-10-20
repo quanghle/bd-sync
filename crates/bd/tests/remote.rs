@@ -9851,6 +9851,14 @@ fn feature_specs_through_bd_serve() {
     assert_eq!(again["replayed"], true, "{again}");
     assert_eq!(again["stderr"], first["stderr"], "the stored stderr is replayed");
     assert_eq!(again["stdout"], first["stdout"]);
+
+    // A batch's close hint reflects the end of the batch: linked by a later op, no hint.
+    let batched = alice.ok(&["-q", "create", "Linked in a batch"]).trim().to_string();
+    let out = alice.with_stdin(&["batch"], &format!("close {batched} -r done\nspec link {batched} {rule}\n"));
+    assert!(out.status.success(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("hint: not linked"), "{stderr}");
+    assert_eq!(alice.json(&["show", &batched])["status"], "closed", "the batch committed");
 }
 
 #[test]

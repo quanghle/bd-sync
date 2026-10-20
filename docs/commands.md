@@ -155,8 +155,10 @@ their output is unchanged.
   printed in `--json` mode too (stdout is unchanged), not with `-q`, never
   for a refused or rolled-back close, and never refuses or changes the exit
   code. `bd batch` prints it once after the batch, as `[N] hint: …` for
-  operation N (under `--dry-run` too); through `bd serve` it reaches the
-  client on stderr, replays included.
+  operation N (under `--dry-run` too), naming the issues still closed and
+  unlinked when the batch ends: a later operation of the batch that links
+  one, marks it `spec:none`, reopens it or deletes it leaves it out. Through
+  `bd serve` it reaches the client on stderr, replays included.
 
 `bd q` is quick capture: it takes the title and the `create` flags `-d`, `-t`,
 `-p`, `-l`, `--parent` and `--dep`, creates the issue exactly as `bd create`

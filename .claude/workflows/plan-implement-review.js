@@ -41,8 +41,10 @@ export const meta = {
 //   validators stay at high, and prompts and labels are unchanged, so shadow pairing holds. AGENTS.md: pass high for a
 //   run estimated at complexity 4-5; anything else throws at start.
 // - workdir (with base, default main): without it the workflow works in a new worktree under .claude/worktrees/. Every
-//   cargo command runs with CARGO_TARGET_DIR=<main checkout>/target/implement-review, shared by runs so a fresh worktree
-//   reuses compiled dependencies.
+//   cargo command runs with CARGO_TARGET_DIR=<the worktree's top level>/target (git rev-parse --show-toplevel in the
+//   worktree or the given workdir): a dir of that worktree alone, gitignored and removed with the worktree. Checkouts of
+//   one workspace sharing a target dir get the same fingerprint per workspace crate and judge freshness by mtimes, so
+//   one could link another's build. A first build there is cold.
 // - baseline (a commit, with workdir): what reviewers diff against instead of the workdir's state at the start.
 // - logDir (an absolute directory without '..' or control characters; pass your scratchpad): every agent that runs cargo
 //   writes each command's output to its own file, <logDir>/<run>/<label>.log, and reads results only from it, where run
@@ -190,7 +192,7 @@ const SETUP = {
     workdir: { type: 'string' },
     branch: { type: 'string' },
     baseline: { type: 'string' },
-    target: { type: 'string', description: 'absolute CARGO_TARGET_DIR shared by workflow runs' },
+    target: { type: 'string', description: 'absolute CARGO_TARGET_DIR of this worktree (<its top level>/target)' },
     tmpdir: { type: 'string', description: 'output of printf %s "${TMPDIR:-/tmp}", when asked for' },
   },
   required: ['workdir', 'baseline', 'target'],
@@ -399,8 +401,10 @@ const SNAPSHOT_CMD =
   'tmp=$(mktemp) && cp "$(git rev-parse --git-path index)" "$tmp" && GIT_INDEX_FILE="$tmp" git add -A && GIT_INDEX_FILE="$tmp" git write-tree; rm -f "$tmp"'
 // The main checkout (not a worktree): bd finds its workspace there, whether a remote server or a local database.
 const ROOT_CMD = 'dirname "$(git rev-parse --path-format=absolute --git-common-dir)"'
-// One target dir for every run, so a fresh worktree reuses compiled dependencies instead of a cold build.
-const TARGET_CMD = `echo "$(${ROOT_CMD})/target/implement-review"`
+// A target dir per worktree (its gitignored /target, removed with it): a dir shared across checkouts shares each
+// workspace crate's fingerprint between them, and cargo judges freshness by mtimes, so a build could link another
+// checkout's crate.
+const TARGET_CMD = 'echo "$(git rev-parse --show-toplevel)/target"'
 let TARGET = ''
 let DIR = ''
 const inDir = (dir) =>

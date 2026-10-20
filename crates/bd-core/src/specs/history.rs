@@ -160,10 +160,12 @@ pub(crate) fn events_after(
 /// purged or compacted away later, which name no parent, and those updated
 /// by an import that kept no previous snapshot (`maybe`); and every issue
 /// that may have been a spec then but is not labelled one now (`specs`).
-/// A create-mode import adds nothing: the issue did not exist before it,
-/// and its edges have `dep_added` events of their own (an import's, of any
-/// type, counts as one to its target in `kids`: it may have replaced a
-/// parent-child edge). `hidden` holds the ids only a purge, a compaction or
+/// An import's `dep_added` of any type counts as an edge to its target in
+/// `kids`, since a content-identical import may have replaced a parent-child
+/// edge, unless the same transaction imported the issue with mode create (it
+/// did not exist before) or with a previous snapshot (which already shows its
+/// old edges); parent-child edges a create-mode import adds still count, as
+/// every parent-child `dep_added` does. `hidden` holds the ids only a purge, a compaction or
 /// an import with no previous snapshot names, minus those a snapshot or an
 /// update shows labelled spec: [`Rebuilder`] probes them before they count.
 /// `kids` does not take an id out of `hidden`, since it holds edges to any
@@ -183,13 +185,29 @@ impl After {
         // Ids named only by a purge, a compaction or an import, and those with direct evidence.
         let mut named: BTreeSet<String> = BTreeSet::new();
         let mut direct: BTreeSet<String> = BTreeSet::new();
+        // (tx, id) of the issues an import after the point created, or updated
+        // keeping a previous snapshot: their import edges replaced nothing unseen.
+        let imported: BTreeSet<(i64, &str)> = events
+            .iter()
+            .filter(|e| {
+                !point.includes(e)
+                    && e.op == "imported"
+                    && (e.data["mode"] == json!("create")
+                        || (e.data["mode"] == json!("update") && e.data["previous"].is_object()))
+            })
+            .filter_map(|e| Some((e.tx, e.issue_id.as_deref()?)))
+            .collect();
         for e in events.iter().filter(|e| !point.includes(e)) {
             let d = &e.data;
             let id = e.issue_id.as_deref();
             match e.op.as_str() {
-                // An import's dep_added may have replaced a parent-child edge it did not record.
+                // An import's dep_added may have replaced a parent-child edge it did not
+                // record, unless the same tx created the issue or kept its previous snapshot.
                 "dep_added" | "dep_removed" | "dep_updated"
-                    if d["type"] == json!("parent-child") || (e.op == "dep_added" && d["import"] == json!(true)) =>
+                    if d["type"] == json!("parent-child")
+                        || (e.op == "dep_added"
+                            && d["import"] == json!(true)
+                            && !id.is_some_and(|id| imported.contains(&(e.tx, id)))) =>
                 {
                     if let (Some(id), Some(target)) = (id, d["target"].as_str()) {
                         out.kids.entry(target.to_string()).or_default().insert(id.to_string());

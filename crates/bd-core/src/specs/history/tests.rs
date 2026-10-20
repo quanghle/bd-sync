@@ -890,8 +890,19 @@ fn a_create_import_after_the_point_adds_no_candidates() {
     let spec = ws.create(pinned("Checkout", &["spec"], None));
     let r = ws.create(pinned("Rule", &["requirement"], Some(&spec)));
     let (t, _) = ws.now();
-    let jsonl: String = (0..8).map(|i| format!("{{\"id\":\"t-{}\",\"title\":\"Imported {i}\"}}\n", 100 + i)).collect();
+    // More issues than the cap, each with a related edge to the spec: the
+    // issues did not exist before, so their edges replaced nothing.
+    let jsonl: String = (0..8)
+        .map(|i| {
+            format!(
+                "{{\"id\":\"t-{}\",\"title\":\"Imported {i}\",\
+                 \"dependencies\":[{{\"depends_on_id\":\"{spec}\",\"type\":\"related\"}}]}}\n",
+                100 + i
+            )
+        })
+        .collect();
     ws.import(&jsonl);
+    assert_eq!(ops_after(&ws, "t-100", t), ["imported", "dep_added"], "the edge was imported");
     let now = ws.now().0;
     let limits = Limits::issues(4);
     let v = ws.store.read(|c| show_as_of_with_cap(c.conn(), &spec, t, limits)).unwrap();
@@ -900,7 +911,67 @@ fn a_create_import_after_the_point_adds_no_candidates() {
     assert!(c.changes.is_empty() && c.unknown.is_empty(), "{c:?}");
     let after =
         ws.store.read(|c| Ok(After::of(&events_after(c.conn(), &History::load(c.conn())?, t, None)?, t))).unwrap();
+    assert!(!after.kids.contains_key(&spec), "{after:?}");
     assert!(after.maybe.is_empty() && after.specs.is_empty() && after.hidden.is_empty(), "{after:?}");
+}
+
+#[test]
+fn a_point_inside_a_create_import_still_counts_its_edges() {
+    let mut ws = Ws::new();
+    let spec = ws.create(pinned("Checkout", &["spec"], None));
+    let (t, _) = ws.now();
+    let jsonl: String = (0..8)
+        .map(|i| {
+            format!(
+                "{{\"id\":\"t-{}\",\"title\":\"Imported {i}\",\
+                 \"dependencies\":[{{\"depends_on_id\":\"{spec}\",\"type\":\"related\"}}]}}\n",
+                100 + i
+            )
+        })
+        .collect();
+    ws.import(&jsonl);
+    let after = ws
+        .store
+        .read(|c| {
+            let conn = c.conn();
+            let hist = History::load(conn)?;
+            let all = events_after(conn, &hist, t, None)?;
+            let seq = all
+                .iter()
+                .find(|e| e.op == "imported" && e.issue_id.as_deref() == Some("t-100"))
+                .map(|e| e.seq)
+                .expect("t-100 imported");
+            let point = Point::Seq(seq);
+            Ok(After::of(&events_after(conn, &hist, point, None)?, point))
+        })
+        .unwrap();
+    // t-100's imported event is at the point, so nothing after it shows the
+    // import created it: its edge still counts. The others' are skipped.
+    assert_eq!(after.kids.get(&spec), Some(&BTreeSet::from(["t-100".to_string()])), "{after:?}");
+}
+
+#[test]
+fn an_update_import_with_previous_adds_no_candidates_for_its_new_edges() {
+    let mut ws = Ws::new();
+    let spec = ws.create(pinned("Checkout", &["spec"], None));
+    let r = ws.create(pinned("Rule", &["requirement"], Some(&spec)));
+    let x = ws.create(titled("Elsewhere", &[], None));
+    let (t, _) = ws.now();
+    ws.import(&format!(
+        "{{\"id\":\"{x}\",\"title\":\"Renamed\",\
+         \"dependencies\":[{{\"depends_on_id\":\"{spec}\",\"type\":\"related\"}}]}}\n"
+    ));
+    assert_eq!(ops_after(&ws, &x, t), ["imported", "dep_added"], "an update with its edge in the same tx");
+    // The spec and r are all there is to rebuild: x would be one more.
+    let now = ws.now().0;
+    let limits = Limits::issues(2);
+    let v = ws.store.read(|c| show_as_of_with_cap(c.conn(), &spec, t, limits)).unwrap();
+    assert_eq!(reqs(&v[0]), [r.as_str()]);
+    let c = ws.store.read(|c| changes_with_cap(c.conn(), Some(&spec), t, now, limits)).unwrap();
+    assert!(c.changes.is_empty() && c.unknown.is_empty(), "{c:?}");
+    let after =
+        ws.store.read(|c| Ok(After::of(&events_after(c.conn(), &History::load(c.conn())?, t, None)?, t))).unwrap();
+    assert!(!after.kids.contains_key(&spec), "{after:?}");
 }
 
 #[test]

@@ -55,7 +55,7 @@ const SETUP = {
         workdir: { type: "string" },
         branch: { type: "string" },
         baseline: { type: "string" },
-        target: { type: "string", description: "absolute CARGO_TARGET_DIR shared by workflow runs" },
+        target: { type: "string", description: "absolute CARGO_TARGET_DIR of this worktree (<its top level>/target)" },
     },
     required: ["workdir", "baseline", "target"],
 };
@@ -265,8 +265,10 @@ const TRIAGE = {
 // ---------- shared prompt pieces ----------
 const SNAPSHOT_CMD =
     'tmp=$(mktemp) && cp "$(git rev-parse --git-path index)" "$tmp" && GIT_INDEX_FILE="$tmp" git add -A && GIT_INDEX_FILE="$tmp" git write-tree; rm -f "$tmp"';
-// One target dir for every run, so a fresh worktree reuses compiled dependencies instead of a cold build.
-const TARGET_CMD = 'echo "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/target/implement-review"';
+// A target dir per worktree (its gitignored /target, removed with it): a dir shared across checkouts shares each
+// workspace crate's fingerprint between them, and cargo judges freshness by mtimes, so a build could link another
+// checkout's crate.
+const TARGET_CMD = 'echo "$(git rev-parse --show-toplevel)/target"';
 
 const fmtFinding = (f) =>
     `[${f.id}] ${f.severity} ${f.category} — ${f.file}${f.line ? ":" + f.line : ""}\n  Claim: ${f.claim}\n  Evidence: ${f.evidence}` +

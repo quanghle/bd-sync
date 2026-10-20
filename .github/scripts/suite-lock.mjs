@@ -14,9 +14,10 @@
 // was not found, 2 on a usage error). The lock is released when the command ends, on SIGINT/SIGTERM/SIGHUP (forwarded
 // to the command) and on exit, and only while owner.json still carries this process's token.
 // Use it for full suites only (`cargo test --workspace`); cargo fmt, cargo clippy and `cargo test -p <crate> [filter]`
-// skip it, since cargo already serializes builds per target directory. The fallback lock in the os temp dir (outside
-// any git checkout) is shared by every local user, so another user may create it; workflow worktrees always use the
-// git common dir.
+// skip it. plan-implement-review worktrees each build in their own target dir (<worktree>/target), so the lock does not
+// guard shared build output: it keeps parallel full suites from overloading the machine and causing timing flakes,
+// which the lighter commands do not. The fallback lock in the os temp dir (outside any git checkout) is shared by
+// every local user, so another user may create it; workflow worktrees always use the git common dir.
 import { execFileSync, spawn } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync } from 'node:fs'

@@ -270,6 +270,29 @@ describe('plan-implement-review', () => {
 			expect(got.status).toBe('done')
 			expect(promptOf(ctx, 'coder:S1')).toContain(`'/logs/bd-1/coder-S1.log'`)
 		})
+
+		it('asks every setup branch for the worktree\'s own target dir, never a shared one', async () => {
+			const LIT = 'echo "$(git rev-parse --show-toplevel)/target"'
+			const { ctx } = await run(ARGS)
+			expect(promptOf(ctx, 'setup')).toContain('^{tree}')
+			expect(promptOf(ctx, 'setup')).toContain(LIT)
+			expect(promptOf(ctx, 'setup')).not.toContain('implement-review')
+
+			// skipImplement needs a baseline and a baseline needs a workdir, so the other two branches plan only.
+			const { skipImplement, baseline, ...rest } = ARGS
+			const critic = { 'planner:critic:0': { approved: true, issues: [] } }
+			for (const [args, branch] of [
+				[{ ...rest, planOnly: true }, 'run this snapshot command'],
+				[{ ...rest, workdir: undefined, planOnly: true }, 'git worktree add'],
+			]) {
+				const { ctx, got } = await run(args, critic)
+				const what = JSON.stringify({ workdir: args.workdir })
+				expect(got.status, what).toBe('planned')
+				expect(promptOf(ctx, 'setup'), what).toContain(branch)
+				expect(promptOf(ctx, 'setup'), what).toContain(LIT)
+				expect(promptOf(ctx, 'setup'), what).not.toContain('implement-review')
+			}
+		})
 	})
 
 	describe('shadow reviewers and the recorded agents', () => {

@@ -4,7 +4,7 @@
 // script isn't a module (top-level await and return), so this lifts the log helpers, the prompt builders and what they use
 // out of the source, like the ops, record and shadow specs, and renders the prompts with a stub agent keyed by label.
 import { execFileSync } from 'node:child_process'
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -67,6 +67,7 @@ const names = [
 	'gateCmd',
 	'gateRerunCmd',
 	'gatePrompt',
+	'TARGET_CMD',
 ]
 
 const DIR = '/w/bd-x-1'
@@ -93,7 +94,7 @@ function load(A, replies = {}, over = {}) {
 		TASK: 'Requirements:\nmake it so',
 		BASE: 'main',
 		DIR,
-		TARGET: '/repo/target/implement-review',
+		TARGET: '/w/bd-x-1/target',
 		setup: { baseline: 'base0' },
 		plan: { summary: 's', requirements: [{ id: 'R1', text: 't', acceptance: 'a' }], steps: [], decisions: [] },
 		done: [],
@@ -264,7 +265,8 @@ describe('plan-implement-review setup', () => {
 			expect(without.logRoot()).toBe('')
 			const prompt = without.setupPrompt()
 			expect(prompt).toContain('Also run `printf %s "${TMPDIR:-/tmp}"` and return its output as tmpdir.')
-			expect(prompt).toContain('/target/implement-review')
+			expect(prompt).toContain('git rev-parse --show-toplevel)/target')
+			expect(prompt).not.toContain('implement-review')
 			expect(load({ ...X, ...A }).setupPrompt()).not.toContain('tmpdir')
 		}
 	})
@@ -296,6 +298,41 @@ async function render() {
 	}
 	return { w, prompts }
 }
+
+describe('plan-implement-review target dir', () => {
+	it('names the worktree\'s own target dir, the literal the Copilot extension shares', () => {
+		expect(load(X).TARGET_CMD).toBe('echo "$(git rev-parse --show-toplevel)/target"')
+	})
+
+	it('gives each checkout its own dir, removed with the worktree', { skip: POSIX, timeout: 30_000 }, () => {
+		const { TARGET_CMD } = load(X)
+		const tmp = mkdtempSync(join(tmpdir(), 'pir-target-'))
+		try {
+			const repo = join(tmp, 'repo')
+			mkdirSync(repo)
+			const git = (args, cwd = repo) => execFileSync('git', args, { cwd, stdio: 'pipe' })
+			git(['init', '-q'])
+			writeFileSync(join(repo, '.gitignore'), '/target\n')
+			git(['add', '.gitignore'])
+			git(['-c', 'user.name=t', '-c', 'user.email=t@t', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', 'x'])
+			const wt = join(tmp, 'wt')
+			git(['worktree', 'add', '-q', wt, '-b', 'wt'])
+			mkdirSync(join(wt, 'sub'))
+			mkdirSync(join(wt, 'target', 'debug'), { recursive: true })
+			writeFileSync(join(wt, 'target', 'debug', 'built'), 'x')
+			const target = (cwd) => execFileSync('sh', ['-c', TARGET_CMD], { cwd, encoding: 'utf8' }).trim()
+			const main = target(repo)
+			expect(main).toBe(join(realpathSync(repo), 'target'))
+			expect(target(wt)).toBe(join(realpathSync(wt), 'target'))
+			expect(target(join(wt, 'sub'))).toBe(join(realpathSync(wt), 'target'))
+			expect(target(wt)).not.toBe(main)
+			git(['worktree', 'remove', wt])
+			expect(existsSync(wt)).toBe(false)
+		} finally {
+			rmSync(tmp, { recursive: true, force: true })
+		}
+	})
+})
 
 describe('plan-implement-review prompts name their own log file', () => {
 	const LABELS = ['coder:S1', 'coder:gate-fix:impl:1', 'coder:fix:r1', 'validate:r0:F1']
@@ -497,7 +534,7 @@ describe('plan-implement-review gate command', () => {
 	it('writes the marker first, then fmt, clippy and the locked suite into its own log', () => {
 		const { gateCmd, SUITE_TEST } = load(X)
 		const cmd = gateCmd('gate:impl')
-		expect(cmd.startsWith(`mkdir -p '${ROOT}/bd-x.1' && cd '${DIR}' && { echo "bd-gate: dir=$PWD run=bd-x.1"; export CARGO_TARGET_DIR='/repo/target/implement-review'; `)).toBe(true)
+		expect(cmd.startsWith(`mkdir -p '${ROOT}/bd-x.1' && cd '${DIR}' && { echo "bd-gate: dir=$PWD run=bd-x.1"; export CARGO_TARGET_DIR='/w/bd-x-1/target'; `)).toBe(true)
 		expect(cmd).toContain('cargo fmt --all --check; echo "exit[fmt]=$?"; cargo clippy --workspace --all-targets --locked -- -D warnings; echo "exit[clippy]=$?"; ')
 		expect(cmd).toContain(`${SUITE_TEST}; echo "exit[test]=$?"; } > ${LOG} 2>&1; grep '^exit\\[' ${LOG}`)
 		// Only the full suite takes the lock.
@@ -508,7 +545,7 @@ describe('plan-implement-review gate command', () => {
 	it('reruns only the suite, appending to the same log', () => {
 		const { gateRerunCmd, SUITE_TEST } = load(X)
 		expect(gateRerunCmd('gate:impl')).toBe(
-			`cd '${DIR}' && { export CARGO_TARGET_DIR='/repo/target/implement-review'; ${SUITE_TEST}; echo "exit[test]=$?"; } >> ${LOG} 2>&1; grep '^exit\\[test\\]' ${LOG} | tail -1`,
+			`cd '${DIR}' && { export CARGO_TARGET_DIR='/w/bd-x-1/target'; ${SUITE_TEST}; echo "exit[test]=$?"; } >> ${LOG} 2>&1; grep '^exit\\[test\\]' ${LOG} | tail -1`,
 		)
 	})
 

@@ -34,6 +34,9 @@ const body = [
 	slice('async function review(', '// Files approved findings'),
 	slice('const stepCoderPrompt =', 'if (A.skipImplement)'),
 	slice('const fixPrompt =', 'for (let round = 0'),
+	// The real setup block, wrapped so its await and return run inside a function: its const setup shadows the setup
+	// param only here, and its DIR, TARGET and LOG_ROOT assignments reach the prompt builders above.
+	`const runSetup = async () => {${slice('const setup = await ops(', '// ---------- Plan')}}`,
 ].join('\n')
 const names = [
 	'ops',
@@ -68,6 +71,9 @@ const names = [
 	'gateRerunCmd',
 	'gatePrompt',
 	'TARGET_CMD',
+	'normPath',
+	'setupOk',
+	'runSetup',
 ]
 
 const DIR = '/w/bd-x-1'
@@ -96,6 +102,7 @@ function load(A, replies = {}, over = {}) {
 		DIR,
 		TARGET: '/w/bd-x-1/target',
 		setup: { baseline: 'base0' },
+		lease: null,
 		plan: { summary: 's', requirements: [{ id: 'R1', text: 't', acceptance: 'a' }], steps: [], decisions: [] },
 		done: [],
 		SHADOWS: [{ model: 'sonnet', effort: 'medium' }],
@@ -276,6 +283,75 @@ describe('plan-implement-review setup', () => {
 		expect(SETUP.required).toEqual(['workdir', 'baseline', 'target'])
 		expect(typeof SETUP.properties.tmpdir.type).toBe('string')
 		expect(SETUP.properties.tmpdir.type).toBe('string')
+	})
+})
+
+describe('plan-implement-review setup target', () => {
+	// [name, args.workdir, report, accepted]. Mirrors the table in workflow-extensions.spec.mjs, so both harnesses give
+	// the same verdicts.
+	const SETUP_CASES = [
+		['its own target', '/w', { workdir: '/w', target: '/w/target' }, true],
+		['a trailing slash', '/w', { workdir: '/w', target: '/w/target/' }, true],
+		['a doubled slash', '/w', { workdir: '/w', target: '/w//target' }, true],
+		['a Windows path', 'C:\\w', { workdir: 'C:\\w', target: 'C:/w/target' }, true],
+		['a target outside the workdir', '/w', { workdir: '/w', target: '/t' }, false],
+		["another checkout's target", '/w', { workdir: '/w', target: '/r/target' }, false],
+		['a subdirectory\'s target', '/w', { workdir: '/w', target: '/w/sub/target' }, false],
+		['another workdir than args.workdir', '/w', { workdir: '/r', target: '/r/target' }, false],
+		['args.workdir with a trailing slash', '/w/', { workdir: '/w', target: '/w/target' }, true],
+		['no args.workdir', undefined, { workdir: '/x', target: '/x/target' }, true],
+	]
+
+	it.each(SETUP_CASES)('%s', (_, workdir, report, ok) => {
+		const w = load({ ...X, workdir })
+		expect(w.setupOk({ ...report, baseline: 'b' }, 'setup')).toBe(ok)
+		if (ok) {
+			expect(w.logs).toEqual([])
+		} else {
+			expect(w.logs).toHaveLength(1)
+			expect(w.logs[0]).toContain(report.target)
+			expect(w.logs[0]).toContain(`${w.normPath(workdir)}/target`)
+		}
+	})
+
+	it('rejects a report missing a field without a log line of its own', () => {
+		const w = load({ ...X, workdir: '/w' })
+		expect(w.setupOk({ workdir: '/w', baseline: 'b' }, 'setup')).toBe(false)
+		expect(w.setupOk(null, 'setup')).toBe(false)
+		expect(w.logs).toEqual([])
+	})
+
+	it('normalizes paths lexically only', () => {
+		const { normPath } = load(X)
+		expect(normPath('C:\\w\\')).toBe('c:/w')
+		expect(normPath('/w//x/')).toBe('/w/x')
+		expect(normPath('/w/../x')).toBe('/w/../x')
+		expect(normPath('/private/w')).toBe('/private/w')
+		expect(normPath(' /w')).toBe(' /w')
+		expect(normPath('/W')).toBe('/W')
+	})
+
+	const BAD = { workdir: '/w', baseline: 'abc12345abc', target: '/r/target' }
+	const GOOD = { workdir: '/w', baseline: 'abc12345abc', target: '/w/target' }
+
+	it('escalates a wrong target once, then ends the run before planning', async () => {
+		const w = load({ ...X, workdir: '/w' }, { setup: BAD, 'setup@sonnet': BAD }, { DIR: '', TARGET: '' })
+		expect(await w.runSetup()).toEqual({ status: 'escalated', reason: 'setup agent failed', lease: null })
+		expect(w.calls.map((c) => c.label)).toEqual(['setup', 'setup@sonnet'])
+		const lines = w.logs.filter((l) => l.startsWith('setup setup'))
+		expect(lines).toHaveLength(2)
+		for (const l of lines) {
+			expect(l).toContain('/r/target')
+			expect(l).toContain('/w/target')
+		}
+	})
+
+	it('proceeds with the escalated report when it names the right target', async () => {
+		const w = load({ ...X, workdir: '/w' }, { setup: BAD, 'setup@sonnet': GOOD }, { DIR: '', TARGET: '' })
+		expect(await w.runSetup()).toBeUndefined()
+		expect(w.calls.map((c) => c.label)).toEqual(['setup', 'setup@sonnet'])
+		expect(w.stepCoderPrompt({ id: 'S1', title: 't', approach: 'a', tests: 't' }, 'coder:S1')).toContain('CARGO_TARGET_DIR=/w/target set')
+		expect(w.gatePrompt('gate:impl')).toContain("export CARGO_TARGET_DIR='/w/target'")
 	})
 })
 

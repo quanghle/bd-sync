@@ -68,7 +68,7 @@ describe('plan-implement-review', () => {
 		if (over[label] !== undefined) return typeof over[label] === 'function' ? over[label](opts) : over[label]
 		if (base === 'claim') return CLAIM
 		if (base.startsWith('heartbeat')) return { ok: true }
-		if (base === 'setup') return { workdir: '/w', baseline: 'abc12345abc', target: '/t', branch: 'b' }
+		if (base === 'setup') return { workdir: '/w', baseline: 'abc12345abc', target: '/w/target', branch: 'b' }
 		if (base.startsWith('gate:')) return { passed: true, failures: [], snapshot: 'snap1', changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
 		if (base.startsWith('review:')) return { findings: [] }
 		if (base.startsWith('record:')) return { ok: true, filed: [], followedUp: [] }
@@ -262,7 +262,7 @@ describe('plan-implement-review', () => {
 		})
 
 		it('gives each implement coder its own file', async () => {
-			const { skipImplement, ...args } = ARGS
+			const args = { ...ARGS, skipImplement: undefined }
 			const { ctx, got } = await run({ ...args, logDir: '/logs' }, {
 				'planner:critic:0': { approved: true, issues: [] },
 				'coder:S1': { summary: 'done', filesChanged: ['a.md'] },
@@ -279,7 +279,7 @@ describe('plan-implement-review', () => {
 			expect(promptOf(ctx, 'setup')).not.toContain('implement-review')
 
 			// skipImplement needs a baseline and a baseline needs a workdir, so the other two branches plan only.
-			const { skipImplement, baseline, ...rest } = ARGS
+			const rest = { ...ARGS, skipImplement: undefined, baseline: undefined }
 			const critic = { 'planner:critic:0': { approved: true, issues: [] } }
 			for (const [args, branch] of [
 				[{ ...rest, planOnly: true }, 'run this snapshot command'],
@@ -292,6 +292,86 @@ describe('plan-implement-review', () => {
 				expect(promptOf(ctx, 'setup'), what).toContain(LIT)
 				expect(promptOf(ctx, 'setup'), what).not.toContain('implement-review')
 			}
+		})
+	})
+
+	describe('setup target', () => {
+		const run = async (args, over = {}) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx(args, script(over))
+			return { ctx, got: await wf.run(ctx) }
+		}
+		const promptOf = (ctx, label) => ctx.calls.find((c) => c.label === label).prompt
+		const targetLines = (ctx) => ctx.logs.filter((l) => /^setup setup(@escalated)?: target /.test(l))
+		const critic = { 'planner:critic:0': { approved: true, issues: [] } }
+
+		// [name, args.workdir, the setup report, accepted]: the same table as plan-implement-review.logs.spec.mjs's
+		// SETUP_CASES, so both harnesses give the same verdicts.
+		const SETUP_CASES = [
+			['its own target', '/w', { workdir: '/w', target: '/w/target' }, true],
+			['a trailing slash', '/w', { workdir: '/w', target: '/w/target/' }, true],
+			['a doubled slash', '/w', { workdir: '/w', target: '/w//target' }, true],
+			['a Windows path', 'C:\\w', { workdir: 'C:\\w', target: 'C:/w/target' }, true],
+			['a target outside the workdir', '/w', { workdir: '/w', target: '/t' }, false],
+			["another checkout's target", '/w', { workdir: '/w', target: '/r/target' }, false],
+			['a subdirectory\'s target', '/w', { workdir: '/w', target: '/w/sub/target' }, false],
+			['another workdir than args.workdir', '/w', { workdir: '/r', target: '/r/target' }, false],
+			['args.workdir with a trailing slash', '/w/', { workdir: '/w', target: '/w/target' }, true],
+			['no args.workdir', undefined, { workdir: '/x', target: '/x/target' }, true],
+		]
+
+		// planOnly: setup and the critic run, and no gate marker (dir=/w) can escalate a case for another reason. A baseline
+		// needs a workdir, so the no-workdir case (the worktree-add branch) drops it.
+		it.each(SETUP_CASES)('%s', async (_, workdir, report, ok) => {
+			const reply = { ...report, baseline: 'abc12345abc', branch: 'b' }
+			const args = { ...ARGS, workdir, baseline: workdir ? ARGS.baseline : undefined, skipImplement: undefined, planOnly: true }
+			const { ctx, got } = await run(args, { ...critic, setup: reply, 'setup@escalated': reply })
+			if (ok) {
+				expect(got.status).toBe('planned')
+				expect(targetLines(ctx)).toEqual([])
+			} else {
+				expect(got.status).toBe('escalated')
+				expect(got.reason).toMatch(/^setup agent failed/)
+				expect(ctx.calls.some((c) => c.label.startsWith('planner:'))).toBe(false)
+				const lines = targetLines(ctx)
+				expect(lines).toHaveLength(2)
+				for (const l of lines) {
+					expect(l).toContain(report.target)
+					expect(l).toContain(`${workdir.replace(/\/+$/, '')}/target`)
+				}
+			}
+		})
+
+		const BAD = { workdir: '/w', baseline: 'abc12345abc', target: '/r/target', branch: 'b' }
+
+		it('escalates a report of another target once, then ends the run before planning', async () => {
+			const { ctx, got } = await run(ARGS, { setup: BAD, 'setup@escalated': BAD })
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toMatch(/^setup agent failed/)
+			const setups = ctx.calls.filter((c) => c.label.startsWith('setup'))
+			expect(setups.map((c) => [c.label, c.agent])).toEqual([
+				['setup', 'task'],
+				['setup@escalated', 'general-purpose'],
+			])
+			expect(ctx.calls.some((c) => /^(planner|coder|gate):/.test(c.label))).toBe(false)
+			const lines = targetLines(ctx)
+			expect(lines).toHaveLength(2)
+			for (const l of lines) {
+				expect(l).toContain('/r/target')
+				expect(l).toContain('/w/target')
+			}
+		})
+
+		it('goes on with the escalated report when it names the worktree\'s own target', async () => {
+			const { ctx, got } = await run({ ...ARGS, skipImplement: undefined }, {
+				...critic,
+				setup: BAD,
+				'coder:S1': { summary: 'done', filesChanged: ['a.md'] },
+			})
+			expect(got.status).toBe('done')
+			expect(targetLines(ctx)).toHaveLength(1)
+			expect(promptOf(ctx, 'coder:S1')).toContain('CARGO_TARGET_DIR=/w/target set')
+			expect(promptOf(ctx, 'gate:impl')).toContain("export CARGO_TARGET_DIR='/w/target'")
 		})
 	})
 
@@ -326,7 +406,7 @@ describe('plan-implement-review', () => {
 
 		it('runs Sonnet medium and Opus high shadows when shadowReview is left out', async () => {
 			const wf = await load('plan-implement-review', workspace)
-			const { shadowReview, ...args } = ARGS
+			const args = { ...ARGS, shadowReview: undefined }
 			const ctx = fakeCtx(args, script({ 'review:code:r0': { findings: [] } }))
 			const got = await wf.run(ctx)
 			const shadows = ctx.calls.filter((c) => c.label.startsWith('review:code:r0@shadow:'))

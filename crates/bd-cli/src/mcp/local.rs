@@ -79,6 +79,23 @@ mod tests {
         (dir, global)
     }
 
+    /// Like `call`, but every content item, each parsed as JSON.
+    fn call_all(server: &mut Server<Local>, name: &str, arguments: Value) -> (bool, Vec<Value>) {
+        let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments, "_meta": { VERSION_KEY: MODERN, CAPABILITIES_KEY: {} } } });
+        let answer = server.handle(&request).unwrap();
+        let result = &answer["result"];
+        let items = result["content"].as_array().unwrap_or_else(|| panic!("{answer}"));
+        let items = items
+            .iter()
+            .map(|item| {
+                let text = item["text"].as_str().unwrap_or_else(|| panic!("{answer}"));
+                serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}: {answer}"))
+            })
+            .collect();
+        (result["isError"].as_bool().unwrap(), items)
+    }
+
     fn call(server: &mut Server<Local>, name: &str, arguments: Value) -> (bool, Value) {
         let request = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": name, "arguments": arguments, "_meta": { VERSION_KEY: MODERN, CAPABILITIES_KEY: {} } } });
@@ -382,5 +399,100 @@ mod tests {
         assert!(err, "{refused}");
         assert_eq!(refused["error"]["code"], "invalid", "{refused}");
         assert_eq!(refused["error"]["exit_code"], 2, "{refused}");
+    }
+
+    #[test]
+    fn close_returns_the_unlinked_spec_hint() {
+        let (_dir, global) = workspace();
+        let db = global.db.clone().unwrap();
+        let mut server = Server::new(Local::new(global, Resolved::new("me/mcp-1", Source::Flag, "test")), false);
+        let create = |server: &mut Server<Local>, args: Value| id_of(&call(server, "create", args).1);
+        let hints = |items: &[Value]| -> Vec<String> {
+            let hints = items[1]["hints"].as_array().unwrap_or_else(|| panic!("{items:?}"));
+            hints.iter().map(|h| h.as_str().unwrap().to_string()).collect()
+        };
+
+        // Specs off: no hint, one item.
+        let off = create(&mut server, json!({ "title": "off" }));
+        let (err, items) = call_all(&mut server, "close", json!({ "ids": [off], "reason": "done" }));
+        assert!(!err, "{items:?}");
+        assert_eq!(items.len(), 1, "{items:?}");
+
+        // `config set` is admin-only inside a capture: turn specs on directly.
+        let mut store = Store::open(&db, Default::default()).unwrap();
+        store.write("config_set", "tester", |tx| bd_core::config::set(tx, "experimental.features", "specs")).unwrap();
+        drop(store);
+
+        // Unlinked work: the result, then the hint.
+        let a = create(&mut server, json!({ "title": "a" }));
+        let (err, items) = call_all(&mut server, "close", json!({ "ids": [a], "reason": "done" }));
+        assert!(!err, "{items:?}");
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0]["issue"]["id"], a, "{items:?}");
+        assert_eq!(items[0]["already_closed"], false, "{items:?}");
+        assert!(items[0].get("hints").is_none(), "{items:?}");
+        let hint = hints(&items);
+        assert_eq!(hint.len(), 1, "{hint:?}");
+        assert!(hint[0].starts_with(&format!("not linked to a feature spec: {a} (")), "{hint:?}");
+        assert!(hint[0].contains("bd spec none"), "{hint:?}");
+
+        // Already closed: nothing closed now, no hint.
+        let (err, items) = call_all(&mut server, "close", json!({ "ids": [a], "reason": "done" }));
+        assert!(!err, "{items:?}");
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["already_closed"], true, "{items:?}");
+
+        // Several ids: an array, then one hint naming both.
+        let b = create(&mut server, json!({ "title": "b" }));
+        let c = create(&mut server, json!({ "title": "c" }));
+        let (err, items) = call_all(&mut server, "close", json!({ "ids": [b, c], "reason": "done" }));
+        assert!(!err, "{items:?}");
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0].as_array().map(Vec::len), Some(2), "{items:?}");
+        let mut closed: Vec<&str> =
+            items[0].as_array().unwrap().iter().map(|r| r["issue"]["id"].as_str().unwrap()).collect();
+        closed.sort_unstable();
+        let mut both = [b.as_str(), c.as_str()];
+        both.sort_unstable();
+        assert_eq!(closed, both, "{items:?}");
+        let hint = hints(&items);
+        assert_eq!(hint.len(), 1, "{hint:?}");
+        assert!(hint[0].starts_with("not linked to a feature spec: "), "{hint:?}");
+        assert!(hint[0].contains(&b) && hint[0].contains(&c), "{hint:?}");
+
+        // Linked to a spec: no hint.
+        let spec = id_of(&bd(
+            &mut server,
+            &["create", "--json", "--pinned", "-t", "feature", "-l", "spec,area:checkout", "--", "Checkout"],
+        ));
+        let l = create(&mut server, json!({ "title": "l" }));
+        let (err, linked) = call(&mut server, "dep_add", json!({ "issue": l, "depends_on": spec, "type": "related" }));
+        assert!(!err, "{linked}");
+        let (err, items) = call_all(&mut server, "close", json!({ "ids": [l], "reason": "done" }));
+        assert!(!err, "{items:?}");
+        assert_eq!(items.len(), 1, "{items:?}");
+
+        // Marked spec:none: no hint.
+        let n = create(&mut server, json!({ "title": "n" }));
+        let (err, none) = call(&mut server, "spec_none", json!({ "ids": [n], "reason": "refactor" }));
+        assert!(!err, "{none}");
+        let (err, items) = call_all(&mut server, "close", json!({ "ids": [n], "reason": "done" }));
+        assert!(!err, "{items:?}");
+        assert_eq!(items.len(), 1, "{items:?}");
+
+        // claim_next: the hint names the closed issue, never the next one.
+        let d = create(&mut server, json!({ "title": "d", "priority": 1 }));
+        let e = create(&mut server, json!({ "title": "e", "priority": 2 }));
+        let (_, claimed) = call(&mut server, "claim", json!({ "id": d }));
+        let token = claimed["lease"]["token"].as_i64().unwrap();
+        let args = json!({ "ids": [d], "reason": "done", "token": token, "claim_next": true });
+        let (err, items) = call_all(&mut server, "close", args);
+        assert!(!err, "{items:?}");
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(items[0]["closed"]["issue"]["id"], d, "{items:?}");
+        assert_eq!(items[0]["next"]["issue"]["id"], e, "{items:?}");
+        let hint = hints(&items);
+        assert!(hint[0].starts_with(&format!("not linked to a feature spec: {d} (")), "{hint:?}");
+        assert!(!hint[0].contains(&e), "{hint:?}");
     }
 }

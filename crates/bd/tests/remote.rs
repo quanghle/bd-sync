@@ -9941,6 +9941,63 @@ fn mcp_spec_tools_through_bd_serve() {
     assert_eq!(mcp_http_call(&server, &secret, "", "spec_drift", json!({}))["count"], 0);
 }
 
+/// Every content item of a successful tool call's answer, parsed as JSON.
+fn mcp_items(answer: &Value) -> Vec<Value> {
+    assert!(mcp_tool_error(answer).is_none(), "{answer}");
+    let content = answer["result"]["content"].as_array().unwrap_or_else(|| panic!("{answer}"));
+    content.iter().map(|c| serde_json::from_str(c["text"].as_str().unwrap()).unwrap()).collect()
+}
+
+#[test]
+fn mcp_close_hint_through_bd_serve() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    let close = |id: &str| mcp_tool_call("close", json!({ "ids": [id], "reason": "done" }));
+    let http_close = |id: &str| {
+        let (status, _, answer) = mcp_post(&server, Some(&secret), "", &[], &close(id));
+        assert_eq!(status, 200, "{answer}");
+        mcp_items(&answer)
+    };
+
+    // Specs off: no hint, one item.
+    let w0 = alice.ok(&["-q", "create", "Before specs"]).trim().to_string();
+    let items = http_close(&w0);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["issue"]["id"], w0.as_str(), "{items:?}");
+
+    check(server.local("admin", &["config", "set", "experimental.features", "specs"]), "config set");
+
+    // bd serve's endpoint (its ToolRunner) carries the server's hint as a second item.
+    let w1 = alice.ok(&["-q", "create", "Build it"]).trim().to_string();
+    let items = http_close(&w1);
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert_eq!(items[0]["issue"]["id"], w1.as_str(), "{items:?}");
+    assert!(items[0].get("hints").is_none(), "{items:?}");
+    let hint = items[1]["hints"][0].as_str().unwrap_or_else(|| panic!("{items:?}"));
+    assert!(hint.starts_with(&format!("not linked to a feature spec: {w1} (")), "{hint}");
+
+    // A remote workspace's bd mcp forwards the call and carries the hint from the server's stderr.
+    let w2 = alice.ok(&["-q", "create", "Ship it"]).trim().to_string();
+    let answers = mcp_answers(alice.cmd(&["mcp"]), &[close(&w2)]);
+    let items = mcp_items(&answers[0]);
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert_eq!(items[0]["issue"]["id"], w2.as_str(), "{items:?}");
+    let hint = items[1]["hints"][0].as_str().unwrap_or_else(|| panic!("{items:?}"));
+    assert!(hint.starts_with(&format!("not linked to a feature spec: {w2} (")), "{hint}");
+
+    // Work a spec link covers: no hint.
+    let spec = alice
+        .ok(&["-q", "create", "Checkout", "--pinned", "-t", "feature", "-l", "spec,area:checkout"])
+        .trim()
+        .to_string();
+    let w3 = alice.ok(&["-q", "create", "Wire it"]).trim().to_string();
+    alice.ok(&["dep", "add", &w3, &spec, "--type", "related"]);
+    let items = http_close(&w3);
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["issue"]["id"], w3.as_str(), "{items:?}");
+}
+
 const PUBLISHED_PLAYBOOK: &str = "description = \"Ship it\"\n[[steps]]\nid = \"a\"\ntitle = \"A\"\n";
 
 /// A publish source in `dir/src`: one playbook and one claude skill.

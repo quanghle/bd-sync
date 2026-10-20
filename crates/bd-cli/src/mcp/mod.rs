@@ -207,7 +207,7 @@ impl<R: Runner> Server<R> {
             return Ok(command_error(&ran));
         }
         Ok(match invocation.result(&ran.stdout) {
-            Ok(text) => json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+            Ok(text) => success(text, &ran.stderr),
             // Unreadable stdout at a findings exit: the command's own error.
             Err(_) if findings => command_error(&ran),
             Err(message) => tool_error("internal", &message, 1),
@@ -269,6 +269,41 @@ pub fn error(id: Value, code: i64, message: &str, data: Option<Value>) -> Value 
         e["data"] = data;
     }
     json!({ "jsonrpc": "2.0", "id": id, "error": e })
+}
+
+/// The most hint lines a tool result carries.
+const MAX_HINTS: usize = 5;
+/// The longest a carried hint line may be, in characters.
+const MAX_HINT_CHARS: usize = 1000;
+
+/// The `hint: ` lines of a command's stderr, without the prefix: only lines
+/// that start with it exactly (not indented, not a batch's `[N] hint:`),
+/// trimmed at the end (CRLF too), empty ones left out, at most `MAX_HINTS`
+/// of them, each cut to `MAX_HINT_CHARS` characters.
+fn hint_lines(stderr: &str) -> Vec<String> {
+    stderr
+        .lines()
+        .filter_map(|l| l.strip_prefix("hint: "))
+        .map(str::trim_end)
+        .filter(|h| !h.is_empty())
+        .take(MAX_HINTS)
+        .map(|h| h.chars().take(MAX_HINT_CHARS).collect())
+        .collect()
+}
+
+/// The tool result of a command that succeeded: `text`, then, when its
+/// stderr held `hint: ` lines, a second text item `{"hints": [...]}`. On a
+/// successful command only `bd close`'s unlinked-spec note prints one
+/// (`Out::note` through `App::print`, after the commit); errors are JSON
+/// under `--json`, and no other stderr is carried.
+fn success(text: String, stderr: &str) -> Value {
+    let mut content = vec![json!({ "type": "text", "text": text })];
+    let hints = hint_lines(stderr);
+    if !hints.is_empty() {
+        let hints = crate::io::printable(&json!({ "hints": hints }).to_string()).into_owned();
+        content.push(json!({ "type": "text", "text": hints }));
+    }
+    json!({ "content": content, "isError": false })
 }
 
 /// A tool result reporting an error as the CLI's `--json` error.
@@ -515,5 +550,105 @@ mod tests {
         let drift_line = vec!["spec".to_string(), "drift".into(), "--json".into()];
         assert_eq!(canned.ran[0], (drift_line, false));
         assert_eq!(canned.ran[4], (vec!["spec".to_string(), "list".into(), "--json".into()], false));
+    }
+
+    /// The content items of one tool call answered with `ran`.
+    fn content_of(name: &str, arguments: Value, ran: Ran) -> (bool, Vec<Value>) {
+        let mut canned = Canned::default();
+        canned.answers.push_back(ran);
+        let mut server = Server::new(&mut canned, false);
+        let r = server.handle(&modern("tools/call", json!({ "name": name, "arguments": arguments }))).unwrap();
+        let is_error = r["result"]["isError"].as_bool().expect("isError is a boolean");
+        (is_error, r["result"]["content"].as_array().expect("content is an array").clone())
+    }
+
+    fn close_with(stdout: &str, stderr: &str) -> (bool, Vec<Value>) {
+        let ran = Ran { stdout: stdout.into(), stderr: stderr.into(), ..Default::default() };
+        content_of("close", json!({ "ids": ["t-1"], "reason": "done" }), ran)
+    }
+
+    fn hints_of(item: &Value) -> Value {
+        assert_eq!(item["type"], "text", "{item}");
+        serde_json::from_str(item["text"].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn hints_on_stderr_follow_a_successful_result() {
+        let shapes = [
+            r#"{"issue":{"id":"t-1","status":"closed"},"already_closed":false}"#,
+            r#"[{"issue":{"id":"t-1"},"already_closed":false},{"issue":{"id":"t-2"},"already_closed":false}]"#,
+            r#"{"closed":{"issue":{"id":"t-1"}},"next":{"from":"queue","issue":{"id":"t-2"}}}"#,
+            r#"{"closed":{"issue":{"id":"t-1"}},"next_note":"nothing ready"}"#,
+            r#"{"issue":{"id":"t-1"},"already_closed":true}"#,
+        ];
+        for stdout in shapes {
+            let (err, hinted) = close_with(stdout, "hint: not linked to a feature spec: t-1 (x)\nwarning: w\n");
+            let (plain_err, plain) = close_with(stdout, "");
+            assert!(!err && !plain_err, "{stdout}");
+            assert_eq!(hinted.len(), 2, "{hinted:?}");
+            assert_eq!(plain.len(), 1, "{plain:?}");
+            // The result item is the same with or without hints.
+            assert_eq!(hinted[0], plain[0], "{stdout}");
+            assert!(!hinted[0]["text"].as_str().unwrap().contains("hints"), "{stdout}");
+            assert_eq!(hints_of(&hinted[1]), json!({ "hints": ["not linked to a feature spec: t-1 (x)"] }));
+            assert!(!hinted[1]["text"].as_str().unwrap().contains("warning"));
+        }
+
+        // Only lines starting with `hint: ` exactly, trimmed, empty ones left out.
+        let stdout = r#"{"issue":{"id":"t-1"},"already_closed":false}"#;
+        let (_, items) =
+            close_with(stdout, "hint: a\r\n  hint: indented\n[1] hint: batch\nwarning: w\nhint: \nhint: b\n");
+        assert_eq!(hints_of(&items[1]), json!({ "hints": ["a", "b"] }));
+        let text = items[1]["text"].as_str().unwrap();
+        assert!(!text.contains("warning") && !text.contains("batch") && !text.contains("indented"), "{text}");
+        // At most MAX_HINTS lines, each cut to MAX_HINT_CHARS characters.
+        let seven: String = (0..7).map(|i| format!("hint: h{i}\n")).collect();
+        let (_, items) = close_with(stdout, &seven);
+        assert_eq!(hints_of(&items[1]), json!({ "hints": ["h0", "h1", "h2", "h3", "h4"] }));
+        let (_, items) = close_with(stdout, &format!("hint: {}\n", "é".repeat(3000)));
+        let long = hints_of(&items[1])["hints"][0].as_str().unwrap().to_string();
+        assert_eq!(long.chars().count(), MAX_HINT_CHARS);
+        assert!(long.chars().all(|c| c == 'é'));
+        // Only whitespace after the prefix, or nothing that matches: one item.
+        assert_eq!(close_with(stdout, "hint:   \n hint: x\nnote: hint: y\n").1.len(), 1);
+
+        // Control and bidi characters are escaped in the text, kept in the data.
+        let (_, items) = close_with(stdout, "hint: a\u{9b}b\u{202e}c\n");
+        let text = items[1]["text"].as_str().unwrap();
+        assert!(!text.contains('\u{9b}') && !text.contains('\u{202e}'), "{text:?}");
+        assert_eq!(hints_of(&items[1])["hints"][0], "a\u{9b}b\u{202e}c");
+
+        // A findings exit is a result, so it carries hints too.
+        let drift = r#"{"since":"T","count":0,"unlinked":[],"shaky":[],"bad_status":[],"orphaned":[],"to_link":[]}"#;
+        let ran = Ran { exit_code: 1, stdout: drift.into(), stderr: "hint: x\n".into() };
+        let (err, items) = content_of("spec_drift", json!({}), ran);
+        assert!(!err);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(hints_of(&items[1]), json!({ "hints": ["x"] }));
+    }
+
+    #[test]
+    fn failed_calls_carry_no_hints() {
+        let failed = |stderr: &str, exit_code: i32| {
+            let ran = Ran { exit_code, stderr: stderr.into(), ..Default::default() };
+            content_of("close", json!({ "ids": ["t-1"], "reason": "done" }), ran)
+        };
+        let json_error = r#"{"error":{"code":"claim_conflict","exit_code":4,"message":"held"}}"#;
+        let (err, items) = failed(&format!("{json_error}\nhint: x\n"), 4);
+        assert!(err);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items, failed(&format!("{json_error}\n"), 4).1);
+
+        let (err, items) = failed("error: boom\nhint: x\n", 1);
+        assert!(err);
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items, failed("error: boom\n", 1).1);
+        assert!(!items[0]["text"].as_str().unwrap().contains("hints"));
+
+        // Unreadable stdout at exit 0 is a tool error, without hints.
+        let ran = Ran { stdout: "not json".into(), stderr: "hint: x\n".into(), ..Default::default() };
+        let (err, items) = content_of("close", json!({ "ids": ["t-1"], "reason": "done" }), ran);
+        assert!(err);
+        assert_eq!(items.len(), 1, "{items:?}");
     }
 }

@@ -446,7 +446,8 @@ a claim's holder and expiry, not its token.
 ### Results
 
 Results are compact JSON in one text block (no `structuredContent`, no
-output schemas), so the model reads each thing once:
+output schemas), followed by a second text block only when the command
+printed hints (below), so the model reads each thing once:
 
 - null fields, empty strings, empty lists and empty objects are left out
   (an empty `ready` is `{}`), and the JSON has no indentation;
@@ -473,9 +474,16 @@ output schemas), so the model reads each thing once:
   `specs`, the specs governing the issue as
   [`bd show --json`](commands.md#issues) gives them (ids with `brief:
   true`), and `specs_truncated: true` when the walk, or the specs'
-  children, was cut; the `close`
-  tool does not show `bd close`'s stderr hint about work no spec link
-  covers (bd-hj7ao), so check with `spec_drift`;
+  children, was cut;
+- when a successful call's command printed hints, the result has a second
+  text block, `{"hints": ["not linked to a feature spec: ID, ... (...)"]}`:
+  today only `close` with feature specs on, naming the closed work no spec
+  link covers (`bd close`'s stderr hint, [Issues](commands.md#issues)). It
+  holds at most 5 lines, and the result block before it is unchanged. Act
+  on it with `dep_add` (`type: "related"`) to a spec or requirement, or
+  with `spec_none`. The issue `claim_next` claimed is never in it, an issue
+  that was already closed and a failed call carry none, and other stderr
+  is not returned;
 - `spec_list` returns `{"specs": [...]}`, each open spec as
   `bd spec list --json` prints it; `spec_show` returns `{"specs":
   [views]}` as `bd spec show --json` does, without `history` unless

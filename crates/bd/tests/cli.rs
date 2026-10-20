@@ -7003,6 +7003,39 @@ fn close_hints_unlinked_work() {
         let created = created.split(':').next().unwrap();
         assert_eq!(stderr, format!("[2] hint: not linked to a feature spec: {created}{HINT_TAIL}\n"));
     }
+    // The batch hint follows the issues' state when the batch ends: a later
+    // operation that links one, marks it spec:none, reopens or deletes it
+    // leaves it out, and an op left with none prints no line.
+    let batch = |ops: String| {
+        let out = ws.batch_as("tester", &ops);
+        assert!(out.status.success(), "{ops}: {}", text_of(&out.stderr));
+        text_of(&out.stderr)
+    };
+    let related = ws.id(&["create", "Linked later"]);
+    assert_eq!(batch(format!("close {related} -r done\ndep add {related} {rule} --type related\n")), "");
+    let none = ws.id(&["create", "No behavior later"]);
+    assert_eq!(batch(format!("close {none} -r done\nspec none {none} -r \"no behavior\"\n")), "");
+    let (one, other) = (ws.id(&["create", "Linked one"]), ws.id(&["create", "Left unlinked"]));
+    assert_eq!(
+        batch(format!("close {one} {other} -r done\nspec link {one} {rule}\n")),
+        format!("[1] hint: not linked to a feature spec: {other}{HINT_TAIL}\n")
+    );
+    let reopened = ws.id(&["create", "Reopened later"]);
+    assert_eq!(batch(format!("close {reopened} -r done\nreopen {reopened}\n")), "");
+    assert_eq!(ws.json(&["show", &reopened])["status"], "open");
+    // A deleted id is skipped, never an error that fails the batch.
+    let deleted = ws.id(&["create", "Deleted later"]);
+    assert_eq!(batch(format!("close {deleted} -r done\ndelete {deleted}\n")), "");
+    assert!(!ws.run_as("tester", &["show", &deleted]).status.success());
+    // Two close ops: each its own line, in op order.
+    let (first, second) = (ws.id(&["create", "First closed"]), ws.id(&["create", "Second closed"]));
+    assert_eq!(
+        batch(format!("close {first} -r done\nclose {second} -r done\n")),
+        format!(
+            "[1] hint: not linked to a feature spec: {first}{HINT_TAIL}\n\
+             [2] hint: not linked to a feature spec: {second}{HINT_TAIL}\n"
+        )
+    );
     // A batch that fails at its last line prints none.
     let out = ws.batch_as("tester", "create \"Doomed\"\nclose $1 -r done\nclose t-999 -r done\n");
     assert!(!out.status.success());

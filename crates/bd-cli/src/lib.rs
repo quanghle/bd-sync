@@ -258,7 +258,14 @@ pub fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Spec(c) => cmd_spec(app, c),
         Command::Graph(a) => cmd_graph(app, a).map(|_| 0),
         Command::Update(a) => write_cmd(app, "update", |tx| exec_update(tx, a)),
-        Command::Close(a) => write_cmd(app, "close", |tx| exec_close(tx, a)),
+        Command::Close(a) => write_cmd(app, "close", |tx| {
+            let mut out = exec_close(tx, a)?;
+            let closed = std::mem::take(&mut out.close_hint);
+            if let Some(hint) = unlinked_note(tx, &closed)? {
+                out = out.note(hint);
+            }
+            Ok(out)
+        }),
         Command::Duplicate(a) => write_cmd(app, "duplicate", |tx| exec_duplicate(tx, a)),
         Command::Supersede(a) => write_cmd(app, "supersede", |tx| exec_supersede(tx, a)),
         Command::Reopen(a) => write_cmd(app, "reopen", |tx| exec_reopen(tx, a)),

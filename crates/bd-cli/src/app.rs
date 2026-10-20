@@ -24,6 +24,12 @@ pub struct Out {
     /// only once its write committed, so a refused or rolled-back write
     /// prints none.
     pub notes: Vec<String>,
+    /// The ids a close closed (named on its command line, each once, not
+    /// already closed), recorded only with feature specs on. The caller turns
+    /// them into the unlinked-spec note with [`crate::commands::unlinked_note`]
+    /// at the end of its transaction. Never printed or serialized by
+    /// [`App::print`].
+    pub close_hint: Vec<String>,
 }
 
 /// Writes JSON output to stdout as it goes.
@@ -37,6 +43,7 @@ impl Out {
             ids: Vec::new(),
             stream: None,
             notes: Vec::new(),
+            close_hint: Vec::new(),
         }
     }
 

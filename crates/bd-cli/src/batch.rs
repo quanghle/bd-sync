@@ -153,7 +153,8 @@ pub fn cmd_batch(app: &mut App, a: &BatchArgs) -> Result<()> {
         let mut produced: Vec<Option<String>> = Vec::with_capacity(ops.len());
         let mut results: Vec<Value> = Vec::with_capacity(ops.len());
         let mut text = Vec::new();
-        let mut notes = Vec::new();
+        // Each operation's own notes and the ids its close (if any) closed.
+        let mut per_op: Vec<(Vec<String>, Vec<String>)> = Vec::with_capacity(ops.len());
         for (i, (lineno, tokens)) in ops.iter().enumerate() {
             failed_at.set(*lineno);
             let tokens = tokens.iter().map(|t| substitute(t, &produced)).collect::<Result<Vec<_>>>()?;
@@ -164,12 +165,23 @@ pub fn cmd_batch(app: &mut App, a: &BatchArgs) -> Result<()> {
                     msg.lines().next().unwrap_or("parse error").trim_start_matches("error: ")
                 ))
             })?;
-            let out = run(tx, &parsed.op)?;
+            let mut out = run(tx, &parsed.op)?;
             produced.push(out.ids.first().cloned());
             text.extend(out.text.iter().map(|l| format!("[{}] {l}", i + 1)));
-            notes.extend(out.notes.iter().map(|n| format!("[{}] {n}", i + 1)));
+            per_op.push((std::mem::take(&mut out.notes), std::mem::take(&mut out.close_hint)));
             results
                 .push(json!({ "op": i + 1, "line": lineno, "command": tokens[0], "ids": out.ids, "result": out.json }));
+        }
+        // The notes in operation order, each close's unlinked-spec hint after
+        // its own notes, computed from the state after the last operation
+        // (and before a dry run's rollback): a later operation that links,
+        // marks spec:none, reopens or deletes an issue leaves it out.
+        let mut notes = Vec::new();
+        for (i, (op_notes, closed)) in per_op.into_iter().enumerate() {
+            notes.extend(op_notes.into_iter().map(|n| format!("[{}] {n}", i + 1)));
+            if let Some(h) = unlinked_note(tx, &closed)? {
+                notes.push(format!("[{}] {h}", i + 1));
+            }
         }
         if dry {
             tx.set_rollback_only();
@@ -194,7 +206,8 @@ pub fn cmd_batch(app: &mut App, a: &BatchArgs) -> Result<()> {
     };
     let out = Out::new(json!({ "committed": !dry, "operations": results })).lines(text).line(summary);
     // The operations' notes print after stdout, once the batch committed
-    // (or, under --dry-run, ran to its end and rolled back).
+    // (or, under --dry-run, ran to its end and rolled back); close hints
+    // reflect the state after the last operation.
     app.print(Out { ids, notes, ..out });
     Ok(())
 }

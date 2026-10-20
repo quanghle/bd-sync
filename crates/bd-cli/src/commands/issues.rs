@@ -158,7 +158,7 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         tx.check_take_over(&ids, a.take_over, &format!("closing {}", ids.join(", ")))?;
     }
     // The issues named, in command-line order, each once: the order the
-    // unlinked-spec hint lists them in.
+    // unlinked-spec hint (`unlinked_note`, run by the caller) lists them in.
     let mut named: Vec<String> = Vec::with_capacity(ids.len());
     for id in &ids {
         if !named.contains(id) {
@@ -189,8 +189,12 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         out = out.id(id);
         results.push(r);
     }
-    if let Some(hint) = unlinked_hint(tx, &named, &results)? {
-        out = out.note(hint);
+    if specs::is_on(tx.conn())? {
+        out.close_hint = named
+            .iter()
+            .filter(|id| results.iter().any(|r| &r.issue.id == *id && !r.already_closed))
+            .cloned()
+            .collect();
     }
     let closed = one_or_many(&results);
     let Some((q, near)) = next else {
@@ -248,23 +252,27 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
 /// Most issues the unlinked-spec hint names before `+N more`.
 const HINT_IDS: usize = 5;
 
-/// With feature specs on, the stderr hint naming the issues this close
-/// closed (of those named, in command-line order) that need a spec link
-/// and have none: not exempt ([`specs::is_exempt`]), not `spec:none`, and
+/// With feature specs on, the stderr hint naming those of `ids` (in their
+/// order) that, at call time, still exist, are closed, need a spec link and
+/// have none: not exempt ([`specs::is_exempt`], `spec:none` included) and
 /// not covered by a link. A walk cut short before a link
 /// ([`Coverage::Unknown`]) counts as covered, so the hint never names work
-/// it could not look at in full. Read-only, inside the close's transaction;
-/// [`Out::note`] prints it only after commit, and it never refuses a close.
-fn unlinked_hint(tx: &WriteCtx<'_>, named: &[String], results: &[bd_core::CloseOutcome]) -> Result<Option<String>> {
-    if !specs::is_on(tx.conn())? {
+/// it could not look at in full. Callers call it at the end of their write
+/// transaction with the ids a close recorded in [`Out::close_hint`], so a
+/// later operation of the same transaction that links one, marks it
+/// `spec:none`, reopens it or deletes it leaves it out. Read-only (no SQL of
+/// its own, no writes, events or `graph::recompute`), it never refuses: an
+/// id that is gone is skipped. [`Out::note`] prints it only after commit.
+pub fn unlinked_note(tx: &WriteCtx<'_>, ids: &[String]) -> Result<Option<String>> {
+    if ids.is_empty() || !specs::is_on(tx.conn())? {
         return Ok(None);
     }
     let mut unlinked = Vec::new();
-    for id in named {
-        let Some(r) = results.iter().find(|r| &r.issue.id == id && !r.already_closed) else {
+    for id in ids {
+        let Some(issue) = tx.find_issue(id)? else {
             continue;
         };
-        if specs::is_exempt(tx.conn(), &r.issue)? {
+        if issue.status != Status::Closed || specs::is_exempt(tx.conn(), &issue)? {
             continue;
         }
         if spec_context::covered(tx.conn(), id)? == Coverage::NotLinked {

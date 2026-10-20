@@ -7,7 +7,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use super::*;
-use crate::claims::ClaimOptions;
+use crate::claims::{self, ClaimOptions};
 use crate::config;
 use crate::model::{IssuePatch, NewIssue};
 use crate::specs::{self, OFF};
@@ -468,6 +468,25 @@ fn remove_closes_the_requirement_with_its_reason_and_sources() {
     ws.write(|tx| tx.spec_remove(&other, "obsolete", &[]));
 }
 
+/// R6: a spec closed while its requirement stays open (only with force) still
+/// lets the requirement be removed.
+#[test]
+fn remove_works_under_a_closed_spec() {
+    let mut ws = Ws::new();
+    let spec = ws.spec();
+    let w = ws.work("Work");
+    let rule = ws.add(&spec, "Rule", &[&w], false);
+    ws.close(&spec); // force: past the open (pinned) requirement
+    assert_eq!((ws.issue(&spec).status, ws.issue(&rule).status), (Status::Closed, Status::Pinned));
+
+    let out = ws.write(|tx| tx.spec_remove(&rule, "obsolete", &[]));
+    assert_eq!(out.requirement.status, Status::Closed);
+    assert_eq!(out.requirement.close_reason.as_deref(), Some("removed: obsolete"));
+    assert_eq!(out.requirement.close_outcome, Some(Outcome::Done));
+    assert_eq!((out.spec.as_str(), out.reason.as_str()), (spec.as_str(), "removed: obsolete"));
+    assert_eq!(ws.issue(&spec).status, Status::Closed, "the spec stays closed");
+}
+
 #[test]
 fn remove_writes_nothing_when_the_close_fails() {
     let mut ws = Ws::new();
@@ -512,6 +531,39 @@ fn link_adds_related_edges_once() {
     let back = ws.write(|tx| tx.spec_link(&w, std::slice::from_ref(&rule)));
     assert!(back[0].already);
     assert_eq!(ws.edge(&w, &rule), None);
+}
+
+/// R13: linking work claimed by another actor and marked spec:none leaves its
+/// status, assignee, labels and lease as they were, and adds only the edges.
+#[test]
+fn link_leaves_the_work_as_it_is() {
+    let mut ws = Ws::new();
+    let spec = ws.spec();
+    // The rule's source is the design, not the work, so the link is a real write.
+    let design = ws.work("Design");
+    let rule = ws.add(&spec, "Rule", &[&design], false);
+    let work = ws.create(NewIssue { labels: strings(&[specs::NONE]), ..NewIssue::titled("Build it") });
+    let wid = work.clone();
+    let claim = ws.try_as("bob", |tx| tx.claim(&wid, &ClaimOptions::default())).unwrap();
+    let state = |ws: &Ws| {
+        let i = ws.issue(&work);
+        let mut labels = i.labels.clone();
+        labels.sort();
+        (i.status, i.assignee.clone(), labels, ws.read(|c| claims::get_lease(c, &work)))
+    };
+    let before = state(&ws);
+    assert_eq!(
+        before,
+        (Status::InProgress, Some("bob".to_string()), strings(&[specs::NONE]), Some(claim.lease.clone()))
+    );
+
+    // As alice, not the holder.
+    let out = ws.write(|tx| tx.spec_link(&work, &strings(&[&rule, &spec])));
+    assert_eq!(out.len(), 2);
+    assert!(out.iter().all(|l| !l.already), "{out:?}");
+    assert_eq!(ws.edge(&work, &rule), Some(DepType::Related));
+    assert_eq!(ws.edge(&work, &spec), Some(DepType::Related));
+    assert_eq!(state(&ws), before, "status, assignee, labels and lease are as they were");
 }
 
 #[test]

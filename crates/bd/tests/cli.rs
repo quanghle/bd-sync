@@ -6441,6 +6441,17 @@ fn spec_write_commands_refuse_and_write_nothing() {
     // remove takes a requirement under a spec that is not pinned.
     let removed = ws.json(&["spec", "remove", &loose_rule, "-r", "  obsolete "]);
     assert_eq!(removed["reason"], "removed: obsolete");
+    // ...or one whose spec was closed with --force over its open requirement.
+    let closing = ws.id(&["spec", "new", "shipping", "Shipping"]);
+    let kept = ws.id(&["spec", "add", &closing, "Ships", "--from", &work]);
+    ws.ok(&["close", &closing, "-r", "retired", "--force"]);
+    let removed = ws.json(&["spec", "remove", &kept, "-r", "obsolete"]);
+    assert_eq!(
+        (&removed["reason"], &removed["spec"], &removed["requirement"]["status"]),
+        (&Value::from("removed: obsolete"), &Value::from(closing.as_str()), &Value::from("closed")),
+        "{removed}"
+    );
+    assert_eq!(ws.json(&["show", &closing])["status"], "closed", "the spec stays closed");
 }
 
 /// T3: `bd spec change` is all or nothing: when the old requirement cannot be
@@ -6475,6 +6486,40 @@ fn spec_remove_and_change_refuse_another_actors_claim() {
     spec_refused(&ws, "alice", &["spec", "remove", &rule, "-r", "obsolete", "--from", &work], 4, "bob");
     spec_refused(&ws, "alice", &["spec", "change", &rule, "New rule", "--from", &work], 4, "bob");
     assert_eq!(ws.json(&["show", &rule])["status"], "in_progress");
+}
+
+/// R13: linking work claimed by another actor and marked spec:none leaves its
+/// status, assignee, labels and lease as they were.
+#[test]
+fn spec_link_leaves_the_work_as_it_is() {
+    let ws = Ws::new();
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let design = ws.id(&["create", "Design"]);
+    let spec = ws.id(&["spec", "new", "checkout", "Checkout"]);
+    let rule = ws.id(&["spec", "add", &spec, "Rule", "--from", &design]);
+    let work = ws.id(&["create", "Build it"]);
+    ws.ok(&["spec", "none", &work, "-r", "no behavior change"]);
+    assert_eq!(ws.json_as("bob", &["claim", &work])["issue"]["assignee"], "bob");
+    let state = || {
+        let s = ws.json(&["show", &work]);
+        (s["status"].clone(), s["assignee"].clone(), s["labels"].clone(), s["lease"].clone())
+    };
+    let before = state();
+    assert_eq!(
+        (&before.0, &before.1, &before.3["holder"]),
+        (&Value::from("in_progress"), &Value::from("bob"), &Value::from("bob")),
+        "{before:?}"
+    );
+    assert!(before.2.as_array().unwrap().iter().any(|l| l == "spec:none"), "{:?}", before.2);
+    let linked = ws.json_as("alice", &["spec", "link", &work, &rule, &spec]);
+    assert_eq!(
+        linked,
+        serde_json::json!([
+            { "issue": work, "target": rule, "already": false },
+            { "issue": work, "target": spec, "already": false },
+        ])
+    );
+    assert_eq!(state(), before, "linking leaves status, assignee, labels and lease as they were");
 }
 
 /// T4: the spec write commands are batch ops whose `$N` is the id each

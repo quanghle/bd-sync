@@ -525,7 +525,8 @@ async function run(ctx) {
     const inDir = (dir) =>
         `Work ONLY in the directory ${dir} (use absolute paths; do not cd elsewhere). Do not commit, push, or touch git branches/index. ` +
         `Run every cargo command with CARGO_TARGET_DIR=${TARGET} set. ` +
-        `Do not create or change skills, MCP definitions, hooks or executable bits (AGENTS.md gates these on the user's approval); mention the need in notes instead.`;
+        `Do not create or change anything that needs the user's approval (AGENTS.md gates it), and mention a needed change in notes instead: .claude/settings.json and .claude/settings.local.json, .claude/agents/, .mcp.json and any other native MCP or hook config, the approved client copies (.claude/skills/, .agents/skills/, .bd/approved/, .bd/agents.lock), hook entries anywhere (plugins/bd/hooks/hooks.json included, which must equal .claude/settings.json's hooks), executable bits on any file, and any file outside this worktree other than the logs and build output these instructions name (your home directory's config included). ` +
+        `Reviewed source is edited like code when the task needs it: plugins/bd/ (its skills and manifests, not its hooks), .bd/source/ (an admin publishes it, each client approves it), .claude/workflows/, .github/extensions/ and .github/scripts/.`;
     const readOnly = (dir) => `Read the code in ${dir} (absolute paths). You are read-only: do not edit files, commit, or touch git state.`;
 
     // ---------- decision ledger ----------

@@ -269,6 +269,9 @@ const SNAPSHOT_CMD =
 // workspace crate's fingerprint between them, and cargo judges freshness by mtimes, so a build could link another
 // checkout's crate.
 const TARGET_CMD = 'echo "$(git rev-parse --show-toplevel)/target"';
+// A path compared lexically only (no '..' resolution, no realpath): backslashes become '/', repeated '/' collapse, a
+// trailing '/' goes and a leading drive letter is lowercased. Kept identical to the Claude Code workflow's normPath.
+const normPath = (p) => String(p).replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/\/+$/, "").replace(/^[A-Za-z]:/, (d) => d.toLowerCase());
 
 const fmtFinding = (f) =>
     `[${f.id}] ${f.severity} ${f.category} — ${f.file}${f.line ? ":" + f.line : ""}\n  Claim: ${f.claim}\n  Evidence: ${f.evidence}` +
@@ -639,6 +642,19 @@ async function run(ctx) {
     }
     const bdFlags = () => ` -C ${bdTarget.root}` + (bdTarget.actor ? ` --actor "${bdTarget.actor}"` : "");
 
+    // TARGET_CMD answers for the agent's cwd, so a setup agent that ran it from the main checkout would report main's target
+    // and the run would silently share it: the target must be <the reported workdir>/target, and that workdir args.workdir
+    // when given, compared with normPath (no symlinks resolved, so pass workdir as the worktree's top level as git reports
+    // it: git rev-parse --show-toplevel). A mismatch is a failed attempt, escalated once by ops(); a second ends the run as
+    // escalated ('setup agent failed').
+    const setupOk = (r, label) => {
+        if (!(r?.workdir && r.baseline && r.target)) return false;
+        const dirOk = !A.workdir || normPath(r.workdir) === normPath(A.workdir);
+        const want = `${normPath(A.workdir || r.workdir)}/target`;
+        if (dirOk && normPath(r.target) === want) return true;
+        ctx.log(`setup ${label}: target ${r.target} is not ${want}` + (dirOk ? "" : ` (workdir ${r.workdir} is not ${A.workdir})`));
+        return false;
+    };
     const setup = await ops(
         A.workdir && A.baseline
             ? `In ${A.workdir}, run \`git rev-parse ${A.baseline}^{tree}\` and return its output as "baseline" (and workdir="${A.workdir}").\n` +
@@ -652,7 +668,7 @@ async function run(ctx) {
                   `3. In that worktree run this and capture the path:\n${TARGET_CMD}\n` +
                   `Return the absolute worktree path as workdir, the branch, the tree id as baseline, and the path as target.`,
         { label: "setup", schema: SETUP },
-        (r) => !!(r?.workdir && r.baseline && r.target),
+        setupOk,
     );
     if (!setup) return { status: "escalated", reason: "setup agent failed", lease };
     DIR = setup.workdir;

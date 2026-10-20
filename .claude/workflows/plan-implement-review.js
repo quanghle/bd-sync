@@ -44,7 +44,10 @@ export const meta = {
 //   cargo command runs with CARGO_TARGET_DIR=<the worktree's top level>/target (git rev-parse --show-toplevel in the
 //   worktree or the given workdir): a dir of that worktree alone, gitignored and removed with the worktree. Checkouts of
 //   one workspace sharing a target dir get the same fingerprint per workspace crate and judge freshness by mtimes, so
-//   one could link another's build. A first build there is cold.
+//   one could link another's build. A first build there is cold. Setup's report is checked: its target must be <its
+//   workdir>/target and, with workdir given, its workdir this one, compared lexically with no symlinks resolved, so pass
+//   the worktree's top level as git reports it (git rev-parse --show-toplevel); otherwise setup escalates once and the
+//   run ends as escalated ('setup agent failed').
 // - baseline (a commit, with workdir): what reviewers diff against instead of the workdir's state at the start.
 // - logDir (an absolute directory without '..' or control characters; pass your scratchpad): every agent that runs cargo
 //   writes each command's output to its own file, <logDir>/<run>/<label>.log, and reads results only from it, where run
@@ -405,6 +408,9 @@ const ROOT_CMD = 'dirname "$(git rev-parse --path-format=absolute --git-common-d
 // workspace crate's fingerprint between them, and cargo judges freshness by mtimes, so a build could link another
 // checkout's crate.
 const TARGET_CMD = 'echo "$(git rev-parse --show-toplevel)/target"'
+// A path compared lexically only (no '..' resolution, no realpath): backslashes become '/', repeated '/' collapse, a
+// trailing '/' goes and a leading drive letter is lowercased. Kept identical to the Copilot extension's normPath.
+const normPath = (p) => String(p).replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/\/+$/, '').replace(/^[A-Za-z]:/, (d) => d.toLowerCase())
 let TARGET = ''
 let DIR = ''
 const inDir = (dir) =>
@@ -630,7 +636,18 @@ const setupPrompt = () =>
         `3. In that worktree run this and capture the path:\n${TARGET_CMD}\n` +
         `Return the absolute worktree path as workdir, the branch, the tree id as baseline, and the path as target.`) +
   (LOG_DIR ? '' : `\nAlso run \`printf %s "\${TMPDIR:-/tmp}"\` and return its output as tmpdir.`)
-const setup = await ops(setupPrompt, { label: 'setup', phase: 'Setup', schema: SETUP }, (r) => !!(r?.workdir && r.baseline && r.target))
+// TARGET_CMD answers for the agent's cwd, so a setup agent that ran it from the main checkout would report main's target
+// and the run would silently share it: the target must be <the reported workdir>/target, and that workdir args.workdir
+// when given, compared with normPath (no realpath). A mismatch is a failed attempt, escalated once by ops().
+const setupOk = (r, label) => {
+  if (!(r?.workdir && r.baseline && r.target)) return false
+  const dirOk = !A.workdir || normPath(r.workdir) === normPath(A.workdir)
+  const want = `${normPath(A.workdir || r.workdir)}/target`
+  if (dirOk && normPath(r.target) === want) return true
+  log(`setup ${label}: target ${r.target} is not ${want}` + (dirOk ? '' : ` (workdir ${r.workdir} is not ${A.workdir})`))
+  return false
+}
+const setup = await ops(setupPrompt, { label: 'setup', phase: 'Setup', schema: SETUP }, setupOk)
 if (!setup?.workdir || !setup.baseline || !setup.target) return { status: 'escalated', reason: 'setup agent failed', lease }
 DIR = setup.workdir
 TARGET = setup.target

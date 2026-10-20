@@ -4020,7 +4020,7 @@ fn mcp_serves_the_local_workspace_on_stdio() {
     assert_eq!(answers.len(), 7, "no answer to the notification: {answers:?}");
     assert_eq!(answers[0]["result"]["protocolVersion"], "2025-11-25", "{}", answers[0]);
     // Within the session, requests go without _meta (the tool calls below carry it: both are served).
-    assert_eq!(answers[1]["result"]["tools"].as_array().unwrap().len(), 19);
+    assert_eq!(answers[1]["result"]["tools"].as_array().unwrap().len(), 25);
     assert!(answers[1]["result"].get("resultType").is_none(), "{}", answers[1]);
 
     let (failed, claim) = mcp_result(&answers[2]);
@@ -4074,7 +4074,20 @@ fn mcp_serves_the_local_workspace_on_stdio() {
     );
     let names: Vec<&str> =
         answers[0]["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["ready", "list", "show", "memories", "spec_list", "spec_show", "spec_drift", "spec_changes"]);
+    assert_eq!(
+        names,
+        [
+            "ready",
+            "list",
+            "show",
+            "memories",
+            "spec_list",
+            "spec_show",
+            "spec_drift",
+            "spec_changes",
+            "spec_candidates"
+        ]
+    );
     assert_eq!(answers[1]["error"]["code"], -32602, "not offered: {}", answers[1]);
     let (_, ready) = mcp_result(&answers[2]);
     assert_eq!(ready["issues"][0]["id"], "t-2");

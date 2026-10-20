@@ -452,7 +452,17 @@ mod tests {
             r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(
             names,
-            ["ready", "list", "show", "memories", "spec_list", "spec_show", "spec_drift", "spec_changes"]
+            [
+                "ready",
+                "list",
+                "show",
+                "memories",
+                "spec_list",
+                "spec_show",
+                "spec_drift",
+                "spec_changes",
+                "spec_candidates"
+            ]
         );
         assert_eq!(r["result"]["cacheScope"], "private");
         let call = modern("tools/call", json!({ "name": "close", "arguments": { "ids": ["a"], "reason": "r" } }));

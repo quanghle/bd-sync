@@ -9904,17 +9904,25 @@ fn mcp_spec_tools_through_bd_serve() {
     let work = alice.ok(&["-q", "create", "Build it"]).trim().to_string();
     alice.ok(&["close", &work, "-r", "done"]);
 
-    // A read token is offered the spec reads, and not spec_none.
+    // A read token is offered the spec reads, and none of the spec writes.
     let (_, _, r) = mcp_post(&server, Some(&reader), "", &[], &mcp_modern(1, "tools/list", json!({})));
     let tools: Vec<&str> =
         r["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    for read in ["spec_list", "spec_show", "spec_drift", "spec_changes"] {
+    for read in ["spec_list", "spec_show", "spec_drift", "spec_changes", "spec_candidates"] {
         assert!(tools.contains(&read), "{read}: {tools:?}");
     }
-    assert!(!tools.contains(&"spec_none"), "{tools:?}");
+    for write in ["spec_none", "spec_new", "spec_add", "spec_change", "spec_remove", "spec_link"] {
+        assert!(!tools.contains(&write), "{write}: {tools:?}");
+    }
     let none = mcp_tool_call("spec_none", json!({ "ids": [work], "reason": "refactor" }));
     let (status, _, r) = mcp_post(&server, Some(&reader), "", &[], &none);
     assert_eq!((status, &r["error"]["code"]), (200, &json!(-32602)), "{r}");
+    let link = mcp_tool_call("spec_link", json!({ "issue": work, "targets": [spec] }));
+    let (status, _, r) = mcp_post(&server, Some(&reader), "", &[], &link);
+    assert_eq!((status, &r["error"]["code"]), (200, &json!(-32602)), "{r}");
+    // Everything here closed after specs turned on: no candidates.
+    let candidates = mcp_http_call(&server, &reader, "", "spec_candidates", json!({}));
+    assert_eq!(candidates, json!({}), "{candidates}");
     let drift = mcp_http_call(&server, &reader, "", "spec_drift", json!({}));
     assert_eq!(drift["count"], 1, "drift found (exit 1) is a result: {drift}");
     assert_eq!(drift["unlinked"][0]["id"], work.as_str(), "{drift}");
@@ -9939,6 +9947,47 @@ fn mcp_spec_tools_through_bd_serve() {
     let last = comments.as_array().and_then(|c| c.last()).unwrap_or_else(|| panic!("a comment: {comments}"));
     assert_eq!(last["author"], "alice/mcp", "{comments}");
     assert_eq!(mcp_http_call(&server, &secret, "", "spec_drift", json!({}))["count"], 0);
+
+    // The spec writes, as a session of the write token's actor.
+    let added = mcp_http_call(
+        &server,
+        &secret,
+        "",
+        "spec_add",
+        json!({ "spec": spec, "sentence": "Keeps the cart", "from": [design] }),
+    );
+    let added = added["requirement"]["id"].as_str().unwrap_or_else(|| panic!("{added}")).to_string();
+    assert_eq!(alice.json(&["show", &added])["created_by"], "alice/mcp");
+    let more = alice.ok(&["-q", "create", "Polish it"]).trim().to_string();
+    alice.ok(&["close", &more, "-r", "done"]);
+    let linked = mcp_http_call(&server, &secret, "", "spec_link", json!({ "issue": more, "targets": [spec] }));
+    assert_eq!(linked[0]["already"], false, "{linked}");
+    let history = alice.json(&["history", &more]);
+    let last = history.as_array().and_then(|h| h.last()).unwrap_or_else(|| panic!("an event: {history}"));
+    assert_eq!(last["actor"], "alice/mcp", "{history}");
+    assert_eq!(mcp_http_call(&server, &secret, "", "spec_drift", json!({}))["count"], 0);
+
+    // A requirement under another actor's live claim: refused naming the holder, never taken over.
+    // Over bd serve a token that does not own the claim (an MCP call never carries admin rights)
+    // gets `unauthorized`, exit 7, as close does; the local not_owner (exit 4) is in cli.rs.
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    bob.ok(&["update", &added, "--status", "open"]);
+    bob.ok(&["claim", &added]);
+    let refused = |tool: &str, arguments: Value| {
+        let (status, _, answer) = mcp_post(&server, Some(&secret), "", &[], &mcp_tool_call(tool, arguments));
+        assert_eq!(status, 200, "{answer}");
+        let error = mcp_tool_error(&answer).unwrap_or_else(|| panic!("{tool} took bob's claim: {answer}"));
+        assert_eq!((&error["code"], &error["exit_code"]), (&json!("unauthorized"), &json!(7)), "{tool}: {error}");
+        assert!(error["message"].as_str().unwrap_or_default().contains("bob"), "{tool}: {error}");
+    };
+    refused("spec_remove", json!({ "requirement": added, "reason": "obsolete" }));
+    refused("spec_change", json!({ "requirement": added, "sentence": "x", "from": [design] }));
+    let held = alice.json(&["show", &added]);
+    assert_eq!(held["status"], "in_progress", "{held}");
+    assert!(held["assignee"].as_str().is_some_and(|a| a.starts_with("bob")), "{held}");
+    let shown = mcp_http_call(&server, &reader, "", "spec_show", json!({ "target": spec }));
+    let requirements = shown["specs"][0]["requirements"].as_array().unwrap_or_else(|| panic!("{shown}"));
+    assert!(requirements.iter().all(|r| r["title"] != "x"), "{shown}");
 }
 
 /// Every content item of a successful tool call's answer, parsed as JSON.

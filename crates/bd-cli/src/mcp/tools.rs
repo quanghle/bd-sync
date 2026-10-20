@@ -59,6 +59,10 @@ enum Shape {
     /// `bd spec changes`'s report: `changes` and `unknown` cut to the limit,
     /// and `more` naming each cut list's full length.
     Changes,
+    /// `bd spec candidates`'s groups, as `{"groups": [...]}`: the groups and
+    /// each group's issues cut to the limit, `count` each group's full size,
+    /// and `more` the number of groups when cut.
+    Candidates,
 }
 
 /// One tool of the catalog.
@@ -79,7 +83,7 @@ pub struct Invocation {
     shape: Shape,
     /// The number of issues asked for (`Shape::Summaries`; one more is
     /// fetched), or the items kept per list (`Shape::Drift`,
-    /// `Shape::Changes`).
+    /// `Shape::Changes`, `Shape::Candidates`).
     limit: usize,
     /// The call asked for closed requirements too (`Shape::SpecViews`).
     history: bool,
@@ -105,6 +109,7 @@ const READY_LIMIT: i64 = 10;
 const LIST_LIMIT: i64 = 20;
 const DRIFT_LIMIT: i64 = 20;
 const CHANGES_LIMIT: i64 = 20;
+const CANDIDATES_LIMIT: i64 = 20;
 const MAX_LIMIT: i64 = 100;
 const MAX_IDS: usize = 20;
 
@@ -340,11 +345,80 @@ pub static TOOLS: &[Tool] = &[
         shape: Shape::Changes,
     },
     Tool {
+        name: "spec_candidates",
+        description: "Closed work from before specs that no spec covers, grouped.",
+        read_only: true,
+        params: &[p("limit", Kind::Int(1, MAX_LIMIT), "Default 20: groups, and issues in each")],
+        build: build_spec_candidates,
+        shape: Shape::Candidates,
+    },
+    Tool {
         name: "spec_none",
         description: "Mark issues as touching no spec, with the reason.",
         read_only: false,
         params: &[req("ids", Kind::List(1, MAX_IDS), ""), req("reason", Kind::Str, "Why no spec")],
         build: build_spec_none,
+        shape: Shape::Write,
+    },
+    Tool {
+        name: "spec_new",
+        description: "Create a spec: a pinned feature for an area.",
+        read_only: false,
+        params: &[
+            req("area", Kind::Str, "Letters, digits, - _ . /"),
+            req("title", Kind::Str, ""),
+            p("parent", Kind::Str, "Parent spec: a sub-spec"),
+            p("description", Kind::Str, ""),
+            p("from", Kind::List(0, MAX_IDS), "Issues or runs it came from"),
+        ],
+        build: build_spec_new,
+        shape: Shape::Write,
+    },
+    Tool {
+        name: "spec_add",
+        description: "Add a requirement or non-goal to a spec in force.",
+        read_only: false,
+        params: &[
+            req("spec", Kind::Str, ""),
+            req("sentence", Kind::Str, "One testable sentence"),
+            req("from", Kind::List(1, MAX_IDS), "Issues or runs it came from"),
+            p("non_goal", Kind::Bool, ""),
+            p("description", Kind::Str, ""),
+        ],
+        build: build_spec_add,
+        shape: Shape::Write,
+    },
+    Tool {
+        name: "spec_change",
+        description: "Replace a requirement by a new one, superseding it.",
+        read_only: false,
+        params: &[
+            req("requirement", Kind::Str, ""),
+            req("sentence", Kind::Str, ""),
+            req("from", Kind::List(1, MAX_IDS), ""),
+            p("description", Kind::Str, ""),
+        ],
+        build: build_spec_change,
+        shape: Shape::Write,
+    },
+    Tool {
+        name: "spec_remove",
+        description: "Close a requirement that no longer holds, with the reason.",
+        read_only: false,
+        params: &[
+            req("requirement", Kind::Str, ""),
+            req("reason", Kind::Str, ""),
+            p("from", Kind::List(0, MAX_IDS), ""),
+        ],
+        build: build_spec_remove,
+        shape: Shape::Write,
+    },
+    Tool {
+        name: "spec_link",
+        description: "Link work to specs or requirements by related edges.",
+        read_only: false,
+        params: &[req("issue", Kind::Str, ""), req("targets", Kind::List(1, MAX_IDS), "Specs or requirements")],
+        build: build_spec_link,
         shape: Shape::Write,
     },
 ];
@@ -389,6 +463,7 @@ impl Tool {
             }
             Shape::Drift => args.int("limit").unwrap_or(DRIFT_LIMIT),
             Shape::Changes => args.int("limit").unwrap_or(CHANGES_LIMIT),
+            Shape::Candidates => args.int("limit").unwrap_or(CANDIDATES_LIMIT),
             _ => 0,
         } as usize;
         let history = self.shape == Shape::SpecViews && args.flag("history");
@@ -433,6 +508,7 @@ impl Invocation {
             Shape::SpecViews => spec_views(value, self.history),
             Shape::Drift => drift(value, self.limit),
             Shape::Changes => changes(value, self.limit),
+            Shape::Candidates => candidates(value, self.limit),
         };
         let text = serde_json::to_string(&prune(shaped).unwrap_or_else(|| json!({}))).expect("JSON values serialize");
         Ok(crate::io::printable(&text).into_owned())
@@ -773,6 +849,76 @@ fn build_spec_none(a: &Args) -> Result<Vec<String>, String> {
     Line::new(&["spec", "none"]).opt("reason", Some(reason)).args(a.list("ids")).done()
 }
 
+/// The string argument `name`, refused when blank.
+fn not_blank<'a>(a: &Args<'a>, name: &str) -> Result<&'a str, String> {
+    let value = a.str(name).unwrap_or_default();
+    if value.trim().is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    Ok(value)
+}
+
+/// The `from` ids, refused when one holds a comma: `--from` splits on commas,
+/// so one item would become several ids, past the item cap.
+fn from_ids<'a>(a: &Args<'a>) -> Result<Vec<&'a str>, String> {
+    let ids = a.list("from");
+    if ids.iter().any(|id| id.contains(',')) {
+        return Err("from items must not contain ','".into());
+    }
+    Ok(ids)
+}
+
+fn build_spec_candidates(_a: &Args) -> Result<Vec<String>, String> {
+    // The limit is applied to the output: bd spec candidates has none.
+    Line::new(&["spec", "candidates"]).done()
+}
+
+fn build_spec_new(a: &Args) -> Result<Vec<String>, String> {
+    let area = not_blank(a, "area")?;
+    let title = not_blank(a, "title")?;
+    Line::new(&["spec", "new"])
+        .opt("parent", a.str("parent"))
+        .opt("description", a.str("description"))
+        .each("from", from_ids(a)?)
+        .arg(area)
+        .arg(title)
+        .done()
+}
+
+fn build_spec_add(a: &Args) -> Result<Vec<String>, String> {
+    let spec = not_blank(a, "spec")?;
+    let sentence = not_blank(a, "sentence")?;
+    Line::new(&["spec", "add"])
+        .each("from", from_ids(a)?)
+        .switch("non-goal", a.flag("non_goal"))
+        .opt("description", a.str("description"))
+        .arg(spec)
+        .arg(sentence)
+        .done()
+}
+
+fn build_spec_change(a: &Args) -> Result<Vec<String>, String> {
+    let requirement = not_blank(a, "requirement")?;
+    let sentence = not_blank(a, "sentence")?;
+    Line::new(&["spec", "change"])
+        .each("from", from_ids(a)?)
+        .opt("description", a.str("description"))
+        .arg(requirement)
+        .arg(sentence)
+        .done()
+}
+
+fn build_spec_remove(a: &Args) -> Result<Vec<String>, String> {
+    let requirement = not_blank(a, "requirement")?;
+    let reason = not_blank(a, "reason")?;
+    Line::new(&["spec", "remove"]).opt("reason", Some(reason)).each("from", from_ids(a)?).arg(requirement).done()
+}
+
+fn build_spec_link(a: &Args) -> Result<Vec<String>, String> {
+    let issue = not_blank(a, "issue")?;
+    Line::new(&["spec", "link"]).arg(issue).args(a.list("targets")).done()
+}
+
 /// Whether `v` is an issue as the CLI prints it.
 fn is_issue(v: &Map<String, Value>) -> bool {
     ["id", "title", "status", "issue_type"].iter().all(|k| v.contains_key(*k))
@@ -893,6 +1039,31 @@ fn changes(value: Value, limit: usize) -> Value {
     }
     if !more.is_empty() {
         out["more"] = Value::Object(more);
+    }
+    out
+}
+
+/// `bd spec candidates`'s groups as `{"groups": [...]}`: the groups and each
+/// group's issues cut to `limit`, `count` each group's full size, and `more`
+/// the number of groups when they were cut.
+fn candidates(value: Value, limit: usize) -> Value {
+    let groups = value.as_array().map(Vec::as_slice).unwrap_or_default();
+    let shaped: Vec<Value> = groups
+        .iter()
+        .take(limit)
+        .map(|g| {
+            let issues = g["issues"].as_array().map(Vec::as_slice).unwrap_or_default();
+            json!({
+                "key": g["key"],
+                "title": g["title"],
+                "count": issues.len(),
+                "issues": issues.iter().take(limit).cloned().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let mut out = json!({ "groups": shaped });
+    if groups.len() > limit {
+        out["more"] = json!({ "groups": groups.len() });
     }
     out
 }
@@ -1141,12 +1312,41 @@ mod tests {
     #[test]
     fn spec_tools_are_listed_last_in_order() {
         let names: Vec<&str> = TOOLS.iter().map(|t| t.name).collect();
-        assert_eq!(names[names.len() - 5..], ["spec_list", "spec_show", "spec_drift", "spec_changes", "spec_none"]);
+        assert_eq!(
+            names[names.len() - 11..],
+            [
+                "spec_list",
+                "spec_show",
+                "spec_drift",
+                "spec_changes",
+                "spec_candidates",
+                "spec_none",
+                "spec_new",
+                "spec_add",
+                "spec_change",
+                "spec_remove",
+                "spec_link"
+            ]
+        );
         let describe = |name: &str| TOOLS.iter().find(|t| t.name == name).unwrap().describe();
-        for read in ["spec_list", "spec_show", "spec_drift", "spec_changes"] {
+        for read in ["spec_list", "spec_show", "spec_drift", "spec_changes", "spec_candidates"] {
             assert_eq!(describe(read)["annotations"], json!({ "readOnlyHint": true }), "{read}");
         }
-        assert_eq!(describe("spec_none")["annotations"], json!({ "destructiveHint": false }));
+        for write in ["spec_none", "spec_new", "spec_add", "spec_change", "spec_remove", "spec_link"] {
+            assert_eq!(describe(write)["annotations"], json!({ "destructiveHint": false }), "{write}");
+        }
+        assert_eq!(describe("spec_new")["inputSchema"]["required"], json!(["area", "title"]));
+        assert_eq!(describe("spec_add")["inputSchema"]["required"], json!(["spec", "sentence", "from"]));
+        assert_eq!(describe("spec_change")["inputSchema"]["required"], json!(["requirement", "sentence", "from"]));
+        assert_eq!(describe("spec_remove")["inputSchema"]["required"], json!(["requirement", "reason"]));
+        assert_eq!(describe("spec_link")["inputSchema"]["required"], json!(["issue", "targets"]));
+        let candidates = describe("spec_candidates");
+        assert_eq!(
+            candidates["inputSchema"]["properties"]["limit"],
+            json!({ "type": "integer", "minimum": 1, "maximum": 100,
+                    "description": "Default 20: groups, and issues in each" })
+        );
+        assert!(candidates["inputSchema"].get("required").is_none(), "{candidates}");
         assert_eq!(describe("spec_show")["inputSchema"]["required"], json!(["target"]));
         assert_eq!(describe("spec_changes")["inputSchema"]["required"], json!(["since"]));
         assert_eq!(
@@ -1193,6 +1393,57 @@ mod tests {
             argv("spec_changes", json!({ "target": "--history", "since": "-1d", "until": "#9", "limit": 3 })),
             ["spec", "changes", "--json", "--since=-1d", "--until=#9", "--", "--history"]
         );
+
+        // The limit cuts the output; it is never passed.
+        assert_eq!(argv("spec_candidates", json!({})), ["spec", "candidates", "--json"]);
+        assert_eq!(argv("spec_candidates", json!({ "limit": 5 })), ["spec", "candidates", "--json"]);
+        assert_eq!(
+            argv(
+                "spec_new",
+                json!({ "area": "-q", "title": "--take-over", "parent": "--force", "description": "-x",
+                        "from": ["--actor=x", "t-1"] })
+            ),
+            [
+                "spec",
+                "new",
+                "--json",
+                "--parent=--force",
+                "--description=-x",
+                "--from=--actor=x",
+                "--from=t-1",
+                "--",
+                "-q",
+                "--take-over"
+            ]
+        );
+        assert_eq!(argv("spec_new", json!({ "area": "a", "title": "T" })), ["spec", "new", "--json", "--", "a", "T"]);
+        assert_eq!(
+            argv(
+                "spec_add",
+                json!({ "spec": "-s", "sentence": "--force", "from": ["t-1"], "non_goal": true, "description": "--x" })
+            ),
+            ["spec", "add", "--json", "--from=t-1", "--non-goal", "--description=--x", "--", "-s", "--force"]
+        );
+        assert_eq!(
+            argv("spec_add", json!({ "spec": "s", "sentence": "x", "from": ["t-1"], "non_goal": false })),
+            ["spec", "add", "--json", "--from=t-1", "--", "s", "x"]
+        );
+        assert_eq!(
+            argv("spec_change", json!({ "requirement": "--take-over", "sentence": "-q", "from": ["t-1", "t-2"] })),
+            ["spec", "change", "--json", "--from=t-1", "--from=t-2", "--", "--take-over", "-q"]
+        );
+        assert_eq!(
+            argv("spec_remove", json!({ "requirement": "-r", "reason": "--force", "from": ["-x"] })),
+            ["spec", "remove", "--json", "--reason=--force", "--from=-x", "--", "-r"]
+        );
+        assert_eq!(
+            argv("spec_remove", json!({ "requirement": "-r", "reason": "--force" })),
+            ["spec", "remove", "--json", "--reason=--force", "--", "-r"]
+        );
+        assert_eq!(
+            argv("spec_link", json!({ "issue": "--force", "targets": ["-q", "s-1"] })),
+            ["spec", "link", "--json", "--", "--force", "-q", "s-1"]
+        );
     }
 
     #[test]
@@ -1219,6 +1470,147 @@ mod tests {
         assert_eq!(err("spec_changes", json!({ "since": "1d", "limit": 0 })), "limit must be between 1 and 100");
         assert_eq!(err("spec_changes", json!({ "since": "1d", "limit": 101 })), "limit must be between 1 and 100");
         assert_eq!(err("spec_changes", json!({ "since": "1d", "history": true })), "unknown argument \"history\"");
+
+        let comma = "from items must not contain ','";
+        assert_eq!(err("spec_new", json!({ "title": "T" })), "area is required");
+        assert_eq!(err("spec_new", json!({ "area": "a" })), "title is required");
+        assert_eq!(err("spec_new", json!({ "area": " ", "title": "T" })), "area must not be empty");
+        assert_eq!(err("spec_new", json!({ "area": "a", "title": "" })), "title must not be empty");
+        assert_eq!(err("spec_new", json!({ "area": "a", "title": "\t" })), "title must not be empty");
+        assert_eq!(err("spec_new", json!({ "area": "a", "title": 5 })), "title must be a string");
+        assert_eq!(err("spec_new", json!({ "area": "a", "title": "T", "from": ["a,b"] })), comma);
+        assert_eq!(err("spec_new", json!({ "area": "a", "title": "T", "from": many })), "from must have 0 to 20 items");
+        assert_eq!(
+            err("spec_new", json!({ "area": "a", "title": "T", "non_goal": true })),
+            "unknown argument \"non_goal\""
+        );
+
+        let add = |extra: Value| {
+            let mut args = json!({ "spec": "s", "sentence": "x", "from": ["t-1"] });
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            invoke("spec_add", args).err().unwrap()
+        };
+        assert_eq!(err("spec_add", json!({ "spec": "s", "sentence": "x" })), "from is required");
+        assert_eq!(add(json!({ "from": [] })), "from must have 1 to 20 items");
+        assert_eq!(add(json!({ "from": many })), "from must have 1 to 20 items");
+        assert_eq!(add(json!({ "non_goal": "yes" })), "non_goal must be true or false");
+        assert_eq!(add(json!({ "sentence": " " })), "sentence must not be empty");
+        assert_eq!(add(json!({ "spec": "" })), "spec must not be empty");
+        assert_eq!(add(json!({ "from": ["t-1,t-2"] })), comma);
+        assert_eq!(add(json!({ "x": 1 })), "unknown argument \"x\"");
+
+        let change = |extra: Value| {
+            let mut args = json!({ "requirement": "r", "sentence": "x", "from": ["t-1"] });
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            invoke("spec_change", args).err().unwrap()
+        };
+        assert_eq!(change(json!({ "requirement": " " })), "requirement must not be empty");
+        assert_eq!(err("spec_change", json!({ "requirement": "r", "from": ["t-1"] })), "sentence is required");
+        assert_eq!(change(json!({ "sentence": " " })), "sentence must not be empty");
+        assert_eq!(change(json!({ "from": [] })), "from must have 1 to 20 items");
+        assert_eq!(change(json!({ "from": many })), "from must have 1 to 20 items");
+        assert_eq!(change(json!({ "from": "t-1" })), "from must be an array of strings");
+        assert_eq!(change(json!({ "from": ["a,b"] })), comma);
+        assert_eq!(change(json!({ "x": 1 })), "unknown argument \"x\"");
+
+        let remove = |extra: Value| {
+            let mut args = json!({ "requirement": "r", "reason": "why" });
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            invoke("spec_remove", args).err().unwrap()
+        };
+        assert_eq!(err("spec_remove", json!({ "requirement": "r" })), "reason is required");
+        assert_eq!(remove(json!({ "reason": " " })), "reason must not be empty");
+        assert_eq!(remove(json!({ "reason": 3 })), "reason must be a string");
+        assert_eq!(remove(json!({ "requirement": "" })), "requirement must not be empty");
+        assert_eq!(remove(json!({ "from": many })), "from must have 0 to 20 items");
+        assert_eq!(remove(json!({ "from": ["a,b"] })), comma);
+        assert_eq!(remove(json!({ "x": 1 })), "unknown argument \"x\"");
+
+        let link = |extra: Value| {
+            let mut args = json!({ "issue": "w", "targets": ["s-1"] });
+            for (k, v) in extra.as_object().unwrap() {
+                args[k] = v.clone();
+            }
+            invoke("spec_link", args).err().unwrap()
+        };
+        assert_eq!(err("spec_link", json!({ "issue": "w" })), "targets is required");
+        assert_eq!(link(json!({ "targets": [] })), "targets must have 1 to 20 items");
+        assert_eq!(link(json!({ "targets": many })), "targets must have 1 to 20 items");
+        assert_eq!(link(json!({ "issue": " " })), "issue must not be empty");
+        assert_eq!(link(json!({ "issue": 7 })), "issue must be a string");
+        assert_eq!(link(json!({ "targets": [""] })), "targets must not have empty items");
+        assert_eq!(link(json!({ "x": 1 })), "unknown argument \"x\"");
+
+        assert_eq!(err("spec_candidates", json!({ "limit": 0 })), "limit must be between 1 and 100");
+        assert_eq!(err("spec_candidates", json!({ "limit": 101 })), "limit must be between 1 and 100");
+        assert_eq!(err("spec_candidates", json!({ "limit": "5" })), "limit must be an integer");
+        assert_eq!(err("spec_candidates", json!({ "x": 1 })), "unknown argument \"x\"");
+    }
+
+    #[test]
+    fn spec_candidates_cuts_groups_and_issues() {
+        let brief = |id: &str, title: &str| json!({ "id": id, "title": title });
+        let none = invoke("spec_candidates", json!({})).unwrap().result("[]").unwrap();
+        assert_eq!(none, "{}");
+        let out = json!([
+            { "key": "epic:e-1", "title": "Checkout",
+              "issues": [brief("a", "A\u{1b}[31m"), brief("b", "B"), brief("c", "C")] },
+            { "key": "label:ui", "issues": [brief("d", "D")] },
+            { "key": "ungrouped", "issues": [brief("e", "E")] },
+        ])
+        .to_string();
+        let text = invoke("spec_candidates", json!({ "limit": 2 })).unwrap().result(&out).unwrap();
+        assert!(text.contains(r#""title":"A\u001b[31m""#), "{text}");
+        let shaped: Value = serde_json::from_str(&text).unwrap();
+        let groups = shaped["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["key"], "epic:e-1");
+        assert_eq!(groups[0]["title"], "Checkout");
+        assert_eq!(groups[0]["count"], 3);
+        assert_eq!(groups[0]["issues"].as_array().unwrap().len(), 2);
+        assert_eq!(groups[0]["issues"][1], brief("b", "B"));
+        assert_eq!(groups[1], json!({ "key": "label:ui", "count": 1, "issues": [brief("d", "D")] }));
+        assert_eq!(shaped["more"], json!({ "groups": 3 }));
+
+        let text = invoke("spec_candidates", json!({})).unwrap().result(&out).unwrap();
+        let shaped: Value = serde_json::from_str(&text).unwrap();
+        assert!(shaped.get("more").is_none(), "{text}");
+        let groups = shaped["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0]["count"], 3);
+        assert_eq!(groups[0]["issues"].as_array().unwrap().len(), 3);
+        assert_eq!(groups[2], json!({ "key": "ungrouped", "count": 1, "issues": [brief("e", "E")] }));
+    }
+
+    #[test]
+    fn spec_writes_return_summaries() {
+        let issue = |id: &str, status: &str| {
+            json!({ "id": id, "title": "t", "status": status, "priority": 2, "issue_type": "story",
+                    "description": "long text", "labels": ["requirement"], "created_by": "me" })
+        };
+        let inv = invoke("spec_change", json!({ "requirement": "s.1", "sentence": "x", "from": ["w"] })).unwrap();
+        let out = json!({ "requirement": issue("s.2", "pinned"), "superseded": issue("s.1", "closed"),
+                          "spec": "s", "non_goal": false, "sources": ["w"] });
+        let shaped: Value = serde_json::from_str(&inv.result(&out.to_string()).unwrap()).unwrap();
+        let summary = |id: &str, status: &str| {
+            json!({ "id": id, "title": "t", "status": status, "priority": 2, "type": "story",
+                    "labels": ["requirement"] })
+        };
+        assert_eq!(
+            shaped,
+            json!({ "requirement": summary("s.2", "pinned"), "superseded": summary("s.1", "closed"),
+                    "spec": "s", "non_goal": false, "sources": ["w"] })
+        );
+
+        let inv = invoke("spec_link", json!({ "issue": "w", "targets": ["s"] })).unwrap();
+        let out = json!([{ "issue": "w", "target": "s", "already": false }]);
+        assert_eq!(inv.result(&out.to_string()).unwrap(), r#"[{"already":false,"issue":"w","target":"s"}]"#);
     }
 
     #[test]
@@ -1387,8 +1779,8 @@ mod tests {
 
     #[test]
     fn the_tool_list_stays_small() {
-        // 8,413 bytes, about 1,970 tokens; every agent connected pays this per session.
+        // 10,668 bytes, about 2,500 tokens; every agent connected pays this per session.
         let list = serde_json::to_string(&TOOLS.iter().map(Tool::describe).collect::<Vec<_>>()).unwrap();
-        assert!(list.len() < 8513, "tools/list is {} bytes", list.len());
+        assert!(list.len() < 10768, "tools/list is {} bytes", list.len());
     }
 }

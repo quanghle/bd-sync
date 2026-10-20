@@ -498,11 +498,10 @@ bd playbook run spec-bootstrap --var groups=KEY,KEY --var reviewer=P  # agents d
 Feature specs are an [experimental feature](#experimental-features): every
 `bd spec` command exits 2 (`feature specs are off in this workspace`) until
 `bd config set experimental.features specs`. See
-[Feature specs](concepts.md#feature-specs) for the convention. `list`,
-`show`, `drift`, `changes` and `none` are also [MCP tools](mcp.md#tools)
-(`spec_list`, `spec_show`, `spec_drift`, `spec_changes`, `spec_none`);
-`candidates` and the writes `new`, `add`, `change`, `remove` and `link`
-are not.
+[Feature specs](concepts.md#feature-specs) for the convention. Every
+subcommand is also an [MCP tool](mcp.md#tools): `spec_list`, `spec_show`,
+`spec_drift`, `spec_changes`, `spec_candidates`, `spec_none`, `spec_new`,
+`spec_add`, `spec_change`, `spec_remove` and `spec_link`.
 With specs on, `bd show` and `bd claim` list the specs governing an issue,
 `bd close` hints at closed work no spec link covers, and `bd query` finds
 work by spec (`spec = ID`, `spec = none`, `area = AREA`); see
@@ -529,14 +528,15 @@ writes without the checks.
   `spec` and `area:AREA` (AREA: 1-64 ASCII letters, digits, `-`, `_`,
   `.` or `/`), a sub-spec of `--parent SPEC` when given. `--json`:
   `{spec, area, parent, sources}`. By hand: `bd create -t feature --pinned
-  -l spec,area:AREA [--parent SPEC] -- TITLE`.
+  -l spec,area:AREA [--parent SPEC] -- TITLE`. Also the MCP tool
+  `spec_new`.
 - **Add.** `bd spec add SPEC SENTENCE --from ID` creates a pinned `story`
   under SPEC labelled `requirement` (and `non-goal` with `--non-goal`).
   SPEC (and `new`'s `--parent`) must be labelled `spec`, not closed, and
   pinned: an open one is refused, naming `bd update ID --status pinned`.
   `--json`: `{requirement, spec, non_goal, sources}`. By hand:
   `bd create -t story --pinned --parent SPEC -l requirement --dep
-  related:ID -- SENTENCE`.
+  related:ID -- SENTENCE`. Also the MCP tool `spec_add`.
 - **Change.** `bd spec change REQ SENTENCE --from ID` creates the new
   requirement under REQ's spec, of REQ's kind (a non-goal stays one), and
   supersedes REQ by it (`bd supersede REQ --with NEW`: a `supersedes`
@@ -546,7 +546,8 @@ writes without the checks.
   `requirement` or `non-goal`, not closed (the refusal names how it was
   closed), a direct child of a pinned spec. `--json`:
   `{requirement, superseded, spec, non_goal, sources}`. By hand: the
-  pinned `bd create` of Add, then `bd supersede REQ --with NEW`.
+  pinned `bd create` of Add, then `bd supersede REQ --with NEW`. Also the
+  MCP tool `spec_change`.
 - **Remove.** `bd spec remove REQ -r WHY` closes a requirement that no
   longer holds, outcome done, with the close reason `removed: WHY`: WHY is
   trimmed and a leading `removed:` in any case dropped, so `-r 'Removed:
@@ -556,7 +557,8 @@ writes without the checks.
   each, so the work that removed it is among its sources in
   `bd spec show --history`. `--json`: `{requirement, spec, reason,
   sources}`, `sources` the edges added. By hand:
-  `bd close REQ --reason 'removed: WHY'`.
+  `bd close REQ --reason 'removed: WHY'`. Also the MCP tool
+  `spec_remove`.
 - **Link.** `bd spec link ID TARGET...` adds a `related` edge from the
   issue to each target, so `bd spec drift` no longer lists it. The issue
   may have any status but must not be a spec part; each target must be a
@@ -567,7 +569,8 @@ writes without the checks.
   to T`, `"already": true`) and left as it is. Never changes status,
   assignee, a claim or a `spec:none` label. `--json`: an array of
   `{issue, target, already}`. By hand: `bd dep add ID TARGET --type
-  related`; remove a wrong link with `bd dep rm`.
+  related`; remove a wrong link with `bd dep rm`. Also the MCP tool
+  `spec_link`.
 
 - **Show.** Takes a spec's id (or a short id) or an area: every open spec
   labelled `area:AREA`, in id order, leaving out those shown inside another
@@ -713,7 +716,8 @@ writes without the checks.
   assignee or a claim. An issue already labelled `spec:none` is left as it
   is (`= ID is already marked spec:none`, no second comment). Also a
   `bd batch` operation (`spec none ID -r WHY`) and the MCP tool
-  `spec_none`. `bd spec link` is the other way to cover work.
+  `spec_none`. `bd spec link` (the MCP tool `spec_link`) is the other way
+  to cover work.
 - **List.** Per open spec: its areas, its parent spec (`parent`, marked
   `(sub-spec of P)`) when that is not closed, its requirements and
   non-goals in force, and how many distinct issues that are not spec
@@ -727,7 +731,8 @@ writes without the checks.
   their topmost epic that is not a playbook run or group (`epic:ID`), else
   their first label in sorted order that is not `change:*`, `severity:*`,
   `spec:*` or `adr:*` (`label:LABEL`), else `ungrouped`; the largest groups
-  first, then by key.
+  first, then by key. Also the MCP tool `spec_candidates` (cut to its
+  `limit`).
 
 ### Data
 

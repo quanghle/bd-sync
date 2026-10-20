@@ -435,3 +435,192 @@ fn covered_agrees_with_linked() {
     }
     assert!(yes > 30 && no > 30, "both kinds seen: {yes} linked, {no} not");
 }
+
+fn brief_ids(b: &[Brief]) -> Vec<&str> {
+    b.iter().map(|b| b.id.as_str()).collect()
+}
+
+#[test]
+fn the_child_budget_cuts_the_requirements() {
+    let mut ws = Ws::new();
+    let spec = ws.pinned("Spec", &["spec"], None);
+    let rules: Vec<String> = (0..5).map(|n| ws.pinned(&format!("Rule {n}"), &["requirement"], Some(&spec))).collect();
+    let work = ws.task("Work", None);
+    ws.relate(&work, &spec);
+
+    // Whole: every requirement, in creation order.
+    let whole = ws.governing(&work);
+    assert_eq!(whole.truncated, None);
+    assert_eq!(ids(&whole), [spec.as_str()]);
+    assert_eq!(brief_ids(&whole.specs[0].requirements), rules.iter().map(String::as_str).collect::<Vec<_>>());
+    // A budget met exactly is not a cut.
+    let five = Limits { children: 5, ..Limits::default() };
+    assert_eq!(ws.governing_with(&work, five), whole);
+
+    // Cut: at most 3 of them, each one of the spec's, and the entry kept.
+    let three = Limits { children: 3, ..Limits::default() };
+    let g = ws.governing_with(&work, three);
+    assert_eq!(g.truncated, Some(Cap::Children));
+    assert_eq!(ids(&g), [spec.as_str()]);
+    let s = &g.specs[0];
+    assert!(s.requirements.len() + s.non_goals.len() <= 3, "{s:?}");
+    assert!(s.requirements.iter().all(|b| rules.contains(&b.id)), "{s:?}");
+    assert!(s.non_goals.is_empty());
+    assert_eq!(
+        (&s.title, &s.via, &s.linked, &s.inherits),
+        (&whole.specs[0].title, &whole.specs[0].via, &whole.specs[0].linked, &whole.specs[0].inherits)
+    );
+    // The walk itself was whole, so coverage is unaffected.
+    assert_eq!(ws.covered_with(&work, three), Coverage::Linked);
+}
+
+#[test]
+fn the_child_budget_counts_every_child_of_a_group() {
+    // A requirement under an epic, not a spec: the group keys under the
+    // epic, and the epic's plain children count against the budget too.
+    let mut ws = Ws::new();
+    let epic = ws.task("Epic", None);
+    for n in 0..5 {
+        ws.task(&format!("Plain {n}"), Some(&epic));
+    }
+    let rule = ws.pinned("Rule", &["requirement"], Some(&epic));
+    let work = ws.task("Work", None);
+    ws.relate(&work, &rule);
+
+    let whole = ws.governing(&work);
+    assert_eq!(whole.truncated, None);
+    assert_eq!(ids(&whole), [epic.as_str()]);
+    assert_eq!(brief_ids(&whole.specs[0].requirements), [rule.as_str()]);
+    assert_eq!(whole.specs[0].linked.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(), [rule.as_str()]);
+
+    let three = Limits { children: 3, ..Limits::default() };
+    let g = ws.governing_with(&work, three);
+    assert_eq!(g.truncated, Some(Cap::Children));
+    assert_eq!(ids(&g), [epic.as_str()]);
+    assert!(brief_ids(&g.specs[0].requirements).iter().all(|id| *id == rule));
+    assert_eq!(g.specs[0].linked, whole.specs[0].linked);
+}
+
+#[test]
+fn the_child_budget_is_shared_by_the_specs() {
+    let mut ws = Ws::new();
+    let a = ws.pinned("A", &["spec"], None);
+    let b = ws.pinned("B", &["spec"], None);
+    for spec in [&a, &b] {
+        for n in 0..3 {
+            ws.pinned(&format!("Rule {n}"), &["requirement"], Some(spec));
+        }
+    }
+    let work = ws.task("Work", None);
+    ws.relate(&work, &a);
+    ws.relate(&work, &b);
+
+    let whole = ws.governing(&work);
+    assert_eq!(whole.truncated, None);
+    assert_eq!(whole.specs.len(), 2);
+    assert!(whole.specs.iter().all(|s| s.requirements.len() == 3));
+
+    let three = Limits { children: 3, ..Limits::default() };
+    let g = ws.governing_with(&work, three);
+    assert_eq!(g.truncated, Some(Cap::Children));
+    assert_eq!(g.ids(), whole.ids());
+    // The first spec in id order spends the budget exactly and is whole.
+    assert_eq!(g.specs[0], whole.specs[0]);
+    // The second keeps its entry, without requirements or non-goals.
+    let second = SpecContext { requirements: vec![], non_goals: vec![], ..whole.specs[1].clone() };
+    assert_eq!(g.specs[1], second);
+}
+
+#[test]
+fn a_walk_cap_wins_over_the_child_budget() {
+    let mut ws = Ws::new();
+    let spec = ws.pinned("Spec", &["spec"], None);
+    for n in 0..5 {
+        ws.pinned(&format!("Rule {n}"), &["requirement"], Some(&spec));
+    }
+    let work = ws.task("Work", None);
+    ws.task("Kid 0", Some(&work));
+    ws.task("Kid 1", Some(&work));
+    ws.relate(&work, &spec);
+    let limits = Limits { descendants: 1, children: 2, ..Limits::default() };
+    let g = ws.governing_with(&work, limits);
+    assert_eq!(ids(&g), [spec.as_str()]);
+    assert_eq!(g.truncated, Some(Cap::Descendants));
+}
+
+/// `id`'s inherited specs as `bd spec show` reads them, outermost first.
+fn oracle(ws: &Ws, id: &str) -> Vec<String> {
+    ws.store
+        .read(|r| {
+            Ok(specs::ancestors(id, &specs::DbSource::new(r.conn()))?.chain.into_iter().rev().map(|n| n.id).collect())
+        })
+        .unwrap()
+}
+
+/// What `bd show` lists as `spec`'s inherited specs, for work linked to it.
+fn inherited(ws: &mut Ws, spec: &str) -> Vec<String> {
+    let work = ws.task("Work", None);
+    ws.relate(&work, spec);
+    let g = ws.governing(&work);
+    assert_eq!(g.truncated, None);
+    let entry = g.specs.iter().find(|s| s.id == spec).unwrap();
+    assert_eq!(entry.inherits, oracle(ws, spec), "{spec}");
+    entry.inherits.clone()
+}
+
+#[test]
+fn inherits_matches_specs_ancestors() {
+    let mut ws = Ws::new();
+    // Nested two and three deep.
+    let top = ws.pinned("Top", &["spec"], None);
+    let mid = ws.pinned("Mid", &["spec"], Some(&top));
+    let low = ws.pinned("Low", &["spec"], Some(&mid));
+    assert_eq!(inherited(&mut ws, &mid), std::slice::from_ref(&top));
+    assert_eq!(inherited(&mut ws, &low), [top.clone(), mid.clone()]);
+    assert_eq!(inherited(&mut ws, &top), Vec::<String>::new());
+
+    // Under a closed spec: nothing.
+    let gone = ws.pinned("Gone", &["spec"], None);
+    let orphan = ws.pinned("Orphan", &["spec"], Some(&gone));
+    ws.close(&gone);
+    assert_eq!(inherited(&mut ws, &orphan), Vec::<String>::new());
+
+    // Under an open spec under a closed one: the open one only.
+    let old = ws.pinned("Old", &["spec"], None);
+    let open = ws.pinned("Open", &["spec"], Some(&old));
+    let leaf = ws.pinned("Leaf", &["spec"], Some(&open));
+    ws.close(&old);
+    assert_eq!(inherited(&mut ws, &leaf), std::slice::from_ref(&open));
+
+    // Under a plain task under a spec: the task ends the chain.
+    let above = ws.pinned("Above", &["spec"], None);
+    let task = ws.task("Task", Some(&above));
+    let below = ws.pinned("Below", &["spec"], Some(&task));
+    assert_eq!(inherited(&mut ws, &below), Vec::<String>::new());
+
+    // A damaged two-spec parent cycle: the other spec only.
+    let x = ws.pinned("X", &["spec"], None);
+    let y = ws.pinned("Y", &["spec"], None);
+    let at = ws.clock.now().0;
+    let (xr, yr) = (x.clone(), y.clone());
+    ws.write(|tx| {
+        let insert = "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+                      VALUES (?1, ?2, 'parent-child', ?3)";
+        tx.conn().execute(insert, params![xr, yr, at])?;
+        tx.conn().execute(insert, params![yr, xr, at])?;
+        Ok(())
+    });
+    assert_eq!(inherited(&mut ws, &x), std::slice::from_ref(&y));
+    assert_eq!(inherited(&mut ws, &y), std::slice::from_ref(&x));
+
+    // Nested past the cap: the nearest MAX_DEPTH, outermost first.
+    let mut chain: Vec<String> = Vec::new();
+    for n in 0..specs::MAX_DEPTH + 2 {
+        let parent = chain.last().cloned();
+        chain.push(ws.pinned(&format!("Level {n}"), &["spec"], parent.as_deref()));
+    }
+    let deepest = chain.last().unwrap().clone();
+    let got = inherited(&mut ws, &deepest);
+    assert_eq!(got.len(), specs::MAX_DEPTH);
+    assert_eq!(got, chain[1..=specs::MAX_DEPTH]);
+}

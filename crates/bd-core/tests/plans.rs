@@ -886,11 +886,13 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         "WHERE lb.label = ?1 AND i.status <> 'closed'",
         "FROM events WHERE issue_id = ?1 AND op = 'reopened'",
         "dep_type IN (?2, ?3)",
-        // Spec context: related edges by either end and children by parent, each under a bound LIMIT; labels by issue.
+        // Spec context: related edges by either end and children by parent, each under a bound LIMIT; labels by issue;
+        // a spec's children (its requirements and non-goals) under a bound LIMIT on the edges, then issues by id.
         "WHERE issue_id = ?1 AND dep_type = 'related'",
         "WHERE depends_on_id = ?1 AND dep_type = 'related'",
         "SELECT label FROM labels WHERE issue_id = ?1 ORDER BY label",
         "dep_type = 'parent-child'\n             ORDER BY issue_id LIMIT ?2",
+        "ORDER BY issue_id LIMIT ?2) d\n         CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = d.issue_id",
         // bd query's spec and area: the covering links, from a spec's parts, an area's specs, or every part.
         "i.id IN (WITH RECURSIVE sp(id) AS (SELECT s.issue_id FROM labels s WHERE s.issue_id = ?",
         "WHERE a.label = 'area:' || ?",

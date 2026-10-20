@@ -13,9 +13,13 @@
 //! Every lookup goes by key (edges by either end, labels and issues by id),
 //! the walk is bounded ([`SPEC_WALK_LIMIT`] descendants, [`SPEC_EDGE_LIMIT`]
 //! related edges, each bound as a statement's LIMIT so the rows read are
-//! bounded too), and a damaged parent cycle ends it. Everything here reads:
-//! callers decide whether specs are on ([`specs::is_on`]) and escape titles,
-//! which are kept as stored.
+//! bounded too), and a damaged parent cycle ends it. The details of the
+//! specs found are bounded as well: their requirements and non-goals come
+//! from at most [`SPEC_CHILD_LIMIT`] children over all of them (again a
+//! bound LIMIT), and the specs each inherits from from a walk up its parent
+//! chain that stops at [`specs::MAX_DEPTH`] specs or a cycle. Everything here
+//! reads: callers decide whether specs are on ([`specs::is_on`]) and escape
+//! titles, which are kept as stored.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::ControlFlow;
@@ -25,41 +29,50 @@ use serde::Serialize;
 
 use crate::error::Result;
 use crate::graph;
-use crate::hierarchy;
 use crate::issues;
 use crate::model::{Issue, Status};
-use crate::specs::{self, Brief, DbSource, NON_GOAL, NONE, REQUIREMENT, SPEC};
+use crate::specs::{self, Brief, NON_GOAL, NONE, REQUIREMENT, SPEC};
 
 /// How many descendants of an issue the walk looks at.
 pub const SPEC_WALK_LIMIT: usize = 500;
 /// How many `related` edges, over the whole lineage, the walk looks at.
 pub const SPEC_EDGE_LIMIT: usize = 5000;
+/// How many children, over all the governing specs, the enrichment looks at for requirements and non-goals.
+pub const SPEC_CHILD_LIMIT: usize = 5000;
 
-/// The walk's bounds: [`SPEC_WALK_LIMIT`] and [`SPEC_EDGE_LIMIT`] by
+/// The bounds: the walk's [`SPEC_WALK_LIMIT`] descendants and
+/// [`SPEC_EDGE_LIMIT`] related edges, and the [`SPEC_CHILD_LIMIT`] children
+/// of the governing specs read for their requirements and non-goals, by
 /// default; tests pass smaller ones.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     pub descendants: usize,
     pub edges: usize,
+    pub children: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { descendants: SPEC_WALK_LIMIT, edges: SPEC_EDGE_LIMIT }
+        Limits { descendants: SPEC_WALK_LIMIT, edges: SPEC_EDGE_LIMIT, children: SPEC_CHILD_LIMIT }
     }
 }
 
-/// Which bound cut a walk short.
+/// Which bound cut the answer short: the walk (then more specs may govern
+/// the issue) or, when the walk was whole, the specs' details.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cap {
     /// More descendants than [`Limits::descendants`].
     Descendants,
     /// More related edges than [`Limits::edges`].
     Edges,
+    /// More children of the governing specs, together, than
+    /// [`Limits::children`]: some requirements and non-goals were left out.
+    Children,
 }
 
-/// The specs governing an issue, in spec id order, and whether the walk
-/// was cut short (then more may govern it).
+/// The specs governing an issue, in spec id order, and whether the answer
+/// was cut short: by the walk (then more may govern it) or, only when the
+/// walk was whole, by the children read for the specs' details.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Governing {
     pub specs: Vec<SpecContext>,
@@ -156,21 +169,9 @@ pub fn governing_with(conn: &Connection, id: &str, limits: Limits) -> Result<Gov
         parts: BTreeMap<String, bool>,
     }
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
-    let mut parents: HashMap<String, Option<String>> = HashMap::new();
+    let mut reads = Reads { conn, parents: HashMap::new(), issues: HashMap::new() };
     for (at, part, is_spec, non_goal) in found {
-        let key = if is_spec {
-            part.clone()
-        } else {
-            let parent = match parents.get(&part) {
-                Some(p) => p.clone(),
-                None => {
-                    let p = graph::parent_of(conn, &part)?;
-                    parents.insert(part.clone(), p.clone());
-                    p
-                }
-            };
-            parent.unwrap_or_else(|| part.clone())
-        };
+        let key = if is_spec { part.clone() } else { reads.parent(&part)?.unwrap_or_else(|| part.clone()) };
         let g = groups.entry(key).or_insert_with(|| Group { via: BTreeSet::new(), parts: BTreeMap::new() });
         g.via.insert(at);
         if !is_spec {
@@ -178,41 +179,41 @@ pub fn governing_with(conn: &Connection, id: &str, limits: Limits) -> Result<Gov
         }
     }
 
-    let src = DbSource::new(conn);
-    let mut issues_read: HashMap<String, Option<Issue>> = HashMap::new();
-    let mut get = |id: &str| -> Result<Option<Issue>> {
-        if let Some(i) = issues_read.get(id) {
-            return Ok(i.clone());
-        }
-        let i = issues::get(conn, id)?;
-        issues_read.insert(id.to_string(), i.clone());
-        Ok(i)
-    };
+    // One budget of children over every group; once it is crossed, later groups read none.
+    let mut room = limits.children;
+    let mut children_cut = false;
     let mut out = Vec::with_capacity(groups.len());
     for (spec_id, group) in groups {
-        let Some(spec) = get(&spec_id)? else { continue };
+        let Some(spec) = reads.issue(&spec_id)? else { continue };
         let mut areas: Vec<String> =
             spec.labels.iter().filter_map(|l| l.strip_prefix("area:")).map(str::to_string).collect();
         areas.sort();
         let mut linked = Vec::with_capacity(group.parts.len());
         for (part, non_goal) in group.parts {
-            if let Some(p) = get(&part)? {
+            if let Some(p) = reads.issue(&part)? {
                 linked.push(LinkedPart { id: p.id, title: p.title, status: p.status, non_goal });
             }
         }
         let (mut requirements, mut non_goals) = (Vec::new(), Vec::new());
-        for child in hierarchy::child_issues(conn, &spec_id, false)? {
-            if child.status != Status::Pinned {
-                continue;
+        if !children_cut {
+            let (kids, crossed) = spec_children(conn, &spec_id, room)?;
+            room = room.saturating_sub(kids.len());
+            if crossed {
+                children_cut = true;
+                room = 0;
             }
-            let has = |l: &str| child.labels.iter().any(|x| x == l);
-            if has(NON_GOAL) {
-                non_goals.push(Brief { id: child.id, title: child.title });
-            } else if has(REQUIREMENT) {
-                requirements.push(Brief { id: child.id, title: child.title });
+            for kid in kids {
+                if kid.status != Status::Pinned.as_str() {
+                    continue;
+                }
+                if kid.non_goal {
+                    non_goals.push(Brief { id: kid.id, title: kid.title });
+                } else if kid.requirement {
+                    requirements.push(Brief { id: kid.id, title: kid.title });
+                }
             }
         }
-        let inherits = specs::ancestors(&spec_id, &src)?.chain.into_iter().rev().map(|n| n.id).collect();
+        let inherits = inherits(&mut reads, &spec_id)?;
         out.push(SpecContext {
             id: spec.id,
             title: spec.title,
@@ -225,7 +226,98 @@ pub fn governing_with(conn: &Connection, id: &str, limits: Limits) -> Result<Gov
             inherits,
         });
     }
-    Ok(Governing { specs: out, truncated })
+    Ok(Governing { specs: out, truncated: truncated.or(children_cut.then_some(Cap::Children)) })
+}
+
+/// The parents and issues [`governing_with`] reads, each read once per call.
+struct Reads<'c> {
+    conn: &'c Connection,
+    parents: HashMap<String, Option<String>>,
+    issues: HashMap<String, Option<Issue>>,
+}
+
+impl Reads<'_> {
+    /// The parent of `id`, if it has one.
+    fn parent(&mut self, id: &str) -> Result<Option<String>> {
+        if let Some(p) = self.parents.get(id) {
+            return Ok(p.clone());
+        }
+        let p = graph::parent_of(self.conn, id)?;
+        self.parents.insert(id.to_string(), p.clone());
+        Ok(p)
+    }
+
+    /// The issue `id`, if it exists.
+    fn issue(&mut self, id: &str) -> Result<Option<Issue>> {
+        if let Some(i) = self.issues.get(id) {
+            return Ok(i.clone());
+        }
+        let i = issues::get(self.conn, id)?;
+        self.issues.insert(id.to_string(), i.clone());
+        Ok(i)
+    }
+}
+
+/// A spec's child, as its requirements and non-goals are read.
+struct Child {
+    id: String,
+    title: String,
+    /// Its status as stored.
+    status: String,
+    requirement: bool,
+    non_goal: bool,
+}
+
+/// Up to `room` children of the spec `id`, in creation order, and whether
+/// it has more: the edge rows are limited (in id order) before any issue or
+/// label is read, one row past `room` telling that the bound was crossed.
+fn spec_children(conn: &Connection, id: &str, room: usize) -> Result<(Vec<Child>, bool)> {
+    const SQL: &str = "SELECT i.id, i.title, i.status,
+               EXISTS(SELECT 1 FROM labels l WHERE l.issue_id = i.id AND l.label = ?3),
+               EXISTS(SELECT 1 FROM labels l WHERE l.issue_id = i.id AND l.label = ?4)
+         FROM (SELECT issue_id FROM dependencies WHERE depends_on_id = ?1 AND dep_type = 'parent-child'
+               ORDER BY issue_id LIMIT ?2) d
+         CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = d.issue_id
+         ORDER BY i.created_at, i.rowid";
+    let mut stmt = conn.prepare_cached(SQL)?;
+    let rows = stmt.query_map(params![id, limit(room.saturating_add(1)), REQUIREMENT, NON_GOAL], |r| {
+        Ok(Child { id: r.get(0)?, title: r.get(1)?, status: r.get(2)?, requirement: r.get(3)?, non_goal: r.get(4)? })
+    })?;
+    let mut kids: Vec<Child> = rows.collect::<rusqlite::Result<_>>()?;
+    if kids.len() <= room {
+        return Ok((kids, false));
+    }
+    // The extra row is the one with the greatest id (bytewise, as SQLite's BINARY collation orders them).
+    if let Some(last) = kids.iter().enumerate().max_by(|a, b| a.1.id.cmp(&b.1.id)).map(|(i, _)| i) {
+        kids.remove(last);
+    }
+    Ok((kids, true))
+}
+
+/// The open specs the spec `spec_id` inherits from, outermost first: its
+/// parent chain while each is an open spec not seen before, to
+/// [`specs::MAX_DEPTH`] specs. The same chain `bd spec show` inherits
+/// through, read without the related and supersedes edges it also loads.
+fn inherits(reads: &mut Reads, spec_id: &str) -> Result<Vec<String>> {
+    let mut chain: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::from([spec_id.to_string()]);
+    let mut at = reads.parent(spec_id)?;
+    while let Some(p) = at {
+        if chain.len() >= specs::MAX_DEPTH {
+            break;
+        }
+        let Some(issue) = reads.issue(&p)? else { break };
+        if !issue.labels.iter().any(|l| l == SPEC) || issue.status == Status::Closed {
+            break;
+        }
+        if !seen.insert(p.clone()) {
+            break;
+        }
+        at = reads.parent(&p)?;
+        chain.push(p);
+    }
+    chain.reverse();
+    Ok(chain)
 }
 
 /// A lineage walk: the bounds, the related edges counted so far, and each

@@ -352,6 +352,39 @@ describe('plan-implement-review', () => {
 		})
 	})
 
+	describe('coder limits in planner prompts', () => {
+		const run = async (args, over = {}) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx(args, script(over))
+			return { ctx, got: await wf.run(ctx) }
+		}
+		const promptOf = (ctx, label) => ctx.calls.find((c) => c.label === label).prompt
+		/** CODER_WORK as the extension defines it: its source slice, evaluated (it references nothing). */
+		const coderWork = () => {
+			const source = readFileSync(new URL('../extensions/plan-implement-review/extension.mjs', import.meta.url), 'utf8')
+			const from = source.indexOf('const CODER_WORK =')
+			const to = source.indexOf('const readOnly =', from)
+			if (from < 0 || to < 0) throw new Error("extension.mjs no longer has the 'const CODER_WORK =' .. 'const readOnly =' anchors")
+			return new Function(`${source.slice(from, to)}; return CODER_WORK`)()
+		}
+
+		it('gives the draft, critic and triage planners the coder limits', async () => {
+			const CODER_WORK = coderWork()
+			expect(typeof CODER_WORK).toBe('string')
+			expect(CODER_WORK).toContain('controller or a person')
+			const { ctx, got } = await run({ ...ARGS, plan: undefined, skipImplement: undefined }, {
+				'planner:draft': PLAN,
+				'planner:critic:0': { approved: true, issues: [] },
+				'coder:S1': { summary: 'done', filesChanged: ['a.md'] },
+				'review:code:r0': { findings: [FOUND] },
+				'validate:r0:F1': { valid: true, blocking: true, reasoning: 'real', fixInstruction: 'fix it' },
+				'planner:triage:r0': { items: [{ id: 'F1', action: 'escalate', reason: 'needs a .claude/settings.json change: the controller must make it' }], converging: true },
+			})
+			expect(got.status).toBe('escalated')
+			for (const label of ['planner:draft', 'planner:critic:0', 'planner:triage:r0']) expect(promptOf(ctx, label), label).toContain(CODER_WORK)
+		})
+	})
+
 	describe('setup target', () => {
 		const run = async (args, over = {}) => {
 			const wf = await load('plan-implement-review', undefined)

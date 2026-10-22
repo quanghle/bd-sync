@@ -416,10 +416,16 @@ const normPath = (p) => String(p).replace(/\\/g, '/').replace(/\/{2,}/g, '/').re
 let TARGET = ''
 let DIR = ''
 const inDir = (dir) =>
-  `Work ONLY in the directory ${dir} (use absolute paths; do not cd elsewhere). Do not commit, push, or touch git branches/index. ` +
+  `Work ONLY in the directory ${dir} (use absolute paths; do not cd elsewhere). Do not commit, merge, rebase, push, trigger CI on GitHub (the local cargo checks these instructions name are fine), or touch git branches/index. ` +
   `Run every cargo command with CARGO_TARGET_DIR=${TARGET} set. ` +
-  `Do not create or change anything that needs the user's approval (AGENTS.md gates it), and mention a needed change in notes instead: .claude/settings.json and .claude/settings.local.json, .claude/agents/, .mcp.json and any other native MCP or hook config, the approved client copies (.claude/skills/, .agents/skills/, .bd/approved/, .bd/agents.lock), hook entries anywhere (plugins/bd/hooks/hooks.json included, which must equal .claude/settings.json's hooks), executable bits on any file, and any file outside this worktree other than the logs and build output these instructions name (your home directory's config included). ` +
+  `Do not create or change anything that needs the user's approval (AGENTS.md gates it), and mention a needed change in notes instead: .claude/settings.json and .claude/settings.local.json, .claude/agents/, .mcp.json and any other native MCP or hook config, the approved client copies (.claude/skills/, .agents/skills/, .bd/approved/, .bd/agents.lock), hook entries anywhere (plugins/bd/hooks/hooks.json included, which must equal .claude/settings.json's hooks), executable bits on any file, .git/ and .env, and any file outside this worktree other than the logs and build output these instructions name (your home directory's config included). ` +
+  `Do not add new Cargo or npm dependencies (a new dependency needs approval: ask first); mention the need in notes instead. ` +
   `Reviewed source is edited like code when the task needs it: plugins/bd/ (its skills and manifests, not its hooks), .bd/source/ (an admin publishes it, each client approves it), .claude/workflows/, .github/extensions/ and .github/scripts/.`
+// What the coder may not do, from inDir: every plan step and approved fix runs through a coder bound by it, and the workflow
+// never pauses, so planner, critic and triage keep work outside it out of steps and fixes.
+const CODER_WORK =
+  `Every plan step and every fix is carried out by the coder inside the worktree, within the coder's limits: no commits, branch changes, merges or rebases (the controller merges the worktree); no push and no CI on GitHub (the worktree's local cargo checks and tests are fine); no change to anything the coder rule lists as needing the user's approval (.claude/settings.json, hook entries anywhere with plugins/bd/hooks/ included, .git/ and .env among them); no new Cargo or npm dependencies (ask first). ` +
+  `The workflow never pauses to hand work to the controller or a person.`
 const readOnly = (dir) => `Read the code in ${dir} (absolute paths). You are read-only: do not edit files, commit, or touch git state.`
 const fmtFinding = (f) =>
   `[${f.id}] ${f.severity} ${f.category} — ${f.file}${f.line ? ':' + f.line : ''}\n  Claim: ${f.claim}\n  Evidence: ${f.evidence}` +
@@ -689,6 +695,7 @@ const planIntro =
   `Order steps so each leaves the workspace building and tested. Follow AGENTS.md Conventions & Patterns (Store::write and events in one transaction, ` +
   `graph::recompute seeds, the lease invariant, claim overrides, io.rs for I/O, cli::access classes, minimal indexes, fixed query plans) and say in the step how. ` +
   `Keep Linux, macOS and Windows building. Name the docs/ or CONTRIBUTING.md page each step updates. ` +
+  `${CODER_WORK} Work that needs the controller or a person (merging or rebasing onto main, pushing, CI, a protected or approval-gated file, a new dependency, a human decision) goes in "risks", never in a step. ` +
   `Record in "decisions" every design choice a reviewer could reasonably push back on (alternatives you rejected and why): ` +
   `those become settled and stop the review loop from flip-flopping. Keep scope to the requirements; list tempting extras as outOfScope.`
 const badPlan = (p) => !p.steps?.length || !p.requirements?.length
@@ -713,9 +720,10 @@ for (let rev = 0; !A.skipImplement; rev++) {
           ? `Earlier critique rounds and how the planner answered (do not re-raise an issue the planner resolved; ` +
             `only raise it again if the revision did not actually address it):\n${critiques.map((c, i) => `Round ${i + 1}:\n${c}`).join('\n')}\n\n`
           : '') +
+        `${CODER_WORK}\n\n` +
         `Blocking issues only: a requirement not covered or covered wrongly, a step that would not work against the actual code, ` +
         `a step order that leaves the build or tests broken, a violated AGENTS.md convention, missing tests for new behavior, code that would not ` +
-        `build on macOS or Windows, or a decision whose rationale is wrong. Preferences and alternatives that are merely different are not blocking. ` +
+        `build on macOS or Windows, a step assigned to the controller or a person, or one needing work outside the coder's limits (it belongs in "risks"), or a decision whose rationale is wrong. Preferences and alternatives that are merely different are not blocking. ` +
         `approved=true if nothing blocks.`,
       { label: `planner:critic:${rev}`, effort: 'high', schema: CRITIQUE },
     )
@@ -1043,6 +1051,7 @@ const triage = (open, round, history) =>
   agent(
     `${readOnly(DIR)}\nYou are the planner, triaging approved review findings for round ${round} before the coder touches anything. ` +
       `Your job is to keep the loop converging: no fix may undo an earlier fix or plan decision unless that decision is itself the defect.\n\n` +
+      `${CODER_WORK}\n\n` +
       `${TASK}\n\n${fmtPlan(plan)}\n\nDECISION LEDGER (live entries):\n${fmtLedger()}\n\n` +
       `SUPERSEDED ENTRIES (overturned earlier; must not come back):\n${fmtLedger(ledger.filter((e) => e.supersededBy))}\n\n` +
       `ALREADY DECIDED FINDINGS:\n${fmtSettled()}\n\n` +
@@ -1055,7 +1064,7 @@ const triage = (open, round, history) =>
       `or fixing it would bring back a superseded entry. Say which.\n` +
       `- amend: a live entry is itself the cause of a real defect. List it in "supersedes", state the newDecision, and give the instruction. ` +
       `Never amend an entry that is itself an amendment, and never restore a superseded entry: that is a cycle, escalate instead.\n` +
-      `- escalate: two requirements or decisions are in real tension, or no fix exists that keeps the ledger consistent.\n` +
+      `- escalate: two requirements or decisions are in real tension, no fix exists that keeps the ledger consistent, or the fix needs work outside the coder's limits (the controller or a person must do it): say in "reason" what they must do. Never write such work into a fix or amend instruction.\n` +
       `Two findings that pull the same code in opposite directions: pick one consistent resolution, fix that one, drop the other. ` +
       `converging=false if the same files keep drawing findings and the cause is structural (the plan, not the fixes); then say the tension in "concern".`,
     { label: `planner:triage:r${round}`, phase: 'Triage', effort: 'high', schema: TRIAGE },

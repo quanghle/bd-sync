@@ -59,21 +59,40 @@ describe('roleOf', () => {
 })
 
 describe('coderOf', () => {
-	it('picks the model and effort with the most requests among coder agents, workflow roles and prefixed subagents', () => {
+	it('sums requests per model and effort among workflow coder agents, ignoring other roles', () => {
 		const w = work(
 			agent('workflow', 'plan-implement-review:coder:S1', 10, tokens(1, 1), 'claude-sonnet-5.5', 'medium'),
-			agent('subagent', 'general-purpose: coder: x', 4, tokens(1, 1), 'claude-opus-5.5', 'high'),
 			agent('workflow', 'plan-implement-review:implement', 8, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('workflow', 'plan-implement-review:coder:S2', 5, tokens(1, 1), 'claude-opus-5.5', 'high'),
 			agent('workflow', 'plan-implement-review:review:code:r0', 50, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('main', 'main', 99, tokens(1, 1), 'claude-opus-5.5', 'high'),
 		)
-		expect(coderOf(w)).toEqual({ model: 'claude-opus-5.5', effort: 'high', requests: 12 })
+		expect(coderOf(w)).toEqual({ model: 'claude-opus-5.5', effort: 'high', requests: 13 })
+	})
+
+	it('prefers workflow coder agents over a `coder:` subagent with more requests', () => {
+		const w = work(
+			agent('workflow', 'plan-implement-review:coder:S1', 6, tokens(1, 1), 'claude-sonnet-5.5', 'medium'),
+			agent('subagent', 'general-purpose: coder: close bd-x.1', 40, tokens(1, 1), 'claude-opus-5.5', 'high'),
+		)
+		expect(coderOf(w)).toEqual({ model: 'claude-sonnet-5.5', effort: 'medium', requests: 6 })
+	})
+
+	it('falls back to `coder:` subagents when there is no workflow coder agent', () => {
+		const w = work(
+			agent('subagent', 'general-purpose: coder: a', 4, tokens(1, 1), 'claude-opus-5-5', 'high'),
+			agent('subagent', 'general-purpose: coder: b', 3, tokens(1, 1), 'claude-sonnet-5.5', 'medium'),
+			agent('main', 'main', 50, tokens(1, 1), 'claude-sonnet-5.5', 'medium'),
+			agent('workflow', 'plan-implement-review:review:code:r0', 30, tokens(1, 1), 'claude-sonnet-5.5', 'medium'),
+		)
+		expect(coderOf(w)).toEqual({ model: 'claude-opus-5.5', effort: 'high', requests: 4 })
 	})
 
 	it('counts one model named both ways (Claude Code and Copilot ids) as one coder', () => {
 		const w = work(
-			agent('subagent', 'general-purpose: coder: a', 5, tokens(1, 1), 'claude-opus-5-5', 'high'),
-			agent('workflow', 'plan-implement-review:implement', 4, tokens(1, 1), 'claude-opus-5.5', 'high'),
-			agent('workflow', 'plan-implement-review:coder:S1', 7, tokens(1, 1), 'claude-sonnet-5.5', 'high'),
+			agent('workflow', 'plan-implement-review:implement', 5, tokens(1, 1), 'claude-opus-5-5', 'high'),
+			agent('workflow', 'plan-implement-review:coder:S1', 4, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('workflow', 'plan-implement-review:coder:S2', 7, tokens(1, 1), 'claude-sonnet-5.5', 'high'),
 		)
 		expect(coderOf(w)).toEqual({ model: 'claude-opus-5.5', effort: 'high', requests: 9 })
 	})
@@ -355,6 +374,7 @@ describe('aggregate and render', () => {
 		expect(md).toContain('## Score by coder')
 		expect(md).toContain('| unknown | 2 | claude-sonnet-5.5/medium | 1 | 4 | 0 | 1 |')
 		expect(md).toContain('exploration counts runs marked by the coder exploration quota')
+		expect(md).toContain('or among its \`coder:\` subagents when it has none')
 	})
 
 	it('splits the score by coder by rubric version, so one band under v2 and v3 stays apart', () => {

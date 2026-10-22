@@ -51,12 +51,16 @@ export function roleOf(agent) {
 }
 
 /**
- * A run's coder: the model and effort with the most requests among its coder-role agents (workflow coder/implement roles,
- * `coder:` subagents), or null when untraced or none.
+ * A run's coder: the model and effort with the most requests among its workflow coder agents (coder/implement roles), or,
+ * when it has none, among its `coder:` subagents; null when untraced or there are none. A controller's `coder:` subagent
+ * (a closer merging worktrees) never outvotes the workflow's own coders.
  */
 export function coderOf(work) {
+  const coders = (work?.steps ?? []).flatMap((s) => s.agents).filter((x) => roleOf(x) === 'coder')
+  const workflow = coders.filter((a) => a.kind === 'workflow')
+  const pool = workflow.length ? workflow : coders
   const by = new Map()
-  for (const a of (work?.steps ?? []).flatMap((s) => s.agents).filter((x) => roleOf(x) === 'coder')) {
+  for (const a of pool) {
     // One name per model across harnesses (Claude Code's claude-opus-5-5, Copilot's claude-opus-5.5).
     const model = canonicalModel(a.model)
     const key = `${model}\0${a.effort}`
@@ -451,7 +455,7 @@ export function render(runs, agg, prices = PRICES) {
         )
       : 'No scored run has a complexity yet.',
     ``,
-    `A run's coder is the model and effort with the most requests among its coder agents (workflow coder and implement roles, \`coder:\` subagents); "no coder agent" runs were coded by the main thread or by subagents without a role prefix. exploration counts runs marked by the coder exploration quota (\`exploration\` metadata, also on each run in --json).`,
+    `A run's coder is the model and effort with the most requests among its workflow coder agents (coder and implement roles), or among its \`coder:\` subagents when it has none; "no coder agent" runs were coded by the main thread or by subagents without a role prefix. exploration counts runs marked by the coder exploration quota (\`exploration\` metadata, also on each run in --json).`,
     ``,
     `## Cost and time by complexity`,
     ``,

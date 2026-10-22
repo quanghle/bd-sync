@@ -11,9 +11,14 @@
 // (default $CLAUDE_CONFIG_DIR/projects), with a transcript for its own thread, each subagent and each workflow agent. Every
 // model request goes to the first step of the run closed at or after it. Requests before the run started (a run: its
 // creation; an issue without steps, which is its own only step: its first claim) or after its last closed step are left
-// out. Only labels (an agent's display name, description or workflow label, at most 80 characters), model ids, effort,
-// token counts, Copilot AI credits and times are read out: prompts, tool input and output and reasoning never reach the
-// result, which --write stores as the run's work metadata.
+// out. A Claude Code workflow run for other issues is left out too: one whose arguments (<session>/workflows/<wf>.json:
+// issue, reviewStep, run, parent) name bd issues none of which is in the run (the run, its steps or findings, or an issue
+// in its parent chain), and one still running (no <wf>.json yet) whose first agent's prompt names issues bd knows, none
+// in the run; their requests within the run's steps are counted as other_work_requests. Copilot CLI logs record neither a
+// workflow's arguments nor its agents' prompts, so its workflow agents are all counted. Only labels (an agent's display
+// name, description or workflow label, at most 80 characters), model ids, effort, token counts, Copilot AI credits and
+// times are read out, and the issue ids in a workflow's arguments or its first agent's prompt, never their text:
+// prompts, tool input and output and reasoning never reach the result, which --write stores as the run's work metadata.
 // It also records times: each agent's busy time per step (its model requests and the tools they ran, as a union of
 // intervals: not the time it sat idle between turns, waited on a person or on another agent, which is traced on its own),
 // each step's elapsed time (from its claim or the previous step's close, whichever is earlier, to its close), gate waits
@@ -304,8 +309,44 @@ export function claudeRequestsOf(entries) {
   }))
 }
 
-/** Every transcript of a Claude Code session: its own thread, its subagents and its workflow agents, with a label for each. */
-export function claudeSources(dir, session) {
+/** The bd issue ids a workflow was run for, from its arguments (issue, reviewStep, run, parent); [] when it names none. */
+export const workflowIssues = (args) =>
+  args && typeof args === 'object' ? ['issue', 'reviewStep', 'run', 'parent'].map((k) => args[k]).filter((v) => typeof v === 'string' && RUN_ID.test(v)) : []
+
+/**
+ * The bd issue ids of the given prefix that a text names (a workflow agent's prompt): the prefix, '-', then base36, with
+ * optional .segments, standing alone, so names such as x-bd-y, .bd-z or bd-y- don't count. Candidates: they may not be issues.
+ */
+export function namedIssues(text, prefix) {
+  if (!prefix || typeof text !== 'string') return []
+  const p = prefix.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const id = new RegExp(`(?<![\\w.-])${p}-[a-z0-9]+(?:\\.[a-z0-9-]+)*(?![\\w-])`, 'g')
+  return [...new Set(text.match(id) ?? [])]
+}
+
+/** The text of a transcript's first user message (an agent's prompt). */
+const promptOf = (entries) => {
+  const c = entries.find((e) => e.type === 'user')?.message?.content
+  return typeof c === 'string' ? c : Array.isArray(c) ? c.map((b) => (typeof b?.text === 'string' ? b.text : '')).join('\n') : ''
+}
+
+/** Whether an issue id is the run, one of its steps or findings, or an issue the run belongs to (its parent chain). */
+export const inRun = (id, run) => id === run || id.startsWith(`${run}.`) || run.startsWith(`${id}.`)
+
+/** The issue id prefix of a run: its first dot segment less its last '-segment' (bd-26et6.5.1 -> bd, bd-sync-2bt.1 -> bd-sync). */
+export const idPrefix = (run) => {
+  const head = String(run).split('.')[0]
+  const i = head.lastIndexOf('-')
+  return i > 0 ? head.slice(0, i) : null
+}
+
+/**
+ * Every transcript of a Claude Code session: its own thread, its subagents and its workflow agents, with a label for each.
+ * A workflow agent also carries the bd issues its workflow was run for: issues, from <session>/workflows/<wf>.json's
+ * arguments (see workflowIssues), and, only while that file is absent (the workflow still running), named: the issue ids
+ * of prefix (see idPrefix) that the workflow's first started agent's prompt names (candidates bd may not know).
+ */
+export function claudeSources(dir, session, prefix = null) {
   const root = join(dir, session)
   const sources = [{ file: join(dir, `${session}.jsonl`), kind: 'main', label: 'main' }]
   const sub = join(root, 'subagents')
@@ -315,17 +356,18 @@ export function claudeSources(dir, session) {
   }
   const wfs = join(sub, 'workflows')
   for (const wf of list(wfs)) {
-    const name = readJson(join(root, 'workflows', `${wf}.json`))?.workflowName ?? wf
-    const labels = new Map(
-      list(join(wfs, wf)).includes('journal.jsonl')
-        ? readJsonl(join(wfs, wf, 'journal.jsonl'))
-            .filter((e) => e.type === 'started' && e.agentId)
-            .map((e) => [e.agentId, e.label ?? e.phase ?? e.agentId])
-        : [],
-    )
+    const meta = readJson(join(root, 'workflows', `${wf}.json`))
+    const name = meta?.workflowName ?? wf
+    const issues = workflowIssues(meta?.args)
+    const started = list(join(wfs, wf)).includes('journal.jsonl')
+      ? readJsonl(join(wfs, wf, 'journal.jsonl')).filter((e) => e.type === 'started' && e.agentId)
+      : []
+    const labels = new Map(started.map((e) => [e.agentId, e.label ?? e.phase ?? e.agentId]))
+    const first = started[0] && join(wfs, wf, `agent-${started[0].agentId}.jsonl`)
+    const named = !meta && prefix && first && existsSync(first) ? namedIssues(promptOf(readJsonl(first)), prefix) : []
     for (const f of list(join(wfs, wf)).filter((f) => /^agent-[\w-]+\.jsonl$/.test(f))) {
       const id = f.slice('agent-'.length, -'.jsonl'.length)
-      sources.push({ file: join(wfs, wf, f), kind: 'workflow', label: label(`${name}:${labels.get(id) ?? id}`) })
+      sources.push({ file: join(wfs, wf, f), kind: 'workflow', label: label(`${name}:${labels.get(id) ?? id}`), issues, named })
     }
   }
   return sources.filter((s) => existsSync(s.file))
@@ -409,8 +451,23 @@ export function timingOf({ createdAt, startedAt, startFrom, steps }) {
  * The trace of a run from its bd record, the Copilot session logs under sessionsDir and the Claude Code transcripts under
  * projectsDir (either may be left out, and its harness's sessions are then missing).
  * record: { run, createdAt, startedAt?, startFrom?, steps: [{ id, closedAt | null, startedAt?, type?, gate?: { type, armedAt } }], actors: [string] }
+ * isIssue(id): whether bd knows an issue id a still-running workflow's first prompt names (see issueChecker); accepts all
+ * by default.
  */
-export function trace(record, { sessionsDir, projectsDir, now = new Date(), birthOf = (file) => statSync(file).birthtimeMs }) {
+export function trace(record, { sessionsDir, projectsDir, now = new Date(), birthOf = (file) => statSync(file).birthtimeMs, isIssue = () => true }) {
+  const prefix = idPrefix(record.run)
+  /**
+   * Whose work a Claude Code source is: 'run' for a workflow run for an issue in the run, 'other' for one run for issues
+   * outside it (by its arguments; while still running, by the issues bd knows that its first prompt names, none in the
+   * run), 'unknown' otherwise (every main thread and subagent, and a workflow naming no issue), which is counted.
+   * inRun is checked before isIssue, so bd is never asked about the run's own ids.
+   */
+  const workOf = (src) => {
+    if (src.kind !== 'workflow') return 'unknown'
+    if (src.issues.length) return src.issues.some((id) => inRun(id, record.run)) ? 'run' : 'other'
+    if (src.named.some((id) => inRun(id, record.run))) return 'run'
+    return src.named.some((id) => isIssue(id)) ? 'other' : 'unknown'
+  }
   const closed = record.steps.filter((s) => s.closedAt).sort((a, b) => a.closedAt.localeCompare(b.closedAt))
   const sessions = []
   const missing = []
@@ -445,7 +502,11 @@ export function trace(record, { sessionsDir, projectsDir, now = new Date(), birt
         }
         continue
       }
-      const rs = claudeSources(d, session).flatMap((src) => claudeRequestsOf(readJsonl(src.file)).map((r) => ({ ...r, actor, kind: src.kind, label: src.label })))
+      // A workflow for another issue (another run's review loop, say) is not this run's work, though it ran meanwhile.
+      const rs = claudeSources(d, session, prefix).flatMap((src) => {
+        const other = workOf(src) === 'other'
+        return claudeRequestsOf(readJsonl(src.file)).map((r) => ({ ...r, actor, kind: src.kind, label: src.label, other }))
+      })
       let born = 0
       try {
         born = birthOf(join(d, `${session}.jsonl`)) || 0
@@ -470,10 +531,16 @@ export function trace(record, { sessionsDir, projectsDir, now = new Date(), birt
   // Each agent's busy spans: its requests and the tools they ran.
   const spans = new Map()
   let outside = 0
+  // Requests inside a step's window of workflows for other issues, left out.
+  let otherWork = 0
   for (const r of requests) {
     const step = r.ts >= begin ? closed.find((s) => s.closedAt >= r.ts) : undefined
     if (!step) {
       outside++
+      continue
+    }
+    if (r.other) {
+      otherWork++
       continue
     }
     const key = [r.actor, r.kind, r.label, r.model, r.effort].join('\0')
@@ -524,6 +591,7 @@ export function trace(record, { sessionsDir, projectsDir, now = new Date(), birt
       .map((s) => ({ ...s, agents: [...s.agents.values()].sort((a, b) => a.first.localeCompare(b.first)) })),
     totals: [...totals.values()].sort((a, b) => b.requests - a.requests),
     outside_requests: outside,
+    other_work_requests: otherWork,
     timing: timingOf(record),
   }
 }
@@ -546,6 +614,7 @@ export function summarize(t) {
     `Work trace: ${t.sessions.length} session(s)` +
       (t.missing.length ? `; not on this machine: ${t.missing.join(', ')}` : '') +
       (t.untraced?.length ? `; harness not traced: ${t.untraced.join(', ')}` : '') +
+      (t.other_work_requests ? `; ${t.other_work_requests} request(s) of workflows for other issues left out` : '') +
       (t.open_steps.length ? `; open steps not traced: ${t.open_steps.map(step).join(', ')}` : ''),
     `Time: agents ${fmtDuration(agentMs)} (${(t.version ?? 1) >= 4 ? 'busy time per agent and step: model requests and the tools they ran, summed' : 'first to last request per agent and step, summed'}; approximate), ` +
       `human wait ${fmtDuration(t.timing?.human_wait_ms)}, elapsed ${fmtDuration(t.timing?.elapsed_ms)} (${t.timing?.start_from === 'claim' ? 'first claim' : 'created'} to last close; includes idle gaps)`,
@@ -562,9 +631,38 @@ export function summarize(t) {
 const RUN_ID = /^[a-z0-9]+(-[a-z0-9]+)+(\.[a-z0-9-]+)*$/
 const asList = (x, key) => (Array.isArray(x) ? x : (x?.[key] ?? []))
 
-/** Runs bd with these arguments and --json in root (or bd's own default), returning the parsed output. */
-export const bdRunner = (root) => (args) =>
-  JSON.parse(execFileSync('bd', [...(root ? ['-C', root] : []), ...args, '--json'], { encoding: 'utf8', maxBuffer: 64 << 20 }))
+/**
+ * Runs bd with these arguments and --json in root (or bd's own default), returning the parsed output. With quiet, bd's
+ * stderr is kept on the error (e.stderr) instead of printed.
+ */
+export const bdRunner = (root, { quiet = false } = {}) => (args) =>
+  JSON.parse(execFileSync('bd', [...(root ? ['-C', root] : []), ...args, '--json'], { encoding: 'utf8', maxBuffer: 64 << 20, ...(quiet ? { stdio: ['ignore', 'pipe', 'pipe'] } : {}) }))
+
+/**
+ * isIssue for trace: whether bd shows an issue id (memoized). Not found is no; any other failure (bd down, a lapsed login)
+ * is warned about once and counts as no too, so the workflow naming it stays counted, as it was before ids were checked.
+ */
+export function issueChecker(bd, warn = (m) => process.stderr.write(`${m}\n`)) {
+  const known = new Map()
+  return (id) => {
+    if (typeof id !== 'string' || !RUN_ID.test(id)) return false
+    if (!known.has(id)) {
+      try {
+        bd(['show', id])
+        known.set(id, true)
+      } catch (e) {
+        known.set(id, false)
+        const why = `${e.stderr ?? ''}${e.stdout ?? ''}${e.message}`
+        // bd exits 3 with {"error":{"code":"not_found"}} for an unknown issue; anything else (a workspace not found) is a failure.
+        if (e.status !== 3 && !/"code"\s*:\s*"not_found"/.test(why) && !known.has('\0warned')) {
+          known.set('\0warned', true)
+          warn(`trace-run: could not check issue ids with bd (${why.trim().split('\n')[0]}); workflows naming them are counted`)
+        }
+      }
+    }
+    return known.get(id)
+  }
+}
 
 /**
  * A step of the record from a bd issue (as bd list or show gives it): its id, close time, claim time, type and, for a
@@ -628,7 +726,9 @@ function main(argv) {
   const run = argv.find((a, i) => !a.startsWith('--') && !valued.includes(argv[i - 1]))
   if (!run) throw new Error('usage: trace-run.mjs <run> [--root <checkout>] [--sessions <dir>] [--projects <dir>] [--actor <name>] [--write] [--summary]')
   const root = opt('--root')
-  const result = trace(readRecord(run, bdRunner(root)), logDirs(opt))
+  // A still-running workflow's prompt names candidates bd may not know (bd-gate, bd-core): a quiet runner keeps bd's
+  // not-found errors off trace-run's stderr.
+  const result = trace(readRecord(run, bdRunner(root)), { ...logDirs(opt), isIssue: issueChecker(bdRunner(root, { quiet: true })) })
   // Print first, so a failed write still leaves the trace on stdout.
   process.stdout.write(`${argv.includes('--summary') ? summarize(result) : JSON.stringify(result, null, 2)}\n`)
   if (!argv.includes('--write')) return

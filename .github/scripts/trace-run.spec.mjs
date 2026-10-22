@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -489,6 +489,7 @@ describe('trace-run CLI', () => {
 echo "$*" >> "${bin}/calls"
 case " $* " in
   *" update "*) [ -n "$FAIL_WRITE" ] && { echo "server unreachable" >&2; exit 8; }; exit 0 ;;
+  *" show "*) echo '{"error":{"code":"not_found","exit_code":3}}' >&2; exit 3 ;;
   *"history squid-x.1 "*) echo '[{"issue_id":"squid-x.1","op":"created","ts":"2026-10-15T10:00:00Z","actor":"${ACTOR}"}]' ;;
   *"history "*) echo '[{"op":"closed","ts":"2026-10-15T10:30:00Z","actor":"${ACTOR}"}]' ;;
   *" list "*) echo '[{"id":"squid-x.1.review","status":"closed"}]' ;;
@@ -528,5 +529,14 @@ esac
 		expect(r.code).toBe(1)
 		expect(r.out).toContain('Work trace: 1 session(s)')
 		expect(r.err).toContain('could not store the work metadata on squid-x.1: server unreachable')
+	})
+
+	it("checks issue ids without printing bd's not-found error", () => {
+		const code = `const m = await import(${JSON.stringify(new URL('./trace-run.mjs', import.meta.url).href)}); process.stdout.write(String(m.issueChecker(m.bdRunner(null, { quiet: true }))('squid-gate')))`
+		const r = spawnSync('node', ['--input-type=module', '-e', code], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } })
+		expect(r.status).toBe(0)
+		expect(r.stdout).toBe('false')
+		expect(r.stderr).toBe('')
+		expect(readFileSync(join(bin, 'calls'), 'utf8')).toBe('show squid-gate --json\n')
 	})
 })

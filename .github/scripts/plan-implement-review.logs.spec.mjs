@@ -89,6 +89,8 @@ const LINT = {
 	changedFiles: ['a.rs'],
 }
 const FOREIGN_REPORT = { ...PASSED, marker: marker('/w/other') }
+// A full tree id for setup reports, unlike every snapshot and gateTree fixture here.
+const BASE_TREE = 'f'.repeat(40)
 
 /**
  * The workflow's helpers bound to args A and a stub agent that answers from replies[label] (null when missing); over
@@ -312,7 +314,7 @@ describe('plan-implement-review setup target', () => {
 
 	it.each(SETUP_CASES)('%s', (_, workdir, report, ok) => {
 		const w = load({ ...X, workdir })
-		expect(w.setupOk({ ...report, baseline: 'b' }, 'setup')).toBe(ok)
+		expect(w.setupOk({ ...report, baseline: BASE_TREE }, 'setup')).toBe(ok)
 		if (ok) {
 			expect(w.logs).toEqual([])
 		} else {
@@ -324,7 +326,7 @@ describe('plan-implement-review setup target', () => {
 
 	it('rejects a report missing a field without a log line of its own', () => {
 		const w = load({ ...X, workdir: '/w' })
-		expect(w.setupOk({ workdir: '/w', baseline: 'b' }, 'setup')).toBe(false)
+		expect(w.setupOk({ workdir: '/w', baseline: BASE_TREE }, 'setup')).toBe(false)
 		expect(w.setupOk(null, 'setup')).toBe(false)
 		expect(w.logs).toEqual([])
 	})
@@ -339,8 +341,8 @@ describe('plan-implement-review setup target', () => {
 		expect(normPath('/W')).toBe('/W')
 	})
 
-	const BAD = { workdir: '/w', baseline: 'abc12345abc', target: '/r/target' }
-	const GOOD = { workdir: '/w', baseline: 'abc12345abc', target: '/w/target' }
+	const BAD = { workdir: '/w', baseline: BASE_TREE, target: '/r/target' }
+	const GOOD = { workdir: '/w', baseline: BASE_TREE, target: '/w/target' }
 
 	it('escalates a wrong target once, then ends the run before planning', async () => {
 		const w = load({ ...X, workdir: '/w' }, { setup: BAD, 'setup@sonnet': BAD }, { DIR: '', TARGET: '' })
@@ -360,6 +362,57 @@ describe('plan-implement-review setup target', () => {
 		expect(w.calls.map((c) => c.label)).toEqual(['setup', 'setup@sonnet'])
 		expect(w.stepCoderPrompt({ id: 'S1', title: 't', approach: 'a', tests: 't' }, 'coder:S1')).toContain('CARGO_TARGET_DIR=/w/target set')
 		expect(w.gatePrompt('gate:impl')).toContain("export CARGO_TARGET_DIR='/w/target'")
+	})
+})
+
+describe('plan-implement-review setup baseline', () => {
+	// [name, baseline, accepted]. Mirrors BASELINE_CASES in workflow-extensions.spec.mjs word for word, so both harnesses
+	// give the same verdicts.
+	const BASELINE_CASES = [
+		['a SHA-1 tree id', 'a'.repeat(40), true],
+		['a SHA-256 tree id', '0123456789abcdef'.repeat(4), true],
+		['a tree id with surrounding whitespace', ` ${'a'.repeat(40)}\n`, true],
+		['an abbreviated id', 'abc12345abc', false],
+		['a seven-character id', 'abcdef0', false],
+		['an uppercase id', 'A'.repeat(40), false],
+		['a non-hex id', 'g'.repeat(40), false],
+		['one hex digit too many', 'a'.repeat(41), false],
+		['a ref name', 'HEAD', false],
+		['whitespace only', '   ', false],
+	]
+
+	it.each(BASELINE_CASES)('%s', (_, baseline, ok) => {
+		const w = load({ ...X, workdir: '/w' })
+		expect(w.setupOk({ workdir: '/w', target: '/w/target', baseline }, 'setup')).toBe(ok)
+		expect(w.logs).toEqual(ok ? [] : [`setup setup: baseline ${JSON.stringify(baseline)} is not a full tree id`])
+	})
+
+	it('logs both a bad baseline and a bad target', () => {
+		const w = load({ ...X, workdir: '/w' })
+		expect(w.setupOk({ workdir: '/w', baseline: 'abc12345abc', target: '/r/target' }, 'setup')).toBe(false)
+		expect(w.logs).toHaveLength(2)
+		expect(w.logs.filter((l) => l.includes('baseline "abc12345abc"'))).toHaveLength(1)
+		expect(w.logs.filter((l) => l.includes('/r/target'))).toHaveLength(1)
+	})
+
+	const SHORT = () => ({ workdir: '/w', baseline: 'abc12345abc', target: '/w/target' })
+
+	it('escalates a non-tree baseline once, then ends the run before planning', async () => {
+		const w = load({ ...X, workdir: '/w' }, { setup: SHORT(), 'setup@sonnet': SHORT() }, { DIR: '', TARGET: '' })
+		expect(await w.runSetup()).toEqual({ status: 'escalated', reason: 'setup agent failed', lease: null })
+		expect(w.calls.map((c) => c.label)).toEqual(['setup', 'setup@sonnet'])
+		expect(w.logs.filter((l) => /is not a full tree id$/.test(l))).toEqual([
+			'setup setup: baseline "abc12345abc" is not a full tree id',
+			'setup setup@sonnet: baseline "abc12345abc" is not a full tree id',
+		])
+	})
+
+	it('goes on with the escalated report and uses its baseline trimmed', async () => {
+		const padded = { workdir: '/w', baseline: `  ${BASE_TREE}\n`, target: '/w/target' }
+		const w = load({ ...X, workdir: '/w' }, { setup: SHORT(), 'setup@sonnet': padded }, { DIR: '', TARGET: '' })
+		expect(await w.runSetup()).toBeUndefined()
+		expect(w.calls.map((c) => c.label)).toEqual(['setup', 'setup@sonnet'])
+		expect(w.logs).toContain(`Working in /w (baseline ${BASE_TREE.slice(0, 8)})`)
 	})
 })
 

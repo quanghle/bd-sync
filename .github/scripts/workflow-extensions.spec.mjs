@@ -64,13 +64,15 @@ const ARGS = { requirements: 'x', issue: 'bd-1', plan: PLAN, skipImplement: true
 describe('plan-implement-review', () => {
 	/** A full tree id, as the gate log's gate-tree= line and the snapshot command print it. */
 	const TREE1 = 'a'.repeat(40)
+	/** A full tree id for setup's baseline, unlike any snapshot fixture here, so a diff names which is which. */
+	const BASE_TREE = 'f'.repeat(40)
 	/** A scripted run over finished work: claim, setup, a green gate, then the reviewers. */
 	const script = (over = {}) => (label, opts) => {
 		const base = label.replace(/@escalated$/, '')
 		if (over[label] !== undefined) return typeof over[label] === 'function' ? over[label](opts) : over[label]
 		if (base === 'claim') return CLAIM
 		if (base.startsWith('heartbeat')) return { ok: true }
-		if (base === 'setup') return { workdir: '/w', baseline: 'abc12345abc', target: '/w/target', branch: 'b' }
+		if (base === 'setup') return { workdir: '/w', baseline: BASE_TREE, target: '/w/target', branch: 'b' }
 		if (base.startsWith('gate:')) return { passed: true, failures: [], snapshot: TREE1, gateTree: TREE1, changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
 		if (base.startsWith('review:')) return { findings: [] }
 		if (base.startsWith('record:')) return { ok: true, filed: [], followedUp: [] }
@@ -597,7 +599,7 @@ describe('plan-implement-review', () => {
 		// planOnly: setup and the critic run, and no gate marker (dir=/w) can escalate a case for another reason. A baseline
 		// needs a workdir, so the no-workdir case (the worktree-add branch) drops it.
 		it.each(SETUP_CASES)('%s', async (_, workdir, report, ok) => {
-			const reply = { ...report, baseline: 'abc12345abc', branch: 'b' }
+			const reply = { ...report, baseline: BASE_TREE, branch: 'b' }
 			const args = { ...ARGS, workdir, baseline: workdir ? ARGS.baseline : undefined, skipImplement: undefined, planOnly: true }
 			const { ctx, got } = await run(args, { ...critic, setup: reply, 'setup@escalated': reply })
 			if (ok) {
@@ -616,7 +618,7 @@ describe('plan-implement-review', () => {
 			}
 		})
 
-		const BAD = { workdir: '/w', baseline: 'abc12345abc', target: '/r/target', branch: 'b' }
+		const BAD = { workdir: '/w', baseline: BASE_TREE, target: '/r/target', branch: 'b' }
 
 		it('escalates a report of another target once, then ends the run before planning', async () => {
 			const { ctx, got } = await run(ARGS, { setup: BAD, 'setup@escalated': BAD })
@@ -646,6 +648,81 @@ describe('plan-implement-review', () => {
 			expect(targetLines(ctx)).toHaveLength(1)
 			expect(promptOf(ctx, 'coder:S1')).toContain('CARGO_TARGET_DIR=/w/target set')
 			expect(promptOf(ctx, 'gate:impl')).toContain("export CARGO_TARGET_DIR='/w/target'")
+		})
+	})
+
+	describe('setup baseline', () => {
+		const run = async (args, over = {}) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx(args, script(over))
+			return { ctx, got: await wf.run(ctx) }
+		}
+		const promptOf = (ctx, label) => ctx.calls.find((c) => c.label === label).prompt
+		const baselineLines = (ctx) => ctx.logs.filter((l) => /^setup setup(@escalated)?: baseline /.test(l))
+		const critic = { 'planner:critic:0': { approved: true, issues: [] } }
+
+		// [name, baseline, accepted]. Mirrors BASELINE_CASES in plan-implement-review.logs.spec.mjs word for word, so both
+		// harnesses give the same verdicts.
+		const BASELINE_CASES = [
+			['a SHA-1 tree id', 'a'.repeat(40), true],
+			['a SHA-256 tree id', '0123456789abcdef'.repeat(4), true],
+			['a tree id with surrounding whitespace', ` ${'a'.repeat(40)}\n`, true],
+			['an abbreviated id', 'abc12345abc', false],
+			['a seven-character id', 'abcdef0', false],
+			['an uppercase id', 'A'.repeat(40), false],
+			['a non-hex id', 'g'.repeat(40), false],
+			['one hex digit too many', 'a'.repeat(41), false],
+			['a ref name', 'HEAD', false],
+			['whitespace only', '   ', false],
+		]
+
+		// planOnly, as in setup target's SETUP_CASES: setup and the critic run, and the result carries the baseline.
+		it.each(BASELINE_CASES)('%s', async (_, baseline, ok) => {
+			const reply = { workdir: '/w', target: '/w/target', branch: 'b', baseline }
+			const args = { ...ARGS, skipImplement: undefined, planOnly: true }
+			const { ctx, got } = await run(args, { ...critic, setup: reply, 'setup@escalated': { ...reply } })
+			if (ok) {
+				expect(got.status).toBe('planned')
+				expect(got.baseline).toBe(baseline.trim())
+				expect(baselineLines(ctx)).toEqual([])
+			} else {
+				expect(got.status).toBe('escalated')
+				expect(got.reason).toMatch(/^setup agent failed/)
+				expect(ctx.calls.some((c) => c.label.startsWith('planner:'))).toBe(false)
+				expect(baselineLines(ctx)).toEqual([
+					`setup setup: baseline ${JSON.stringify(baseline)} is not a full tree id`,
+					`setup setup@escalated: baseline ${JSON.stringify(baseline)} is not a full tree id`,
+				])
+			}
+		})
+
+		const SHORT = () => ({ workdir: '/w', baseline: 'abc12345abc', target: '/w/target', branch: 'b' })
+
+		it('escalates a non-tree baseline once, then ends the run before planning', async () => {
+			const { ctx, got } = await run(ARGS, { setup: SHORT(), 'setup@escalated': SHORT() })
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toMatch(/^setup agent failed/)
+			const setups = ctx.calls.filter((c) => c.label.startsWith('setup'))
+			expect(setups.map((c) => [c.label, c.agent])).toEqual([
+				['setup', 'task'],
+				['setup@escalated', 'general-purpose'],
+			])
+			expect(ctx.calls.some((c) => /^(planner|coder|gate):/.test(c.label))).toBe(false)
+			expect(baselineLines(ctx)).toEqual([
+				'setup setup: baseline "abc12345abc" is not a full tree id',
+				'setup setup@escalated: baseline "abc12345abc" is not a full tree id',
+			])
+		})
+
+		it('goes on with the escalated report and uses its baseline trimmed', async () => {
+			const { ctx, got } = await run(ARGS, {
+				setup: SHORT(),
+				'setup@escalated': { workdir: '/w', baseline: `  ${BASE_TREE}\n`, target: '/w/target', branch: 'b' },
+			})
+			expect(got.status).toBe('done')
+			expect(baselineLines(ctx)).toHaveLength(1)
+			expect(promptOf(ctx, 'gate:impl')).toContain(`git diff --name-only ${BASE_TREE} <snapshot>`)
+			expect(promptOf(ctx, 'review:code:r0')).toContain(`git diff ${BASE_TREE} ${TREE1}`)
 		})
 	})
 

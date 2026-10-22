@@ -80,8 +80,14 @@ const names = [
 const DIR = '/w/bd-x-1'
 const ROOT = '/logs root'
 const marker = (dir, run = 'bd-x.1') => `bd-gate: dir=${dir} run=${run}`
-const PASSED = { passed: true, failures: [], snapshot: 'snap2', changedFiles: ['a.rs'], marker: marker(DIR) }
-const LINT = { passed: false, failures: [{ command: 'cargo clippy', excerpt: 'unused variable' }], snapshot: 'snap1', changedFiles: ['a.rs'] }
+const PASSED = { passed: true, failures: [], snapshot: 'a'.repeat(40), gateTree: 'a'.repeat(40), changedFiles: ['a.rs'], marker: marker(DIR) }
+const LINT = {
+	passed: false,
+	failures: [{ command: 'cargo clippy', excerpt: 'unused variable' }],
+	snapshot: 'b'.repeat(40),
+	gateTree: 'b'.repeat(40),
+	changedFiles: ['a.rs'],
+}
 const FOREIGN_REPORT = { ...PASSED, marker: marker('/w/other') }
 
 /**
@@ -600,7 +606,8 @@ describe('plan-implement-review contaminated gate', () => {
 
 	it('keeps the gate report fields required', () => {
 		const { GATE } = load(X)
-		expect(GATE.required).toEqual(['passed', 'failures', 'snapshot', 'changedFiles'])
+		expect(GATE.required).toEqual(['passed', 'failures', 'snapshot', 'gateTree', 'changedFiles'])
+		expect(GATE.properties.gateTree).toMatchObject({ type: 'string' })
 		expect(GATE.properties.log).toMatchObject({ type: 'string' })
 		expect(GATE.properties.marker).toMatchObject({ type: 'string' })
 	})
@@ -655,6 +662,8 @@ describe('plan-implement-review gate command', () => {
 		expect(prompt).toContain(`head -1 ${LOG}`)
 		expect(prompt).toContain(`Return the path ${ROOT}/bd-x.1/gate-impl.log as "log", exactly as written here and without the shell quotes`)
 		expect(prompt).toContain('verbatim as "marker"')
+		expect(prompt).toContain('"gateTree"')
+		expect(prompt).toContain(`grep '^gate-tree=' ${LOG} | tail -1`)
 		expect(prompt).toContain('git diff --name-only base0 <snapshot>')
 		expect(prompt).toContain('Do NOT fix anything')
 	})
@@ -760,6 +769,9 @@ describe('plan-implement-review reused gate log', () => {
 		['no reply', null],
 		['a pass without a snapshot', NO_SNAP],
 		['a pass contradicting its failures', CONTRA],
+		['a snapshot that is not a tree id', { ...PASSED, snapshot: 'UNKNOWN_NOT_RUN', gateTree: 'UNKNOWN_NOT_RUN' }],
+		['an abbreviated tree id', { ...PASSED, snapshot: 'abc1234', gateTree: 'abc1234' }],
+		['a snapshot that differs from its gateTree', { ...PASSED, gateTree: 'c'.repeat(40) }],
 	])('offers the retry the first log after %s', async (_, first) => {
 		const { w, labels } = await gateOnce({ 'gate:impl': first })
 		expect(labels).toEqual(['gate:impl', 'gate:impl@sonnet'])
@@ -781,7 +793,28 @@ describe('plan-implement-review reused gate log', () => {
 		expect(p).toContain(w.gateCmd('gate:impl@sonnet'))
 		expect(p).toContain(w.gateRerunCmd('gate:impl@sonnet'))
 		expect(p).toContain('never read any other log')
+		// Both branches ask for gateTree from the log they report from: the first log, or the retry's own.
+		expect(p).toContain('"gateTree"')
+		expect(p).toContain(`grep '^gate-tree=' '${FIRST}' | tail -1`)
+		expect(p).toContain(`grep '^gate-tree=' '${OWN}' | tail -1`)
 		expect(targets(p)).toEqual(new Set([OWN]))
+	})
+
+	it.each([
+		['a 40-hex', 'd'.repeat(40)],
+		['a 64-hex', 'e'.repeat(64)],
+	])('passes %s snapshot equal to its gateTree without a retry', async (_, id) => {
+		const report = { ...PASSED, snapshot: id, gateTree: id }
+		const { g, labels } = await gateOnce({ 'gate:impl': report })
+		expect(g).toBe(report)
+		expect(labels).toEqual(['gate:impl'])
+	})
+
+	it('refuses an UNKNOWN_NOT_RUN snapshot on the retry too', async () => {
+		const unknown = { ...PASSED, snapshot: 'UNKNOWN_NOT_RUN', gateTree: 'UNKNOWN_NOT_RUN' }
+		const { g, labels } = await gateOnce({ 'gate:impl': unknown, 'gate:impl@sonnet': { ...unknown, log: FIRST } })
+		expect(g).toBeNull()
+		expect(labels).toEqual(['gate:impl', 'gate:impl@sonnet'])
 	})
 
 	it.each([

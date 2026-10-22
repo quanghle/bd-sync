@@ -30,7 +30,13 @@ function load(replies) {
 const SCHEMA = { type: 'object' }
 const OPTS = { label: 'claim', phase: 'Setup', schema: SCHEMA }
 const PROMPT = 'Run exactly: bd claim bd-x --json'
-const gateValid = (r) => !!(r?.snapshot && r.passed !== r.failures.length > 0)
+// Mirrors gate()'s first check: a full tree id (40 or 64 lowercase hex) as the snapshot, the log's gateTree equal to it
+// (both trimmed), and a pass exactly when there are no failures.
+const TREE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+const trimmed = (v) => (typeof v === 'string' ? v.trim() : '')
+const gateValid = (r) => TREE.test(trimmed(r?.snapshot)) && trimmed(r.gateTree) === trimmed(r.snapshot) && r.passed !== r.failures.length > 0
+const T1 = 'a'.repeat(40)
+const T2 = 'b'.repeat(40)
 const labelPrompt = (l) => `Write to ${l}.log`
 
 describe('plan-implement-review ops()', () => {
@@ -79,8 +85,8 @@ describe('plan-implement-review ops()', () => {
 	})
 
 	it('escalates a gate report that contradicts itself, and returns null if sonnet contradicts itself too', async () => {
-		const contradictory = { snapshot: 's', passed: true, failures: [{ command: 'lint' }] }
-		const consistent = { snapshot: 's2', passed: false, failures: [{ command: 'lint' }] }
+		const contradictory = { snapshot: T1, gateTree: T1, passed: true, failures: [{ command: 'lint' }] }
+		const consistent = { snapshot: T2, gateTree: T2, passed: false, failures: [{ command: 'lint' }] }
 		const gate = { label: 'gate:impl', phase: 'Gate', schema: SCHEMA }
 
 		const fixed = load({ haiku: contradictory, sonnet: consistent })
@@ -141,8 +147,31 @@ describe('plan-implement-review ops()', () => {
 		])
 	})
 
+	it.each([
+		['a snapshot that is not a tree id', { snapshot: 'UNKNOWN_NOT_RUN', gateTree: 'UNKNOWN_NOT_RUN' }],
+		['an abbreviated tree id', { snapshot: 'abc1234', gateTree: 'abc1234' }],
+		['an uppercase tree id', { snapshot: T1.toUpperCase(), gateTree: T1.toUpperCase() }],
+		['a snapshot that differs from its gateTree', { snapshot: T1, gateTree: T2 }],
+		['a missing gateTree', { snapshot: T1 }],
+	])('gateValid refuses %s, and ops() escalates it once', async (_, ids) => {
+		const bad = { ...ids, passed: true, failures: [] }
+		expect(gateValid(bad)).toBe(false)
+		const good = { snapshot: T2, gateTree: T2, passed: true, failures: [] }
+		const gate = { label: 'gate:impl', phase: 'Gate', schema: SCHEMA }
+		const { ops, calls } = load({ haiku: bad, sonnet: good })
+		expect(await ops(PROMPT, gate, gateValid)).toBe(good)
+		expect(calls.map((c) => c.label)).toEqual(['gate:impl', 'gate:impl@sonnet'])
+	})
+
+	it('gateValid accepts a 40- or 64-hex tree id equal to its gateTree, after trimming both', () => {
+		for (const id of [T1, 'c'.repeat(64)]) {
+			expect(gateValid({ snapshot: id, gateTree: id, passed: true, failures: [] })).toBe(true)
+			expect(gateValid({ snapshot: ` ${id}\n`, gateTree: `${id}\n`, passed: true, failures: [] })).toBe(true)
+		}
+	})
+
 	it('does not escalate a consistent failed gate (passed=false with failures)', async () => {
-		const failed = { snapshot: 's', passed: false, failures: [{ command: 'test' }] }
+		const failed = { snapshot: T1, gateTree: T1, passed: false, failures: [{ command: 'test' }] }
 		const { ops, calls } = load({ haiku: failed, sonnet: null })
 		expect(await ops(PROMPT, { label: 'gate:impl', phase: 'Gate', schema: SCHEMA }, gateValid)).toBe(failed)
 		expect(calls).toHaveLength(1)

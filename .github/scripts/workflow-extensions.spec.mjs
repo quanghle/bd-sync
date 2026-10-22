@@ -62,6 +62,8 @@ const FOUND = { file: 'src/a.rs', line: 4, severity: 'minor', category: 'correct
 const ARGS = { requirements: 'x', issue: 'bd-1', plan: PLAN, skipImplement: true, workdir: '/w', baseline: 'abc12345abc', actor: 'me/copilot-1', shadowReview: false }
 
 describe('plan-implement-review', () => {
+	/** A full tree id, as the gate log's gate-tree= line and the snapshot command print it. */
+	const TREE1 = 'a'.repeat(40)
 	/** A scripted run over finished work: claim, setup, a green gate, then the reviewers. */
 	const script = (over = {}) => (label, opts) => {
 		const base = label.replace(/@escalated$/, '')
@@ -69,7 +71,7 @@ describe('plan-implement-review', () => {
 		if (base === 'claim') return CLAIM
 		if (base.startsWith('heartbeat')) return { ok: true }
 		if (base === 'setup') return { workdir: '/w', baseline: 'abc12345abc', target: '/w/target', branch: 'b' }
-		if (base.startsWith('gate:')) return { passed: true, failures: [], snapshot: 'snap1', changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
+		if (base.startsWith('gate:')) return { passed: true, failures: [], snapshot: TREE1, gateTree: TREE1, changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
 		if (base.startsWith('review:')) return { findings: [] }
 		if (base.startsWith('record:')) return { ok: true, filed: [], followedUp: [] }
 		if (base.startsWith('validate:')) return { valid: true, blocking: false, reasoning: 'real but minor' }
@@ -274,10 +276,10 @@ describe('plan-implement-review', () => {
 			return { ctx, got: await wf.run(ctx) }
 		}
 		const promptOf = (ctx, label) => ctx.calls.find((c) => c.label === label).prompt
-		const GREEN = { passed: true, failures: [], snapshot: 'snap1', changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
+		const GREEN = { passed: true, failures: [], snapshot: TREE1, gateTree: TREE1, changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
 		const FOREIGN = { ...GREEN, marker: 'bd-gate: dir=/w/other run=bd-1' }
-		const UNMARKED = { passed: true, failures: [], snapshot: 'snap1', changedFiles: ['README.md'] }
-		const LINT = { passed: false, failures: [{ command: 'cargo clippy', excerpt: 'warning: x' }], snapshot: 'snap1', changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
+		const UNMARKED = { passed: true, failures: [], snapshot: TREE1, gateTree: TREE1, changedFiles: ['README.md'] }
+		const LINT = { passed: false, failures: [{ command: 'cargo clippy', excerpt: 'warning: x' }], snapshot: TREE1, gateTree: TREE1, changedFiles: ['README.md'], log: '/x/gate.log', marker: 'bd-gate: dir=/w run=bd-1' }
 
 		it('rejects a logDir that is not an absolute directory without .. or control characters, at start', async () => {
 			const wf = await load('plan-implement-review', undefined)
@@ -295,6 +297,8 @@ describe('plan-implement-review', () => {
 			expect(gate).toContain(`mkdir -p '/logs/bd-1'`)
 			expect(gate).toContain('bd-gate: dir=$PWD run=bd-1')
 			expect(gate).toContain(`head -1 '/logs/bd-1/gate-impl.log'`)
+			expect(gate).toContain('"gateTree"')
+			expect(gate).toContain(`grep '^gate-tree=' '/logs/bd-1/gate-impl.log' | tail -1`)
 			expect(ctx.logs).toContain('Logs in /logs/bd-1')
 
 			const { ctx: dflt } = await run(ARGS)
@@ -382,6 +386,40 @@ describe('plan-implement-review', () => {
 				expect(got.status).toBe('done')
 				const p = promptOf(ctx, 'gate:impl@escalated')
 				for (const piece of [`test -f '${FIRST}'`, 'gate-tree=', 'gate-exit=', '75', '128', `> '/logs/bd-1/gate-impl-escalated.log' 2>&1`]) expect(p).toContain(piece)
+				// Both branches ask for gateTree from the log they report from: the first log, or the retry's own.
+				expect(p).toContain('"gateTree"')
+				expect(p).toContain(`grep '^gate-tree=' '${FIRST}' | tail -1`)
+				expect(p).toContain(`grep '^gate-tree=' '${OWN}' | tail -1`)
+			})
+
+			it.each([
+				['a snapshot that is not a tree id', { ...GREEN, snapshot: 'UNKNOWN_NOT_RUN', gateTree: 'UNKNOWN_NOT_RUN' }],
+				['an abbreviated tree id', { ...GREEN, snapshot: 'abc1234', gateTree: 'abc1234' }],
+				['a snapshot that differs from its gateTree', { ...GREEN, gateTree: 'c'.repeat(40) }],
+			])('refuses %s, escalating once with the first log offered', async (_, first) => {
+				const { ctx, got } = await run(L, { 'gate:impl': first, 'gate:impl@escalated': { ...GREEN, log: FIRST } })
+				expect(got.status).toBe('done')
+				expect(ctx.calls.filter((c) => c.label.startsWith('gate:impl')).map((c) => [c.label, c.agent])).toEqual([
+					['gate:impl', 'task'],
+					['gate:impl@escalated', 'general-purpose'],
+				])
+				expect(promptOf(ctx, 'gate:impl@escalated')).toContain(`test -f '${FIRST}'`)
+			})
+
+			it('refuses an UNKNOWN_NOT_RUN snapshot on the escalated attempt too', async () => {
+				const unknown = { ...GREEN, snapshot: 'UNKNOWN_NOT_RUN', gateTree: 'UNKNOWN_NOT_RUN' }
+				const { ctx, got } = await run(L, { 'gate:impl': unknown, 'gate:impl@escalated': { ...unknown, log: FIRST } })
+				expect(got).toMatchObject({ status: 'escalated', reason: 'gate agent failed' })
+				expect(ctx.calls.some((c) => c.label.startsWith('review:'))).toBe(false)
+			})
+
+			it.each([
+				['a 40-hex', 'd'.repeat(40)],
+				['a 64-hex', 'e'.repeat(64)],
+			])('passes %s snapshot equal to its gateTree without escalating', async (_, id) => {
+				const { ctx, got } = await run(L, { 'gate:impl': { ...GREEN, snapshot: id, gateTree: id } })
+				expect(got.status).toBe('done')
+				expect(ctx.calls.some((c) => c.label === 'gate:impl@escalated')).toBe(false)
 			})
 
 			it('offers no reuse after a contradictory report with a foreign marker', async () => {

@@ -63,11 +63,12 @@ export const meta = {
 //   log starts with a `bd-gate: dir=$PWD run=<run>` marker that its agent returns; a report whose marker names another
 //   directory or run (or does not parse), or a pass without one, is escalated once and then ends the run as escalated
 //   ('gate log contaminated: ...'), never reaching the gate-fix coder. Each gate command ends its log with gate-tree=<tree>
-//   and gate-exit=<test exit> lines. When the first gate attempt fails on its report alone (no reply, no snapshot, or a
-//   pass contradicting its failures) and is not contaminated, the @sonnet retry may report from that attempt's log
-//   instead of rerunning: only when it has this run's marker, one exit[fmt] and one exit[clippy] line, and ends in those
-//   lines with an exit other than 75 or 128+, for the tree the retry snapshots. Otherwise it reruns into its own log, and
-//   a retry reporting any other log fails.
+//   and gate-exit=<test exit> lines. When the first gate attempt fails on its report alone (no reply, a snapshot that is
+//   not a full tree id or differs from its gateTree, the log's last gate-tree= id, or a pass contradicting its failures)
+//   and is not contaminated, the @sonnet retry may report from that attempt's log instead of rerunning: only when it has
+//   this run's marker, one exit[fmt] and one exit[clippy] line, and ends in those lines with an exit other than 75 or
+//   128+, for the tree the retry snapshots. Otherwise it reruns into its own log, and a retry reporting any other log
+//   fails.
 // - maxRounds, maxGateFixes, maxPlanRevisions, maxAmendments: loop limits (defaults below).
 // - planOnly: return the vetted plan without implementing.
 // - plan: start from a given plan (e.g. an escalated run's) instead of drafting one; planIssues lists blocking issues
@@ -342,11 +343,12 @@ const GATE = {
       },
     },
     snapshot: { type: 'string', description: 'tree id from the snapshot command' },
+    gateTree: { type: 'string', description: "tree id on the gate log's last gate-tree= line, without the prefix" },
     changedFiles: { type: 'array', items: { type: 'string' } },
     log: { type: 'string', description: 'the log file the gate command wrote' },
     marker: { type: 'string', description: 'the first line of that log (head -1), verbatim' },
   },
-  required: ['passed', 'failures', 'snapshot', 'changedFiles'],
+  required: ['passed', 'failures', 'snapshot', 'gateTree', 'changedFiles'],
 }
 const FINDING = {
   type: 'object',
@@ -824,7 +826,8 @@ const gateRerunCmd = (label) => {
 // failure (see gate()): that retry snapshots the tree first and checks the first log without running cargo (this run's
 // marker, one exit[fmt] and one exit[clippy] line, and a gate-tree=<its snapshot>, gate-exit=<n> tail with n neither 75
 // nor 128 or above and equal to the last exit[test]), reports from it if every check holds, and otherwise runs the gates
-// into its own log. Both ask for the log's raw path back; gate() strips one pair of shell quotes anyway.
+// into its own log. Both ask for the log's raw path back; gate() strips one pair of shell quotes anyway. Both also ask for
+// "gateTree", the id on the last gate-tree= line of the log reported from, which gate() checks against the snapshot.
 const gatePrompt = (label, reuseFrom) => {
   const own = logFile(label)
   const file = shPath(own)
@@ -843,7 +846,11 @@ const gatePrompt = (label, reuseFrom) => {
     `Return the path ${raw} as "log", exactly as written here and without the shell quotes, and the output of \`head -1 ${q}\` verbatim as "marker".\n`
   const changed = `Then run \`git diff --name-only ${setup.baseline} <snapshot>\` and return the list as changedFiles.`
   const snapshot = `Then run this and return its output as "snapshot":\n${SNAPSHOT_CMD}\n${changed}`
-  if (!reuseFrom) return `${inDir(DIR)}\nRun the CI gates there ${what}: ${runBlock}${readFrom(file)}${excerpts}${logReturn(own, file)}${snapshot}`
+  const gateTree = (q) =>
+    `Return the tree id on the last gate-tree= line of the log you read results from (\`grep '^gate-tree=' ${q} | tail -1\`, ` +
+    `without the gate-tree= prefix) as "gateTree".\n`
+  if (!reuseFrom)
+    return `${inDir(DIR)}\nRun the CI gates there ${what}: ${runBlock}${readFrom(file)}${excerpts}${logReturn(own, file)}${gateTree(file)}${snapshot}`
   const prev = shPath(reuseFrom)
   return (
     `${inDir(DIR)}\nAn earlier attempt ran the CI gates ${what} there into ${prev}, but its report was unusable. ` +
@@ -854,17 +861,18 @@ const gatePrompt = (label, reuseFrom) => {
     `4. \`tail -n 2 ${prev}\` prints exactly gate-tree=<your snapshot> and then gate-exit=<n>, where n is neither 75 (the suite lock was busy and nothing ran) ` +
     `nor 128 or above (killed), and n equals the code on the last exit[test] line (\`grep '^exit\\[test\\]=' ${prev} | tail -1\`).\n` +
     `If every check holds, do not run cargo. ${readFrom(prev)}Return "passed" true exactly when exit[fmt], exit[clippy] and n are all 0. ` +
-    `${excerpts}${logReturn(reuseFrom, prev)}Return the snapshot you took first as "snapshot". ${changed}\n` +
+    `${excerpts}${logReturn(reuseFrom, prev)}${gateTree(prev)}Return the snapshot you took first as "snapshot". ${changed}\n` +
     `If any check fails (the log is missing, incomplete, killed, another run's or directory's, or records a different tree), ` +
-    `run the gates into your own log: ${runBlock}${readFrom(file)}${excerpts}${logReturn(own, file)}After that run, take a new snapshot. ${snapshot}\n` +
+    `run the gates into your own log: ${runBlock}${readFrom(file)}${excerpts}${logReturn(own, file)}${gateTree(file)}After that run, take a new snapshot. ${snapshot}\n` +
     `Either way, never read any other log.`
   )
 }
 // A gate report that contradicts itself, or whose log is contaminated, counts as a failed gate agent and is escalated
 // once. If the last attempt is still contaminated, gate() returns a { contaminated } marker instead of null; the marker
 // reflects only that attempt and names the log it used. ops() calls valid on the first attempt before it renders the
-// retry, so valid records whether the first attempt failed on its report alone (no reply, no snapshot, or a pass
-// contradicting its failures) with a log that may still be good: a report naming another run or directory, or a pass
+// retry, so valid records whether the first attempt failed on its report alone (no reply, a snapshot that is not a full
+// tree id (40 or 64 lowercase hex) or differs from its gateTree, or a pass contradicting its failures; both trimmed only
+// for the check) with a log that may still be good: a report naming another run or directory, or a pass
 // without a marker, never offers it. Only then is the retry offered the first attempt's log (gatePrompt's reuseFrom),
 // and its report must name that log or its own (one pair of shell quotes stripped): any other fails the attempt.
 const gate = async (label) => {
@@ -872,10 +880,13 @@ const gate = async (label) => {
   const first = logFile(label)
   let reuse = false
   let dirty = null
+  const TREE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
   const r = await ops((l, prev) => gatePrompt(l, prev && reuse ? first : undefined), { label, phase: 'Gate', schema: GATE }, (x, l) => {
     dirty = null
     const retry = l !== label
-    if (!(x?.snapshot && x.passed !== x.failures.length > 0)) {
+    const snap = typeof x?.snapshot === 'string' ? x.snapshot.trim() : ''
+    const tree = typeof x?.gateTree === 'string' ? x.gateTree.trim() : ''
+    if (!(TREE.test(snap) && tree === snap && x.passed !== x.failures.length > 0)) {
       if (!retry) reuse = x == null || !contamination(x, DIR, RUN_ID)
       return false
     }

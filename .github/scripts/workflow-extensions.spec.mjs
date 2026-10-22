@@ -592,6 +592,73 @@ describe('plan-implement-review', () => {
 			expect(ctx.calls.find((c) => c.label === 'record:r0').prompt).toContain(`${SENTENCE}Return ok=true`)
 		})
 	})
+
+	// The fix coder once reported a change under a bd id, which settled a bogus ledger entry: its schema now takes only
+	// this call's F-ids, and a change matching no finding settles nothing. reviewStep and the record:r0 filing give F1
+	// its bdId before the fix coder runs, so the finding's own bdId is a real case here.
+	describe('fix coder ids', () => {
+		const run = async (over) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx(
+				{ ...ARGS, reviewStep: 'bd-1.review' },
+				script({
+					'review:code:r0': { findings: [FOUND] },
+					'validate:r0:F1': { valid: true, blocking: true, reasoning: 'real', fixInstruction: 'fix it' },
+					'planner:triage:r0': { items: [{ id: 'F1', action: 'fix', reason: 'r', instruction: 'i' }], converging: true },
+					'record:r0': { ok: true, filed: [{ id: 'F1', bdId: 'bd-1.review.1' }], followedUp: [] },
+					...over,
+				}),
+			)
+			return { ctx, got: await wf.run(ctx) }
+		}
+		const fixCall = (ctx) => ctx.calls.find((c) => c.label === 'coder:fix:r1')
+		const reachedGate = (ctx) => ctx.calls.some((c) => c.label === 'gate:r1')
+		const fixEntries = (got) => got.ledger.filter((e) => e.source === 'fix')
+		const UNMATCHED = 'Fix changes matched no finding in this call and settle nothing: '
+
+		it("passes this call's F-ids as the changes[].id enum", async () => {
+			const { ctx, got } = await run({ 'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }] } })
+			const call = fixCall(ctx)
+			const id = call.schema.properties.changes.items.properties.id
+			expect(id.type).toBe('string')
+			expect(id.enum).toEqual(['F1'])
+			expect(call.schema.required).toEqual(['summary', 'filesChanged', 'changes'])
+			expect(call.prompt).toContain('F-id exactly as given')
+			expect(reachedGate(ctx)).toBe(true)
+			expect(fixEntries(got)).toMatchObject([{ about: 'F1', decision: 'c', rationale: 'Handles nothing', files: ['src/a.rs'] }])
+		})
+
+		it('settles nothing for a change under a bd id and escalates naming it', async () => {
+			const { ctx, got } = await run({
+				'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'bd-1.review.1', change: 'c' }, { id: 'bd-nx85b', change: 'c' }] },
+			})
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toBe('coder could not fix F1 without breaking the ledger (coder reported unknown ids: bd-1.review.1, bd-nx85b)')
+			expect(fixEntries(got)).toEqual([])
+			expect(got.open.map((f) => [f.id, f.bdId])).toEqual([['F1', 'bd-1.review.1']])
+			expect(ctx.logs).toContain(`${UNMATCHED}bd-1.review.1, bd-nx85b`)
+			expect(reachedGate(ctx)).toBe(false)
+		})
+
+		it('escalates without unknown ids when the coder reports no change', async () => {
+			const { ctx, got } = await run({ 'coder:fix:r1': { summary: 's', filesChanged: [], changes: [] } })
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toBe('coder could not fix F1 without breaking the ledger')
+			expect(got.reason).not.toContain('unknown ids')
+			expect(ctx.logs.some((m) => m.startsWith(UNMATCHED))).toBe(false)
+			expect(reachedGate(ctx)).toBe(false)
+		})
+
+		it('goes on to the gate when every finding matched, logging extra ids', async () => {
+			const { ctx, got } = await run({
+				'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }, { id: 'bd-nx85b', change: 'c' }] },
+			})
+			expect(reachedGate(ctx)).toBe(true)
+			expect(fixEntries(got)).toHaveLength(1)
+			expect(fixEntries(got)).toMatchObject([{ about: 'F1', rationale: 'Handles nothing', files: ['src/a.rs'] }])
+			expect(ctx.logs).toContain(`${UNMATCHED}bd-nx85b`)
+		})
+	})
 })
 
 describe('score-issue', () => {

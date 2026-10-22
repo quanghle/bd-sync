@@ -1188,8 +1188,44 @@ async function run(ctx) {
         `Fix ONLY these findings, minimally, as instructed. Do not refactor, restyle, or address anything else, even if you notice it ` +
         `(mention it in notes instead). If an instruction cannot be done without breaking a ledger entry, skip that finding and say why in notes. ` +
         `Add or adjust tests that prove each fix. Run \`cargo fmt --all\` and the affected tests before returning. ` +
-        `Return one "changes" entry per finding you fixed.\n\n` +
+        `Return one "changes" entry per finding you fixed, with id set to that finding's F-id exactly as given above.\n\n` +
         logRule(label);
+
+    // The fix coder's schema accepts only this call's F-ids as changes[].id: the runtime validates it at the StructuredOutput
+    // call and has the agent retry on a mismatch. work is never empty here (the loop returns before Fix when it is).
+    const fixedSchema = (work) => {
+        const ids = work.map((x) => x.f.id);
+        return {
+            ...FIXED,
+            properties: {
+                ...FIXED.properties,
+                changes: {
+                    ...FIXED.properties.changes,
+                    items: {
+                        ...FIXED.properties.changes.items,
+                        properties: {
+                            ...FIXED.properties.changes.items.properties,
+                            id: { type: "string", enum: ids, description: `the fixed finding's F-id: one of ${ids.join(", ")}` },
+                        },
+                    },
+                },
+            },
+        };
+    };
+    // Matches fix changes to this call's findings by F-id only. An unmatched id settles nothing; a finding with no matched
+    // change is skipped.
+    const matchFixes = (work, changes) => {
+        const byId = new Map(work.map((x) => [x.f.id, x.f]));
+        const matched = [];
+        const unmatched = [];
+        for (const ch of changes || []) {
+            const f = byId.get(ch.id);
+            if (f) matched.push({ f, ch });
+            else unmatched.push(ch.id);
+        }
+        const done = new Set(matched.map((m) => m.f.id));
+        return { matched, unmatched, skipped: work.filter((x) => !done.has(x.f.id)) };
+    };
 
     for (let round = 0; round <= MAX_ROUNDS; round++) {
         const pass = await reviewPass(round);
@@ -1286,17 +1322,16 @@ async function run(ctx) {
         await renew();
         ctx.log(`Fixing ${work.length} finding(s): ${work.map((x) => x.f.id).join(", ")}; dropped ${drops.length}`);
         const fixLabel = `coder:fix:r${round + 1}`;
-        const fixed = await agent(fixPrompt(work, fixLabel), { label: fixLabel, schema: FIXED, ...CODER_OPTS });
+        const fixed = await agent(fixPrompt(work, fixLabel), { label: fixLabel, schema: fixedSchema(work), ...CODER_OPTS });
         if (!fixed) return result("escalated", { reason: "fix coder failed", open: work.map((x) => x.f) });
-        for (const c of fixed.changes) {
-            const f = open.find((o) => o.id === c.id);
-            settle({ source: "fix", round: round + 1, about: c.id, decision: c.change, rationale: f ? f.claim : "", files: f ? [f.file] : fixed.filesChanged });
-        }
-        const fixedIds = new Set(fixed.changes.map((c) => c.id));
-        const skipped = work.filter((x) => !fixedIds.has(x.f.id));
+        const { matched, unmatched, skipped } = matchFixes(work, fixed.changes);
+        for (const { f, ch } of matched) settle({ source: "fix", round: round + 1, about: f.id, decision: ch.change, rationale: f.claim, files: [f.file] });
+        if (unmatched.length) ctx.log(`Fix changes matched no finding in this call and settle nothing: ${unmatched.join(", ")}`);
         if (skipped.length) {
             return result("escalated", {
-                reason: `coder could not fix ${skipped.map((x) => x.f.id).join(", ")} without breaking the ledger`,
+                reason:
+                    `coder could not fix ${skipped.map((x) => x.f.id).join(", ")} without breaking the ledger` +
+                    (unmatched.length ? ` (coder reported unknown ids: ${unmatched.join(", ")})` : ""),
                 notes: fixed.notes,
                 open: work.map((x) => x.f),
             });

@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { canonicalModel, ROLE_PREFIXES } from './reviewer-catch.mjs'
-import { activeMs, bdRunner, fmtDuration, logDirs, readRecord, stepFrom, timingOf, trace } from './trace-run.mjs'
+import { activeMs, bdRunner, fmtDuration, issueChecker, logDirs, readRecord, stepFrom, timingOf, trace } from './trace-run.mjs'
 
 // ---------- roles ----------
 // What an agent did, from its trace label: 'main', a workflow's '<workflow>:<role>[:...]', or a subagent's
@@ -583,6 +583,9 @@ function main(argv) {
   const root = opt('--root')
   const dirs = logDirs(opt)
   const bd = bdRunner(root)
+  // A still-running workflow's prompt names candidates bd may not know (bd-gate, bd-core): a quiet runner keeps bd's
+  // not-found errors off calibrate's stderr, and one checker serves every run, so each id is asked once and a bd failure warns once.
+  const isIssue = issueChecker(bdRunner(root, { quiet: true }))
   const issues = bd(['list', '--all', '-n', '0'])
   // A run without a review step has no follow-ups; any other failure leaves the count unknown, not zero.
   const followUpsOf = (step) => {
@@ -596,7 +599,7 @@ function main(argv) {
   }
   const traceOf = (id) => {
     try {
-      const work = trace(readRecord(id, bd), dirs)
+      const work = trace(readRecord(id, bd), { ...dirs, isIssue })
       const why = untracedWhy(work)
       return why ? { work: null, why } : { work, why: null }
     } catch (e) {

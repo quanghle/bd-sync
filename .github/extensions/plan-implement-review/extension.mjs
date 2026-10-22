@@ -275,6 +275,9 @@ const TARGET_CMD = 'echo "$(git rev-parse --show-toplevel)/target"';
 // A path compared lexically only (no '..' resolution, no realpath): backslashes become '/', repeated '/' collapse, a
 // trailing '/' goes and a leading drive letter is lowercased. Kept identical to the Claude Code workflow's normPath.
 const normPath = (p) => String(p).replace(/\\/g, "/").replace(/\/{2,}/g, "/").replace(/\/+$/, "").replace(/^[A-Za-z]:/, (d) => d.toLowerCase());
+// A full git tree id, SHA-1 or SHA-256 (40 or 64 lowercase hex), as git write-tree and rev-parse <commit>^{tree} print
+// it: what gate() requires of a snapshot and setupOk of a baseline. Kept identical to the Claude Code workflow's TREE.
+const TREE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
 const fmtFinding = (f) =>
     `[${f.id}] ${f.severity} ${f.category} — ${f.file}${f.line ? ":" + f.line : ""}\n  Claim: ${f.claim}\n  Evidence: ${f.evidence}` +
@@ -684,15 +687,20 @@ async function run(ctx) {
     // TARGET_CMD answers for the agent's cwd, so a setup agent that ran it from the main checkout would report main's target
     // and the run would silently share it: the target must be <the reported workdir>/target, and that workdir args.workdir
     // when given, compared with normPath (no symlinks resolved, so pass workdir as the worktree's top level as git reports
-    // it: git rev-parse --show-toplevel). A mismatch is a failed attempt, escalated once by ops(); a second ends the run as
-    // escalated ('setup agent failed').
+    // it: git rev-parse --show-toplevel). The baseline, trimmed, must be a full tree id (TREE), so a short id, 'HEAD' or
+    // other text never becomes what reviewers diff against; a non-tree one is logged with its value. Each check that fails
+    // logs its own line. A mismatch of either is a failed attempt, escalated once by ops(); a second ends the run as
+    // escalated ('setup agent failed'). A report missing a field fails silently.
     const setupOk = (r, label) => {
         if (!(r?.workdir && r.baseline && r.target)) return false;
+        const base = typeof r.baseline === "string" ? r.baseline.trim() : "";
+        const treeOk = TREE.test(base);
+        if (!treeOk) ctx.log(`setup ${label}: baseline ${JSON.stringify(r.baseline)} is not a full tree id`);
         const dirOk = !A.workdir || normPath(r.workdir) === normPath(A.workdir);
         const want = `${normPath(A.workdir || r.workdir)}/target`;
-        if (dirOk && normPath(r.target) === want) return true;
-        ctx.log(`setup ${label}: target ${r.target} is not ${want}` + (dirOk ? "" : ` (workdir ${r.workdir} is not ${A.workdir})`));
-        return false;
+        const targetOk = dirOk && normPath(r.target) === want;
+        if (!targetOk) ctx.log(`setup ${label}: target ${r.target} is not ${want}` + (dirOk ? "" : ` (workdir ${r.workdir} is not ${A.workdir})`));
+        return treeOk && targetOk;
     };
     const setup = await ops(
         A.workdir && A.baseline
@@ -710,6 +718,8 @@ async function run(ctx) {
         setupOk,
     );
     if (!setup) return { status: "escalated", reason: "setup agent failed", lease };
+    // setupOk checked it trimmed: every later use (prompts, git diff, prevSnap, the planOnly result) gets the bare id.
+    setup.baseline = setup.baseline.trim();
     DIR = setup.workdir;
     TARGET = setup.target;
     ctx.log(`Working in ${DIR} (baseline ${setup.baseline.slice(0, 8)})`);
@@ -902,7 +912,6 @@ async function run(ctx) {
         const first = logFile(label);
         let reuse = false;
         let dirty = null;
-        const TREE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
         const r = await ops((l, prev) => gatePrompt(l, prev && reuse ? first : undefined), { label, schema: GATE }, (x, l) => {
             dirty = null;
             const retry = l !== label;

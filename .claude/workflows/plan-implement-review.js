@@ -48,10 +48,11 @@ export const meta = {
 //   cargo command runs with CARGO_TARGET_DIR=<the worktree's top level>/target (git rev-parse --show-toplevel in the
 //   worktree or the given workdir): a dir of that worktree alone, gitignored and removed with the worktree. Checkouts of
 //   one workspace sharing a target dir get the same fingerprint per workspace crate and judge freshness by mtimes, so
-//   one could link another's build. A first build there is cold. Setup's report is checked: its target must be <its
-//   workdir>/target and, with workdir given, its workdir this one, compared lexically with no symlinks resolved, so pass
-//   the worktree's top level as git reports it (git rev-parse --show-toplevel); otherwise setup escalates once and the
-//   run ends as escalated ('setup agent failed').
+//   one could link another's build. A first build there is cold. Setup's report is checked: its baseline, trimmed,
+//   must be a full tree id (40 or 64 lowercase hex), so a short id, 'HEAD' or other text never becomes what reviewers
+//   diff against, and its target must be <its workdir>/target and, with workdir given, its workdir this one, compared
+//   lexically with no symlinks resolved, so pass the worktree's top level as git reports it (git rev-parse
+//   --show-toplevel); otherwise setup escalates once and the run ends as escalated ('setup agent failed').
 // - baseline (a commit, with workdir): what reviewers diff against instead of the workdir's state at the start.
 // - logDir (an absolute directory without '..' or control characters; pass your scratchpad): every agent that runs cargo
 //   writes each command's output to its own file, <logDir>/<run>/<label>.log, and reads results only from it, where run
@@ -435,6 +436,9 @@ const TARGET_CMD = 'echo "$(git rev-parse --show-toplevel)/target"'
 // A path compared lexically only (no '..' resolution, no realpath): backslashes become '/', repeated '/' collapse, a
 // trailing '/' goes and a leading drive letter is lowercased. Kept identical to the Copilot extension's normPath.
 const normPath = (p) => String(p).replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/\/+$/, '').replace(/^[A-Za-z]:/, (d) => d.toLowerCase())
+// A full git tree id, SHA-1 or SHA-256 (40 or 64 lowercase hex), as git write-tree and rev-parse <commit>^{tree} print
+// it: what gate() requires of a snapshot and setupOk of a baseline. Kept identical to the Copilot extension's TREE.
+const TREE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 let TARGET = ''
 let DIR = ''
 const inDir = (dir) =>
@@ -679,17 +683,25 @@ const setupPrompt = () =>
   (LOG_DIR ? '' : `\nAlso run \`printf %s "\${TMPDIR:-/tmp}"\` and return its output as tmpdir.`)
 // TARGET_CMD answers for the agent's cwd, so a setup agent that ran it from the main checkout would report main's target
 // and the run would silently share it: the target must be <the reported workdir>/target, and that workdir args.workdir
-// when given, compared with normPath (no realpath). A mismatch is a failed attempt, escalated once by ops().
+// when given, compared with normPath (no realpath). The baseline, trimmed, must be a full tree id (TREE), so a short id,
+// 'HEAD' or other text never becomes what reviewers diff against; a non-tree one is logged with its value. Each check
+// that fails logs its own line. A mismatch of either is a failed attempt, escalated once by ops(); a second ends the run
+// as escalated ('setup agent failed'). A report missing a field fails silently.
 const setupOk = (r, label) => {
   if (!(r?.workdir && r.baseline && r.target)) return false
+  const base = typeof r.baseline === 'string' ? r.baseline.trim() : ''
+  const treeOk = TREE.test(base)
+  if (!treeOk) log(`setup ${label}: baseline ${JSON.stringify(r.baseline)} is not a full tree id`)
   const dirOk = !A.workdir || normPath(r.workdir) === normPath(A.workdir)
   const want = `${normPath(A.workdir || r.workdir)}/target`
-  if (dirOk && normPath(r.target) === want) return true
-  log(`setup ${label}: target ${r.target} is not ${want}` + (dirOk ? '' : ` (workdir ${r.workdir} is not ${A.workdir})`))
-  return false
+  const targetOk = dirOk && normPath(r.target) === want
+  if (!targetOk) log(`setup ${label}: target ${r.target} is not ${want}` + (dirOk ? '' : ` (workdir ${r.workdir} is not ${A.workdir})`))
+  return treeOk && targetOk
 }
 const setup = await ops(setupPrompt, { label: 'setup', phase: 'Setup', schema: SETUP }, setupOk)
 if (!setup?.workdir || !setup.baseline || !setup.target) return { status: 'escalated', reason: 'setup agent failed', lease }
+// setupOk checked it trimmed: every later use (prompts, git diff, prevSnap, the planOnly result) gets the bare id.
+setup.baseline = setup.baseline.trim()
 DIR = setup.workdir
 TARGET = setup.target
 LOG_ROOT ||= `${tmpRootOf(setup.tmpdir).replace(/\/$/, '')}/plan-implement-review`
@@ -880,7 +892,6 @@ const gate = async (label) => {
   const first = logFile(label)
   let reuse = false
   let dirty = null
-  const TREE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
   const r = await ops((l, prev) => gatePrompt(l, prev && reuse ? first : undefined), { label, phase: 'Gate', schema: GATE }, (x, l) => {
     dirty = null
     const retry = l !== label

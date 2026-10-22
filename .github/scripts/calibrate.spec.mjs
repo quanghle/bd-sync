@@ -4,7 +4,7 @@ import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { aggregate, coderOf, costOf, joinRuns, overlaps, PRICES, render, roleOf, untracedWhy } from './calibrate.mjs'
+import { aggregate, coderOf, costOf, joinRuns, overlaps, plannerOf, PRICES, render, roleOf, untracedWhy } from './calibrate.mjs'
 import { ROLE_PREFIXES } from './reviewer-catch.mjs'
 
 // credits: the AI credits a request cost; left out, a trace stored without them.
@@ -100,6 +100,44 @@ describe('coderOf', () => {
 	it('is null without a coder agent or a trace', () => {
 		expect(coderOf(work(agent('main', 'main', 9, tokens(1, 1)), agent('subagent', 'Explore: find it', 3, tokens(1, 1))))).toBeNull()
 		expect(coderOf(null)).toBeNull()
+	})
+})
+
+describe('plannerOf', () => {
+	it('sums requests per model and effort among workflow planner, critic and triage agents, ignoring other roles and subagents', () => {
+		// Counting the planner: subagent, the validator or the coder would make high win.
+		const w = work(
+			agent('workflow', 'plan-implement-review:planner:draft', 3, tokens(1, 1), 'claude-opus-5.5', 'medium'),
+			agent('workflow', 'plan-implement-review:planner:critic:0', 2, tokens(1, 1), 'claude-opus-5-5', 'medium'),
+			agent('workflow', 'plan-implement-review:planner:triage:r0', 4, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('subagent', 'general-purpose: planner: plan bd-x', 2, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('workflow', 'plan-implement-review:validate:r0:F1', 50, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('workflow', 'plan-implement-review:coder:S1', 20, tokens(1, 1), 'claude-opus-5.5', 'high'),
+		)
+		expect(plannerOf(w)).toEqual({ model: 'claude-opus-5.5', effort: 'medium', requests: 5 })
+	})
+
+	it('prefers workflow planner agents over a `planner:` subagent with more requests', () => {
+		const w = work(
+			agent('workflow', 'plan-implement-review:planner:draft', 2, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('subagent', 'general-purpose: planner: plan bd-x', 5, tokens(1, 1), 'claude-opus-5.5', 'medium'),
+		)
+		expect(plannerOf(w)).toEqual({ model: 'claude-opus-5.5', effort: 'high', requests: 2 })
+	})
+
+	it('falls back to `planner:` subagents when there is no workflow planner agent', () => {
+		const w = work(
+			agent('subagent', 'general-purpose: planner: plan bd-x', 3, tokens(1, 1), 'claude-opus-5.5', 'high'),
+			agent('subagent', 'Plan: planner: estimate bd-x', 2, tokens(1, 1), 'claude-opus-5.5', 'medium'),
+			agent('workflow', 'plan-implement-review:coder:S1', 30, tokens(1, 1), 'claude-opus-5.5', 'medium'),
+			agent('workflow', 'plan-implement-review:validate:r0:F1', 30, tokens(1, 1), 'claude-opus-5.5', 'medium'),
+		)
+		expect(plannerOf(w)).toEqual({ model: 'claude-opus-5.5', effort: 'high', requests: 3 })
+	})
+
+	it('is null without a planner agent or a trace', () => {
+		expect(plannerOf(work(agent('main', 'main', 9, tokens(1, 1)), agent('subagent', 'Explore: find it', 3, tokens(1, 1))))).toBeNull()
+		expect(plannerOf(null)).toBeNull()
 	})
 })
 
@@ -283,6 +321,18 @@ describe('joinRuns', () => {
 		expect(row).toMatchObject({ exploration, coder: { model: 'claude-sonnet-5.5', effort: 'medium', requests: 6 } })
 		expect(JSON.parse(JSON.stringify(row)).exploration).toEqual(exploration)
 	})
+
+	it("puts each run's planner on its row", () => {
+		expect(rows.map((r) => r.planner)).toEqual([null, null])
+		const exploration = { planner: 'opus/medium', plannerRule: 'sha1-2-0-3' }
+		const [row] = joinRuns([run('bd-p.1', { exploration, work: work(agent('workflow', 'plan-implement-review:planner:draft', 7, tokens(1, 1), 'claude-opus-5-5', 'medium')) })], {
+			followUpsOf: () => [],
+			traceOf: () => ({ work: null, why: 'unused' }),
+		})
+		const planner = { model: 'claude-opus-5.5', effort: 'medium', requests: 7 }
+		expect(row).toMatchObject({ exploration, planner })
+		expect(JSON.parse(JSON.stringify(row)).planner).toEqual(planner)
+	})
 })
 
 // A run judged complexity 2, as aggregate reads it.
@@ -375,6 +425,60 @@ describe('aggregate and render', () => {
 		expect(md).toContain('| unknown | 2 | claude-sonnet-5.5/medium | 1 | 4 | 0 | 1 |')
 		expect(md).toContain('exploration counts runs marked by the coder exploration quota')
 		expect(md).toContain('or among its \`coder:\` subagents when it has none')
+	})
+
+	it('puts runs without a planner agent apart from untraced ones in the score by planner', () => {
+		expect(agg.planners).toEqual([
+			{ rubric: null, complexity: 2, planner: 'untraced', model: null, effort: null, runs: 1, overall: 4, serious: 0, plannerCost: null, exploration: 0 },
+			{ rubric: null, complexity: 3, planner: 'no planner agent', model: null, effort: null, runs: 1, overall: 4, serious: 0, plannerCost: 0, exploration: 0 },
+			{ rubric: null, complexity: 4, planner: 'no planner agent', model: null, effort: null, runs: 1, overall: 3, serious: 2, plannerCost: 0, exploration: 0 },
+		])
+	})
+
+	it('scores each complexity band by planner, with the planner cost per run, counting planner exploration runs', () => {
+		const explored = [
+			scoredRow(
+				'p1',
+				4,
+				0,
+				work(
+					agent('workflow', 'plan-implement-review:planner:draft', 5, tokens(1, 1, 0, 0, 400), 'claude-opus-5.5', 'medium'),
+					agent('workflow', 'plan-implement-review:validate:r0:F1', 9, tokens(1, 1, 0, 0, 900), 'claude-opus-5.5', 'high'),
+					agent('subagent', 'general-purpose: planner: estimate p1', 1, tokens(1, 1, 0, 0, 100), 'claude-opus-5.5', 'high'),
+				),
+				{ exploration: { planner: 'opus/medium', plannerRule: 'sha1-2-0-3' } },
+			),
+			scoredRow('p2', 3, 1, work(agent('subagent', 'general-purpose: planner: x', 5, tokens(1, 1, 0, 0, 200), 'claude-opus-5-5', 'high'))),
+			scoredRow('p3', 5, 0, null),
+		]
+		const a = aggregate(explored)
+		// p1's cost is its draft ($4) and its pre-step subagent ($1), not its validator.
+		expect(a.planners).toEqual([
+			{ rubric: null, complexity: 2, planner: 'claude-opus-5.5/high', model: 'claude-opus-5.5', effort: 'high', runs: 1, overall: 3, serious: 1, plannerCost: 2, exploration: 0 },
+			{ rubric: null, complexity: 2, planner: 'claude-opus-5.5/medium', model: 'claude-opus-5.5', effort: 'medium', runs: 1, overall: 4, serious: 0, plannerCost: 5, exploration: 1 },
+			{ rubric: null, complexity: 2, planner: 'untraced', model: null, effort: null, runs: 1, overall: 5, serious: 0, plannerCost: null, exploration: 0 },
+		])
+		const md = render(explored, a)
+		expect(md).toContain('## Score by planner')
+		expect(md).toContain('| unknown | 2 | claude-opus-5.5/medium | 1 | 4 | 0 | $5.00 | 1 |')
+		expect(md).toContain('exploration counts runs marked by the planner effort exploration')
+	})
+
+	it('counts coder and planner exploration from their own keys of one exploration value', () => {
+		const w = work(
+			agent('workflow', 'plan-implement-review:coder:S1', 5, tokens(1, 1), 'claude-sonnet-5.5', 'medium'),
+			agent('workflow', 'plan-implement-review:planner:draft', 3, tokens(1, 1), 'claude-opus-5.5', 'medium'),
+		)
+		const plannerOnly = { planner: 'opus/medium', plannerRule: 'sha1-2-0-3' }
+		const coderOnly = { coder: 'sonnet/medium', rule: 'sha1-0-3' }
+		const a = aggregate([
+			scoredRow('x1', 4, 0, w, { exploration: plannerOnly }),
+			scoredRow('x2', 4, 0, w, { exploration: coderOnly }),
+			scoredRow('x3', 4, 0, w, { exploration: { ...coderOnly, ...plannerOnly } }),
+		])
+		expect(a.coders[0].exploration).toBe(2)
+		expect(a.planners[0].exploration).toBe(2)
+		expect(aggregate([scoredRow('x1', 4, 0, w, { exploration: plannerOnly })]).coders[0].exploration).toBe(0)
 	})
 
 	it('splits the score by coder by rubric version, so one band under v2 and v3 stays apart', () => {
@@ -475,12 +579,15 @@ describe('aggregate and render', () => {
 			'## Complexity: estimate vs judged',
 			'## Score by complexity',
 			'## Score by coder',
+			'## Score by planner',
 			'## Cost and time by complexity',
 			'## Time by step',
 			'## Cost and time by role, model and effort',
 			'## Main-thread context per request',
 		])
 			expect(md).toContain(heading)
+		expect(md.indexOf('## Score by coder')).toBeLessThan(md.indexOf('## Score by planner'))
+		expect(md.indexOf('## Score by planner')).toBeLessThan(md.indexOf('## Cost and time by complexity'))
 		expect(md).toContain('Costs are Copilot AI credits as USD (1 credit = $0.01)')
 		expect(md).toContain('| r1 | small | 2 | 3 | 1 | 4 (draft) | – |')
 		expect(md).toContain('| unknown | 2 | 1 | 4 | 0 |')

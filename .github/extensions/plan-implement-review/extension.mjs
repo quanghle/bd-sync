@@ -393,6 +393,13 @@ const reviewEffortOf = (v) => {
     if (!EFFORTS.includes(v)) throw new Error(`args.reviewEffort must be one of ${EFFORTS.join("|")}, got ${JSON.stringify(v)}`);
     return { effort: v };
 };
+// args.plannerEffort: the effort of the planner-role agents (planner draft, critic, final, revise, triage); "high" when absent, a
+// known word as is; anything else throws. Validators stay high.
+const effortOf = (v, name) => {
+    if (v == null) return "high";
+    if (!EFFORTS.includes(v)) throw new Error(`args.${name} must be one of ${EFFORTS.join("|")}, got ${JSON.stringify(v)}`);
+    return v;
+};
 
 // A follow-up's key: FNV-1a of its file and claim. Finding ids restart at F1 each run, so an id alone would match another
 // run's follow-up on the same step; the claim is the same on resume (journaled agents) and differs between findings.
@@ -447,6 +454,9 @@ function parseArgs(raw) {
         CODER_OPTS: { ...(A.model ? { model: A.model } : {}), ...(A.effort ? { effort: A.effort } : {}) },
         // Effort for the real reviewers only (shadows keep theirs, validators stay high); absent: the session's.
         REVIEW_OPTS: reviewEffortOf(A.reviewEffort),
+        // Effort for the planner-role agents (planner draft, critic, final, revise, triage), for AGENTS.md's planner effort
+        // exploration; validators stay high. Default high.
+        PLANNER_EFFORT: effortOf(A.plannerEffort, "plannerEffort"),
         // args.logDir, checked here so a bad value throws at start; the run's log directory is named by RUN_ID.
         LOG_DIR: logDirOf(A.logDir),
         RUN_ID: A.issue ? safeId(A.issue) : `run-${fnv1a(`${reqText}\n${A.workdir ?? ""}`)}`,
@@ -472,7 +482,7 @@ const recordAgent = (run, entry) => {
 const RECORDED = /^(review|validate):/;
 
 async function run(ctx) {
-    const { A, TASK, BASE, MAX_ROUNDS, MAX_GATE_FIXES, MAX_PLAN_REVISIONS, MAX_AMENDMENTS, TTL, SHADOWS, CODER_OPTS, REVIEW_OPTS, LOG_DIR, RUN_ID } = parseArgs(ctx.args);
+    const { A, TASK, BASE, MAX_ROUNDS, MAX_GATE_FIXES, MAX_PLAN_REVISIONS, MAX_AMENDMENTS, TTL, SHADOWS, CODER_OPTS, REVIEW_OPTS, PLANNER_EFFORT, LOG_DIR, RUN_ID } = parseArgs(ctx.args);
 
     // Workflow subagents: `kind` picks the built-in agent, `effort` its reasoning effort, `model` a Copilot model id.
     // Identical prompt + options are memoized into one subagent, so labels must be unique per call.
@@ -704,6 +714,7 @@ async function run(ctx) {
     ctx.log(`Logs in ${LOG_ROOT}/${RUN_ID}`);
     if (SHADOWS.length) ctx.log(`Shadow reviewers: ${SHADOWS.map((o) => `${o.model}/${o.effort}`).join(", ")}`);
     if (REVIEW_OPTS.effort) ctx.log(`Reviewers at effort ${REVIEW_OPTS.effort}`);
+    if (PLANNER_EFFORT !== "high") ctx.log(`Planner effort: ${PLANNER_EFFORT} (planner, critic, triage; validators stay high)`);
 
     // ---------- Plan ----------
     // Every planning agent renews the lease first, so no gap between renewals spans more than one planning agent.
@@ -730,7 +741,7 @@ async function run(ctx) {
     const fmtBlockers = (bs) =>
         bs.map((b) => `- ${b.issue}\n    evidence: ${b.evidence}${b.suggestion ? `\n    suggestion: ${b.suggestion}` : ""}`).join("\n");
     const badPlan = (p) => !p.steps?.length || !p.requirements?.length;
-    let plan = A.plan ?? (await planAgent(planIntro, { label: "planner:draft", effort: "high", schema: PLAN }));
+    let plan = A.plan ?? (await planAgent(planIntro, { label: "planner:draft", effort: PLANNER_EFFORT, schema: PLAN }));
     if (!plan || badPlan(plan)) return { status: "escalated", reason: "planner failed", workdir: DIR, lease };
     if (A.plan) ctx.log(`Starting from the given plan (${plan.steps.length} step(s))`);
     // Issues already known against a given plan stand in for the first critique.
@@ -756,7 +767,7 @@ async function run(ctx) {
                     `a step order that leaves the build or tests broken, a violated AGENTS.md convention, missing tests for new behavior, code that would not ` +
                     `build on macOS or Windows, a step assigned to the controller or a person, or one needing work outside the coder's limits (it belongs in "risks"), or a decision whose rationale is wrong. Preferences and alternatives that are merely different are not blocking. ` +
                     `approved=true if nothing blocks.`,
-                { label: `planner:critic:${rev}`, kind: "rubber-duck", effort: "high", schema: CRITIQUE },
+                { label: `planner:critic:${rev}`, kind: "rubber-duck", effort: PLANNER_EFFORT, schema: CRITIQUE },
             );
             if (!crit) ctx.log(`Plan critic ${rev} failed; accepting the plan as is`);
             blockers = (crit?.issues || []).filter((i) => i.blocking);
@@ -782,7 +793,7 @@ async function run(ctx) {
                     `Verified blocking issues, each with its fix:\n${fmtBlockers(blockers)}\n\n` +
                     `Return the full plan with exactly these corrections applied (adopt each suggestion; if the code shows one is wrong, ` +
                     `make the smallest change that resolves the issue and record why in "decisions"). Change nothing else.`,
-                { label: `planner:final:${rev}`, effort: "high", schema: PLAN },
+                { label: `planner:final:${rev}`, effort: PLANNER_EFFORT, schema: PLAN },
             );
             if (!final || badPlan(final)) return { status: "escalated", reason: "planner failed to apply the final corrections", workdir: DIR, plan, blockers, lease };
             plan = final;
@@ -796,7 +807,7 @@ async function run(ctx) {
                 `The critic raised these blocking issues:\n${fmtBlockers(blockers)}\n\n` +
                 `Return the full revised plan. Address each issue, or keep your choice and strengthen its rationale in "decisions" if the critic is wrong. ` +
                 `Do not reintroduce anything an earlier critique round made you remove:\n${critiques.slice(0, -1).join("\n") || "(no earlier rounds)"}`,
-            { label: `planner:revise:${rev + 1}`, effort: "high", schema: PLAN },
+            { label: `planner:revise:${rev + 1}`, effort: PLANNER_EFFORT, schema: PLAN },
         );
         if (!revised || badPlan(revised)) return { status: "escalated", reason: "planner failed to revise the plan", workdir: DIR, plan, blockers, lease };
         plan = revised;
@@ -1148,7 +1159,7 @@ async function run(ctx) {
                 `- escalate: two requirements or decisions are in real tension, no fix exists that keeps the ledger consistent, or the fix needs work outside the coder's limits (the controller or a person must do it): say in "reason" what they must do. Never write such work into a fix or amend instruction.\n` +
                 `Two findings that pull the same code in opposite directions: pick one consistent resolution, fix that one, drop the other. ` +
                 `converging=false if the same files keep drawing findings and the cause is structural (the plan, not the fixes); then say the tension in "concern".`,
-            { label: `planner:triage:r${round}`, effort: "high", schema: TRIAGE },
+            { label: `planner:triage:r${round}`, effort: PLANNER_EFFORT, schema: TRIAGE },
         );
 
     // ---------- Implement ----------
@@ -1420,7 +1431,7 @@ const planImplementReview = defineWorkflow({
             "Planner turns requirements into a vetted plan, coder implements it step by step, reviewers report, controller validates, " +
             "planner triages fixes against a decision ledger to stop circular fixes. Use for requirements (often a bd issue or epic) that need a plan " +
             "before coding and an independent review loop that must not oscillate. " +
-            "args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, reviewEffort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, " +
+            "args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, reviewEffort?, plannerEffort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, " +
             "maxRounds?, maxGateFixes?, maxPlanRevisions?, maxAmendments?, planOnly?, plan?, planFile?, planIssues?, skipImplement?, shadowReview? }. " +
             "With issue, the workflow claims it (pass actor = your bd actor so you can close it later, " +
             "and token if you already hold it) and renews the lease before each planning agent and between stages; a failed heartbeat is escalated once, then the lease shown by bd show decides (an expired one is lost). " +
@@ -1434,6 +1445,8 @@ const planImplementReview = defineWorkflow({
             "on the task agent at low effort, escalated once to the general-purpose agent at medium when one fails its schema (retry labelled <label>@escalated). " +
             "reviewEffort (low | medium | high | xhigh | max) runs the real reviewers at that effort, at the session's model; without it they run at the " +
             "session's effort; shadows and validators keep theirs (AGENTS.md: high for a run estimated at complexity 4-5). " +
+            "plannerEffort (low | medium | high | xhigh | max, default high) runs the planner, critic and triage agents at that effort, at the session's model " +
+            "(AGENTS.md's planner effort exploration); validators stay high. " +
             "Without workdir it works in a new worktree under .copilot/worktrees/. " +
             "logDir (absolute; default <os tmpdir>/plan-implement-review) holds each agent's command output as <logDir>/<run>/<label>.log " +
             "(run: the issue id, sanitized); full cargo test --workspace runs go through .github/scripts/suite-lock.mjs; a gate log whose bd-gate marker " +
@@ -1469,6 +1482,7 @@ const planImplementReview = defineWorkflow({
                 model: { type: "string" },
                 effort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"] },
                 reviewEffort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"] },
+                plannerEffort: { type: "string", enum: ["low", "medium", "high", "xhigh", "max"] },
                 shadowReview: {
                     anyOf: [
                         { type: "boolean", enum: [false] },

@@ -3,7 +3,7 @@ export const meta = {
   description:
     'Planner turns requirements into a vetted plan, coder implements it step by step, gates run, reviewers report, controller validates, planner triages fixes against a decision ledger to stop circular fixes',
   whenToUse:
-    "Implementing requirements (often a bd issue or a `change` playbook run) that need a plan before coding and an independent review loop that must not oscillate. args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, reviewEffort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, maxRounds?, maxGateFixes?, maxPlanRevisions?, maxAmendments?, planOnly?, plan?, planIssues?, skipImplement?, shadowReview? }. With issue, pass actor (your bd actor) so you can close it later, and run score-issue on it just before closing it. model and effort set the coding agents (implement, gate fixes, review fixes). Before passing reviewStep or any arg beyond these, read the args comment in .claude/workflows/plan-implement-review.js.",
+    "Implementing requirements (often a bd issue or a `change` playbook run) that need a plan before coding and an independent review loop that must not oscillate. args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, reviewEffort?, plannerEffort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, maxRounds?, maxGateFixes?, maxPlanRevisions?, maxAmendments?, planOnly?, plan?, planIssues?, skipImplement?, shadowReview? }. With issue, pass actor (your bd actor) so you can close it later, and run score-issue on it just before closing it. model and effort set the coding agents (implement, gate fixes, review fixes); plannerEffort the planner, critic and triage agents. Before passing reviewStep or any arg beyond these, read the args comment in .claude/workflows/plan-implement-review.js.",
   phases: [
     { title: 'Setup', detail: 'claim the bd issue, worktree + baseline snapshot' },
     { title: 'Plan', detail: 'planner drafts, critic challenges, planner revises' },
@@ -34,12 +34,16 @@ export const meta = {
 //   batch, app or io.
 // - model, effort: the coding agents (implement, gate fixes, review fixes); the others keep theirs: claim, heartbeat,
 //   setup, gates and bd records on haiku at low effort, escalated once to sonnet at medium when one fails its schema
-//   (retry labelled <label>@sonnet); planner, critic, triage and validators at high effort; reviewers at the session's
-//   model, at reviewEffort when given, else the session's effort.
+//   (retry labelled <label>@sonnet); planner, critic and triage at plannerEffort (default high), validators at high
+//   effort; reviewers at the session's model, at reviewEffort when given, else the session's effort.
 // - reviewEffort (low|medium|high|xhigh|max): the effort every real reviewer (review:<kind>:r<N>, full and focused,
 //   every round) runs at; without it the session's. Their model stays the session's, shadows keep their own effort,
 //   validators stay at high, and prompts and labels are unchanged, so shadow pairing holds. AGENTS.md: pass high for a
 //   run estimated at complexity 4-5; anything else throws at start.
+// - plannerEffort (low|medium|high|xhigh|max, default high): the effort of the planner-role agents (planner:draft,
+//   planner:critic, planner:final, planner:revise, planner:triage), for AGENTS.md's planner effort exploration; their
+//   model stays the session's, and validators stay at high effort because their verdicts decide what ships. Anything
+//   else throws at start.
 // - workdir (with base, default main): without it the workflow works in a new worktree under .claude/worktrees/. Every
 //   cargo command runs with CARGO_TARGET_DIR=<the worktree's top level>/target (git rev-parse --show-toplevel in the
 //   worktree or the given workdir): a dir of that worktree alone, gitignored and removed with the worktree. Checkouts of
@@ -120,6 +124,15 @@ const SHADOWS = shadowsOf(A.shadowReview)
 // Effort for the real reviewers only: shadows keep theirs and validators stay high; absent, no effort key, so the
 // session's effort.
 const REVIEW_OPTS = reviewEffortOf(A.reviewEffort)
+// args.plannerEffort: the effort of the planner-role agents (planner draft, critic, final, revise, triage; calibrate.mjs's
+// planner role). Validators stay at high effort whatever it is. Kept out of the EFFORTS..SHADOWS slice the shadow spec
+// evaluates without A.
+const effortOf = (v, name) => {
+  if (v == null) return 'high'
+  if (!EFFORTS.includes(v)) throw new Error(`args.${name} must be one of ${EFFORTS.join('|')}, got ${JSON.stringify(v)}`)
+  return v
+}
+const PLANNER_EFFORT = effortOf(A.plannerEffort, 'plannerEffort')
 // args.logDir (and the TMPDIR the setup agent reports): an absolute directory, put into prompts and shell commands, so no
 // '..' segment and no control character (a newline would split a command). Trailing slashes are dropped.
 const logDirOf = (v) => {
@@ -143,8 +156,8 @@ const TTL = A.ttl || '30m'
 
 // Model and effort for the coding agents (implement, gate fixes, review fixes); the others keep theirs: mechanical
 // agents (claim, heartbeat, setup, gates, bd records) on haiku at low effort (sonnet at medium on a schema failure; see
-// ops()), planner, critic, triage and validators high, reviewers at the session's model, at reviewEffort when given
-// (else the session's effort).
+// ops()), planner, critic and triage at PLANNER_EFFORT (default high), validators high, reviewers at the session's model,
+// at reviewEffort when given (else the session's effort).
 const CODER_OPTS = { ...(A.model ? { model: A.model } : {}), ...(A.effort ? { effort: A.effort } : {}) }
 
 // Mechanical agents (claim, heartbeat, bd:root, setup, gate, bd records) only run commands and report output: haiku at low
@@ -682,6 +695,7 @@ log(`Working in ${DIR} (baseline ${setup.baseline.slice(0, 8)})`)
 log(`Logs in ${LOG_ROOT}/${RUN_ID}`)
 if (SHADOWS.length) log(`Shadow reviewers: ${SHADOWS.map((o) => `${o.model}/${o.effort}`).join(', ')}`)
 if (REVIEW_OPTS.effort) log(`Reviewers at effort ${REVIEW_OPTS.effort}`)
+if (PLANNER_EFFORT !== 'high') log(`Planner effort: ${PLANNER_EFFORT} (planner, critic, triage; validators stay high)`)
 
 // ---------- Plan ----------
 // Every planning agent renews the lease first, so no gap between renewals spans more than one planning agent.
@@ -706,7 +720,7 @@ const planIntro =
   `Record in "decisions" every design choice a reviewer could reasonably push back on (alternatives you rejected and why): ` +
   `those become settled and stop the review loop from flip-flopping. Keep scope to the requirements; list tempting extras as outOfScope.`
 const badPlan = (p) => !p.steps?.length || !p.requirements?.length
-let plan = A.plan ?? (await planAgent(planIntro, { label: 'planner:draft', effort: 'high', schema: PLAN }))
+let plan = A.plan ?? (await planAgent(planIntro, { label: 'planner:draft', effort: PLANNER_EFFORT, schema: PLAN }))
 if (!plan || badPlan(plan)) return { status: 'escalated', reason: 'planner failed', workdir: DIR, lease }
 if (A.plan) log(`Starting from the given plan (${plan.steps.length} step(s))`)
 // Issues already known against a given plan stand in for the first critique.
@@ -732,7 +746,7 @@ for (let rev = 0; !A.skipImplement; rev++) {
         `a step order that leaves the build or tests broken, a violated AGENTS.md convention, missing tests for new behavior, code that would not ` +
         `build on macOS or Windows, a step assigned to the controller or a person, or one needing work outside the coder's limits (it belongs in "risks"), or a decision whose rationale is wrong. Preferences and alternatives that are merely different are not blocking. ` +
         `approved=true if nothing blocks.`,
-      { label: `planner:critic:${rev}`, effort: 'high', schema: CRITIQUE },
+      { label: `planner:critic:${rev}`, effort: PLANNER_EFFORT, schema: CRITIQUE },
     )
     if (!crit) log(`Plan critic ${rev} failed; accepting the plan as is`)
     blockers = (crit?.issues || []).filter((i) => i.blocking)
@@ -758,7 +772,7 @@ for (let rev = 0; !A.skipImplement; rev++) {
         `Verified blocking issues, each with its fix:\n${fmtBlockers(blockers)}\n\n` +
         `Return the full plan with exactly these corrections applied (adopt each suggestion; if the code shows one is wrong, ` +
         `make the smallest change that resolves the issue and record why in "decisions"). Change nothing else.`,
-      { label: `planner:final:${rev}`, effort: 'high', schema: PLAN },
+      { label: `planner:final:${rev}`, effort: PLANNER_EFFORT, schema: PLAN },
     )
     if (!final || badPlan(final)) return { status: 'escalated', reason: 'planner failed to apply the final corrections', workdir: DIR, plan, blockers, lease }
     plan = final
@@ -772,7 +786,7 @@ for (let rev = 0; !A.skipImplement; rev++) {
       `The critic raised these blocking issues:\n${fmtBlockers(blockers)}\n\n` +
       `Return the full revised plan. Address each issue, or keep your choice and strengthen its rationale in "decisions" if the critic is wrong. ` +
       `Do not reintroduce anything an earlier critique round made you remove:\n${critiques.slice(0, -1).join('\n') || '(no earlier rounds)'}`,
-    { label: `planner:revise:${rev + 1}`, effort: 'high', schema: PLAN },
+    { label: `planner:revise:${rev + 1}`, effort: PLANNER_EFFORT, schema: PLAN },
   )
   if (!revised || badPlan(revised)) return { status: 'escalated', reason: 'planner failed to revise the plan', workdir: DIR, plan, blockers, lease }
   plan = revised
@@ -1122,7 +1136,7 @@ const triage = (open, round, history) =>
       `- escalate: two requirements or decisions are in real tension, no fix exists that keeps the ledger consistent, or the fix needs work outside the coder's limits (the controller or a person must do it): say in "reason" what they must do. Never write such work into a fix or amend instruction.\n` +
       `Two findings that pull the same code in opposite directions: pick one consistent resolution, fix that one, drop the other. ` +
       `converging=false if the same files keep drawing findings and the cause is structural (the plan, not the fixes); then say the tension in "concern".`,
-    { label: `planner:triage:r${round}`, phase: 'Triage', effort: 'high', schema: TRIAGE },
+    { label: `planner:triage:r${round}`, phase: 'Triage', effort: PLANNER_EFFORT, schema: TRIAGE },
   )
 
 // ---------- Implement ----------

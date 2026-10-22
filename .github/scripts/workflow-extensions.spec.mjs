@@ -210,6 +210,63 @@ describe('plan-implement-review', () => {
 		expect(wf.meta.argsSchema.properties.reviewEffort.enum).toEqual(['low', 'medium', 'high', 'xhigh', 'max'])
 	})
 
+	it('runs the planning agents at plannerEffort, the critic still the rubber-duck', async () => {
+		const wf = await load('plan-implement-review', undefined)
+		const ctx = fakeCtx({ ...PLAN_ONLY, plannerEffort: 'medium' }, script(PLANNING))
+		expect((await wf.run(ctx)).status).toBe('planned')
+		const planners = ctx.calls.filter((c) => c.label.startsWith('planner:'))
+		expect(planners.map((c) => c.label)).toEqual(['planner:draft', 'planner:critic:0', 'planner:revise:1', 'planner:critic:1', 'planner:final:1'])
+		for (const c of planners) expect(c.reasoningEffort, c.label).toBe('medium')
+		expect(ctx.calls.find((c) => c.label === 'planner:critic:0')).toMatchObject({ agent: 'rubber-duck', reasoningEffort: 'medium' })
+		expect(ctx.logs).toContain('Planner effort: medium (planner, critic, triage; validators stay high)')
+	})
+
+	it('runs triage at plannerEffort and keeps validators at high', async () => {
+		const wf = await load('plan-implement-review', undefined)
+		const ctx = fakeCtx(
+			{ ...ARGS, plan: undefined, skipImplement: undefined, plannerEffort: 'medium' },
+			script({
+				'planner:draft': PLAN,
+				'planner:critic:0': { approved: true, issues: [] },
+				'coder:S1': { summary: 'done', filesChanged: ['a.md'] },
+				'review:code:r0': { findings: [FOUND] },
+				'validate:r0:F1': { valid: true, blocking: true, reasoning: 'real', fixInstruction: 'fix it' },
+				'planner:triage:r0': { items: [{ id: 'F1', action: 'escalate', reason: 'needs a .claude/settings.json change: the controller must make it' }], converging: true },
+			}),
+		)
+		expect((await wf.run(ctx)).status).toBe('escalated')
+		const call = (label) => ctx.calls.find((c) => c.label === label)
+		for (const label of ['planner:draft', 'planner:critic:0', 'planner:triage:r0']) expect(call(label).reasoningEffort, label).toBe('medium')
+		expect(call('validate:r0:F1').reasoningEffort).toBe('high')
+		expect('reasoningEffort' in call('coder:S1')).toBe(false)
+		const reviewers = ctx.calls.filter((c) => /^review:[a-z]+:r0$/.test(c.label))
+		expect(reviewers.length >= 1).toBe(true)
+		for (const c of reviewers) expect('reasoningEffort' in c, c.label).toBe(false)
+	})
+
+	it('keeps the planning agents at high by default', async () => {
+		const wf = await load('plan-implement-review', undefined)
+		const ctx = fakeCtx(PLAN_ONLY, script(PLANNING))
+		expect((await wf.run(ctx)).status).toBe('planned')
+		const planners = ctx.calls.filter((c) => c.label.startsWith('planner:'))
+		expect(planners).toHaveLength(5)
+		for (const c of planners) expect(c.reasoningEffort, c.label).toBe('high')
+		expect(ctx.logs.some((l) => String(l).startsWith('Planner effort'))).toBe(false)
+	})
+
+	it.each(['huge', 'HIGH', '', 3, { effort: 'medium' }])('rejects plannerEffort %j at start, before any agent runs', async (v) => {
+		const wf = await load('plan-implement-review', undefined)
+		const ctx = fakeCtx({ requirements: 'x', plannerEffort: v }, script())
+		await expect(wf.run(ctx)).rejects.toThrow(/args\.plannerEffort must be one of low\|medium\|high\|xhigh\|max/)
+		expect(ctx.calls).toHaveLength(0)
+	})
+
+	it('lists plannerEffort in its args schema and description', async () => {
+		const wf = await load('plan-implement-review', undefined)
+		expect(wf.meta.argsSchema.properties.plannerEffort).toEqual({ type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'] })
+		expect(wf.meta.description).toContain('plannerEffort?')
+	})
+
 	describe('logs, the suite lock and the gate marker', () => {
 		const run = async (args, over = {}) => {
 			const wf = await load('plan-implement-review', undefined)

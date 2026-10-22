@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from './expect.mjs'
-import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { execFileSync, spawnSync } from 'node:child_process'
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -802,5 +802,90 @@ describe('calibrate CLI', () => {
 		const calls = readFileSync(join(bin, 'calls'), 'utf8')
 		// a.1 and b.1 have no agent sessions, and c.1 already has a stored trace: nothing to write.
 		expect(calls).not.toContain(' update ')
+	})
+
+	// Runs calibrate --json over one stepless run, bd-x.1 (10:00 to 11:00), whose Claude Code session holds two
+	// still-running workflows: wf_gate, whose first prompt names only bd-gate and bd-core, and wf_theirs, whose first
+	// prompt names bd-y.1.implement, which bd knows. showCases are case arms answering bd's `show` for those ids.
+	const traced = (showCases) => {
+		const script = fileURLToPath(new URL('./calibrate.mjs', import.meta.url))
+		const ACTOR = 'Quang Le/claude-a9c91d0b'
+		const events = [
+			{ issue_id: 'bd-x.1', op: 'created', ts: '2026-10-15T10:00:00Z', actor: ACTOR },
+			{ issue_id: 'bd-x.1', op: 'closed', ts: '2026-10-15T11:00:00Z', actor: ACTOR },
+		]
+		writeFileSync(
+			join(bin, 'bd'),
+			[
+				'#!/bin/sh',
+				`echo "$*" >> "${bin}/calls"`,
+				'case " $* " in',
+				`  *" list --all -n 0 --json "*) echo '${JSON.stringify([issue('bd-x.1', 'closed')])}' ;;`,
+				...showCases,
+				`  *" show "*) echo '{"status":"closed","dependents":[]}' ;;`,
+				`  *" history bd-x.1 "*) echo '${JSON.stringify(events)}' ;;`,
+				`  *" list "*) echo '[]' ;;`,
+				'esac',
+				'',
+			].join('\n'),
+		)
+		chmodSync(join(bin, 'bd'), 0o755)
+		const projects = join(bin, 'projects')
+		const dir = join(projects, '-w-bd')
+		const SESSION = '6f26e090-4089-4a32-bdd2-c49ba9c91d0b'
+		const jsonl = (file, entries) => writeFileSync(file, entries.map((e) => JSON.stringify(e)).join('\n') + '\n')
+		mkdirSync(dir, { recursive: true })
+		jsonl(join(dir, `${SESSION}.jsonl`), [{ type: 'user', timestamp: '2026-10-15T10:00:00Z', message: { content: 'hello' } }])
+		// A workflow still running (no <session>/workflows/<wf>.json): one claim agent, first prompted with `prompt`.
+		const running = (wf, prompt, at) => {
+			const flow = join(dir, SESSION, 'subagents', 'workflows', wf)
+			mkdirSync(flow, { recursive: true })
+			jsonl(join(flow, 'journal.jsonl'), [{ type: 'started', agentId: 'k', label: 'claim' }])
+			jsonl(join(flow, 'agent-k.jsonl'), [
+				{ type: 'user', message: { content: prompt } },
+				{
+					type: 'assistant',
+					timestamp: at,
+					requestId: `${wf}-k`,
+					message: { model: 'claude-opus-5-5', stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }, content: [] },
+				},
+			])
+		}
+		running('wf_gate', 'Run bd-gate: dir=/w on bd-core', '2026-10-15T10:25:00Z')
+		running('wf_theirs', 'Claim bd-y.1.implement.', '2026-10-15T10:25:01Z')
+		const r = spawnSync('node', [script, '--json', '--sessions', bin, '--projects', projects], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } })
+		return { status: r.status, stdout: r.stdout, stderr: r.stderr, calls: readFileSync(join(bin, 'calls'), 'utf8') }
+	}
+	const labelsOf = (stdout) =>
+		JSON.parse(stdout)
+			.runs.find((x) => x.id === 'bd-x.1')
+			.work.steps.flatMap((s) => s.agents)
+			.map((a) => a.label)
+
+	it('keeps a running workflow whose prompt names only ids bd does not know, and leaves out one naming an issue bd knows, as trace-run does', () => {
+		const out = traced([`  *" show bd-core "*) echo 'issue not_found' >&2; exit 3 ;;`, `  *" show bd-gate "*) echo 'issue not_found' >&2; exit 3 ;;`])
+		if (out.status !== 0) throw new Error(`exit ${out.status}: ${out.stderr}`)
+		expect(out.status).toBe(0)
+		const r = JSON.parse(out.stdout).runs.find((x) => x.id === 'bd-x.1')
+		expect(r.traced).toBe('backfilled')
+		const labels = r.work.steps.flatMap((s) => s.agents).map((a) => a.label)
+		expect(labels).toContain('wf_gate:claim')
+		expect(labels.filter((l) => l.startsWith('wf_theirs'))).toEqual([])
+		expect(r.work.other_work_requests).toBe(1)
+		expect(out.calls).toContain('show bd-core --json')
+		expect(out.calls).toContain('show bd-gate --json')
+		expect(out.calls).toContain('show bd-y.1.implement --json')
+		// Ids in the run are never asked about.
+		expect(out.calls).not.toContain('show bd-x.1.implement')
+		expect(out.stderr).not.toContain('not_found')
+		expect(out.stderr).not.toContain('could not check issue ids')
+	})
+
+	it('warns once when bd cannot check the ids, keeps the workflow and still reports', () => {
+		const out = traced([`  *" show bd-core "*) echo 'server unreachable' >&2; exit 8 ;;`, `  *" show bd-gate "*) echo 'server unreachable' >&2; exit 8 ;;`])
+		if (out.status !== 0) throw new Error(`exit ${out.status}: ${out.stderr}`)
+		expect(out.status).toBe(0)
+		expect(out.stderr.split('could not check issue ids with bd').length - 1).toBe(1)
+		expect(labelsOf(out.stdout)).toContain('wf_gate:claim')
 	})
 })

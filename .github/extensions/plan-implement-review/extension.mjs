@@ -323,7 +323,12 @@ const shPath = (s) => `'${String(s).replaceAll("'", `'\\''`)}'`;
 // that line as "marker". A marker naming another directory or run, or one that does not parse, means the agent read
 // another run's log (or a stale one), so its verdict says nothing about this worktree; so does a pass with no marker at
 // all. Such a report never counts as a pass and never reaches the gate-fix coder. A failure without a marker (the agent
-// stopped before the log was read back) stays an ordinary failure.
+// stopped before the log was read back) stays an ordinary failure. Each gate command ends its log with gate-tree=<tree>
+// and gate-exit=<test exit> lines. When the first gate attempt fails on its report alone (no reply, no snapshot, or a
+// pass contradicting its failures) and is not contaminated, the @escalated retry may report from that attempt's log
+// instead of rerunning: only when it has this run's marker, one exit[fmt] and one exit[clippy] line, and ends in those
+// lines with an exit other than 75 or 128+, for the tree the retry snapshots. Otherwise it reruns into its own log, and a
+// retry reporting any other log fails.
 const markerOf = (line) => {
     const m = /^bd-gate: dir=(.*) run=(\S*)$/.exec(String(line ?? "").trim());
     return m ? { dir: m[1], run: m[2] } : null;
@@ -485,17 +490,20 @@ async function run(ctx) {
     // agent at low effort. One that fails its schema (null, or a result its caller rejects) is escalated once to the
     // general-purpose agent at medium effort, never retried at the same level; the retry's label gets @escalated. Copilot
     // model ids are not named by class, so the escalation changes the agent kind, not the model. prompt is a string or a
-    // function of the attempt's label (so each attempt can name its own log file); valid gets the report and that label.
+    // function (label, prev) of the attempt's label (so each attempt can name its own log file): prev is undefined on the
+    // first attempt and { label } of the first attempt on the retry, so a caller (the gate) can render a retry prompt of its
+    // own. valid gets the report and that label; it is called on the first attempt before the retry prompt is rendered, so
+    // a caller's valid can record why the first report failed.
     const OPS = { kind: "task", effort: "low" };
     const OPS_ESCALATED = { kind: "general-purpose", effort: "medium" };
     async function ops(prompt, opts, valid = (r) => r != null) {
-        const text = (l) => (typeof prompt === "function" ? prompt(l) : prompt);
+        const text = (l, prev) => (typeof prompt === "function" ? prompt(l, prev) : prompt);
         const r = await agent(text(opts.label), { ...opts, ...OPS });
         if (valid(r, opts.label)) return r;
         ctx.log(`${opts.label} failed its schema on the ${OPS.kind} agent; escalating to ${OPS_ESCALATED.kind}`);
         const retryLabel = `${opts.label}@escalated`;
         const again = await agent(
-            `${text(retryLabel)}\n\nAn earlier attempt at this may have run some of these commands before failing: check their effects first and do not repeat one that already took effect.`,
+            `${text(retryLabel, { label: opts.label })}\n\nAn earlier attempt at this may have run some of these commands before failing: check their effects first and do not repeat one that already took effect.`,
             { ...opts, ...OPS_ESCALATED, label: retryLabel },
         );
         return valid(again, retryLabel) ? again : null;
@@ -802,49 +810,96 @@ async function run(ctx) {
     // The CI gates from .github/workflows/ci.yml as one shell line: a marker first (contamination), then fmt, clippy and the
     // full suite (under the suite lock), each run even if an earlier one fails, all into the attempt's own log; then the
     // exit[...] lines. gateRerunCmd runs the suite again when the lock was still busy (exit[test]=75), appending to the log.
+    // Each command then ends the log with gate-tree=<the tree checked, by SNAPSHOT_CMD> and gate-exit=<its cargo test exit>,
+    // appended after the group's redirect, so they are written only once the command finished: a log ending in them is
+    // complete. gate-exit=75 means the lock was busy and nothing ran, 128 or above that the suite was killed.
     const gateCmd = (label) => {
         const file = shPath(logFile(label));
         return (
             `mkdir -p ${shPath(`${LOG_ROOT}/${RUN_ID}`)} && cd ${shPath(DIR)} && { echo "bd-gate: dir=$PWD run=${RUN_ID}"; ` +
             `export CARGO_TARGET_DIR=${shPath(TARGET)}; cargo fmt --all --check; echo "exit[fmt]=$?"; ` +
             `cargo clippy --workspace --all-targets --locked -- -D warnings; echo "exit[clippy]=$?"; ` +
-            `${SUITE_TEST}; echo "exit[test]=$?"; } > ${file} 2>&1; grep '^exit\\[' ${file}`
+            `${SUITE_TEST}; t=$?; echo "exit[test]=$t"; } > ${file} 2>&1; ` +
+            `echo "gate-tree=$(${SNAPSHOT_CMD})" >> ${file}; echo "gate-exit=$t" >> ${file}; grep '^exit\\[' ${file}`
         );
     };
     const gateRerunCmd = (label) => {
         const file = shPath(logFile(label));
         return (
-            `cd ${shPath(DIR)} && { export CARGO_TARGET_DIR=${shPath(TARGET)}; ${SUITE_TEST}; echo "exit[test]=$?"; } >> ${file} 2>&1; ` +
-            `grep '^exit\\[test\\]' ${file} | tail -1`
+            `cd ${shPath(DIR)} && { export CARGO_TARGET_DIR=${shPath(TARGET)}; ${SUITE_TEST}; t=$?; echo "exit[test]=$t"; } >> ${file} 2>&1; ` +
+            `echo "gate-tree=$(${SNAPSHOT_CMD})" >> ${file}; echo "gate-exit=$t" >> ${file}; grep '^exit\\[test\\]' ${file} | tail -1`
         );
     };
-    const gatePrompt = (label) => {
-        const file = shPath(logFile(label));
-        return (
-            `${inDir(DIR)}\nRun the CI gates there (cargo fmt check, clippy -D warnings, the full test suite under the suite lock): ` +
+    // The gate agent's prompt. reuseFrom, the first attempt's log, is given only to the escalated retry of a report-only
+    // failure (see gate()): that retry snapshots the tree first and checks the first log without running cargo (this
+    // run's marker, one exit[fmt] and one exit[clippy] line, and a gate-tree=<its snapshot>, gate-exit=<n> tail with n
+    // neither 75 nor 128 or above and equal to the last exit[test]), reports from it if every check holds, and otherwise
+    // runs the gates into its own log. Both ask for the log's raw path back; gate() strips one pair of shell quotes anyway.
+    const gatePrompt = (label, reuseFrom) => {
+        const own = logFile(label);
+        const file = shPath(own);
+        const what = "(cargo fmt check, clippy -D warnings, the full test suite under the suite lock)";
+        const runBlock =
             `in the foreground, with the Bash tool's longest timeout (600000 ms), run exactly:\n${gateCmd(label)}\n` +
             `While the last exit[test] line is exit[test]=75 (another worktree held the suite lock and the tests did not run), run this, as often as it takes:\n` +
             `${gateRerunCmd(label)}\n` +
-            `Running the checks changes nothing, so run them even if an earlier attempt already did. ` +
-            `Read the results only from ${file} (grep, tail), never from another log.\n` +
+            `Each command ends the log with a gate-tree=<tree id> line and then a gate-exit=<test exit> line. ` +
+            `Running the checks changes nothing, so run them even if an earlier attempt already did. `;
+        const readFrom = (q) => `Read the results only from ${q} (grep, tail), never from another log.\n`;
+        const excerpts =
             `Do NOT fix anything. For each failing command, return a trimmed excerpt with the real errors (max ~60 lines each; ` +
-            `for tests, the failing test names and their panic messages).\n` +
-            `Return ${file} as "log", and the output of \`head -1 ${file}\` verbatim as "marker".\n` +
-            `Then run this and return its output as "snapshot":\n${SNAPSHOT_CMD}\n` +
-            `Then run \`git diff --name-only ${setup.baseline} <snapshot>\` and return the list as changedFiles.`
+            `for tests, the failing test names and their panic messages).\n`;
+        const logReturn = (raw, q) =>
+            `Return the path ${raw} as "log", exactly as written here and without the shell quotes, and the output of \`head -1 ${q}\` verbatim as "marker".\n`;
+        const changed = `Then run \`git diff --name-only ${setup.baseline} <snapshot>\` and return the list as changedFiles.`;
+        const snapshot = `Then run this and return its output as "snapshot":\n${SNAPSHOT_CMD}\n${changed}`;
+        if (!reuseFrom) return `${inDir(DIR)}\nRun the CI gates there ${what}: ${runBlock}${readFrom(file)}${excerpts}${logReturn(own, file)}${snapshot}`;
+        const prev = shPath(reuseFrom);
+        return (
+            `${inDir(DIR)}\nAn earlier attempt ran the CI gates ${what} there into ${prev}, but its report was unusable. ` +
+            `First run this and keep its output as your snapshot:\n${SNAPSHOT_CMD}\nThen check that log, without running cargo:\n` +
+            `1. \`test -f ${prev}\` succeeds.\n` +
+            `2. \`head -1 ${prev}\` prints exactly bd-gate: dir=${DIR} run=${RUN_ID} (a /private prefix or a trailing slash on the directory does not matter).\n` +
+            `3. \`grep '^exit\\[fmt\\]=' ${prev}\` and \`grep '^exit\\[clippy\\]=' ${prev}\` each print exactly one line, and both codes are below 128.\n` +
+            `4. \`tail -n 2 ${prev}\` prints exactly gate-tree=<your snapshot> and then gate-exit=<n>, where n is neither 75 (the suite lock was busy and nothing ran) ` +
+            `nor 128 or above (killed), and n equals the code on the last exit[test] line (\`grep '^exit\\[test\\]=' ${prev} | tail -1\`).\n` +
+            `If every check holds, do not run cargo. ${readFrom(prev)}Return "passed" true exactly when exit[fmt], exit[clippy] and n are all 0. ` +
+            `${excerpts}${logReturn(reuseFrom, prev)}Return the snapshot you took first as "snapshot". ${changed}\n` +
+            `If any check fails (the log is missing, incomplete, killed, another run's or directory's, or records a different tree), ` +
+            `run the gates into your own log: ${runBlock}${readFrom(file)}${excerpts}${logReturn(own, file)}After that run, take a new snapshot. ${snapshot}\n` +
+            `Either way, never read any other log.`
         );
     };
     // A gate report that contradicts itself, or whose log is contaminated, counts as a failed gate agent and is escalated
     // once. If the last attempt is still contaminated, gate() returns a { contaminated } marker instead of null; the marker
-    // reflects only that attempt.
+    // reflects only that attempt and names the log it used. ops() calls valid on the first attempt before it renders the
+    // retry, so valid records whether the first attempt failed on its report alone (no reply, no snapshot, or a pass
+    // contradicting its failures) with a log that may still be good: a report naming another run or directory, or a pass
+    // without a marker, never offers it. Only then is the retry offered the first attempt's log (gatePrompt's reuseFrom),
+    // and its report must name that log or its own (one pair of shell quotes stripped): any other fails the attempt.
     const gate = async (label) => {
+        const reportedLog = (s) => (typeof s === "string" ? s.trim().replace(/^'(.*)'$/s, "$1") : "");
+        const first = logFile(label);
+        let reuse = false;
         let dirty = null;
-        const r = await ops(gatePrompt, { label, schema: GATE }, (x, l) => {
+        const r = await ops((l, prev) => gatePrompt(l, prev && reuse ? first : undefined), { label, schema: GATE }, (x, l) => {
             dirty = null;
-            if (!(x?.snapshot && x.passed !== x.failures.length > 0)) return false;
+            const retry = l !== label;
+            if (!(x?.snapshot && x.passed !== x.failures.length > 0)) {
+                if (!retry) reuse = x == null || !contamination(x, DIR, RUN_ID);
+                return false;
+            }
+            let used = logFile(l);
+            if (retry && reuse) {
+                used = reportedLog(x.log);
+                if (used !== first && used !== logFile(l)) {
+                    ctx.log(`gate ${l}: report read ${used || "no log"}, not ${first} or ${logFile(l)}`);
+                    return false;
+                }
+            }
             const c = contamination(x, DIR, RUN_ID);
             if (c) {
-                dirty = { contaminated: true, ...c, log: logFile(l) };
+                dirty = { contaminated: true, ...c, log: used };
                 ctx.log(`gate ${l}: log contaminated (${c.marker || "no marker"})`);
             }
             return !c;
@@ -862,7 +917,8 @@ async function run(ctx) {
 
     // Run the gate; on failure send the coder back up to MAX_GATE_FIXES times. Gate fixes are settled too,
     // and must not undo earlier decisions to get green. Returns null if the gate agent itself failed, and the { contaminated }
-    // marker if its log was another run's (never sent to the gate-fix coder).
+    // marker if its log was another run's (never sent to the gate-fix coder). A gate's retry may reuse the first attempt's
+    // complete log instead of rerunning (see gate()).
     async function gateUntilGreen(tag, round) {
         ctx.phase("Gate");
         await renew();
@@ -1381,7 +1437,7 @@ const planImplementReview = defineWorkflow({
             "Without workdir it works in a new worktree under .copilot/worktrees/. " +
             "logDir (absolute; default <os tmpdir>/plan-implement-review) holds each agent's command output as <logDir>/<run>/<label>.log " +
             "(run: the issue id, sanitized); full cargo test --workspace runs go through .github/scripts/suite-lock.mjs; a gate log whose bd-gate marker " +
-            "names another directory or run, or a pass without one, escalates as 'gate log contaminated'. " +
+            "names another directory or run, or a pass without one, escalates as 'gate log contaminated'; after a report-only failure the escalated gate retry may reuse the first attempt's complete log for the same tree. " +
             "planOnly returns the vetted plan without implementing. plan starts from a given plan (e.g. one an escalated run returned) instead of drafting one; " +
             "planIssues lists blocking issues already known against it ({ issue, evidence?, suggestion? }), handled as the first critique; " +
             "planFile (absolute path) loads either from JSON: a plan, or an escalated run's result whose blockers become planIssues. " +

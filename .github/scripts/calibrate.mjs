@@ -73,6 +73,29 @@ export function coderOf(work) {
   return best
 }
 
+/**
+ * A run's planner: the model and effort with the most requests among its workflow planner-role agents (planner, critic and
+ * triage roles), or, when it has none, among its `planner:` subagents (such as the controller's pre-step planner, which the
+ * planner effort exploration does not set); null when untraced or there are none.
+ */
+export function plannerOf(work) {
+  const planners = (work?.steps ?? []).flatMap((s) => s.agents).filter((x) => roleOf(x) === 'planner')
+  const workflow = planners.filter((a) => a.kind === 'workflow')
+  const pool = workflow.length ? workflow : planners
+  const by = new Map()
+  for (const a of pool) {
+    // One name per model across harnesses (Claude Code's claude-opus-5-5, Copilot's claude-opus-5.5).
+    const model = canonicalModel(a.model)
+    const key = `${model}\0${a.effort}`
+    const x = by.get(key) ?? { model, effort: a.effort, requests: 0 }
+    x.requests += a.requests
+    by.set(key, x)
+  }
+  let best = null
+  for (const x of by.values()) if (!best || x.requests > best.requests) best = x
+  return best
+}
+
 // ---------- cost ----------
 const USD_PER_CREDIT = 0.01
 const NANO = 1e9
@@ -159,7 +182,9 @@ export function joinRuns(issues, { followUpsOf, traceOf }) {
         traced: work ? (md.work ? 'stored' : run.status === 'closed' ? 'backfilled' : 'partial') : null,
         untraced: work ? null : why,
         coder: coderOf(work),
-        // The coder exploration quota's marker, e.g. { coder: 'sonnet/medium', rule: 'sha1-0-3' }.
+        planner: plannerOf(work),
+        // The exploration markers, e.g. { coder: 'sonnet/medium', rule: 'sha1-0-3' } (coder quota) and/or
+        // { planner: 'opus/medium', plannerRule: 'sha1-2-0-3' } (planner effort exploration).
         exploration: md.exploration ?? null,
         timing,
       }
@@ -275,8 +300,34 @@ export function aggregate(runs, prices = PRICES) {
     x.runs++
     x.overall.push(r.overall)
     x.serious += r.findings.serious
-    if (r.exploration) x.exploration++
+    if (r.exploration?.coder) x.exploration++
     coders.set(key, x)
+  }
+  // The same for each run's planner, with the cost of its planner-role agents (the pre-step `planner:` subagent included)
+  // per traced run; recomputed from the trace like coders.
+  const planners = new Map()
+  for (const r of scored) {
+    const p = plannerOf(r.work)
+    const label = p ? `${p.model}/${p.effort}` : r.work ? 'no planner agent' : 'untraced'
+    const key = `${rubricOf(r)}\0${complexityOf(r)}\0${label}`
+    const x = planners.get(key) ?? {
+      rubric: rubricOf(r),
+      complexity: complexityOf(r),
+      planner: label,
+      model: p?.model ?? null,
+      effort: p?.effort ?? null,
+      runs: 0,
+      overall: [],
+      serious: 0,
+      plannerCost: [],
+      exploration: 0,
+    }
+    x.runs++
+    x.overall.push(r.overall)
+    x.serious += r.findings.serious
+    if (r.work) x.plannerCost.push(sum(agentsOf(r).filter((a) => roleOf(a) === 'planner').map((a) => costOf(a.tokens, a.model, prices) ?? 0)))
+    if (r.exploration?.planner) x.exploration++
+    planners.set(key, x)
   }
   const roles = new Map()
   const runCosts = new Map()
@@ -353,6 +404,9 @@ export function aggregate(runs, prices = PRICES) {
     coders: [...coders.values()]
       .map((x) => Object.assign(x, { overall: mean(x.overall) }))
       .toSorted((a, b) => byVersion(a.rubric, b.rubric) || a.complexity - b.complexity || a.coder.localeCompare(b.coder)),
+    planners: [...planners.values()]
+      .map((x) => Object.assign(x, { overall: mean(x.overall), plannerCost: mean(x.plannerCost) }))
+      .toSorted((a, b) => byVersion(a.rubric, b.rubric) || a.complexity - b.complexity || a.planner.localeCompare(b.planner)),
     roles: [...roles.values()].map((x) => Object.assign(x, { runs: x.runs.size })).toSorted((a, b) => b.cost - a.cost),
     runCosts: Object.fromEntries(runCosts),
     runTimes,
@@ -455,7 +509,18 @@ export function render(runs, agg, prices = PRICES) {
         )
       : 'No scored run has a complexity yet.',
     ``,
-    `A run's coder is the model and effort with the most requests among its workflow coder agents (coder and implement roles), or among its \`coder:\` subagents when it has none; "no coder agent" runs were coded by the main thread or by subagents without a role prefix. exploration counts runs marked by the coder exploration quota (\`exploration\` metadata, also on each run in --json).`,
+    `A run's coder is the model and effort with the most requests among its workflow coder agents (coder and implement roles), or among its \`coder:\` subagents when it has none; "no coder agent" runs were coded by the main thread or by subagents without a role prefix. exploration counts runs marked by the coder exploration quota (\`exploration.coder\` metadata, also on each run in --json).`,
+    ``,
+    `## Score by planner`,
+    ``,
+    agg.planners.length
+      ? table(
+          ['rubric', 'complexity', 'planner (model/effort)', 'runs', 'mean overall', 'serious findings', 'planner cost/run', 'exploration'],
+          agg.planners.map((x) => [ver(x.rubric), x.complexity, x.planner, x.runs, n(x.overall, 2), x.serious, usd(x.plannerCost), x.exploration]),
+        )
+      : 'No scored run has a complexity yet.',
+    ``,
+    `A run's planner is the model and effort with the most requests among its workflow planner agents (planner, critic and triage roles), or among its \`planner:\` subagents, such as the controller's pre-step planner, when it has none; "no planner agent" runs had neither. planner cost/run is the mean cost of all its planner agents, the pre-step subagent included, over the row's traced runs (priced requests only, as in the role table). exploration counts runs marked by the planner effort exploration (\`exploration.planner\` metadata, AGENTS.md; also on each run in --json); Score by coder counts \`exploration.coder\`.`,
     ``,
     `## Cost and time by complexity`,
     ``,

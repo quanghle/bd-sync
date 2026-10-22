@@ -252,6 +252,18 @@ describe('plan-implement-review', () => {
 			expect(gate).toContain(`grep '^exit\\[' `)
 			expect(gate).toContain('600000')
 			expect(gate).not.toContain('tee ')
+			// Each command ends its log with the tree checked and the suite's exit, after the group's redirect.
+			const { ctx: logged } = await run({ ...ARGS, logDir: '/logs' })
+			const tailed = promptOf(logged, 'gate:impl')
+			const at = (s) => tailed.indexOf(s)
+			const pieces = [
+				`t=$?; echo "exit[test]=$t"; } > '/logs/bd-1/gate-impl.log' 2>&1; echo "gate-tree=$(`,
+				`echo "gate-exit=$t" >> '/logs/bd-1/gate-impl.log'`,
+				`} >> '/logs/bd-1/gate-impl.log' 2>&1; echo "gate-tree=`,
+			]
+			for (const p of pieces) expect(at(p)).toBeGreaterThan(-1)
+			expect(at(pieces[0])).toBeLessThan(at(pieces[1]))
+			expect(at(pieces[1])).toBeLessThan(at(pieces[2]))
 		})
 
 		it('gives validators and gate-fix coders their own files', async () => {
@@ -300,6 +312,39 @@ describe('plan-implement-review', () => {
 			const { ctx, got } = await run(ARGS, { 'gate:impl': FOREIGN, 'gate:impl@escalated': GREEN })
 			expect(got.status).toBe('done')
 			expect(promptOf(ctx, 'gate:impl@escalated')).toContain('/bd-1/gate-impl-escalated.log')
+		})
+
+		describe('the escalated gate reusing the first log', () => {
+			const CONTRA = { ...GREEN, failures: [{ command: 'cargo clippy', excerpt: 'x' }] }
+			const FIRST = '/logs/bd-1/gate-impl.log'
+			const L = { ...ARGS, logDir: '/logs' }
+
+			it('offers the first log after a report-only failure and takes a reused pass', async () => {
+				const { ctx, got } = await run(L, { 'gate:impl': CONTRA, 'gate:impl@escalated': { ...GREEN, log: FIRST } })
+				expect(got.status).toBe('done')
+				const p = promptOf(ctx, 'gate:impl@escalated')
+				for (const piece of [`test -f '${FIRST}'`, 'gate-tree=', 'gate-exit=', '75', '128', `> '/logs/bd-1/gate-impl-escalated.log' 2>&1`]) expect(p).toContain(piece)
+			})
+
+			it('offers no reuse after a contradictory report with a foreign marker', async () => {
+				const { ctx } = await run(L, { 'gate:impl': { ...CONTRA, marker: 'bd-gate: dir=/w/other run=bd-1' } })
+				expect(promptOf(ctx, 'gate:impl@escalated')).not.toContain(FIRST)
+			})
+
+			it('fails a reuse retry that reports another log, without a gate fix', async () => {
+				const { ctx, got } = await run(L, { 'gate:impl': CONTRA, 'gate:impl@escalated': GREEN })
+				expect(got.status).toBe('escalated')
+				expect(got.reason).toBe('gate agent failed')
+				expect(ctx.logs.some((l) => l.startsWith('gate gate:impl@escalated: report read /x/gate.log'))).toBe(true)
+				expect(ctx.calls.some((c) => c.label.startsWith('coder:gate-fix'))).toBe(false)
+			})
+
+			it('names the first log when a reused report is contaminated', async () => {
+				const { got } = await run(L, { 'gate:impl': CONTRA, 'gate:impl@escalated': { ...FOREIGN, log: FIRST } })
+				expect(got.status).toBe('escalated')
+				expect(got.reason).toMatch(/^gate log contaminated/)
+				expect(got.reason).toContain(`(log ${FIRST})`)
+			})
 		})
 
 		it('escalates a contaminated gate after review fixes, keeping the open findings', async () => {

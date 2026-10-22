@@ -115,6 +115,32 @@ describe('plan-implement-review ops()', () => {
 		])
 	})
 
+	it("passes a prompt function the first attempt's label as prev on the retry only", async () => {
+		const seen = []
+		const { ops, calls } = load({ haiku: null, sonnet: { ok: true } })
+		const prompt = (l, prev) => (seen.push([l, prev]), `Write to ${l}.log`)
+		expect(await ops(prompt, { ...OPTS, label: 'x' })).toEqual({ ok: true })
+		expect(seen).toEqual([
+			['x', undefined],
+			['x@sonnet', { label: 'x' }],
+		])
+		expect(calls.map((c) => c.label)).toEqual(['x', 'x@sonnet'])
+	})
+
+	it('calls valid on the first attempt before rendering the retry prompt', async () => {
+		const events = []
+		const { ops } = load({ haiku: { n: 1 }, sonnet: { n: 2 } })
+		const prompt = (l) => (events.push(['prompt', l]), `Write to ${l}.log`)
+		const valid = (r, l) => (events.push(['valid', l]), false)
+		expect(await ops(prompt, { ...OPTS, label: 'x' }, valid)).toBeNull()
+		expect(events).toEqual([
+			['prompt', 'x'],
+			['valid', 'x'],
+			['prompt', 'x@sonnet'],
+			['valid', 'x@sonnet'],
+		])
+	})
+
 	it('does not escalate a consistent failed gate (passed=false with failures)', async () => {
 		const failed = { snapshot: 's', passed: false, failures: [{ command: 'test' }] }
 		const { ops, calls } = load({ haiku: failed, sonnet: null })

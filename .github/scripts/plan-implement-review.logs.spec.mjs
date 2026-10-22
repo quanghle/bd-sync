@@ -71,6 +71,7 @@ const names = [
 	'gateRerunCmd',
 	'gatePrompt',
 	'TARGET_CMD',
+	'SNAPSHOT_CMD',
 	'normPath',
 	'setupOk',
 	'runSetup',
@@ -608,21 +609,37 @@ describe('plan-implement-review gate command', () => {
 	const LOG = `'${ROOT}/bd-x.1/gate-impl.log'`
 
 	it('writes the marker first, then fmt, clippy and the locked suite into its own log', () => {
-		const { gateCmd, SUITE_TEST } = load(X)
+		const { gateCmd, SUITE_TEST, SNAPSHOT_CMD } = load(X)
 		const cmd = gateCmd('gate:impl')
 		expect(cmd.startsWith(`mkdir -p '${ROOT}/bd-x.1' && cd '${DIR}' && { echo "bd-gate: dir=$PWD run=bd-x.1"; export CARGO_TARGET_DIR='/w/bd-x-1/target'; `)).toBe(true)
 		expect(cmd).toContain('cargo fmt --all --check; echo "exit[fmt]=$?"; cargo clippy --workspace --all-targets --locked -- -D warnings; echo "exit[clippy]=$?"; ')
-		expect(cmd).toContain(`${SUITE_TEST}; echo "exit[test]=$?"; } > ${LOG} 2>&1; grep '^exit\\[' ${LOG}`)
+		expect(cmd).toContain(
+			`${SUITE_TEST}; t=$?; echo "exit[test]=$t"; } > ${LOG} 2>&1; echo "gate-tree=$(${SNAPSHOT_CMD})" >> ${LOG}; echo "gate-exit=$t" >> ${LOG}; grep '^exit\\[' ${LOG}`,
+		)
+		// The tail lines come after the group's redirect, so they are written only once the command finished.
+		expect(cmd.endsWith(`grep '^exit\\[' ${LOG}`)).toBe(true)
+		const at = (s) => cmd.indexOf(s)
+		expect(at(`} > ${LOG} 2>&1`)).toBeGreaterThan(-1)
+		expect(at(`} > ${LOG} 2>&1`)).toBeLessThan(at('gate-tree='))
+		expect(at('gate-tree=')).toBeLessThan(at('gate-exit=$t'))
+		expect(at('gate-exit=$t')).toBeLessThan(at("grep '^exit"))
 		// Only the full suite takes the lock.
 		expect(cmd.split('suite-lock.mjs --run').length).toBe(2)
 		expect(cmd).not.toContain('tee')
 	})
 
 	it('reruns only the suite, appending to the same log', () => {
-		const { gateRerunCmd, SUITE_TEST } = load(X)
-		expect(gateRerunCmd('gate:impl')).toBe(
-			`cd '${DIR}' && { export CARGO_TARGET_DIR='/w/bd-x-1/target'; ${SUITE_TEST}; echo "exit[test]=$?"; } >> ${LOG} 2>&1; grep '^exit\\[test\\]' ${LOG} | tail -1`,
+		const { gateRerunCmd, SUITE_TEST, SNAPSHOT_CMD } = load(X)
+		const cmd = gateRerunCmd('gate:impl')
+		expect(cmd).toBe(
+			`cd '${DIR}' && { export CARGO_TARGET_DIR='/w/bd-x-1/target'; ${SUITE_TEST}; t=$?; echo "exit[test]=$t"; } >> ${LOG} 2>&1; ` +
+				`echo "gate-tree=$(${SNAPSHOT_CMD})" >> ${LOG}; echo "gate-exit=$t" >> ${LOG}; grep '^exit\\[test\\]' ${LOG} | tail -1`,
 		)
+		const at = (s) => cmd.indexOf(s)
+		expect(at(`} >> ${LOG} 2>&1`)).toBeGreaterThan(-1)
+		expect(at(`} >> ${LOG} 2>&1`)).toBeLessThan(at('gate-tree='))
+		expect(at('gate-tree=')).toBeLessThan(at('gate-exit=$t'))
+		expect(at('gate-exit=$t')).toBeLessThan(at("grep '^exit"))
 	})
 
 	it('asks for the command, the rerun on exit 75, the log and the marker', () => {
@@ -635,7 +652,7 @@ describe('plan-implement-review gate command', () => {
 		expect(prompt).toContain(`>> ${LOG} 2>&1`)
 		expect(prompt).toContain('600000')
 		expect(prompt).toContain(`head -1 ${LOG}`)
-		expect(prompt).toContain(`Return ${LOG} as "log"`)
+		expect(prompt).toContain(`Return the path ${ROOT}/bd-x.1/gate-impl.log as "log", exactly as written here and without the shell quotes`)
 		expect(prompt).toContain('verbatim as "marker"')
 		expect(prompt).toContain('git diff --name-only base0 <snapshot>')
 		expect(prompt).toContain('Do NOT fix anything')
@@ -681,8 +698,12 @@ describe('plan-implement-review gate command', () => {
 				execFileSync('sh', ['-c', 'command -v zsh'], { stdio: 'ignore' })
 				shells.push('zsh')
 			} catch {}
+			// The tree SNAPSHOT_CMD prints in the worktree: what a retry's own snapshot would compare the log's tail with.
+			const tree = () => execFileSync('sh', ['-c', w.SNAPSHOT_CMD], { cwd: dir, encoding: 'utf8' }).trim()
+			const tail = (log) => log.trimEnd().split('\n').slice(-2)
+			// Before git init, git's 'not a repository' goes to stderr; piped, it stays out of the test output.
 			const run = (sh) => {
-				const out = execFileSync(sh, ['-c', cmd], { encoding: 'utf8', env })
+				const out = execFileSync(sh, ['-c', cmd], { encoding: 'utf8', env, stdio: ['ignore', 'pipe', 'pipe'] })
 				const log = readFileSync(file, 'utf8')
 				const first = log.split('\n')[0]
 				const m = w.markerOf(first)
@@ -692,6 +713,7 @@ describe('plan-implement-review gate command', () => {
 				expect(out).toBe('exit[fmt]=0\nexit[clippy]=1\nexit[test]=0\n')
 				expect(log).toContain(`cargo clippy --workspace --all-targets --locked -- -D warnings target=${target}`)
 				expect(log).toContain('cargo test --workspace --locked')
+				expect(log.match(/^gate-exit=/gm)).toHaveLength(1)
 				return log
 			}
 			for (const sh of shells) expect(run(sh)).not.toContain('lock held')
@@ -699,16 +721,133 @@ describe('plan-implement-review gate command', () => {
 			execFileSync('git', ['init', '-q', dir])
 			mkdirSync(join(dir, '.github', 'scripts'), { recursive: true })
 			copyFileSync(fileURLToPath(new URL('./suite-lock.mjs', import.meta.url)), join(dir, '.github', 'scripts', 'suite-lock.mjs'))
+			// SNAPSHOT_CMD copies the index, which a fresh git init does not have yet.
+			execFileSync('git', ['-C', dir, 'add', '-A'])
+			const id = tree()
+			expect(id).toMatch(/^[0-9a-f]{40,64}$/)
 			for (const sh of shells) {
-				expect(run(sh)).toContain('lock held')
+				const log = run(sh)
+				expect(log).toContain('lock held')
 				expect(existsSync(join(dir, '.git', 'bd-suite.lock'))).toBe(false)
+				// The log ends with the tree checked and the suite's exit, after the exit lines the command printed.
+				expect(tail(log)).toEqual([`gate-tree=${id}`, 'gate-exit=0'])
 			}
-			// The rerun appends one more exit[test] line.
+			// The rerun appends one more exit[test] line, and a fresh tail after it.
 			const again = execFileSync('sh', ['-c', w.gateRerunCmd('gate:impl')], { encoding: 'utf8', env })
 			expect(again).toBe('exit[test]=0\n')
-			expect(readFileSync(file, 'utf8').match(/^exit\[test\]=/gm)).toHaveLength(2)
+			const log = readFileSync(file, 'utf8')
+			expect(log.match(/^exit\[test\]=/gm)).toHaveLength(2)
+			expect(log.match(/^gate-exit=/gm)).toHaveLength(2)
+			expect(tail(log)).toEqual([`gate-tree=${tree()}`, 'gate-exit=0'])
+			expect(tree()).toBe(id)
 		} finally {
 			rmSync(tmp, { recursive: true, force: true })
 		}
+	})
+})
+
+describe('plan-implement-review reused gate log', () => {
+	const CONTRA = { ...PASSED, failures: [{ command: 'cargo clippy', excerpt: 'x' }] }
+	const NO_SNAP = { ...PASSED, snapshot: '' }
+	const FIRST = `${ROOT}/bd-x.1/gate-impl.log`
+	const OWN = `${ROOT}/bd-x.1/gate-impl-sonnet.log`
+	const R1LOG = `${ROOT}/bd-x.1/gate-r1.log`
+	const targets = (prompt) => new Set([...prompt.matchAll(/>>? '([^']*)'/g)].map((m) => m[1]))
+	const retryPrompt = (w) => w.calls.find((c) => c.label === 'gate:impl@sonnet').prompt
+
+	it.each([
+		['no reply', null],
+		['a pass without a snapshot', NO_SNAP],
+		['a pass contradicting its failures', CONTRA],
+	])('offers the retry the first log after %s', async (_, first) => {
+		const { w, labels } = await gateOnce({ 'gate:impl': first })
+		expect(labels).toEqual(['gate:impl', 'gate:impl@sonnet'])
+		const p = retryPrompt(w)
+		expect(p).toContain(w.SNAPSHOT_CMD)
+		expect(p.indexOf(w.SNAPSHOT_CMD)).toBeLessThan(p.indexOf(`test -f '${FIRST}'`))
+		expect(p).toContain(`test -f '${FIRST}'`)
+		expect(p).toContain(`head -1 '${FIRST}'`)
+		expect(p).toContain('bd-gate: dir=/w/bd-x-1 run=bd-x.1')
+		expect(p).toContain('exit[fmt]')
+		expect(p).toContain('exit[clippy]')
+		expect(p).toContain('128')
+		expect(p).toContain('75')
+		expect(p).toContain(`tail -n 2 '${FIRST}'`)
+		expect(p).toContain('gate-tree=<your snapshot>')
+		expect(p).toContain('gate-exit=')
+		expect(p).toContain(`Return the path ${FIRST} as "log"`)
+		expect(p).toContain('git diff --name-only base0 <snapshot>')
+		expect(p).toContain(w.gateCmd('gate:impl@sonnet'))
+		expect(p).toContain(w.gateRerunCmd('gate:impl@sonnet'))
+		expect(p).toContain('never read any other log')
+		expect(targets(p)).toEqual(new Set([OWN]))
+	})
+
+	it.each([
+		['a consistent foreign-marker report', { ...LINT, marker: marker('/w/other') }],
+		['a consistent pass without a marker', { ...PASSED, marker: '' }],
+		['a consistent contaminated pass', FOREIGN_REPORT],
+		['a contradictory report with a foreign marker', { ...CONTRA, marker: marker('/w/other') }],
+		['a contradictory pass without a marker', { ...CONTRA, marker: '' }],
+		['a snapshot-less report with a foreign marker', { ...NO_SNAP, marker: marker('/w/other') }],
+	])('gives a plain retry after %s', async (_, first) => {
+		const { w, labels } = await gateOnce({ 'gate:impl': first })
+		expect(labels).toEqual(['gate:impl', 'gate:impl@sonnet'])
+		const p = retryPrompt(w)
+		expect(p.startsWith(w.gatePrompt('gate:impl@sonnet'))).toBe(true)
+		expect(p).not.toContain(FIRST)
+	})
+
+	it('returns a reused pass as is', async () => {
+		const reused = { ...PASSED, log: FIRST }
+		const { g } = await gateOnce({ 'gate:impl': CONTRA, 'gate:impl@sonnet': reused })
+		expect(g).toBe(reused)
+	})
+
+	it.each([
+		['its own log', OWN],
+		['the first log quoted', `'${FIRST}'`],
+		['its own log padded', `  ${OWN}\n`],
+	])('accepts a reuse retry reporting %s', async (_, log) => {
+		const report = { ...PASSED, log }
+		const { g } = await gateOnce({ 'gate:impl': CONTRA, 'gate:impl@sonnet': report })
+		expect(g).toBe(report)
+	})
+
+	it.each([
+		['another log', R1LOG, R1LOG],
+		['no log', undefined, 'no log'],
+		['another log quoted', `'${R1LOG}'`, R1LOG],
+	])('fails a reuse retry reporting %s', async (_, log, shown) => {
+		const { w, g } = await gateOnce({ 'gate:impl': CONTRA, 'gate:impl@sonnet': { ...PASSED, log } })
+		expect(g).toBeNull()
+		expect(w.logs).toContain(`gate gate:impl@sonnet: report read ${shown}, not ${FIRST} or ${OWN}`)
+	})
+
+	it('names the first log when a reused report is contaminated', async () => {
+		const { g } = await gateOnce({ 'gate:impl': CONTRA, 'gate:impl@sonnet': { ...PASSED, marker: marker('/w/other'), log: `'${FIRST}'` } })
+		expect(g).toMatchObject({ contaminated: true, dir: '/w/other', log: FIRST })
+	})
+
+	it('treats a reused pass without a marker as contaminated', async () => {
+		const { g } = await gateOnce({ 'gate:impl': CONTRA, 'gate:impl@sonnet': { ...PASSED, marker: '', log: FIRST } })
+		expect(g).toMatchObject({ contaminated: true, marker: '', log: FIRST })
+	})
+
+	it('checks no log path on a retry that was not offered reuse', async () => {
+		const { g } = await gateOnce({ 'gate:impl': { ...CONTRA, marker: marker('/w/other') }, 'gate:impl@sonnet': PASSED })
+		expect(g).toBe(PASSED)
+	})
+
+	it('sends a reused lint failure to the gate-fix coder', async () => {
+		const w = load(X, {
+			'gate:impl': null,
+			'gate:impl@sonnet': { ...LINT, marker: marker(DIR), log: FIRST },
+			'coder:gate-fix:impl:1': { summary: 'fixed lint', filesChanged: ['a.rs'] },
+			'gate:impl:1': PASSED,
+		})
+		expect(await w.gateUntilGreen('impl', 0)).toBe(PASSED)
+		expect(w.calls.map((c) => c.label)).toEqual(['gate:impl', 'gate:impl@sonnet', 'coder:gate-fix:impl:1', 'gate:impl:1'])
+		expect(w.calls[2].prompt).toContain('unused variable')
 	})
 })

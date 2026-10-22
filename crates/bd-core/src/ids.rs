@@ -29,12 +29,15 @@ pub(crate) fn adaptive_length(existing: i64) -> usize {
     MAX_LEN
 }
 
+/// Digest bytes to take for a `len`-char base36 id: enough that 256^bytes
+/// covers 36^len, so every id of that length is reachable.
 fn hash_bytes_for(len: usize) -> usize {
     match len {
         3 => 2,
         4 => 3,
         5 | 6 => 4,
-        _ => 5,
+        7 => 5,
+        _ => 6,
     }
 }
 
@@ -170,6 +173,25 @@ mod tests {
         assert_eq!(base36(&[0, 35], 3), "00z");
         assert_eq!(base36(&[0xff, 0xff], 3).len(), 3);
         assert_eq!(base36(&[1, 2, 3, 4, 5], 8).len(), 8);
+    }
+
+    #[test]
+    fn hash_bytes_cover_the_id_space() {
+        for len in MIN_LEN..=MAX_LEN {
+            let bytes = hash_bytes_for(len);
+            assert!(256f64.powi(bytes as i32) >= 36f64.powi(len as i32), "len {len} with {bytes} bytes");
+            assert!(bytes <= 8, "len {len} needs more than a u64");
+        }
+    }
+
+    #[test]
+    fn eight_char_ids_reach_the_top_of_the_alphabet() {
+        // With 5 bytes, 256^5 < 36^8 and the first char never passed 'e'.
+        let first_chars: std::collections::BTreeSet<char> = (0..2000u32)
+            .map(|nonce| hash_id("bd", "t", "d", "alice", 42, nonce, 8))
+            .map(|id| id.chars().nth(3).unwrap())
+            .collect();
+        assert!(first_chars.iter().any(|&c| c > 'e'), "{first_chars:?}");
     }
 
     #[test]

@@ -181,9 +181,11 @@ effort: "medium" } (a level below the gating reviewers; pick another model and e
 never fix, file or triage them. Work done outside the workflow still reviews through it \
 (skipImplement with plan, workdir and baseline, plus shadowReview; see review). Keep the \
 workflow's result for the score step. The controller (whoever starts the workflow) sets the \
-coding agents' model and effort with model and effort (AGENTS.md "Delegating to agents", including \
-the coder exploration quota: record `exploration` metadata on the run before implementing when it \
-applies)."""
+coding agents' model and effort with model and effort, and the planner, critic and triage \
+agents' effort with plannerEffort (AGENTS.md "Delegating to agents": the coder exploration quota \
+and the planner effort exploration, which runs a picked run's planner, critic and triage agents \
+at medium; when either pick applies, record `exploration` metadata on the run before \
+implementing, both pairs in one object when both apply)."""
 acceptance_criteria = "Evidence: close reason names the commit(s); a comment maps each requirement (and mitigation) to its code and test, and names the shadow reviewer model(s) and effort(s) with the shadowFindings count per round."
 
 [[steps]]

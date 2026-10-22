@@ -14,11 +14,16 @@
 // before the run's last steps and its score gate close. The complexity tables (estimate vs judged, score, score by coder,
 // and cost and time by complexity) are per rubric version (.bd/rubric.md's Version, recorded with each estimate and score):
 // a run counts under its judged score's version, and an estimate/judged pair of different versions is counted apart as mixed.
+// The Controller sessions section reads each session a run's trace names over its whole main thread from this machine's
+// logs (the Claude Code main transcript or Copilot's main requests, through trace-run's readers, found by the directory
+// listing only), reports its cost, mean tokens read per request by quarter and the runs traced and finished in it, and is
+// never stored by --write.
 import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { canonicalModel, ROLE_PREFIXES } from './reviewer-catch.mjs'
-import { activeMs, bdRunner, fmtDuration, issueChecker, logDirs, readRecord, stepFrom, timingOf, trace } from './trace-run.mjs'
+import { activeMs, bdRunner, claudeRequestsOf, findClaudeSessions, findSessions, fmtDuration, harnessOf, issueChecker, logDirs, readJsonl, readRecord, sessionRequests, stepFrom, timingOf, trace } from './trace-run.mjs'
 
 // ---------- roles ----------
 // What an agent did, from its trace label: 'main', a workflow's '<workflow>:<role>[:...]', or a subagent's
@@ -417,6 +422,146 @@ export function aggregate(runs, prices = PRICES) {
   }
 }
 
+// ---------- controller sessions ----------
+const msOf = (t) => (t == null ? NaN : Date.parse(t))
+// Tokens read by a request: input, cache reads and cache writes, as mainPerRequest counts them.
+const readOf = (r) => (r.tokens?.input ?? 0) + (r.tokens?.cache_read ?? 0) + (r.tokens?.cache_write ?? 0)
+
+/**
+ * One row per agent session named in any run's work.sessions, over that session's whole main thread on this machine, for
+ * the Controller sessions section (how a long controller session's cost and context grow against the runs it drove).
+ *
+ * runs: joined runs ({ id, status, work?: { sessions: [{ actor?, session, harness? }], steps }, timing? }); a session entry
+ * stored before Claude Code support has { actor, session } only, and its harness is read from the actor (else copilot).
+ * mainOf({ harness, session }): the session's main-thread requests ([{ id, ts, end?, model, tokens, owned? }], subagents
+ * and workflows left out), or null when its log is not on this machine (or cannot be read).
+ * bornOf({ harness, session }): the transcript's birth time in ms (0 when unknown), breaking a start tie between Claude
+ * Code sessions as trace() does.
+ *
+ * A request id copied into a resumed or forked session counts once, per harness: the Copilot copy the session owns wins,
+ * else the session that started first (ties by birth time when both are known, then more requests, then session id).
+ *
+ * Returns [{ harness, session, missing, first, last, requests, cost, unpriced, outputUnknown, perRequestByQuarter: [Q1..Q4],
+ * runs: [ids traced in it], finished: [ids finished in it] }]: present sessions by first request (none last), then missing
+ * ones by session id. A missing session's figures are null (not zero) and it finishes nothing. A closed run is finished in
+ * at most one session: among those it names whose first-to-last span holds its last step close (timing, else its traced
+ * steps' last close), the one with the latest main request at or before the close (ties by session id).
+ */
+export function controllerSessions(runs, mainOf, prices = PRICES, { bornOf = () => 0 } = {}) {
+  const sessions = new Map()
+  const keyOf = (harness, session) => `${harness}\0${session}`
+  for (const r of runs)
+    for (const s of r.work?.sessions ?? []) {
+      if (typeof s?.session !== 'string' || !s.session) continue
+      const harness = s.harness ?? harnessOf(s.actor ?? '')?.harness ?? 'copilot'
+      const key = keyOf(harness, s.session)
+      const x = sessions.get(key) ?? { harness, session: s.session, runs: [] }
+      if (!x.runs.includes(r.id)) x.runs.push(r.id)
+      sessions.set(key, x)
+    }
+
+  // Each session read once; a request id repeated within one log counts once.
+  const present = []
+  const missing = []
+  for (const x of sessions.values()) {
+    const reqs = mainOf({ harness: x.harness, session: x.session })
+    if (reqs == null) {
+      missing.push(x)
+      continue
+    }
+    const ids = new Set()
+    const own = reqs.filter((r) => !ids.has(r.id) && ids.add(r.id))
+    present.push({ ...x, reqs: own, start: own.reduce((m, r) => (r.ts < m ? r.ts : m), '￿'), born: bornOf({ harness: x.harness, session: x.session }) || 0 })
+  }
+
+  // Across sessions, as trace() does: the owned Copilot copy, else the session that started first.
+  const byBirth = (a, b) => (a.born && b.born ? a.born - b.born : 0)
+  present.sort((a, b) => a.start.localeCompare(b.start) || byBirth(a, b) || b.reqs.length - a.reqs.length || a.session.localeCompare(b.session))
+  const owners = new Map()
+  for (const x of present)
+    for (const r of x.reqs) {
+      const key = keyOf(x.harness, r.id)
+      const prev = owners.get(key)
+      if (!prev || (r.owned === true && prev.r.owned !== true)) owners.set(key, { x, r })
+    }
+
+  const rows = new Map()
+  for (const x of present) {
+    const kept = x.reqs.filter((r) => owners.get(keyOf(x.harness, r.id)).x === x).toSorted((a, b) => a.ts.localeCompare(b.ts) || String(a.id).localeCompare(String(b.id)))
+    let cost = 0
+    let unpriced = 0
+    let outputUnknown = 0
+    for (const r of kept) {
+      const c = costOf(r.tokens, r.model, prices)
+      if (c == null) unpriced++
+      else {
+        cost += c
+        outputUnknown += r.tokens?.output_unknown ?? 0
+      }
+    }
+    const quarters = [[], [], [], []]
+    kept.forEach((r, j) => quarters[Math.floor((4 * j) / kept.length)].push(readOf(r)))
+    const last = kept.reduce((m, r) => {
+      const t = r.end ?? r.ts
+      return m == null || msOf(t) > msOf(m) ? t : m
+    }, null)
+    rows.set(keyOf(x.harness, x.session), {
+      harness: x.harness,
+      session: x.session,
+      missing: false,
+      first: kept.length ? kept[0].ts : null,
+      last,
+      requests: kept.length,
+      cost,
+      unpriced,
+      outputUnknown,
+      perRequestByQuarter: quarters.map((q) => (q.length ? Math.round(mean(q)) : null)),
+      runs: x.runs,
+      finished: [],
+      kept,
+    })
+  }
+
+  // A closed run counts as finished once, in the session active right before its last step closed.
+  for (const r of runs) {
+    if (r.status !== 'closed') continue
+    const named = [...new Set((r.work?.sessions ?? []).filter((s) => typeof s?.session === 'string' && s.session).map((s) => keyOf(s.harness ?? harnessOf(s.actor ?? '')?.harness ?? 'copilot', s.session)))]
+      .map((key) => rows.get(key))
+      .filter(Boolean)
+    if (!named.length) continue
+    const start = msOf(r.timing?.start)
+    const elapsed = r.timing?.elapsed_ms
+    const close = Number.isFinite(start) && Number.isFinite(elapsed) ? start + elapsed : msOf(spanOf(r)?.[1])
+    if (!Number.isFinite(close)) continue
+    const candidates = named
+      .filter((x) => x.first != null && msOf(x.first) <= close && close <= msOf(x.last))
+      .map((x) => ({ x, latest: Math.max(...x.kept.map((q) => msOf(q.ts)).filter((t) => t <= close)) }))
+      .toSorted((a, b) => b.latest - a.latest || a.x.session.localeCompare(b.x.session))
+    if (candidates.length) candidates[0].x.finished.push(r.id)
+  }
+
+  const byFirst = (a, b) => (a.first === b.first ? 0 : a.first == null ? 1 : b.first == null ? -1 : msOf(a.first) - msOf(b.first) || a.first.localeCompare(b.first))
+  return [
+    ...[...rows.values()].toSorted((a, b) => byFirst(a, b) || a.session.localeCompare(b.session)).map(({ kept, ...row }) => row),
+    ...missing
+      .toSorted((a, b) => a.session.localeCompare(b.session))
+      .map((x) => ({
+        harness: x.harness,
+        session: x.session,
+        missing: true,
+        first: null,
+        last: null,
+        requests: null,
+        cost: null,
+        unpriced: 0,
+        outputUnknown: 0,
+        perRequestByQuarter: [null, null, null, null],
+        runs: x.runs,
+        finished: [],
+      })),
+  ]
+}
+
 // ---------- render ----------
 const n = (x, digits = 1) => (x == null ? '–' : Number.isInteger(x) ? String(x) : x.toFixed(digits))
 const usd = (x) => (x == null ? '–' : `$${x.toFixed(2)}`)
@@ -436,6 +581,10 @@ const table = (head, rows) => [`| ${head.join(' | ')} |`, `|${head.map(() => '--
 /** The report as markdown. */
 export function render(runs, agg, prices = PRICES) {
   const gapCell = (r) => (r.estimate != null && complexityOf(r) != null ? n(complexityOf(r) - r.estimate) : '–')
+  const controllers = agg.controllers ?? []
+  const when = (t) => (t ? t.slice(0, 16).replace('T', ' ') : '–')
+  const quarter = (q) => (q == null ? '–' : k(q))
+  const ids = (xs) => (xs?.length ? xs.join(', ') : '–')
   return [
     `# Calibration report`,
     ``,
@@ -574,7 +723,63 @@ export function render(runs, agg, prices = PRICES) {
     agg.mainPerRequest.length
       ? table(['run', 'main requests', 'tokens read per request'], agg.mainPerRequest.map((x) => [x.id, x.requests, k(x.perRequest)]))
       : 'No traced main thread.',
+    ``,
+    `## Controller sessions`,
+    ``,
+    controllers.length
+      ? table(
+          ['session', 'harness', 'first', 'last', 'main requests', 'cost', 'Q1', 'Q2', 'Q3', 'Q4', 'runs', 'finished'],
+          controllers.map((x) =>
+            x.missing
+              ? [x.session, x.harness, 'not on this machine', '–', '–', '–', '–', '–', '–', '–', ids(x.runs), '–']
+              : [x.session, x.harness, when(x.first), when(x.last), x.requests, usd(x.cost) + extras(x), ...x.perRequestByQuarter.map(quarter), ids(x.runs), ids(x.finished)],
+          ),
+        )
+      : 'No traced session on this machine.',
+    ``,
+    `One row per agent session named in a run's trace, over its whole main thread on this machine (the Claude Code main transcript, Copilot's main requests), the requests between and after runs included; subagent and workflow requests are left out (they are in the per-run tables), and a request copied into a resumed or forked session is counted once, as in the traces. Q1-Q4: mean tokens read per request (input, cache reads and writes, as above) in each time-ordered quarter of its main requests, so a growing context shows as rising quarters. runs: the runs whose trace names the session; finished: the closed runs whose last step closed within its first to last main request (a run handed off counts in one session). Costs as above. A session whose log is not here is listed as not on this machine.`,
   ].join('\n')
+}
+
+// ---------- session logs ----------
+/**
+ * Reads a session's main thread from this machine's logs, for controllerSessions: mainOf({ harness, session }) gives
+ * the main requests of the Claude Code main transcript (never its subagents or workflows) or of Copilot's events.jsonl
+ * (kind 'main'), or null when no log is found or it cannot be read. bornOf gives a Claude transcript's birth time (0
+ * when unknown, and for Copilot, whose owned flag decides). Files are found only through trace-run's directory
+ * listings and kept only when the listed name equals the id exactly: no path is built from the id itself.
+ */
+export function sessionReader({ sessionsDir, projectsDir }) {
+  const claudeFiles = (session) =>
+    projectsDir && typeof session === 'string' && session ? findClaudeSessions(projectsDir, session).filter((f) => f.session === session) : []
+  const mainOf = ({ harness, session }) => {
+    if (typeof session !== 'string' || !session) return null
+    try {
+      if (harness === 'copilot') {
+        const found = sessionsDir ? findSessions(sessionsDir, session).filter((f) => f.session === session) : []
+        if (!found.length) return null
+        return found.flatMap((f) => sessionRequests(f.dir, f.session)).filter((r) => r.kind === 'main')
+      }
+      if (harness === 'claude') {
+        const found = claudeFiles(session)
+        if (!found.length) return null
+        return found.flatMap((f) => claudeRequestsOf(readJsonl(join(f.dir, `${f.session}.jsonl`))))
+      }
+    } catch {
+      return null
+    }
+    return null
+  }
+  const bornOf = ({ harness, session }) => {
+    if (harness !== 'claude') return 0
+    try {
+      const [f] = claudeFiles(session)
+      return f ? statSync(join(f.dir, `${f.session}.jsonl`)).birthtimeMs || 0 : 0
+    } catch {
+      return 0
+    }
+  }
+  return { mainOf, bornOf }
 }
 
 // ---------- CLI ----------
@@ -608,6 +813,8 @@ function main(argv) {
   }
   const runs = joinRuns(issues, { followUpsOf, traceOf })
   const agg = aggregate(runs)
+  const reader = sessionReader(dirs)
+  agg.controllers = controllerSessions(runs, reader.mainOf, PRICES, { bornOf: reader.bornOf })
   process.stdout.write(`${argv.includes('--json') ? JSON.stringify({ runs, aggregate: agg }, null, 2) : render(runs, agg)}\n`)
   // Only finished runs: a backfill of an open run misses its remaining work and would stand in for it as 'stored'.
   if (argv.includes('--write'))

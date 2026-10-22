@@ -134,6 +134,63 @@ describe('plan-implement-review', () => {
 		expect((await wf.run(ctx)).status).toBe('done')
 	})
 
+	it('throws when the lease has expired, even if it is still the actor\'s with the same token', async () => {
+		const wf = await load('plan-implement-review', undefined)
+		const ctx = fakeCtx(
+			ARGS,
+			script({
+				'heartbeat:0': { ok: false, error: 'expired' },
+				'heartbeat:0@escalated': { ok: false, error: 'expired' },
+				'heartbeat:0:lease': { has: true, holder: 'me/copilot-1', token: 'tok', expiresAt: '2026-10-20T08:23:37.693Z', now: '2026-10-20T08:33:59Z' },
+			}),
+		)
+		await expect(wf.run(ctx)).rejects.toThrow(/expired 2026-10-20T08:23:37\.693Z/)
+		const check = ctx.calls.find((c) => c.label === 'heartbeat:0:lease')
+		expect(check.prompt).toContain('expires_at (as expiresAt)')
+		expect(check.prompt).toContain('date -u +%Y-%m-%dT%H:%M:%SZ')
+	})
+
+	/** A plan-only run that drafts, revises once after a blocking critique, then applies a final suggested correction. */
+	const PLAN_ONLY = { requirements: 'x', issue: 'bd-1', workdir: '/w', actor: 'me/copilot-1', shadowReview: false, planOnly: true, maxPlanRevisions: 1 }
+	const BLOCKING = { approved: false, issues: [{ blocking: true, issue: 'i', evidence: 'e', suggestion: 's' }] }
+	const PLANNING = { 'planner:draft': PLAN, 'planner:critic:0': BLOCKING, 'planner:revise:1': PLAN, 'planner:critic:1': BLOCKING, 'planner:final:1': PLAN }
+
+	it('renews the lease before each planning agent', async () => {
+		const wf = await load('plan-implement-review', undefined)
+		const ctx = fakeCtx(PLAN_ONLY, script(PLANNING))
+		expect((await wf.run(ctx)).status).toBe('planned')
+		const labels = ctx.calls.map((c) => c.label).filter((l) => /^(heartbeat|planner):/.test(l) && !l.endsWith('@escalated'))
+		expect(labels).toEqual([
+			'heartbeat:0',
+			'planner:draft',
+			'heartbeat:1',
+			'planner:critic:0',
+			'heartbeat:2',
+			'planner:revise:1',
+			'heartbeat:3',
+			'planner:critic:1',
+			'heartbeat:4',
+			'planner:final:1',
+		])
+		expect(ctx.calls.find((c) => c.label === 'planner:critic:0')).toMatchObject({ agent: 'rubber-duck', reasoningEffort: 'high' })
+	})
+
+	it('does not start a planning agent once the lease is lost', async () => {
+		const wf = await load('plan-implement-review', undefined)
+		const ctx = fakeCtx(
+			PLAN_ONLY,
+			script({
+				...PLANNING,
+				'heartbeat:1': { ok: false, error: 'held by other' },
+				'heartbeat:1@escalated': { ok: false, error: 'held by other' },
+				'heartbeat:1:lease': { has: true, holder: 'someone/else', token: 'x' },
+			}),
+		)
+		await expect(wf.run(ctx)).rejects.toThrow(/Lost the lease on bd-1/)
+		expect(ctx.calls.some((c) => c.label === 'planner:draft')).toBe(true)
+		expect(ctx.calls.some((c) => c.label.startsWith('planner:critic:0'))).toBe(false)
+	})
+
 	it('validates its arguments', async () => {
 		const wf = await load('plan-implement-review', undefined)
 		await expect(wf.run(fakeCtx({}, script()))).rejects.toThrow(/args.requirements is required/)

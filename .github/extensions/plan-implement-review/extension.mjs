@@ -30,6 +30,8 @@ const LEASE = {
         has: { type: "boolean", description: "false when bd show prints no lease" },
         holder: { type: "string", description: "lease.holder, verbatim" },
         token: { type: "string", description: "lease.token, verbatim" },
+        expiresAt: { type: "string", description: "lease.expires_at, verbatim" },
+        now: { type: "string", description: "the output of date -u +%Y-%m-%dT%H:%M:%SZ" },
     },
     required: ["has"],
 };
@@ -603,9 +605,15 @@ async function run(ctx) {
         ctx.log(`Claimed ${A.issue} as ${c.actor} (token ${c.token}, ttl ${TTL})`);
     }
 
-    // Renew between stages. A failed heartbeat is escalated once (it is idempotent under the token); if that fails too, the
-    // lease itself decides: an agent that mangles the command (a dropped --actor reads as "now held by <the same actor>")
-    // must not end the run, or resume would replay the journaled failure. Someone else holding the issue now: stop.
+    // Renew before each planning agent and between stages. A failed heartbeat is escalated once (it is idempotent under the
+    // token); if that fails too, the lease itself decides, and only when it has the same holder and token and has not
+    // expired: an agent that mangles the command (a dropped --actor reads as "now held by <the same actor>") must not end
+    // the run, or resume would replay the journaled failure. Anything else (someone else holding the issue, another token,
+    // no lease, an expired one): stop. The lease-check agent reports the time, as the Claude Code workflow (which has no
+    // clock) does; ISO-8601 UTC strings compare as text, and a missing value counts as not expired.
+    function expired(l) {
+        return !!(l.expiresAt && l.now) && l.expiresAt.slice(0, 19) <= l.now.slice(0, 19);
+    }
     let beats = 0;
     async function renew() {
         if (!lease) return;
@@ -620,14 +628,19 @@ async function run(ctx) {
         if (h) return;
         const l = await ops(
             `Run exactly: bd -C ${lease.root} show ${lease.issue} --json\n` +
-                `Return the "lease" object's holder and token exactly as printed (has=false if there is no lease). Do nothing else.`,
+                `Return the "lease" object's holder, token and expires_at (as expiresAt) exactly as printed (has=false if there is no lease). ` +
+                `Then run \`date -u +%Y-%m-%dT%H:%M:%SZ\` and return its output as now. Do nothing else.`,
             { label: `${label}:lease`, schema: LEASE },
         );
-        if (l?.has && l.holder === lease.actor && String(l.token) === String(lease.token)) {
+        if (l?.has && l.holder === lease.actor && String(l.token) === String(lease.token) && !expired(l)) {
             ctx.log(`Heartbeat on ${lease.issue} failed (${failed?.error ?? "heartbeat agent failed"}) but the lease is still ${l.holder}'s, token ${l.token}; continuing.`);
             return;
         }
-        const now = l ? (l.has ? `held by ${l.holder}, token ${l.token}` : "no lease") : "lease check failed";
+        const now = l
+            ? l.has
+                ? `held by ${l.holder}, token ${l.token}` + (expired(l) ? `, expired ${l.expiresAt}` : "")
+                : "no lease"
+            : "lease check failed";
         throw new Error(
             `Lost the lease on ${lease.issue} (${failed?.error ?? "heartbeat agent failed"}; ${now}); stopping. Work so far is in ${DIR || "no worktree yet"}.`,
         );
@@ -679,8 +692,12 @@ async function run(ctx) {
     if (REVIEW_OPTS.effort) ctx.log(`Reviewers at effort ${REVIEW_OPTS.effort}`);
 
     // ---------- Plan ----------
+    // Every planning agent renews the lease first, so no gap between renewals spans more than one planning agent.
+    const planAgent = async (prompt, opts) => {
+        await renew();
+        return agent(prompt, opts);
+    };
     ctx.phase("Plan");
-    await renew();
     const runContext = A.reviewStep
         ? `\n\nThis work is part of a playbook run: \`bd${bdFlags()} show ${A.reviewStep}\` is its review step; its parent is the run. ` +
           `Read the run's requirements and decisions steps (and their decision children): their acceptance and design fields are settled input. ` +
@@ -698,7 +715,7 @@ async function run(ctx) {
     const fmtBlockers = (bs) =>
         bs.map((b) => `- ${b.issue}\n    evidence: ${b.evidence}${b.suggestion ? `\n    suggestion: ${b.suggestion}` : ""}`).join("\n");
     const badPlan = (p) => !p.steps?.length || !p.requirements?.length;
-    let plan = A.plan ?? (await agent(planIntro, { label: "planner:draft", effort: "high", schema: PLAN }));
+    let plan = A.plan ?? (await planAgent(planIntro, { label: "planner:draft", effort: "high", schema: PLAN }));
     if (!plan || badPlan(plan)) return { status: "escalated", reason: "planner failed", workdir: DIR, lease };
     if (A.plan) ctx.log(`Starting from the given plan (${plan.steps.length} step(s))`);
     // Issues already known against a given plan stand in for the first critique.
@@ -712,7 +729,7 @@ async function run(ctx) {
             blockers = pending;
             pending = null;
         } else {
-            const crit = await agent(
+            const crit = await planAgent(
                 `${readOnly(DIR)}\nYou are the plan critic. Try to break this plan before any code is written.\n\n${TASK}${runContext}\n\n${fmtPlan(plan)}\n\n` +
                     `Plan decisions:\n${fmtDecisions(plan)}\n\n` +
                     (critiques.length
@@ -744,7 +761,7 @@ async function run(ctx) {
                 };
             }
             ctx.log(`Plan: applying ${blockers.length} suggested correction(s) without another critique`);
-            const final = await agent(
+            const final = await planAgent(
                 `${planIntro}\n\nYour previous plan:\n${fmtPlan(plan)}\n\nIts decisions:\n${fmtDecisions(plan)}\n\n` +
                     `Verified blocking issues, each with its fix:\n${fmtBlockers(blockers)}\n\n` +
                     `Return the full plan with exactly these corrections applied (adopt each suggestion; if the code shows one is wrong, ` +
@@ -758,7 +775,7 @@ async function run(ctx) {
         }
         ctx.log(`Plan critic: ${blockers.length} blocking issue(s); revising`);
         critiques.push(blockers.map((b) => `- ${b.issue} (evidence: ${b.evidence})`).join("\n"));
-        const revised = await agent(
+        const revised = await planAgent(
             `${planIntro}\n\nYour previous plan:\n${fmtPlan(plan)}\n\nIts decisions:\n${fmtDecisions(plan)}\n\n` +
                 `The critic raised these blocking issues:\n${fmtBlockers(blockers)}\n\n` +
                 `Return the full revised plan. Address each issue, or keep your choice and strengthen its rationale in "decisions" if the critic is wrong. ` +
@@ -1306,7 +1323,7 @@ const planImplementReview = defineWorkflow({
             "args: { requirements (string or string[]; alias task), issue?, reviewStep?, tier?, model?, effort?, reviewEffort?, actor?, token?, ttl?, workdir?, logDir?, base?, baseline?, " +
             "maxRounds?, maxGateFixes?, maxPlanRevisions?, maxAmendments?, planOnly?, plan?, planFile?, planIssues?, skipImplement?, shadowReview? }. " +
             "With issue, the workflow claims it (pass actor = your bd actor so you can close it later, " +
-            "and token if you already hold it) and renews the lease between stages; a failed heartbeat is escalated once, then the lease shown by bd show decides. " +
+            "and token if you already hold it) and renews the lease before each planning agent and between stages; a failed heartbeat is escalated once, then the lease shown by bd show decides (an expired one is lost). " +
             "With reviewStep (a playbook run's review step, e.g. a `change` run's), the planner reads the run's requirements and decisions steps as settled input, " +
             "each finding approved for a fix becomes a bug issue under that step, commented once a later round confirms the fix and returned as confirmedFixes " +
             "for the caller to close after closing the implement and verify steps (bd refuses to close a child of a blocked step); a filed finding the planner " +

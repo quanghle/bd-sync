@@ -1,8 +1,10 @@
-// renew() in .claude/workflows/plan-implement-review.js renews the lease between stages. A heartbeat agent can report a
-// failure that isn't one (a dropped --actor reads as "now held by <the same actor>"), and a run that stops on it
-// replays the cached failure on resume. So a failed heartbeat is escalated once, then checked against the lease bd shows,
-// compared by the script. A workflow script isn't a module (top-level await and return), so this lifts renew() and what it
-// uses out of the source, like the ops and record specs, and runs it with a stub agent.
+// renew() in .claude/workflows/plan-implement-review.js renews the lease between stages, and the Plan stage renews it
+// before each planning agent through planAgent. A heartbeat agent can report a failure that isn't one (a dropped --actor
+// reads as "now held by <the same actor>"), and a run that stops on it replays the cached failure on resume. So a failed
+// heartbeat is escalated once, then checked against the lease bd shows, compared by the script: the same holder and
+// token on a lease that has not expired (by the time the lease-check agent reports) continues; anything else, an expired
+// lease included, is lost. A workflow script isn't a module (top-level await and return), so this lifts renew(),
+// expired(), planAgent and what they use out of the source, like the ops and record specs, and runs them with stubs.
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from './expect.mjs'
@@ -17,8 +19,10 @@ const slice = (from, to) => {
 const body = [
 	slice('const OPS =', '// ---------- schemas'),
 	slice('const HEARTBEAT =', 'const SETUP ='),
-	slice('let beats = 0', '// Where bd records go'),
+	slice('function expired(', '// Where bd records go'),
 ].join('\n')
+const planAgentBody = slice('// Every planning agent renews the lease first', "phase('Plan')")
+const planSection = slice("phase('Plan')", '// ---------- gate')
 
 const LEASE = { issue: 'bd-x', token: '678', actor: 'Quang Le/claude-1', root: '/repo' }
 
@@ -61,6 +65,36 @@ describe('plan-implement-review renew()', () => {
 		await renew('Review')
 		expect(labels()).toEqual(['heartbeat:0', 'heartbeat:0@sonnet', 'heartbeat:0:lease'])
 		expect(calls[2].prompt).toContain('bd -C /repo show bd-x --json')
+		expect(calls[2].prompt).toContain('expires_at (as expiresAt)')
+		expect(calls[2].prompt).toContain('date -u +%Y-%m-%dT%H:%M:%SZ')
+		expect(logs.at(-1)).toContain('continuing')
+	})
+
+	const same = { has: true, holder: 'Quang Le/claude-1', token: '678' }
+
+	it('stops when the lease has expired', async () => {
+		const { renew } = load({
+			heartbeat: { haiku: lost, sonnet: lost },
+			lease: { haiku: { ...same, expiresAt: '2026-10-20T08:23:37.693Z', now: '2026-10-20T08:33:59Z' } },
+		})
+		await expect(renew('Gate')).rejects.toThrow('expired 2026-10-20T08:23:37.693Z')
+	})
+
+	it('stops when the lease expires within the second the check reports', async () => {
+		const { renew } = load({
+			heartbeat: { haiku: lost, sonnet: lost },
+			lease: { haiku: { ...same, expiresAt: '2026-10-20T08:33:59.500Z', now: '2026-10-20T08:33:59Z' } },
+		})
+		await expect(renew('Gate')).rejects.toThrow('expired 2026-10-20T08:33:59.500Z')
+	})
+
+	it.each([
+		['before expiry', { expiresAt: '2026-10-20T08:23:37.693Z', now: '2026-10-20T08:20:00Z' }],
+		['with no times', {}],
+		['with only expiresAt', { expiresAt: '2026-10-20T08:23:37.693Z' }],
+	])('continues %s', async (_, times) => {
+		const { renew, logs } = load({ heartbeat: { haiku: lost, sonnet: lost }, lease: { haiku: { ...same, ...times } } })
+		await renew('Gate')
 		expect(logs.at(-1)).toContain('continuing')
 	})
 
@@ -87,5 +121,52 @@ describe('plan-implement-review renew()', () => {
 		await renew('Plan')
 		await renew('Gate')
 		expect(labels()).toEqual(['heartbeat:0', 'heartbeat:1'])
+	})
+})
+
+/** planAgent bound to stub renew and agent that record each call in events. */
+function liftPlanAgent(renew, agent) {
+	return new Function('renew', 'agent', `${planAgentBody}; return planAgent`)(renew, agent)
+}
+
+describe('plan-implement-review Plan-stage renewals', () => {
+	const labels = ['planner:draft', 'planner:critic:0', 'planner:final:1', 'planner:revise:1']
+
+	it.each(labels.map((l) => [l]))('renews the lease before %s and passes its options through', async (label) => {
+		const events = []
+		const planAgent = liftPlanAgent(
+			async (phase) => events.push(['renew', phase]),
+			async (prompt, opts) => (events.push(['agent', opts]), { from: opts.label, prompt }),
+		)
+		const result = await planAgent('the prompt', { label, effort: 'high', schema: { label } })
+		expect(events).toEqual([
+			['renew', 'Plan'],
+			['agent', { label, effort: 'high', schema: { label }, phase: 'Plan' }],
+		])
+		expect(result).toEqual({ from: label, prompt: 'the prompt' })
+	})
+
+	it('does not start the planning agent once the lease is lost', async () => {
+		const calls = []
+		const planAgent = liftPlanAgent(
+			async () => {
+				throw new Error('Lost the lease on bd-x (heartbeat agent failed; no lease); stopping.')
+			},
+			async (prompt, opts) => calls.push(opts),
+		)
+		await expect(planAgent('p', { label: 'planner:critic:0', effort: 'high' })).rejects.toThrow('Lost the lease')
+		expect(calls).toEqual([])
+	})
+
+	it('runs every Plan-stage agent through planAgent', () => {
+		expect(planSection).not.toMatch(/\bagent\(/)
+		expect(planSection).not.toMatch(/\bops\(/)
+		expect(planSection).not.toMatch(/\brenew\(/)
+		expect(planSection.match(/\bplanAgent\(/g)?.length).toBe(4)
+		expect(planSection.split('label: ').length - 1).toBe(4)
+		expect(planSection).toContain("label: 'planner:draft'")
+		expect(planSection).toContain('label: `planner:critic:${rev}`')
+		expect(planSection).toContain('label: `planner:final:${rev}`')
+		expect(planSection).toContain('label: `planner:revise:${rev + 1}`')
 	})
 })

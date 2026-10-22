@@ -33,6 +33,12 @@ function wrap(args, command, env = {}) {
 	return { child, done }
 }
 
+/** Poll every 20 ms, for up to `ms` (10 s by default), until `file` exists. */
+async function waitForFile(file, ms = 10_000) {
+	const until = Date.now() + ms
+	while (!existsSync(file) && Date.now() < until) await new Promise((r) => setTimeout(r, 20))
+}
+
 /** A node child that appends 'start <id>', waits about 300 ms, then appends 'end <id>' to EV_FILE. */
 const holder = [NODE, '-e', "const fs=require('fs');const f=process.env.EV_FILE,id=process.env.EV_ID;fs.appendFileSync(f,'start '+id+'\\n');setTimeout(()=>fs.appendFileSync(f,'end '+id+'\\n'),300)"]
 const touch = (file) => [NODE, '-e', `require('fs').writeFileSync(${JSON.stringify(file)}, 'ran')`]
@@ -104,8 +110,7 @@ describe('suite-lock', () => {
 
 	it('releases the lock on SIGTERM', { skip: process.platform === 'win32' && 'no POSIX signals', timeout: 20_000 }, async () => {
 		const { child, done } = wrap([], [NODE, '-e', 'setTimeout(() => {}, 10000)'])
-		const until = Date.now() + 10_000
-		while (!existsSync(join(lock, 'owner.json')) && Date.now() < until) await new Promise((r) => setTimeout(r, 20))
+		await waitForFile(join(lock, 'owner.json'))
 		expect(existsSync(join(lock, 'owner.json'))).toBe(true)
 		child.kill('SIGTERM')
 		const r = await done
@@ -115,17 +120,29 @@ describe('suite-lock', () => {
 
 	it('keeps the lock on SIGTERM until the command has exited', { skip: process.platform === 'win32' && 'no POSIX signals', timeout: 20_000 }, async () => {
 		const ended = join(dir, 'ended')
-		// The command takes 300 ms to wind down after SIGTERM, like a suite closing its browsers.
-		const slow = [NODE, '-e', `process.on('SIGTERM', () => setTimeout(() => { require('fs').writeFileSync(${JSON.stringify(ended)}, 'x'); process.exit(0) }, 300)); setTimeout(() => {}, 10000)`]
+		const ready = join(dir, 'ready')
+		const stopping = join(dir, 'stopping')
+		const go = join(dir, 'go')
+		// The command winds down after SIGTERM, like a suite closing its browsers. It writes `ready` only once its
+		// SIGTERM handler exists, so the signal never arrives before the handler. On SIGTERM it writes `stopping` and
+		// blocks until the test writes `go`, so the mid-shutdown state is held by construction, not by timer margins.
+		// Without `go` it gives up after 10 s and exits 1 without writing `ended`, so a failed test leaves no child behind.
+		const [END, RDY, STOP, GO] = [ended, ready, stopping, go].map((f) => JSON.stringify(f))
+		const slow = [
+			NODE,
+			'-e',
+			`const fs=require('fs');process.on('SIGTERM',()=>{fs.writeFileSync(${STOP},'x');const cap=Date.now()+10000;const t=setInterval(()=>{if(fs.existsSync(${GO})){clearInterval(t);fs.writeFileSync(${END},'x');process.exit(0)}else if(Date.now()>cap)process.exit(1)},20)});fs.writeFileSync(${RDY},'x');setTimeout(()=>{},10000)`,
+		]
 		const { child, done } = wrap([], slow)
-		const until = Date.now() + 10_000
-		while (!existsSync(join(lock, 'owner.json')) && Date.now() < until) await new Promise((r) => setTimeout(r, 20))
-		// Give the command time to install its SIGTERM handler.
-		await new Promise((r) => setTimeout(r, 200))
+		await waitForFile(ready)
+		expect(existsSync(ready)).toBe(true)
+		expect(existsSync(join(lock, 'owner.json'))).toBe(true)
 		child.kill('SIGTERM')
-		await new Promise((r) => setTimeout(r, 100))
+		await waitForFile(stopping)
+		expect(existsSync(stopping)).toBe(true)
 		expect(existsSync(ended)).toBe(false)
 		expect(existsSync(lock)).toBe(true)
+		writeFileSync(go, 'x')
 		const r = await done
 		expect(existsSync(ended)).toBe(true)
 		expect(r.code).toBe(0)

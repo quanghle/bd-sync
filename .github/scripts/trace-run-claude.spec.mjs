@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from './expect.mjs'
-import { claudeRequestsOf, claudeSources, claudeSuffix, findClaudeSessions, harnessOf, logDirs, summarize, trace } from './trace-run.mjs'
+import { claudeRequestsOf, claudeSources, claudeSuffix, findClaudeSessions, harnessOf, idPrefix, inRun, issueChecker, logDirs, namedIssues, summarize, trace, workflowIssues } from './trace-run.mjs'
 
 // Claude Code transcripts as trace-run reads them, next to trace-run.spec.mjs's Copilot session logs.
 const SESSION = '6f26e090-4089-4a32-bdd2-c49ba9c91d0b'
@@ -251,5 +251,224 @@ describe('trace-run on Claude Code transcripts', () => {
 
 	it('never copies transcript content into the result', () => {
 		expect(JSON.stringify(trace(record, { projectsDir: projects }))).not.toContain(SECRET)
+	})
+})
+
+describe('issue ids of other work', () => {
+	it('finds issue ids of the prefix standing alone', () => {
+		expect(namedIssues('Do bd-0f9k and bd-mkf7.1.review (see bd-bphf).', 'bd')).toEqual(['bd-0f9k', 'bd-mkf7.1.review', 'bd-bphf'])
+		expect(namedIssues('Do bd-0f9k, then bd-0f9k again.', 'bd')).toEqual(['bd-0f9k'])
+		expect(namedIssues('.bd-card__body, bd-button--primary, x-bd-y, bd-card-x', 'bd')).toEqual([])
+		expect(namedIssues('bd-x', undefined)).toEqual([])
+		expect(namedIssues(undefined, 'bd')).toEqual([])
+	})
+
+	it('reads a hyphenated prefix as a whole, so bd-sync ids are not bd ids', () => {
+		const text = 'Claim bd-26et6.5.1.implement; see bd-sync-2bt.1, x-bd-y, .bd-z, bd-y- and bd-gate: dir=/w'
+		expect(namedIssues(text, 'bd')).toEqual(['bd-26et6.5.1.implement', 'bd-gate'])
+		expect(namedIssues(text, 'bd-sync')).toEqual(['bd-sync-2bt.1'])
+		// The prefix is escaped: a regex character in it matches only itself.
+		expect(namedIssues('bxd-1 b.d-1', 'b.d')).toEqual(['b.d-1'])
+	})
+
+	it('takes the id prefix of a run from its first dot segment less its last -segment', () => {
+		expect(idPrefix('bd-26et6.5.1')).toBe('bd')
+		expect(idPrefix('bd-sync-2bt.1')).toBe('bd-sync')
+		expect(idPrefix('bd-sync-2bt')).toBe('bd-sync')
+		expect(idPrefix('nohyphen.1')).toBe(null)
+	})
+
+	it('checks ids with bd once each, and counts a failure as not an issue', () => {
+		const calls = []
+		const isIssue = issueChecker((args) => {
+			calls.push(args)
+			if (args[1] === 'bd-card') throw Object.assign(new Error('not found'), { status: 3 })
+			return { id: args[1] }
+		})
+		expect([isIssue('bd-x'), isIssue('bd-x'), isIssue('bd-card'), isIssue('bd-card'), isIssue('not an id')]).toEqual([true, true, false, false, false])
+		expect(calls).toEqual([
+			['show', 'bd-x'],
+			['show', 'bd-card'],
+		])
+	})
+
+	it('warns once when bd fails for another reason than not found, and keeps such workflows counted', () => {
+		const warnings = []
+		const isIssue = issueChecker(
+			() => {
+				throw Object.assign(new Error('bd: connection refused'), { stderr: 'connection refused' })
+			},
+			(m) => warnings.push(m),
+		)
+		expect([isIssue('bd-y'), isIssue('bd-z')]).toEqual([false, false])
+		expect(warnings).toHaveLength(1)
+		expect(warnings[0]).toContain('could not check issue ids with bd (connection refused')
+		expect(warnings[0]).toContain('workflows naming them are counted')
+		const quiet = []
+		const notFound = issueChecker(
+			() => {
+				throw Object.assign(new Error('exit 3'), { status: 3, stdout: '{"error":{"code":"not_found"}}' })
+			},
+			(m) => quiet.push(m),
+		)
+		expect(notFound('bd-y')).toBe(false)
+		const byCode = issueChecker(
+			() => {
+				throw Object.assign(new Error('Command failed'), { status: 1, stderr: '{"error":{"code": "not_found","exit_code":3}}' })
+			},
+			(m) => quiet.push(m),
+		)
+		expect(byCode('bd-y')).toBe(false)
+		expect(quiet).toEqual([])
+		const noWorkspace = []
+		issueChecker(
+			() => {
+				throw Object.assign(new Error('workspace not found'), { status: 1 })
+			},
+			(m) => noWorkspace.push(m),
+		)('bd-y')
+		expect(noWorkspace).toHaveLength(1)
+	})
+
+	it('matches issue ids against the run and reads only ids from workflow arguments', () => {
+		expect(inRun('bd-x.1', 'bd-x.1')).toBe(true)
+		expect(inRun('bd-x.1.review', 'bd-x.1')).toBe(true)
+		expect(inRun('bd-x', 'bd-x.1')).toBe(true)
+		expect(inRun('bd-x.10', 'bd-x.1')).toBe(false)
+		expect(inRun('bd-xy', 'bd-x')).toBe(false)
+		expect(inRun('bd-y.1', 'bd-x.1')).toBe(false)
+		expect(workflowIssues({ issue: 'bd-x', reviewStep: 'bd-x.1.review', requirements: 'bd-z', tier: 'small' })).toEqual(['bd-x', 'bd-x.1.review'])
+		expect(workflowIssues({ run: 'bd-x.1', parent: 'bd-x', issue: 3 })).toEqual(['bd-x.1', 'bd-x'])
+		expect(workflowIssues({ issue: 'not an id; rm' })).toEqual([])
+		expect(workflowIssues(undefined)).toEqual([])
+		expect(workflowIssues(null)).toEqual([])
+		expect(workflowIssues('bd-x')).toEqual([])
+	})
+})
+
+describe('trace-run leaves out workflows for other issues', () => {
+	const bdRecord = { ...record, run: 'bd-x.1', steps: record.steps.map((s) => ({ ...s, id: s.id.replace('squid-x.1', 'bd-x.1') })) }
+	const flows = () => join(dir, SESSION, 'subagents', 'workflows')
+	// A finished workflow: its arguments in <session>/workflows/<wf>.json, one agent with one request at `at`.
+	const finished = (wf, args, at) => {
+		mkdirSync(join(flows(), wf), { recursive: true })
+		writeFileSync(join(dir, SESSION, 'workflows', `${wf}.json`), JSON.stringify({ workflowName: 'plan-implement-review', args }))
+		jsonl(join(flows(), wf, 'agent-c.jsonl'), [{ type: 'user', message: { content: `Work bd-y.1 ${SECRET}` } }, res(at, `${wf}-c`, usage(1, 1))])
+	}
+	// A workflow still running (no <wf>.json): a claim agent started first with `prompt`, then a coder whose prompt
+	// names bd-y.1 in passing.
+	const running = (wf, prompt, at) => {
+		mkdirSync(join(flows(), wf), { recursive: true })
+		jsonl(join(flows(), wf, 'journal.jsonl'), [
+			{ type: 'started', agentId: 'k', label: 'claim' },
+			{ type: 'started', agentId: 'c', label: 'coder:S1' },
+		])
+		jsonl(join(flows(), wf, 'agent-k.jsonl'), [{ type: 'user', message: { content: `${prompt} ${SECRET}` } }, res(at, `${wf}-k`, usage(1, 1))])
+		jsonl(join(flows(), wf, 'agent-c.jsonl'), [{ type: 'user', message: { content: [{ type: 'text', text: `Implement S1; bd-y.1 does it differently. ${SECRET}` }] } }, res(at, `${wf}-c`, usage(1, 1))])
+	}
+	const review = (t, run = 'bd-x.1') => t.steps.find((s) => s.step === `${run}.review`).agents.map((a) => [a.label, a.requests])
+	const requests = (t) => t.totals.reduce((n, x) => n + x.requests, 0)
+
+	it('leaves out a finished workflow whose arguments name only other issues, and keeps ones for the run, a step or its parent', () => {
+		finished('wf_other', { issue: 'bd-y.1.implement', reviewStep: 'bd-y.1.review', requirements: SECRET }, '2026-10-15T10:25:00Z')
+		finished('wf_parent', { issue: 'bd-x', reviewStep: 'bd-x.1.review' }, '2026-10-15T10:25:01Z')
+		finished('wf_step', { issue: 'bd-x.1.implement' }, '2026-10-15T10:25:02Z')
+		const t = trace(bdRecord, { projectsDir: projects })
+		expect(review(t)).toEqual([
+			['main', 1],
+			[expect.stringMatching(/^general-purpose: /), 1],
+			['score-issue:judge', 1],
+			['plan-implement-review:c', 2],
+		])
+		expect(t.other_work_requests).toBe(1)
+		expect(t.outside_requests).toBe(2)
+		// main 2, subagent 1, judge 1, our two workflows 2: not wf_other's.
+		expect(requests(t)).toBe(6)
+		expect(t.totals.find((x) => x.model === MODEL && x.effort === 'unknown').requests).toBe(2)
+		const text = summarize(t)
+		expect(text).toContain('; 1 request(s) of workflows for other issues left out')
+		expect(JSON.stringify(t)).not.toContain(SECRET)
+		expect(text).not.toContain(SECRET)
+		expect(JSON.stringify(t)).not.toContain('"other"')
+	})
+
+	it('leaves out a running workflow whose first prompt names an issue bd knows outside the run, never asking bd about ours', () => {
+		running('wf_theirs', 'Claim bd-y.1.implement.', '2026-10-15T10:25:00Z')
+		running('wf_ours', 'Claim bd-x.1.implement.', '2026-10-15T10:25:01Z')
+		running('wf_anon', 'Claim the next issue.', '2026-10-15T10:25:02Z')
+		const calls = []
+		const t = trace(bdRecord, {
+			projectsDir: projects,
+			isIssue: (id) => {
+				calls.push(id)
+				return id === 'bd-y.1.implement'
+			},
+		})
+		const labels = review(t).map(([l]) => l)
+		expect(labels).toContain('wf_ours:claim')
+		expect(labels).toContain('wf_ours:coder:S1')
+		expect(labels).toContain('wf_anon:claim')
+		expect(labels).toContain('wf_anon:coder:S1')
+		expect(labels.some((l) => l.startsWith('wf_theirs'))).toBe(false)
+		expect(t.other_work_requests).toBe(2)
+		expect(calls).toContain('bd-y.1.implement')
+		expect(calls.every((id) => !inRun(id, 'bd-x.1'))).toBe(true)
+		expect(JSON.stringify(t)).not.toContain(SECRET)
+		expect(summarize(t)).not.toContain(SECRET)
+		expect(summarize(t)).toContain('; 2 request(s) of workflows for other issues left out')
+	})
+
+	it('keeps a running workflow whose prompt names only ids bd does not know', () => {
+		running('wf_gate', 'Run bd-gate: dir=/w on bd-core', '2026-10-15T10:25:00Z')
+		const calls = []
+		const t = trace(bdRecord, {
+			projectsDir: projects,
+			isIssue: (id) => {
+				calls.push(id)
+				return false
+			},
+		})
+		expect(review(t).map(([l]) => l)).toContain('wf_gate:claim')
+		expect(calls).toContain('bd-gate')
+		expect(calls).toContain('bd-core')
+		expect(t.other_work_requests).toBe(0)
+		expect(summarize(t)).not.toContain('for other issues left out')
+	})
+
+	it('reads the issue ids of a hyphenated prefix whole', () => {
+		const run = 'bd-sync-x.1'
+		const hyphenated = { ...bdRecord, run, steps: bdRecord.steps.map((s) => ({ ...s, id: s.id.replace('bd-x.1', run) })) }
+		running('wf_theirs', 'Claim bd-sync-y.1.implement (not bd-x.1).', '2026-10-15T10:25:00Z')
+		// Under a prefix of bd, this one would name nothing and stay counted.
+		running('wf_z', 'Claim bd-sync-z.2.', '2026-10-15T10:25:01Z')
+		running('wf_ours', 'Claim bd-sync-x.1.implement.', '2026-10-15T10:25:02Z')
+		const calls = []
+		const t = trace(hyphenated, { projectsDir: projects, isIssue: (id) => (calls.push(id), true) })
+		const labels = review(t, run).map(([l]) => l)
+		expect(labels).toContain('wf_ours:claim')
+		expect(labels).toContain('wf_ours:coder:S1')
+		expect(labels.some((l) => l.startsWith('wf_theirs') || l.startsWith('wf_z'))).toBe(false)
+		expect(t.other_work_requests).toBe(4)
+		expect([...new Set(calls)].toSorted()).toEqual(['bd-sync-y.1.implement', 'bd-sync-z.2'])
+	})
+
+	it('reads a prompt for issue ids only while the workflow has no arguments file', () => {
+		running('wf_done', 'Claim bd-y.1.implement.', '2026-10-15T10:25:00Z')
+		writeFileSync(join(dir, SESSION, 'workflows', 'wf_done.json'), JSON.stringify({ workflowName: 'plan-implement-review', args: { tier: 'small' } }))
+		const [src] = claudeSources(dir, SESSION, 'bd').filter((s) => s.file.includes('wf_done'))
+		expect([src.issues, src.named]).toEqual([[], []])
+		const t = trace(bdRecord, { projectsDir: projects })
+		expect(review(t).map(([l]) => l)).toContain('plan-implement-review:claim')
+		expect(t.other_work_requests).toBe(0)
+	})
+
+	it('gives every agent of a running workflow the ids its first prompt names, and main and subagents none', () => {
+		running('wf_theirs', 'Claim bd-y.1.implement.', '2026-10-15T10:25:00Z')
+		const srcs = claudeSources(dir, SESSION, 'bd')
+		expect(srcs.filter((s) => s.file.includes('wf_theirs')).map((s) => [s.label, s.issues, s.named])).toEqual([
+			['wf_theirs:coder:S1', [], ['bd-y.1.implement']],
+			['wf_theirs:claim', [], ['bd-y.1.implement']],
+		])
+		expect(srcs.filter((s) => s.kind !== 'workflow').every((s) => s.issues === undefined && s.named === undefined)).toBe(true)
 	})
 })

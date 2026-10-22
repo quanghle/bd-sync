@@ -374,6 +374,7 @@ describe('plan-implement-review', () => {
 		describe('the escalated gate reusing the first log', () => {
 			const CONTRA = { ...GREEN, failures: [{ command: 'cargo clippy', excerpt: 'x' }] }
 			const FIRST = '/logs/bd-1/gate-impl.log'
+			const OWN = '/logs/bd-1/gate-impl-escalated.log'
 			const L = { ...ARGS, logDir: '/logs' }
 
 			it('offers the first log after a report-only failure and takes a reused pass', async () => {
@@ -386,6 +387,49 @@ describe('plan-implement-review', () => {
 			it('offers no reuse after a contradictory report with a foreign marker', async () => {
 				const { ctx } = await run(L, { 'gate:impl': { ...CONTRA, marker: 'bd-gate: dir=/w/other run=bd-1' } })
 				expect(promptOf(ctx, 'gate:impl@escalated')).not.toContain(FIRST)
+			})
+
+			it('offers no reuse after a contradictory pass without a marker', async () => {
+				const { ctx, got } = await run(L, { 'gate:impl': { ...CONTRA, marker: '' } })
+				expect(promptOf(ctx, 'gate:impl@escalated')).not.toContain(FIRST)
+				expect(got.status).toBe('done')
+			})
+
+			it.each([
+				['its own log', OWN],
+				['its own log padded', `  ${OWN}\n`],
+				['the first log quoted', `'${FIRST}'`],
+			])('accepts a reuse retry reporting %s', async (_, log) => {
+				const { ctx, got } = await run(L, { 'gate:impl': CONTRA, 'gate:impl@escalated': { ...GREEN, log } })
+				expect(got.status).toBe('done')
+				expect(ctx.logs.some((l) => l.startsWith('gate gate:impl@escalated: report read'))).toBe(false)
+			})
+
+			it('sends a reused lint failure to the gate-fix coder', async () => {
+				const { ctx, got } = await run(L, {
+					'gate:impl': null,
+					'gate:impl@escalated': { ...LINT, log: FIRST },
+					'coder:gate-fix:impl:1': { summary: 'fixed lint', filesChanged: ['a.rs'] },
+				})
+				expect(ctx.calls.map((c) => c.label).filter((l) => l.startsWith('gate:') || l.startsWith('coder:gate-fix'))).toEqual(['gate:impl', 'gate:impl@escalated', 'coder:gate-fix:impl:1', 'gate:impl:1'])
+				expect(promptOf(ctx, 'coder:gate-fix:impl:1')).toContain('### cargo clippy\nwarning: x')
+				expect(got.status).toBe('done')
+			})
+
+			// ops() passes (retryLabel, prev) only to the retry, and valid sets reuse before the retry is rendered
+			it.each([
+				['no reply', null],
+				['a pass without a snapshot', { ...GREEN, snapshot: '' }],
+			])('renders the first gate plainly and the retry, after %s, under its own label with the first log', async (_, first) => {
+				const { ctx, got } = await run(L, { 'gate:impl': first, 'gate:impl@escalated': { ...GREEN, log: FIRST } })
+				const p1 = promptOf(ctx, 'gate:impl')
+				expect(p1).not.toContain('An earlier attempt ran the CI gates')
+				expect(p1).toContain(`> '${FIRST}' 2>&1`)
+				const p2 = promptOf(ctx, 'gate:impl@escalated')
+				expect(p2).toContain('An earlier attempt ran the CI gates')
+				expect(p2).toContain(`test -f '${FIRST}'`)
+				expect(p2).toContain(`> '${OWN}' 2>&1`)
+				expect(got.status).toBe('done')
 			})
 
 			it('fails a reuse retry that reports another log, without a gate fix', async () => {

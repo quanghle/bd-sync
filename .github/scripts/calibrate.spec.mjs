@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { aggregate, coderOf, costOf, joinRuns, overlaps, plannerOf, PRICES, render, roleOf, untracedWhy } from './calibrate.mjs'
+import { aggregate, coderOf, controllerSessions, costOf, joinRuns, overlaps, plannerOf, PRICES, render, roleOf, sessionReader, untracedWhy } from './calibrate.mjs'
 import { ROLE_PREFIXES } from './reviewer-catch.mjs'
 
 // credits: the AI credits a request cost; left out, a trace stored without them.
@@ -584,8 +584,11 @@ describe('aggregate and render', () => {
 			'## Time by step',
 			'## Cost and time by role, model and effort',
 			'## Main-thread context per request',
+			'## Controller sessions',
 		])
 			expect(md).toContain(heading)
+		expect(md.indexOf('## Main-thread context per request')).toBeLessThan(md.indexOf('## Controller sessions'))
+		expect(md).toContain('No traced session on this machine.')
 		expect(md.indexOf('## Score by coder')).toBeLessThan(md.indexOf('## Score by planner'))
 		expect(md.indexOf('## Score by planner')).toBeLessThan(md.indexOf('## Cost and time by complexity'))
 		expect(md).toContain('Costs are Copilot AI credits as USD (1 credit = $0.01)')
@@ -615,6 +618,37 @@ describe('aggregate and render', () => {
 		expect(md).toContain('No scored run has a complexity yet.')
 		expect(md).toContain('No run has a complexity yet.')
 		expect(md).toContain('No closed steps.')
+		expect(md).toContain('No traced session on this machine.')
+	})
+
+	it('renders controller sessions, a missing one as not on this machine', () => {
+		const controllers = [
+			{
+				harness: 'claude',
+				session: 'sess-a',
+				missing: false,
+				first: '2026-10-01T10:00:00.000Z',
+				last: '2026-10-01T12:30:00.000Z',
+				requests: 40,
+				cost: 1.5,
+				unpriced: 1,
+				outputUnknown: 0,
+				perRequestByQuarter: [150000, null, 170000, null],
+				runs: ['r1', 'r2'],
+				finished: ['r2'],
+			},
+			{ harness: 'copilot', session: 'sess-b', missing: true, first: null, last: null, requests: null, cost: null, unpriced: 0, outputUnknown: 0, perRequestByQuarter: [null, null, null, null], runs: ['r3'], finished: [] },
+		]
+		const md = render([], { ...aggregate([]), controllers })
+		expect(md).toContain('| session | harness | first | last | main requests | cost | Q1 | Q2 | Q3 | Q4 | runs | finished |')
+		expect(md).toContain('| sess-a | claude | 2026-10-01 10:00 | 2026-10-01 12:30 | 40 | $1.50 + 1 req unpriced | 150k | – | 170k | – | r1, r2 | r2 |')
+		expect(md).toContain('| sess-b | copilot | not on this machine | – | – | – | – | – | – | – | r3 | – |')
+		expect(md).toContain('150k')
+		expect(md).toContain('– |')
+		expect(md).toContain('+ 1 req unpriced')
+		expect(md).not.toContain('No traced session on this machine.')
+		for (const phrase of ['whole main thread', 'subagent and workflow requests are left out', 'counted once', 'listed as not on this machine'])
+			expect(md).toContain(phrase)
 	})
 })
 
@@ -757,6 +791,220 @@ describe('overlaps', () => {
 	})
 })
 
+// A main-thread request at hh:mm on 2026-10-15, reading `read` tokens (input), with its own extras.
+const mreq = (id, hhmm, read = 1000, extra = {}) => ({
+	id,
+	ts: `2026-10-15T${hhmm}:00Z`,
+	end: `2026-10-15T${hhmm}:30Z`,
+	model: 'claude-opus-5-5',
+	tokens: { input: read, output: 10, cache_read: 0, cache_write: 0 },
+	...extra,
+})
+// A run naming sessions [{ session, harness }], with one traced step closing at stepClose and a bd timing closing at close.
+const csRun = (id, sessions, { status = 'closed', start = '2026-10-15T09:00:00Z', close, stepClose = '2026-10-15T10:30:00Z' } = {}) => ({
+	id,
+	status,
+	created: start,
+	work: { sessions: sessions.map((s) => ({ actor: `u/${s.harness ?? 'copilot'}-00000000`, harness: 'claude', ...s })), steps: [{ step: `${id}.s`, closed_at: stepClose, agents: [] }] },
+	timing: close ? { start, elapsed_ms: Date.parse(close) - Date.parse(start), human_wait_ms: 0, steps: [], gates: [] } : undefined,
+})
+const stub = (logs) => (s) => logs.get(s.session) ?? null
+
+describe('controllerSessions', () => {
+	it('counts every main request of the session, far outside the run step windows', () => {
+		const logs = new Map([['A', [mreq('r1', '02:00'), mreq('r2', '10:15'), mreq('r3', '20:00')]]])
+		const [row] = controllerSessions([csRun('x', [{ session: 'A' }])], stub(logs))
+		expect(row).toMatchObject({ harness: 'claude', session: 'A', missing: false, requests: 3, first: '2026-10-15T02:00:00Z', last: '2026-10-15T20:00:30Z', runs: ['x'] })
+	})
+
+	it('reads each quarter as the mean tokens per request, by position in time order', () => {
+		const at8 = Array.from({ length: 8 }, (_, j) => mreq(`q${j}`, `1${j}:00`, (j + 1) * 100))
+		const rows = (reqs) => controllerSessions([csRun('x', [{ session: 'A' }])], stub(new Map([['A', reqs]])))[0]
+		// Shuffled input: quarters follow ts, not input order.
+		expect(rows(at8.toReversed()).perRequestByQuarter).toEqual([150, 350, 550, 750])
+		expect(rows([mreq('a', '10:00', 100), mreq('b', '11:00', 200), mreq('c', '12:00', 300)]).perRequestByQuarter).toEqual([100, 200, 300, null])
+		expect(rows([mreq('a', '10:00', 100), mreq('b', '11:00', 300)]).perRequestByQuarter).toEqual([100, null, 300, null])
+		expect(rows([mreq('a', '10:00', 101)]).perRequestByQuarter).toEqual([101, null, null, null])
+		expect(rows([])).toMatchObject({ requests: 0, first: null, last: null, cost: 0, perRequestByQuarter: [null, null, null, null] })
+		// Cache reads and writes count as read; a mean is rounded.
+		const cached = mreq('a', '10:00', 0, { tokens: { input: 1, output: 9, cache_read: 2, cache_write: 4 } })
+		expect(rows([cached, mreq('b', '10:00', 0)]).perRequestByQuarter).toEqual([7, null, 0, null])
+	})
+
+	it('prices each request, counting unpriced and output-unknown ones apart', () => {
+		const priced = mreq('a', '10:00', 1000)
+		const lacking = mreq('b', '10:05', 1000, { model: 'claude-unknown-9' })
+		const unknownOut = mreq('c', '10:10', 1000, { tokens: { input: 1000, output: 0, cache_read: 0, cache_write: 0, output_unknown: 1 } })
+		const [row] = controllerSessions([csRun('x', [{ session: 'A' }])], stub(new Map([['A', [priced, lacking, unknownOut]]])))
+		expect(row.cost).toBeCloseTo(costOf(priced.tokens, priced.model) + costOf(unknownOut.tokens, unknownOut.model))
+		expect(row).toMatchObject({ unpriced: 1, outputUnknown: 1, requests: 3 })
+		const cop = mreq('p', '10:00', 1000, { model: 'claude-opus-5.5', tokens: { input: 1000, output: 1, cache_read: 0, cache_write: 0, nano_aiu: 3e9 }, owned: true })
+		const [c] = controllerSessions([csRun('y', [{ session: 'C', harness: 'copilot' }])], stub(new Map([['C', [cop]]])))
+		expect(c).toMatchObject({ harness: 'copilot', unpriced: 0 })
+		expect(c.cost).toBeCloseTo(0.03)
+	})
+
+	it('counts a run handed off across two sessions as finished once, in the session that closed it', () => {
+		const logs = new Map([
+			['A', [mreq('a1', '10:00'), mreq('a2', '11:00')]],
+			['B', [mreq('b1', '11:30'), mreq('b2', '12:30')]],
+		])
+		const rows = controllerSessions([csRun('x', [{ session: 'A' }, { session: 'B' }], { close: '2026-10-15T12:00:00Z' })], stub(logs))
+		expect(rows.map((r) => [r.session, r.runs, r.finished])).toEqual([
+			['A', ['x'], []],
+			['B', ['x'], ['x']],
+		])
+		// Both spans hold the close: the session with the latest request before it finished the run.
+		const both = new Map([
+			['A', [mreq('a1', '10:00'), mreq('a2', '11:50'), mreq('a3', '13:00')]],
+			['B', [mreq('b1', '09:00'), mreq('b2', '11:40'), mreq('b3', '12:10'), mreq('b4', '14:00')]],
+		])
+		const rs = controllerSessions([csRun('x', [{ session: 'A' }, { session: 'B' }], { close: '2026-10-15T12:00:00Z' })], stub(both))
+		expect(rs.map((r) => [r.session, r.finished])).toEqual([
+			['B', []],
+			['A', ['x']],
+		])
+		// Without timing, the traced steps' last close decides; a close no span holds is not attributed.
+		expect(controllerSessions([csRun('x', [{ session: 'A' }], { stepClose: '2026-10-15T10:30:00Z' })], stub(logs))[0].finished).toEqual(['x'])
+		expect(controllerSessions([csRun('x', [{ session: 'A' }], { close: '2026-10-15T23:00:00Z' })], stub(logs))[0].finished).toEqual([])
+	})
+
+	it('lists a session whose log is not here as missing, with null figures, after the present ones', () => {
+		const rows = controllerSessions(
+			[csRun('x', [{ session: 'B' }, { session: 'A' }], { close: '2026-10-15T10:30:00Z' }), csRun('y', [{ session: 'B' }])],
+			stub(new Map([['A', [mreq('a1', '10:00'), mreq('a2', '11:00')]]])),
+		)
+		expect(rows.map((r) => r.session)).toEqual(['A', 'B'])
+		expect(rows[1]).toEqual({
+			harness: 'claude',
+			session: 'B',
+			missing: true,
+			first: null,
+			last: null,
+			requests: null,
+			cost: null,
+			unpriced: 0,
+			outputUnknown: 0,
+			perRequestByQuarter: [null, null, null, null],
+			runs: ['x', 'y'],
+			finished: [],
+		})
+		expect(rows[0].finished).toEqual(['x'])
+	})
+
+	it('counts a request copied into a resumed or forked session once', () => {
+		const owned = mreq('r1', '10:00', 1000, { owned: true })
+		const copy = mreq('r1', '09:00', 1000, { owned: false })
+		const cop = controllerSessions(
+			[csRun('x', [{ session: 'S1', harness: 'copilot' }, { session: 'S2', harness: 'copilot' }])],
+			stub(new Map([['S1', [owned]], ['S2', [copy, mreq('r2', '11:00')]]])),
+		)
+		expect(Object.fromEntries(cop.map((r) => [r.session, r.requests]))).toEqual({ S1: 1, S2: 1 })
+		// Claude Code: the earlier-starting session keeps a shared id.
+		const shared = mreq('c1', '10:00')
+		const cl = controllerSessions(
+			[csRun('x', [{ session: 'late' }, { session: 'early' }])],
+			stub(new Map([['late', [shared, mreq('c3', '12:00')]], ['early', [mreq('c0', '09:00'), shared]]])),
+		)
+		expect(Object.fromEntries(cl.map((r) => [r.session, r.requests]))).toEqual({ early: 2, late: 1 })
+		// A start tie: the transcript born first keeps it.
+		const tie = (born) =>
+			Object.fromEntries(
+				controllerSessions([csRun('x', [{ session: 'P' }, { session: 'Q' }])], stub(new Map([['P', [shared]], ['Q', [shared]]])), PRICES, { bornOf: (s) => born[s.session] }).map((r) => [
+					r.session,
+					r.requests,
+				]),
+			)
+		expect(tie({ P: 2000, Q: 1000 })).toEqual({ P: 0, Q: 1 })
+		expect(tie({ P: 1000, Q: 2000 })).toEqual({ P: 1, Q: 0 })
+		// Ids are scoped per harness: a Copilot and a Claude request may share one.
+		const mixed = controllerSessions([csRun('x', [{ session: 'P' }, { session: 'C', harness: 'copilot' }])], stub(new Map([['P', [shared]], ['C', [shared]]])))
+		expect(mixed.map((r) => r.requests)).toEqual([1, 1])
+	})
+
+	it('reads only work.sessions, and infers the harness of an old-shape entry from its actor', () => {
+		const logs = new Map([['A', [mreq('a', '10:00')]]])
+		expect(controllerSessions([{ id: 'x', status: 'closed' }, { id: 'y', status: 'closed', work: { sessions: [], steps: [] } }], stub(logs))).toEqual([])
+		expect(controllerSessions([{ id: 'z', status: 'closed', work: { sessions: [{ session: '' }, { actor: 'u/x' }], steps: [] } }], stub(logs))).toEqual([])
+		const old = { id: 'o', status: 'closed', work: { sessions: [{ actor: 'u/claude-1234abcd', session: 'A' }], steps: [] } }
+		const seen = []
+		const [row] = controllerSessions([old], (s) => (seen.push(s), logs.get(s.session)))
+		expect(row.harness).toBe('claude')
+		expect(seen).toEqual([{ harness: 'claude', session: 'A' }])
+		const [cop] = controllerSessions([{ id: 'p', status: 'closed', work: { sessions: [{ actor: 'u/someone', session: 'A' }], steps: [] } }], stub(logs))
+		expect(cop.harness).toBe('copilot')
+	})
+
+	it('reads a session once however many runs name it, and never finishes an open run', () => {
+		let reads = 0
+		const logs = new Map([['A', [mreq('a1', '10:00'), mreq('a2', '11:00')]]])
+		const rows = controllerSessions(
+			[csRun('open', [{ session: 'A' }], { status: 'open', close: '2026-10-15T10:30:00Z' }), csRun('done', [{ session: 'A' }, { session: 'A' }], { close: '2026-10-15T10:30:00Z' })],
+			(s) => (reads++, logs.get(s.session)),
+		)
+		expect(reads).toBe(1)
+		expect(rows[0]).toMatchObject({ runs: ['open', 'done'], finished: ['done'] })
+	})
+})
+
+describe('sessionReader', () => {
+	let tmp
+	const jsonl = (file, entries) => writeFileSync(file, entries.map((e) => JSON.stringify(e)).join('\n') + '\n')
+	const usage = { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 100, cache_creation_input_tokens: 20 }
+	const assistant = (requestId, timestamp) => ({ type: 'assistant', timestamp, requestId, message: { model: 'claude-opus-5-5', stop_reason: 'end_turn', usage, content: [] } })
+	beforeEach(() => {
+		tmp = mkdtempSync(join(tmpdir(), 'calibrate-reader-'))
+	})
+	afterEach(() => rmSync(tmp, { recursive: true, force: true }))
+
+	it('reads only the main transcript of a Claude Code session listed under its exact id', () => {
+		const SESSION = '6f26e090-4089-4a32-bdd2-c49ba9c91d0b'
+		const projects = join(tmp, 'projects')
+		const dir = join(projects, '-w-bd')
+		mkdirSync(join(dir, SESSION, 'subagents'), { recursive: true })
+		jsonl(join(dir, `${SESSION}.jsonl`), [{ type: 'user', timestamp: '2026-10-15T10:00:00Z', message: { content: 'hi' } }, assistant('req-main', '2026-10-15T10:00:05Z')])
+		jsonl(join(dir, SESSION, 'subagents', 'agent-a.jsonl'), [assistant('req-sub', '2026-10-15T10:01:00Z')])
+		const { mainOf, bornOf } = sessionReader({ sessionsDir: join(tmp, 'none'), projectsDir: projects })
+		const reqs = mainOf({ harness: 'claude', session: SESSION })
+		expect(reqs.map((r) => r.id)).toEqual(['req-main'])
+		expect(reqs[0].tokens.cache_read).toBe(100)
+		expect(mainOf({ harness: 'claude', session: `../-w-bd/${SESSION}` })).toBe(null)
+		expect(mainOf({ harness: 'claude', session: SESSION.slice(-8) })).toBe(null)
+		expect(mainOf({ harness: 'claude', session: '00000000-0000-0000-0000-000000000000' })).toBe(null)
+		expect(mainOf({ harness: 'claude', session: 42 })).toBe(null)
+		expect(typeof bornOf({ harness: 'claude', session: SESSION })).toBe('number')
+		expect(bornOf({ harness: 'claude', session: SESSION.slice(-8) })).toBe(0)
+		expect(bornOf({ harness: 'copilot', session: SESSION })).toBe(0)
+	})
+
+	it("reads only a Copilot session's main requests, under its exact id", () => {
+		const SID = '0b1c2d3e-4f50-6172-8394-a5b6c7d8e9f0'
+		const sessions = join(tmp, 'sessions')
+		mkdirSync(join(sessions, SID), { recursive: true })
+		const record = (apiCallId, timestamp, agentId) => ({
+			type: 'session.usage_record',
+			timestamp,
+			...(agentId ? { agentId } : {}),
+			data: { usage: { model: 'claude-opus-5.5', apiCallId, inputTokens: 50, outputTokens: 5, cacheReadTokens: 30, cacheWriteTokens: 0, duration: 1000, copilotUsage: { totalNanoAiu: 1e9 } } },
+		})
+		jsonl(join(sessions, SID, 'events.jsonl'), [record('c-main', '2026-10-15T10:00:05Z'), record('c-sub', '2026-10-15T10:01:05Z', 'agent-1')])
+		const { mainOf } = sessionReader({ sessionsDir: sessions, projectsDir: join(tmp, 'none') })
+		const reqs = mainOf({ harness: 'copilot', session: SID })
+		expect(reqs.map((r) => r.id)).toEqual(['c-main'])
+		expect(reqs[0].owned).toBe(true)
+		expect(mainOf({ harness: 'copilot', session: SID.slice(-8) })).toBe(null)
+		expect(mainOf({ harness: 'copilot', session: `../sessions/${SID}` })).toBe(null)
+		expect(mainOf({ harness: 'codex', session: SID })).toBe(null)
+	})
+
+	it('treats missing directories as no session', () => {
+		const { mainOf, bornOf } = sessionReader({ sessionsDir: undefined, projectsDir: join(tmp, 'absent') })
+		expect(mainOf({ harness: 'copilot', session: 'x' })).toBe(null)
+		expect(mainOf({ harness: 'claude', session: 'x' })).toBe(null)
+		expect(bornOf({ harness: 'claude', session: 'x' })).toBe(0)
+	})
+})
+
 const issue = (id, status, metadata = {}) => ({ id, status, created_at: '2026-10-15T01:00:00Z', metadata: { playbook: { name: 'change', role: 'run', vars: {} }, ...metadata } })
 const history = (id) => JSON.stringify([{ issue_id: id, op: 'created', ts: '2026-10-15T01:00:00Z', actor: 'Quang Le' }])
 
@@ -799,6 +1047,8 @@ describe('calibrate CLI', () => {
 		expect(out).toMatch(/\| squid-a\.1 \|([^|]*\|){8} 0 \|/)
 		expect(out).toMatch(/\| squid-b\.1 \|([^|]*\|){8} \? \|/)
 		expect(out).toContain('none: no agent sessions')
+		expect(out).toContain('## Controller sessions')
+		expect(out).toContain('No traced session on this machine.')
 		const calls = readFileSync(join(bin, 'calls'), 'utf8')
 		// a.1 and b.1 have no agent sessions, and c.1 already has a stored trace: nothing to write.
 		expect(calls).not.toContain(' update ')
@@ -879,6 +1129,10 @@ describe('calibrate CLI', () => {
 		expect(out.calls).not.toContain('show bd-x.1.implement')
 		expect(out.stderr).not.toContain('not_found')
 		expect(out.stderr).not.toContain('could not check issue ids')
+		// The session's main transcript holds only a user entry: the workflow agents' requests are not its main thread.
+		const controllers = JSON.parse(out.stdout).aggregate.controllers
+		expect(controllers.length).toBe(1)
+		expect(controllers[0]).toMatchObject({ harness: 'claude', session: '6f26e090-4089-4a32-bdd2-c49ba9c91d0b', missing: false, runs: ['bd-x.1'], requests: 0 })
 	})
 
 	it('warns once when bd cannot check the ids, keeps the workflow and still reports', () => {

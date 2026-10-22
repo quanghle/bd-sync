@@ -21,7 +21,7 @@ export const meta = {
 // Kept here rather than in meta.whenToUse, which the skill listing truncates at about 1,500 characters.
 // - requirements (string or string[]; alias task): what to build.
 // - issue: the workflow claims it (pass actor = your bd actor so you can close it later, and token if you already hold
-//   it) and renews the lease (ttl, default 30m) between stages.
+//   it) and renews the lease (ttl, default 30m) before each planning agent and between stages.
 // - reviewStep (a `change` playbook run's review step): the planner reads the run's requirements and decisions steps as
 //   settled input; each finding approved for a fix becomes a bug issue under that step, commented once a later round
 //   confirms the fix and returned as confirmedFixes for the caller to close after closing the implement and verify
@@ -186,6 +186,8 @@ const LEASE = {
     has: { type: 'boolean', description: 'false when bd show prints no lease' },
     holder: { type: 'string', description: 'lease.holder, verbatim' },
     token: { type: 'string', description: 'lease.token, verbatim' },
+    expiresAt: { type: 'string', description: 'lease.expires_at, verbatim' },
+    now: { type: 'string', description: 'the output of date -u +%Y-%m-%dT%H:%M:%SZ' },
   },
   required: ['has'],
 }
@@ -582,9 +584,15 @@ if (A.issue) {
   log(`Claimed ${A.issue} as ${c.actor} (token ${c.token}, ttl ${TTL})`)
 }
 
-// Renew between stages. A failed heartbeat is escalated once (it is idempotent under the token); if that fails too, the
-// lease itself decides: an agent that mangles the command (a dropped --actor reads as "now held by <the same actor>")
-// must not end the run, or resume would replay the cached failure. Someone else holding the issue now: stop.
+// Renew before each planning agent and between stages. A failed heartbeat is escalated once (it is idempotent under the
+// token); if that fails too, the lease itself decides, and only when it has the same holder and token and has not
+// expired: an agent that mangles the command (a dropped --actor reads as "now held by <the same actor>") must not end
+// the run, or resume would replay the cached failure. Anything else (someone else holding the issue, another token, no
+// lease, an expired one): stop. The script has no clock, so the lease-check agent reports the time; ISO-8601 UTC strings
+// compare as text, and a missing value counts as not expired.
+function expired(l) {
+  return !!(l.expiresAt && l.now) && l.expiresAt.slice(0, 19) <= l.now.slice(0, 19)
+}
 let beats = 0
 async function renew(phase) {
   if (!lease) return
@@ -599,14 +607,19 @@ async function renew(phase) {
   if (h) return
   const l = await ops(
     `Run exactly: bd -C ${lease.root} show ${lease.issue} --json\n` +
-      `Return the "lease" object's holder and token exactly as printed (has=false if there is no lease). Do nothing else.`,
+      `Return the "lease" object's holder, token and expires_at (as expiresAt) exactly as printed (has=false if there is no lease). ` +
+      `Then run \`date -u +%Y-%m-%dT%H:%M:%SZ\` and return its output as now. Do nothing else.`,
     { label: `${label}:lease`, phase, schema: LEASE },
   )
-  if (l?.has && l.holder === lease.actor && String(l.token) === String(lease.token)) {
+  if (l?.has && l.holder === lease.actor && String(l.token) === String(lease.token) && !expired(l)) {
     log(`Heartbeat on ${lease.issue} failed (${failed?.error ?? 'heartbeat agent failed'}) but the lease is still ${l.holder}'s, token ${l.token}; continuing.`)
     return
   }
-  const now = l ? (l.has ? `held by ${l.holder}, token ${l.token}` : 'no lease') : 'lease check failed'
+  const now = l
+    ? l.has
+      ? `held by ${l.holder}, token ${l.token}` + (expired(l) ? `, expired ${l.expiresAt}` : '')
+      : 'no lease'
+    : 'lease check failed'
   throw new Error(
     `Lost the lease on ${lease.issue} (${failed?.error ?? 'heartbeat agent failed'}; ${now}); stopping. Work so far is in ${DIR || 'no worktree yet'}.`,
   )
@@ -658,8 +671,12 @@ if (SHADOWS.length) log(`Shadow reviewers: ${SHADOWS.map((o) => `${o.model}/${o.
 if (REVIEW_OPTS.effort) log(`Reviewers at effort ${REVIEW_OPTS.effort}`)
 
 // ---------- Plan ----------
+// Every planning agent renews the lease first, so no gap between renewals spans more than one planning agent.
+const planAgent = async (prompt, opts) => {
+  await renew('Plan')
+  return agent(prompt, { ...opts, phase: 'Plan' })
+}
 phase('Plan')
-await renew('Plan')
 const runContext = A.reviewStep
   ? `\n\nThis work is part of a \`change\` playbook run: \`bd${bdFlags()} show ${A.reviewStep}\` is its review step; its parent is the run. ` +
     `Read the run's requirements and decisions steps (and their decision children): their acceptance and design fields are settled input. ` +
@@ -675,7 +692,7 @@ const planIntro =
   `Record in "decisions" every design choice a reviewer could reasonably push back on (alternatives you rejected and why): ` +
   `those become settled and stop the review loop from flip-flopping. Keep scope to the requirements; list tempting extras as outOfScope.`
 const badPlan = (p) => !p.steps?.length || !p.requirements?.length
-let plan = A.plan ?? (await agent(planIntro, { label: 'planner:draft', phase: 'Plan', effort: 'high', schema: PLAN }))
+let plan = A.plan ?? (await planAgent(planIntro, { label: 'planner:draft', effort: 'high', schema: PLAN }))
 if (!plan || badPlan(plan)) return { status: 'escalated', reason: 'planner failed', workdir: DIR, lease }
 if (A.plan) log(`Starting from the given plan (${plan.steps.length} step(s))`)
 // Issues already known against a given plan stand in for the first critique.
@@ -689,7 +706,7 @@ for (let rev = 0; !A.skipImplement; rev++) {
     blockers = pending
     pending = null
   } else {
-    const crit = await agent(
+    const crit = await planAgent(
       `${readOnly(DIR)}\nYou are the plan critic. Try to break this plan before any code is written.\n\n${TASK}${runContext}\n\n${fmtPlan(plan)}\n\n` +
         `Plan decisions:\n${fmtDecisions(plan)}\n\n` +
         (critiques.length
@@ -700,7 +717,7 @@ for (let rev = 0; !A.skipImplement; rev++) {
         `a step order that leaves the build or tests broken, a violated AGENTS.md convention, missing tests for new behavior, code that would not ` +
         `build on macOS or Windows, or a decision whose rationale is wrong. Preferences and alternatives that are merely different are not blocking. ` +
         `approved=true if nothing blocks.`,
-      { label: `planner:critic:${rev}`, phase: 'Plan', effort: 'high', schema: CRITIQUE },
+      { label: `planner:critic:${rev}`, effort: 'high', schema: CRITIQUE },
     )
     if (!crit) log(`Plan critic ${rev} failed; accepting the plan as is`)
     blockers = (crit?.issues || []).filter((i) => i.blocking)
@@ -721,12 +738,12 @@ for (let rev = 0; !A.skipImplement; rev++) {
       }
     }
     log(`Plan: applying ${blockers.length} suggested correction(s) without another critique`)
-    const final = await agent(
+    const final = await planAgent(
       `${planIntro}\n\nYour previous plan:\n${fmtPlan(plan)}\n\nIts decisions:\n${fmtDecisions(plan)}\n\n` +
         `Verified blocking issues, each with its fix:\n${fmtBlockers(blockers)}\n\n` +
         `Return the full plan with exactly these corrections applied (adopt each suggestion; if the code shows one is wrong, ` +
         `make the smallest change that resolves the issue and record why in "decisions"). Change nothing else.`,
-      { label: `planner:final:${rev}`, phase: 'Plan', effort: 'high', schema: PLAN },
+      { label: `planner:final:${rev}`, effort: 'high', schema: PLAN },
     )
     if (!final || badPlan(final)) return { status: 'escalated', reason: 'planner failed to apply the final corrections', workdir: DIR, plan, blockers, lease }
     plan = final
@@ -735,12 +752,12 @@ for (let rev = 0; !A.skipImplement; rev++) {
   }
   log(`Plan critic: ${blockers.length} blocking issue(s); revising`)
   critiques.push(blockers.map((b) => `- ${b.issue} (evidence: ${b.evidence})`).join('\n'))
-  const revised = await agent(
+  const revised = await planAgent(
     `${planIntro}\n\nYour previous plan:\n${fmtPlan(plan)}\n\nIts decisions:\n${fmtDecisions(plan)}\n\n` +
       `The critic raised these blocking issues:\n${fmtBlockers(blockers)}\n\n` +
       `Return the full revised plan. Address each issue, or keep your choice and strengthen its rationale in "decisions" if the critic is wrong. ` +
       `Do not reintroduce anything an earlier critique round made you remove:\n${critiques.slice(0, -1).join('\n') || '(no earlier rounds)'}`,
-    { label: `planner:revise:${rev + 1}`, phase: 'Plan', effort: 'high', schema: PLAN },
+    { label: `planner:revise:${rev + 1}`, effort: 'high', schema: PLAN },
   )
   if (!revised || badPlan(revised)) return { status: 'escalated', reason: 'planner failed to revise the plan', workdir: DIR, plan, blockers, lease }
   plan = revised

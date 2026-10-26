@@ -203,6 +203,20 @@ the same answer as single commands:
   whose agent token is refused here can have the command retried with
   their own token from the OS keychain ([Person's token in the
   keychain](#persons-token-in-the-keychain)).
+- **Approvers.** A human gate that names [approvers](playbooks.md#approvers)
+  is opened, on every one of those paths, only by a human token of an
+  approver or a sub-actor of one; an admin token is no exception (exit 7).
+  A stored list that is not valid matches nobody. Changing the approvers of
+  an open human gate (`bd gate update`, `update --set-metadata`, an import)
+  needs a human token of one of its approvers (of any person, when it has
+  none) or a human admin's; agent tokens never may, so an agent cannot add
+  itself.
+- **In a browser.** With `[oauth]` and `--public-url`, a person may also
+  approve a human gate at `<public-url>/w/<workspace>/gates/<gate id>`
+  after signing in, without a token: only an account the rules or the
+  authorizer grant kind `human` in that workspace, and one of the gate's
+  approvers when it names them ([Approving human gates in the
+  browser](sign-in.md#approving-human-gates-in-the-browser)).
 - **Playbook metadata.** Only admins change `metadata.playbook`, which
   makes runs and groups close themselves, on an existing issue.
 - **GitHub gates** may name only repositories in the workspace's

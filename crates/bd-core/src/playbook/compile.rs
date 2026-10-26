@@ -25,7 +25,7 @@ use super::loader::Loader;
 use super::model::{Loop, LoopOver, MAX_DEPTH, MAX_RUN_ISSUES, Playbook, Step, StepGate, VarDef};
 use super::template::{self, Condition, render};
 use crate::error::{Error, Result};
-use crate::gates::{GateKind, GateSpec};
+use crate::gates::{self, GateKind, GateSpec};
 use crate::model::{DepType, GATE_TYPE, MAX_TITLE_CHARS};
 
 /// How deep `expand` may nest.
@@ -689,6 +689,12 @@ impl Builder<'_> {
             repo: opt(&g.repo)?,
             branch: opt(&g.branch)?,
             event: opt(&g.event)?,
+            approvers: if g.approvers.is_empty() {
+                None
+            } else {
+                let rendered = g.approvers.iter().map(|a| r(a)).collect::<Result<Vec<_>>>()?;
+                Some(gates::approvers_input(rendered).map_err(|e| at(e.to_string()))?)
+            },
         };
         spec.validate().map_err(|e| at(e.to_string()))?;
         let title = match &g.title {

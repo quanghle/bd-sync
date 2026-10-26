@@ -1634,4 +1634,33 @@ mod tests {
         let err = Verifier::new(dir.path()).verify("bdt_x").unwrap_err().to_string();
         assert!(err.contains("server.db") && err.contains("kind"), "{err}");
     }
+
+    #[test]
+    fn binding_an_account_for_an_approval_issues_no_token_and_is_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = Identity {
+            provider: "github".into(),
+            issuer: "https://github.com".into(),
+            subject: "7".into(),
+            login: "alice".into(),
+        };
+        let detail = "to approve gate bd-1 in proj; no token issued";
+        assert_eq!(bind_account(dir.path(), &user, true, detail).unwrap(), "github:alice");
+        let file = read_scoped(dir.path(), None).unwrap();
+        assert!(file.tokens.is_empty(), "no token: {:?}", file.tokens);
+        assert_eq!(file.accounts.len(), 1);
+        assert!(file.accounts[0].is(&user) && file.accounts[0].actor == "github:alice");
+        let events = server_db::events(dir.path(), 0, None, &[], 100).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let e = &events[0].event;
+        assert_eq!(e.kind, "signed_in");
+        assert_eq!(e.actor.as_deref(), Some("github:alice"));
+        assert_eq!(e.provider.as_deref(), Some("github"));
+        assert_eq!(e.issuer.as_deref(), Some("https://github.com"));
+        assert_eq!(e.subject.as_deref(), Some("7"));
+        assert_eq!((e.token.as_deref(), e.client.as_deref()), (None, None));
+        assert_eq!(e.detail.as_deref(), Some(detail));
+        // Bound for good: a later sign-in acts as the same actor.
+        assert_eq!(preview_actor(dir.path(), &user, true).unwrap(), "github:alice");
+    }
 }

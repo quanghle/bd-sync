@@ -504,7 +504,7 @@ fn as_of_matches_recorded_state_after_every_write() {
         env.w(|tx| tx.escalate_gate(&g, "overdue"));
     });
     step(&mut env, &|env| {
-        env.w(|tx| tx.resolve_gate(&g, Some("approved"), false));
+        env.w(|tx| tx.resolve_gate(&g, Some("approved"), false, None));
     });
     step(&mut env, &|env| {
         env.w(|tx| tx.close_issue(&x, &CloseOptions { reason: Some("done".into()), ..Default::default() }));

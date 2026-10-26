@@ -19,7 +19,7 @@ and error codes.
 | Events | `events` (`--follow`, `--wait`, `prune`), `history` (`--diff`), `show --as-of` | [Event history](concepts.md#event-history), [Reading an issue as of a past moment](concepts.md#reading-an-issue-as-of-a-past-moment) |
 | Agents | `prime`, `hook session-start/subagent-start/pre-tool-use`, `setup`, `agents manifest/status/pull/approve/watch` (`manifest --playbooks`: the playbooks a remote workspace's clients approve), `mcp` | [Agent assets](agents.md), [Setup and the plugins](setup.md), [MCP server](mcp.md) |
 | Publishing | `publish` (`--from`, `--dry-run`, `--only playbooks\|agents`, `--rollback`, `--allow-empty`) | [Publishing](agents.md#publishing) |
-| Playbooks and gates | `playbook list/show/plan/run/status/runs/compact/discard/extract`, `gate list/show/check/resolve/create`, `purge` | [Playbooks](playbooks.md) |
+| Playbooks and gates | `playbook list/show/plan/run/status/runs/compact/discard/extract`, `gate list/show/check/resolve/create/update`, `purge` | [Playbooks](playbooks.md) |
 | Data | `export`, `import`, `batch`, `backup` | [below](#data) |
 | GitHub | `github status/pull/push/sync` | [GitHub Issues sync](github.md) |
 | Operations | `metrics`, `bench` | [Observability](observability.md), [Benchmarks](benchmarks.md) |

@@ -187,7 +187,7 @@ commit-ordered; `tx` groups the events of one transaction.
 
 | group | ops |
 |---|---|
-| issues | `created`, `updated` (field-level old/new), `closed`, `reopened` (with the close fields it cleared), `deleted` (with a snapshot), `compacted` ([Compaction](#compaction): old/new like `updated`) |
+| issues | `created`, `updated` (field-level old/new), `closed` (with `via: "browser"` for a gate approved [in a browser](sign-in.md#approving-human-gates-in-the-browser)), `reopened` (with the close fields it cleared), `deleted` (with a snapshot), `compacted` ([Compaction](#compaction): old/new like `updated`) |
 | claims | `claimed`, `released`, `reclaimed`, `lease_granted` |
 | graph | `dep_added`, `dep_removed`, `dep_updated`, `blocked`, `unblocked` |
 | other | `commented`, `memory_set`, `memory_deleted`, `config_set`, `config_unset`, `prefix_renamed` and `references_renamed` ([Renaming the prefix](commands.md#renaming-the-prefix)), `imported` (an update with the issue's `previous` snapshot), `pruned` |

@@ -75,6 +75,10 @@ malformed spec parts) do not.
 - **Sign-in**: sign-ins, refreshes, refusals and revocations, with the
   provider, subject, login, actor and token name, never a secret or an
   email ([What bd keeps about people](security.md#what-bd-keeps-about-people)).
+  [Gate approvals in the browser](sign-in.md#approving-human-gates-in-the-browser)
+  log `gate approval` with its `outcome` (`approved`, `refused`, `already
+  resolved`, `not ready`, ...) and `gate approval refused` lines, with the
+  provider, subject, login, actor, workspace and gate.
 - **Sign-in secrets** ([from a command](sign-in.md#secrets-from-a-command)):
   at start, which command fetches how many secrets, then (once known, the
   server serving meanwhile) that it answered, or why the steps needing
@@ -116,6 +120,7 @@ Prometheus text:
 | `bd_serve_commands_total` | commands run |
 | `bd_serve_tool_calls_total` | MCP tool calls |
 | `bd_serve_publishes_total{outcome}` | `bd publish` runs (dry runs aside), `applied` or `refused` |
+| `bd_serve_approvals_total{outcome}` | human gates [approved in the browser](sign-in.md#approving-human-gates-in-the-browser), `approved`, or approvals `refused` (an account not let in, whose actor is taken, not granted kind `human` or not an approver, a refusal when posting, a post from another site); notices (expired, used, resolved, not ready, not found) are not counted |
 | `bd_serve_panics_total` | panics |
 | `bd_serve_start_time_seconds` | when the server started |
 

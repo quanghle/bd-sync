@@ -53,10 +53,20 @@ fn condition(g: &GateView) -> String {
                 c.push_str(if s.kind == GateKind::Timer { " " } else { " timeout " });
                 c.push_str(t);
             }
+            match s.approvers.as_deref() {
+                Some([]) => c.push_str(" by nobody (invalid approvers)"),
+                Some(list) => c.push_str(&format!(" by {}", shown_approvers(list, " or "))),
+                None => {}
+            }
             c
         }
         None => format!("invalid ({})", g.spec_error.as_deref().unwrap_or("?")),
     }
+}
+
+/// Stored approvers as a terminal may show them.
+fn shown_approvers(list: &[String], sep: &str) -> String {
+    list.iter().map(|a| io::printable(a)).collect::<Vec<_>>().join(sep)
 }
 
 fn ago(t: Timestamp, now: Timestamp) -> String {
@@ -118,6 +128,13 @@ pub fn cmd_gate(app: &mut App, cmd: &GateCommand) -> Result<()> {
             if let Some(a) = &g.assignee {
                 out = out.line(format!("  assignee: {a}"));
             }
+            match g.spec.as_ref().and_then(|s| s.approvers.as_deref()) {
+                Some([]) => {
+                    out = out.line("  approvers: invalid (matches nobody through bd serve; fix with bd gate update)")
+                }
+                Some(list) => out = out.line(format!("  approvers: {}", shown_approvers(list, ", "))),
+                None => {}
+            }
             if let Some(r) = &g.run_id {
                 out = out.line(format!("  watching GitHub run {r}"));
             }
@@ -138,6 +155,10 @@ pub fn cmd_gate(app: &mut App, cmd: &GateCommand) -> Result<()> {
             let out = app.write("gate.create", |tx| exec_create(tx, a))?;
             app.print(out);
         }
+        GateCommand::Update(a) => {
+            let out = app.write("gate.update", |tx| exec_update(tx, a))?;
+            app.print(out);
+        }
     }
     Ok(())
 }
@@ -147,7 +168,7 @@ pub fn exec_resolve(tx: &mut WriteCtx<'_>, a: &GateResolveArgs) -> Result<Out> {
     let mut results = Vec::new();
     for raw in &a.ids {
         let id = tx.resolve_id(raw)?;
-        let r = tx.resolve_gate(&id, a.reason.as_deref(), a.force)?;
+        let r = tx.resolve_gate(&id, a.reason.as_deref(), a.force, None)?;
         out = out.line(if r.already_closed {
             format!("= {id} was already open")
         } else {
@@ -174,6 +195,7 @@ pub fn exec_create(tx: &mut WriteCtx<'_>, a: &GateCreateArgs) -> Result<Out> {
         repo: a.repo.clone().filter(|s| !s.trim().is_empty()),
         branch: a.branch.clone().filter(|s| !s.trim().is_empty()),
         event: a.event.clone().filter(|s| !s.trim().is_empty()),
+        approvers: if a.approvers.is_empty() { None } else { Some(gates::approvers_input(a.approvers.clone())?) },
     };
     let blocks =
         a.blocks.iter().filter(|b| !b.trim().is_empty()).map(|b| tx.resolve_id(b)).collect::<Result<Vec<_>>>()?;
@@ -193,6 +215,17 @@ pub fn exec_create(tx: &mut WriteCtx<'_>, a: &GateCreateArgs) -> Result<Out> {
         .line(format!("✓ Created gate {}: {} (holds back {})", gate.id, gate.title, blocks.join(", ")))
         .line(format!("  {}", state_text(&view, now)))
         .id(gate.id))
+}
+
+pub fn exec_update(tx: &mut WriteCtx<'_>, a: &GateUpdateArgs) -> Result<Out> {
+    let id = tx.resolve_id(&a.id)?;
+    let done = tx.set_gate_approvers(&id, (!a.clear_approvers).then(|| a.approvers.clone()))?;
+    let view = gates::view_of(tx.conn(), &done.issue)?;
+    let line = match gates::approvers_of(&done.issue) {
+        Some(list) => format!("✓ Gate {id}: approvers {}", shown_approvers(&list, ", ")),
+        None => format!("✓ Gate {id}: approvers cleared"),
+    };
+    Ok(Out::new(&view).line(line).id(id))
 }
 
 /// What checking one gate found.
@@ -407,7 +440,7 @@ fn apply_verdicts(tx: &mut WriteCtx<'_>, checked: &mut [Checked]) -> Result<()> 
             }
             Ok(match &c.verdict {
                 Verdict::Resolve(detail) => {
-                    let r = tx.resolve_gate(&c.id, Some(detail), false)?;
+                    let r = tx.resolve_gate(&c.id, Some(detail), false, None)?;
                     Some(("opened", r.unblocked.iter().map(|u| u.id.clone()).collect()))
                 }
                 Verdict::Escalate(detail) => tx.escalate_gate(&c.id, detail)?.then(|| ("escalated", Vec::new())),

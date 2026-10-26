@@ -1,11 +1,12 @@
 //! The pages people see during an authorization (`authorize/`): the
-//! consent page, refusals, and the page sending the browser on. Every value
-//! shown is escaped, and each page comes with the Content-Security-Policy it
-//! needs: its inline style, and forms posting only where the consent goes.
-//! The pages fetch nothing: icons are inline SVG drawn with presentation
-//! attributes, which the policy's `style-src` does not cover, and a client's
-//! logo comes inside the page, as a `data:` URL.
-
+//! consent page, refusals, and the page sending the browser on; and those
+//! of a human gate's approval in the browser: the approval page and its
+//! notices. Every value shown is escaped, and each page comes with the
+//! Content-Security-Policy it needs: its inline style, and forms posting
+//! only where the consent or the approval goes. The pages fetch nothing:
+//! icons are inline SVG drawn with presentation attributes, which the
+//! policy's `style-src` does not cover, and a client's logo comes inside
+//! the page, as a `data:` URL.
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use sha2::{Digest, Sha256};
@@ -60,6 +61,8 @@ font-size:17px;font-weight:600;background:var(--fg);color:var(--bg)}
 dt{opacity:.55}
 dd{margin:0;min-width:0;overflow-wrap:break-word}
 .note{display:block;opacity:.55;font-size:.88em}
+.note-line{display:block}
+.note-line .note{display:inline}
 .callout{display:flex;gap:10px;align-items:flex-start;margin:0 0 20px}
 .callout svg{width:18px;height:18px;flex:none;margin-top:2px}
 .actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px 24px;margin:0}
@@ -245,12 +248,138 @@ Access lasts {lasts}.</span></p>\n",
     page(200, "Connect to bd", &body, parts)
 }
 
-/// The page asking which provider to sign in with, to connect `client`:
-/// each option a label and the link that starts its sign-in.
-pub fn choose(client: &str, options: &[(String, String)]) -> Page {
+/// The most characters of a title the approval page shows.
+const MAX_TITLE: usize = 200;
+
+/// The most issues the approval page lists as held back.
+const MAX_HOLDS: usize = 20;
+
+/// What the gate approval page shows.
+pub struct ApproveGate<'a> {
+    pub workspace: &'a str,
+    /// The gate's id and title.
+    pub gate: &'a str,
+    pub title: &'a str,
+    /// The issues the gate holds back: id, title and status.
+    pub holds: &'a [(String, String, String)],
+    /// The run or parent the gate belongs to: id and title.
+    pub part_of: Option<(&'a str, &'a str)>,
+    /// The gate's approvers, if it names any (an empty list: a stored list
+    /// that is not valid, which matches nobody).
+    pub approvers: Option<&'a [String]>,
+    /// The provider the person signed in with, as the page names it.
+    pub provider: &'a str,
+    /// The actor the approval is recorded as.
+    pub actor: &'a str,
+    /// The approval's id, posted back with it.
+    pub id: &'a str,
+    /// Where the approval is posted.
+    pub action: &'a str,
+}
+
+/// The page asking a person to approve a human gate: what the gate is,
+/// what it holds back, and who the approval is recorded as, with one
+/// button. Its form posts only to this server (`'self'`), and the consent
+/// page's script ([`ARMING`]) keeps a double click from sending it.
+/// Titles come from whoever may write to the workspace, agents included,
+/// so every value is shown escaped ([`shown`]): nothing in them can pass
+/// for the page's own text.
+pub fn approve_gate(a: &ApproveGate<'_>) -> Page {
+    let title = shown(a.title, MAX_TITLE);
+    let actor = shown(a.actor, MAX_TITLE);
+    let workspace = shown(a.workspace, MAX_TITLE);
+    let mut holds = String::new();
+    for (id, title, status) in a.holds.iter().take(MAX_HOLDS) {
+        holds.push_str(&format!(
+            "<span class=\"note-line\"><code>{}</code> {} <span class=\"note\">{}</span></span>",
+            shown(id, MAX_TITLE),
+            shown(title, MAX_TITLE),
+            shown(status, MAX_TITLE)
+        ));
+    }
+    if a.holds.len() > MAX_HOLDS {
+        holds.push_str(&format!("<span class=\"note\">and {} more</span>", a.holds.len() - MAX_HOLDS));
+    }
+    if a.holds.is_empty() {
+        holds.push_str("Nothing");
+    }
+    let part_of = a.part_of.map_or(String::new(), |(id, title)| {
+        format!(
+            "<div><dt>Part of</dt><dd><code>{}</code> {}</dd></div>\n",
+            shown(id, MAX_TITLE),
+            shown(title, MAX_TITLE)
+        )
+    });
+    let approvers = match a.approvers {
+        None => String::new(),
+        Some([]) => "<div><dt>Approvers</dt><dd>None valid: nobody may approve</dd></div>\n".to_string(),
+        Some(list) => format!(
+            "<div><dt>Approvers</dt><dd>{}</dd></div>\n",
+            list.iter().map(|a| shown(a, MAX_TITLE)).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    let body = format!(
+        "<div class=\"link\" aria-hidden=\"true\"><div class=\"avatar\">{MARK}</div></div>\n\
+<h1>Approve {title}?</h1>\n\
+<p class=\"lead\">You're signed in to {provider} as <b>{actor}</b>.</p>\n\
+<dl class=\"facts\">\n\
+<div><dt>Workspace</dt><dd>{workspace}</dd></div>\n\
+<div><dt>Gate</dt><dd><code>{gate}</code> {title}</dd></div>\n\
+<div><dt>Holds back</dt><dd>{holds}</dd></div>\n\
+{part_of}{approvers}</dl>\n\
+<p class=\"callout\">{SHIELD}<span>Approving resolves this gate, so the work it holds back can go ahead. \
+It is recorded in {workspace} as approved by <b>{actor}</b>. Only approve if you opened this link just now, \
+in this browser.</span></p>\n",
+        provider = shown(a.provider, MAX_TITLE),
+        gate = shown(a.gate, MAX_TITLE),
+    );
+    let actions = format!(
+        "<form method=\"post\" action=\"{action}\" class=\"actions\">\n\
+<input type=\"hidden\" name=\"approval\" value=\"{id}\">\n\
+<button type=\"submit\" class=\"primary\">Approve</button>\n\
+</form>\n",
+        action = escape(a.action),
+        id = escape(a.id),
+    );
+    let parts = Parts { actions: &actions, form_action: "'self'", script: Some(ARMING), ..Parts::default() };
+    page(200, "Approve a gate", &body, parts)
+}
+
+/// A page telling why there is nothing to approve, or why it cannot be: a
+/// refusal with no way back, since no application waits.
+pub fn notice(status: u16, title: &str, why: &str) -> Page {
+    refusal(status, title, why, None)
+}
+
+/// `text` as HTML, at most `max` characters of it (then '…'), with what a
+/// terminal or a page would not show plainly escaped as `\uXXXX`: control
+/// characters and text direction controls ([`bd_cli::io::printable`]), and
+/// invisible and blank characters ([`hidden`](super::clients::hidden)).
+fn shown(text: &str, max: usize) -> String {
+    let cut: String = if text.chars().count() > max {
+        text.chars().take(max).chain(std::iter::once('…')).collect()
+    } else {
+        text.to_string()
+    };
+    let printable = bd_cli::io::printable(&cut);
+    let mut out = String::with_capacity(printable.len());
+    for c in printable.chars() {
+        if super::clients::hidden(c) {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    escape(&out)
+}
+
+/// The page asking which provider to sign in with, under `heading` (what
+/// the sign-in is for): each option a label and the link that starts its
+/// sign-in.
+pub fn choose(heading: &str, options: &[(String, String)]) -> Page {
     let mut body = format!(
-        "<h1>Sign in to connect {}</h1>\n<p class=\"lead\">Choose how to sign in.</p>\n<div class=\"choices\">\n",
-        escape(client)
+        "<h1>{}</h1>\n<p class=\"lead\">Choose how to sign in.</p>\n<div class=\"choices\">\n",
+        escape(heading)
     );
     for (label, href) in options {
         body.push_str(&format!("<a class=\"button\" href=\"{}\">Continue with {}</a>\n", escape(href), escape(label)));
@@ -547,7 +676,7 @@ mod tests {
                 "choose",
                 "Choosing a provider",
                 choose(
-                    "ChatGPT",
+                    "Sign in to connect ChatGPT",
                     &[
                         (
                             "GitHub".to_string(),
@@ -581,6 +710,30 @@ mod tests {
                 ),
             ),
             ("onward", "Onward (refresh left out)", onward("http://[::1]:8080/callback?code=c&state=s")),
+            (
+                "approve-gate",
+                "Approving a human gate",
+                approve_gate(&ApproveGate {
+                    workspace: "proj",
+                    gate: "proj-a1b2",
+                    title: "Release sign-off",
+                    holds: &[
+                        ("proj-c3d4".to_string(), "Deploy to production".to_string(), "open".to_string()),
+                        ("proj-e5f6".to_string(), "Announce the release".to_string(), "open".to_string()),
+                    ],
+                    part_of: Some(("proj-r1", "release 1.4")),
+                    approvers: Some(&["github:octocat".to_string(), "github:hubot".to_string()]),
+                    provider: "GitHub",
+                    actor: "github:octocat",
+                    id: "c0ffee",
+                    action: "https://bd.example.com/w/proj/gates/proj-a1b2",
+                }),
+            ),
+            (
+                "gate-notice",
+                "A gate already resolved",
+                notice(200, "Already resolved", "This gate was resolved already: there is nothing to approve."),
+            ),
         ];
         let mut index = String::from("<h1>bd authorization pages</h1>\n<ul>\n");
         let write = |name: &str, page: &Page| {
@@ -598,6 +751,35 @@ mod tests {
         index.push_str("</ul>\n");
         write("index", &page(200, "bd authorization pages", &index, Parts::default()));
         println!("{}", dir.join("index.html").display());
+    }
+
+    /// Where [`gate_page`]'s form posts: a URL with markup in it.
+    const GATE_ACTION: &str = "https://bd.example.com/w/proj/gates/g\"><x>";
+
+    /// An approval page for a gate titled `title`, every other value shown
+    /// `other`.
+    fn gate_page(title: &str, other: &str) -> Page {
+        let holds = [(other.to_string(), title.to_string(), other.to_string())];
+        let approvers = [other.to_string()];
+        approve_gate(&ApproveGate {
+            workspace: other,
+            gate: other,
+            title,
+            holds: &holds,
+            part_of: Some((other, title)),
+            approvers: Some(&approvers),
+            provider: other,
+            actor: other,
+            id: "c0ffee",
+            action: GATE_ACTION,
+        })
+    }
+
+    /// The text of the page's only script.
+    fn script_of(page: &Page) -> &str {
+        let start = page.html.find("<script>").unwrap() + "<script>".len();
+        let end = page.html.find("</script>").unwrap();
+        &page.html[start..end]
     }
 
     #[test]
@@ -620,22 +802,80 @@ mod tests {
             action: "https://bd.example.com/oauth/consent",
             form_origins: &["'self'"],
         });
-        let start = page.html.find("<script>").unwrap() + "<script>".len();
-        let end = page.html.find("</script>").unwrap();
-        let hash = STANDARD.encode(Sha256::digest(&page.html.as_bytes()[start..end]));
+        let hash = STANDARD.encode(Sha256::digest(script_of(&page).as_bytes()));
         assert!(page.csp.contains(&format!("; script-src 'sha256-{hash}';")), "{}", page.csp);
         assert_eq!(page.html.matches("<script").count(), 1);
-        for other in [refusal(403, "t", "w", Some("https://app.example/cb")), onward("https://app.example/cb")] {
+
+        // The approval page runs the same script, and only it.
+        let page = gate_page("Ship it", "proj");
+        assert_eq!(page.html.matches("<script").count(), 1);
+        assert_eq!(script_of(&page), ARMING);
+        let arming = STANDARD.encode(Sha256::digest(ARMING.as_bytes()));
+        assert!(page.csp.contains(&format!("; script-src 'sha256-{arming}';")), "{}", page.csp);
+        let form = "<form method=\"post\" action=\"https://bd.example.com/w/proj/gates/g&quot;&gt;&lt;x&gt;\" \
+class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
+        assert!(page.html.contains(form), "{}", page.html);
+
+        let options = [("GitHub".to_string(), "https://bd.example.com/oauth/choose?flow=f".to_string())];
+        for other in [
+            refusal(403, "t", "w", Some("https://app.example/cb")),
+            onward("https://app.example/cb"),
+            notice(404, "t", "w"),
+            choose("Sign in to approve gate g in proj", &options),
+        ] {
             assert!(!other.html.contains("<script") && !other.csp.contains("script-src"), "{}", other.csp);
         }
     }
 
     #[test]
     fn the_policy_allows_the_inline_style() {
-        let page = refusal(400, "t", "w", None);
-        let start = page.html.find("<style>").unwrap() + "<style>".len();
-        let end = page.html.find("</style>").unwrap();
-        let hash = STANDARD.encode(Sha256::digest(&page.html.as_bytes()[start..end]));
-        assert!(page.csp.contains(&format!("style-src 'sha256-{hash}'")));
+        for page in [refusal(400, "t", "w", None), gate_page("Ship it", "proj"), notice(409, "t", "w")] {
+            let start = page.html.find("<style>").unwrap() + "<style>".len();
+            let end = page.html.find("</style>").unwrap();
+            let hash = STANDARD.encode(Sha256::digest(&page.html.as_bytes()[start..end]));
+            assert!(page.csp.contains(&format!("style-src 'sha256-{hash}'")));
+        }
+    }
+
+    #[test]
+    fn the_approval_page_shows_hostile_titles_escaped() {
+        for title in ["<script>alert(1)</script>", "\u{202E}evil", "a\u{200B}b"] {
+            let page = gate_page(title, "<b>\"x\"</b>\u{202E}");
+            assert!(!page.html.contains("<script>alert"), "{}", page.html);
+            assert!(!page.html.contains('\u{202E}') && !page.html.contains('\u{200B}'), "{}", page.html);
+            assert!(!page.html.contains("<b>\"x\"</b>"), "{}", page.html);
+            assert!(!page.html.contains(GATE_ACTION), "{}", page.html);
+            assert!(page.html.contains("<dd>&lt;b&gt;&quot;x&quot;&lt;/b&gt;\\u202e</dd>"), "{}", page.html);
+            assert!(page.csp.contains("form-action 'self';"), "{}", page.csp);
+        }
+        let html = gate_page("<script>alert(1)</script>", "proj").html;
+        assert!(html.contains("<h1>Approve &lt;script&gt;alert(1)&lt;/script&gt;?</h1>"), "{html}");
+        let html = gate_page("\u{202E}evil", "proj").html;
+        assert!(html.contains("<h1>Approve \\u202eevil?</h1>"), "{html}");
+        let html = gate_page("a\u{200B}b", "proj").html;
+        assert!(html.contains("<h1>Approve a\\u200bb?</h1>"), "{html}");
+
+        // Long titles are cut; the actor shows, an email never comes into it.
+        let long = "x".repeat(MAX_TITLE + 50);
+        let html = gate_page(&long, "proj").html;
+        assert!(html.contains(&format!("<h1>Approve {}…?</h1>", "x".repeat(MAX_TITLE))), "{html}");
+        assert!(html.contains("You're signed in to proj as <b>proj</b>."), "{html}");
+
+        // A list of approvers that is not valid matches nobody, and says so.
+        let page = approve_gate(&ApproveGate {
+            workspace: "proj",
+            gate: "g",
+            title: "t",
+            holds: &[],
+            part_of: None,
+            approvers: Some(&[]),
+            provider: "GitHub",
+            actor: "github:alice",
+            id: "i",
+            action: "a",
+        });
+        assert!(page.html.contains("<dt>Approvers</dt><dd>None valid"), "{}", page.html);
+        assert!(page.html.contains("<dt>Holds back</dt><dd>Nothing</dd>"), "{}", page.html);
+        assert!(!page.html.contains("<dt>Part of</dt>"), "{}", page.html);
     }
 }

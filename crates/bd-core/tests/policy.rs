@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use bd_core::gates::{GateKind, GateRepos, GateSpec, NewGate};
+use bd_core::gates::{self, GateKind, GateRepos, GateSpec, NewGate};
 use bd_core::playbook::{self, CompactOptions, DiscardOptions, Loader, RunRequest, StartOptions};
 use bd_core::transfer::{ExportOptions, ImportOptions};
 use bd_core::*;
@@ -552,9 +552,9 @@ fn human_gates_open_only_for_a_person() {
     let none = Guard::default();
 
     // The gate itself: resolving, closing, pinning, retyping, re-specifying, deleting.
-    let e = denied(env.as_("bot", bot(), |tx| tx.resolve_gate(gate, Some("lgtm"), false)), "is a human gate");
+    let e = denied(env.as_("bot", bot(), |tx| tx.resolve_gate(gate, Some("lgtm"), false, None)), "is a human gate");
     assert_eq!(e.needs(), [Need::Human]);
-    denied(env.as_("ops", ops(), |tx| tx.resolve_gate(gate, None, true)), "only a person can open it");
+    denied(env.as_("ops", ops(), |tx| tx.resolve_gate(gate, None, true, None)), "only a person can open it");
     denied(env.as_("bot", bot(), |tx| tx.close_issue(gate, &CloseOptions::default())), "open it");
     let pin = patch(|p| p.status = Some(Status::Pinned));
     denied(env.as_("bot", bot(), |tx| tx.update_issue(gate, &pin, &none, false)), "open it");
@@ -639,7 +639,7 @@ fn human_gates_open_only_for_a_person() {
     .expect("a person may");
 
     // A person resolves it; the work flows again.
-    env.as_("carol", person("carol"), |tx| tx.resolve_gate(gate, Some("approved"), false)).unwrap();
+    env.as_("carol", person("carol"), |tx| tx.resolve_gate(gate, Some("approved"), false, None)).unwrap();
     let ready: Vec<String> =
         env.store.read(|r| r.ready(&ReadyQuery::default())).unwrap().into_iter().map(|i| i.id).collect();
     assert_eq!(ready, vec!["t-1.deploy.notify", "t-1.deploy.upload"]);
@@ -672,7 +672,7 @@ fn people_and_the_cli_are_not_limited_by_human_gates() {
             })
         })
         .unwrap();
-    env.as_("bot", agent("bot"), |tx| tx.resolve_gate(&timer.id, None, false)).unwrap();
+    env.as_("bot", agent("bot"), |tx| tx.resolve_gate(&timer.id, None, false, None)).unwrap();
     env.as_("bot", agent("bot"), |tx| tx.discard_run(&run, &discard(true, false, false))).unwrap();
     env.assert_healthy();
 }
@@ -1034,10 +1034,10 @@ fn a_gate_with_held_work_below_it_opens_only_for_a_person() {
     let held = child(&mut env, "alice", None, &timer, NewIssue::titled("Held below the timer"));
     let approval = human_gate(&mut env, &held);
     env.clock.advance(Duration::from_secs(2 * 3600));
-    let r = env.as_("bot", agent("bot"), |tx| tx.resolve_gate(&timer, Some("timer elapsed"), false));
+    let r = env.as_("bot", agent("bot"), |tx| tx.resolve_gate(&timer, Some("timer elapsed"), false, None));
     denied(r, &format!("holds work that waits for human gate {approval}"));
     assert!(env.issue(&later).is_blocked);
-    env.as_("carol", person("carol"), |tx| tx.resolve_gate(&timer, Some("timer elapsed"), false)).unwrap();
+    env.as_("carol", person("carol"), |tx| tx.resolve_gate(&timer, Some("timer elapsed"), false, None)).unwrap();
     assert!(!env.issue(&later).is_blocked);
     assert!(env.issue(&held).is_blocked, "{approval} still holds its work");
     // Nor may an agent delete such a gate.
@@ -1200,4 +1200,357 @@ fn closing_as_a_duplicate_needs_an_admin_to_take_over_another_actors_claim() {
     env.as_("alice", admin_agent("alice"), |tx| tx.close_as(&held, &canonical, Replacement::Duplicate, &opts)).unwrap();
     assert_eq!(env.issue(&held).status, Status::Closed);
     env.assert_healthy();
+}
+
+fn gate_with(env: &mut Env, approvers: Option<Vec<String>>) -> (String, String) {
+    let work = env.create("Deploy");
+    let spec = GateSpec { approvers, ..GateSpec::new(GateKind::Human) };
+    let gate = env
+        .as_("alice", None, |tx| {
+            tx.create_gate(NewGate {
+                spec,
+                blocks: vec![work.clone()],
+                title: None,
+                description: String::new(),
+                assignee: None,
+                parent: None,
+                priority: None,
+                ephemeral: false,
+            })
+        })
+        .unwrap();
+    (gate.id, work)
+}
+
+fn closed_event(env: &Env, id: &str) -> Value {
+    let q = EventQuery { issue_id: Some(id.into()), ops: vec!["closed".into()], ..Default::default() };
+    env.store.read(|r| r.events(&q)).unwrap().events.pop().expect("a closed event").data
+}
+
+#[test]
+fn resolving_a_gate_records_how() {
+    let mut env = Env::new();
+    let (browser, _) = gate_with(&mut env, None);
+    let (cli, _) = gate_with(&mut env, None);
+    env.as_("carol", None, |tx| {
+        tx.resolve_gate(&browser, Some("approved in the browser by carol"), false, Some("browser"))
+    })
+    .unwrap();
+    env.as_("carol", None, |tx| tx.resolve_gate(&cli, None, false, None)).unwrap();
+    let data = closed_event(&env, &browser);
+    assert_eq!(data["via"], "browser");
+    assert_eq!(data["reason"], "approved in the browser by carol");
+    assert!(closed_event(&env, &cli).get("via").is_none(), "no via key without one");
+    env.assert_healthy();
+}
+
+fn store_approvers(env: &mut Env, gate: &str, approvers: Value) {
+    let mut meta = env.issue(gate).metadata;
+    meta["gate"]["approvers"] = approvers;
+    let patch = IssuePatch { metadata: Some(meta), ..Default::default() };
+    env.as_("alice", None, |tx| tx.update_issue(gate, &patch, &Guard::default(), false)).unwrap();
+}
+
+#[test]
+fn gate_approvers_are_set_replaced_and_cleared_as_stored() {
+    let mut env = Env::new();
+    let (gate, _) = gate_with(&mut env, Some(vec!["carol".into()]));
+    let stored = |env: &Env| env.issue(&gate).metadata["gate"].get("approvers").cloned();
+    assert_eq!(stored(&env), Some(json!(["carol"])));
+
+    let set = |list: &[&str]| Some(list.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+    let r = env.as_("alice", None, |tx| tx.set_gate_approvers(&gate, set(&[" dave ", "erin/x", "Dave"]))).unwrap();
+    assert_eq!(r.changed, vec!["metadata"]);
+    assert_eq!(stored(&env), Some(json!(["dave", "erin/x"])));
+    assert_eq!(env.issue(&gate).metadata["gate"]["type"], "human", "the condition is kept");
+    env.as_("alice", None, |tx| tx.set_gate_approvers(&gate, None)).unwrap();
+    assert_eq!(stored(&env), None);
+
+    // A list stored invalid is replaced or cleared as it is.
+    for bad in [json!(42), json!(["carol", ""])] {
+        store_approvers(&mut env, &gate, bad.clone());
+        assert_eq!(gates::approvers_of(&env.issue(&gate)), Some(vec![]), "{bad}");
+        env.as_("alice", None, |tx| tx.set_gate_approvers(&gate, set(&["carol"]))).unwrap();
+        assert_eq!(stored(&env), Some(json!(["carol"])), "{bad}");
+    }
+    store_approvers(&mut env, &gate, json!(42));
+    env.as_("alice", None, |tx| tx.set_gate_approvers(&gate, None)).unwrap();
+    assert_eq!(stored(&env), None);
+
+    for bad in [set(&["carol\nadmin"]), set(&[" "]), set(&[])] {
+        let e = env.as_("alice", None, |tx| tx.set_gate_approvers(&gate, bad.clone())).unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{bad:?}: {e}");
+    }
+    let work = env.create("Later");
+    let mut spec = GateSpec::new(GateKind::Timer);
+    spec.timeout = Some("1h".into());
+    let timer = env
+        .as_("alice", None, |tx| {
+            tx.create_gate(NewGate {
+                spec,
+                blocks: vec![work.clone()],
+                title: None,
+                description: String::new(),
+                assignee: None,
+                parent: None,
+                priority: None,
+                ephemeral: false,
+            })
+        })
+        .unwrap();
+    let e = env.as_("alice", None, |tx| tx.set_gate_approvers(&timer.id, set(&["carol"]))).unwrap_err();
+    assert!(e.exit_code() == 2 && e.to_string().contains("only apply to human gates"), "{e}");
+    let e = env.as_("alice", None, |tx| tx.set_gate_approvers(&work, set(&["carol"]))).unwrap_err();
+    assert!(e.exit_code() == 2 && e.to_string().contains("not a gate"), "{e}");
+
+    env.as_("alice", None, |tx| tx.resolve_gate(&gate, None, false, None)).unwrap();
+    let e = env.as_("alice", None, |tx| tx.set_gate_approvers(&gate, set(&["carol"]))).unwrap_err();
+    assert!(e.exit_code() == 2 && e.to_string().contains("is resolved"), "{e}");
+    env.assert_healthy();
+}
+
+fn human_admin(actor: &str) -> Option<Policy> {
+    Some(Policy { actor: actor.into(), admin: true, human: true, max_claims: None })
+}
+
+/// A human gate approved by carol only, the task it blocks, a container of
+/// both, and a run held back by the gate whose last open step is `step`.
+struct Approved {
+    env: Env,
+    container: String,
+    task: String,
+    gate: String,
+    run: String,
+    step: String,
+}
+
+fn approved_fixture() -> Approved {
+    let mut env = Env::new();
+    let container = env
+        .as_("alice", None, |tx| {
+            tx.create_issue(NewIssue { issue_type: Some("epic".into()), ..NewIssue::titled("Release") })
+        })
+        .unwrap()
+        .id;
+    let task = child(&mut env, "alice", None, &container, NewIssue::titled("Deploy"));
+    let spec = GateSpec { approvers: Some(vec!["carol".into()]), ..GateSpec::new(GateKind::Human) };
+    let gate = env
+        .as_("alice", None, |tx| {
+            tx.create_gate(NewGate {
+                spec,
+                blocks: vec![task.clone()],
+                title: None,
+                description: String::new(),
+                assignee: None,
+                parent: Some(container.clone()),
+                priority: None,
+                ephemeral: false,
+            })
+        })
+        .unwrap()
+        .id;
+    let run = env
+        .as_("alice", None, |tx| {
+            tx.create_issue(NewIssue { deps: vec![(DepType::Blocks, gate.clone())], ..NewIssue::titled("Rollout") })
+        })
+        .unwrap()
+        .id;
+    set_role(&mut env, &run, "run");
+    let step =
+        child(&mut env, "alice", None, &run, NewIssue { status: Some(Status::Pinned), ..NewIssue::titled("Step") });
+    assert_eq!(gates::approvers_of(&env.issue(&gate)), Some(vec!["carol".to_string()]));
+    Approved { env, container, task, gate, run, step }
+}
+
+/// The export with `gate`'s line changed by `f`.
+fn exported_with(env: &Env, gate: &str, f: impl Fn(&mut Value)) -> String {
+    let mut snap = Vec::new();
+    env.store.read(|r| r.export_jsonl(&mut snap, &ExportOptions::default())).unwrap();
+    String::from_utf8(snap)
+        .unwrap()
+        .lines()
+        .map(|l| {
+            let mut v: Value = serde_json::from_str(l).unwrap();
+            if v["id"] == gate {
+                f(&mut v);
+            }
+            format!("{v}\n")
+        })
+        .collect()
+}
+
+type GatePath = fn(&mut Approved, &str, Option<Policy>) -> Result<()>;
+
+/// Every way past a human gate, each on a fresh [`approved_fixture`].
+fn approver_paths() -> Vec<(&'static str, GatePath)> {
+    fn update(fx: &mut Approved, id: &str, actor: &str, policy: Option<Policy>, p: IssuePatch) -> Result<()> {
+        let id = id.to_string();
+        fx.env.as_(actor, policy, |tx| tx.update_issue(&id, &p, &Guard::default(), false)).map(drop)
+    }
+    fn import(fx: &mut Approved, actor: &str, policy: Option<Policy>, f: fn(&mut Value)) -> Result<()> {
+        let text = exported_with(&fx.env, &fx.gate, f);
+        fx.env.as_(actor, policy, |tx| tx.import_jsonl(&mut text.as_bytes(), &ImportOptions::default())).map(drop)
+    }
+    vec![
+        ("resolve", |fx, a, p| {
+            let g = fx.gate.clone();
+            fx.env.as_(a, p, |tx| tx.resolve_gate(&g, None, false, None)).map(drop)
+        }),
+        ("force-close the task", |fx, a, p| {
+            let t = fx.task.clone();
+            fx.env.as_(a, p, |tx| tx.close_issue(&t, &CloseOptions { force: true, ..Default::default() })).map(drop)
+        }),
+        ("pin the gate", |fx, a, p| {
+            let g = fx.gate.clone();
+            update(fx, &g, a, p, patch(|p| p.status = Some(Status::Pinned)))
+        }),
+        ("pin the task", |fx, a, p| {
+            let t = fx.task.clone();
+            update(fx, &t, a, p, patch(|p| p.status = Some(Status::Pinned)))
+        }),
+        ("retype the gate", |fx, a, p| {
+            let g = fx.gate.clone();
+            let timer = json!({ "type": "timer", "timeout": "1s" });
+            update(fx, &g, a, p, patch(|p| p.set_metadata = vec![("gate".into(), timer)]))
+        }),
+        ("remove the blocks edge", |fx, a, p| {
+            let (t, g) = (fx.task.clone(), fx.gate.clone());
+            fx.env.as_(a, p, |tx| tx.remove_dependency(&t, &g)).map(drop)
+        }),
+        ("move the gate out", |fx, a, p| {
+            let g = fx.gate.clone();
+            update(fx, &g, a, p, patch(|p| p.parent = Some(None)))
+        }),
+        ("move the task out", |fx, a, p| {
+            let t = fx.task.clone();
+            update(fx, &t, a, p, patch(|p| p.parent = Some(None)))
+        }),
+        ("delete the gate", |fx, a, p| {
+            let ids = vec![fx.gate.clone()];
+            fx.env
+                .as_(a, p, |tx| tx.delete_issues(&ids, &DeleteOptions { force: true, ..Default::default() }))
+                .map(drop)
+        }),
+        ("delete the container", |fx, a, p| {
+            let ids = vec![fx.container.clone()];
+            fx.env
+                .as_(a, p, |tx| tx.delete_issues(&ids, &DeleteOptions { force: true, ..Default::default() }))
+                .map(drop)
+        }),
+        ("auto-close the run", |fx, a, p| {
+            let s = fx.step.clone();
+            fx.env.as_(a, p, |tx| tx.close_issue(&s, &CloseOptions::default()))?;
+            assert_eq!(fx.env.issue(&fx.run).status, Status::Closed, "the run closed with its last step");
+            Ok(())
+        }),
+        ("import closing the gate", |fx, a, p| {
+            import(fx, a, p, |v| {
+                v["status"] = json!("closed");
+                v["closed_at"] = json!(T0);
+            })
+        }),
+        ("import changing its approvers", |fx, a, p| {
+            import(fx, a, p, |v| v["metadata"]["gate"]["approvers"] = json!(["dave"]))
+        }),
+    ]
+}
+
+#[test]
+fn approvers_alone_get_past_their_gates_on_every_path() {
+    for (name, path) in approver_paths() {
+        let mut fx = approved_fixture();
+        let r = path(&mut fx, "dave", person("dave"));
+        match r {
+            Err(e @ Error::Unauthorized(_)) => {
+                let m = e.to_string();
+                assert!(m.contains("carol") && m.contains(&fx.gate), "{name}: {m}");
+            }
+            other => panic!("{name}: expected dave to be refused, got {other:?}"),
+        }
+        assert_eq!(fx.env.issue(&fx.gate).status, Status::Open, "{name}");
+        for actor in ["carol", "carol/laptop"] {
+            let mut fx = approved_fixture();
+            path(&mut fx, actor, person(actor)).unwrap_or_else(|e| panic!("{name} as {actor}: {e}"));
+        }
+    }
+    // The import changing approvers is a human admin's too.
+    let (_, change) = approver_paths().pop().unwrap();
+    change(&mut approved_fixture(), "dave", human_admin("dave")).expect("a human admin may change approvers");
+
+    let mut fx = approved_fixture();
+    let g = fx.gate.clone();
+    fx.env.as_("CAROL", person("CAROL"), |tx| tx.resolve_gate(&g, None, false, None)).expect("case is ignored");
+    assert_eq!(closed_event(&fx.env, &g)["reason"], "resolved by CAROL");
+    assert!(!fx.env.issue(&fx.task).is_blocked);
+    fx.env.assert_healthy();
+}
+
+#[test]
+fn who_may_change_a_gates_approvers() {
+    let set = |list: &[&str]| Some(list.iter().map(|a| a.to_string()).collect::<Vec<_>>());
+    let mut fx = approved_fixture();
+    let g = fx.gate.clone();
+    // A human admin is bound by them to resolve, but may change them, and then resolve.
+    denied(
+        fx.env.as_("dave", human_admin("dave"), |tx| tx.resolve_gate(&g, None, false, None)),
+        "only carol can open it",
+    );
+    fx.env.as_("dave", human_admin("dave"), |tx| tx.set_gate_approvers(&g, set(&["dave"]))).unwrap();
+    fx.env.as_("dave", human_admin("dave"), |tx| tx.resolve_gate(&g, None, false, None)).unwrap();
+    assert_eq!(fx.env.issue(&g).status, Status::Closed);
+
+    let mut fx = approved_fixture();
+    let g = fx.gate.clone();
+    fx.env.as_("dave", human_admin("dave"), |tx| tx.set_gate_approvers(&g, None)).unwrap();
+    assert_eq!(gates::approvers_of(&fx.env.issue(&g)), None);
+    // ... and repairs a list stored invalid.
+    for bad in [json!(42), json!(["carol", ""])] {
+        store_approvers(&mut fx.env, &g, bad.clone());
+        fx.env.as_("dave", human_admin("dave"), |tx| tx.set_gate_approvers(&g, set(&["carol"]))).unwrap();
+        assert_eq!(fx.env.issue(&g).metadata["gate"]["approvers"], json!(["carol"]), "{bad}");
+        store_approvers(&mut fx.env, &g, bad.clone());
+        fx.env.as_("dave", human_admin("dave"), |tx| tx.set_gate_approvers(&g, None)).unwrap();
+        assert!(fx.env.issue(&g).metadata["gate"].get("approvers").is_none(), "{bad}");
+        store_approvers(&mut fx.env, &g, json!(["carol"]));
+    }
+
+    // Agents never may, admins or not; nor a person who is not an approver.
+    for (actor, policy, needle) in [
+        ("bot", agent("bot"), "only a person can change its approvers"),
+        ("bot", admin_agent("bot"), "only a person can change its approvers"),
+        ("dave", person("dave"), "approvers (carol), or a human admin's"),
+    ] {
+        denied(fx.env.as_(actor, policy.clone(), |tx| tx.set_gate_approvers(&g, set(&["dave"]))), needle);
+        denied(fx.env.as_(actor, policy, |tx| tx.set_gate_approvers(&g, None)), needle);
+    }
+    let raw = patch(|p| p.set_metadata = vec![("gate".into(), json!({ "type": "human", "approvers": ["dave"] }))]);
+    denied(fx.env.as_("dave", person("dave"), |tx| tx.update_issue(&g, &raw, &Guard::default(), false)), "approvers");
+    assert_eq!(gates::approvers_of(&fx.env.issue(&g)), Some(vec!["carol".to_string()]));
+    // Other edits of the gate stay open to anyone who could make them before.
+    let retitle = patch(|p| p.title = Some("Approve the deploy".into()));
+    fx.env.as_("bot", agent("bot"), |tx| tx.update_issue(&g, &retitle, &Guard::default(), false)).unwrap();
+    // An approver may change them.
+    fx.env.as_("carol", person("carol"), |tx| tx.set_gate_approvers(&g, set(&["carol", "dave"]))).unwrap();
+    fx.env.as_("dave", person("dave"), |tx| tx.resolve_gate(&g, None, false, None)).unwrap();
+    fx.env.assert_healthy();
+}
+
+#[test]
+fn invalid_approvers_match_nobody_through_a_policy() {
+    for bad in [json!(42), json!(["carol", ""]), json!(["carol\nadmin"])] {
+        let mut fx = approved_fixture();
+        let g = fx.gate.clone();
+        store_approvers(&mut fx.env, &g, bad.clone());
+        denied(fx.env.as_("carol", person("carol"), |tx| tx.resolve_gate(&g, None, false, None)), "not valid");
+        let t = fx.task.clone();
+        let force = CloseOptions { force: true, ..Default::default() };
+        denied(fx.env.as_("carol", person("carol"), |tx| tx.close_issue(&t, &force)), "not valid");
+        // A local write is not limited by them.
+        fx.env.as_("alice", None, |tx| tx.resolve_gate(&g, None, false, None)).unwrap();
+        assert_eq!(fx.env.issue(&g).status, Status::Closed, "{bad}");
+    }
+    let mut fx = approved_fixture();
+    let g = fx.gate.clone();
+    fx.env.as_("dave", None, |tx| tx.resolve_gate(&g, None, false, None)).expect("informational locally");
+    fx.env.assert_healthy();
 }

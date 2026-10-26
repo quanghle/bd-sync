@@ -564,8 +564,9 @@ pub fn web_sign_in_url(github: &Github, callback: &str, state: &str, challenge: 
 
 /// Finish a web sign-in: get the token GitHub gives for `code` (which came
 /// back to `callback`; `verifier` is its PKCE verifier), and see what the
-/// rules let its account do in `workspace` ([`admit`]). The GitHub token
-/// serves for this only: it is never stored, logged or sent on.
+/// rules let its account do in `workspace` ([`admit`]), for OAuth `client`
+/// (`None`: a gate's approval). The GitHub token serves for this only: it
+/// is never stored, logged or sent on.
 /// `signed_in_as` gets the account's login once GitHub named it.
 #[allow(clippy::too_many_arguments)]
 pub fn web_sign_in(
@@ -575,7 +576,7 @@ pub fn web_sign_in(
     callback: &str,
     verifier: &str,
     workspace: &str,
-    client: &str,
+    client: Option<&str>,
     signed_in_as: &mut Option<String>,
 ) -> Result<Admitted> {
     let github = github_of(sign_in)?;
@@ -604,7 +605,7 @@ pub fn web_sign_in(
     let Some(access) = body["access_token"].as_str().filter(|t| !t.is_empty()) else {
         return Err(refused(github, "finish a sign-in", status, &body));
     };
-    admit(root, sign_in, &api, access, workspace, Some(client), signed_in_as)
+    admit(root, sign_in, &api, access, workspace, client, signed_in_as)
 }
 
 /// The identity of GitHub account `id`, now `login`, at the GitHub at `url`.

@@ -42,6 +42,14 @@
 //!   container holding it), or moving it, or the gate, out of a live parent.
 //!   A playbook run or group whose last open step closes is refused too when
 //!   a human gate holds it. An import may not do any of that either.
+//! * **Approvers** narrow that further: a human gate whose
+//!   `metadata.gate.approvers` names actors ([`crate::gates::approvers_of`])
+//!   is shut, on every path above, to a person who is not one of them or a
+//!   sub-actor of one ([`approves`], ignoring ASCII case), admins included.
+//!   A list stored invalid matches nobody. Changing an open human gate's
+//!   approvers (by update, `bd gate update` or import) needs a person who may
+//!   open it, or a human admin ([`may_edit_approvers`]), which is how an
+//!   invalid list is repaired. Without a policy approvers are informational.
 //! * **`metadata.playbook`**, which makes runs and groups close themselves,
 //!   is written by playbook runs; other callers need [`Policy::admin`] to
 //!   change it on an existing issue (by update or import).
@@ -65,7 +73,7 @@ use serde_json::{Value, json};
 
 use crate::claims;
 use crate::error::{Error, Need, Result};
-use crate::gates::GateKind;
+use crate::gates::{self, GateKind};
 use crate::graph;
 use crate::issues::{self, ISSUE_COLUMNS, issue_from_row};
 use crate::model::{DepType, GATE_TYPE, Issue, Lease, Status};
@@ -114,6 +122,37 @@ pub fn is_actor_or_sub_actor(root: &str, actor: &str) -> bool {
             || actor.strip_prefix(root).and_then(|r| r.strip_prefix('/')).is_some_and(|r| !r.trim().is_empty()))
 }
 
+/// Whether `actor` is `approver` or one of its sub-actors
+/// (`<approver>/<name>`), ignoring ASCII case.
+pub fn approves(approver: &str, actor: &str) -> bool {
+    if approver.is_empty() {
+        return false;
+    }
+    if approver.eq_ignore_ascii_case(actor) {
+        return true;
+    }
+    actor.get(..approver.len()).is_some_and(|head| head.eq_ignore_ascii_case(approver))
+        && actor[approver.len()..].strip_prefix('/').is_some_and(|rest| !rest.trim().is_empty())
+}
+
+/// Whether `policy` may open human gate `gate`: a person, and one of its
+/// approvers (or a sub-actor of one) when it has any. A list stored invalid
+/// reads as empty and matches nobody.
+pub fn may_open(policy: &Policy, gate: &Issue) -> bool {
+    policy.human && gates::approvers_of(gate).is_none_or(|l| l.iter().any(|a| approves(a, &policy.actor)))
+}
+
+/// Whether `policy` may change the approvers of open human gate `gate`: a
+/// person who may open it, or a human admin (whatever the list stored).
+pub fn may_edit_approvers(policy: &Policy, gate: &Issue) -> bool {
+    policy.human && (policy.admin || may_open(policy, gate))
+}
+
+/// `metadata.gate.approvers` as stored, absent read as null.
+fn raw_approvers(issue: &Issue) -> &Value {
+    issue.metadata.pointer("/gate/approvers").unwrap_or(&Value::Null)
+}
+
 /// An open (not closed or pinned) gate whose condition is `human`. Only the
 /// condition's type counts, so a human gate with an otherwise invalid
 /// condition is still one.
@@ -137,8 +176,11 @@ enum Hold {
     Contains(String),
 }
 
-/// Open human gates `id` depends on through its own `blocks` edges.
-fn human_gates_on(conn: &rusqlite::Connection, id: &str) -> Result<Option<String>> {
+/// Which open human gates are shut to the caller (see [`WriteCtx::shut`]).
+type Shut<'a> = &'a dyn Fn(&Issue) -> bool;
+
+/// Shut open human gates `id` depends on through its own `blocks` edges.
+fn human_gates_on(conn: &rusqlite::Connection, id: &str, shut: Shut<'_>) -> Result<Option<String>> {
     let sql = format!(
         "SELECT {ISSUE_COLUMNS} FROM dependencies d
          CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = d.depends_on_id
@@ -148,19 +190,25 @@ fn human_gates_on(conn: &rusqlite::Connection, id: &str) -> Result<Option<String
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let gates = stmt.query_map([id], issue_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(gates.into_iter().find(is_open_human_gate).map(|g| g.id))
+    Ok(gates.into_iter().find(|g| shut(g)).map(|g| g.id))
 }
 
-/// The open human gate holding `id` back: through `id`'s own `blocks` edges,
+/// The shut human gate holding `id` back: through `id`'s own `blocks` edges,
 /// or an ancestor's (up to a closed one, below which nothing is blocked).
-fn holding_gate(conn: &rusqlite::Connection, id: &str) -> Result<Option<String>> {
-    holding_gate_in(conn, id, &mut HashSet::new())
+fn holding_gate(conn: &rusqlite::Connection, id: &str, shut: Shut<'_>) -> Result<Option<String>> {
+    holding_gate_in(conn, id, &mut HashSet::new(), shut)
 }
 
 /// [`holding_gate`], skipping what an earlier walk found: `clear` holds
-/// issues from which the walk up to the first terminal ancestor met no open
-/// human gate, and gets this walk's issues when it meets none either.
-fn holding_gate_in(conn: &rusqlite::Connection, id: &str, clear: &mut HashSet<String>) -> Result<Option<String>> {
+/// issues from which the walk up to the first terminal ancestor met no shut
+/// human gate, and gets this walk's issues when it meets none either (the
+/// policy, and so `shut`, is fixed for the transaction).
+fn holding_gate_in(
+    conn: &rusqlite::Connection,
+    id: &str,
+    clear: &mut HashSet<String>,
+    shut: Shut<'_>,
+) -> Result<Option<String>> {
     let mut walked = Vec::new();
     let mut seen = HashSet::new();
     let mut cur = id.to_string();
@@ -168,7 +216,7 @@ fn holding_gate_in(conn: &rusqlite::Connection, id: &str, clear: &mut HashSet<St
         if clear.contains(&cur) {
             break;
         }
-        if let Some(g) = human_gates_on(conn, &cur)? {
+        if let Some(g) = human_gates_on(conn, &cur, shut)? {
             return Ok(Some(g));
         }
         let parent = graph::parent_of(conn, &cur)?;
@@ -183,14 +231,14 @@ fn holding_gate_in(conn: &rusqlite::Connection, id: &str, clear: &mut HashSet<St
     Ok(None)
 }
 
-/// An open human gate below `id` in the hierarchy, or one holding back live work below it.
-fn gate_below(conn: &rusqlite::Connection, id: &str) -> Result<Option<String>> {
+/// A shut human gate below `id` in the hierarchy, or one holding back live work below it.
+fn gate_below(conn: &rusqlite::Connection, id: &str, shut: Shut<'_>) -> Result<Option<String>> {
     for d in issues::descendants(conn, id)? {
-        if is_open_human_gate(&d) {
+        if shut(&d) {
             return Ok(Some(d.id));
         }
         if !d.status.is_terminal()
-            && let Some(g) = human_gates_on(conn, &d.id)?
+            && let Some(g) = human_gates_on(conn, &d.id, shut)?
         {
             return Ok(Some(g));
         }
@@ -198,17 +246,17 @@ fn gate_below(conn: &rusqlite::Connection, id: &str) -> Result<Option<String>> {
     Ok(None)
 }
 
-fn human_hold(conn: &rusqlite::Connection, issue: &Issue) -> Result<Option<Hold>> {
+fn human_hold(conn: &rusqlite::Connection, issue: &Issue, shut: Shut<'_>) -> Result<Option<Hold>> {
     if issue.status.is_terminal() {
         return Ok(None);
     }
-    if is_open_human_gate(issue) {
+    if shut(issue) {
         return Ok(Some(Hold::Is));
     }
-    if let Some(g) = holding_gate(conn, &issue.id)? {
+    if let Some(g) = holding_gate(conn, &issue.id, shut)? {
         return Ok(Some(Hold::HeldBy(g)));
     }
-    Ok(gate_below(conn, &issue.id)?.map(Hold::Contains))
+    Ok(gate_below(conn, &issue.id, shut)?.map(Hold::Contains))
 }
 
 /// `metadata.playbook` makes runs and groups close themselves when their
@@ -240,9 +288,69 @@ fn human_only(id: &str, hold: &Hold, what: &str) -> Error {
     Error::with_needs(&[Need::Human], message)
 }
 
-/// One open human gate and the live work it holds back.
+/// The refusal for a person who is not one of `approvers` (the gate's, as
+/// [`gates::approvers_of`] reads them): the shapes of [`human_only`].
+fn approvers_only(id: &str, hold: &Hold, what: &str, approvers: &[String], actor: &str) -> Error {
+    const FIX: &str = "a human admin can replace or clear them with bd gate update";
+    let Some((last, rest)) = approvers.split_last() else {
+        return Error::Unauthorized(match hold {
+            Hold::Is => format!("{id} is a human gate whose approvers are not valid, so nobody can {what}; {FIX}"),
+            Hold::HeldBy(g) => format!(
+                "{id} waits for human gate {g}, whose approvers are not valid, so nobody can {what} before {g} is \
+                 resolved; {FIX}"
+            ),
+            Hold::Contains(g) => format!(
+                "{id} holds work that waits for human gate {g}, whose approvers are not valid, so nobody can {what} \
+                 before {g} is resolved; {FIX}"
+            ),
+        });
+    };
+    let who = if rest.is_empty() { last.clone() } else { format!("{} or {last}", rest.join(", ")) };
+    Error::Unauthorized(match hold {
+        Hold::Is => format!("{id} is a human gate: only {who} can {what} ({actor} is not an approver)"),
+        Hold::HeldBy(g) => format!(
+            "{id} waits for human gate {g}: only {who} can {what} before {g} is resolved ({actor} is not an approver)"
+        ),
+        Hold::Contains(g) => format!(
+            "{id} holds work that waits for human gate {g}: only {who} can {what} before {g} is resolved \
+             ({actor} is not an approver)"
+        ),
+    })
+}
+
+/// Why `policy` may not get past `gate` (as `hold` stands to it): a caller
+/// that is not a person is told so ([`human_only`]); a person, who its
+/// approvers are ([`approvers_only`]).
+fn gate_refusal_for(policy: Option<&Policy>, id: &str, hold: &Hold, what: &str, gate: Option<&Issue>) -> Error {
+    match policy.filter(|p| p.human).zip(gate.and_then(gates::approvers_of)) {
+        Some((p, approvers)) => approvers_only(id, hold, what, &approvers, &p.actor),
+        None => human_only(id, hold, what),
+    }
+}
+
+/// The refusal for changing the approvers of open human gate `gate`.
+fn approvers_edit(policy: &Policy, gate: &Issue) -> Error {
+    let id = &gate.id;
+    if !policy.human {
+        return human_only(id, &Hold::Is, "change its approvers");
+    }
+    let which = match gates::approvers_of(gate) {
+        Some(l) if l.is_empty() => " (its approvers are not valid)".to_string(),
+        Some(l) => format!(" ({})", l.join(", ")),
+        None => String::new(),
+    };
+    Error::Unauthorized(format!(
+        "{id}: changing a human gate's approvers needs a human access token of one of its approvers{which}, or a \
+         human admin's"
+    ))
+}
+
+/// One open human gate and, when it is shut to the caller, the live work it holds back.
 struct HumanHold {
-    gate: String,
+    /// The gate as it was before the import.
+    gate: Issue,
+    /// Shut to the caller ([`WriteCtx::shut`]): the work below is only walked then.
+    shut: bool,
     /// Work that depends on the gate through a `blocks` edge.
     direct: Vec<String>,
     /// Work below that in the hierarchy, each with the directly held issue above it.
@@ -251,8 +359,9 @@ struct HumanHold {
     around: Vec<(String, String)>,
 }
 
-/// What a restricted import must leave be: every open human gate, still
-/// holding back the same work.
+/// What an import under a policy must leave be: every open human gate shut
+/// to the caller, still holding back the same work, and the approvers of
+/// every open human gate, unless the caller may change them.
 pub(crate) struct HumanHolds(Vec<HumanHold>);
 
 /// A live claim held by an actor other than the transaction's.
@@ -284,9 +393,27 @@ impl WriteCtx<'_> {
         self.policy().filter(|p| !p.admin)
     }
 
-    /// Whether human gates are protected from this caller.
+    /// Whether human gates may be shut to this caller: any policy, as
+    /// approvers bind people too.
     fn gates_limited(&self) -> bool {
-        self.policy().is_some_and(|p| !p.human)
+        self.policy().is_some()
+    }
+
+    /// Whether `gate` is an open human gate this caller may not open
+    /// ([`may_open`]); never without a policy.
+    fn shut(&self, gate: &Issue) -> bool {
+        is_open_human_gate(gate) && self.policy().is_some_and(|p| !may_open(p, gate))
+    }
+
+    /// The refusal for getting past the gate `hold` names (`id` itself for
+    /// [`Hold::Is`]), worded for this caller.
+    fn gate_refusal(&self, id: &str, hold: &Hold, what: &str) -> Result<Error> {
+        let gate = match hold {
+            Hold::Is => id,
+            Hold::HeldBy(g) | Hold::Contains(g) => g,
+        };
+        let gate = issues::get(self.conn(), gate)?;
+        Ok(gate_refusal_for(self.policy(), id, hold, what, gate.as_ref()))
     }
 
     /// `issue`'s claim, if it is live and held by an actor other than this
@@ -413,12 +540,12 @@ impl WriteCtx<'_> {
         if !self.gates_limited() {
             return Ok(());
         }
-        if is_open_human_gate(issue) {
-            return Err(human_only(&issue.id, &Hold::Is, "open it"));
+        if self.shut(issue) {
+            return Err(self.gate_refusal(&issue.id, &Hold::Is, "open it")?);
         }
         // Without force, a close that gets here is not held back by anything.
-        if force && let Some(hold) = human_hold(self.conn(), issue)? {
-            return Err(human_only(&issue.id, &hold, "close it"));
+        if force && let Some(hold) = human_hold(self.conn(), issue, &|g| self.shut(g))? {
+            return Err(self.gate_refusal(&issue.id, &hold, "close it")?);
         }
         Ok(())
     }
@@ -440,18 +567,27 @@ impl WriteCtx<'_> {
             claim_override = self.check_claim_override(old, take_over)?;
         }
         if self.gates_limited() && !old.status.is_terminal() {
-            if is_open_human_gate(old) && !is_open_human_gate(new) {
+            // Approvers do not make a gate any less human, so editing them never trips this.
+            if self.shut(old) && !is_open_human_gate(new) {
                 let what = if new.status.is_terminal() { "open it" } else { "change its type or condition" };
-                return Err(human_only(&old.id, &Hold::Is, what));
+                return Err(self.gate_refusal(&old.id, &Hold::Is, what)?);
             }
             if new.status.is_terminal()
-                && let Some(hold) = human_hold(self.conn(), old)?
+                && let Some(hold) = human_hold(self.conn(), old, &|g| self.shut(g))?
             {
-                return Err(human_only(&old.id, &hold, "pin it"));
+                return Err(self.gate_refusal(&old.id, &hold, "pin it")?);
             }
             if let Some(parent) = moved_from {
                 self.check_move_out(old, parent)?;
             }
+        }
+        // Compared as stored, so an edit from one invalid list to another counts too.
+        if let Some(policy) = self.policy()
+            && is_open_human_gate(old)
+            && raw_approvers(old) != raw_approvers(new)
+            && !may_edit_approvers(policy, old)
+        {
+            return Err(approvers_edit(policy, old));
         }
         if let Some(policy) = self.policy().filter(|_| !playbook) {
             check_playbook_metadata(policy, old, &new.metadata)?;
@@ -466,8 +602,8 @@ impl WriteCtx<'_> {
         if issues::require(self.conn(), parent)?.status.is_terminal() {
             return Ok(());
         }
-        match human_hold(self.conn(), issue)? {
-            Some(hold) => Err(human_only(&issue.id, &hold, &format!("move it out of {parent}"))),
+        match human_hold(self.conn(), issue, &|g| self.shut(g))? {
+            Some(hold) => Err(self.gate_refusal(&issue.id, &hold, &format!("move it out of {parent}"))?),
             None => Ok(()),
         }
     }
@@ -488,8 +624,9 @@ impl WriteCtx<'_> {
         }
         if self.gates_limited() {
             debug_assert!(!c.status.is_terminal() && !is_open_human_gate(c));
-            if let Some(g) = holding_gate_in(self.conn(), &c.id, clear)? {
-                return Err(human_only(&c.id, &Hold::HeldBy(g), "close it (its last open step just closed)"));
+            if let Some(g) = holding_gate_in(self.conn(), &c.id, clear, &|g| self.shut(g))? {
+                let hold = Hold::HeldBy(g);
+                return Err(self.gate_refusal(&c.id, &hold, "close it (its last open step just closed)")?);
             }
         }
         Ok(true)
@@ -504,8 +641,8 @@ impl WriteCtx<'_> {
             return Ok(());
         }
         if *dep_type == DepType::Blocks {
-            if is_open_human_gate(&issues::require(self.conn(), target)?) {
-                return Err(human_only(issue, &Hold::HeldBy(target.to_string()), "remove that edge"));
+            if self.shut(&issues::require(self.conn(), target)?) {
+                return Err(self.gate_refusal(issue, &Hold::HeldBy(target.to_string()), "remove that edge")?);
             }
             return Ok(());
         }
@@ -531,8 +668,8 @@ impl WriteCtx<'_> {
         }
         for id in ids {
             let Some(issue) = issues::get(self.conn(), id)? else { continue };
-            if let Some(hold) = human_hold(self.conn(), &issue)? {
-                return Err(human_only(id, &hold, "delete it"));
+            if let Some(hold) = human_hold(self.conn(), &issue, &|g| self.shut(g))? {
+                return Err(self.gate_refusal(id, &hold, "delete it")?);
             }
         }
         Ok(())
@@ -546,8 +683,9 @@ impl WriteCtx<'_> {
         }
     }
 
-    /// Snapshot of the human gates a restricted caller must leave be (`None`
-    /// when gates are not protected from it).
+    /// Snapshot of every open human gate, with the work held back by those
+    /// shut to the caller, for an import to leave be (`None` without a
+    /// policy).
     pub(crate) fn human_holds(&self) -> Result<Option<HumanHolds>> {
         if !self.gates_limited() {
             return Ok(None);
@@ -562,6 +700,10 @@ impl WriteCtx<'_> {
         };
         let mut holds = Vec::new();
         for g in gates.into_iter().filter(is_open_human_gate) {
+            if !self.shut(&g) {
+                holds.push(HumanHold { gate: g, shut: false, direct: vec![], below: vec![], around: vec![] });
+                continue;
+            }
             let direct: Vec<String> = {
                 let mut stmt = self.conn().prepare_cached(
                     "SELECT d.issue_id FROM dependencies d
@@ -585,39 +727,54 @@ impl WriteCtx<'_> {
                     }
                 }
             }
-            holds.push(HumanHold { gate: g.id, direct, below, around });
+            holds.push(HumanHold { gate: g, shut: true, direct, below, around });
         }
         Ok(Some(HumanHolds(holds)))
     }
 
-    /// Refuse when a human gate from `before` was opened, changed or deleted,
-    /// or work it held back got past it.
+    /// Refuse when a human gate from `before` shut to the caller was opened,
+    /// changed or deleted, or work it held back got past it; or when the
+    /// approvers of any of them changed and the caller may not change them.
     pub(crate) fn check_human_holds(&self, before: &HumanHolds) -> Result<()> {
-        for HumanHold { gate, direct, below, around } in &before.0 {
-            if !issues::get(self.conn(), gate)?.as_ref().is_some_and(is_open_human_gate) {
-                return Err(human_only(gate, &Hold::Is, "open, change or delete it"));
-            }
-            for w in direct {
-                let still_held = graph::load_edge(self.conn(), w, gate)?.is_some_and(|e| e.dep_type == DepType::Blocks);
-                let live = issues::get(self.conn(), w)?.is_some_and(|i| !i.status.is_terminal());
-                if !still_held || !live {
-                    return Err(human_only(w, &Hold::HeldBy(gate.clone()), "close it or remove that edge"));
+        let Some(policy) = self.policy() else { return Ok(()) };
+        for HumanHold { gate: old, shut, direct, below, around } in &before.0 {
+            let gate = &old.id;
+            // Worded from the gate as it was: the import may have changed or deleted it.
+            let refuse = |id: &str, hold: &Hold, what: &str| gate_refusal_for(Some(policy), id, hold, what, Some(old));
+            let now = issues::get(self.conn(), gate)?;
+            if *shut {
+                if !now.as_ref().is_some_and(is_open_human_gate) {
+                    return Err(refuse(gate, &Hold::Is, "open, change or delete it"));
+                }
+                for w in direct {
+                    let still_held =
+                        graph::load_edge(self.conn(), w, gate)?.is_some_and(|e| e.dep_type == DepType::Blocks);
+                    let live = issues::get(self.conn(), w)?.is_some_and(|i| !i.status.is_terminal());
+                    if !still_held || !live {
+                        return Err(refuse(w, &Hold::HeldBy(gate.clone()), "close it or remove that edge"));
+                    }
+                }
+                for (w, held) in below {
+                    let live = issues::get(self.conn(), w)?.is_some_and(|i| !i.status.is_terminal());
+                    // Retyping a parent-child edge on the way up would move it out from under `held`.
+                    if !live || !graph::ancestors(self.conn(), w)?.contains(held) {
+                        return Err(refuse(w, &Hold::HeldBy(gate.clone()), "close it or move it out of its parent"));
+                    }
+                }
+                // The containers around them may not close, or lose them, either.
+                for (x, container) in around {
+                    let live = issues::get(self.conn(), container)?.is_some_and(|i| !i.status.is_terminal());
+                    if !live || !graph::ancestors(self.conn(), x)?.contains(container) {
+                        let hold = Hold::Contains(gate.clone());
+                        return Err(refuse(container, &hold, &format!("close it or move {x} out of it")));
+                    }
                 }
             }
-            for (w, held) in below {
-                let live = issues::get(self.conn(), w)?.is_some_and(|i| !i.status.is_terminal());
-                // Retyping a parent-child edge on the way up would move it out from under `held`.
-                if !live || !graph::ancestors(self.conn(), w)?.contains(held) {
-                    return Err(human_only(w, &Hold::HeldBy(gate.clone()), "close it or move it out of its parent"));
-                }
-            }
-            // The containers around them may not close, or lose them, either.
-            for (x, container) in around {
-                let live = issues::get(self.conn(), container)?.is_some_and(|i| !i.status.is_terminal());
-                if !live || !graph::ancestors(self.conn(), x)?.contains(container) {
-                    let hold = Hold::Contains(gate.clone());
-                    return Err(human_only(container, &hold, &format!("close it or move {x} out of it")));
-                }
+            if let Some(now) = &now
+                && raw_approvers(now) != raw_approvers(old)
+                && !may_edit_approvers(policy, old)
+            {
+                return Err(approvers_edit(policy, old));
             }
         }
         Ok(())
@@ -638,6 +795,24 @@ mod tests {
             assert!(!p.owns(bad), "{bad}");
         }
         assert!(!Policy::default().owns("/x"), "an empty actor owns nothing");
+    }
+
+    #[test]
+    fn approvers_match_themselves_and_their_sub_actors_ignoring_case() {
+        for (approver, actor) in [("carol", "carol"), ("carol", "CAROL"), ("Carol", "carol/laptop"), ("a/b", "A/B/c")] {
+            assert!(approves(approver, actor), "{approver} {actor}");
+        }
+        for (approver, actor) in [
+            ("carol", "carolx"),
+            ("carol", "carol/"),
+            ("carol", "carol/ "),
+            ("carol", "dave"),
+            ("", ""),
+            ("carol/x", "carol"),
+        ] {
+            assert!(!approves(approver, actor), "{approver} {actor}");
+        }
+        assert!(!approves("a", "\u{e9}/x"), "no panic off a char boundary");
     }
 
     #[test]

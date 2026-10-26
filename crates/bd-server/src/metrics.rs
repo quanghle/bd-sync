@@ -44,6 +44,10 @@ pub static TOOL_CALLS: Counter = Counter::new();
 /// `bd publish` and `bd publish --rollback` runs (dry runs aside) that changed a workspace, and those refused.
 pub static PUBLISHES: Counter = Counter::new();
 pub static PUBLISHES_REFUSED: Counter = Counter::new();
+/// Human gates approved in the browser, and approvals refused (an account
+/// that may not approve, a foreign post, a refusal at the approval).
+pub static APPROVALS: Counter = Counter::new();
+pub static APPROVALS_REFUSED: Counter = Counter::new();
 /// Connections open now.
 pub static OPEN: AtomicI64 = AtomicI64::new(0);
 
@@ -119,6 +123,11 @@ pub fn render() -> String {
         "Runs of bd publish (dry runs aside), by outcome.",
         &[("{outcome=\"applied\"}", PUBLISHES.get()), ("{outcome=\"refused\"}", PUBLISHES_REFUSED.get())],
     );
+    counter(
+        "approvals_total",
+        "Human gates approved in the browser, by outcome.",
+        &[("{outcome=\"approved\"}", APPROVALS.get()), ("{outcome=\"refused\"}", APPROVALS_REFUSED.get())],
+    );
     let _ = writeln!(
         out,
         "# HELP bd_serve_connections_open Connections open now.\n# TYPE bd_serve_connections_open gauge\n\
@@ -190,5 +199,19 @@ mod tests {
         assert!(text.contains("bd_serve_refused_total{reason=\"unknown_token\"} "), "{text}");
         assert!(text.lines().all(|l| l.starts_with('#') || l.split(' ').count() == 2), "{text}");
         assert!(BUSY.get() >= 1);
+    }
+
+    #[test]
+    fn approvals_render_by_outcome() {
+        APPROVALS.add();
+        APPROVALS_REFUSED.add();
+        let text = render();
+        assert!(text.contains("# TYPE bd_serve_approvals_total counter"), "{text}");
+        for outcome in ["approved", "refused"] {
+            let line =
+                text.lines().find(|l| l.starts_with(&format!("bd_serve_approvals_total{{outcome=\"{outcome}\"}} ")));
+            let n: u64 = line.and_then(|l| l.rsplit(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
+            assert!(n >= 1, "{outcome}: {text}");
+        }
     }
 }

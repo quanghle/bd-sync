@@ -23,6 +23,9 @@ actor for good, and issues a token only if a rule or the admin's
 [authorizer](#deciding-with-an-authorizer) lets the account into the
 workspace. An account let in by neither gets nothing.
 
+With `[oauth]`, people can also sign in in a browser to [approve a human
+gate](#approving-human-gates-in-the-browser), which issues no token.
+
 ## A first configuration
 
 Register bd as a client ("web application") at the provider:
@@ -541,3 +544,108 @@ server and are never stored. The answer that issued a bd token is kept for
   asked about a workspace that does not exist: deny names it does not know.
 - At most 8 sign-in requests run at once (others get 503, which clients
   retry); refreshes have 8 slots of their own.
+
+## Approving human gates in the browser
+
+With `[oauth]` and `--public-url`, a person can approve a [human
+gate](playbooks.md#gates) in a browser instead of running `bd gate
+resolve` with a human token. The gate's page is
+
+```text
+<public-url>/w/<workspace>/gates/<gate id>
+https://bd.example.com/w/proj/gates/t-12.gate-publish
+```
+
+with the gate's exact id (no prefix matching). Opening it starts the
+authorization server's browser sign-in: the provider chooser at
+`<public-url>/oauth/choose` when there are several browser providers
+(OIDC providers, and GitHub with its client secret), or straight to the
+provider when there is one, and back at that provider's callback,
+`<public-url>/oauth/<name>/callback`. There is no new URL to register,
+and `bd serve check` prints none. Without `--public-url`, without
+`[oauth]`, or with an `auth.toml` edited since start into one the server
+would refuse (`[oauth]` with no browser provider, say), the path answers
+404. bd does not print the link itself: build it from the public URL, the
+workspace and the gate id.
+
+**Who may approve.** After the provider says who signed in, the account
+is judged for the gate's workspace as a sign-in is: `deny` first, then the
+[authorizer](#deciding-with-an-authorizer) (asked with `"event":
+"sign_in"` and `"client": null`, as for `bd remote login`) or the
+[rules](#rules). Only a grant of kind `human` may approve, whatever its
+role; an account let in as an agent, a denied account, or one no rule
+lets in gets a refusal page that says nothing about the gate. When the
+gate names [approvers](playbooks.md#approvers), the account's actor
+(`github:alice`, `corp:alice`) must also be one of them or a sub-actor of
+one. An authorizer that may not grant `human` (`human = false`, the
+default) lets no one approve.
+
+**No token.** The account is bound to its actor as at any sign-in, and the
+binding is recorded in the audit trail as a `signed_in` event without a
+token, its detail naming the gate and workspace (`bd serve token events
+--kind signed_in`). No access or refresh token is issued: the sign-in is
+good for this approval only.
+
+**Nothing is told before that.** Up to the account's admission, a gate
+that exists, a missing workspace, a missing issue, an issue that is not a
+gate and a gate that is not human get the same answers. Only an account
+granted human access to the workspace learns which: it gets a page saying
+there is no such workspace or gate, that it is not a gate or not a human
+gate, that the gate is already resolved, or that it is not ready (it is
+deferred, or the work it holds back still waits for other work).
+
+**The page** shows the workspace, the gate's id and title, the issues it
+holds back (id, title and status), the run or parent it belongs to, its
+approvers, and the provider and actor the person is signed in as, never an
+email. Titles are cut at 200 characters, and control, direction and
+invisible characters are shown escaped, so text an agent wrote cannot pass
+for the page's own. It has a single Approve button, under the
+consent page's protections: a strict Content Security Policy, no framing,
+and a form that is not sent until the page has had focus for 600 ms
+([Security](security.md#approving-gates-in-the-browser)).
+
+**The approval** lasts 10 minutes and works once, from the browser that
+signed in: it is bound to a cookie of its own,
+
+```text
+bd_gate_<suffix>=<value>; Path=<public-url path>/w/<workspace>/gates/<gate id>; Max-Age=600; HttpOnly; SameSite=Strict
+```
+
+named `__Secure-bd_gate_<suffix>`, and `Secure`, on an https public URL.
+The `POST` to the same path must say it came from the page: an `Origin`
+of the server or `Sec-Fetch-Site: same-origin`, and neither saying
+otherwise. In one transaction the server then checks the gate again
+(still an open human gate, ready to approve, and the person still one who
+may open it) and resolves it as the person's actor, as `bd gate resolve`
+does: the held work becomes ready, and a run whose last step it was
+closes. The gate's `closed` event names the actor, has the reason
+`approved in the browser by <actor>`, and carries `"via": "browser"` in
+its data.
+
+**Refusals** end on a page of this server, never a redirect elsewhere, and
+write nothing to the workspace. Once the provider has admitted an account
+with a human grant, though, the account stays bound to its actor and the
+sign-in is audited as a tokenless `signed_in` event in `server.db`, even
+when the page then refuses or shows a notice:
+
+| case | status |
+|---|---|
+| sign-in cancelled at the provider | 403 |
+| the provider failed, or returned no code | 502, 400 |
+| account denied, let in by no rule, or granted kind `agent` | 403 |
+| not one of the gate's approvers, at sign-in or when posting (approvers changed since) | 403 |
+| a sign-in step or an approval expired, or a link this server did not give | 400 |
+| an approval posted again | 400 (`already used`) |
+| a post from another site, or with neither `Origin` nor `Sec-Fetch-Site` | 403 |
+| a post without the approval's cookie (another browser) | 403; the approval stays usable from its own browser |
+| no such workspace, issue or gate, not a gate, not a human gate (after admission) | 404 |
+| already resolved | 409 |
+| not ready: deferred, or blocked by other work, when signing in or when posting | 409 |
+| the server or workspace busy | 503 |
+
+Approval sign-ins share the 8 sign-in slots: the provider's callback and
+the approval's `POST` each take one. The server logs each approval
+(`gate approval`, with its `outcome`) and refusal (`gate approval
+refused`) with the provider, subject, login, actor, workspace and gate,
+never an email, and counts them in `/metrics`
+([`bd_serve_approvals_total`](observability.md#server-metrics)).

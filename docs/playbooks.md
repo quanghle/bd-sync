@@ -282,16 +282,16 @@ is never `in_progress`.
 
 | type | opens when | escalates when |
 |---|---|---|
-| `human` | someone runs `bd gate resolve <id>` (through `bd serve`: with a human token) | `timeout` passes after arming |
+| `human` | someone runs `bd gate resolve <id>` (through `bd serve`: with a human token, of one of its [approvers](#approvers) when it names them) or approves it [in a browser](sign-in.md#approving-human-gates-in-the-browser) | `timeout` passes after arming |
 | `timer` | `timeout` (`30m`, `24h`, `2d`) has passed since arming | never |
 | `issue` | the `await_id` issue closes as done | it closes as failed, or `timeout` passes |
 | `gh:pr` | GitHub pull request `await_id` (a number, `#` optional) merges | it closes without merging, or `timeout` passes |
 | `gh:run` | the GitHub Actions run succeeds | it fails or is cancelled, or `timeout` passes |
 
 Gate keys: `type`, `await_id`, `timeout` (positive), `title`,
-`description`, `assignee`, and for GitHub gates `repo`, plus `branch` (at
-most 255 characters) and `event` (lowercase letters and `_`) for a
-`gh:run` that names a workflow.
+`description`, `assignee`, `approvers` for human gates ([below](#approvers)),
+and for GitHub gates `repo`, plus `branch` (at most 255 characters) and
+`event` (lowercase letters and `_`) for a `gh:run` that names a workflow.
 
 A gate **arms** when the step it guards could otherwise start (its `needs`
 are closed); timers and timeouts count from that moment.
@@ -323,6 +323,9 @@ bd gate show t-12.gate-publish
 bd gate check [IDS] [--dry-run] [--type all|gh|local|<type>]
 bd gate resolve t-12.gate-publish -r "approved"   # --force: before it armed
 bd gate create -t gh:pr --await-id 42 --blocks t-7
+bd gate create -t human --blocks t-8 --approver github:alice,github:bob
+bd gate update t-12.gate-publish --approver github:carol   # replace the approvers
+bd gate update t-12.gate-publish --clear-approvers        # anyone with a human token again
 bd gate create -t gh:run --await-id release.yml --branch v1.2.0 --event push --blocks t-9
 ```
 
@@ -339,3 +342,52 @@ the GitHub ones, `--type gh` only those.
 Escalation records the reason on the gate, comments on it and lists it in
 `bd prime`; it never opens the gate. A person decides with
 `bd gate resolve`.
+
+### Approvers
+
+A human gate may name who may open it:
+
+```toml
+[steps.gate]
+type = "human"
+approvers = ["github:alice", "{{reviewer}}"]   # templated like other gate fields
+```
+
+or `bd gate create -t human --approver <actor>` (repeatable, or comma
+separated), and `bd gate update <id> --approver <actor>` (replacing the
+list) or `--clear-approvers` on an open gate. Approvers apply to human
+gates only. A list holds 1 to 32 actors, each trimmed, at most 255
+characters, with no control characters, no `,`, and no `/` at either end;
+a later entry equal to an earlier one ignoring ASCII case is dropped, and
+any other bad entry (or a template that renders blank) is refused with
+exit 2. `bd gate show` and `bd gate list` show them (`human by
+github:alice or github:bob`), in text and in JSON (`spec.approvers`, `[]` for a stored list that is
+not valid).
+
+An approver `github:alice` matches the actor `github:alice` and its
+sub-actors (`github:alice/laptop`), ignoring ASCII case. A signed-in
+person acts as `<provider>:<login>` ([Accounts and
+actors](sign-in.md#accounts-and-actors)).
+
+- **Locally** approvers are informational: anyone may resolve the gate,
+  as with human gates themselves.
+- **Through `bd serve`** only a human token of an approver, or of a
+  sub-actor of one, opens the gate or moves the work it holds back past it,
+  on every path a human token is needed for ([Roles and what tokens may
+  do](remote.md#roles-and-what-tokens-may-do)); an admin is no exception.
+  Changing the approvers of an open human gate (`bd gate update`, `bd
+  update --set-metadata`, an import) needs a human token of one of its
+  approvers (of any person, when it has none) or a human admin's; agent
+  tokens never may.
+- **A stored list that is not valid** (written by hand with `bd update
+  --set-metadata`, say) does not change the gate's condition, but matches
+  nobody: through `bd serve` nobody may open the gate until a human admin
+  replaces or clears it with `bd gate update`. `bd gate show` says so.
+  `bd playbook extract` refuses a step held by a gate with such a list
+  until it is fixed, rather than write the step without its gate.
+
+People can approve a human gate in a browser at `<public-url>/w/<workspace>/gates/<gate id>`
+([Approving human gates in the
+browser](sign-in.md#approving-human-gates-in-the-browser)). The gate is
+resolved as their actor, with the reason `approved in the browser by
+<actor>`, and its `closed` event carries `"via": "browser"`.

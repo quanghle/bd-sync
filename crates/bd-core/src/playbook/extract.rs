@@ -142,7 +142,17 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
     for g in all.iter().filter(|i| i.issue_type == GATE_TYPE) {
         let Ok(spec) = gates::spec_of(g) else { continue };
         let view = gates::view_of(conn, g)?;
-        for held in view.blocks.iter().filter(|b| step_ids.contains_key(&b.id)) {
+        let mut held = view.blocks.iter().filter(|b| step_ids.contains_key(&b.id)).peekable();
+        // Gate issues are never steps, so skipping this one would leave the
+        // step it holds back with no gate at all: refuse instead.
+        if held.peek().is_some() && spec.approvers.as_ref().is_some_and(Vec::is_empty) {
+            return Err(Error::invalid(format!(
+                "gate {} has invalid approvers; a human admin can replace or clear them with bd gate update \
+                 before extracting",
+                g.id
+            )));
+        }
+        for held in held {
             gates_for.entry(held.id.clone()).or_insert_with(|| StepGate {
                 kind: spec.kind,
                 await_id: spec.await_id.clone(),
@@ -153,6 +163,7 @@ pub fn extract(conn: &Connection, root: &str, name: Option<&str>) -> Result<Play
                 title: None,
                 description: g.description.clone(),
                 assignee: g.assignee.clone(),
+                approvers: spec.approvers.clone().unwrap_or_default(),
             });
         }
     }

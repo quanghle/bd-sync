@@ -29,6 +29,14 @@
 //! are a workspace setting, [`GateRepos`] (config `gate.repos`), enforced when
 //! a gate is written and again before it is probed. Under `bd serve`, human
 //! gates open only for a person: see [`crate::policy`].
+//!
+//! A human gate may name its **approvers** (`metadata.gate.approvers`, 1 to
+//! [`MAX_APPROVERS`] actors): through `bd serve`, only they or their
+//! sub-actors may open it. They are read apart from the condition
+//! ([`approvers_in`]): a stored list that is not valid matches nobody, and
+//! never makes the condition unreadable, so a human admin can always replace
+//! or clear it ([`WriteCtx::set_gate_approvers`]). Locally they are
+//! informational.
 
 use std::fmt;
 
@@ -40,7 +48,7 @@ use crate::config;
 use crate::error::{Error, Result};
 use crate::graph::{self, BlockChange};
 use crate::issues::{self, CloseOptions, CloseOutcome};
-use crate::model::{DepType, GATE_TYPE, Issue, IssueRef, NewIssue, Outcome, Status};
+use crate::model::{DepType, GATE_TYPE, Guard, Issue, IssuePatch, IssueRef, NewIssue, Outcome, Status};
 use crate::store::WriteCtx;
 use crate::time::{Timestamp, format_duration_ms, parse_duration};
 
@@ -130,11 +138,89 @@ pub struct GateSpec {
     /// `gh:run` on a workflow: only runs triggered by this event (`push`, `workflow_dispatch`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
+    /// `human`: who may open it through bd serve (each an actor, or any of
+    /// its sub-actors). A spec read from metadata ([`spec_of`]) carries what
+    /// [`approvers_in`] reads, `Some([])` for a stored list that is not
+    /// valid, which matches nobody; [`GateSpec::validate`] is for new input.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approvers: Option<Vec<String>>,
+}
+
+/// The most approvers a human gate may name.
+pub const MAX_APPROVERS: usize = 32;
+
+/// An approver as stored: an actor name with no surrounding spaces, at most
+/// 255 characters, no control characters, no `,` (lists are comma separated)
+/// and no `/` at either end (`a/b` names a sub-actor).
+pub fn approver_ok(a: &str) -> bool {
+    !a.is_empty()
+        && a == a.trim()
+        && a.chars().count() <= 255
+        && !a.chars().any(|c| c.is_control() || c == ',')
+        && !a.starts_with('/')
+        && !a.ends_with('/')
+}
+
+/// New approvers (from the command line or a rendered playbook): refused
+/// when one has a control character anywhere, then trimmed, later
+/// duplicates (ignoring ASCII case) dropped. Blank entries are kept for
+/// [`check_approvers`] to refuse.
+pub fn approvers_input(list: impl IntoIterator<Item = String>) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in list {
+        if raw.chars().any(char::is_control) {
+            return Err(Error::invalid(format!("approver {raw:?} has a control character")));
+        }
+        let a = raw.trim();
+        if !out.iter().any(|o| o.eq_ignore_ascii_case(a)) {
+            out.push(a.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// A list of approvers as stored: 1 to [`MAX_APPROVERS`] valid, distinct
+/// (ignoring ASCII case) actor names.
+pub fn check_approvers(list: &[String]) -> Result<()> {
+    if list.is_empty() {
+        return Err(Error::invalid("approvers needs at least one actor"));
+    }
+    if list.len() > MAX_APPROVERS {
+        return Err(Error::invalid(format!("at most {MAX_APPROVERS} approvers, got {}", list.len())));
+    }
+    for (i, a) in list.iter().enumerate() {
+        if !approver_ok(a) {
+            return Err(Error::invalid(format!(
+                "invalid approver {a:?} (an actor name: not blank, no surrounding spaces, control characters or ',', \
+                 no '/' at either end, at most 255 characters)"
+            )));
+        }
+        if list[..i].iter().any(|b| b.eq_ignore_ascii_case(a)) {
+            return Err(Error::invalid(format!("approver {a:?} is listed twice")));
+        }
+    }
+    Ok(())
+}
+
+/// The approvers stored in `metadata.gate.approvers`, failing closed: `None`
+/// when there are none (absent or null), the list when it is valid as stored
+/// ([`check_approvers`], nothing normalized), and an empty list, which
+/// matches nobody, for anything else.
+pub fn approvers_in(metadata: &Value) -> Option<Vec<String>> {
+    let v = metadata.get("gate")?.get("approvers").filter(|v| !v.is_null())?;
+    let list: Option<Vec<String>> =
+        v.as_array().and_then(|items| items.iter().map(|i| i.as_str().map(String::from)).collect());
+    Some(list.filter(|l| check_approvers(l).is_ok()).unwrap_or_default())
+}
+
+/// [`approvers_in`] of a gate's metadata.
+pub fn approvers_of(issue: &Issue) -> Option<Vec<String>> {
+    approvers_in(&issue.metadata)
 }
 
 impl GateSpec {
     pub fn new(kind: GateKind) -> GateSpec {
-        GateSpec { kind, await_id: None, timeout: None, repo: None, branch: None, event: None }
+        GateSpec { kind, await_id: None, timeout: None, repo: None, branch: None, event: None, approvers: None }
     }
 
     /// For `gh:run`: the awaited run id when `await_id` is one, rather than a workflow.
@@ -200,6 +286,12 @@ impl GateSpec {
             return Err(Error::invalid(format!(
                 "invalid event {e:?} (a GitHub event name such as push or workflow_dispatch)"
             )));
+        }
+        if let Some(list) = &self.approvers {
+            if self.kind != GateKind::Human {
+                return Err(Error::invalid(format!("approvers only apply to human gates, not {}", self.kind)));
+            }
+            check_approvers(list)?;
         }
         Ok(())
     }
@@ -461,7 +553,9 @@ fn meta_str(meta: Option<&Map<String, Value>>, key: &str) -> Option<String> {
     })
 }
 
-/// The gate's condition, or why it has none.
+/// The gate's condition, or why it has none. Its approvers are read apart
+/// ([`approvers_in`]): a stored list that is not valid reads as `Some([])`
+/// and never makes the condition fail.
 pub fn spec_of(issue: &Issue) -> std::result::Result<GateSpec, String> {
     spec_from_metadata(&issue.metadata)
 }
@@ -476,9 +570,27 @@ fn spec_from_metadata(metadata: &Value) -> std::result::Result<GateSpec, String>
             fields.insert(key.into(), v.clone());
         }
     }
-    let spec: GateSpec = serde_json::from_value(Value::Object(fields)).map_err(|e| e.to_string())?;
+    let mut spec: GateSpec = serde_json::from_value(Value::Object(fields)).map_err(|e| e.to_string())?;
     spec.validate().map_err(|e| e.to_string())?;
+    spec.approvers = approvers_in(metadata);
     Ok(spec)
+}
+
+/// The playbook run `id` belongs to (its nearest ancestor that is one), else
+/// its parent.
+pub fn run_of(conn: &Connection, id: &str) -> Result<Option<IssueRef>> {
+    let ancestors = graph::ancestors(conn, id)?;
+    for a in &ancestors {
+        if let Some(issue) = issues::get(conn, a)?
+            && issue.metadata.pointer("/playbook/role").and_then(Value::as_str) == Some("run")
+        {
+            return Ok(issues::refs(conn, std::slice::from_ref(a))?.pop());
+        }
+    }
+    match ancestors.first() {
+        Some(p) => Ok(issues::refs(conn, std::slice::from_ref(p))?.pop()),
+        None => Ok(None),
+    }
 }
 
 /// Gate view of `issue`; fails if it is not a gate.
@@ -823,8 +935,15 @@ impl WriteCtx<'_> {
     }
 
     /// Open a gate by hand (any kind). `force` resolves it even while the
-    /// work it holds back still has open prerequisites.
-    pub fn resolve_gate(&mut self, id: &str, reason: Option<&str>, force: bool) -> Result<CloseOutcome> {
+    /// work it holds back still has open prerequisites. `via` is recorded in
+    /// the `closed` event ([`CloseOptions::via`]).
+    pub fn resolve_gate(
+        &mut self,
+        id: &str,
+        reason: Option<&str>,
+        force: bool,
+        via: Option<&str>,
+    ) -> Result<CloseOutcome> {
         let issue = issues::require(self.conn(), id)?;
         if issue.issue_type != GATE_TYPE {
             return Err(Error::invalid(format!("{id} is not a gate")));
@@ -838,8 +957,51 @@ impl WriteCtx<'_> {
         let reason = reason.unwrap_or_else(|| format!("resolved by {}", self.actor()));
         self.close_issue(
             id,
-            &CloseOptions { reason: Some(reason), outcome: Some(Outcome::Done), force: true, ..Default::default() },
+            &CloseOptions {
+                reason: Some(reason),
+                outcome: Some(Outcome::Done),
+                force: true,
+                via: via.map(String::from),
+                ..Default::default()
+            },
         )
+    }
+
+    /// Replace (`Some`) or clear (`None`) the approvers of an open human gate.
+    /// Works on the stored `metadata.gate` as it is, so a list stored invalid
+    /// can always be replaced or cleared; the write goes through
+    /// [`WriteCtx::update_issue`] and its policy checks.
+    pub fn set_gate_approvers(&mut self, id: &str, approvers: Option<Vec<String>>) -> Result<issues::UpdateOutcome> {
+        let issue = issues::require(self.conn(), id)?;
+        if issue.issue_type != GATE_TYPE {
+            return Err(Error::invalid(format!("{id} is not a gate")));
+        }
+        if issue.status.is_terminal() {
+            return Err(Error::invalid(format!("{id} is resolved")));
+        }
+        let list = match approvers {
+            Some(list) => {
+                let list = approvers_input(list)?;
+                check_approvers(&list)?;
+                if !spec_of(&issue).is_ok_and(|s| s.kind == GateKind::Human) {
+                    return Err(Error::invalid(format!("{id}: approvers only apply to human gates")));
+                }
+                Some(list)
+            }
+            None => None,
+        };
+        let mut gate =
+            gate_meta(&issue).cloned().ok_or_else(|| Error::invalid(format!("{id} has no gate condition")))?;
+        match list {
+            Some(l) => {
+                gate.insert("approvers".into(), json!(l));
+            }
+            None => {
+                gate.remove("approvers");
+            }
+        }
+        let patch = IssuePatch { set_metadata: vec![("gate".into(), Value::Object(gate))], ..Default::default() };
+        self.update_issue(id, &patch, &Guard::default(), false)
     }
 
     /// Flag a gate for attention. Idempotent per reason: returns false (and
@@ -959,6 +1121,85 @@ mod tests {
         assert!(human.validate().is_err(), "repo is GitHub-only");
         assert_eq!(GateKind::parse("bead").unwrap(), GateKind::Issue);
         assert!(GateKind::parse("mail").is_err());
+    }
+
+    fn human_with(list: &[&str]) -> GateSpec {
+        GateSpec { approvers: Some(list.iter().map(|a| a.to_string()).collect()), ..GateSpec::new(GateKind::Human) }
+    }
+
+    #[test]
+    fn approvers_are_validated_on_human_gates_only() {
+        human_with(&["carol", "dave/laptop", "github:erin"]).validate().unwrap();
+        let mut timer = GateSpec::new(GateKind::Timer);
+        timer.timeout = Some("1h".into());
+        let mut issue = GateSpec::new(GateKind::Issue);
+        issue.await_id = Some("t-1".into());
+        let mut gh = GateSpec::new(GateKind::GhPr);
+        gh.await_id = Some("7".into());
+        for mut s in [timer, issue, gh] {
+            s.approvers = Some(vec!["carol".into()]);
+            let e = s.validate().unwrap_err().to_string();
+            assert!(e.contains("only apply to human gates"), "{e}");
+        }
+        let many: Vec<String> = (0..=MAX_APPROVERS).map(|i| format!("a{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        for bad in [
+            &[][..],
+            &many[..],
+            &[""],
+            &[" carol"],
+            &["carol\nadmin"],
+            &["carol\u{7f}"],
+            &["a,b"],
+            &["/carol"],
+            &["carol/"],
+            &["carol", "CAROL"],
+        ] {
+            let e = human_with(bad).validate().unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{bad:?}: {e}");
+        }
+        human_with(&many[..MAX_APPROVERS]).validate().unwrap();
+    }
+
+    #[test]
+    fn approvers_input_refuses_controls_and_normalizes() {
+        for raw in ["\tcarol", "carol\n", "ca\nrol"] {
+            let e = approvers_input([raw.to_string()]).unwrap_err().to_string();
+            assert!(e.contains("control character"), "{raw:?}: {e}");
+        }
+        let got = approvers_input([" carol ", "dave", "Carol", " "].map(String::from)).unwrap();
+        assert_eq!(got, vec!["carol", "dave", ""], "trimmed, the first spelling kept, blanks left to refuse");
+        let got = approvers_input(["Carol", "carol"].map(String::from)).unwrap();
+        assert_eq!(got, vec!["Carol"]);
+        assert!(check_approvers(&approvers_input([" ".to_string()]).unwrap()).is_err());
+    }
+
+    #[test]
+    fn stored_approvers_fail_closed_apart_from_the_condition() {
+        let meta = |approvers: Value| json!({ "gate": { "type": "human", "approvers": approvers } });
+        assert_eq!(approvers_in(&json!({ "gate": { "type": "human" } })), None);
+        assert_eq!(approvers_in(&meta(Value::Null)), None);
+        assert_eq!(approvers_in(&json!({})), None);
+        assert_eq!(approvers_in(&meta(json!(["carol", "dave/x"]))), Some(vec!["carol".into(), "dave/x".into()]));
+        let many: Vec<String> = (0..=MAX_APPROVERS).map(|i| format!("a{i}")).collect();
+        for bad in [
+            json!(42),
+            json!([1]),
+            json!(["carol", ""]),
+            json!(["carol\nadmin"]),
+            json!([" carol"]),
+            json!(many),
+            json!(["carol", "CAROL"]),
+        ] {
+            assert_eq!(approvers_in(&meta(bad.clone())), Some(vec![]), "{bad}");
+        }
+
+        let mut metadata = meta(json!(42));
+        metadata["gate"]["timeout"] = json!("4h");
+        let spec = spec_from_metadata(&metadata).expect("the condition reads despite the approvers");
+        assert_eq!(spec.kind, GateKind::Human);
+        assert_eq!(spec.timeout.as_deref(), Some("4h"));
+        assert_eq!(spec.approvers, Some(vec![]));
     }
 
     #[test]

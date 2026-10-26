@@ -291,8 +291,9 @@ pub(crate) fn shows_plainly(text: &str, max: usize) -> bool {
     !text.is_empty() && text.chars().count() <= max && !hides_something(text)
 }
 
-/// Whether `c` is never shown in a name: see [`hides_something`].
-fn hidden(c: char) -> bool {
+/// Whether `c` is never shown in a name: see [`hides_something`]. The
+/// gate approval page (`pages::approve_gate`) escapes these in titles.
+pub(crate) fn hidden(c: char) -> bool {
     (c.is_whitespace() && c != ' ')
         || matches!(
             c,

@@ -202,7 +202,9 @@ fn gates_arm_when_their_step_could_start() {
     assert_eq!(env.gate("t-1.gate-deploy").phase, GatePhase::Escalated);
     assert_eq!(env.store.read(|r| r.comments("t-1.gate-deploy")).unwrap().len(), 1);
 
-    env.store.write("resolve", "carol", |tx| tx.resolve_gate("t-1.gate-deploy", Some("approved"), false)).unwrap();
+    env.store
+        .write("resolve", "carol", |tx| tx.resolve_gate("t-1.gate-deploy", Some("approved"), false, None))
+        .unwrap();
     assert_eq!(env.ready_ids(), vec!["t-1.deploy"]);
 
     // The timer in front of cleanup starts only when deploy closes.
@@ -213,7 +215,7 @@ fn gates_arm_when_their_step_could_start() {
     assert!(matches!(env.evaluate("t-1.gate-cleanup"), Some(Verdict::Pending(d)) if d.contains("opens in 30m")));
     env.clock.advance(Duration::from_secs(1800));
     assert!(matches!(env.evaluate("t-1.gate-cleanup"), Some(Verdict::Resolve(_))));
-    env.store.write("resolve", "bd", |tx| tx.resolve_gate("t-1.gate-cleanup", None, false)).unwrap();
+    env.store.write("resolve", "bd", |tx| tx.resolve_gate("t-1.gate-cleanup", None, false, None)).unwrap();
     let closed = env.close("t-1.cleanup");
     assert_eq!(closed.completed.len(), 1, "run completes once gates and steps are closed");
     assert_eq!(env.issue(&run).status, Status::Closed);
@@ -591,9 +593,9 @@ fn compact_folds_a_finished_run_and_discard_removes_one() {
     let err = env.store.write("compact", "a", |tx| tx.compact_run(&run, &CompactOptions::default())).unwrap_err();
     assert!(matches!(err, Error::Refused(_)), "{err}");
     env.close("t-1.build");
-    env.store.write("resolve", "a", |tx| tx.resolve_gate("t-1.gate-deploy", Some("ok by carol"), false)).unwrap();
+    env.store.write("resolve", "a", |tx| tx.resolve_gate("t-1.gate-deploy", Some("ok by carol"), false, None)).unwrap();
     env.close_failed("t-1.deploy");
-    env.store.write("resolve", "a", |tx| tx.resolve_gate("t-1.gate-cleanup", None, true)).unwrap();
+    env.store.write("resolve", "a", |tx| tx.resolve_gate("t-1.gate-cleanup", None, true, None)).unwrap();
     env.close("t-1.cleanup");
     assert_eq!(env.issue(&run).close_outcome, Some(Outcome::Failed));
 
@@ -645,6 +647,75 @@ fn extract_round_trips_a_run() {
     assert_eq!(shape(&a), shape(&b), "{text}");
     assert_eq!(b.issues.iter().find(|i| i.key == "tests.unit").unwrap().priority, 1);
     assert!(b.issues.iter().any(|i| i.role == Role::Gate));
+}
+
+fn approver_plan(approvers: &str, vars: &[(&str, &str)]) -> Result<Plan> {
+    let toml = format!(
+        "[vars.first]\n[vars.second]\n[vars.a]\n[vars.b]\n[vars.approver]\n\
+         [[steps]]\nid = \"ship\"\n[steps.gate]\ntype = \"human\"\napprovers = {approvers}\n"
+    );
+    let pb = playbook::parse_toml(&toml, "test.toml", "test")?;
+    pb.validate()?;
+    let req =
+        RunRequest { vars: vars.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(), ..Default::default() };
+    playbook::compile(&pb, &req, &Loader::default())
+}
+
+fn gate_approvers(plan: &Plan) -> Option<Vec<String>> {
+    plan.issues.iter().find(|i| i.role == Role::Gate).unwrap().gate.as_ref().unwrap().approvers.clone()
+}
+
+#[test]
+fn gate_approvers_render_and_normalize() {
+    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+    let cases: [Case; 4] = [
+        (r#"["{{first}}", "{{second}}"]"#, &[("first", "alice"), ("second", "bob")], &["alice", "bob"]),
+        (r#"["{{a}}", "x"]"#, &[("a", "y")], &["y", "x"]),
+        (r#"["Carol", "carol"]"#, &[], &["Carol"]),
+        (r#"["{{a}}", "{{b}}"]"#, &[("a", "carol"), ("b", "carol")], &["carol"]),
+    ];
+    for (approvers, vars, want) in cases {
+        let plan = approver_plan(approvers, vars).unwrap();
+        let want: Vec<String> = want.iter().map(|w| w.to_string()).collect();
+        assert_eq!(gate_approvers(&plan), Some(want), "{approvers}");
+    }
+
+    let e = approver_plan(r#"["{{approver}}"]"#, &[("approver", "")]).unwrap_err();
+    assert_eq!(e.exit_code(), 2, "{e}");
+    let e = approver_plan(r#"["{{approver}}"]"#, &[("approver", "a\nb")]).unwrap_err();
+    assert_eq!(e.exit_code(), 2, "{e}");
+    let e = approver_plan("[\"ca\\u0000rol\"]", &[]).unwrap_err().to_string();
+    assert!(e.contains("control character"), "{e}");
+    let e = approver_plan("[]", &[]).unwrap_err().to_string();
+    assert!(e.contains("approvers needs at least one actor"), "{e}");
+    let timer = "[[steps]]\nid = \"bake\"\n[steps.gate]\ntype = \"timer\"\ntimeout = \"1h\"\napprovers = [\"carol\"]\n";
+    let e = playbook::parse_toml(timer, "test.toml", "test").unwrap_err().to_string();
+    assert!(e.contains("approvers only apply to human gates"), "{e}");
+}
+
+#[test]
+fn extract_keeps_gate_approvers_and_refuses_invalid_ones() {
+    let mut env = Env::new();
+    let toml = "[[steps]]\nid = \"build\"\n[[steps]]\nid = \"deploy\"\nneeds = [\"build\"]\n\
+        [steps.gate]\ntype = \"human\"\napprovers = [\"carol\", \"dave/laptop\"]\n";
+    let run = env.start(toml, &[]);
+    let part_of = env.store.read(|r| gates::run_of(r.conn(), "t-1.gate-deploy")).unwrap().unwrap();
+    assert_eq!(part_of.id, run);
+    let pb = env.store.read(|r| playbook::extract(r.conn(), &run, Some("again"))).unwrap();
+    let text = playbook::to_toml(&pb).unwrap();
+    let again = playbook::parse_toml(&text, "x.toml", "again").unwrap();
+    let plan = playbook::compile(&again, &RunRequest::default(), &Loader::default()).unwrap();
+    assert_eq!(gate_approvers(&plan), Some(vec!["carol".into(), "dave/laptop".into()]), "{text}");
+
+    let gate = "t-1.gate-deploy";
+    let mut meta = env.issue(gate).metadata;
+    meta["gate"]["approvers"] = json!(42);
+    let patch = IssuePatch { metadata: Some(meta), ..Default::default() };
+    env.store.write("update", "alice", |tx| tx.update_issue(gate, &patch, &Guard::default(), false)).unwrap();
+    let e = env.store.read(|r| playbook::extract(r.conn(), &run, Some("again"))).unwrap_err();
+    assert_eq!(e.exit_code(), 2, "{e}");
+    let e = e.to_string();
+    assert!(e.contains(gate) && e.contains("bd gate update"), "no ungated version of the step: {e}");
 }
 
 #[test]

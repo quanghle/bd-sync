@@ -473,6 +473,10 @@ pub struct CloseOptions {
     pub guard: Guard,
     /// Fencing token from `claim`: close only while that lease is still held.
     pub token: Option<i64>,
+    /// How the close was made, recorded as `via` in the `closed` event
+    /// (`browser`: a human gate approved on bd serve's approval page). No
+    /// command-line flag sets it.
+    pub via: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -950,7 +954,7 @@ impl WriteCtx<'_> {
         self.check_close(&old, opts.force)?;
         let reason = opts.reason.clone().filter(|r| !r.trim().is_empty());
         let outcome = opts.outcome.unwrap_or(Outcome::Done);
-        let mut freed = self.mark_closed(&old, reason, outcome, false, claim_override)?;
+        let mut freed = self.mark_closed(&old, reason, outcome, false, claim_override, opts.via.as_deref())?;
         let (completed, also_freed) = self.close_finished_containers(id)?;
         freed.extend(also_freed);
         let done: HashSet<&String> = completed.iter().collect();
@@ -965,7 +969,8 @@ impl WriteCtx<'_> {
 
     /// Close one issue and recompute what it held back; returns the issues it
     /// freed. `auto`: a run or group closing after its last step; `claim_override`:
-    /// the live claim of another actor this close ended.
+    /// the live claim of another actor this close ended; `via`: how it was
+    /// closed ([`CloseOptions::via`]).
     fn mark_closed(
         &mut self,
         old: &Issue,
@@ -973,6 +978,7 @@ impl WriteCtx<'_> {
         outcome: Outcome,
         auto: bool,
         claim_override: Option<Value>,
+        via: Option<&str>,
     ) -> Result<Vec<String>> {
         let id = old.id.as_str();
         self.conn()
@@ -990,6 +996,9 @@ impl WriteCtx<'_> {
         }
         if let Some(o) = claim_override {
             data["claim_override"] = o;
+        }
+        if let Some(v) = via {
+            data["via"] = json!(v);
         }
         self.emit("closed", Some(id), data)?;
         let seeds = graph::seeds_for_terminal_flip(self.conn(), id)?;
@@ -1038,7 +1047,7 @@ impl WriteCtx<'_> {
             } else {
                 (Outcome::Done, "every step closed")
             };
-            freed.extend(self.mark_closed(&p, Some(reason.into()), outcome, true, None)?);
+            freed.extend(self.mark_closed(&p, Some(reason.into()), outcome, true, None, None)?);
             closed.push(parent.clone());
             settled = Some(parent);
         }

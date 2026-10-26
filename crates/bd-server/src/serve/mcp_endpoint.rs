@@ -209,6 +209,7 @@ impl mcp::Runner for ToolRunner<'_> {
             token_actor: policy.actor,
             max_claims: policy.max_claims,
             token: Some(self.token.summary()),
+            approvals: self.server.approval_base(&self.ws.name),
             ..capture
         };
         let (exit_code, captured) = io::capture(capture, || bd_cli::execute(&mut app, &cli.command));

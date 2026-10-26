@@ -7,7 +7,7 @@
 //! saved kind and role cover what the command needs, saved trusting the CA
 //! this remote is reached through, is sent.
 
-use bd_core::Need;
+use bd_core::{Error, Need};
 
 use super::{Configured, Remote, Trust, config};
 use crate::actor::{self, Env};
@@ -94,6 +94,32 @@ pub(super) fn skip_note(skip: &Skip) -> Option<String> {
     }
 }
 
+/// Why a command that sends only the person's token (`bd gate review`)
+/// cannot run against `url`: no token saved (exit 7), a keychain that
+/// cannot be read (exit 2), a token that may not do it or was saved
+/// trusting another CA (exit 7), or no person at a terminal (exit 2).
+/// Never a secret.
+pub(super) fn person_error(skip: Skip, url: &str) -> Error {
+    match skip {
+        Skip::NoToken => Error::Unauthorized(format!(
+            "no person's access token is saved in the keychain for {url}; save one with `bd remote login --human`"
+        )),
+        Skip::Unavailable(why) => {
+            Error::Refused(format!("keychain unavailable: {}", crate::agents::show::printable(&why)))
+        }
+        Skip::AgentSession => {
+            Error::Refused("the person's access token in the keychain is not used inside an agent session".into())
+        }
+        Skip::NotTerminal => Error::Refused(
+            "the person's access token in the keychain is used only with a terminal on stdin (stdin is not one)".into(),
+        ),
+        skip @ (Skip::Uncovered { .. } | Skip::Trust(_)) => {
+            let note = skip_note(&skip).unwrap_or_default();
+            Error::Unauthorized(note.strip_prefix("bd: ").unwrap_or(&note).to_string())
+        }
+    }
+}
+
 /// What a command needs, for people.
 fn needed(needs: &[Need]) -> &'static str {
     match (needs.contains(&Need::Admin), needs.contains(&Need::Human)) {
@@ -120,6 +146,36 @@ mod tests {
         assert!(!asked.get(), "the session is checked first");
         assert!(matches!(gate(&none, &|| false), Err(Skip::NotTerminal)));
         assert!(gate(&none, &terminal).is_ok());
+    }
+
+    #[test]
+    fn a_person_only_command_says_why_the_keychain_token_was_not_used() {
+        let url = "https://bd.example.com/w/proj";
+        let cases = [
+            (Skip::NoToken, 7),
+            (Skip::Unavailable("test keychain:\nunavailable".into()), 2),
+            (Skip::Uncovered { kind: Kind::Agent, role: Role::Write, needs: vec![Need::Human] }, 7),
+            (Skip::Trust("saved trusting another CA certificate".into()), 7),
+            (Skip::AgentSession, 2),
+            (Skip::NotTerminal, 2),
+        ];
+        for (skip, code) in cases {
+            let shown = format!("{skip:?}");
+            let e = person_error(skip, url);
+            assert_eq!(e.exit_code(), code, "{shown}");
+            let text = e.to_string();
+            assert!(!text.contains("bdt_") && !text.contains("bdr_") && !text.starts_with("bd: "), "{text}");
+            assert!(!text.contains('\n'), "{text}");
+        }
+        let text = person_error(Skip::NoToken, url).to_string();
+        assert!(text.contains(url) && text.contains("bd remote login --human"), "{text}");
+        let text =
+            person_error(Skip::Uncovered { kind: Kind::Agent, role: Role::Write, needs: vec![Need::Human] }, url)
+                .to_string();
+        assert!(
+            text.starts_with("the person's access token saved in the keychain is role write, kind agent"),
+            "{text}"
+        );
     }
 
     #[test]

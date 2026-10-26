@@ -326,6 +326,17 @@ is needed:
 - **`bd publish`**, which always needs a person's admin token, takes the
   keychain token before it sends anything, and also works with no other
   token configured.
+- **`bd gate review`** ([Reviewing human
+  gates](playbooks.md#reviewing-human-gates)) uses the keychain token
+  only: it looks it up once, before it sends anything, prints the note
+  once, and ignores `$BD_TOKEN` and tokens saved by `bd remote login`,
+  never sending them. It refuses inside an agent session and without a
+  terminal on stdin before it reads the remote configuration or the
+  keychain (exit 2), and fails with the keychain unavailable (exit 2, with
+  the reason), with no keychain token for the workspace (exit 7, naming
+  `bd remote login --human`), or with one that is not a person's or was
+  saved trusting another CA (exit 7, saying why). Its errors, the remote
+  configuration's included, are printed on one line, escaped.
 - **Never otherwise.** The keychain is not read inside an agent session
   (the variables above), when stdin is not a terminal, or for any other
   command or refusal; `$BD_TOKEN` and saved tokens are used as before, and

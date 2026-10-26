@@ -25,10 +25,7 @@ pub(super) async fn gate_approval(
     gate: &str,
     req: Request<Incoming>,
 ) -> Response<Body> {
-    if server.public_url.is_none() {
-        return no_approvals();
-    }
-    let issuer = match server.issuer() {
+    let issuer = match server.approvals_issuer() {
         Ok(Some(issuer)) => issuer,
         Ok(None) => return no_approvals(),
         // Settings that cannot be used now (startup refused them; edited since): no approvals, said in the log.

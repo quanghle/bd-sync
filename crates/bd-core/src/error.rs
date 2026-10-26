@@ -116,6 +116,9 @@ pub enum Error {
     Needs {
         message: String,
         needs: Vec<Need>,
+        /// The human gate a person must open to get past this refusal, set
+        /// by the policy's human-gate refusals ([`Error::with_gate`]).
+        gate: Option<String>,
     },
 
     /// A bd server could not be reached, refused the request, or answered
@@ -229,7 +232,24 @@ impl Error {
         let mut needs = needs.to_vec();
         needs.sort_unstable();
         needs.dedup();
-        Error::Needs { message: message.into(), needs }
+        Error::Needs { message: message.into(), needs, gate: None }
+    }
+
+    /// Names the human gate a person must open to get past this refusal;
+    /// a no-op on every error but [`Error::Needs`].
+    pub fn with_gate(mut self, gate: impl Into<String>) -> Self {
+        if let Error::Needs { gate: g, .. } = &mut self {
+            *g = Some(gate.into());
+        }
+        self
+    }
+
+    /// The human gate named by [`Error::with_gate`], if any.
+    pub fn gate(&self) -> Option<&str> {
+        match self {
+            Error::Needs { gate, .. } => gate.as_deref(),
+            _ => None,
+        }
     }
 
     /// The rights that would get past this refusal; empty for every other error.

@@ -157,21 +157,12 @@ pub fn cmd_approve(app: &App, remote: Option<&Remote>, a: &AgentsApproveArgs) ->
 
 /// Refuse to run where any agent harness's session id variable is set.
 fn refuse_in_agent_session(env: &dyn Fn(&str) -> Option<String>) -> Result<()> {
-    let set: Vec<String> = actor::HARNESSES
-        .iter()
-        .flat_map(|(_, vars)| vars.iter())
-        .filter(|v| env(v).is_some())
-        .map(|v| format!("${v}"))
-        .collect();
-    if set.is_empty() {
-        return Ok(());
-    }
-    Err(Error::Refused(format!(
-        "bd agents approve does not run inside an agent session ({} set): approving the skills, MCP servers and \
-         playbooks a checkout runs is the user's decision. An agent should ask the user to run `bd agents approve` in \
-         a separate terminal",
-        set.join(", ")
-    )))
+    actor::refuse_in_agent_session(
+        env,
+        "bd agents approve",
+        "approving the skills, MCP servers and playbooks a checkout runs is the user's decision. An agent should ask \
+         the user to run `bd agents approve` in a separate terminal",
+    )
 }
 
 /// Whether environment variable `name` is set and not empty here.
@@ -185,10 +176,19 @@ pub fn approves(answer: &str) -> bool {
     answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes")
 }
 
-/// Write `prompt` on `out` and read the answer from `input`. An empty line,
-/// anything but `y` or `yes`, a read error and the end of input decline.
-/// Write errors are ignored: the answer decides.
-fn ask_one(input: &mut dyn BufRead, out: &mut dyn Write, prompt: &str) -> bool {
+/// An answer to a `[y/N]` prompt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Answer {
+    Yes,
+    No,
+    /// The input ended (or could not be read): nothing more can be asked.
+    End,
+}
+
+/// Write `prompt` on `out` and read the answer from `input`: `y` or `yes`
+/// says yes, an empty line or anything else no, and the end of input or a
+/// read error ends the asking. Write errors are ignored: the answer decides.
+pub(crate) fn ask(input: &mut dyn BufRead, out: &mut dyn Write, prompt: &str) -> Answer {
     let _ = write!(out, "{prompt} [y/N] ");
     let _ = out.flush();
     let mut answer = String::new();
@@ -197,7 +197,16 @@ fn ask_one(input: &mut dyn BufRead, out: &mut dyn Write, prompt: &str) -> bool {
         let _ = writeln!(out);
     }
     let _ = writeln!(out);
-    matches!(read, Ok(n) if n > 0) && approves(&answer)
+    match read {
+        Ok(n) if n > 0 && approves(&answer) => Answer::Yes,
+        Ok(n) if n > 0 => Answer::No,
+        _ => Answer::End,
+    }
+}
+
+/// [`ask`], where the end of input declines.
+fn ask_one(input: &mut dyn BufRead, out: &mut dyn Write, prompt: &str) -> bool {
+    matches!(ask(input, out, prompt), Answer::Yes)
 }
 
 /// What to ask about per harness, and what is known already.
@@ -1294,6 +1303,16 @@ mod tests {
             }
         }
         refuse_in_agent_session(&|_| None).unwrap();
+    }
+
+    #[test]
+    fn ask_says_yes_no_or_that_the_input_ended() {
+        let mut out = Vec::new();
+        assert_eq!(ask(&mut "YES\n".as_bytes(), &mut out, "Go?"), Answer::Yes);
+        assert_eq!(ask(&mut "\n".as_bytes(), &mut out, "Go?"), Answer::No);
+        assert_eq!(ask(&mut "nope\n".as_bytes(), &mut out, "Go?"), Answer::No);
+        assert_eq!(ask(&mut "".as_bytes(), &mut out, "Go?"), Answer::End);
+        assert!(String::from_utf8(out).unwrap().starts_with("Go? [y/N] "));
     }
 
     fn playbook(path: &str, change: PlaybookChange, text: &str, approved: Option<&str>) -> PlaybookReview {

@@ -195,11 +195,11 @@ impl<R: Runner> Server<R> {
         };
         let invocation = match tool.invoke(arguments) {
             Ok(i) => i,
-            Err(message) => return Ok(tool_error("invalid", &message, 2)),
+            Err(message) => return Ok(tool_error("invalid", &message, 2, Map::new())),
         };
         let ran = match self.runner.run(&invocation.argv, !tool.read_only) {
             Ok(ran) => ran,
-            Err(e) => return Ok(tool_error(e.code(), &e.to_string(), e.exit_code())),
+            Err(e) => return Ok(tool_error(e.code(), &e.to_string(), e.exit_code(), Map::new())),
         };
         // A findings exit (spec drift's 1) with its JSON on stdout is a result.
         let findings = ran.exit_code != 0 && invocation.accepts_exit(ran.exit_code) && !ran.stdout.trim().is_empty();
@@ -210,7 +210,7 @@ impl<R: Runner> Server<R> {
             Ok(text) => success(text, &ran.stderr),
             // Unreadable stdout at a findings exit: the command's own error.
             Err(_) if findings => command_error(&ran),
-            Err(message) => tool_error("internal", &message, 1),
+            Err(message) => tool_error("internal", &message, 1, Map::new()),
         })
     }
 }
@@ -306,12 +306,20 @@ fn success(text: String, stderr: &str) -> Value {
     json!({ "content": content, "isError": false })
 }
 
-/// A tool result reporting an error as the CLI's `--json` error.
-fn tool_error(code: &str, message: &str, exit_code: i32) -> Value {
-    let body = json!({ "error": { "code": code, "message": message, "exit_code": exit_code } });
-    let text = crate::io::printable(&body.to_string()).into_owned();
+/// A tool result reporting an error as the CLI's `--json` error, with
+/// `extra` keys (a human gate's `gate` and `approval_url`) added to it.
+fn tool_error(code: &str, message: &str, exit_code: i32, extra: Map<String, Value>) -> Value {
+    let mut error = json!({ "code": code, "message": message, "exit_code": exit_code });
+    if let Value::Object(e) = &mut error {
+        e.extend(extra);
+    }
+    let text = crate::io::printable(&json!({ "error": error }).to_string()).into_owned();
     json!({ "content": [{ "type": "text", "text": text }], "isError": true })
 }
+
+/// The keys of a command's JSON error carried into its tool error: the
+/// human gate a refusal names and its approval link, when they are strings.
+const CARRIED_ERROR_KEYS: [&str; 2] = ["gate", "approval_url"];
 
 /// The tool result of a command that failed: the JSON error it printed on
 /// stderr, else its first line of stderr.
@@ -319,13 +327,15 @@ fn command_error(ran: &Ran) -> Value {
     let reported = ran.stderr.lines().find_map(|l| {
         let v: Value = serde_json::from_str(l).ok()?;
         let e = v.get("error")?;
-        Some((e.get("code")?.as_str()?.to_string(), e.get("message")?.as_str()?.to_string()))
+        let extra: Map<String, Value> =
+            CARRIED_ERROR_KEYS.iter().filter_map(|k| Some((k.to_string(), json!(e.get(*k)?.as_str()?)))).collect();
+        Some((e.get("code")?.as_str()?.to_string(), e.get("message")?.as_str()?.to_string(), extra))
     });
     match reported {
-        Some((code, message)) => tool_error(&code, &message, ran.exit_code),
+        Some((code, message, extra)) => tool_error(&code, &message, ran.exit_code, extra),
         None => {
             let line = ran.stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("failed");
-            tool_error("failed", line.trim_start_matches("error: "), ran.exit_code)
+            tool_error("failed", line.trim_start_matches("error: "), ran.exit_code, Map::new())
         }
     }
 }
@@ -660,5 +670,28 @@ mod tests {
         let (err, items) = content_of("close", json!({ "ids": ["t-1"], "reason": "done" }), ran);
         assert!(err);
         assert_eq!(items.len(), 1, "{items:?}");
+    }
+
+    #[test]
+    fn a_refusal_at_a_human_gate_keeps_its_gate_and_link() {
+        let failed = |stderr: &str| {
+            let ran = Ran { exit_code: 7, stderr: stderr.into(), ..Default::default() };
+            let (err, items) = content_of("close", json!({ "ids": ["t-2"], "reason": "done" }), ran);
+            assert!(err);
+            serde_json::from_str::<Value>(items[0]["text"].as_str().unwrap()).unwrap()
+        };
+        let linked = r#"{"error":{"approval_url":"https://x/bd/w/p/gates/t-1","code":"unauthorized","exit_code":7,"gate":"t-1","message":"held"}}"#;
+        let v = failed(&format!("{linked}\nhint: x\n"));
+        assert_eq!(v["error"]["gate"], "t-1");
+        assert_eq!(v["error"]["approval_url"], "https://x/bd/w/p/gates/t-1");
+        assert_eq!((&v["error"]["code"], &v["error"]["exit_code"]), (&"unauthorized".into(), &7.into()));
+
+        let plain = r#"{"error":{"code":"unauthorized","exit_code":7,"message":"held"}}"#;
+        let v = failed(&format!("{plain}\n"));
+        assert!(v["error"].get("gate").is_none() && v["error"].get("approval_url").is_none(), "{v}");
+        // Only strings are carried.
+        let odd = r#"{"error":{"approval_url":["x"],"code":"unauthorized","exit_code":7,"gate":1,"message":"held"}}"#;
+        let v = failed(&format!("{odd}\n"));
+        assert!(v["error"].get("gate").is_none() && v["error"].get("approval_url").is_none(), "{v}");
     }
 }

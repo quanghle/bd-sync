@@ -248,6 +248,9 @@ pub enum GateCommand {
     /// Replace or clear the approvers of an open human gate
     #[command(long_about = GATE_UPDATE_LONG_ABOUT)]
     Update(GateUpdateArgs),
+    /// Review waiting human gates and resolve them, asking at a terminal
+    #[command(long_about = GATE_REVIEW_LONG_ABOUT)]
+    Review(GateReviewArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -422,4 +425,35 @@ pub struct GateUpdateArgs {
     /// Remove the approvers
     #[arg(long)]
     pub clear_approvers: bool,
+}
+
+const GATE_REVIEW_LONG_ABOUT: &str = "\
+Review waiting human gates and resolve them, asking at a terminal
+
+Shows each open human gate that is armed or escalated (or only the gates
+named), with its state, run, the work it holds back and its approvers, and
+asks `Resolve <id>? [y/N]` on the terminal: y or yes resolves it, anything
+else declines, and the end of input stops asking. Each gate is read again
+just before it is asked about. Only a person runs it: it refuses inside an
+agent session and without a terminal on stdin, with no flag to get past
+either. In a remote workspace it sends only the person's token saved in the
+OS keychain (`bd remote login --human`), never $BD_TOKEN or a token saved by
+`bd remote login`, and skips gates whose approvers do not name its actor.
+Prompts go to stderr; the summary goes to stdout (--json for JSON).";
+
+const GATE_REVIEW_EXAMPLES: &str = "\
+Examples:
+  bd gate review
+  bd gate review bd-15 bd-16
+  bd gate review -r \"ship it\"
+  bd gate review --json";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = GATE_REVIEW_EXAMPLES)]
+pub struct GateReviewArgs {
+    /// Only these gates (default: every human gate waiting for a person)
+    pub ids: Vec<String>,
+    /// Reason recorded with each gate resolved (default: approved in bd gate review by ACTOR)
+    #[arg(short, long)]
+    pub reason: Option<String>,
 }

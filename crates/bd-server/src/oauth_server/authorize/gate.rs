@@ -94,13 +94,10 @@ const NOT_READY: &str =
 
 const EXPIRED: &str = "This approval has expired. Open the link again.";
 
-/// Whether `id` may be a gate's id in a path: 1 to 128 characters of
-/// `[A-Za-z0-9._-]`, starting with a letter or digit. Anything else is no
-/// issue of bd's, and kept out of cookie paths and logs.
+/// Whether `id` may be a gate's id in a path ([`bd_core::gates::approval_id_ok`]).
+/// Anything else is no issue of bd's, and kept out of cookie paths and logs.
 pub fn gate_id_ok(id: &str) -> bool {
-    id.len() <= 128
-        && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
-        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    bd_core::gates::approval_id_ok(id)
 }
 
 fn not_found() -> Answer {

@@ -14,6 +14,7 @@ pub mod cli;
 pub mod commands;
 pub mod credentials;
 pub mod fmt;
+pub mod gate_review;
 pub mod gates;
 pub mod gh;
 pub mod github;
@@ -36,7 +37,7 @@ use bd_core::{Error, Result};
 use serde_json::json;
 
 use crate::app::App;
-use crate::cli::{Cli, Command, CommentCommand, EpicCommand, HookCommand, LabelCommand, MemoryCommand};
+use crate::cli::{Cli, Command, CommentCommand, EpicCommand, GateCommand, HookCommand, LabelCommand, MemoryCommand};
 use crate::commands::*;
 
 /// Run a command line: on the workspace's server when it is remote, else
@@ -113,6 +114,7 @@ pub fn execute(app: &mut App, cmd: &Command) -> i32 {
                 | Command::Remote(_)
                 | Command::Hook(_)
                 | Command::Agents(cli::AgentsCommand::Approve(_) | cli::AgentsCommand::Watch(_))
+                | Command::Gate(cli::GateCommand::Review(_))
         )
     {
         tracing::warn!(target: "bd::slow", command = name, total_ms, "slow command");
@@ -130,13 +132,22 @@ pub fn execute(app: &mut App, cmd: &Command) -> i32 {
 /// The lines `report` prints for an error; `actor` is who the command ran
 /// as, if it got that far.
 pub fn render_error(e: &Error, json: bool, actor: Option<&actor::Resolved>) -> String {
+    // A refusal at a human gate names it; bd serve may offer its approval page.
+    let link = e.gate().and_then(io::approval_url);
     if json {
-        return format!(
-            "{}\n",
-            json!({ "error": { "code": e.code(), "message": e.to_string(), "exit_code": e.exit_code() } })
-        );
+        let mut error = json!({ "code": e.code(), "message": e.to_string(), "exit_code": e.exit_code() });
+        if let Some(gate) = e.gate() {
+            error["gate"] = json!(gate);
+        }
+        if let Some(url) = link {
+            error["approval_url"] = json!(url);
+        }
+        return format!("{}\n", json!({ "error": error }));
     }
     let mut s = format!("error: {e}\n");
+    if let Some(url) = link {
+        s.push_str(&format!("approve in a browser: {url}\n"));
+    }
     if let Some(h) = actor.and_then(|a| other_session_hint(e, a)).or_else(|| hint(e).map(String::from)) {
         s.push_str(&format!("hint: {h}\n"));
     }
@@ -323,6 +334,7 @@ pub fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Backup(a) => backup::cmd_backup(app, a).map(|_| 0),
         Command::Batch(a) => batch::cmd_batch(app, a).map(|_| 0),
         Command::Playbook(c) => playbooks::cmd_playbook(app, c).map(|_| 0),
+        Command::Gate(GateCommand::Review(a)) => gate_review::cmd_review(app, None, a),
         Command::Gate(c) => gates::cmd_gate(app, c).map(|_| 0),
         Command::Github(c) => github::cmd_github(app, c),
         Command::Purge(a) => playbooks::cmd_purge(app, a).map(|_| 0),
@@ -451,5 +463,38 @@ mod tests {
         assert!(text.contains("`bd remote login --human`"), "{text}");
         let plain = render_error(&Error::Unauthorized("x".into()), false, None);
         assert!(!plain.contains("--human"), "{plain}");
+    }
+
+    #[test]
+    fn a_refusal_at_a_human_gate_names_it_and_its_approval_link() {
+        let e = || Error::with_needs(&[bd_core::Need::Human], "msg").with_gate("t-1");
+        let (_, c) = io::Capture::buffered(1024);
+        let c = io::Capture { approvals: Some("https://x/bd/w/p/gates/".into()), ..c };
+        let ((text, json), _) = io::capture(c, || (render_error(&e(), false, None), render_error(&e(), true, None)));
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines[0], "error: msg");
+        assert_eq!(lines[1], "approve in a browser: https://x/bd/w/p/gates/t-1");
+        assert!(lines[2].starts_with("hint: only a person"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["error"]["gate"], "t-1");
+        assert_eq!(v["error"]["approval_url"], "https://x/bd/w/p/gates/t-1");
+        assert_eq!((&v["error"]["code"], &v["error"]["exit_code"]), (&"unauthorized".into(), &7.into()));
+
+        // Outside bd serve: the gate, no link.
+        let text = render_error(&e(), false, None);
+        assert!(!text.contains("approve in a browser") && !text.contains("/gates/"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&render_error(&e(), true, None)).unwrap();
+        assert_eq!(v["error"]["gate"], "t-1");
+        assert!(v["error"].get("approval_url").is_none(), "{v}");
+
+        // A refusal naming no gate has neither key, even under bd serve.
+        let (_, c) = io::Capture::buffered(1024);
+        let c = io::Capture { approvals: Some("https://x/bd/w/p/gates/".into()), ..c };
+        let plain = || Error::with_needs(&[bd_core::Need::Human], "msg");
+        let ((text, json), _) =
+            io::capture(c, || (render_error(&plain(), false, None), render_error(&plain(), true, None)));
+        assert!(!text.contains("approve in a browser"), "{text}");
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(v["error"].get("gate").is_none() && v["error"].get("approval_url").is_none(), "{v}");
     }
 }

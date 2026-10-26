@@ -81,7 +81,16 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
             "ready": ready,
             "ready_total": stats.ready,
             "stats": stats,
-            "gates_needing_attention": attention,
+            "gates_needing_attention": attention
+                .iter()
+                .map(|g| {
+                    let mut v = serde_json::to_value(g).unwrap_or(serde_json::Value::Null);
+                    if let (Some(url), Some(o)) = (crate::gates::approval_url_of(g), v.as_object_mut()) {
+                        o.insert("approval_url".into(), url.into());
+                    }
+                    v
+                })
+                .collect::<Vec<_>>(),
             "memories": shown_memories,
             "playbooks": shown_playbooks,
             "playbooks_total": playbooks.len(),
@@ -168,19 +177,28 @@ pub fn cmd_prime(app: &mut App, a: &PrimeArgs) -> Result<()> {
     if !attention.is_empty() {
         o.push(String::new());
         o.push(format!("## Gates needing a person ({})", attention.len()));
+        o.push(
+            "Only a person opens a human gate: hand the person its approval link (where shown) or ask them to run \
+             `bd gate review` in a terminal of their own."
+                .into(),
+        );
         for g in &attention {
             let what = match (&g.escalation, g.phase) {
                 (Some(reason), bd_core::gates::GatePhase::Escalated) => format!("escalated: {reason}"),
                 _ => "awaiting approval".to_string(),
             };
             let holds: Vec<&str> = g.blocks.iter().map(|b| b.id.as_str()).collect();
-            o.push(format!(
+            let mut line = format!(
                 "- {} {} — {what} (holds {}); open with `bd gate resolve {}`",
                 g.id,
                 g.title,
                 holds.join(", "),
                 g.id
-            ));
+            );
+            if let Some(url) = crate::gates::approval_url_of(g) {
+                line.push_str(&format!("; or approve in a browser: {url}"));
+            }
+            o.push(crate::agents::show::printable(&line));
         }
     }
     if !playbooks.is_empty() || !pending_playbooks.is_empty() || ignored_playbooks > 0 {

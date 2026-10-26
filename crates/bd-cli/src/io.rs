@@ -80,6 +80,10 @@ pub struct Capture {
     /// noted by [`note_needs`]: `bd serve` sends them in the exit frame
     /// when the request committed no write.
     pub needs: Vec<Need>,
+    /// The base `<issuer>/w/<ws>/gates/` of the approval pages `bd serve`
+    /// offers this request (a gate's link is the base and its id), `None`
+    /// when it offers none.
+    pub approvals: Option<String>,
 }
 
 impl Capture {
@@ -98,6 +102,7 @@ impl Capture {
             max_claims: None,
             token: None,
             needs: Vec::new(),
+            approvals: None,
         }
     }
 
@@ -196,6 +201,14 @@ pub fn policy() -> Option<bd_core::Policy> {
 /// The summary of the access token of the request being served, if any.
 pub fn request_token() -> Option<serde_json::Value> {
     with_capture(|c| c.token.clone()).flatten()
+}
+
+/// The link to the approval page of `gate` that `bd serve` offers this
+/// request: `None` outside `bd serve`, when it offers none, or for an id an
+/// approval page would not take.
+pub fn approval_url(gate: &str) -> Option<String> {
+    let base = with_capture(|c| c.approvals.clone()).flatten()?;
+    bd_core::gates::approval_id_ok(gate).then(|| format!("{base}{gate}"))
 }
 
 /// Note the rights a refusal of the request said would get past it; does
@@ -575,6 +588,24 @@ mod tests {
         }
         e.finish(&mut out);
         String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn approval_links_come_only_from_the_request_capture() {
+        assert_eq!(approval_url("t-1"), None, "outside bd serve");
+        let (_, c) = Capture::buffered(1024);
+        let (url, _) = capture(c, || approval_url("t-1"));
+        assert_eq!(url, None, "a server offering no approval pages");
+        let (_, c) = Capture::buffered(1024);
+        let c = Capture { approvals: Some("https://x/bd/w/p/gates/".into()), ..c };
+        let long = "a".repeat(129);
+        let (urls, _) = capture(c, || {
+            let bad: Vec<_> =
+                ["", ".x", "a b", "a/b", "a?b", long.as_str()].iter().map(|id| approval_url(id)).collect();
+            (approval_url("t-1"), bad)
+        });
+        assert_eq!(urls.0.as_deref(), Some("https://x/bd/w/p/gates/t-1"));
+        assert!(urls.1.iter().all(Option::is_none), "{:?}", urls.1);
     }
 
     #[test]

@@ -266,6 +266,12 @@ pub fn session(env: &Env<'_>) -> Option<Session> {
     (!parts.is_empty()).then(|| Session { label: parts.join("."), vars })
 }
 
+/// The variables of [`HARNESSES`] set in `env`: one or more means this runs
+/// inside an agent session.
+pub fn agent_session_vars(env: &Env<'_>) -> Vec<&'static str> {
+    HARNESSES.iter().flat_map(|&(_, names)| names.iter().copied()).filter(|v| env(v).is_some()).collect()
+}
+
 /// The last 8 letters and digits of a session id, lowercased: the random
 /// part of a UUID, whether v4 or time-ordered v7 (whose first digits are
 /// the same for sessions started within a minute).
@@ -858,6 +864,18 @@ mod tests {
 
     const COPILOT: (&str, &str) = ("COPILOT_AGENT_SESSION_ID", "286f56fd-c22e-458a-93ac-dfcfb9bb2788");
     const CLAUDE: (&str, &str) = ("CLAUDE_CODE_SESSION_ID", "8e7d0c1a-0b6f-4c55-9d3e-1f2a3b4c5d6e");
+
+    #[test]
+    fn agent_session_vars_lists_the_harness_variables_set() {
+        assert!(agent_session_vars(&with(&[])).is_empty());
+        assert!(agent_session_vars(&with(&[("BD_SESSION", "w1"), ("BD_ACTOR", "a")])).is_empty(), "not a harness's");
+        assert!(agent_session_vars(&with(&[("CODEX_THREAD_ID", " ")])).is_empty(), "blank is unset");
+        assert_eq!(agent_session_vars(&with(&[COPILOT])), ["COPILOT_AGENT_SESSION_ID"]);
+        assert_eq!(
+            agent_session_vars(&with(&[("CODEX_SESSION_ID", "s"), CLAUDE, ("CODEX_THREAD_ID", "t")])),
+            ["CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID"]
+        );
+    }
 
     #[test]
     fn explicit_actors_win_over_sessions() {

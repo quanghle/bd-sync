@@ -96,14 +96,28 @@ impl Env {
     }
 }
 
-fn denied<T: std::fmt::Debug>(r: Result<T>, needle: &str) {
+/// Asserts `r` is an access refusal mentioning `needle`, and returns it.
+fn denied<T: std::fmt::Debug>(r: Result<T>, needle: &str) -> Error {
     match r {
-        Err(e @ Error::Unauthorized(_)) => {
+        Err(e) if is_refusal(&e) => {
             assert!(e.to_string().contains(needle), "{e}");
-            assert_eq!(e.exit_code(), 7);
+            e
         }
         other => panic!("expected an access refusal mentioning {needle:?}, got {other:?}"),
     }
+}
+
+fn is_refusal(e: &Error) -> bool {
+    e.code() == "unauthorized" && e.exit_code() == 7
+}
+
+#[test]
+fn refusals_name_each_right_they_need_once_in_order() {
+    let e = Error::with_needs(&[Need::Human, Need::Admin, Need::Human], "no");
+    assert_eq!(e.needs(), [Need::Admin, Need::Human]);
+    assert!(is_refusal(&e));
+    assert_eq!(e.to_string(), "no");
+    assert!(Error::Unauthorized("no".into()).needs().is_empty());
 }
 
 fn force_release() -> ReleaseOptions {
@@ -132,7 +146,8 @@ fn other_actors_claims_need_an_admin() {
     // Without force the old answers stand; with it, a write token is refused.
     let e = env.as_("alice", agent("alice"), |tx| tx.release(&held, &ReleaseOptions::default())).unwrap_err();
     assert!(matches!(e, Error::NotOwner { .. }), "{e}");
-    denied(env.as_("alice", agent("alice"), |tx| tx.release(&held, &force_release())), "needs an admin");
+    let e = denied(env.as_("alice", agent("alice"), |tx| tx.release(&held, &force_release())), "needs an admin");
+    assert_eq!(e.needs(), [Need::Admin]);
     let cas = ReleaseOptions {
         guard: Guard { if_assignee: Some(Some("bob/w1".into())), ..Default::default() },
         take_over: true,
@@ -537,7 +552,8 @@ fn human_gates_open_only_for_a_person() {
     let none = Guard::default();
 
     // The gate itself: resolving, closing, pinning, retyping, re-specifying, deleting.
-    denied(env.as_("bot", bot(), |tx| tx.resolve_gate(gate, Some("lgtm"), false)), "is a human gate");
+    let e = denied(env.as_("bot", bot(), |tx| tx.resolve_gate(gate, Some("lgtm"), false)), "is a human gate");
+    assert_eq!(e.needs(), [Need::Human]);
     denied(env.as_("ops", ops(), |tx| tx.resolve_gate(gate, None, true)), "only a person can open it");
     denied(env.as_("bot", bot(), |tx| tx.close_issue(gate, &CloseOptions::default())), "open it");
     let pin = patch(|p| p.status = Some(Status::Pinned));
@@ -1114,7 +1130,8 @@ fn a_claim_limit_caps_the_work_an_actor_and_its_agents_hold() {
     env.as_("bob/w2", capped("bob", 2), |tx| tx.claim(&ids[1], &claim)).unwrap();
 
     // Every way of taking more work is refused, by any of bob's agents.
-    denied(env.as_("bob", capped("bob", 2), |tx| tx.claim(&ids[2], &claim)), "allows at most 2");
+    let e = denied(env.as_("bob", capped("bob", 2), |tx| tx.claim(&ids[2], &claim)), "allows at most 2");
+    assert!(e.needs().is_empty(), "no token right gets past a claim limit: {:?}", e.needs());
     denied(env.as_("bob/w3", capped("bob", 2), |tx| tx.claim_next(&ReadyQuery::default(), &claim)), "would hold 3");
     let reserve = patch(|p| p.assignee = Some(Some("bob/w3".into())));
     denied(
@@ -1178,7 +1195,8 @@ fn closing_as_a_duplicate_needs_an_admin_to_take_over_another_actors_claim() {
     let e = env
         .as_("alice", agent("alice"), |tx| tx.close_as(&held, &canonical, Replacement::Duplicate, &plain))
         .unwrap_err();
-    assert!(matches!(e, Error::Unauthorized(_)), "{e}");
+    assert!(is_refusal(&e), "{e}");
+    assert_eq!(e.needs(), [Need::Admin]);
     env.as_("alice", admin_agent("alice"), |tx| tx.close_as(&held, &canonical, Replacement::Duplicate, &opts)).unwrap();
     assert_eq!(env.issue(&held).status, Status::Closed);
     env.assert_healthy();

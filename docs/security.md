@@ -282,6 +282,27 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   directory on Unix; bd refuses a file its group or others can access. A
   saved token is bound to the CAs it was checked against, so a checkout
   naming its own CA for a server cannot redirect it.
+- **A person's token in the OS keychain.** `bd remote login --human`
+  keeps a human token in the Secret Service (Linux), the login Keychain
+  (macOS) or Credential Manager (Windows), never in a file or an
+  environment variable, so it is off disk, out of agents' environment and
+  out of the credentials file agents' commands use. It is saved only from a
+  terminal outside agent sessions, after the server confirms its kind is
+  `human`. bd reads it only outside agent sessions with stdin a terminal,
+  and only after the server refused a command for want of a person's or
+  admin's rights without committing a write, or for `bd publish`; each
+  read waits at most 5 seconds. It is sent only to the URL and the CA
+  trust it was saved for, which renewal checks again under
+  `credentials.lock` before it uses a re-read item.
+- **The keychain is not a security boundary against a determined
+  agent.** Any process running as the same user can use an unlocked
+  keychain, as the OS lets it, and an agent can run bd under a faked
+  terminal with its session variables cleared: the checks above keep a
+  well-behaved agent from using a person's token by accident, not a
+  hostile one from using it on purpose. Where agents must not get past
+  human gates even then, the browser approval a person gives on another
+  device (bd-d8iwi.2) is the boundary; keep human tokens off machines
+  where untrusted agents run as you.
 - **Tokens never appear on the command line or in output.** `bd remote
   login` reads them from stdin or a prompt without echo; `bd remote show`
   and `bd info` show a token's name, role, kind and expiry, never its

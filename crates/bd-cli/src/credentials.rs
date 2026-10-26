@@ -408,7 +408,7 @@ pub fn remove(path: &Path, url: &str, workspace_only: bool) -> Result<RemoveRepo
 
 /// How long saving or removing a token waits for another bd process
 /// changing the file: one renewing a token holds it for a minute at most.
-const LOCK_WAIT: Duration = Duration::from_secs(90);
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(90);
 
 /// `credentials.lock`, next to the credentials file, held: released when
 /// dropped, or when the process ends.

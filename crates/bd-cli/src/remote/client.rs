@@ -8,7 +8,7 @@ use bd_core::{Error, Result};
 use serde::Serialize;
 
 use super::delivery::Delivery;
-use super::{Configured, Remote, Trust, env};
+use super::{Configured, Remote, Source, Trust, env};
 use crate::credentials;
 use crate::protocol::{ErrorBody, ExecRequest, ExecResponse, FRAMES_CONTENT_TYPE, Frame, PROTOCOL, PROTOCOL_HEADER};
 use crate::stream::{Cut, FrameReader};
@@ -139,7 +139,8 @@ impl Remote {
             url: c.url,
             token: Mutex::new(token),
             renewing: None,
-            roots: trust.certs,
+            trust,
+            human: false,
             retry: retry_budget(),
             connect_timeout: Duration::from_secs(10),
             attempt_timeout: Duration::from_secs(120),
@@ -168,6 +169,16 @@ impl Remote {
         self
     }
 
+    /// What the server's certificate is checked against.
+    pub(super) fn trust(&self) -> &Trust {
+        &self.trust
+    }
+
+    /// The workspace this remote reaches, as configured: its URL and CA file.
+    pub(super) fn configured(&self) -> Configured {
+        Configured { url: self.url.clone(), source: Source::Flag, ca_cert: self.trust.path.clone() }
+    }
+
     /// The time left before the deadline, if there is one.
     pub(super) fn time_left(&self) -> Option<Duration> {
         self.deadline.map(|(at, _)| at.saturating_duration_since(Instant::now()))
@@ -175,7 +186,7 @@ impl Remote {
 
     fn agent(&self) -> Result<ureq::Agent> {
         let mut tls = ureq::tls::TlsConfig::builder();
-        if let Some(certs) = &self.roots {
+        if let Some(certs) = &self.trust.certs {
             tls = tls.root_certs(ureq::tls::RootCerts::new_with_certs(certs));
         }
         let config = ureq::Agent::config_builder()

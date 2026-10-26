@@ -41,6 +41,7 @@ fn bd(dir: &Path) -> Command {
         "BD_GH",
         "BD_TIMING",
         "BD_REMOTE_RETRY_SECS",
+        "BD_TEST_KEYCHAIN",
         "BD_SESSION",
         "CLAUDE_CODE_SESSION_ID",
         "COPILOT_AGENT_SESSION_ID",
@@ -251,7 +252,7 @@ fn same_file(reported: &Value, expected: &Path) -> bool {
 }
 
 /// One raw exec request: the error body, or the answer's frames gathered into
-/// `{"exit_code", "stdout", "stderr", "replayed", "files", "cursor", "issue"}`.
+/// `{"exit_code", "stdout", "stderr", "replayed", "needs", "files", "cursor", "issue"}`.
 /// Like the client, it waits out 409 "pending": an earlier attempt of the
 /// request still running.
 fn post(url: &str, token: &str, body: &Value) -> (u16, Value) {
@@ -310,6 +311,7 @@ fn gather(frames: &str) -> Value {
         "stdout": stdout,
         "stderr": exit["stderr"],
         "replayed": exit["replayed"],
+        "needs": exit.get("needs").cloned().unwrap_or_else(|| json!([])),
         "files": files,
         "cursor": cursor,
         "issue": issue,
@@ -3015,6 +3017,58 @@ fn only_human_tokens_resolve_human_gates() {
     alice.ok(&["create", "Hotfix"]);
     alice.ok(&["gate", "create", "-t", "human", "--blocks", "t-4"]);
     check(server.local("local-ops", &["gate", "resolve", "t-5"]), "local resolve");
+}
+
+/// The exit frame names what a refusal needs (`admin`, `human`) when the
+/// request committed nothing, so a person's client can send it again with
+/// their own token; info tells a client its token's kind and role.
+#[test]
+fn refusals_name_what_they_need_in_the_exit_frame() {
+    let server = Server::start();
+    let alice_secret = server.token("alice-laptop", "alice", &[]);
+    let bob_secret = server.token("bob-laptop", "bob", &[]);
+    let ops_secret = server.token("ops", "ops", &["--role", "admin"]);
+    let carol_secret = server.token("carol-desk", "carol", &["--role", "admin", "--kind", "human"]);
+    let alice = server.client(&alice_secret);
+    let url = server.url();
+    let exec = |secret: &str, argv: &[&str]| {
+        let (status, answer) = post(&url, secret, &json!({ "argv": argv }));
+        assert_eq!(status, 200, "{answer}");
+        answer
+    };
+
+    alice.ok(&["create", "Deploy"]);
+    alice.ok(&["gate", "create", "-t", "human", "--blocks", "t-1"]);
+    alice.ok(&["create", "Contended"]);
+    alice.ok(&["claim", "t-3"]);
+
+    let answer = exec(&alice_secret, &["gate", "resolve", "t-2", "-r", "lgtm"]);
+    assert_eq!((&answer["exit_code"], &answer["needs"]), (&json!(7), &json!(["human"])), "{answer}");
+    assert!(answer["stderr"].as_str().unwrap().contains("bd remote login --human"), "{answer}");
+    let answer = exec(&bob_secret, &["update", "t-3", "--assignee", "bob", "--take-over"]);
+    assert_eq!((&answer["exit_code"], &answer["needs"]), (&json!(7), &json!(["admin"])), "{answer}");
+    let answer = exec(&ops_secret, &["publish", "--dry-run"]);
+    assert_eq!((&answer["exit_code"], &answer["needs"]), (&json!(7), &json!(["admin", "human"])), "{answer}");
+    // Refusals no token kind or role of a person would get past name nothing.
+    let answer = exec(&alice_secret, &["config", "set", "lease.grace", "1m"]);
+    assert_eq!((&answer["exit_code"], &answer["needs"]), (&json!(7), &json!([])), "{answer}");
+
+    // A batch refused part way commits nothing, so it names what it needs too.
+    let (status, answer) = post(
+        &url,
+        &alice_secret,
+        &json!({ "argv": ["batch"], "stdin": "comment add t-2 \"looks fine\"\nclose t-2\n" }),
+    );
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!((&answer["exit_code"], &answer["needs"]), (&json!(7), &json!(["human"])), "{answer}");
+    assert_eq!(alice.json(&["comments", "t-2"]).as_array().unwrap().len(), 0, "the whole batch rolled back");
+    assert_eq!(alice.json(&["show", "t-2"])["status"], "open");
+
+    // What the client checks before it uses a person's token for such a command.
+    let carol = server.client(&carol_secret).json(&["info"])["token"].clone();
+    assert_eq!((&carol["actor"], &carol["kind"], &carol["role"]), (&json!("carol"), &json!("human"), &json!("admin")));
+    let token = alice.json(&["info"])["token"].clone();
+    assert_eq!((&token["actor"], &token["kind"], &token["role"]), (&json!("alice"), &json!("agent"), &json!("write")));
 }
 
 #[test]
@@ -10260,4 +10314,566 @@ fn publishes_and_refusals_are_logged_and_counted_without_contents() {
     let metrics = answer.as_mut().unwrap().body_mut().read_to_string().unwrap();
     assert!(metrics.contains("bd_serve_publishes_total{outcome=\"applied\"} 1"), "{metrics}");
     assert!(metrics.contains("bd_serve_publishes_total{outcome=\"refused\"} 2"), "{metrics}");
+}
+
+/// A file standing in for the OS keychain (`$BD_TEST_KEYCHAIN`, debug builds):
+/// JSON `{account: entry}`, each operation logged to `<path>.log`.
+struct Keychain {
+    path: std::path::PathBuf,
+}
+
+impl Keychain {
+    fn new(dir: &Path) -> Keychain {
+        Keychain { path: dir.join("keychain.json") }
+    }
+
+    /// `cmd` using this keychain.
+    fn on(&self, mut cmd: Command) -> Command {
+        cmd.env("BD_TEST_KEYCHAIN", &self.path);
+        cmd
+    }
+
+    /// `bd args` on the client machine `dir`, using this keychain.
+    fn bd(&self, dir: &Path, args: &[&str]) -> Command {
+        let mut cmd = bd(dir);
+        cmd.args(args);
+        self.on(cmd)
+    }
+
+    /// Every operation so far, one `get|set|delete <account>` a line.
+    fn log(&self) -> String {
+        let mut log = self.path.clone().into_os_string();
+        log.push(".log");
+        std::fs::read_to_string(log).unwrap_or_default()
+    }
+
+    /// The items, each entry parsed.
+    fn items(&self) -> serde_json::Map<String, Value> {
+        let Ok(text) = std::fs::read_to_string(&self.path) else { return Default::default() };
+        let items: serde_json::Map<String, Value> = serde_json::from_str(&text).unwrap();
+        items.into_iter().map(|(k, v)| (k, serde_json::from_str(v.as_str().unwrap()).unwrap())).collect()
+    }
+
+    fn unavailable(&self) {
+        std::fs::write(&self.path, "unavailable").unwrap();
+    }
+
+    /// Save `entry` under `account`, as `bd remote login --human` would.
+    fn put(&self, account: &str, entry: Value) {
+        let mut items: serde_json::Map<String, Value> =
+            std::fs::read_to_string(&self.path).map(|t| serde_json::from_str(&t).unwrap()).unwrap_or_default();
+        items.insert(account.to_string(), Value::String(entry.to_string()));
+        std::fs::write(&self.path, Value::Object(items).to_string()).unwrap();
+    }
+
+    /// The operations logged since the log read `before`.
+    fn since(&self, before: &str) -> String {
+        let log = self.log();
+        assert!(log.starts_with(before), "{log}");
+        log[before.len()..].to_string()
+    }
+}
+
+/// `bd remote login --human` on a pseudo-terminal, typing `token` at its
+/// prompt: its output, and what the terminal showed.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn login_human_typing(cmd: Command, token: &str) -> (Output, String) {
+    let mut t = pty::Terminal::spawn(cmd);
+    t.expect("(input hidden): ");
+    t.answer(token);
+    t.finish()
+}
+
+/// `bd remote login --human` (and `--provider`) on a pseudo-terminal, typing nothing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn on_terminal(cmd: Command) -> (Output, String) {
+    pty::Terminal::spawn(cmd).finish_within(Duration::from_secs(60))
+}
+
+/// The credentials file of a client machine's `dir` (its `XDG_CONFIG_HOME` is `<dir>/.xdg`).
+fn credentials_file(dir: &Path) -> std::path::PathBuf {
+    dir.join(".xdg").join("bd").join("credentials.toml")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn human_tokens_are_kept_in_the_keychain_only() {
+    let server = Server::start();
+    let carol = server.token("carol-desk", "carol", &["--role", "admin", "--kind", "human"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let dir = alice.dir.path();
+    let keychain = Keychain::new(dir);
+    let url = server.url();
+
+    let (out, shown) = login_human_typing(keychain.on(alice.cmd(&["remote", "login", &url, "--human"])), &carol);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}{shown}");
+    assert!(!stdout.contains(&carol) && !shown.contains(&carol), "never shown: {stdout}{shown}");
+    assert!(
+        stdout.contains("Saved the person's access token for") && stdout.contains("in the test keychain"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("acts as carol, role admin, kind human"), "{stdout}");
+    assert!(stdout.contains("used only for commands that need it, in a terminal outside agent sessions"), "{stdout}");
+    let items = keychain.items();
+    let account = format!("server:{}", server.base);
+    assert_eq!(items.keys().collect::<Vec<_>>(), [&account], "one item, for the server");
+    let entry = &items[&account];
+    assert_eq!((&entry["token"], &entry["kind"], &entry["role"]), (&json!(carol), &json!("human"), &json!("admin")));
+    assert_eq!(entry["ca"], "system");
+    assert!(!credentials_file(dir).exists(), "never in the credentials file");
+
+    // Plain show and logout never touch the keychain; normal commands use $BD_TOKEN as before.
+    let logged = keychain.log();
+    let shown: Value =
+        serde_json::from_str(&check(keychain.on(alice.cmd(&["--json", "remote", "show"])).output().unwrap(), "show"))
+            .unwrap();
+    assert!(shown.get("human").is_none(), "{shown}");
+    let created: Value = serde_json::from_str(&check(
+        keychain.on(alice.cmd(&["--json", "create", "Plain"])).output().unwrap(),
+        "create",
+    ))
+    .unwrap();
+    assert_eq!(created["created_by"], "alice", "{created}");
+    check(keychain.on(alice.cmd(&["remote", "logout", &url])).output().unwrap(), "plain logout");
+    assert_eq!(keychain.log(), logged, "no keychain access");
+    assert_eq!(keychain.items().len(), 1);
+
+    // show --human names the token's kind and role, never the token.
+    let out = keychain.on(alice.cmd(&["--json", "remote", "show", "--human"])).output().unwrap();
+    let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!text.contains("bdt_") && !text.contains("bdr_"), "{text}");
+    let shown: Value = serde_json::from_str(&check(out, "show --human")).unwrap();
+    let human = &shown["human"];
+    assert_eq!(
+        (&human["kind"], &human["role"], &human["scope"]),
+        (&json!("human"), &json!("admin"), &json!("server")),
+        "{shown}"
+    );
+    assert_eq!((&human["key"], &human["store"]), (&json!(server.base), &json!("test keychain")), "{shown}");
+    let out = keychain.on(alice.cmd(&["remote", "show", "--human"])).output().unwrap();
+    let text = check(out, "show --human");
+    assert!(
+        text.contains(&format!("human token  saved for {} in the test keychain (kind human, role admin)", server.base)),
+        "{text}"
+    );
+    assert!(!text.contains("bdt_"), "{text}");
+    // Inside an agent session it is not even looked at.
+    let before = keychain.log();
+    let out =
+        keychain.on(alice.cmd(&["remote", "show", "--human"])).env("COPILOT_AGENT_SESSION_ID", "s1").output().unwrap();
+    assert!(check(out, "show --human in a session").contains("human token  not checked inside an agent session"));
+    assert_eq!(keychain.log(), before);
+
+    // logout --human forgets it (no terminal needed); the credentials file stays untouched.
+    let out = keychain.on(alice.cmd(&["remote", "logout", &url, "--human"])).stdin(Stdio::null()).output().unwrap();
+    let text = check(out, "logout --human");
+    assert!(
+        text.contains(&format!("Removed the person's access token saved for {} from the test keychain", server.base)),
+        "{text}"
+    );
+    assert!(keychain.items().is_empty());
+    assert!(!credentials_file(dir).exists());
+    let text = check(keychain.on(alice.cmd(&["remote", "show", "--human"])).output().unwrap(), "show --human");
+    assert!(text.contains("human token  none: `bd remote login --human` saves one"), "{text}");
+    let shown: Value = serde_json::from_str(&check(
+        keychain.on(alice.cmd(&["--json", "remote", "show", "--human"])).output().unwrap(),
+        "show",
+    ))
+    .unwrap();
+    assert!(shown["human"].is_null(), "{shown}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn login_human_workspace_only() {
+    let server = Server::start();
+    let carol = server.token("carol-desk", "carol", &["--kind", "human"]);
+    let dir = checkout_dir();
+    let keychain = Keychain::new(dir.path());
+    let url = server.url();
+    let cmd = keychain.bd(dir.path(), &["--json", "remote", "login", &url, "--human", "--workspace-only"]);
+    let (out, shown) = login_human_typing(cmd, &carol);
+    assert!(out.status.success(), "{shown}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        (&v["scope"], &v["human"], &v["store"], &v["role"]),
+        (&json!("workspace"), &json!(true), &json!("test keychain"), &json!("write"))
+    );
+    assert!(v.get("path").is_none(), "{v}");
+    let items = keychain.items();
+    assert_eq!(items.keys().collect::<Vec<_>>(), [&format!("workspace:{url}")]);
+    assert!(!credentials_file(dir.path()).exists());
+}
+
+#[test]
+fn login_human_refusals() {
+    let server = Server::start();
+    let carol = server.token("carol-desk", "carol", &["--kind", "human"]);
+    let dir = checkout_dir();
+    let keychain = Keychain::new(dir.path());
+    let url = server.url();
+    let login = |extra: &[&str]| keychain.bd(dir.path(), &[&["remote", "login", &url, "--human"][..], extra].concat());
+    let refused = |mut cmd: Command, what: &str| {
+        let out = piped::output_with_input(cmd.stdout(Stdio::piped()).stderr(Stdio::piped()), format!("{carol}\n"));
+        assert_eq!(out.status.code(), Some(2), "{what}: {}", stderr_of(&out));
+        stderr_of(&out)
+    };
+
+    let mut in_session = login(&[]);
+    in_session.env("COPILOT_AGENT_SESSION_ID", "s1");
+    let stderr = refused(in_session, "in an agent session");
+    assert!(
+        stderr.contains("does not run inside an agent session ($COPILOT_AGENT_SESSION_ID set)")
+            && stderr.contains("ask the user to run it in a separate terminal"),
+        "{stderr}"
+    );
+    let stderr = refused(login(&[]), "piped");
+    assert!(stderr.contains("runs only in a terminal"), "{stderr}");
+    refused(login(&["--no-verify"]), "with --no-verify");
+    assert!(!keychain.path.exists() && keychain.log().is_empty(), "the keychain was not touched");
+    keychain.unavailable();
+    refused(login(&[]), "an unavailable keychain");
+    assert_eq!(std::fs::read_to_string(&keychain.path).unwrap(), "unavailable");
+    assert!(!credentials_file(dir.path()).exists());
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // On a terminal, the unavailable keychain is named before any token is asked for.
+        let (out, shown) = on_terminal(login(&[]));
+        assert_eq!(out.status.code(), Some(2), "{shown}");
+        assert!(shown.contains("test keychain: unavailable") && !shown.contains("input hidden"), "{shown}");
+        std::fs::remove_file(&keychain.path).unwrap();
+
+        // A token of another kind is not kept.
+        let alice = server.token("alice-laptop", "alice", &[]);
+        let (out, shown) = login_human_typing(login(&[]), &alice);
+        assert_eq!(out.status.code(), Some(2), "{shown}");
+        assert!(shown.contains("of kind agent") && shown.contains("nothing was saved"), "{shown}");
+        assert!(keychain.items().is_empty());
+        assert!(!credentials_file(dir.path()).exists());
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn human_sign_in_of_agent_kind_is_revoked() {
+    let github = FakeGithub::start();
+    let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"bob\"]\n");
+    let dir = checkout_dir();
+    let keychain = Keychain::new(dir.path());
+    let url = server.url();
+    github.next("bob", 0);
+    let (out, shown) =
+        on_terminal(keychain.bd(dir.path(), &["remote", "login", "--provider", "github", "--human", &url]));
+    assert_eq!(out.status.code(), Some(2), "{shown}");
+    assert!(shown.contains("of kind agent") && shown.contains("a person's token, so nothing was saved"), "{shown}");
+    assert!(shown.contains("was revoked on the server"), "{shown}");
+    assert!(keychain.items().is_empty());
+    assert!(!credentials_file(dir.path()).exists());
+    let root = server.root.path();
+    let out = bd(root).args(["--json", "serve", "token", "list", "--root"]).arg(root).output().unwrap();
+    let list: Value = serde_json::from_str(&check(out, "token list")).unwrap();
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 1, "{list:?}");
+    assert!(list[0]["revoked_at"].is_string(), "the token issued is revoked: {list:?}");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn logout_human_revokes_a_sign_in() {
+    let github = FakeGithub::start();
+    let server = sign_in_server(&github, "[[github.allow]]\nusers = [\"carol\"]\nkind = \"human\"\n");
+    let dir = checkout_dir();
+    let keychain = Keychain::new(dir.path());
+    let url = server.url();
+    github.next("carol", 0);
+    let (out, shown) =
+        on_terminal(keychain.bd(dir.path(), &["--json", "remote", "login", "--provider", "github", "--human", &url]));
+    assert!(out.status.success(), "{shown}");
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        (&v["actor"], &v["kind"], &v["account"]["login"]),
+        (&json!("github:carol"), &json!("human"), &json!("carol")),
+        "{v}"
+    );
+    let items = keychain.items();
+    let entry = &items[&format!("server:{}", server.base)];
+    assert_eq!((&entry["signed_in"], &entry["kind"]), (&json!(true), &json!("human")), "{entry}");
+    assert!(!credentials_file(dir.path()).exists());
+
+    let out = keychain.bd(dir.path(), &["remote", "logout", &url, "--human"]).stdin(Stdio::null()).output().unwrap();
+    let text = check(out, "logout --human");
+    assert!(
+        text.contains("Removed the person's access token") && text.contains("revoked it on the server too"),
+        "{text}"
+    );
+    assert!(keychain.items().is_empty());
+    let root = server.root.path();
+    let out = bd(root).args(["--json", "serve", "token", "list", "--root"]).arg(root).output().unwrap();
+    let list: Value = serde_json::from_str(&check(out, "token list")).unwrap();
+    assert!(list.as_array().unwrap().iter().all(|t| t["revoked_at"].is_string()), "{list}");
+}
+
+/// A workspace with a human gate `t-2` blocking `t-1`, made by `alice`.
+fn gated(alice: &Client) {
+    alice.ok(&["create", "Deploy"]);
+    assert_eq!(alice.ok(&["-q", "gate", "create", "-t", "human", "--blocks", "t-1"]).trim(), "t-2");
+}
+
+/// The person's token `secret` saved in `keychain` for alice's workspace by `bd remote login --human`
+/// (`--workspace-only` with `workspace_only`), on a terminal.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn save_human(keychain: &Keychain, alice: &Client, secret: &str, workspace_only: bool) {
+    let mut args = vec!["remote", "login", &alice.url, "--human"];
+    if workspace_only {
+        args.push("--workspace-only");
+    }
+    let (out, shown) = login_human_typing(keychain.on(alice.cmd(&args)), secret);
+    assert!(out.status.success(), "{shown}");
+}
+
+const HUMAN_NOTE: &str = "bd: using the person's access token saved in the test keychain";
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn gate_resolve_uses_the_keychain_token_after_a_refusal() {
+    let server = Server::start();
+    let carol = server.token("carol-desk", "carol", &["--kind", "human"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let keychain = Keychain::new(alice.dir.path());
+    save_human(&keychain, &alice, &carol, true);
+    gated(&alice);
+
+    let before = keychain.log();
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["gate", "resolve", "t-2", "-r", "approved"])));
+    assert!(out.status.success(), "{shown}");
+    assert_eq!(shown.matches(HUMAN_NOTE).count(), 1, "{shown}");
+    assert!(shown.contains(&format!("{HUMAN_NOTE} (role write) for this command")), "{shown}");
+    assert!(!shown.contains("is a human gate") && !shown.contains(&carol), "{shown}");
+    assert_eq!(keychain.since(&before), format!("get workspace:{}\n", alice.url), "one read, no write");
+    assert_eq!(alice.json(&["show", "t-2"])["status"], "closed");
+    let events = alice.ok(&["--json", "events", "--since", "0"]);
+    let events: Vec<Value> = events.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let resolved = events.iter().rfind(|e| e["issue_id"] == "t-2").unwrap();
+    assert_eq!((&resolved["op"], &resolved["actor"]), (&json!("closed"), &json!("carol")), "{events:?}");
+    assert!(!credentials_file(alice.dir.path()).exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn a_server_scope_item_is_found_after_a_workspace_miss() {
+    let server = Server::start();
+    let carol = server.token("carol-desk", "carol", &["--kind", "human"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let keychain = Keychain::new(alice.dir.path());
+    save_human(&keychain, &alice, &carol, false);
+    gated(&alice);
+
+    let before = keychain.log();
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["gate", "resolve", "t-2"])));
+    assert!(out.status.success(), "{shown}");
+    assert_eq!(keychain.since(&before), format!("get workspace:{}\nget server:{}\n", alice.url, server.base));
+    assert_eq!(alice.json(&["show", "t-2"])["status"], "closed");
+}
+
+#[test]
+fn the_keychain_is_not_used_by_agents_or_without_a_terminal() {
+    let server = Server::start();
+    let carol = server.token("carol-desk", "carol", &["--kind", "human", "--role", "admin"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let keychain = Keychain::new(alice.dir.path());
+    let entry = json!({ "token": carol, "ca": "system", "kind": "human", "role": "admin" });
+    keychain.put(&format!("workspace:{}", alice.url), entry);
+    gated(&alice);
+
+    let mut in_session = keychain.on(alice.cmd(&["gate", "resolve", "t-2"]));
+    in_session.env("COPILOT_AGENT_SESSION_ID", "s1");
+    for (mut cmd, what) in
+        [(in_session, "in an agent session"), (keychain.on(alice.cmd(&["gate", "resolve", "t-2"])), "piped")]
+    {
+        let out = cmd.stdin(Stdio::null()).output().unwrap();
+        assert_eq!(out.status.code(), Some(7), "{what}: {}", stderr_of(&out));
+        assert!(stderr_of(&out).contains("bd remote login --human"), "{what}: {}", stderr_of(&out));
+        assert!(!stderr_of(&out).contains("bd: "), "{what}: no note: {}", stderr_of(&out));
+    }
+    assert!(keychain.log().is_empty(), "never read: {}", keychain.log());
+    assert_eq!(alice.json(&["show", "t-2"])["status"], "open");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn the_keychain_is_never_read_for_other_commands() {
+    let server = Server::start();
+    let carol = server.token("carol-desk", "carol", &["--kind", "human", "--role", "admin"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let keychain = Keychain::new(alice.dir.path());
+    save_human(&keychain, &alice, &carol, true);
+
+    let before = keychain.log();
+    for args in [&["create", "Plain"][..], &["show", "t-1"], &["ready"]] {
+        let (out, shown) = on_terminal(keychain.on(alice.cmd(args)));
+        assert!(out.status.success(), "bd {args:?}: {shown}");
+        assert!(!shown.contains("keychain"), "bd {args:?}: {shown}");
+    }
+    // A refusal no person's token is asked for (an admin-only command) leaves it alone too.
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["config", "set", "lease.grace", "1m"])));
+    assert_eq!(out.status.code(), Some(7), "{shown}");
+    assert!(!shown.contains("keychain"), "{shown}");
+    assert_eq!(keychain.since(&before), "", "never read");
+    assert_eq!(alice.json(&["show", "t-1"])["created_by"], "alice");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn an_empty_or_unavailable_keychain_falls_back() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let keychain = Keychain::new(alice.dir.path());
+    gated(&alice);
+
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["gate", "resolve", "t-2"])));
+    assert_eq!(out.status.code(), Some(7), "{shown}");
+    assert!(shown.contains("t-2 is a human gate") && shown.contains("bd remote login --human"), "{shown}");
+    assert!(!shown.contains("keychain unavailable") && !shown.contains(HUMAN_NOTE), "{shown}");
+    assert_eq!(keychain.log(), format!("get workspace:{}\nget server:{}\n", alice.url, server.base));
+
+    keychain.unavailable();
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["gate", "resolve", "t-2"])));
+    assert_eq!(out.status.code(), Some(7), "{shown}");
+    assert!(shown.contains("t-2 is a human gate") && shown.contains("bd: keychain unavailable: "), "{shown}");
+    // With --json, stderr stays the one error.
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["--json", "gate", "resolve", "t-2"])));
+    assert_eq!(out.status.code(), Some(7), "{shown}");
+    assert!(!shown.contains("keychain unavailable"), "{shown}");
+
+    assert_eq!(alice.json(&["show", "t-2"])["status"], "open");
+    assert!(!credentials_file(alice.dir.path()).exists());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn take_overs_use_the_keychain_token_only_when_it_is_admin() {
+    let server = Server::start();
+    let carol = server.token("carol-desk", "carol", &["--kind", "human"]);
+    let dana = server.token("dana-desk", "dana", &["--kind", "human", "--role", "admin"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    let keychain = Keychain::new(alice.dir.path());
+    bob.ok(&["create", "Contended"]);
+    bob.ok(&["claim", "t-1"]);
+
+    save_human(&keychain, &alice, &carol, true);
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["release", "t-1", "--take-over"])));
+    assert_eq!(out.status.code(), Some(7), "{shown}");
+    assert!(shown.contains("is role write") && shown.contains("needs an admin token"), "{shown}");
+    assert!(!shown.contains(HUMAN_NOTE), "{shown}");
+    assert_eq!(alice.json(&["show", "t-1"])["assignee"], "bob");
+
+    save_human(&keychain, &alice, &dana, true);
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["release", "t-1", "--take-over"])));
+    assert!(out.status.success(), "{shown}");
+    assert!(shown.contains(&format!("{HUMAN_NOTE} (role admin)")), "{shown}");
+    assert_eq!(alice.json(&["show", "t-1"])["status"], "open");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn publish_uses_the_keychain_token_up_front() {
+    let (server, log) = logged_server(Server::prepare(), &[]);
+    let carol = server.token("carol-desk", "carol", &["--kind", "human", "--role", "admin"]);
+    let alice = server.client(&server.token("alice-laptop", "alice", &["--role", "admin"]));
+    let keychain = Keychain::new(alice.dir.path());
+    publish_source(alice.dir.path());
+    save_human(&keychain, &alice, &carol, true);
+
+    let before = keychain.log();
+    let cmd = keychain.on(alice.cmd(&["publish", "--from", "src", "--dry-run", "--only", "playbooks"]));
+    let (out, shown) = on_terminal(cmd);
+    assert!(out.status.success(), "{shown}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("+ playbooks/ship.toml"), "{shown}");
+    assert_eq!(shown.matches(HUMAN_NOTE).count(), 1, "{shown}");
+    assert_eq!(keychain.since(&before), format!("get workspace:{}\n", alice.url));
+    eventually("the publish's log line", || logged(&log, r#"command="publish""#) == 1);
+    let text = std::fs::read_to_string(&log).unwrap();
+    let publishes: Vec<&str> =
+        text.lines().filter(|l| l.contains(" exec ") && l.contains(r#"command="publish""#)).collect();
+    assert_eq!(publishes.len(), 1, "sent once, with the person's token: {text}");
+    assert!(publishes[0].contains("token=carol-desk") && publishes[0].contains("exit_code=0"), "{}", publishes[0]);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn publish_works_with_only_the_keychain_token() {
+    let server = Server::start();
+    let carol = server.token("carol-desk", "carol", &["--kind", "human", "--role", "admin"]);
+    let dir = checkout_dir();
+    let keychain = Keychain::new(dir.path());
+    let url = server.url();
+    publish_source(dir.path());
+    let login = keychain.bd(dir.path(), &["remote", "login", &url, "--human", "--workspace-only"]);
+    let (out, shown) = login_human_typing(login, &carol);
+    assert!(out.status.success(), "{shown}");
+    assert!(!credentials_file(dir.path()).exists());
+
+    let publish = || keychain.bd(dir.path(), &["--remote", &url, "publish", "--from", "src", "--dry-run"]);
+    let before = keychain.log();
+    let (out, shown) = on_terminal(publish());
+    assert!(out.status.success(), "{shown}");
+    assert_eq!(shown.matches(HUMAN_NOTE).count(), 1, "{shown}");
+    assert_eq!(keychain.since(&before), format!("get workspace:{url}\n"));
+
+    // Without a terminal, no token: as before, and the keychain is not read.
+    let before = keychain.log();
+    let out = publish().stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains(&format!("no access token for {url}")), "{}", stderr_of(&out));
+    assert_eq!(keychain.since(&before), "");
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn human_sign_ins_renew_in_the_keychain() {
+    let github = FakeGithub::start();
+    github.install("acme");
+    let server = refresh_server(&github, "[[github.allow]]\nusers = [\"carol\"]\nkind = \"human\"\n");
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let keychain = Keychain::new(alice.dir.path());
+    let url = server.url();
+    github.next("carol", 0);
+    let login =
+        keychain.on(alice.cmd(&["remote", "login", "--provider", "github", "--human", "--workspace-only", &url]));
+    let (out, shown) = on_terminal(login);
+    assert!(out.status.success(), "{shown}");
+    let account = format!("workspace:{url}");
+    let mut entry = keychain.items()[&account].clone();
+    assert_eq!((&entry["signed_in"], &entry["kind"]), (&json!(true), &json!("human")), "{entry}");
+    let first = entry["token"].clone();
+    entry["refresh_after"] = json!("2020-01-01T00:00:00.000Z");
+    keychain.put(&account, entry);
+
+    gated(&alice);
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["gate", "resolve", "t-2"])));
+    assert!(out.status.success(), "{shown}");
+    let renewed = keychain.items()[&account].clone();
+    assert_ne!(renewed["token"], first, "renewed");
+    assert_ne!(renewed["refresh_after"], json!("2020-01-01T00:00:00.000Z"), "{renewed}");
+    assert_eq!((&renewed["kind"], &renewed["signed_in"]), (&json!("human"), &json!(true)), "{renewed}");
+    assert!(renewed.get("refresh_request").is_none(), "answered: {renewed}");
+    assert_eq!(alice.json(&["show", "t-2"])["status"], "closed");
+    assert!(!credentials_file(alice.dir.path()).exists());
+
+    // Revoked on the server: refused, never sent again with alice's token.
+    let root = server.root.path();
+    check(
+        bd(root).args(["serve", "token", "revoke", "--account", "carol", "--root"]).arg(root).output().unwrap(),
+        "revoke",
+    );
+    alice.ok(&["create", "Hotfix"]);
+    assert_eq!(alice.ok(&["-q", "gate", "create", "-t", "human", "--blocks", "t-3"]).trim(), "t-4");
+    let (out, shown) = on_terminal(keychain.on(alice.cmd(&["gate", "resolve", "t-4"])));
+    assert_eq!(out.status.code(), Some(7), "{shown}");
+    assert_eq!(shown.matches(HUMAN_NOTE).count(), 1, "{shown}");
+    assert_eq!(alice.json(&["show", "t-4"])["status"], "open");
+    assert!(!credentials_file(alice.dir.path()).exists());
 }

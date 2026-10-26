@@ -150,3 +150,11 @@ pub(super) fn respond(out: &mut FrameWriter, response: &ExecResponse) -> std::re
 pub(super) fn lossy(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
+
+/// The rights the exit frame names: what a refusal said would get past it,
+/// only when the request committed no write (`App::write` records each
+/// committed one), so a client sending it again with such a token never
+/// applies a part of it twice.
+pub(super) fn needs_for(needs: Vec<bd_core::Need>, committed: bool) -> Vec<bd_core::Need> {
+    if committed { Vec::new() } else { needs }
+}

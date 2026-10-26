@@ -1,6 +1,17 @@
+use serde::{Deserialize, Serialize};
+
 use crate::model::Status;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A right a refused operation needs that the caller's access token lacks:
+/// an admin token, or a person's (human-kind) one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Need {
+    Admin,
+    Human,
+}
 
 /// Every failure the engine can report. Each variant maps to a stable
 /// machine-readable [`Error::code`] and a process [`Error::exit_code`].
@@ -99,6 +110,14 @@ pub enum Error {
     /// workspaces or actor do not allow the operation.
     Unauthorized(String),
 
+    /// An [`Error::Unauthorized`] refusal that a token with the rights in
+    /// `needs` (sorted, without duplicates) would get past: same code, exit
+    /// code and text. Built by [`Error::with_needs`], read by [`Error::needs`].
+    Needs {
+        message: String,
+        needs: Vec<Need>,
+    },
+
     /// A bd server could not be reached, refused the request, or answered
     /// unexpectedly, and the command did not take effect: it is safe to run
     /// again.
@@ -124,7 +143,8 @@ impl std::fmt::Display for Error {
             | Error::NoWorkspace(msg)
             | Error::Unauthorized(msg)
             | Error::Remote(msg)
-            | Error::AnswerLost(msg) => f.write_str(msg),
+            | Error::AnswerLost(msg)
+            | Error::Needs { message: msg, .. } => f.write_str(msg),
             Error::NotFound { kind, id } => write!(f, "{kind} not found: {id}"),
             Error::AlreadyClaimed { id, holder } => write!(f, "{id} is already claimed by {holder}"),
             Error::NotClaimable { id, status } => write!(f, "{id} is not claimable (status {status})"),
@@ -204,6 +224,22 @@ impl Error {
         Error::NotFound { kind, id: id.into() }
     }
 
+    /// An access refusal that a token with the `needs` rights would get past.
+    pub fn with_needs(needs: &[Need], message: impl Into<String>) -> Self {
+        let mut needs = needs.to_vec();
+        needs.sort_unstable();
+        needs.dedup();
+        Error::Needs { message: message.into(), needs }
+    }
+
+    /// The rights that would get past this refusal; empty for every other error.
+    pub fn needs(&self) -> &[Need] {
+        match self {
+            Error::Needs { needs, .. } => needs,
+            _ => &[],
+        }
+    }
+
     /// Stable machine-readable error code (used in JSON error output).
     pub fn code(&self) -> &'static str {
         match self {
@@ -222,7 +258,7 @@ impl Error {
             Error::Busy(_) | Error::Locked(_) => "busy",
             Error::SchemaTooNew { .. } => "schema_too_new",
             Error::NoWorkspace(_) => "no_workspace",
-            Error::Unauthorized(_) => "unauthorized",
+            Error::Unauthorized(_) | Error::Needs { .. } => "unauthorized",
             Error::Remote(_) => "remote",
             Error::AnswerLost(_) => "answer_lost",
             Error::Sqlite(_) => "sqlite",
@@ -245,7 +281,7 @@ impl Error {
             | Error::LeaseLost { .. } => 4,
             Error::Busy(_) | Error::Locked(_) => 5,
             Error::EventsTruncated { .. } | Error::HistoryPruned { .. } => 6,
-            Error::Unauthorized(_) => 7,
+            Error::Unauthorized(_) | Error::Needs { .. } => 7,
             Error::Remote(_) => 8,
             Error::AnswerLost(_) => 9,
             Error::Conflict { .. } => 13,

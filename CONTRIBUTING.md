@@ -128,7 +128,8 @@ crates/bd-cli/src/    lib (run, execute, dispatch) · cli/ (clap; access: what b
                       · commands/ · playbooks · gates (gh probes) · batch · fmt · logging
                       · backup (bd backup and bd serve's backups: snapshots, naming, retention)
                       · io (stdio and files, or a captured request) · mcp/ (MCP tools over stdio)
-                      · remote/ (client) · credentials (bd remote login) · tokens (roles, token summaries)
+                      · remote/ (client) · credentials (bd remote login) · keychain (login --human)
+                      · tokens (roles, token summaries)
                       · protocol (wire format) · stream (reading streamed answers) · agents (bd agents)
                       + agents/ (checkout, lock, mcp_file, sync, approve, show, hook, watch) · hook (session
                       hook output per harness)

@@ -87,7 +87,7 @@ pub use claims::{Claim, ClaimOptions, LeaseView, NextFrom, ReclaimOptions, Recla
 pub use compaction::{Candidate, CompactIssueOutcome, CompactStats};
 pub use config::IdMode;
 pub use duplicates::{CloseAsOptions, CloseAsOutcome, Replacement, SimilarPair, similar_pairs};
-pub use error::{Error, Result};
+pub use error::{Error, Need, Result};
 pub use events::{EventPage, EventQuery, PruneOptions, PruneOutcome};
 pub use graph::{BlockChange, DepChange, Direction, TreeNode};
 pub use issues::{

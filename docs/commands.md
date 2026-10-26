@@ -23,7 +23,7 @@ and error codes.
 | Data | `export`, `import`, `batch`, `backup` | [below](#data) |
 | GitHub | `github status/pull/push/sync` | [GitHub Issues sync](github.md) |
 | Operations | `metrics`, `bench` | [Observability](observability.md), [Benchmarks](benchmarks.md) |
-| Remote | `serve`, `serve check`, `serve token create/list/revoke/events/accounts/link/name`, `remote set/show/unset/login/logout` | [Remote server](remote.md), [Signing in](sign-in.md) |
+| Remote | `serve`, `serve check`, `serve token create/list/revoke/events/accounts/link/name`, `remote set/show/unset/login/logout`, `remote login/logout/show --human` (a person's token in the OS keychain) | [Remote server](remote.md), [Signing in](sign-in.md) |
 
 `rm` subcommands also answer to `remove`, and `list` subcommands of
 `playbook`, `gate` and `serve token` to `ls`.

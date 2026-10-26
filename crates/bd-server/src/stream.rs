@@ -457,7 +457,12 @@ impl FrameWriter {
         for (path, data) in &r.files {
             let _ = self.write(Some(path), data.as_bytes());
         }
-        self.finish(Exit { exit_code: r.exit_code, stderr: r.stderr.clone(), replayed: r.replayed })
+        self.finish(Exit {
+            exit_code: r.exit_code,
+            stderr: r.stderr.clone(),
+            replayed: r.replayed,
+            needs: r.needs.clone(),
+        })
     }
 
     /// The command finished: send the rest of its output, then `exit`; or,
@@ -468,6 +473,7 @@ impl FrameWriter {
                 exit_code: exit.exit_code,
                 stderr: exit.stderr,
                 replayed: exit.replayed,
+                needs: exit.needs,
                 issue: self.issue.take(),
                 cursor: self.cursor,
                 ..Default::default()
@@ -699,7 +705,8 @@ mod tests {
                 Frame::Issue(id) => r.issue = Some(id.into_owned()),
                 Frame::Cursor(seq) => r.cursor = Some(seq),
                 Frame::Exit(exit) => {
-                    (r.exit_code, r.stderr, r.replayed) = (exit.exit_code, exit.stderr, exit.replayed);
+                    (r.exit_code, r.stderr, r.replayed, r.needs) =
+                        (exit.exit_code, exit.stderr, exit.replayed, exit.needs);
                     exited = true;
                 }
             }
@@ -727,7 +734,7 @@ mod tests {
         w.file("snap.jsonl", b"{\"_type\":\"header\"}\n").unwrap();
         w.file("empty.jsonl", b"").unwrap();
         w.stdout("✓ done\n".as_bytes()).unwrap();
-        let sent = w.finish(Exit { exit_code: 3, stderr: "error: x\n".into(), replayed: false });
+        let sent = w.finish(Exit { exit_code: 3, stderr: "error: x\n".into(), ..Default::default() });
         assert!(!sent.streamed);
         assert_eq!(sent.bytes, 12 + 19 + 9);
         let body = answered.blocking_recv().unwrap();
@@ -738,6 +745,31 @@ mod tests {
         assert_eq!(r.files.get("snap.jsonl").map(String::as_str), Some("{\"_type\":\"header\"}\n"));
         assert_eq!(r.files.get("empty.jsonl").map(String::as_str), Some(""), "an empty file still has a frame");
         assert_eq!((r.exit_code, r.stderr.as_str()), (3, "error: x\n"));
+    }
+
+    #[test]
+    fn exit_frames_carry_what_a_refusal_needs() {
+        use bd_core::Need;
+        let needs = vec![Need::Admin, Need::Human];
+        let (mut w, answered) = writer(Limits::SERVE);
+        w.finish(Exit { exit_code: 7, needs: needs.clone(), ..Default::default() });
+        let text = String::from_utf8(runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap()).unwrap();
+        assert!(text.contains(r#""needs":["admin","human"]"#), "{text}");
+        assert_eq!(gather(text.as_bytes()).needs, needs);
+
+        // A held answer keeps them, and sends them when it is responded with.
+        let (mut w, answered) = writer(Limits::SERVE);
+        w.hold(10);
+        let held = w.finish(Exit { exit_code: 7, needs: needs.clone(), ..Default::default() }).held.unwrap();
+        assert_eq!(held.needs, needs);
+        w.respond(&held);
+        assert_eq!(gather(&runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap()).needs, needs);
+
+        // None is sent when there are none.
+        let (mut w, answered) = writer(Limits::SERVE);
+        w.finish(Exit { exit_code: 7, ..Default::default() });
+        let bytes = runtime().block_on(read_all(answered.blocking_recv().unwrap())).unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("needs"));
     }
 
     #[test]
@@ -880,7 +912,7 @@ mod tests {
         let (mut w, mut answered) = writer(Limits::SERVE);
         w.hold(10);
         w.stdout(b"t-1\n").unwrap();
-        let sent = w.finish(Exit { exit_code: 0, stderr: "warn\n".into(), replayed: false });
+        let sent = w.finish(Exit { exit_code: 0, stderr: "warn\n".into(), ..Default::default() });
         let held = sent.held.expect("held whole");
         assert_eq!((held.stdout.as_str(), held.stderr.as_str(), sent.bytes), ("t-1\n", "warn\n", 4));
         assert!(answered.try_recv().is_err(), "nothing sent yet: the server stores it first");

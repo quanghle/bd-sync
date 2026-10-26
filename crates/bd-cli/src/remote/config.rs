@@ -4,13 +4,15 @@
 
 use std::path::{Path, PathBuf};
 
-use bd_core::{Error, Result};
+use bd_core::{Error, Need, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{Configured, Remote, Source, env};
+use super::{Configured, Remote, Source, env, human};
 use crate::app::App;
+use crate::cli::Command;
 use crate::credentials;
+use crate::io;
 use crate::protocol::valid_workspace_name;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -142,26 +144,38 @@ pub(super) fn token_for(url: &str, trust: &Trust, source: &Source) -> Result<Opt
     // A CA named by a checkout's remote.toml must be the one the token was
     // saved under, or a cloned repository could send it to a man in the
     // middle. $BD_CA_CERT is the user's own setting.
-    if env("BD_CA_CERT").is_none() && trust.anchor != saved.ca {
-        let ca_cert = trust.path.as_deref();
-        let then = match (saved.ca.as_str(), ca_cert) {
-            (credentials::SYSTEM_CA, _) => "the system's certificate authorities",
-            (_, Some(_)) => "another CA certificate",
-            (_, None) => "a CA certificate",
-        };
-        let now = ca_cert.map_or_else(
-            || "the system's certificate authorities".to_string(),
-            |p| format!("the CA certificate {}", p.display()),
-        );
-        return Err(Error::Unauthorized(format!(
-            "the access token saved for {} is not sent to {url}: it was saved trusting {then}, and {url} is now \
-             set up to trust {now}. If that CA is trusted, log in again here (`bd remote login`); or set BD_TOKEN with \
-             {}",
-            saved.key,
-            env_setup(url, ca_cert)
-        )));
+    if let Some(e) = saved_trust_error(url, &saved.key, &saved.ca, trust) {
+        return Err(e);
     }
     Ok(Some(Token::Saved(saved)))
+}
+
+/// Why a token saved for `key` trusting `saved_ca` is not sent to `url`,
+/// now reached under `trust`; `None` when it may be. `$BD_CA_CERT`, the
+/// user's own setting, overrides the check.
+pub(super) fn saved_trust_error(url: &str, key: &str, saved_ca: &str, trust: &Trust) -> Option<Error> {
+    trust_error(url, key, saved_ca, trust, env("BD_CA_CERT").is_some())
+}
+
+fn trust_error(url: &str, key: &str, saved_ca: &str, trust: &Trust, ca_override: bool) -> Option<Error> {
+    if ca_override || trust.anchor == saved_ca {
+        return None;
+    }
+    let ca_cert = trust.path.as_deref();
+    let then = match (saved_ca, ca_cert) {
+        (credentials::SYSTEM_CA, _) => "the system's certificate authorities",
+        (_, Some(_)) => "another CA certificate",
+        (_, None) => "a CA certificate",
+    };
+    let now = ca_cert.map_or_else(
+        || "the system's certificate authorities".to_string(),
+        |p| format!("the CA certificate {}", p.display()),
+    );
+    Some(Error::Unauthorized(format!(
+        "the access token saved for {key} is not sent to {url}: it was saved trusting {then}, and {url} is now set \
+         up to trust {now}. If that CA is trusted, log in again here (`bd remote login`); or set BD_TOKEN with {}",
+        env_setup(url, ca_cert)
+    )))
 }
 
 /// The certificates of a PEM CA file.
@@ -187,10 +201,44 @@ pub fn ca_certificates(path: &Path) -> std::result::Result<Vec<ureq::tls::Certif
 
 /// The remote workspace this invocation uses, or `None` for a local one.
 pub fn detect(app: &App) -> Result<Option<Remote>> {
-    let Some(c) = configured(app)? else { return Ok(None) };
-    let trust = Trust::load(c.ca_cert.as_deref())?;
+    let Some((c, trust)) = configured_trust(app)? else { return Ok(None) };
     let token = token_for(&c.url, &trust, &c.source)?.ok_or_else(|| missing_token(&c.url, trust.path.as_deref()))?;
     Ok(Some(token.remote(c, trust)))
+}
+
+/// [`detect`] for the command line `cmd` (`bd`'s own entry point): `bd
+/// publish`, which only a person's admin token may run, also goes with the
+/// person's token from the keychain when no other is configured. No other
+/// command looks at the keychain here.
+pub fn detect_for(app: &App, cmd: &Command) -> Result<Option<Remote>> {
+    let Some((c, trust)) = configured_trust(app)? else { return Ok(None) };
+    if let Some(token) = token_for(&c.url, &trust, &c.source)? {
+        return Ok(Some(token.remote(c, trust)));
+    }
+    let missing = missing_token(&c.url, trust.path.as_deref());
+    if !matches!(cmd, Command::Publish(_)) {
+        return Err(missing);
+    }
+    match human::human_remote(c, trust, &[Need::Admin, Need::Human]) {
+        Ok((remote, note)) => {
+            io::errln(note);
+            Ok(Some(remote))
+        }
+        Err(skip) => {
+            if let Some(note) = human::skip_note(&skip).filter(|_| !app.g.json) {
+                io::errln(note);
+            }
+            Err(missing)
+        }
+    }
+}
+
+/// The remote workspace this invocation uses, and what its server is
+/// trusted through, before its access token is looked up.
+pub(super) fn configured_trust(app: &App) -> Result<Option<(Configured, Trust)>> {
+    let Some(c) = configured(app)? else { return Ok(None) };
+    let trust = Trust::load(c.ca_cert.as_deref())?;
+    Ok(Some((c, trust)))
 }
 
 /// The nearest `.bd/remote.toml`, unless a nearer `.bd/bd.db` comes first.
@@ -273,6 +321,27 @@ mod tests {
         ] {
             assert!(check_url(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn saved_tokens_go_only_where_their_trust_holds() {
+        let system = Trust::load(None).unwrap();
+        let private = Trust { path: Some(PathBuf::from("ca.pem")), certs: None, anchor: "sha256:ab".into() };
+        let url = "https://bd.example.com/w/proj";
+        let key = "https://bd.example.com";
+        assert!(trust_error(url, key, credentials::SYSTEM_CA, &system, false).is_none());
+        assert!(trust_error(url, key, "sha256:ab", &private, false).is_none());
+
+        let e = trust_error(url, key, credentials::SYSTEM_CA, &private, false).expect("another anchor");
+        assert_eq!(e.exit_code(), 7);
+        let text = e.to_string();
+        assert!(text.contains("saved trusting the system's certificate authorities"), "{text}");
+        assert!(text.contains("the CA certificate ca.pem") && text.contains(key), "{text}");
+        let e = trust_error(url, key, "sha256:00", &system, false).expect("another anchor");
+        assert!(e.to_string().contains("saved trusting a CA certificate"), "{e}");
+
+        assert!(trust_error(url, key, "sha256:00", &system, true).is_none(), "$BD_CA_CERT is the user's own");
+        assert!(trust_error(url, key, credentials::SYSTEM_CA, &private, true).is_none());
     }
 
     #[test]

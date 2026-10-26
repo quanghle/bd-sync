@@ -16,7 +16,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use bd_core::{Error, Result};
+use bd_core::{Error, Need, Result};
 
 /// Stderr kept for a served command's response. Commands print errors and
 /// warnings there, which are short; anything past this is cut.
@@ -76,6 +76,10 @@ pub struct Capture {
     /// What `bd info` tells its client of the request's access token (the
     /// server's summary of it); the fields above are what it may override.
     pub token: Option<serde_json::Value>,
+    /// The rights a refusal said would get past it (see [`Error::needs`]),
+    /// noted by [`note_needs`]: `bd serve` sends them in the exit frame
+    /// when the request committed no write.
+    pub needs: Vec<Need>,
 }
 
 impl Capture {
@@ -93,6 +97,7 @@ impl Capture {
             token_actor: String::new(),
             max_claims: None,
             token: None,
+            needs: Vec::new(),
         }
     }
 
@@ -191,6 +196,19 @@ pub fn policy() -> Option<bd_core::Policy> {
 /// The summary of the access token of the request being served, if any.
 pub fn request_token() -> Option<serde_json::Value> {
     with_capture(|c| c.token.clone()).flatten()
+}
+
+/// Note the rights a refusal of the request said would get past it; does
+/// nothing outside `bd serve`.
+pub fn note_needs(needs: &[Need]) {
+    if needs.is_empty() {
+        return;
+    }
+    with_capture(|c| {
+        c.needs.extend_from_slice(needs);
+        c.needs.sort_unstable();
+        c.needs.dedup();
+    });
 }
 
 fn with_capture<T>(f: impl FnOnce(&mut Capture) -> T) -> Option<T> {
@@ -509,9 +527,10 @@ pub fn require_admin(what: &str) -> Result<()> {
 /// MCP tool call has neither). Locally the workspace's owner may.
 pub fn require_admin_human(what: &str) -> Result<()> {
     match with_capture(|c| c.admin && c.human) {
-        Some(false) => {
-            Err(Error::Unauthorized(format!("{what} needs an admin access token of a person (role admin, kind human)")))
-        }
+        Some(false) => Err(Error::with_needs(
+            &[Need::Admin, Need::Human],
+            format!("{what} needs an admin access token of a person (role admin, kind human)"),
+        )),
         _ => Ok(()),
     }
 }
@@ -769,6 +788,34 @@ mod tests {
         }
         let (ok, _) = capture(Capture { admin: true, human: true, ..recording().1 }, || require_admin_human("x"));
         assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn refusals_note_what_they_need_in_the_capture() {
+        let (e, _) = capture(recording().1, || require_admin_human("bd publish"));
+        assert_eq!(e.unwrap_err().needs(), [Need::Admin, Need::Human]);
+        let (e, _) = capture(recording().1, || require_admin("config set"));
+        assert!(e.unwrap_err().needs().is_empty(), "admin-only commands do not need a person");
+
+        note_needs(&[Need::Human]);
+        let ((), c) = capture(recording().1, || {
+            note_needs(&[Need::Human]);
+            note_needs(&[]);
+            note_needs(&[Need::Admin, Need::Human]);
+        });
+        assert_eq!(c.needs, [Need::Admin, Need::Human], "merged, sorted, without duplicates");
+
+        // A refused command leaves them in the request's capture.
+        use clap::Parser;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join(".bd").join("bd.db");
+        let cli =
+            crate::cli::Cli::try_parse_from(["bd", "--db", db.to_str().unwrap(), "publish", "--dry-run"]).unwrap();
+        let mut app = crate::app::App::new(cli.global).unwrap();
+        let (code, c) = capture(recording().1, || crate::execute(&mut app, &cli.command));
+        assert_eq!(code, 7);
+        assert_eq!(c.needs, [Need::Admin, Need::Human]);
+        assert!(String::from_utf8_lossy(&c.stderr).contains("bd remote login --human"));
     }
 
     #[test]

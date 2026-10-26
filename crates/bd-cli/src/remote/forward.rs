@@ -4,10 +4,11 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use bd_core::{Error, Result};
+use bd_core::{Error, Need, Result};
 
 use super::delivery::{Delivery, OutputFile};
 use super::events::{follow_events, wait_for_events};
+use super::human::{human_remote, skip_note};
 use super::{Remote, identity, response_error, without_session_flag};
 use crate::app::App;
 use crate::cli::*;
@@ -112,7 +113,47 @@ fn forward(app: &App, remote: &Remote, cli: &Cli, hook: bool) -> Result<ExecResp
     check_outputs(app, &cli.command)?;
     // A session hook prints `bd prime` only once it knows the command worked.
     let write = crate::cli::access(&cli.command) == crate::cli::Access::Write;
-    let response = remote.exec_into(&request, &mut Delivery::new(output_files(app, &cli.command), hook, write))?;
+    // The person's token is looked up at most once: up front for publish, which only a person's admin
+    // token may run, else after a refusal naming what the command needs.
+    let mut looked = hook || remote.human;
+    let mut skipped = None;
+    let mut human = None;
+    if !looked && matches!(cli.command, Command::Publish(_)) {
+        looked = true;
+        match human_remote(remote.configured(), remote.trust().clone(), &[Need::Admin, Need::Human]) {
+            Ok((r, note)) => {
+                io::errln(note);
+                human = Some(r);
+            }
+            Err(skip) => skipped = Some(skip),
+        }
+    }
+    let sender = human.as_ref().unwrap_or(remote);
+    let mut delivery = Delivery::new(output_files(app, &cli.command), hook, write);
+    let mut response = sender.exec_into(&request, &mut delivery)?;
+    // Refused for want of a person's (or an admin's) rights, with nothing committed: sent once more, as a
+    // new request, with the person's token, where it may be used. Never after output reached the user.
+    if !hook && response.exit_code == 7 && !response.needs.is_empty() && !delivery.printed {
+        if !looked {
+            match human_remote(remote.configured(), remote.trust().clone(), &response.needs) {
+                Ok((human, note)) => {
+                    io::errln(note);
+                    let mut again = request.clone();
+                    again.request_id = Some(random_hex(16)?);
+                    let mut delivery = Delivery::new(output_files(app, &cli.command), hook, write);
+                    response = human.exec_into(&again, &mut delivery)?;
+                }
+                Err(skip) => skipped = Some(skip),
+            }
+        }
+        if let Some(note) = skipped.as_ref().and_then(skip_note).filter(|_| !app.g.json) {
+            if !response.stderr.is_empty() && !response.stderr.ends_with('\n') {
+                response.stderr.push('\n');
+            }
+            response.stderr.push_str(&note);
+            response.stderr.push('\n');
+        }
+    }
     Ok(match &cli.command {
         Command::Publish(_) => crate::publish::from_older_server(response, app.g.json),
         _ => response,

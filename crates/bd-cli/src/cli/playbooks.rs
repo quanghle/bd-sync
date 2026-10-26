@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Subcommand};
+use clap::{ArgGroup, Args, Subcommand};
 
 use super::*;
 
@@ -245,6 +245,9 @@ pub enum GateCommand {
     /// Put a gate in front of existing work
     #[command(long_about = GATE_CREATE_LONG_ABOUT)]
     Create(Box<GateCreateArgs>),
+    /// Replace or clear the approvers of an open human gate
+    #[command(long_about = GATE_UPDATE_LONG_ABOUT)]
+    Update(GateUpdateArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -317,7 +320,8 @@ Put a gate in front of existing work
 Creates a gate that each --blocks issue waits on, as on any blocker. The gate
 also takes on their prerequisites, so it arms only once that work could
 otherwise start; timers and timeouts count from arming. Gate types:
-  human   opens with `bd gate resolve` (through bd serve, by a human token)
+  human   opens with `bd gate resolve` (through bd serve, by a human token;
+          with --approver, only one of the approvers or their sub-actors)
   timer   opens once --timeout has passed
   issue   opens when the --await-id issue closes as done
   gh:pr   opens when pull request --await-id merges
@@ -330,6 +334,7 @@ evaluates gates.";
 const GATE_CREATE_EXAMPLES: &str = "\
 Examples:
   bd gate create -t human --blocks bd-12 -a alice
+  bd gate create -t human --blocks bd-12 --approver github:alice,github:bob
   bd gate create -t timer --timeout 24h --blocks bd-12
   bd gate create -t gh:pr --await-id 42 --blocks bd-12 --timeout 2d
   bd gate create -t gh:run --await-id ci.yml --branch main --blocks bd-12";
@@ -372,6 +377,8 @@ pub struct GateCreateArgs {
     /// Who should act on it, e.g. the approver
     #[arg(short, long, value_name = "ACTOR")]
     pub assignee: Option<String>,
+    #[arg(long = "approver", value_name = "ACTOR", value_delimiter = ',', help = APPROVER_HELP)]
+    pub approvers: Vec<String>,
     /// Parent issue (default: the parent of the single issue it holds back, unless that parent is closed)
     #[arg(long, value_name = "ID")]
     pub parent: Option<String>,
@@ -379,4 +386,40 @@ pub struct GateCreateArgs {
     /// holds back)
     #[arg(short, long, value_parser = parse_priority)]
     pub priority: Option<u8>,
+}
+
+const APPROVER_HELP: &str = "Human gates only: who may open it through bd serve, an actor or any of its sub-actors \
+(repeatable or comma separated, at most 32; locally informational)";
+
+const GATE_UPDATE_LONG_ABOUT: &str = "\
+Replace or clear the approvers of an open human gate
+
+--approver replaces the whole list; --clear-approvers removes it, so any
+human token may open the gate again. A list stored invalid (which matches
+nobody) is replaced or cleared the same way. Through bd serve, this needs a
+human token of one of the gate's approvers (of any person when it has none),
+or a human admin's. Locally, approvers are informational.";
+
+const GATE_UPDATE_EXAMPLES: &str = "\
+Examples:
+  bd gate update bd-15 --approver github:alice --approver github:bob
+  bd gate update bd-15 --clear-approvers";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = GATE_UPDATE_EXAMPLES)]
+#[command(group(ArgGroup::new("change").required(true).args(["approvers", "clear_approvers"])))]
+pub struct GateUpdateArgs {
+    /// The gate
+    pub id: String,
+    #[arg(
+        long = "approver",
+        value_name = "ACTOR",
+        value_delimiter = ',',
+        conflicts_with = "clear_approvers",
+        help = APPROVER_HELP
+    )]
+    pub approvers: Vec<String>,
+    /// Remove the approvers
+    #[arg(long)]
+    pub clear_approvers: bool,
 }

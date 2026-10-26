@@ -280,7 +280,7 @@ fn walk_the_graph(ws: &mut Ws) {
     // and the last one closes the groups above it, checking human gates.
     ws.write("alice", None, |tx| tx.close_issue(&blocker, &CloseOptions::default()));
     ws.write("bot", agent(), |tx| tx.close_issue(&second, &CloseOptions::default()));
-    ws.write("carol", person(), |tx| tx.resolve_gate(&gate, Some("approved"), false));
+    ws.write("carol", person(), |tx| tx.resolve_gate(&gate, Some("approved"), false, None));
     let claim = ws.write("bot", agent(), |tx| tx.claim(&first, &ClaimOptions::default()));
     ws.write("bot", agent(), |tx| tx.heartbeat(&first, Some(claim.lease.token), None));
     ws.write("bot", agent(), |tx| {
@@ -540,7 +540,7 @@ fn run_the_commands(ws: &mut Ws) {
         })
         .unwrap();
     ws.write("bd-serve", None, |tx| tx.escalate_gate(&gate.id, "overdue"));
-    ws.write("bd-serve", None, |tx| tx.resolve_gate(&gate.id, Some("timer passed"), false));
+    ws.write("bd-serve", None, |tx| tx.resolve_gate(&gate.id, Some("timer passed"), false, None));
     ws.write("alice", None, |tx| {
         tx.record_request("req-1", "token-1", "close")?;
         tx.close_issue(&work, &CloseOptions { take_over: true, ..Default::default() })?;

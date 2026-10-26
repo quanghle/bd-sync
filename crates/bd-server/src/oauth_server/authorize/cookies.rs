@@ -1,4 +1,4 @@
-//! The cookies binding an authorization's steps to one browser: the authorization's, each consent's and each flow at a provider's.
+//! The cookies binding an authorization's steps to one browser: the authorization's, each consent's, each flow at a provider's and each gate approval's.
 
 use std::time::Duration;
 
@@ -81,4 +81,41 @@ pub(super) fn set_flow_cookie(issuer: &str, state: &str, sealed: &str, lasts: Du
 pub(super) fn flow_cookie<'h>(issuer: &str, headers: &'h str, state: &str) -> Option<&'h str> {
     let wanted = flow_cookie_name(issuer, state);
     headers.split(';').filter_map(|c| c.trim().split_once('=')).find(|(name, _)| *name == wanted).map(|(_, v)| v)
+}
+
+/// The name of the cookie that binds one gate approval to the browser that
+/// signed in for it: its own, as for a consent.
+fn gate_cookie_name(issuer: &str, suffix: &str) -> String {
+    let prefix = if issuer.starts_with("https://") { "__Secure-" } else { "" };
+    format!("{prefix}bd_gate_{suffix}")
+}
+
+/// The value of gate approval cookie `suffix` in the browser's `Cookie`
+/// headers (joined with `;`), if well-formed.
+pub fn gate_cookie<'h>(issuer: &str, headers: &'h str, suffix: &str) -> Option<&'h str> {
+    let wanted = gate_cookie_name(issuer, suffix);
+    headers
+        .split(';')
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(name, _)| *name == wanted)
+        .map(|(_, value)| value)
+        .filter(|v| v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// The `Set-Cookie` value binding a gate approval to this browser: sent
+/// back to that gate's page only, never with another site's request
+/// (`SameSite=Strict`: the approval is posted from this server's own page),
+/// for as long as `lasts` (zero: removed).
+pub(super) fn set_gate_cookie(
+    issuer: &str,
+    workspace: &str,
+    gate: &str,
+    suffix: &str,
+    value: &str,
+    lasts: Duration,
+) -> String {
+    let secure = if issuer.starts_with("https://") { "; Secure" } else { "" };
+    let path = format!("{}/w/{workspace}/gates/{gate}", path_of(issuer));
+    let name = gate_cookie_name(issuer, suffix);
+    format!("{name}={value}; Path={path}; Max-Age={}; HttpOnly; SameSite=Strict{secure}", lasts.as_secs())
 }

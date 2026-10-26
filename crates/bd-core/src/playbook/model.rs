@@ -17,7 +17,7 @@ use serde_json::{Map, Value};
 
 use super::template::{self, Condition, experimental_refs, is_ident};
 use crate::error::{Error, Result};
-use crate::gates::{GateKind, GateSpec, validate_repo};
+use crate::gates::{GateKind, GateSpec, MAX_APPROVERS, approver_ok, validate_repo};
 use crate::time::parse_duration;
 
 /// Most steps (after loops and expansions) a single run may create.
@@ -221,6 +221,10 @@ pub struct StepGate {
     /// Who should act on it (e.g. the approver of a human gate).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    /// Human gates: the actors (or their sub-actors) who may open it through
+    /// bd serve. Templates; trimmed and deduplicated once rendered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approvers: Vec<String>,
 }
 
 impl StepGate {
@@ -234,13 +238,44 @@ impl StepGate {
             repo: if templated(&self.repo) { None } else { self.repo.clone() },
             branch: self.branch.clone(),
             event: if templated(&self.event) { Some("push".into()) } else { self.event.clone() },
+            approvers: None,
         };
         let spec = match self.kind {
             GateKind::GhPr if templated(&self.await_id) => GateSpec { await_id: Some("1".into()), ..spec },
             GateKind::GhRun if templated(&self.await_id) => GateSpec { await_id: Some("workflow".into()), ..spec },
             _ => spec,
         };
-        spec.validate().map_err(|e| e.to_string())
+        spec.validate().map_err(|e| e.to_string())?;
+        self.check_approvers()
+    }
+
+    /// The approvers that can be checked before rendering: human gates only,
+    /// each literal a valid actor, at most [`MAX_APPROVERS`] distinct ones.
+    /// Duplicates are dropped once rendered, so they are not refused here.
+    fn check_approvers(&self) -> std::result::Result<(), String> {
+        if self.approvers.is_empty() {
+            return Ok(());
+        }
+        if self.kind != GateKind::Human {
+            return Err(format!("approvers only apply to human gates, not {}", self.kind));
+        }
+        let mut literals: Vec<String> = Vec::new();
+        for a in self.approvers.iter().filter(|a| !a.contains("{{")) {
+            if a.chars().any(char::is_control) {
+                return Err(format!("approver {a:?} has a control character"));
+            }
+            let a = a.trim();
+            if !approver_ok(a) {
+                return Err(format!("invalid approver {a:?}"));
+            }
+            if !literals.iter().any(|l| l.eq_ignore_ascii_case(a)) {
+                literals.push(a.to_string());
+            }
+        }
+        if literals.len() > MAX_APPROVERS {
+            return Err(format!("at most {MAX_APPROVERS} approvers, got {}", literals.len()));
+        }
+        Ok(())
     }
 }
 
@@ -381,6 +416,7 @@ impl Step {
                 }
             }
             out.push(("gate.description", &g.description));
+            out.extend(g.approvers.iter().map(|a| ("gate.approvers", a.as_str())));
         }
         if let Some(l) = &self.repeat {
             match &l.over {
@@ -590,6 +626,8 @@ struct RawGate {
     #[serde(default)]
     description: String,
     assignee: Option<String>,
+    #[serde(default)]
+    approvers: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -670,6 +708,9 @@ fn convert_step(raw: RawStep, path: &str) -> std::result::Result<Step, String> {
                 }
                 (a, b) => a.or(b).map(|s| s.0),
             };
+            if g.approvers.as_ref().is_some_and(Vec::is_empty) {
+                return Err(at("gate: approvers needs at least one actor"));
+            }
             let gate = StepGate {
                 kind,
                 await_id,
@@ -680,6 +721,7 @@ fn convert_step(raw: RawStep, path: &str) -> std::result::Result<Step, String> {
                 title: g.title,
                 description: g.description,
                 assignee: g.assignee,
+                approvers: g.approvers.unwrap_or_default(),
             };
             gate.check_static().map_err(|e| at(&format!("gate: {e}")))?;
             Some(gate)
@@ -1154,10 +1196,10 @@ needs = ["missing-d"]
 
     #[test]
     fn unknown_keys_are_errors_with_locations() {
-        let err = parse("[[steps]]\nid = \"a\"\ntitle = \"A\"\n[steps.gate]\ntype = \"human\"\napprovers = [\"x\"]\n")
+        let err = parse("[[steps]]\nid = \"a\"\ntitle = \"A\"\n[steps.gate]\ntype = \"human\"\napprover = [\"x\"]\n")
             .unwrap_err()
             .to_string();
-        assert!(err.contains("approvers") && err.contains("line"), "{err}");
+        assert!(err.contains("approver") && err.contains("line"), "{err}");
         let err = parse("[[steps]]\nid = \"a\"\nneeds_typo = []\n").unwrap_err().to_string();
         assert!(err.contains("needs_typo"), "{err}");
         let err = parse("[[steps]]\nid = \"a\"\n[steps.gate]\ntype = \"human\"\nbranch = \"main\"\n")

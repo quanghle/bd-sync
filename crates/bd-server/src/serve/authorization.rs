@@ -242,7 +242,7 @@ pub(super) async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Re
     let provider =
         oauth_server::callback_provider(under_issuer(server, req.uri().path())).unwrap_or_default().to_string();
     let srv = server.clone();
-    let answered = match step {
+    let done = match step {
         Authorizing::Begin => {
             blocking(move || Ok(srv.authorizing(&issuer, |cx| authorize::begin(cx, &query, browser.as_deref())))).await
         }
@@ -272,14 +272,8 @@ pub(super) async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Re
         }
         Authorizing::Decide => {
             // Only the consent page posts here: SameSite keeps the cookie from other sites' forms, and this their
-            // requests. Browsers say where a form came from (Origin, Sec-Fetch-Site); a post that says neither
-            // is no browser's, or a very old one's.
-            let origin = req.headers().get(header::ORIGIN);
-            let site = req.headers().get("sec-fetch-site");
-            let foreign = origin.is_some_and(|o| o.as_bytes() != authorize::origin(&issuer).as_bytes())
-                || site.is_some_and(|s| s.as_bytes() != b"same-origin")
-                || (origin.is_none() && site.is_none());
-            if foreign {
+            // requests.
+            if !same_origin(req.headers(), &issuer) {
                 let why = "The decision came from another site. Start again from the application.";
                 return html_page(pages::refusal(403, "Couldn't connect the application", why, None));
             }
@@ -291,10 +285,31 @@ pub(super) async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Re
             Ok((server.authorizing(&issuer, |cx| authorize::decide(cx, &body, &cookies)), Vec::new()))
         }
     };
-    let (answer, cookies_set) = match answered {
+    let (answer, cookies_set) = match done {
         Ok(answered) => answered,
         Err(e) => return Reject::internal(e).response(),
     };
+    // After a POST, the browser must GET where it is sent.
+    answered(answer, &cookies_set, matches!(step, Authorizing::Decide | Authorizing::Relay))
+}
+
+/// Whether a form posted with `headers` came from a page of `issuer`'s own
+/// origin. Browsers say where a form came from (`Origin`,
+/// `Sec-Fetch-Site`): at least one must be there, and every one there must
+/// say this origin; a post that says neither is no browser's, or a very old
+/// one's.
+pub(super) fn same_origin(headers: &HeaderMap, issuer: &str) -> bool {
+    let origin = headers.get(header::ORIGIN);
+    let site = headers.get("sec-fetch-site");
+    let foreign = origin.is_some_and(|o| o.as_bytes() != authorize::origin(issuer).as_bytes())
+        || site.is_some_and(|s| s.as_bytes() != b"same-origin")
+        || (origin.is_none() && site.is_none());
+    !foreign
+}
+
+/// The response for a browser's step: `answer` (a page, or a redirect: 303
+/// after a POST, `posted`, else 302), with the cookies it sets.
+pub(super) fn answered(answer: authorize::Answer, cookies_set: &[String], posted: bool) -> Response<Body> {
     let mut r = match answer {
         authorize::Answer::Page(page) => html_page(page),
         authorize::Answer::Redirect(url) => {
@@ -303,8 +318,6 @@ pub(super) async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Re
                 let why = "The server ran into a problem. Try again later.";
                 return html_page(pages::refusal(500, "Something went wrong", why, None));
             };
-            // After a POST, the browser must GET where it is sent.
-            let posted = matches!(step, Authorizing::Decide | Authorizing::Relay);
             let status = if posted { StatusCode::SEE_OTHER } else { StatusCode::FOUND };
             let mut r = response(status, "text/plain", Body::whole(Bytes::new()));
             let headers = r.headers_mut();
@@ -355,11 +368,17 @@ pub(super) fn oauth_error(status: StatusCode, error: &str, description: &str) ->
 /// The answer while `auth.toml` (or `--public-url`) cannot be used:
 /// logged here, at most once a minute, as anyone may send these requests;
 /// the answer tells nothing of why.
-fn sign_in_misconfigured(e: &Error) -> Response<Body> {
+pub(super) fn sign_in_misconfigured(e: &Error) -> Response<Body> {
+    log_misconfigured(e);
+    let msg = "the server's sign-in settings are not valid; see the server log";
+    Reject::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg, 1).response()
+}
+
+/// Log that `auth.toml` (or `--public-url`) cannot be used: at most once a
+/// minute, as anyone may send the requests that find it.
+pub(super) fn log_misconfigured(e: &Error) {
     static LOGGED: crate::metrics::Throttle = crate::metrics::Throttle::new(60_000);
     if let Some(skipped) = LOGGED.pass() {
         tracing::error!(target: "bd::serve", error = %e, skipped, "sign-in is misconfigured");
     }
-    let msg = "the server's sign-in settings are not valid; see the server log";
-    Reject::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", msg, 1).response()
 }

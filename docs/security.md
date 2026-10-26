@@ -45,7 +45,7 @@ playbook run gets the same answer as a single command
 - **Overrides need the right token.** Taking over another actor's live
   claim needs `--take-over` and an admin token (unless the claim is held by
   the token's own actor or a sub-actor). Getting past a human gate needs a
-  human token. Only admins change `metadata.playbook` on existing issues,
+  human token, of one of its approvers when it names them. Only admins change `metadata.playbook` on existing issues,
   set configuration (`gate.repos` included), rename the issue prefix,
   import, sync with GitHub (`bd github`), prune events or run `doctor`.
 - **Actors are bound to tokens.** A token acts as its actor or its
@@ -217,6 +217,81 @@ OAuth](mcp.md#signing-in-with-oauth)).
   rate-limit these endpoints: do that per address at the proxy ([Behind a
   proxy](mcp.md#behind-a-proxy)).
 
+## Approving gates in the browser
+
+With `[oauth]` and `--public-url`, people approve human gates at
+`<public-url>/w/<workspace>/gates/<gate id>` after signing in with the
+authorization server's providers ([Approving human gates in the
+browser](sign-in.md#approving-human-gates-in-the-browser)). The approval is
+a human-gate override without a token, so it gets the protections of the
+consent page and more.
+
+- **Only people the server would give a human token.** The account is
+  judged for the gate's workspace as at a sign-in (`deny`, then the
+  authorizer or the rules); only a grant of kind `human` may approve, so
+  an agent with an agent-kind grant cannot approve with its own account,
+  and an authorizer that may not grant `human` lets no one approve. The
+  account is bound to its actor and the binding audited, and no token is
+  issued.
+- **Login CSRF and flow confusion.** Before sign-in nothing is kept on the
+  server: the flow, with what comes after it (the gate, or an MCP client's
+  authorization), is sealed with the running server's key, under a label
+  of its own for each step and kind, so a flow started for one cannot
+  finish as the other. As for the MCP flow, it is bound to the browser
+  by the `bd_oauth` cookie and a per-flow cookie with the state, PKCE
+  verifier and nonce, and a provider's answer naming another issuer is
+  refused.
+- **CSRF and clickjacking.** The approval page has a strict Content
+  Security Policy (style and its one script by hash, `form-action 'self'`,
+  `frame-ancestors 'none'`), and its form is not sent until the page has
+  had focus for 600 ms. The `POST` needs an `Origin` of the server or
+  `Sec-Fetch-Site: same-origin` (neither saying otherwise), and a cookie
+  of its own (`bd_gate_<suffix>`, `__Secure-` on https), `HttpOnly`,
+  `SameSite=Strict` and scoped to the gate's path, whose value is known
+  only after sign-in. The approval id lasts 10 minutes and works once; one
+  posted from another browser is refused without being used up.
+- **No existence leak.** The gate's path checks only the shapes of the
+  workspace name and id and answers alike for any gate, or none, until the
+  account is admitted with human access to that workspace. A gate is found
+  by its exact id, never a prefix.
+- **What is approved is shown.** The page names the workspace, the gate,
+  what it holds back and the run it belongs to, and who the approval is
+  recorded as. Titles, which agents write, are escaped, with control,
+  direction and invisible characters shown as escapes, so they cannot fake
+  the page; the gate posted is the one the approval id was issued for.
+- **Approvers hold on every served path.** A gate's approvers are enforced
+  in the engine on every path that can open a human gate or move work
+  past it (`gate resolve`, `close`, pins, type changes, edges, moves,
+  deletes, run closing, imports), for tokens and browser approvals alike,
+  admins included. A stored list that is not valid matches nobody. Only
+  an approver's human token, any person's when there are none, or a human
+  admin's may change the list, and the change is recorded in the gate's
+  history.
+- **Checked again when posting.** The approval resolves the gate in one
+  transaction that checks again that it is an open human gate, ready to
+  approve (not deferred or blocked again since the page), and that the
+  person may open it; otherwise it writes nothing. The `closed` event
+  names the person's actor and `"via": "browser"`.
+- **Emails are never shown or logged.** The page shows the provider and
+  actor; the logs name the provider, subject, login, actor, workspace and
+  gate.
+- **Bounded.** The provider's callback and the approval's `POST` share the
+  8 sign-in slots; approvals waiting for their `POST` are kept in memory,
+  at most 1024, the oldest dropped first. Refusals end on this server's
+  pages, never a redirect elsewhere.
+
+Residual risks, accepted:
+
+- **A person may approve without reading.** An agent can send a person
+  the link of a gate it wants opened. The page shows what the gate holds
+  back and who is signed in, but bd cannot make anyone read it. Open only
+  links you expect, and name approvers on gates that matter.
+- **Approvers are informational in local workspaces**, as human gates
+  are: anyone who can write `bd.db` can open them.
+- **A rollback** to a `bd serve` that predates approvers ignores them:
+  any human token opens such gates again. Gates resolved meanwhile stay
+  resolved, and open approval pages fail (404).
+
 ## What bd keeps about people
 
 bd keeps what it needs to tell who may call it, and no more (data
@@ -249,7 +324,8 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   `account-deleted` notification erases an account the same way. Workspace
   histories keep the actor; copies outside `server.db` (logs, backups) are
   the admin's to expire.
-- **Audit trail.** `server.db` records each sign-in, token created,
+- **Audit trail.** `server.db` records each sign-in (one to approve a
+  gate in a browser too, as a `signed_in` event without a token), token created,
   refresh, revocation (and why), account forgotten, linked or named, and
   client registered, in the same transaction as the change, for 90 days
   (client registrations, which anyone may make: the latest 5000).

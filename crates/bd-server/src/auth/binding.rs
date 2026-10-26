@@ -38,6 +38,29 @@ pub fn preview_actor(root: &Path, user: &Identity, by_login: bool) -> Result<Str
     Ok(actor)
 }
 
+/// Bind `user`'s account to its actor as a sign-in does, issuing no token:
+/// for a person who signed in in a browser to approve a human gate. The
+/// binding is recorded as a `signed_in` event without a token, `detail`
+/// saying what for (never an email), in the binding's own transaction.
+/// Refused as a sign-in would be for its actor's sake. The actor bound.
+pub fn bind_account(root: &Path, user: &Identity, by_login: bool, detail: &str) -> Result<String> {
+    change_scoped(root, &Scope { user: Some(user), ..Scope::default() }, |_, file| {
+        let actor = account_actor(file, user, Timestamp::now(), by_login)?;
+        check_actor(&actor)?;
+        file.events.push(AuthEvent {
+            kind: "signed_in",
+            actor: Some(actor.clone()),
+            provider: Some(user.provider.clone()),
+            issuer: Some(user.issuer.clone()),
+            subject: Some(user.subject.clone()),
+            token: None,
+            client: None,
+            detail: Some(detail.to_string()),
+        });
+        Ok(actor)
+    })
+}
+
 /// The actor of `user`'s tokens: the one bound to its account, else its
 /// login, bound to it now. Refused while the login would bind another
 /// account's actor; and, when a rule let the account in `by_login`, while

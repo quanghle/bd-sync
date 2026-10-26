@@ -137,6 +137,7 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         take_over: a.take_over,
         guard: guard_from(&a.guard)?,
         token: a.token,
+        via: None,
     };
     let ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
     // The next issue's query and --ttl, parsed before anything is written

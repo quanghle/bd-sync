@@ -17,6 +17,14 @@ pub(super) fn mcp_path(path: &str) -> Option<(&str, &str)> {
     Some((prefix, name)).filter(|(_, w)| valid_workspace_name(w))
 }
 
+/// `<public url path>/w/<name>/gates/<id>` (or with the public URL's path
+/// stripped) -> `<name>` and `<id>`: a human gate's approval page. Their
+/// shapes are checked where it is served.
+pub(super) fn gate_path<'p>(server: &Server, path: &'p str) -> Option<(&'p str, &'p str)> {
+    let (workspace, gate) = under_issuer(server, path).strip_prefix("/w/")?.split_once("/gates/")?;
+    Some((workspace, gate)).filter(|(w, g)| !w.is_empty() && !w.contains('/') && !g.is_empty() && !g.contains('/'))
+}
+
 /// A step of sign-in from the command line (the device flow).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SignInStep {
@@ -160,6 +168,15 @@ pub(super) async fn handle(
         } else {
             let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response();
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
+            r
+        }
+    } else if let Some((workspace, gate)) = gate_path(&server, &path) {
+        if req.method() == Method::GET || req.method() == Method::POST {
+            let (workspace, gate) = (workspace.to_string(), gate.to_string());
+            gate_approval(&server, &workspace, &gate, req).await
+        } else {
+            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET or POST", 2).response();
+            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
             r
         }
     } else if let Some((prefix, workspace)) = mcp_path(&path) {

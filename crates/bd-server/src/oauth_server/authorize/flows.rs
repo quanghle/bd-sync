@@ -20,6 +20,23 @@ pub(super) const CHOOSING: &str = "choose";
 
 pub(super) const AT_PROVIDER: &str = "provider";
 
+/// The hop from a gate's page to the chooser (`/oauth/choose`), where the
+/// browser's cookie is seen: a [`Then::Gate`] not yet bound to a browser.
+pub(super) const GATE_BEGIN: &str = "gate-begin";
+
+/// What a browser sign-in goes on to once the person signed in: an
+/// application's authorization, or a human gate's approval. It is sealed
+/// with the flow and decides its sealing's AAD ([`Sealer::seal`]), so a flow
+/// of one kind never finishes as the other.
+#[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "then", rename_all = "snake_case")]
+pub(super) enum Then {
+    /// The client's authorization request, as it sent it.
+    Authorize { query: String },
+    /// Approving the human gate `gate` of `workspace`.
+    Gate { workspace: String, gate: String },
+}
+
 /// An authorization before anyone signed in: choosing a provider, then
 /// signing in there. Anyone may start one, so the server keeps none: it is
 /// sealed ([`Sealer`]) into what the browser brings back, the link it
@@ -27,8 +44,8 @@ pub(super) const AT_PROVIDER: &str = "provider";
 /// the client's request is checked again at each step.
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct Pending {
-    /// The client's authorization request, as it sent it.
-    pub(super) query: String,
+    /// What the sign-in is for.
+    pub(super) then: Then,
     /// The hash of the browser's cookie.
     pub(super) browser: String,
     /// Until when it may go on (milliseconds since the epoch).
@@ -60,28 +77,43 @@ impl Sealer {
         Sealer(ring::aead::LessSafeKey::new(key))
     }
 
-    /// `value`, sealed for `step`: base64url of a random nonce and the ciphertext.
+    /// `value`, sealed for `step`: base64url of a random nonce and the
+    /// ciphertext. The AAD is `step` for an authorization and `gate:<step>`
+    /// for a gate's approval ([`aad`]).
     pub(super) fn seal(&self, step: &str, value: &Pending) -> Result<String, Error> {
         let mut nonce = [0u8; 12];
         SecureRandom::fill(&SystemRandom::new(), &mut nonce)
             .map_err(|_| Error::Io(std::io::Error::other("the system's random number generator failed")))?;
         let mut data = serde_json::to_vec(value)?;
-        let aad = ring::aead::Aad::from(step.as_bytes());
+        let aad = aad(step, matches!(value.then, Then::Gate { .. }));
+        let aad = ring::aead::Aad::from(aad.as_bytes());
         self.0
             .seal_in_place_append_tag(ring::aead::Nonce::assume_unique_for_key(nonce), aad, &mut data)
             .map_err(|_| Error::Io(std::io::Error::other("sealing a flow failed")))?;
         Ok(URL_SAFE_NO_PAD.encode([&nonce[..], &data].concat()))
     }
 
-    /// What [`Sealer::seal`] sealed for `step`, if `sealed` is that.
+    /// What [`Sealer::seal`] sealed for `step`, if `sealed` is that: opened
+    /// under either kind's AAD, and kept only if its kind is the one that AAD
+    /// is for.
     pub(super) fn open(&self, step: &str, sealed: &str) -> Option<Pending> {
         let bytes = URL_SAFE_NO_PAD.decode(sealed).ok()?;
         let (nonce, data) = bytes.split_at_checked(12)?;
-        let nonce = ring::aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
-        let mut data = data.to_vec();
-        let plain = self.0.open_in_place(nonce, ring::aead::Aad::from(step.as_bytes()), &mut data).ok()?;
-        serde_json::from_slice(plain).ok()
+        [false, true].into_iter().find_map(|gate| {
+            let nonce = ring::aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
+            let mut data = data.to_vec();
+            let aad = aad(step, gate);
+            let plain = self.0.open_in_place(nonce, ring::aead::Aad::from(aad.as_bytes()), &mut data).ok()?;
+            let pending: Pending = serde_json::from_slice(plain).ok()?;
+            (matches!(pending.then, Then::Gate { .. }) == gate).then_some(pending)
+        })
     }
+}
+
+/// The AAD a flow is sealed with for `step`: the step itself for an
+/// authorization (as before gates had flows), `gate:<step>` for a gate's.
+fn aad(step: &str, gate: bool) -> String {
+    if gate { format!("gate:{step}") } else { step.to_string() }
 }
 
 pub(super) fn now_millis() -> i64 {
@@ -99,12 +131,35 @@ pub(super) struct Consent {
     pub(super) cookie: String,
 }
 
+/// A human gate's approval page, shown to a person the rules let in:
+/// waiting for its one POST ([`super::gate::approve`]).
+#[derive(Debug)]
+pub(super) struct Approval {
+    pub(super) workspace: String,
+    pub(super) gate: String,
+    /// The actor it is recorded as: the account's, bound at the sign-in.
+    pub(super) actor: String,
+    /// The account, for the log: its provider, login and subject (never an email).
+    pub(super) provider: String,
+    pub(super) login: String,
+    pub(super) subject: String,
+    /// The hash of the value of its own cookie ([`gate_cookie`]).
+    pub(super) browser: String,
+    /// What names its cookie.
+    pub(super) cookie: String,
+}
+
 /// Authorizations under way, by the hash of their secret at each step
-/// (`state` at GitHub, the consent id, the code); each taken once.
+/// (`state` at GitHub, the consent id, the code, the approval id); each
+/// taken once.
 pub struct Flows {
     pub(super) sealer: Sealer,
     pub(super) consents: Kept<Consent>,
     pub(super) codes: Kept<Code>,
+    /// Gate approval pages waiting for their POST, and those posted (for
+    /// [`STEP_TTL`] after: one posted again is told it was used).
+    pub(super) approvals: Kept<Approval>,
+    pub(super) approvals_spent: Kept<()>,
     /// Codes redeemed, for [`CODE_TTL`] after: one sent again revokes the
     /// token it issued (RFC 6749 section 4.1.2).
     spent: Kept<Spent>,
@@ -142,6 +197,8 @@ impl Default for Flows {
             consents: Kept::new(STEP_TTL),
             codes: Kept::new(CODE_TTL),
             spent: Kept::new(CODE_TTL),
+            approvals: Kept::new(STEP_TTL),
+            approvals_spent: Kept::new(STEP_TTL),
         }
     }
 }
@@ -213,7 +270,7 @@ impl<T> Kept<T> {
     }
 
     /// [`Kept::put`], expiring at `until`.
-    fn put_until(&mut self, key: String, until: Instant, value: T) {
+    pub(super) fn put_until(&mut self, key: String, until: Instant, value: T) {
         let now = Instant::now();
         if self.map.len() >= MAX_FLOWS {
             self.map.retain(|_, (until, _)| *until > now);

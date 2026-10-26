@@ -20,15 +20,20 @@
 //!
 //! Each step is bound to the browser that started it by a cookie. The steps
 //! before a sign-in keep nothing on the server: the request is sealed into
-//! the chooser link ([`Pending`]) and a per-flow cookie (`Sealer`). Consents
-//! and codes are kept in memory for minutes ([`Flows`]): a restart ends
-//! authorizations under way.
+//! the chooser link ([`Pending`]) and a per-flow cookie (`Sealer`), with what
+//! the sign-in goes on to ([`Then`]: this authorization, or a human gate's
+//! approval), which also sets the AAD it is sealed with, so a flow of one
+//! kind never finishes as the other. Consents, codes and gate approvals are
+//! kept in memory for minutes ([`Flows`]): a restart ends authorizations
+//! under way. A human gate's approval goes through the same steps from its
+//! own page, `<public url>/w/<ws>/gates/<id>` ([`gate`]).
 
 mod begin;
 mod callback;
 mod consent;
 mod cookies;
 mod flows;
+pub mod gate;
 mod request;
 #[cfg(test)]
 mod tests;
@@ -38,6 +43,7 @@ pub use callback::*;
 pub use consent::*;
 pub use cookies::*;
 pub use flows::*;
+pub use gate::{Approved, Found, GateInfo, Gates};
 use request::*;
 
 use std::path::Path;
@@ -83,6 +89,8 @@ pub struct Ctx<'a> {
     /// Whether the server has this workspace: told only to accounts the
     /// rules let in, as the resource metadata tells no one.
     pub workspace_exists: &'a dyn Fn(&str) -> bool,
+    /// The workspaces' gates, for approvals ([`gate`]).
+    pub gates: &'a dyn Gates,
 }
 
 /// Where a step sends the browser.

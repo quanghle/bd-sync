@@ -1664,13 +1664,13 @@ fn playbook_runs_flow_through_ready_and_gates() {
 #[test]
 fn playbook_files_are_parsed_strictly() {
     let ws = Ws::new();
-    ws.playbook("typo", "[[steps]]\nid = \"a\"\n[steps.gate]\ntype = \"human\"\napprovers = [\"lead\"]\n");
+    ws.playbook("typo", "[[steps]]\nid = \"a\"\n[steps.gate]\ntype = \"human\"\napprover = [\"lead\"]\n");
     let out = ws.run_as("tester", &["playbook", "show", "typo"]);
     assert_eq!(out.status.code(), Some(2));
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("approvers") && err.contains("line 5"), "{err}");
+    assert!(err.contains("approver") && err.contains("line 5"), "{err}");
     let listed = ws.json(&["playbook", "list"]);
-    assert!(listed["playbooks"][0]["error"].as_str().unwrap().contains("approvers"));
+    assert!(listed["playbooks"][0]["error"].as_str().unwrap().contains("approver"));
 }
 
 #[test]
@@ -1744,6 +1744,61 @@ fn gate_check_type_local_leaves_github_gates_alone() {
     let checked: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(checked["checked"].as_array().unwrap().len(), 1, "{checked}");
     assert_eq!(checked["checked"][0]["action"], "error");
+}
+
+#[test]
+fn gate_approvers_are_set_shown_updated_and_repaired() {
+    let ws = Ws::new();
+    let work = ws.id(&["create", "Deploy"]);
+    let gate =
+        ws.id(&["gate", "create", "-t", "human", "--blocks", &work, "--approver", "alice", "--approver", "bob,Alice"]);
+    assert_eq!(ws.json(&["gate", "show", &gate])["spec"]["approvers"], serde_json::json!(["alice", "bob"]));
+    assert!(ws.ok(&["gate", "show", &gate]).contains("  approvers: alice, bob\n"));
+    assert!(ws.ok(&["gate", "list"]).contains(&format!("{gate} [human by alice or bob]")));
+
+    for bad in [" ", "carol\nadmin"] {
+        assert_eq!(ws.code_as("tester", &["gate", "create", "-t", "human", "--blocks", &work, "--approver", bad]), 2);
+    }
+    assert_eq!(
+        ws.code_as(
+            "tester",
+            &["gate", "create", "-t", "timer", "--timeout", "1h", "--blocks", &work, "--approver", "a"]
+        ),
+        2
+    );
+
+    let updated = ws.json(&["gate", "update", &gate, "--approver", "carol"]);
+    assert_eq!(updated["spec"]["approvers"], serde_json::json!(["carol"]));
+    assert!(
+        ws.ok(&["gate", "update", &gate, "--approver", "carol,dave"])
+            .contains(&format!("✓ Gate {gate}: approvers carol, dave"))
+    );
+    assert_eq!(ws.code_as("tester", &["gate", "update", &gate]), 2, "a change is required");
+    assert_eq!(ws.code_as("tester", &["gate", "update", &gate, "--approver", "x", "--clear-approvers"]), 2);
+    assert_eq!(ws.code_as("tester", &["gate", "update", &gate, "--approver", "a\tb"]), 2);
+    assert!(
+        ws.ok(&["gate", "update", &gate, "--clear-approvers"]).contains(&format!("✓ Gate {gate}: approvers cleared"))
+    );
+    let shown = ws.json(&["show", &gate]);
+    let meta = if shown.is_array() { &shown[0]["metadata"] } else { &shown["metadata"] };
+    assert!(meta["gate"].get("approvers").is_none(), "{meta}");
+    assert_eq!(meta["gate"]["type"], "human");
+
+    // A list stored invalid matches nobody, and `bd gate update` repairs it.
+    ws.ok(&["update", &gate, "--set-metadata", r#"gate={"type":"human","approvers":42}"#]);
+    assert_eq!(ws.json(&["gate", "show", &gate])["spec"]["approvers"], serde_json::json!([]));
+    assert!(
+        ws.ok(&["gate", "show", &gate])
+            .contains("approvers: invalid (matches nobody through bd serve; fix with bd gate update)")
+    );
+    assert!(ws.ok(&["gate", "list"]).contains("[human by nobody (invalid approvers)]"));
+    ws.ok(&["gate", "update", &gate, "--approver", "carol"]);
+    assert_eq!(ws.json(&["gate", "show", &gate])["spec"]["approvers"], serde_json::json!(["carol"]));
+
+    // Locally, approvers are informational.
+    let out = ws.run_as("dave", &["gate", "resolve", &gate]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ws.code_as("tester", &["gate", "update", &gate, "--approver", "carol"]), 2, "resolved");
 }
 
 /// A stand-in for `gh run list` that prints `runs.json` from its own

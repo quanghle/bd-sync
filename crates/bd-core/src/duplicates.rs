@@ -180,6 +180,7 @@ impl WriteCtx<'_> {
                 take_over: opts.take_over,
                 guard: Guard::default(),
                 token: None,
+                via: None,
             },
         )?;
         Ok(CloseAsOutcome {

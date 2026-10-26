@@ -5,6 +5,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
 use super::super::clients::Client;
 use super::super::form;
+use super::super::pages;
 use crate::auth;
 use crate::oauth::OauthConfig;
 
@@ -155,7 +156,8 @@ fn flows_are_taken_once_and_expire() {
 fn flows_before_a_sign_in_are_sealed_for_their_step() {
     let sealer = Sealer::new();
     let at = AtProvider { provider: "github".into(), state: "s".into(), verifier: "v".into(), nonce: "n".into() };
-    let pending = Pending { query: "client_id=x".into(), browser: "b".into(), until: 1, at: Some(at) };
+    let then = Then::Authorize { query: "client_id=x".into() };
+    let pending = Pending { then, browser: "b".into(), until: 1, at: Some(at) };
     let sealed = sealer.seal(AT_PROVIDER, &pending).unwrap();
     assert!(!sealed.contains("client_id") && !sealed.contains("github"), "unread: {sealed}");
     assert_eq!(sealer.open(AT_PROVIDER, &sealed), Some(pending));
@@ -165,6 +167,50 @@ fn flows_before_a_sign_in_are_sealed_for_their_step() {
     *changed.last_mut().unwrap() ^= 1;
     assert_eq!(sealer.open(AT_PROVIDER, &URL_SAFE_NO_PAD.encode(changed)), None, "unchanged");
     assert_eq!(sealer.open(AT_PROVIDER, "AAAA"), None);
+}
+
+fn gate_pending() -> Pending {
+    let then = Then::Gate { workspace: "proj".into(), gate: "bd-1".into() };
+    Pending { then, browser: String::new(), until: 1, at: None }
+}
+
+#[test]
+fn a_flow_opens_only_as_the_kind_it_was_sealed_as() {
+    let sealer = Sealer::new();
+    let authorize = || Pending { then: Then::Authorize { query: "q".into() }, browser: "b".into(), until: 1, at: None };
+    // An authorization's AAD is its step, as before gates had flows.
+    let sealed = sealer.seal(AT_PROVIDER, &authorize()).unwrap();
+    assert_eq!(sealer.open(AT_PROVIDER, &sealed), Some(authorize()));
+    // Sealed under a gate's AAD, it is not taken for a gate's flow.
+    let forged = sealer.seal("gate:provider", &authorize()).unwrap();
+    assert_eq!(sealer.open(AT_PROVIDER, &forged), None);
+    // A gate's opens as a gate's, for its own step only.
+    let sealed = sealer.seal(AT_PROVIDER, &gate_pending()).unwrap();
+    assert_eq!(sealer.open(AT_PROVIDER, &sealed), Some(gate_pending()));
+    assert_eq!(sealer.open(CHOOSING, &sealed), None);
+    let sealed = sealer.seal(CHOOSING, &gate_pending()).unwrap();
+    assert_eq!(sealer.open(CHOOSING, &sealed), Some(gate_pending()));
+    assert_eq!(sealer.open(AT_PROVIDER, &sealed), None);
+    // The hop from a gate's page goes on to the chooser only.
+    let begun = sealer.seal(GATE_BEGIN, &gate_pending()).unwrap();
+    assert_eq!(sealer.open(GATE_BEGIN, &begun), Some(gate_pending()));
+    assert_eq!(sealer.open(CHOOSING, &begun), None);
+    assert_eq!(sealer.open(AT_PROVIDER, &begun), None);
+}
+
+#[test]
+fn what_comes_then_round_trips() {
+    for then in [
+        Then::Authorize { query: "client_id=x&state=y".into() },
+        Then::Gate { workspace: "proj".into(), gate: "bd-1.2".into() },
+    ] {
+        let json = serde_json::to_value(&then).unwrap();
+        assert!(json["then"] == "authorize" || json["then"] == "gate", "{json}");
+        assert_eq!(serde_json::from_value::<Then>(json).unwrap(), then);
+    }
+    let pending = gate_pending();
+    let json = serde_json::to_string(&pending).unwrap();
+    assert_eq!(serde_json::from_str::<Pending>(&json).unwrap(), pending);
 }
 
 #[test]
@@ -253,4 +299,218 @@ fn codes_are_redeemed_once_and_a_code_sent_again_names_its_token() {
     assert!(matches!(flows.redeem("c6", "bdc_1", &other_verifier), Redeemed::Again(None)));
     assert!(matches!(flows.redeem("c6", "bdc_other", VERIFIER), Redeemed::Again(None)));
     assert!(matches!(redeem(&mut flows, "c6"), Redeemed::Again(Some(t)) if t == "t6"), "its own client: revoked");
+}
+
+/// Gates as a map, recording each approval asked for.
+struct FakeGates {
+    found: Found,
+    answer: Approved,
+    calls: std::sync::Mutex<Vec<(String, String, String)>>,
+}
+
+impl FakeGates {
+    fn answering(answer: Approved) -> FakeGates {
+        FakeGates { found: Found::NoIssue, answer, calls: Default::default() }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.lock().unwrap().len()
+    }
+}
+
+impl Gates for FakeGates {
+    fn find(&self, _: &str, _: &str) -> Result<Found, bd_core::Error> {
+        Ok(self.found.clone())
+    }
+
+    fn approve(&self, workspace: &str, gate: &str, actor: &str) -> Result<Approved, bd_core::Error> {
+        self.calls.lock().unwrap().push((workspace.into(), gate.into(), actor.into()));
+        Ok(self.answer.clone())
+    }
+}
+
+/// A root whose auth.toml turns `[oauth]` on with GitHub's web flow, and
+/// with `oidc` another provider.
+fn gate_root(oidc: bool) -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("github-secret"), "s3cret\n").unwrap();
+    let mut config = String::from(
+        "[github]\nclient_id = \"Iv1.test\"\nclient_secret_file = \"github-secret\"\n\
+         [[github.allow]]\nusers = [\"alice\"]\nrole = \"write\"\nkind = \"human\"\n",
+    );
+    if oidc {
+        std::fs::write(root.path().join("acme-secret"), "s3cret\n").unwrap();
+        config.push_str(
+            "[oidc.acme]\nissuer = \"https://acme.example\"\nclient_id = \"bd-client\"\n\
+             client_secret_file = \"acme-secret\"\nlabel = \"Acme SSO\"\n\
+             [[oidc.acme.allow]]\nemail_domains = [\"acme.example\"]\nrole = \"write\"\n",
+        );
+    }
+    config.push_str("[oauth]\nredirect_hosts = [\"app.example\"]\n");
+    std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    root
+}
+
+fn with_ctx<T>(root: &std::path::Path, flows: &Mutex<Flows>, gates: &FakeGates, f: impl FnOnce(&Ctx<'_>) -> T) -> T {
+    let documents = super::super::cimd::Documents::new();
+    let exists = |_: &str| true;
+    f(&Ctx { root, issuer: ISSUER, documents: &documents, flows, workspace_exists: &exists, gates })
+}
+
+fn page(answer: &Answer) -> &pages::Page {
+    match answer {
+        Answer::Page(p) => p,
+        a => panic!("not a page: {a:?}"),
+    }
+}
+
+/// The `flow` of a chooser's or a redirect's URL.
+fn flow_of(url: &str) -> String {
+    let query = url.split_once('?').unwrap().1.replace("&amp;", "&");
+    let query = query.split('"').next().unwrap();
+    form::decode(query).unwrap().into_iter().find(|(k, _)| k == "flow").unwrap().1
+}
+
+#[test]
+fn a_gate_page_goes_on_to_the_chooser_telling_nothing() {
+    let root = gate_root(false);
+    let (flows, gates) = (Mutex::new(Flows::default()), FakeGates::answering(Approved::Resolved));
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        for (ws, id) in [("proj", "bd-1"), ("nosuch", "bd-2.3"), ("proj", "x")] {
+            let (answer, cookies) = gate::begin(cx, ws, id);
+            let Answer::Redirect(url) = &answer else { panic!("{ws}/{id}: {answer:?}") };
+            assert!(url.starts_with(&format!("{ISSUER}/oauth/choose?flow=")), "{url}");
+            assert!(cookies.is_empty(), "no cookie yet: {cookies:?}");
+            let opened = lock(&flows).sealer.open(GATE_BEGIN, &flow_of(url)).unwrap();
+            assert_eq!(opened.then, Then::Gate { workspace: ws.into(), gate: id.into() });
+        }
+        for (ws, id) in [("a/b", "bd-1"), ("proj", "../x"), ("proj", "a/b"), ("proj", ""), ("-x", "bd-1")] {
+            assert_eq!(page(&gate::begin(cx, ws, id).0).status, 404, "{ws}/{id}");
+        }
+    });
+    assert_eq!(gates.calls(), 0);
+}
+
+#[test]
+fn the_chooser_binds_a_gate_flow_to_the_browser_and_goes_on() {
+    let root = gate_root(false);
+    let (flows, gates) = (Mutex::new(Flows::default()), FakeGates::answering(Approved::Resolved));
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let Answer::Redirect(url) = gate::begin(cx, "proj", "bd-1").0 else { panic!() };
+        let query = form::encode(&[("flow", flow_of(&url).as_str())]);
+        let (answer, cookies) = choose(cx, &query, None);
+        let Answer::Redirect(to) = answer else { panic!("{answer:?}") };
+        assert!(to.starts_with("https://github.com/login/oauth/authorize?"), "{to}");
+        assert!(cookies.iter().any(|c| c.starts_with(&format!("{SECURE_COOKIE}="))), "{cookies:?}");
+        assert!(cookies.iter().any(|c| c.starts_with("__Secure-bd_flow_")), "{cookies:?}");
+        // The hop is for the chooser alone, without a provider named.
+        let with_provider = format!("{query}&provider=github");
+        assert_eq!(page(&choose(cx, &with_provider, None).0).status, 400);
+    });
+}
+
+#[test]
+fn several_providers_are_chosen_from_for_the_gate() {
+    let root = gate_root(true);
+    let (flows, gates) = (Mutex::new(Flows::default()), FakeGates::answering(Approved::Resolved));
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let Answer::Redirect(url) = gate::begin(cx, "proj", "bd-1").0 else { panic!() };
+        let browser = "b".repeat(64);
+        let query = form::encode(&[("flow", flow_of(&url).as_str())]);
+        let (answer, cookies) = choose(cx, &query, Some(&browser));
+        let p = page(&answer);
+        assert_eq!(p.status, 200);
+        assert!(p.html.contains("Sign in to approve gate bd-1 in proj"), "{}", p.html);
+        assert!(p.html.contains("Acme SSO") && p.html.contains("GitHub"), "{}", p.html);
+        assert_eq!(cookies, vec![set_cookie(ISSUER, &browser)], "the browser's own cookie kept");
+        let link = p.html.split("href=\"").nth(1).unwrap();
+        let opened = lock(&flows).sealer.open(CHOOSING, &flow_of(link)).unwrap();
+        assert_eq!(opened.then, Then::Gate { workspace: "proj".into(), gate: "bd-1".into() });
+        assert_eq!(opened.browser, auth::hash(&browser));
+    });
+}
+
+fn approval(cookie: &str, value: &str) -> Approval {
+    Approval {
+        workspace: "proj".into(),
+        gate: "bd-1".into(),
+        actor: "github:alice".into(),
+        provider: "github".into(),
+        login: "alice".into(),
+        subject: "7".into(),
+        browser: auth::hash(value),
+        cookie: cookie.into(),
+    }
+}
+
+#[test]
+fn approvals_are_posted_once_from_their_own_browser() {
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let opened = Approved::Opened { unblocked: vec!["bd-2".into()], completed: vec![] };
+    let gates = FakeGates::answering(opened);
+    let value = "c".repeat(64);
+    let cookies = format!("x=1; __Secure-bd_gate_ab12={value}");
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let post =
+            |id: &str, gate: &str, cookies: &str| gate::approve(cx, "proj", gate, &format!("approval={id}"), cookies);
+        let html = |answer: &(Answer, Vec<String>)| page(&answer.0).html.clone();
+        // Unknown, or expired: nothing approved.
+        let unknown = post("nope", "bd-1", &cookies);
+        assert_eq!((page(&unknown.0).status, html(&unknown).contains("expired")), (400, true));
+        lock(&flows).approvals.put_until(auth::hash("old"), std::time::Instant::now(), approval("ab12", &value));
+        let expired = post("old", "bd-1", &cookies);
+        assert_eq!((page(&expired.0).status, html(&expired).contains("expired")), (400, true));
+        assert_eq!(gates.calls(), 0);
+        lock(&flows).approvals.put(auth::hash("id1"), approval("ab12", &value));
+        // Another browser's: refused, and the approval stays for its own.
+        for other in
+            ["", "__Secure-bd_gate_ab12=".to_string().as_str(), &format!("__Secure-bd_gate_ab12={}", "d".repeat(64))]
+        {
+            assert_eq!(page(&post("id1", "bd-1", other).0).status, 403, "{other:?}");
+        }
+        // Another gate's page: refused.
+        assert_eq!(page(&post("id1", "bd-2", &cookies).0).status, 400);
+        assert_eq!(gates.calls(), 0);
+        let (answer, set) = post("id1", "bd-1", &cookies);
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert_eq!(*gates.calls.lock().unwrap(), [("proj".into(), "bd-1".into(), "github:alice".into())]);
+        assert_eq!(set, vec![set_gate_cookie(ISSUER, "proj", "bd-1", "ab12", "", Duration::ZERO)], "cleared");
+        let again = post("id1", "bd-1", &cookies);
+        assert_eq!((page(&again.0).status, html(&again).contains("already used")), (400, true));
+        assert_eq!(gates.calls(), 1);
+    });
+    let gates = FakeGates::answering(Approved::NotArmed);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        lock(&flows).approvals.put(auth::hash("id2"), approval("ab12", &value));
+        let (answer, _) = gate::approve(cx, "proj", "bd-1", "approval=id2", &cookies);
+        assert_eq!(page(&answer).status, 409);
+        assert!(page(&answer).html.contains("not ready"), "{}", page(&answer).html);
+    });
+    let mut flows = Flows::default();
+    for i in 0..=MAX_FLOWS {
+        flows.approvals.put(i.to_string(), approval("ab12", &value));
+    }
+    assert_eq!(flows.approvals.map.len(), MAX_FLOWS);
+    assert!(flows.approvals.take("0").is_none(), "the oldest went first");
+}
+
+#[test]
+fn gate_cookies_are_strict_to_their_page() {
+    let c = "e".repeat(64);
+    assert_eq!(
+        set_gate_cookie(ISSUER, "proj", "bd-1", "ab12", &c, STEP_TTL),
+        format!(
+            "__Secure-bd_gate_ab12={c}; Path=/bd/w/proj/gates/bd-1; Max-Age=600; HttpOnly; SameSite=Strict; Secure"
+        )
+    );
+    assert_eq!(
+        set_gate_cookie("http://127.0.0.1:7420", "proj", "bd-1", "ab12", &c, STEP_TTL),
+        format!("bd_gate_ab12={c}; Path=/w/proj/gates/bd-1; Max-Age=600; HttpOnly; SameSite=Strict")
+    );
+    assert_eq!(gate_cookie(ISSUER, &format!("__Secure-bd_gate_ab12={c}"), "ab12"), Some(c.as_str()));
+    assert_eq!(gate_cookie(ISSUER, &format!("bd_gate_ab12={c}"), "ab12"), None, "unprefixed, on https");
+    assert_eq!(gate_cookie(ISSUER, "__Secure-bd_gate_ab12=abc", "ab12"), None);
+    assert!(gate::gate_id_ok("bd-1.2_x") && !gate::gate_id_ok("") && !gate::gate_id_ok(".x"));
+    assert!(!gate::gate_id_ok(&"a".repeat(129)) && gate::gate_id_ok(&"a".repeat(128)));
 }

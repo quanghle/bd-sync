@@ -91,6 +91,7 @@ use bd_cli::protocol::{
     RefreshRequest, RevokeAnswer, SignInAnswer, SignInPoll, SignInStart, valid_workspace_name,
 };
 
+mod approval;
 mod authorization;
 mod check;
 mod exec;
@@ -99,6 +100,7 @@ mod mcp_endpoint;
 mod routes;
 mod signin;
 
+use approval::*;
 use authorization::*;
 use exec::*;
 use listen::*;
@@ -756,6 +758,7 @@ impl Server {
             documents: &self.documents,
             flows: &self.flows,
             workspace_exists: &exists,
+            gates: self,
         })
     }
 
@@ -1166,6 +1169,38 @@ mod tests {
             assert_eq!(oauth_endpoint(&server, elsewhere), None, "{elsewhere}");
         }
         assert_eq!(oauth_endpoint(&server, "/bd/oauth/token/"), None);
+    }
+
+    #[test]
+    fn gate_pages_are_served_under_the_public_path_or_stripped_only() {
+        let mut server = Server::new(PathBuf::from("."), 1, Waits::default());
+        server.public_url = Some("https://x/bd".into());
+        assert_eq!(gate_path(&server, "/bd/w/proj/gates/t-1"), Some(("proj", "t-1")));
+        assert_eq!(gate_path(&server, "/w/proj/gates/t-1"), Some(("proj", "t-1")), "stripped");
+        for elsewhere in
+            ["/other/w/proj/gates/t-1", "/w/proj/gates/a/b", "/w/proj/gates/", "/w//gates/t-1", "/w/proj/mcp"]
+        {
+            assert_eq!(gate_path(&server, elsewhere), None, "{elsewhere}");
+        }
+    }
+
+    #[test]
+    fn a_form_is_same_origin_only_if_every_header_says_so() {
+        let issuer = "https://x/bd";
+        let headers = |pairs: &[(&'static str, &'static str)]| {
+            let mut h = HeaderMap::new();
+            for (k, v) in pairs {
+                h.insert(*k, HeaderValue::from_static(v));
+            }
+            h
+        };
+        assert!(same_origin(&headers(&[("origin", "https://x")]), issuer));
+        assert!(same_origin(&headers(&[("sec-fetch-site", "same-origin")]), issuer));
+        assert!(same_origin(&headers(&[("origin", "https://x"), ("sec-fetch-site", "same-origin")]), issuer));
+        assert!(!same_origin(&headers(&[("origin", "https://x"), ("sec-fetch-site", "cross-site")]), issuer));
+        assert!(!same_origin(&headers(&[("origin", "https://evil"), ("sec-fetch-site", "same-origin")]), issuer));
+        assert!(!same_origin(&headers(&[("origin", "null")]), issuer));
+        assert!(!same_origin(&headers(&[]), issuer), "neither");
     }
 
     #[test]

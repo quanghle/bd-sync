@@ -1,4 +1,5 @@
-//! Back from the provider: `/oauth/<provider>/callback` (relayed first when posted), then the consent page.
+//! Back from the provider: `/oauth/<provider>/callback` (relayed first when posted), then the consent page (or, for
+//! a human gate's approval, its approval page: `gate::signed_in`).
 
 use std::time::Duration;
 
@@ -45,7 +46,7 @@ pub fn relay(cx: &Ctx<'_>, provider: &str, body: &str) -> Answer {
 /// `GET <issuer>/oauth/<provider>/callback?<query>`: the provider sent the
 /// browser back. Find out who signed in and what the rules or the
 /// authorizer let the account do in the workspace, and ask whether the
-/// client may.
+/// client may; or, signed in to approve a human gate, whether to approve it.
 pub fn callback(
     cx: &Ctx<'_>,
     provider: &str,
@@ -82,7 +83,7 @@ fn signed_in(
     let pending =
         flow_cookie(cx.issuer, cookies, state).and_then(|sealed| lock(cx.flows).sealer.open(AT_PROVIDER, sealed));
     let pending = pending.filter(|p| p.until > now_millis() && p.at.as_ref().is_some_and(|at| at.state == state));
-    let Some(Pending { query: requested, browser: started_in, at: Some(at), .. }) = pending else {
+    let Some(Pending { then, browser: started_in, at: Some(at), .. }) = pending else {
         return refused(400, "This sign-in has expired. Start again from the application.");
     };
     let AtProvider { provider: started_with, verifier, nonce, .. } = at;
@@ -96,15 +97,6 @@ fn signed_in(
         Ok(s) => s,
         Err(answer) => return answer,
     };
-    let request = match request_of(cx, &oauth_config, &requested) {
-        Ok(r) => r,
-        Err(answer) => return answer,
-    };
-    let label = match (provider, sign_in.oidc(provider)) {
-        ("github", _) => "GitHub".to_string(),
-        (_, Some(oidc)) => oidc.label.clone(),
-        _ => return refused(404, NO_APPS),
-    };
     // Mix-up: an OIDC provider's answer names it (RFC 9207), where it says it does, and never another one.
     if let Some(oidc) = sign_in.oidc(provider) {
         let required = oidc.metadata().is_ok_and(|md| md.iss_parameter);
@@ -117,6 +109,23 @@ fn signed_in(
             return refused(400, "This sign-in came back from another provider. Start again from the application.");
         }
     }
+    let requested = match then {
+        Then::Authorize { query } => query,
+        Then::Gate { workspace, gate } => {
+            let back =
+                gate::Returned { provider, error: get("error"), code: get("code"), verifier: &verifier, nonce: &nonce };
+            return gate::signed_in(cx, &sign_in, &back, &workspace, &gate, fresh);
+        }
+    };
+    let request = match request_of(cx, &oauth_config, &requested) {
+        Ok(r) => r,
+        Err(answer) => return answer,
+    };
+    let label = match (provider, sign_in.oidc(provider)) {
+        ("github", _) => "GitHub".to_string(),
+        (_, Some(oidc)) => oidc.label.clone(),
+        _ => return refused(404, NO_APPS),
+    };
     let back = |error: &str, description: &str| request.error_url(cx.issuer, error, description);
     if let Some(error) = get("error") {
         let (error, description) = match error {
@@ -140,7 +149,7 @@ fn signed_in(
     let admitted = match sign_in.oidc(provider) {
         None => {
             let as_who = &mut signed_in_as;
-            oauth::web_sign_in(cx.root, &sign_in, code, &callback_url, &verifier, workspace, client, as_who)
+            oauth::web_sign_in(cx.root, &sign_in, code, &callback_url, &verifier, workspace, Some(client), as_who)
         }
         Some(oidc) => oidc
             .metadata()

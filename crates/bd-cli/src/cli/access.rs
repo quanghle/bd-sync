@@ -181,6 +181,27 @@ mod tests {
     }
 
     #[test]
+    fn gate_update_writes_and_takes_exactly_one_change() {
+        let access_of = |argv: &[&str]| access(&Cli::try_parse_from(argv).unwrap().command);
+        assert_eq!(access_of(&["bd", "gate", "update", "t-1", "--approver", "a,b", "--approver", "c"]), Access::Write);
+        assert_eq!(access_of(&["bd", "gate", "update", "t-1", "--clear-approvers"]), Access::Write);
+        assert_eq!(
+            access_of(&["bd", "gate", "create", "-t", "human", "--blocks", "t-2", "--approver", "a"]),
+            Access::Write
+        );
+        assert!(Cli::try_parse_from(["bd", "gate", "update", "t-1"]).is_err(), "a change is required");
+        assert!(Cli::try_parse_from(["bd", "gate", "update", "t-1", "--approver", "a", "--clear-approvers"]).is_err());
+        let Command::Gate(GateCommand::Update(a)) =
+            Cli::try_parse_from(["bd", "gate", "update", "t-1", "--approver", "a,b", "--approver", "c"])
+                .unwrap()
+                .command
+        else {
+            panic!("not gate update");
+        };
+        assert_eq!(a.approvers, ["a", "b", "c"]);
+    }
+
+    #[test]
     fn publish_is_a_write_through_the_server_and_no_mcp_tool() {
         for argv in [&["bd", "publish"][..], &["bd", "publish", "--dry-run"], &["bd", "publish", "--rollback"]] {
             let cmd = Cli::try_parse_from(argv).unwrap().command;

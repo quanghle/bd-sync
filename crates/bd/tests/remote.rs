@@ -10261,3 +10261,632 @@ fn publishes_and_refusals_are_logged_and_counted_without_contents() {
     assert!(metrics.contains("bd_serve_publishes_total{outcome=\"applied\"} 1"), "{metrics}");
     assert!(metrics.contains("bd_serve_publishes_total{outcome=\"refused\"} 2"), "{metrics}");
 }
+
+// Human gates approved in the browser, through the authorization server's sign-in.
+
+/// The public URL's origin in the gate tests: the browser reaches it at the test server's address.
+const PUBLIC: &str = "https://bd.example.com";
+
+/// `--public-url` of the gate tests' servers.
+const PUBLIC_URL: &[&str] = &["--public-url", "https://bd.example.com/bd"];
+
+/// The GitHub rules of the gate tests: people (kind human) in proj and in nosuch, which is granted but never
+/// created; mallory's account (id 4242) denied; bob let in as an agent.
+const GATE_RULES: &str = "deny = [\"4242\"]\n\n\
+    [[github.allow]]\nusers = [\"alice\", \"carol\", \"dave\", \"mallory\"]\nrole = \"write\"\nkind = \"human\"\n\
+    workspaces = [\"proj\", \"nosuch\"]\n\n\
+    [[github.allow]]\nusers = [\"bob\"]\nrole = \"write\"\nworkspaces = [\"proj\"]\n";
+
+/// What [`gate_root`] puts in workspace proj.
+struct GateIds {
+    /// `Deploy <b>prod</b>`, held back by [`GateIds::human`].
+    task: String,
+    /// A human gate, titled `Approve <i>prod</i>`.
+    human: String,
+    /// A human gate only github:carol may approve.
+    carol: String,
+    timer: String,
+    /// A human gate itself waiting for open work: not armed.
+    unarmed: String,
+    /// A playbook run (`Ship <b>release</b>`) whose only open child is its human gate [`GateIds::run_gate`].
+    run: String,
+    run_gate: String,
+    /// More human gates, each holding back a task of its own.
+    spares: Vec<String>,
+}
+
+/// [`oauth_root_at`] with these GitHub `rules`, and workspace proj holding the gates of [`GateIds`], made with
+/// the local CLI before the server starts.
+fn gate_root(github: &FakeGithub, rules: &str) -> (TempDir, GateIds) {
+    let root = oauth_root_at(Some(github), rules, "loopback_redirects = true\n");
+    let ws = root.path().join("proj");
+    let run = |args: &[&str]| {
+        let out = bd(&ws).env("BD_ACTOR", "setup").args(args).output().unwrap();
+        check(out, &format!("bd {args:?}")).trim().to_string()
+    };
+    let human = |title: &str, holds: &str, extra: &[&str]| {
+        let mut args = vec!["-q", "gate", "create", "-t", "human", "--blocks", holds, "--title", title];
+        args.extend_from_slice(extra);
+        run(&args)
+    };
+    let task = run(&["-q", "create", "Deploy <b>prod</b>"]);
+    let gate = human("Approve <i>prod</i>", &task, &[]);
+    let keys = run(&["-q", "create", "Rotate keys"]);
+    let carol = human("Rotate the keys", &keys, &["--approver", "github:carol"]);
+    let later = run(&["-q", "create", "Later"]);
+    let timer = run(&["-q", "gate", "create", "-t", "timer", "--timeout", "24h", "--blocks", &later]);
+    let prerequisite = run(&["-q", "create", "Prerequisite"]);
+    let held = run(&["-q", "create", "Held"]);
+    let unarmed = human("Not yet", &held, &[]);
+    run(&["dep", "add", &unarmed, &prerequisite]);
+    write(
+        &ws.join(".bd").join("playbooks"),
+        "ship.toml",
+        "title = \"Ship <b>release</b>\"\n[[steps]]\nid = \"ship\"\ntitle = \"Ship it\"\n[steps.gate]\ntype = \"human\"\n",
+    );
+    let started: Value = serde_json::from_str(&run(&["--json", "playbook", "run", "ship"])).unwrap();
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+    // Its step is done already: the gate is the run's last open child.
+    run(&["close", &format!("{run_id}.ship"), "--force"]);
+    let spares = (1..=4)
+        .map(|n| {
+            let task = run(&["-q", "create", &format!("Spare {n}")]);
+            human(&format!("Spare gate {n}"), &task, &[])
+        })
+        .collect();
+    let ids = GateIds {
+        task,
+        human: gate,
+        carol,
+        timer,
+        unarmed,
+        run_gate: format!("{run_id}.gate-ship"),
+        run: run_id,
+        spares,
+    };
+    (root, ids)
+}
+
+/// `url`, on the public URL, as the test browser reaches it.
+fn local_url(server: &Server, url: &str) -> String {
+    assert!(url.starts_with(PUBLIC), "{url}");
+    url.replacen(PUBLIC, &server.base, 1)
+}
+
+/// Every `Set-Cookie` of `headers`, one per line.
+fn cookies_from(headers: &ureq::http::HeaderMap) -> String {
+    headers.get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join("\n")
+}
+
+/// The `Set-Cookie` line of `headers` setting a cookie whose name starts with `name`.
+fn cookie_line(headers: &ureq::http::HeaderMap, name: &str) -> Option<String> {
+    cookies_from(headers).lines().find(|l| l.starts_with(name)).map(String::from)
+}
+
+/// The value of the browser's `bd_oauth` cookie a step set.
+fn bd_oauth(headers: &ureq::http::HeaderMap) -> String {
+    let line = cookie_line(headers, "__Secure-bd_oauth=").unwrap_or_else(|| panic!("no bd_oauth: {headers:?}"));
+    line["__Secure-bd_oauth=".len()..line.find(';').unwrap()].to_string()
+}
+
+/// The URL of a gate's page under the public URL's path, as the test browser reaches it.
+fn gate_url(server: &Server, ws: &str, id: &str) -> String {
+    format!("{}/bd/w/{ws}/gates/{id}", server.base)
+}
+
+/// A browser's answer: status, headers and body.
+type Answered = (u16, ureq::http::HeaderMap, String);
+
+/// GET a gate's page, then the chooser it leads to: both answers.
+fn gate_begin(server: &Server, ws: &str, id: &str) -> (Answered, Answered) {
+    let first = browse(&gate_url(server, ws, id), None, None);
+    assert_eq!(first.0, 302, "{}", first.2);
+    let choose = location(&first.1);
+    assert!(choose.starts_with(&format!("{PUBLIC}/bd/oauth/choose?flow=")), "{choose}");
+    let second = browse(&local_url(server, &choose), None, None);
+    (first, second)
+}
+
+/// What the browser was shown back from the provider: the approval page, or what came instead.
+struct Signed {
+    status: u16,
+    headers: ureq::http::HeaderMap,
+    page: String,
+}
+
+impl Signed {
+    /// The approval id the page's form posts.
+    fn approval(&self) -> String {
+        let field = "name=\"approval\" value=\"";
+        let at = self.page.find(field).unwrap_or_else(|| panic!("no approval form: {}", self.page)) + field.len();
+        self.page[at..at + self.page[at..].find('"').unwrap()].to_string()
+    }
+
+    /// The `Set-Cookie` line of the approval's own cookie.
+    fn cookie_line(&self) -> String {
+        cookie_line(&self.headers, "__Secure-bd_gate_").unwrap_or_else(|| panic!("no gate cookie: {:?}", self.headers))
+    }
+
+    /// `name=value` of the approval's own cookie, as the browser sends it back.
+    fn cookie(&self) -> String {
+        self.cookie_line().split(';').next().unwrap().to_string()
+    }
+
+    fn has_form(&self) -> bool {
+        self.page.contains("<form") || self.page.contains("name=\"approval\"")
+    }
+}
+
+/// On from a chooser that sent the browser to (fake) GitHub, signing in there, back to the callback.
+fn signed_in_at_github(server: &Server, github: &FakeGithub, choose: &Answered) -> Signed {
+    assert_eq!(choose.0, 302, "one provider: straight to it: {}", choose.2);
+    let oauth = bd_oauth(&choose.1);
+    let to_github = location(&choose.1);
+    assert!(to_github.starts_with(&format!("{}/login/oauth/authorize?", github.url)), "{to_github}");
+    let (status, headers, _) = browse(&to_github, None, None);
+    assert_eq!(status, 302);
+    let back = location(&headers);
+    assert!(back.starts_with(&format!("{PUBLIC}/bd/oauth/github/callback?")), "{back}");
+    let (status, headers, page) = browse(&local_url(server, &back), Some(&oauth), None);
+    Signed { status, headers, page }
+}
+
+/// Open a gate's link in a fresh browser and sign in at GitHub as `login`.
+fn approve_flow(server: &Server, github: &FakeGithub, login: &str, ws: &str, id: &str) -> Signed {
+    github.next(login, 0);
+    let (_, choose) = gate_begin(server, ws, id);
+    signed_in_at_github(server, github, &choose)
+}
+
+/// POST `body` to `url` as a browser form, with these `Origin` and `Sec-Fetch-Site` headers (left out where
+/// `None`) and this `Cookie` header (none if empty).
+fn post_gate(url: &str, origin: Option<&str>, site: Option<&str>, cookie: &str, body: &str) -> Answered {
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).proxy(None).build().into();
+    let mut req = agent.post(url).header("content-type", "application/x-www-form-urlencoded");
+    if let Some(origin) = origin {
+        req = req.header("origin", origin);
+    }
+    if let Some(site) = site {
+        req = req.header("sec-fetch-site", site);
+    }
+    if !cookie.is_empty() {
+        req = req.header("cookie", cookie);
+    }
+    let mut r = req.send(body).unwrap();
+    let text = r.body_mut().read_to_string().unwrap_or_default();
+    (r.status().as_u16(), r.headers().clone(), text)
+}
+
+/// Approve what `signed` shows, from its browser, as the approval page posts it.
+fn post_approval(server: &Server, id: &str, signed: &Signed) -> Answered {
+    let body = format!("approval={}", signed.approval());
+    post_gate(&gate_url(server, "proj", id), Some(PUBLIC), None, &signed.cookie(), &body)
+}
+
+/// `bd_serve_approvals_total` by outcome: (approved, refused), read with the admin token `admin`.
+fn approvals_counted(server: &Server, admin: &str) -> (u64, u64) {
+    let agent: ureq::Agent = ureq::Agent::config_builder().proxy(None).build().into();
+    let mut answer =
+        agent.get(format!("{}/metrics", server.base)).header("authorization", format!("Bearer {admin}")).call();
+    let text = answer.as_mut().unwrap().body_mut().read_to_string().unwrap();
+    let value = |outcome: &str| -> u64 {
+        let series = format!("bd_serve_approvals_total{{outcome=\"{outcome}\"}} ");
+        let line = text.lines().find(|l| l.starts_with(&series)).unwrap_or_else(|| panic!("{series}: {text}"));
+        line[series.len()..].parse().unwrap()
+    };
+    (value("approved"), value("refused"))
+}
+
+/// The `closed` events of issue `id`, read on the server's host.
+fn closed_events(server: &Server, id: &str) -> Vec<Value> {
+    let out = server.local("ops", &["--json", "events", "--since", "0", "--issue", id, "--op", "closed"]);
+    check(out, "events")
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|e| e["op"] == "closed")
+        .collect()
+}
+
+/// Issue `id` as `bd show --json` shows it on the server's host.
+fn shown_on_host(server: &Server, id: &str) -> Value {
+    serde_json::from_str(&check(server.local("ops", &["--json", "show", id]), "show")).unwrap()
+}
+
+#[test]
+fn people_approve_human_gates_in_the_browser() {
+    let github = FakeGithub::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let ops = server.token("ops", "ops", &["--role", "admin"]);
+    assert_eq!(approvals_counted(&server, &ops), (0, 0));
+
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.human);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    for shown in [
+        "<h1>Approve Approve &lt;i&gt;prod&lt;/i&gt;?</h1>",
+        "You're signed in to GitHub as <b>github:alice</b>.",
+        "<div><dt>Workspace</dt><dd>proj</dd></div>",
+        &format!("<code>{}</code> Deploy &lt;b&gt;prod&lt;/b&gt; <span class=\"note\">open</span>", ids.task),
+        &format!("action=\"{PUBLIC}/bd/w/proj/gates/{}\"", ids.human),
+    ] {
+        assert!(signed.page.contains(shown), "{shown}: {}", signed.page);
+    }
+    assert!(!signed.page.contains("<b>prod</b>") && !signed.page.contains("<i>prod</i>"), "escaped");
+    assert!(!signed.page.contains("<dt>Approvers</dt>"), "none named: {}", signed.page);
+    let set = signed.cookie_line();
+    let path = format!("; Path=/bd/w/proj/gates/{}; Max-Age=600; HttpOnly; SameSite=Strict; Secure", ids.human);
+    assert!(set.ends_with(&path), "{set}");
+    let suffix = &set["__Secure-bd_gate_".len()..set.find('=').unwrap()];
+    assert!(!suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_hexdigit()), "{set}");
+    let csp = signed.headers.get("content-security-policy").unwrap().to_str().unwrap();
+    for directive in ["form-action 'self'", "frame-ancestors 'none'", "script-src 'sha256-"] {
+        assert!(csp.contains(directive), "{directive}: {csp}");
+    }
+    assert_eq!(signed.headers.get("cache-control").unwrap(), "no-store");
+
+    let (status, headers, page) = post_approval(&server, &ids.human, &signed);
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("The work it held back can go ahead."), "{page}");
+    assert!(cookies_from(&headers).contains("Max-Age=0"), "its cookie is cleared: {headers:?}");
+    let closed = closed_events(&server, &ids.human);
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["actor"], "github:alice");
+    assert_eq!(closed[0]["data"]["reason"], "approved in the browser by github:alice");
+    assert_eq!(closed[0]["data"]["via"], "browser");
+    let ready: Value = serde_json::from_str(&check(server.local("ops", &["--json", "ready"]), "ready")).unwrap();
+    assert!(ready.as_array().unwrap().iter().any(|i| i["id"] == ids.task.as_str()), "{ready}");
+
+    // The run's last open child was its gate: approving it completes the run.
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.run_gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let part_of =
+        format!("<div><dt>Part of</dt><dd><code>{}</code> Ship &lt;b&gt;release&lt;/b&gt;</dd></div>", ids.run);
+    assert!(signed.page.contains(&part_of), "{}", signed.page);
+    let (status, _, page) = post_approval(&server, &ids.run_gate, &signed);
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("Its run is complete."), "{page}");
+    assert_eq!(shown_on_host(&server, &ids.run)["status"], "closed");
+    assert_eq!(closed_events(&server, &ids.run_gate)[0]["data"]["via"], "browser");
+
+    // No token for the person; the account is bound, its sign-ins recorded without one.
+    let root = server.root.path();
+    let out = bd(root).args(["--json", "serve", "token", "list", "--root"]).arg(root).output().unwrap();
+    let tokens: Value = serde_json::from_str(&check(out, "token list")).unwrap();
+    assert!(!tokens.to_string().contains("github:alice"), "{tokens}");
+    assert!(stored(root, "tokens").iter().all(|t| t["actor"] != "github:alice"));
+    let accounts = stored(root, "accounts");
+    assert!(accounts.iter().any(|a| a["actor"] == "github:alice" && a["provider"] == "github"), "{accounts:?}");
+    let args = ["--json", "serve", "token", "events", "--kind", "signed_in", "--root"];
+    let out = bd(root).args(args).arg(root).output().unwrap();
+    let events: Value = serde_json::from_str(&check(out, "token events")).unwrap();
+    let alice: Vec<&Value> = events.as_array().unwrap().iter().filter(|e| e["actor"] == "github:alice").collect();
+    assert_eq!(alice.len(), 2, "one per approval's sign-in: {events}");
+    for e in alice {
+        assert!(e["token"].is_null(), "no token issued: {e}");
+        let detail = e["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("to approve gate") && detail.contains("no token issued"), "{e}");
+    }
+    assert_eq!(approvals_counted(&server, &ops), (2, 0));
+}
+
+#[test]
+fn agent_kind_grants_and_denied_accounts_cannot_approve_gates() {
+    let github = FakeGithub::start();
+    github.set_id("mallory", 4242);
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let ops = server.token("ops", "ops", &["--role", "admin"]);
+    for login in ["bob", "mallory"] {
+        let signed = approve_flow(&server, &github, login, "proj", &ids.human);
+        assert_eq!(signed.status, 403, "{login}: {}", signed.page);
+        assert!(signed.page.contains("may not approve gates in this workspace"), "{login}: {}", signed.page);
+        for told in [ids.human.as_str(), "Deploy", "prod", "Approve"] {
+            assert!(!signed.page.contains(told), "{login}: nothing of the gate ({told}): {}", signed.page);
+        }
+        assert!(!signed.has_form() && cookie_line(&signed.headers, "__Secure-bd_gate_").is_none(), "{login}");
+    }
+    assert_eq!(shown_on_host(&server, &ids.human)["status"], "open");
+    let (approved, refused) = approvals_counted(&server, &ops);
+    assert_eq!(approved, 0);
+    assert!(refused >= 2, "{refused}");
+    let root = server.root.path();
+    assert!(stored(root, "accounts").iter().all(|a| a["actor"] != "github:bob"), "refused before binding");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_authorizer_decides_who_approves_gates_and_must_allow_people() {
+    let github = FakeGithub::start();
+    let (root, ids) = gate_root(&github, "[authorizer]\ncommand = [\"./authorize\"]\n");
+    let script = root.path().join("authorize");
+    std::fs::write(&script, AUTHORIZER).unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    std::fs::write(root.path().join("decision.json"), r#"{"allow":true,"role":"write","kind":"human"}"#).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let root = server.root.path().to_path_buf();
+    let ops = server.token("ops", "ops", &["--role", "admin"]);
+
+    // The authorizer may not grant kind human (`human = false`, the default): refused.
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.human);
+    assert_eq!(signed.status, 403, "{}", signed.page);
+    assert!(!signed.page.contains(&ids.human), "{}", signed.page);
+    let asked = std::fs::read_to_string(root.join("requests.log")).unwrap();
+    for told in ["\"event\":\"sign_in\"", "\"workspace\":\"proj\"", "\"client\":null"] {
+        assert!(asked.contains(told), "{told}: {asked}");
+    }
+    assert_eq!(approvals_counted(&server, &ops), (0, 1));
+
+    // Once it may: approved.
+    let config = std::fs::read_to_string(root.join("auth.toml")).unwrap();
+    let config = config.replacen("command = [\"./authorize\"]\n", "command = [\"./authorize\"]\nhuman = true\n", 1);
+    std::fs::write(root.join("auth.toml"), config).unwrap();
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.human);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = post_approval(&server, &ids.human, &signed);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(closed_events(&server, &ids.human)[0]["actor"], "github:alice");
+}
+
+#[test]
+fn approvers_narrow_who_may_approve_a_gate() {
+    let github = FakeGithub::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let ops = server.client(&server.token("ops", "ops", &["--role", "admin", "--kind", "human"]));
+
+    // Signed in, but not its approver.
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.carol);
+    assert_eq!(signed.status, 403, "{}", signed.page);
+    assert!(signed.page.contains("Only github:carol can approve it"), "{}", signed.page);
+    assert!(!signed.has_form());
+
+    // The same holds for tokens: a human admin token of someone else may not resolve it; carol's may.
+    let out = ops.run(&["gate", "resolve", &ids.carol]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("github:carol"), "{}", stderr_of(&out));
+    github.next("carol", 0);
+    let carol = tempfile::tempdir().unwrap();
+    check(github_login(carol.path(), &server.url()), "carol's sign-in");
+    check(signed_in(carol.path(), &server.url(), &["gate", "resolve", &ids.carol, "-r", "rotated"]), "carol resolves");
+    assert_eq!(shown_on_host(&server, &ids.carol)["status"], "closed");
+
+    // Approvers named between the page and the approval: checked again when it is posted.
+    let gate = &ids.spares[0];
+    let signed = approve_flow(&server, &github, "dave", "proj", gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    ops.ok(&["gate", "update", gate, "--approver", "github:carol"]);
+    let (status, _, page) = post_approval(&server, gate, &signed);
+    assert_eq!(status, 403, "{page}");
+    assert!(page.contains("github:carol"), "{page}");
+    assert_eq!(ops.json(&["gate", "show", gate])["status"], "open");
+    assert!(closed_events(&server, gate).is_empty());
+    let (approved, refused) = approvals_counted(&server, &ops.token);
+    assert_eq!(approved, 0);
+    assert!(refused >= 2, "{refused}");
+}
+
+#[test]
+fn gate_pages_tell_nothing_before_sign_in() {
+    let github = FakeGithub::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let cases = [
+        ("nosuch", ids.human.as_str(), "No such workspace"),
+        ("proj", "t-999", "No such gate"),
+        ("proj", ids.task.as_str(), "Not a gate"),
+        ("proj", ids.timer.as_str(), "Not a human gate"),
+        ("proj", ids.human.as_str(), "Approve Approve"),
+    ];
+    let names = |headers: &ureq::http::HeaderMap| {
+        let mut names: Vec<String> = headers.keys().map(|k| k.to_string()).collect();
+        names.sort();
+        names
+    };
+    let mut begun = Vec::new();
+    for (ws, id, _) in cases {
+        github.next("alice", 0);
+        let (first, choose) = gate_begin(&server, ws, id);
+        let to = location(&first.1);
+        let shape = (first.0, names(&first.1), to[..to.find("flow=").unwrap()].to_string());
+        assert_eq!(choose.0, 302, "{ws}/{id}: {}", choose.2);
+        assert!(location(&choose.1).starts_with(&format!("{}/login/oauth/authorize?", github.url)));
+        begun.push((ws, id, shape, (choose.0, names(&choose.1)), choose));
+    }
+    for (ws, id, shape, chose, _) in &begun {
+        assert_eq!(shape, &begun[0].2, "{ws}/{id}: the same answer as any other");
+        assert_eq!(chose, &begun[0].3, "{ws}/{id}: the same choice");
+    }
+    // Signed in (granted nosuch too), a person is told what the link names.
+    let mut forms = 0;
+    for ((ws, id, _, _, choose), (_, _, says)) in begun.iter().zip(cases) {
+        github.next("alice", 0);
+        let signed = signed_in_at_github(&server, &github, choose);
+        assert!(signed.page.contains(&format!("<h1>{says}")), "{ws}/{id}: {}", signed.page);
+        if signed.has_form() {
+            forms += 1;
+            assert_eq!((*ws, *id), ("proj", ids.human.as_str()));
+        } else {
+            assert_eq!(signed.status, 404, "{ws}/{id}: {}", signed.page);
+        }
+    }
+    assert_eq!(forms, 1);
+}
+
+#[test]
+fn approvals_refuse_foreign_posts_replays_and_resolved_gates() {
+    let github = FakeGithub::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let ops = server.client(&server.token("ops", "ops", &["--role", "admin", "--kind", "human"]));
+    let gate = &ids.spares[0];
+    let url = gate_url(&server, "proj", gate);
+    let signed = approve_flow(&server, &github, "alice", "proj", gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let body = format!("approval={}", signed.approval());
+    let cookie = signed.cookie();
+
+    // Another site's form, or a post that does not say where it came from.
+    for (origin, site) in [
+        (Some("https://evil.example"), None),
+        (Some("https://evil.example"), Some("same-origin")),
+        (Some(PUBLIC), Some("cross-site")),
+        (None, Some("cross-site")),
+        (None, None),
+    ] {
+        let (status, _, page) = post_gate(&url, origin, site, &cookie, &body);
+        assert_eq!(status, 403, "{origin:?} {site:?}: {page}");
+        assert!(page.contains("another site"), "{page}");
+    }
+    assert_eq!(ops.json(&["gate", "show", gate])["status"], "open");
+
+    // Another browser (no cookie, or not this approval's) does not take it from this one.
+    let (name, _) = cookie.split_once('=').unwrap();
+    for other in [String::new(), format!("{name}={}", "0".repeat(64))] {
+        let (status, _, page) = post_gate(&url, Some(PUBLIC), None, &other, &body);
+        assert_eq!(status, 403, "{page}");
+        assert!(page.contains("different browser"), "{page}");
+    }
+    let (status, _, page) = post_gate(&url, None, Some("same-origin"), &cookie, &body);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(ops.json(&["gate", "show", gate])["status"], "closed");
+    // Once.
+    let (status, _, page) = post_gate(&url, Some(PUBLIC), None, &cookie, &body);
+    assert_eq!(status, 400, "{page}");
+    assert!(page.contains("already used"), "{page}");
+    // A resolved gate's link leads to a notice.
+    let signed = approve_flow(&server, &github, "alice", "proj", gate);
+    assert_eq!(signed.status, 409, "{}", signed.page);
+    assert!(signed.page.contains("Already resolved") && !signed.has_form(), "{}", signed.page);
+
+    // Resolved between the page and the approval.
+    let gate = &ids.spares[1];
+    let signed = approve_flow(&server, &github, "alice", "proj", gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    ops.ok(&["gate", "resolve", gate, "-r", "done elsewhere"]);
+    let (status, _, page) = post_approval(&server, gate, &signed);
+    assert_eq!(status, 409, "{page}");
+    assert!(page.contains("Already resolved"), "{page}");
+    assert_eq!(closed_events(&server, gate).len(), 1);
+    assert_eq!(closed_events(&server, gate)[0]["actor"], "ops");
+
+    // Deferred between the page and the approval: not ready, and left as it is.
+    let gate = &ids.spares[2];
+    let signed = approve_flow(&server, &github, "alice", "proj", gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    ops.ok(&["update", gate, "--status", "deferred"]);
+    let (status, _, page) = post_approval(&server, gate, &signed);
+    assert_eq!(status, 409, "{page}");
+    assert!(page.contains("not ready to approve"), "{page}");
+    assert_eq!(ops.json(&["gate", "show", gate])["status"], "deferred");
+    assert!(closed_events(&server, gate).is_empty());
+
+    // Waiting for other work: nothing to approve yet.
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.unarmed);
+    assert_eq!(signed.status, 409, "{}", signed.page);
+    assert!(signed.page.contains("not ready to approve") && !signed.has_form(), "{}", signed.page);
+
+    // Cancelled at the provider: a page of this server's, no redirect.
+    github.next("alice", 0);
+    github.deny(true);
+    let (_, choose) = gate_begin(&server, "proj", &ids.human);
+    let signed = signed_in_at_github(&server, &github, &choose);
+    assert_eq!(signed.status, 403, "{}", signed.page);
+    assert!(signed.headers.get("location").is_none());
+    assert!(signed.page.contains("cancelled") && !signed.has_form(), "{}", signed.page);
+    assert_eq!(ops.json(&["gate", "show", &ids.human])["status"], "open");
+}
+
+#[cfg(unix)]
+#[test]
+fn gates_are_approved_through_a_chosen_oidc_provider() {
+    let github = FakeGithub::start();
+    let idp = FakeOidc::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    std::fs::write(root.path().join("acme-secret"), "oidc-s3cret\n").unwrap();
+    let config = std::fs::read_to_string(root.path().join("auth.toml")).unwrap();
+    let oidc = format!(
+        "\n[oidc.acme]\nissuer = \"{}\"\nclient_id = \"bd-client\"\nclient_secret_file = \"acme-secret\"\n\
+         label = \"Acme SSO\"\nscopes = [\"email\"]\n\n[[oidc.acme.allow]]\nemails = [\"alice@acme.example\"]\n\
+         role = \"write\"\nkind = \"human\"\nworkspaces = [\"proj\"]\n",
+        idp.url
+    );
+    std::fs::write(root.path().join("auth.toml"), config + &oidc).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+
+    let (_, (status, headers, page)) = gate_begin(&server, "proj", &ids.human);
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains(&format!("<h1>Sign in to approve gate {} in proj</h1>", ids.human)), "{page}");
+    assert!(page.contains(">Continue with GitHub<") && page.contains(">Continue with Acme SSO<"), "{page}");
+    let oauth = bd_oauth(&headers);
+    let at = page.find(">Continue with Acme SSO<").unwrap();
+    let start = page[..at].rfind("href=\"").unwrap() + "href=\"".len();
+    let acme = page[start..at - 1].replace("&amp;", "&");
+    let (status, headers, body) = browse(&local_url(&server, &acme), Some(&oauth), None);
+    assert_eq!(status, 302, "{body}");
+    let to_idp = location(&headers);
+    assert!(to_idp.starts_with(&format!("{}/authorize?", idp.url)), "{to_idp}");
+    idp.next(
+        "248289761001",
+        json!({ "preferred_username": "alice", "email": "alice@acme.example", "email_verified": true }),
+    );
+    let (_, headers, _) = browse(&to_idp, None, None);
+    let back = location(&headers);
+    assert!(back.starts_with(&format!("{PUBLIC}/bd/oauth/acme/callback?")), "{back}");
+    let (status, headers, page) = browse(&local_url(&server, &back), Some(&oauth), None);
+    let signed = Signed { status, headers, page };
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("You're signed in to Acme SSO as <b>acme:alice</b>."), "{}", signed.page);
+    assert!(!signed.page.contains("alice@acme.example"), "never the email: {}", signed.page);
+    let (status, _, page) = post_approval(&server, &ids.human, &signed);
+    assert_eq!(status, 200, "{page}");
+    let closed = closed_events(&server, &ids.human);
+    assert_eq!(closed[0]["actor"], "acme:alice");
+    assert_eq!(closed[0]["data"]["via"], "browser");
+}
+
+#[test]
+fn no_oauth_no_gate_page() {
+    // A server without sign-in.
+    let server = Server::start();
+    for path in ["/w/proj/gates/t-1", "/bd/w/proj/gates/t-1"] {
+        assert_eq!(browse(&format!("{}{path}", server.base), None, None).0, 404, "{path}");
+    }
+    drop(server);
+
+    // Started with sign-in but without [oauth] and --public-url; [oauth] added later serves no approvals.
+    let github = FakeGithub::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let full = std::fs::read_to_string(root.path().join("auth.toml")).unwrap();
+    let (without, _) = full.split_once("\n[oauth]\n").unwrap();
+    // Without [oauth], the client secret of GitHub's web sign-in has nothing to serve.
+    let without = without.replacen("client_secret_file = \"github-secret\"\n", "", 1);
+    std::fs::write(root.path().join("auth.toml"), without).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    let paths = [format!("/w/proj/gates/{}", ids.human), format!("/bd/w/proj/gates/{}", ids.human)];
+    for path in &paths {
+        assert_eq!(browse(&format!("{}{path}", server.base), None, None).0, 404, "{path}");
+    }
+    std::fs::write(server.root.path().join("auth.toml"), &full).unwrap();
+    for path in &paths {
+        assert_eq!(browse(&format!("{}{path}", server.base), None, None).0, 404, "{path}");
+    }
+    drop(server);
+
+    // Started able to serve them; then auth.toml loses its browser provider (GitHub's client secret).
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let check_out = bd(root.path()).args(["serve", "check", "--root"]).arg(root.path()).args(PUBLIC_URL).output();
+    let said = check_out.unwrap();
+    let said = format!("{}{}", String::from_utf8_lossy(&said.stdout), String::from_utf8_lossy(&said.stderr));
+    assert!(!said.contains("/gates"), "nothing new to register: {said}");
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let url = gate_url(&server, "proj", &ids.human);
+    assert_eq!(browse(&url, None, None).0, 302);
+    let config = std::fs::read_to_string(server.root.path().join("auth.toml")).unwrap();
+    let edited = config.replacen("client_secret_file = \"github-secret\"\n", "", 1);
+    assert_ne!(edited, config);
+    std::fs::write(server.root.path().join("auth.toml"), edited).unwrap();
+    let (status, headers, page) = browse(&url, None, None);
+    assert_eq!(status, 404, "{page}");
+    assert!(headers.get("location").is_none());
+}

@@ -45,6 +45,13 @@ pub fn unavailable(cli: &Cli, e: &Error) -> i32 {
 
 /// Run the command on the server; returns the process exit code.
 pub fn run(app: &mut App, remote: Remote, cli: &Cli) -> i32 {
+    // The client asks the person and sends its own requests: the command line itself is never forwarded.
+    if let Command::Gate(GateCommand::Review(a)) = &cli.command {
+        return match crate::gate_review::cmd_review(app, Some(&remote), a) {
+            Ok(code) => code,
+            Err(e) => crate::report(&e, app.g.json),
+        };
+    }
     let hook = is_hook(cli);
     let remote = if hook { remote.quick().within(crate::agents::hook::server_budget(app)) } else { remote };
     match forward(app, &remote, cli, hook) {

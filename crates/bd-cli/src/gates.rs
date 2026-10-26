@@ -18,6 +18,7 @@ use bd_core::{Error, Queries, Result, Timestamp, WriteCtx};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::agents::show;
 use crate::app::{App, Out};
 use crate::cli::*;
 use crate::fmt::rel;
@@ -65,7 +66,7 @@ fn condition(g: &GateView) -> String {
 }
 
 /// Stored approvers as a terminal may show them.
-fn shown_approvers(list: &[String], sep: &str) -> String {
+pub(crate) fn shown_approvers(list: &[String], sep: &str) -> String {
     list.iter().map(|a| io::printable(a)).collect::<Vec<_>>().join(sep)
 }
 
@@ -73,7 +74,7 @@ fn ago(t: Timestamp, now: Timestamp) -> String {
     if now.since(t).abs() < 1000 { "just now".into() } else { rel(t, now) }
 }
 
-fn state_text(g: &GateView, now: Timestamp) -> String {
+pub(crate) fn state_text(g: &GateView, now: Timestamp) -> String {
     match g.phase {
         GatePhase::Waiting => "waiting for its work's prerequisites".into(),
         GatePhase::Resolved => format!(
@@ -93,6 +94,22 @@ fn state_text(g: &GateView, now: Timestamp) -> String {
     }
 }
 
+/// The browser approval link of a human gate that is armed or escalated,
+/// where the `bd serve` running this request offers one ([`io::approval_url`]).
+pub(crate) fn approval_url_of(g: &GateView) -> Option<String> {
+    let human = g.spec.as_ref().is_some_and(|s| s.kind == GateKind::Human);
+    (g.is_armed() && human).then(|| io::approval_url(&g.id)).flatten()
+}
+
+/// `view` as JSON with its approval link, when it has one.
+fn with_link(view: &GateView) -> Result<Value> {
+    let mut v = serde_json::to_value(view)?;
+    if let (Some(url), Some(o)) = (approval_url_of(view), v.as_object_mut()) {
+        o.insert("approval_url".into(), url.into());
+    }
+    Ok(v)
+}
+
 fn gate_line(g: &GateView, now: Timestamp) -> String {
     let holds: Vec<&str> = g.blocks.iter().map(|b| b.id.as_str()).collect();
     format!(
@@ -110,7 +127,7 @@ pub fn cmd_gate(app: &mut App, cmd: &GateCommand) -> Result<()> {
     match cmd {
         GateCommand::List(a) => {
             let (list, now) = app.read(|r| Ok((gates::list(r.conn(), a.all)?, r.now())))?;
-            let mut out = Out::new(&list);
+            let mut out = Out::new(list.iter().map(with_link).collect::<Result<Vec<_>>>()?);
             if list.is_empty() {
                 out = out.line(if a.all { "No gates" } else { "No open gates" });
             }
@@ -120,29 +137,43 @@ pub fn cmd_gate(app: &mut App, cmd: &GateCommand) -> Result<()> {
             app.print(out);
         }
         GateCommand::Show(a) => {
-            let (g, now) = app.read(|r| Ok((gates::view(r.conn(), &r.resolve_id(&a.id)?)?, r.now())))?;
-            let mut out = Out::new(&g)
-                .line(format!("{} {} · {}", phase_icon(g.phase), g.id, g.title))
-                .line(format!("  condition: {}", condition(&g)))
-                .line(format!("  state: {}", state_text(&g, now)));
+            let (g, part_of, now) = app.read(|r| {
+                let id = r.resolve_id(&a.id)?;
+                Ok((gates::view(r.conn(), &id)?, gates::run_of(r.conn(), &id)?, r.now()))
+            })?;
+            let link = approval_url_of(&g);
+            let mut json = with_link(&g)?;
+            if let (Some(p), Some(o)) = (&part_of, json.as_object_mut()) {
+                o.insert("part_of".into(), json!({ "id": p.id, "title": p.title }));
+            }
+            let mut out = Out::new(json)
+                .line(show::printable(&format!("{} {} · {}", phase_icon(g.phase), g.id, g.title)))
+                .line(show::printable(&format!("  condition: {}", condition(&g))))
+                .line(show::printable(&format!("  state: {}", state_text(&g, now))));
+            if let Some(p) = &part_of {
+                out = out.line(show::printable(&format!("  part of: {} {}", p.id, p.title)));
+            }
             if let Some(a) = &g.assignee {
-                out = out.line(format!("  assignee: {a}"));
+                out = out.line(show::printable(&format!("  assignee: {a}")));
             }
             match g.spec.as_ref().and_then(|s| s.approvers.as_deref()) {
                 Some([]) => {
                     out = out.line("  approvers: invalid (matches nobody through bd serve; fix with bd gate update)")
                 }
-                Some(list) => out = out.line(format!("  approvers: {}", shown_approvers(list, ", "))),
+                Some(list) => out = out.line(show::printable(&format!("  approvers: {}", shown_approvers(list, ", ")))),
                 None => {}
             }
             if let Some(r) = &g.run_id {
-                out = out.line(format!("  watching GitHub run {r}"));
+                out = out.line(show::printable(&format!("  watching GitHub run {r}")));
             }
             for b in &g.blocks {
-                out = out.line(format!("  holds back: {} {} [{}]", b.id, b.title, b.status));
+                out = out.line(show::printable(&format!("  holds back: {} {} [{}]", b.id, b.title, b.status)));
             }
             if g.phase == GatePhase::Armed || g.phase == GatePhase::Escalated {
                 out = out.line(format!("  open it by hand: bd gate resolve {}", g.id));
+            }
+            if let Some(url) = link {
+                out = out.line(format!("  approve in a browser: {url}"));
             }
             app.print(out.id(g.id.clone()));
         }
@@ -158,6 +189,9 @@ pub fn cmd_gate(app: &mut App, cmd: &GateCommand) -> Result<()> {
         GateCommand::Update(a) => {
             let out = app.write("gate.update", |tx| exec_update(tx, a))?;
             app.print(out);
+        }
+        GateCommand::Review(_) => {
+            return Err(Error::invalid("bd gate review runs through crate::gate_review::cmd_review"));
         }
     }
     Ok(())
@@ -596,6 +630,47 @@ fn cmd_check(app: &mut App, a: &GateCheckArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_human_gates_a_person_can_open_now_get_an_approval_link() {
+        let gate = |phase: GatePhase, kind: Option<GateKind>| GateView {
+            id: "t-1".into(),
+            title: "Gate".into(),
+            status: if phase == GatePhase::Resolved { bd_core::Status::Closed } else { bd_core::Status::Open },
+            phase,
+            spec: kind.map(GateSpec::new),
+            spec_error: kind.is_none().then(|| "no metadata.gate condition".into()),
+            assignee: None,
+            created_at: Timestamp::from_millis(0),
+            armed_at: None,
+            deadline: None,
+            escalated_at: None,
+            escalation: None,
+            run_id: None,
+            closed_at: None,
+            close_reason: None,
+            blocks: Vec::new(),
+        };
+        let human = Some(GateKind::Human);
+        let linked = [gate(GatePhase::Armed, human), gate(GatePhase::Escalated, human)];
+        let unlinked = [
+            gate(GatePhase::Waiting, human),
+            gate(GatePhase::Escalated, None),
+            gate(GatePhase::Escalated, Some(GateKind::Timer)),
+            gate(GatePhase::Resolved, human),
+        ];
+        assert!(linked.iter().all(|g| approval_url_of(g).is_none()), "outside bd serve");
+        let (_, c) = io::Capture::buffered(1024);
+        let c = io::Capture { approvals: Some("https://x/bd/w/p/gates/".into()), ..c };
+        let ((yes, no), _) = io::capture(c, || {
+            (
+                linked.iter().map(approval_url_of).collect::<Vec<_>>(),
+                unlinked.iter().map(approval_url_of).collect::<Vec<_>>(),
+            )
+        });
+        assert!(yes.iter().all(|u| u.as_deref() == Some("https://x/bd/w/p/gates/t-1")), "{yes:?}");
+        assert!(no.iter().all(Option::is_none), "{no:?}");
+    }
 
     #[test]
     fn a_verdict_that_cannot_be_applied_leaves_the_others() {

@@ -472,7 +472,7 @@ pub fn validate_repo(repo: &str) -> Result<()> {
 }
 
 /// Where a gate is in its life.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GatePhase {
     /// The work it holds back still has open prerequisites.
@@ -496,8 +496,9 @@ impl GatePhase {
     }
 }
 
-/// A gate as `bd gate` shows it.
-#[derive(Clone, Debug, Serialize)]
+/// A gate as `bd gate` shows it; read back from its JSON too (missing
+/// optional fields read as `None`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GateView {
     pub id: String,
     pub title: String,
@@ -529,6 +530,14 @@ pub struct GateView {
     pub close_reason: Option<String>,
     /// Issues this gate holds back.
     pub blocks: Vec<IssueRef>,
+}
+
+/// Whether `id` may name a gate in an approval link's path: 1 to 128
+/// characters of `[A-Za-z0-9._-]`, starting with a letter or digit.
+pub fn approval_id_ok(id: &str) -> bool {
+    id.len() <= 128
+        && id.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
 impl GateView {
@@ -1079,6 +1088,68 @@ impl WriteCtx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn approval_ids_are_path_safe() {
+        for ok in ["bd-1.2_x".to_string(), "a".repeat(128), "9".into()] {
+            assert!(approval_id_ok(&ok), "{ok}");
+        }
+        for bad in [String::new(), ".x".into(), "-x".into(), "a b".into(), "a/b".into(), "a?b".into(), "a".repeat(129)]
+        {
+            assert!(!approval_id_ok(&bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn gate_views_read_back_from_their_json() {
+        let armed = GateView {
+            id: "t-1.gate".into(),
+            title: "Approve".into(),
+            status: Status::Open,
+            phase: GatePhase::Armed,
+            spec: Some(GateSpec { approvers: Some(vec!["carol".into()]), ..GateSpec::new(GateKind::Human) }),
+            spec_error: None,
+            assignee: None,
+            created_at: Timestamp(1_700_000_000_000),
+            armed_at: Some(Timestamp(1_700_000_001_000)),
+            deadline: None,
+            escalated_at: None,
+            escalation: None,
+            run_id: None,
+            closed_at: None,
+            close_reason: None,
+            blocks: vec![IssueRef {
+                id: "t-1.deploy".into(),
+                title: "Deploy".into(),
+                status: Status::Open,
+                priority: 2,
+                issue_type: "task".into(),
+                assignee: None,
+            }],
+        };
+        let bare = GateView {
+            id: "t-2".into(),
+            spec: None,
+            spec_error: Some("no condition".into()),
+            phase: GatePhase::Escalated,
+            blocks: vec![],
+            ..armed.clone()
+        };
+        for view in [armed, bare] {
+            let json = serde_json::to_value(&view).unwrap();
+            let back: GateView = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&back).unwrap(), json);
+            assert_eq!((back.id, back.phase, back.spec), (view.id, view.phase, view.spec));
+        }
+        // Optional fields left out read as None; required ones may not be.
+        let v: GateView = serde_json::from_value(json!({
+            "id": "t-3", "title": "x", "status": "open", "phase": "waiting",
+            "created_at": "2026-10-01T05:28:15.123Z", "blocks": []
+        }))
+        .unwrap();
+        assert!(v.spec.is_none() && v.armed_at.is_none() && v.close_reason.is_none());
+        assert!(serde_json::from_value::<GateView>(json!({ "id": "t-3", "title": "x" })).is_err());
+    }
 
     #[test]
     fn spec_validation() {

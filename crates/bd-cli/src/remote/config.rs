@@ -9,10 +9,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{Configured, Remote, Source, env, human};
+use crate::actor;
 use crate::app::App;
-use crate::cli::Command;
+use crate::cli::{Command, GateCommand};
 use crate::credentials;
+use crate::gate_review;
 use crate::io;
+use crate::keychain;
 use crate::protocol::valid_workspace_name;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -208,9 +211,13 @@ pub fn detect(app: &App) -> Result<Option<Remote>> {
 
 /// [`detect`] for the command line `cmd` (`bd`'s own entry point): `bd
 /// publish`, which only a person's admin token may run, also goes with the
-/// person's token from the keychain when no other is configured. No other
-/// command looks at the keychain here.
+/// person's token from the keychain when no other is configured, and `bd
+/// gate review` goes only with it ([`review_remote`]). No other command
+/// looks at the keychain here.
 pub fn detect_for(app: &App, cmd: &Command) -> Result<Option<Remote>> {
+    if let Command::Gate(GateCommand::Review(_)) = cmd {
+        return review_remote(app).map_err(gate_review::one_line);
+    }
     let Some((c, trust)) = configured_trust(app)? else { return Ok(None) };
     if let Some(token) = token_for(&c.url, &trust, &c.source)? {
         return Ok(Some(token.remote(c, trust)));
@@ -230,6 +237,23 @@ pub fn detect_for(app: &App, cmd: &Command) -> Result<Option<Remote>> {
             }
             Err(missing)
         }
+    }
+}
+
+/// The remote workspace `bd gate review` uses, sending only the person's
+/// token from the keychain, looked up once: never `$BD_TOKEN` or a token
+/// saved by `bd remote login`. A person at a terminal is checked for first,
+/// before the configuration or the keychain is read.
+fn review_remote(app: &App) -> Result<Option<Remote>> {
+    gate_review::people_only(&actor::env, &keychain::stdin_is_terminal)?;
+    let Some((c, trust)) = configured_trust(app)? else { return Ok(None) };
+    let url = c.url.clone();
+    match human::human_remote(c, trust, &[Need::Human]) {
+        Ok((remote, note)) => {
+            io::errln(note);
+            Ok(Some(remote))
+        }
+        Err(skip) => Err(human::person_error(skip, &url)),
     }
 }
 

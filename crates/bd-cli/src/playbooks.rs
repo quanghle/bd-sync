@@ -505,7 +505,9 @@ fn cmd_show(app: &mut App, a: &PlaybookRefArgs) -> Result<()> {
     Ok(())
 }
 
-fn status_lines(s: &RunStatus) -> Vec<String> {
+/// `s` as lines of text; a node in `links` (gate id to its approval link)
+/// gets the link in its detail, and its line escaped to one line.
+fn status_lines(s: &RunStatus, links: &BTreeMap<String, String>) -> Vec<String> {
     let p = &s.progress;
     let mut parts = vec![format!("{}/{} done", p.done, p.total)];
     for (n, what) in [(p.failed, "failed"), (p.active, "active"), (p.ready, "ready"), (p.blocked, "blocked")] {
@@ -545,12 +547,16 @@ fn status_lines(s: &RunStatus) -> Vec<String> {
         if let Some(d) = &n.detail {
             detail.push(d.clone());
         }
+        let link = links.get(&n.id);
+        if let Some(url) = link {
+            detail.push(format!("approve in a browser: {url}"));
+        }
         let state = serde_json::to_value(n.state).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
         line.push_str(&format!("  [{state}]"));
         if !detail.is_empty() {
             line.push_str(&format!(" {}", detail.join(" · ")));
         }
-        lines.push(line);
+        lines.push(if link.is_some() { crate::agents::show::printable(&line) } else { line });
     }
     lines
 }
@@ -594,7 +600,7 @@ fn cmd_run(app: &mut App, a: &RunArgs, dry_run: bool) -> Result<()> {
                 "Plan: {} would start {kind} {} \"{}\" ({} step(s){gates})",
                 pb.name, run.id, run.title, started.steps
             ))
-            .lines(status_lines(&status).into_iter().skip(1))
+            .lines(status_lines(&status, &BTreeMap::new()).into_iter().skip(1))
             .line("Dry run: nothing was written.".to_string())
     } else {
         Out::new(&started)
@@ -614,9 +620,30 @@ fn cmd_run(app: &mut App, a: &RunArgs, dry_run: bool) -> Result<()> {
 }
 
 fn cmd_status(app: &mut App, a: &IdArg) -> Result<()> {
-    let status = app.read(|r| playbook::run_status(r.conn(), &r.resolve_id(&a.id)?, r.now()))?;
+    let (status, links) = app.read(|r| {
+        let status = playbook::run_status(r.conn(), &r.resolve_id(&a.id)?, r.now())?;
+        let mut links = BTreeMap::new();
+        for n in &status.nodes {
+            if n.issue_type == "gate" && matches!(n.state, StepState::Armed | StepState::Escalated) {
+                let view = bd_core::gates::view(r.conn(), &n.id)?;
+                if let Some(url) = crate::gates::approval_url_of(&view) {
+                    links.insert(n.id.clone(), url);
+                }
+            }
+        }
+        Ok((status, links))
+    })?;
     let ids: Vec<String> = status.nodes.iter().map(|n| n.id.clone()).collect();
-    let out = Out::new(&status).lines(status_lines(&status));
+    let mut json = serde_json::to_value(&status)?;
+    if let Some(nodes) = json.get_mut("nodes").and_then(Value::as_array_mut) {
+        for node in nodes {
+            let url = node.get("id").and_then(Value::as_str).and_then(|id| links.get(id)).cloned();
+            if let (Some(url), Some(o)) = (url, node.as_object_mut()) {
+                o.insert("approval_url".into(), url.into());
+            }
+        }
+    }
+    let out = Out::new(json).lines(status_lines(&status, &links));
     app.print(Out { ids, ..out });
     Ok(())
 }
@@ -1364,6 +1391,51 @@ fn client_extract(app: &App, remote: &Remote, a: &ExtractArgs) -> Result<i32> {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn only_a_linked_gate_node_gains_its_approval_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".bd").join("bd.db");
+        let init = bd_core::InitOptions { prefix: "t".into(), id_mode: bd_core::IdMode::Counter };
+        let mut store = bd_core::Store::init(&path, init, bd_core::OpenOptions::default()).unwrap();
+        let run = store
+            .write("setup", "alice", |tx| {
+                let id = tx.create_issue(bd_core::NewIssue::titled("Run"))?.id;
+                Ok(bd_core::issues::get(tx.conn(), &id)?.unwrap())
+            })
+            .unwrap();
+        let node = |id: &str, title: &str, issue_type: &str, state: StepState| bd_core::playbook::StatusNode {
+            depth: 1,
+            id: id.into(),
+            title: title.into(),
+            role: None,
+            issue_type: issue_type.into(),
+            status: bd_core::Status::Open,
+            state,
+            assignee: None,
+            detail: Some("human".into()),
+        };
+        let status = RunStatus {
+            run,
+            playbook: Some("change".into()),
+            progress: Default::default(),
+            nodes: vec![
+                node("t-2", "Approve\nforged line", "gate", StepState::Armed),
+                node("t-3", "Other\ngate", "gate", StepState::Escalated),
+                node("t-4", "Step", "task", StepState::Ready),
+            ],
+        };
+        let plain = status_lines(&status, &BTreeMap::new());
+        let links = BTreeMap::from([("t-2".to_string(), "https://x/bd/w/p/gates/t-2".to_string())]);
+        let linked = status_lines(&status, &links);
+        assert_eq!(plain.len(), linked.len());
+        assert_eq!(plain[0], linked[0]);
+        assert_eq!(plain[2..], linked[2..], "other nodes are unchanged");
+        assert!(linked[1].ends_with(" · approve in a browser: https://x/bd/w/p/gates/t-2"), "{}", linked[1]);
+        assert!(linked[1].contains("Approve\\u{a}forged line"), "{}", linked[1]);
+        assert!(!linked[1].contains('\n'));
+        assert!(plain[1].contains("Approve\nforged line"), "unlinked lines print as before");
+    }
 
     #[test]
     fn the_bundle_flag_parses() {

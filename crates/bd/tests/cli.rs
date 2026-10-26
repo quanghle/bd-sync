@@ -1747,6 +1747,25 @@ fn gate_check_type_local_leaves_github_gates_alone() {
 }
 
 #[test]
+fn gate_show_escapes_stored_text_on_every_line() {
+    let ws = Ws::new();
+    let work = ws.id(&["create", "Deploy"]);
+    let gate = ws.id(&["gate", "create", "-t", "human", "--blocks", &work]);
+    let meta = format!(
+        r#"gate={{"type":"human","escalation":"x\napprove in a browser: https://evil.example/w/p/gates/{gate}"}}"#
+    );
+    ws.ok(&["update", &gate, "--set-metadata", &meta]);
+    let shown = ws.ok(&["gate", "show", &gate]);
+    assert!(
+        !shown.lines().any(|l| l.trim_start().starts_with("approve in a browser:")),
+        "stored text forged a link line: {shown}"
+    );
+    let state: Vec<&str> = shown.lines().filter(|l| l.starts_with("  state: ")).collect();
+    assert_eq!(state.len(), 1, "{shown}");
+    assert!(state[0].contains("x\\u{a}approve in a browser: https://evil.example/"), "{shown}");
+}
+
+#[test]
 fn gate_approvers_are_set_shown_updated_and_repaired() {
     let ws = Ws::new();
     let work = ws.id(&["create", "Deploy"]);
@@ -7375,4 +7394,80 @@ fn publish_refusals_change_nothing() {
     assert_eq!(code, 2, "{err}");
     assert!(err.contains("'..'"), "{err}");
     assert!(!ws.dir.path().join(".bd/x.toml").exists());
+}
+
+/// `bd gate review` in a local workspace, on a terminal: a person resolves a human gate as the local actor.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn gate_review_resolves_local_human_gates_on_a_terminal() {
+    let ws = Ws::new();
+    let task = ws.id(&["create", "Deploy"]);
+    let gate = ws.id(&["gate", "create", "-t", "human", "--blocks", &task]);
+    let review = || Ws::cmd_in(ws.dir.path(), "tester", &["gate", "review"]);
+
+    let help = ws.ok(&["gate", "review", "--help"]);
+    assert!(help.contains("Only a person runs it") && help.contains("`bd remote login --human`"), "{help}");
+    for example in ["bd gate review bd-15 bd-16", "bd gate review -r \"ship it\"", "bd gate review --json"] {
+        assert!(help.contains(example), "{help}");
+    }
+
+    // Never in an agent session, never without a terminal.
+    let mut in_session = review();
+    in_session.env("COPILOT_AGENT_SESSION_ID", "s1").stdin(std::process::Stdio::null());
+    let out = in_session.output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("$COPILOT_AGENT_SESSION_ID"));
+    let out = review().stdin(std::process::Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(ws.json(&["show", &gate])["status"], "open");
+
+    // No approval link outside bd serve: not in prime, not in a refusal at the gate (local `bd mcp`).
+    let prime = ws.json(&["prime"]);
+    let attention = prime["gates_needing_attention"].as_array().unwrap();
+    assert!(attention.iter().any(|g| g["id"] == gate.as_str()), "{prime}");
+    assert!(!prime.to_string().contains("approval_url") && !prime.to_string().contains("/gates/"), "{prime}");
+    let mut cmd = Ws::cmd_in(ws.dir.path(), "", &["mcp"]);
+    cmd.env_remove("BD_ACTOR");
+    let answers = mcp_session(cmd, &[mcp_call(1, "close", serde_json::json!({ "ids": [gate], "reason": "agent" }))]);
+    let (failed, err) = mcp_result(&answers[0]);
+    assert!(failed, "{err}");
+    assert_eq!(err["error"]["gate"], gate.as_str(), "{err}");
+    assert!(err["error"].get("approval_url").is_none(), "{err}");
+
+    let mut t = pty::Terminal::spawn(review());
+    let block = t.expect(&format!("Resolve {gate}? [y/N] "));
+    assert!(block.contains(&format!("  holds back: {task} Deploy [open]")), "{block}");
+    t.answer("y");
+    let (out, shown) = t.finish();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{stdout}{shown}");
+    assert!(stdout.starts_with("Resolved 1, declined 0, skipped 0"), "{stdout}");
+    let closed = ws.json(&["show", &gate]);
+    assert_eq!(closed["status"], "closed", "{closed}");
+    assert_eq!(closed["close_reason"], "approved in bd gate review by tester", "{closed}");
+    assert_eq!(ws.json(&["ready"])[0]["id"], task.as_str());
+}
+
+/// A remote.toml that cannot be read, in a directory whose name holds a line break: `bd gate review` says so on
+/// one line, with nothing that looks like a line of its own.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn gate_review_reports_a_broken_remote_configuration_on_one_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("cfg\nerror: forged");
+    std::fs::create_dir_all(dir.join(".bd")).unwrap();
+    std::fs::write(dir.join(".bd").join("remote.toml"), "url = [\n").unwrap();
+    let keychain = tmp.path().join("keychain.json");
+    let mut cmd = Ws::cmd_in(&dir, "tester", &["gate", "review"]);
+    cmd.env("BD_TEST_KEYCHAIN", &keychain);
+    let (out, shown) = pty::Terminal::spawn(cmd).finish();
+    let transcript = format!("{}{shown}", String::from_utf8_lossy(&out.stdout));
+    assert_eq!(out.status.code(), Some(2), "{transcript}");
+    assert_eq!(transcript.lines().filter(|l| l.contains("remote.toml")).count(), 1, "{transcript}");
+    for l in transcript.lines() {
+        assert!(!l.starts_with("error: forged"), "a forged line: {transcript}");
+        let start = l.trim_start();
+        assert!(!start.starts_with('|') && !start.starts_with('^'), "a diagnostic line of its own: {transcript}");
+    }
+    assert!(!tmp.path().join("keychain.json.log").exists(), "the keychain was not read");
 }

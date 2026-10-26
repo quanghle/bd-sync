@@ -285,7 +285,11 @@ fn human_only(id: &str, hold: &Hold, what: &str) -> Error {
              (with a human access token)"
         ),
     };
-    Error::with_needs(&[Need::Human], message)
+    let gate = match hold {
+        Hold::Is => id,
+        Hold::HeldBy(g) | Hold::Contains(g) => g,
+    };
+    Error::with_needs(&[Need::Human], message).with_gate(gate)
 }
 
 /// The refusal for a person who is not one of `approvers` (the gate's, as

@@ -272,6 +272,16 @@ pub fn agent_session_vars(env: &Env<'_>) -> Vec<&'static str> {
     HARNESSES.iter().flat_map(|&(_, names)| names.iter().copied()).filter(|v| env(v).is_some()).collect()
 }
 
+/// Refuse `what` where any agent harness's session id variable is set in
+/// `env`: `advice` says why and what an agent should do instead.
+pub fn refuse_in_agent_session(env: &Env<'_>, what: &str, advice: &str) -> Result<()> {
+    let set: Vec<String> = agent_session_vars(env).iter().map(|v| format!("${v}")).collect();
+    if set.is_empty() {
+        return Ok(());
+    }
+    Err(Error::Refused(format!("{what} does not run inside an agent session ({} set): {advice}", set.join(", "))))
+}
+
 /// The last 8 letters and digits of a session id, lowercased: the random
 /// part of a UUID, whether v4 or time-ordered v7 (whose first digits are
 /// the same for sessions started within a minute).

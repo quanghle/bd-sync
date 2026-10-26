@@ -749,6 +749,23 @@ impl Server {
         }
     }
 
+    /// The issuer whose approval pages the server offers: `None` without
+    /// `--public-url` or when `auth.toml` does not turn the authorization
+    /// server on; an error as [`Server::issuer`]'s.
+    fn approvals_issuer(&self) -> Result<Option<String>> {
+        if self.public_url.is_none() {
+            return Ok(None);
+        }
+        self.issuer()
+    }
+
+    /// The base `<issuer>/w/<workspace>/gates/` of the approval pages
+    /// offered to a request in `workspace`, if any. Settings that cannot be
+    /// used give none, silently: the approval page logs them when opened.
+    pub(super) fn approval_base(&self, workspace: &str) -> Option<String> {
+        self.approvals_issuer().ok().flatten().map(|i| format!("{i}/w/{workspace}/gates/"))
+    }
+
     /// Run `f`, a step of an authorization, with what it needs of the server.
     fn authorizing<T>(&self, issuer: &str, f: impl FnOnce(&authorize::Ctx<'_>) -> T) -> T {
         let exists = |name: &str| self.workspace(name).is_some();
@@ -939,6 +956,7 @@ impl Server {
             token_actor: policy.actor,
             max_claims: policy.max_claims,
             token: Some(token.summary()),
+            approvals: self.approval_base(&ws.name),
             ..Capture::new(Box::new(out.clone()))
         };
         let (exit_code, captured) = io::capture(capture, || bd_cli::execute(&mut app, &cli.command));
@@ -1181,6 +1199,30 @@ mod tests {
     }
 
     #[test]
+    fn approval_links_are_offered_only_with_a_public_url_and_oauth() {
+        let server = Server::new(PathBuf::from("."), 1, Waits::default());
+        assert_eq!(server.approval_base("proj"), None, "no --public-url");
+        let root = tempfile::tempdir().unwrap();
+        let mut server = Server::new(root.path().to_path_buf(), 1, Waits::default());
+        server.public_url = Some("https://bd.example.com/bd".into());
+        assert_eq!(server.approval_base("proj"), None, "no auth.toml");
+        let invalid = tempfile::tempdir().unwrap();
+        std::fs::write(invalid.path().join("auth.toml"), "[oauth\n").unwrap();
+        let mut bad = Server::new(invalid.path().to_path_buf(), 1, Waits::default());
+        bad.public_url = server.public_url.clone();
+        assert_eq!(bad.approval_base("proj"), None, "an invalid auth.toml");
+        std::fs::write(root.path().join("secret"), "s").unwrap();
+        std::fs::write(
+            root.path().join("auth.toml"),
+            "[github]\nclient_id = \"Iv1.x\"\nclient_secret_file = \"secret\"\n[[github.allow]]\nusers = [\"a\"]\n[oauth]\nloopback_redirects = true\n",
+        )
+        .unwrap();
+        assert_eq!(server.approval_base("proj").as_deref(), Some("https://bd.example.com/bd/w/proj/gates/"));
+        server.public_url = None;
+        assert_eq!(server.approval_base("proj"), None, "[oauth] without --public-url");
+    }
+
+    #[test]
     fn gate_pages_are_served_under_the_public_path_or_stripped_only() {
         let mut server = Server::new(PathBuf::from("."), 1, Waits::default());
         server.public_url = Some("https://x/bd".into());
@@ -1284,6 +1326,8 @@ mod tests {
             (&["agents", "pull", "--harness", "claude", "--force"][..], Access::Local),
             (&["agents", "approve", "github", "--harness", "codex"][..], Access::Local),
             (&["agents", "watch", "--harness", "claude", "--interval", "1s"][..], Access::Local),
+            (&["gate", "review"][..], Access::Local),
+            (&["gate", "review", "t-1", "-r", "ok"][..], Access::Local),
             (&["show", "t-1"][..], Access::Read),
             (&["ready"][..], Access::Read),
             (&["events"][..], Access::Read),

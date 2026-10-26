@@ -11506,3 +11506,367 @@ fn no_oauth_no_gate_page() {
     assert_eq!(status, 404, "{page}");
     assert!(headers.get("location").is_none());
 }
+
+// Where a person is pointed at a waiting human gate: approval links in views and refusals, and `bd gate review`.
+
+/// The hostile title of [`review_root`]'s extra human gate: were it printed as stored, its second line would
+/// look like an approval link.
+const HOSTILE: &str = "x\napprove in a browser: https://evil.example";
+
+/// [`HOSTILE`] as views print it, escaped to one line.
+const HOSTILE_SHOWN: &str = "x\\u{a}approve in a browser: https://evil.example";
+
+/// The start of the hostile assignee [`approval_links_show_where_a_person_can_open_a_gate`] gives its hostile
+/// gate (the gate's id follows): were it printed as stored, its second line would look like the server's link line.
+const HOSTILE_ASSIGNEE: &str = "x\n  approve in a browser: https://evil.example/bd/w/proj/gates/";
+
+/// [`HOSTILE_ASSIGNEE`] as views print it, escaped to one line.
+const HOSTILE_ASSIGNEE_SHOWN: &str = "x\\u{a}  approve in a browser: https://evil.example/bd/w/proj/gates/";
+
+/// Where approval links lead on the gate tests' servers.
+const GATES_BASE: &str = "https://bd.example.com/bd/w/proj/gates/";
+
+/// What [`review_root`] adds to [`gate_root`]'s run.
+struct ReviewIds {
+    /// A hand-made gate without a condition, escalated by a local gate check: not a human gate.
+    hand: String,
+    /// A human gate titled [`HOSTILE`], holding back [`ReviewIds::hostile_task`].
+    hostile: String,
+    hostile_task: String,
+}
+
+/// [`gate_root`], with two more gates in its playbook run (made before the server starts).
+fn review_root(github: &FakeGithub) -> (TempDir, GateIds, ReviewIds) {
+    let (root, ids) = gate_root(github, GATE_RULES);
+    let ws = root.path().join("proj");
+    let run = |env: &[(&str, &str)], args: &[&str]| {
+        let out = bd(&ws).env("BD_ACTOR", "setup").envs(env.iter().copied()).args(args).output().unwrap();
+        check(out, &format!("bd {args:?}")).trim().to_string()
+    };
+    let hand = run(&[], &["-q", "create", "Hand-made", "-t", "gate", "--parent", &ids.run]);
+    let hostile_task = run(&[], &["-q", "create", "Hostile held"]);
+    let hostile = run(
+        &[],
+        &["-q", "gate", "create", "-t", "human", "--blocks", &hostile_task, "--parent", &ids.run, "--title", HOSTILE],
+    );
+    let checked = run(&[("BD_GH", "/nonexistent/gh")], &["--json", "gate", "check", "--type", "local"]);
+    let checked: Value = serde_json::from_str(&checked).unwrap();
+    assert!(
+        checked["checked"].as_array().unwrap().iter().any(|c| c["id"] == hand.as_str() && c["action"] == "escalated"),
+        "the hand-made gate escalates: {checked}"
+    );
+    (root, ids, ReviewIds { hand, hostile, hostile_task })
+}
+
+/// The approval link of gate `id` on the gate tests' servers.
+fn approval_link(id: &str) -> String {
+    format!("{GATES_BASE}{id}")
+}
+
+/// The one line of `text` holding `needle`.
+fn the_line<'t>(text: &'t str, needle: &str) -> &'t str {
+    let found: Vec<&str> = text.lines().filter(|l| l.contains(needle)).collect();
+    assert_eq!(found.len(), 1, "one line with {needle:?}: {text}");
+    found[0]
+}
+
+/// Every approval link in `text` is the server's own, and the hostile title and assignee cannot fake one: their
+/// text appears only escaped, inside its line.
+fn links_are_the_servers(what: &str, text: &str) {
+    for l in text.lines() {
+        if l.contains("evil.example") {
+            assert!(
+                l.contains(HOSTILE_SHOWN) || l.contains(HOSTILE_ASSIGNEE_SHOWN),
+                "{what}: hostile text on its own line: {l:?}\n{text}"
+            );
+        }
+    }
+    let rest = text.replace(HOSTILE_SHOWN, "").replace(HOSTILE_ASSIGNEE_SHOWN, "");
+    assert!(!rest.contains("evil.example"), "{what}: {text}");
+    const SAID: &str = "approve in a browser: ";
+    for (at, _) in rest.match_indices(SAID) {
+        assert!(rest[at + SAID.len()..].starts_with(GATES_BASE), "{what}: a link not the server's: {text}");
+    }
+}
+
+/// [`links_are_the_servers`] for a view, whose lines carry a link only after other text.
+fn view_lines(what: &str, text: &str) {
+    links_are_the_servers(what, text);
+    for l in text.lines() {
+        assert!(!l.starts_with("approve in a browser:"), "{what}: a link line of its own: {l:?}\n{text}");
+    }
+}
+
+/// The JSON error a refused `--json` command printed on stderr, and its exit code.
+fn json_error(out: &Output) -> (i32, Value) {
+    let v: Value = serde_json::from_str(stderr_of(out).trim())
+        .unwrap_or_else(|e| panic!("not one JSON error ({e}): {}", stderr_of(out)));
+    (out.status.code().unwrap(), v["error"].clone())
+}
+
+#[test]
+fn approval_links_show_where_a_person_can_open_a_gate() {
+    let github = FakeGithub::start();
+    let (root, ids, more) = review_root(&github);
+    let assignee = format!("{HOSTILE_ASSIGNEE}{}", more.hostile);
+    let out = bd(&root.path().join("proj"))
+        .env("BD_ACTOR", "setup")
+        .args(["update", &more.hostile, "--assignee", &assignee])
+        .output()
+        .unwrap();
+    check(out, "the hostile assignee");
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let alice = server.client(&secret);
+    let (hand, hostile) = (more.hand.as_str(), more.hostile.as_str());
+
+    // playbook status: the run's nodes, the two extra gates among them, before any link is looked for.
+    let status = alice.json(&["playbook", "status", &ids.run]);
+    let nodes = status["nodes"].as_array().unwrap();
+    let node = |id: &str| nodes.iter().find(|n| n["id"] == id).unwrap_or_else(|| panic!("no node {id}: {status}"));
+    for id in [hand, hostile, ids.run_gate.as_str()] {
+        node(id);
+    }
+    assert_eq!(node(&ids.run_gate)["approval_url"], approval_link(&ids.run_gate), "{status}");
+    assert_eq!(node(hostile)["approval_url"], approval_link(hostile), "{status}");
+    assert!(node(hand).get("approval_url").is_none(), "{status}");
+    assert_eq!(nodes.iter().filter(|n| n.get("approval_url").is_some()).count(), 2, "{status}");
+    let text = alice.ok(&["playbook", "status", &ids.run]);
+    the_line(&text, &format!(" {hand} "));
+    the_line(&text, &format!(" {hostile} "));
+    assert!(the_line(&text, &format!(" {} ", ids.run_gate)).ends_with(&approval_link(&ids.run_gate)), "{text}");
+    let line = the_line(&text, &format!(" {hostile} "));
+    assert!(line.contains(HOSTILE_SHOWN) && line.ends_with(&approval_link(hostile)), "{text}");
+    assert!(!the_line(&text, &format!(" {hand} ")).contains("approve in a browser"), "{text}");
+    assert_eq!(text.matches(GATES_BASE).count(), 2, "{text}");
+    view_lines("playbook status", &text);
+
+    // prime: each human gate a person can open now with its link; the hand-made gate escalated, without one.
+    let prime = alice.ok(&["prime"]);
+    let human = the_line(&prime, &format!("- {} ", ids.human));
+    assert!(human.ends_with(&format!("; or approve in a browser: {}", approval_link(&ids.human))), "{prime}");
+    let line = the_line(&prime, &format!("- {hostile} "));
+    assert!(line.contains(HOSTILE_SHOWN), "{prime}");
+    assert!(line.ends_with(&format!("; or approve in a browser: {}", approval_link(hostile))), "{prime}");
+    let line = the_line(&prime, &format!("- {hand} "));
+    assert!(line.contains("escalated") && !line.contains("approve in a browser"), "{prime}");
+    assert_eq!(prime.matches("`bd gate review`").count(), 1, "the sentence for agents, once: {prime}");
+    view_lines("prime", &prime);
+    let attention = alice.json(&["prime"])["gates_needing_attention"].clone();
+    let entry = |id: &str| {
+        attention.as_array().unwrap().iter().find(|g| g["id"] == id).unwrap_or_else(|| panic!("{id}: {attention}"))
+    };
+    assert_eq!(entry(&ids.human)["approval_url"], approval_link(&ids.human), "{attention}");
+    assert_eq!(entry(hostile)["approval_url"], approval_link(hostile), "{attention}");
+    assert!(entry(hand).get("approval_url").is_none(), "{attention}");
+    let hook = check(alice.cmd(&["prime", "--hook", "claude"]).stdin(Stdio::null()).output().unwrap(), "hook");
+    assert!(hook.contains(&format!("; or approve in a browser: {}", approval_link(&ids.human))), "{hook}");
+    assert_eq!(hook.matches("`bd gate review`").count(), 1, "{hook}");
+    view_lines("prime --hook claude", &hook);
+
+    // An agent's refusal at the gate, and at the work it holds back.
+    let out = alice.run(&["gate", "resolve", &ids.human]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    let stderr = stderr_of(&out);
+    let lines: Vec<&str> = stderr.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("error:")).unwrap_or_else(|| panic!("{stderr}"));
+    assert_eq!(
+        lines.get(at + 1).copied(),
+        Some(format!("approve in a browser: {}", approval_link(&ids.human)).as_str())
+    );
+    assert_eq!(lines.iter().filter(|l| l.starts_with("approve in a browser:")).count(), 1, "{stderr}");
+    links_are_the_servers("gate resolve", &stderr);
+    let (code, error) = json_error(&alice.run(&["--json", "gate", "resolve", &ids.human]));
+    assert_eq!((code, &error["code"]), (7, &json!("unauthorized")), "{error}");
+    assert_eq!((&error["gate"], &error["approval_url"]), (&json!(ids.human), &json!(approval_link(&ids.human))));
+    let (code, error) = json_error(&alice.run(&["--json", "close", &ids.task, "--force"]));
+    assert_eq!(code, 7, "{error}");
+    assert_eq!((&error["gate"], &error["approval_url"]), (&json!(ids.human), &json!(approval_link(&ids.human))));
+    let (code, error) = json_error(&alice.run(&["--json", "close", &more.hostile_task, "--force"]));
+    assert_eq!((code, &error["gate"], &error["approval_url"]), (7, &json!(hostile), &json!(approval_link(hostile))));
+
+    // gate show: what it is part of, and its link; gate list --json: links on human gates a person can open now.
+    let shown = alice.ok(&["gate", "show", &ids.run_gate]);
+    assert!(shown.contains(&format!("\n  part of: {} Ship <b>release</b>\n", ids.run)), "{shown}");
+    assert!(shown.contains(&format!("\n  approve in a browser: {}\n", approval_link(&ids.run_gate))), "{shown}");
+    view_lines("gate show", &shown);
+    let shown = alice.json(&["gate", "show", &ids.run_gate]);
+    assert_eq!((&shown["part_of"]["id"], &shown["part_of"]["title"]), (&json!(ids.run), &json!("Ship <b>release</b>")));
+    assert_eq!(shown["approval_url"], approval_link(&ids.run_gate), "{shown}");
+    let shown = alice.ok(&["gate", "show", hostile]);
+    view_lines("gate show (hostile)", &shown);
+    assert!(shown.contains(&format!("  approve in a browser: {}", approval_link(hostile))), "{shown}");
+    let said: Vec<&str> = shown.lines().filter(|l| l.trim_start().starts_with("approve in a browser:")).collect();
+    assert_eq!(said, vec![format!("  approve in a browser: {}", approval_link(hostile))], "{shown}");
+    let assignee: Vec<&str> = shown.lines().filter(|l| l.starts_with("  assignee:")).collect();
+    assert_eq!(assignee, vec![format!("  assignee: {HOSTILE_ASSIGNEE_SHOWN}{hostile}")], "{shown}");
+    let list = alice.json(&["gate", "list"]);
+    let mut linked = Vec::new();
+    for g in list.as_array().unwrap() {
+        let id = g["id"].as_str().unwrap();
+        let open_now = g["spec"]["type"] == "human" && (g["phase"] == "armed" || g["phase"] == "escalated");
+        match g.get("approval_url") {
+            Some(url) => {
+                assert!(open_now, "{g}");
+                assert_eq!(url, &json!(approval_link(id)));
+                linked.push(id.to_string());
+            }
+            None => assert!(!open_now, "{g}"),
+        }
+    }
+    for id in [&ids.human, &ids.carol, &ids.run_gate, &more.hostile] {
+        assert!(linked.contains(id), "{id}: {list}");
+    }
+    for id in [hand, &ids.timer, &ids.unarmed] {
+        assert!(!linked.iter().any(|l| l == id), "{id}: {list}");
+    }
+
+    // bd serve never runs the review: the client asks the person.
+    let (status, r) = post(&alice.url, &secret, &json!({ "argv": ["gate", "review"] }));
+    assert_eq!((status, r["exit_code"].as_i64()), (200, Some(2)), "{r}");
+    assert!(r["stderr"].as_str().unwrap().contains("is not available through bd serve"), "{r}");
+}
+
+/// The views and refusals of [`approval_links_show_where_a_person_can_open_a_gate`] on a server offering no
+/// approval pages: no link anywhere, and the refusals still name their gate.
+fn no_approval_links(server: &Server, ids: &GateIds, more: &ReviewIds) {
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let mut texts = Vec::new();
+    for args in [
+        &["prime"][..],
+        &["--json", "prime"],
+        &["playbook", "status", &ids.run],
+        &["--json", "playbook", "status", &ids.run],
+        &["gate", "show", &ids.run_gate],
+        &["--json", "gate", "show", &ids.run_gate],
+        &["--json", "gate", "list"],
+    ] {
+        texts.push((format!("{args:?}"), alice.ok(args)));
+    }
+    let hook = check(alice.cmd(&["prime", "--hook", "claude"]).stdin(Stdio::null()).output().unwrap(), "hook");
+    assert!(hook.contains("`bd gate review`"), "{hook}");
+    texts.push(("prime --hook claude".into(), hook));
+    let out = alice.run(&["gate", "resolve", &ids.human]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    assert!(!stderr_of(&out).contains("approve in a browser"), "{}", stderr_of(&out));
+    texts.push(("gate resolve".into(), stderr_of(&out)));
+    for (args, gate) in [
+        (vec!["--json", "gate", "resolve", &ids.human], &ids.human),
+        (vec!["--json", "close", &ids.task, "--force"], &ids.human),
+        (vec!["--json", "close", &more.hostile_task, "--force"], &more.hostile),
+    ] {
+        let out = alice.run(&args);
+        let (code, error) = json_error(&out);
+        assert_eq!((code, &error["gate"]), (7, &json!(gate)), "{args:?}: {error}");
+        assert!(error.get("approval_url").is_none(), "{args:?}: {error}");
+        texts.push((format!("{args:?}"), stderr_of(&out)));
+    }
+    for (what, text) in texts {
+        assert!(!text.contains("/gates/"), "{what}: {text}");
+    }
+}
+
+#[test]
+fn no_approval_links_without_approval_pages() {
+    let github = FakeGithub::start();
+    // auth.toml without [oauth] (nor the client secret only GitHub's web sign-in uses), with --public-url.
+    let (root, ids, more) = review_root(&github);
+    let full = std::fs::read_to_string(root.path().join("auth.toml")).unwrap();
+    let (without, _) = full.split_once("\n[oauth]\n").unwrap();
+    let without = without.replacen("client_secret_file = \"github-secret\"\n", "", 1);
+    std::fs::write(root.path().join("auth.toml"), &without).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    no_approval_links(&server, &ids, &more);
+    drop(server);
+
+    // [oauth] in auth.toml, but no --public-url.
+    let (root, ids, more) = review_root(&github);
+    let full = std::fs::read_to_string(root.path().join("auth.toml")).unwrap();
+    std::fs::write(root.path().join("auth.toml"), &without).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    std::fs::write(server.root.path().join("auth.toml"), &full).unwrap();
+    no_approval_links(&server, &ids, &more);
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn people_review_waiting_gates_with_the_keychain_token_only() {
+    let github = FakeGithub::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let (server, log) = logged_server(root, PUBLIC_URL);
+    let carol = server.token("carol-desk", "carol", &["--kind", "human"]);
+    let agent = server.token("alice-laptop", "alice", &[]);
+    let url = server.url();
+    let dir = checkout_dir();
+    std::fs::write(dir.path().join(".bd/remote.toml"), format!("url = \"{url}\"\n")).unwrap();
+    let keychain = Keychain::new(dir.path());
+    // An agent's token beside the checkout's remote.toml: the review never sends it.
+    let review = |keychain: &Keychain| {
+        let mut cmd = keychain.bd(dir.path(), &["gate", "review"]);
+        cmd.env("BD_TOKEN", &agent);
+        cmd
+    };
+
+    // Refused inside an agent session and without a terminal, before the keychain or the configuration is read.
+    let out = review(&keychain).env("COPILOT_AGENT_SESSION_ID", "s1").stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("$COPILOT_AGENT_SESSION_ID") && stderr_of(&out).contains("bd gate review"));
+    let out = review(&keychain).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", stderr_of(&out));
+    assert!(stderr_of(&out).contains("runs only in a terminal"), "{}", stderr_of(&out));
+    assert_eq!(keychain.log(), "", "the keychain was not read");
+    // On a terminal, with nothing in the keychain: the person is told how to save their token.
+    let (out, shown) = on_terminal(review(&keychain));
+    assert_eq!(out.status.code(), Some(7), "{shown}");
+    assert!(shown.contains("bd remote login --human") && !shown.contains("bdt_"), "{shown}");
+
+    let entry = json!({ "token": carol, "ca": "system", "kind": "human", "role": "write" });
+    keychain.put(&format!("workspace:{url}"), entry);
+    let before = keychain.log();
+    let mut t = pty::Terminal::spawn(review(&keychain));
+    let block = t.expect(&format!("Resolve {}? [y/N] ", ids.human));
+    for shown in [
+        format!("{} Approve <i>prod</i>\n", ids.human),
+        "  state: ".to_string(),
+        format!("  holds back: {} Deploy <b>prod</b> [open]\n", ids.task),
+        "  approvers: any person\n".to_string(),
+    ] {
+        assert!(block.contains(&shown), "{shown}: {block}");
+    }
+    t.answer("y");
+    let next = t.expect("? [y/N] ");
+    let asked = next.rsplit("Resolve ").next().unwrap().trim_end_matches("? [y/N] ").to_string();
+    assert_ne!(asked, ids.carol, "carol's gate is not asked about: {next}");
+    t.answer("n");
+    let (out, shown) = t.finish();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(out.status.success(), "{stdout}{shown}");
+    assert!(stdout.starts_with("Resolved 1, declined 1, skipped 1"), "{stdout}");
+    assert!(stdout.lines().next().unwrap().ends_with(", 1 waiting for their work's prerequisites"), "{stdout}");
+    assert!(stdout.contains(&format!("  skipped {}: only github:carol may approve it (you are carol)", ids.carol)));
+    assert_eq!(shown.matches(HUMAN_NOTE).count(), 1, "{shown}");
+    assert_eq!(keychain.since(&before), format!("get workspace:{url}\n"), "one lookup");
+    for text in [&stdout, &shown] {
+        assert!(!text.contains("bdt_") && !text.contains("bdr_"), "{text}");
+    }
+
+    let closed = closed_events(&server, &ids.human);
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(
+        (&closed[0]["actor"], &closed[0]["data"]["reason"]),
+        (&json!("carol"), &json!("approved in bd gate review by carol"))
+    );
+    let ready: Value = serde_json::from_str(&check(server.local("ops", &["--json", "ready"]), "ready")).unwrap();
+    assert!(ready.as_array().unwrap().iter().any(|i| i["id"] == ids.task.as_str()), "unblocked: {ready}");
+    assert_eq!(shown_on_host(&server, &asked)["status"], "open", "declined");
+    assert_eq!(shown_on_host(&server, &ids.carol)["status"], "open", "skipped");
+
+    // Every request went with the person's token from the keychain.
+    eventually("the review's log lines", || logged(&log, r#"command="gate""#) >= 3);
+    let text = std::fs::read_to_string(&log).unwrap();
+    let exec: Vec<&str> = text.lines().filter(|l| l.contains("bd::serve") && l.contains(" exec ")).collect();
+    assert!(exec.iter().any(|l| l.contains(r#"command="info""#)), "{text}");
+    for l in &exec {
+        assert!(l.contains("token=carol-desk") && !l.contains("alice-laptop"), "{l}");
+    }
+}

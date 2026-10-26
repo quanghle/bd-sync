@@ -169,6 +169,11 @@ impl Remote {
         self
     }
 
+    /// Whether it sends the person's token from the keychain.
+    pub(crate) fn sends_keychain_token(&self) -> bool {
+        self.human
+    }
+
     /// What the server's certificate is checked against.
     pub(super) fn trust(&self) -> &Trust {
         &self.trust

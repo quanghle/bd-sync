@@ -341,7 +341,84 @@ the GitHub ones, `--type gh` only those.
 
 Escalation records the reason on the gate, comments on it and lists it in
 `bd prime`; it never opens the gate. A person decides with
-`bd gate resolve`.
+`bd gate resolve` or [`bd gate review`](#reviewing-human-gates).
+
+**Approval links.** Through a `bd serve` started with `--public-url` and
+an `auth.toml` whose `[oauth]` loads, the commands it runs for clients
+name where a person can [approve a human gate in a
+browser](sign-in.md#approving-human-gates-in-the-browser), for each open
+human gate that is armed or escalated:
+
+- `bd prime`'s "Gates needing a person" section ends the gate's line with
+  `; or approve in a browser: <url>` (`--json`: `approval_url` on its
+  `gates_needing_attention` entry), and says once that only a person opens
+  a human gate, so an agent hands the person the link or asks them to run
+  `bd gate review` in a terminal of their own;
+- a refusal at a human gate (resolving it, or closing, moving or editing
+  the work it holds back, with a token that may not) prints `approve in a
+  browser: <url>` right after its `error:` line; its JSON error, and an MCP
+  tool's, add `gate` (the gate's id, also without a link) and
+  `approval_url`;
+- `bd playbook status` adds `· approve in a browser: <url>` to the gate's
+  line (`--json`: `approval_url` on its node);
+- `bd gate show` adds `approve in a browser: <url>`, and for any gate in a
+  run `part of: <id> <title>` (`--json`: `approval_url` and `part_of`
+  `{id, title}`); `bd gate list --json` adds `approval_url` to such gates.
+
+A link is `<public-url>/w/<workspace>/gates/<gate id>`, composed by the
+server from its public URL and the gate's id (ids of letters, digits,
+`.`, `_` and `-` only), never taken from stored text; lines that carry one
+are escaped to one line. A local workspace, a local `bd mcp`, or a server
+without `--public-url` or a valid `[oauth]` shows none: the line is left
+out and the JSON key is absent. Other commands, `bd show` and `bd gate
+list`'s text among them, show no links.
+
+### Reviewing human gates
+
+```bash
+bd gate review                      # every open human gate that is armed or escalated
+bd gate review bd-15 bd-16          # only these (partial ids resolve)
+bd gate review -r "ship it"         # the reason recorded with each gate resolved
+bd gate review --json               # the summary as JSON
+```
+
+`bd gate review` walks the human gates waiting for a person, in `bd gate
+list` order, and resolves the ones you say yes to. Before asking about
+each one it reads it again, skipping it if it is no longer a human gate,
+already resolved, or no longer armed, then shows on stderr its id and
+title, its state, the run it belongs to, the work it holds back and its
+approvers, and asks `Resolve <id>? [y/N]`. `y` or `yes` resolves it, with
+the `-r` text or `approved in bd gate review by <actor>` as its reason,
+each in one write of its own and never with `--force`; any other answer
+declines; the end of input (Ctrl-D) stops asking and lists the rest as
+not asked. Gates named that are not human, already resolved, or missing
+are skipped with the reason; a human gate still waiting for its work's
+prerequisites is skipped too, and counted.
+
+- **People only.** It refuses inside an agent session (any of the harness
+  session variables set) and without a terminal on stdin (exit 2), before
+  it reads any token or gate, with no flag to get past either. Locally
+  that is a convention, as human gates are; through `bd serve` the
+  server's human and approver checks back it.
+- **Remotely it sends only the person's keychain token** ([Person's token
+  in the keychain](remote.md#persons-token-in-the-keychain)) and skips
+  gates whose [approvers](#approvers) do not name its actor (or are not
+  valid). Locally approvers are shown, marked not checked.
+- **Summary** on stdout: `Resolved N, declined M, skipped K`, with `not
+  asked`, `failed` and `N waiting for their work's prerequisites` when
+  there are any, then a line per gate resolved, skipped or failed; or `No
+  human gates waiting for approval` (with the waiting count when there is
+  one). With `--json`: `{"resolved": [{"id", "unblocked": [ids],
+  "completed": [ids]}], "declined": [ids], "skipped": [{"id", "reason"}],
+  "failed": [{"id", "code", "message", "exit_code"}], "not_asked": [ids],
+  "waiting": N}`. A gate someone resolved meanwhile is skipped as `already
+  open (resolved meanwhile)`, not a failure.
+- **Exit codes.** 0, or the first failed resolve's code (the review goes
+  on past it); a lost connection (8) or a lost answer (9) stops it. 2 in an
+  agent session, without a terminal, or with the keychain unavailable; 7
+  with no keychain token for the workspace, or one that is not a person's
+  or was saved trusting another CA. Every message from the server, the
+  workspace or the configuration is escaped to one line.
 
 ### Approvers
 

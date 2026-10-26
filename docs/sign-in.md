@@ -565,8 +565,16 @@ provider when there is one, and back at that provider's callback,
 and `bd serve check` prints none. Without `--public-url`, without
 `[oauth]`, or with an `auth.toml` edited since start into one the server
 would refuse (`[oauth]` with no browser provider, say), the path answers
-404. bd does not print the link itself: build it from the public URL, the
-workspace and the gate id.
+404. bd composes the link only where the server offers this page, from
+`--public-url`, the workspace and the gate's id, never from stored text
+(a gate title cannot supply one): `bd prime` (with a sentence telling
+agents to hand the link over, or to ask the person to run `bd gate
+review`), a refusal at a human gate (`approve in a browser: <url>` after
+the `error:` line, `approval_url` in its JSON), `bd playbook status`, `bd
+gate show` and `bd gate list --json`, for the commands `bd serve` runs for
+clients and MCP clients only, and only for open human gates that are armed
+or escalated ([Approval links](playbooks.md#gates)). Without `--public-url`
+or a valid `[oauth]`, none shows one; otherwise build it as above.
 
 **Who may approve.** After the provider says who signed in, the account
 is judged for the gate's workspace as a sign-in is: `deny` first, then the

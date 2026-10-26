@@ -118,6 +118,12 @@ fn refusals_name_each_right_they_need_once_in_order() {
     assert!(is_refusal(&e));
     assert_eq!(e.to_string(), "no");
     assert!(Error::Unauthorized("no".into()).needs().is_empty());
+    assert_eq!(e.gate(), None, "with_needs names no gate");
+    assert_eq!(Error::with_needs(&[Need::Admin], "no").gate(), None);
+    let g = Error::with_needs(&[Need::Human], "no").with_gate("t-1");
+    assert_eq!((g.gate(), g.needs(), g.to_string().as_str()), (Some("t-1"), &[Need::Human][..], "no"));
+    assert!(is_refusal(&g));
+    assert_eq!(Error::Unauthorized("no".into()).with_gate("t-1").gate(), None, "only a Needs refusal names a gate");
 }
 
 fn force_release() -> ReleaseOptions {
@@ -554,6 +560,7 @@ fn human_gates_open_only_for_a_person() {
     // The gate itself: resolving, closing, pinning, retyping, re-specifying, deleting.
     let e = denied(env.as_("bot", bot(), |tx| tx.resolve_gate(gate, Some("lgtm"), false, None)), "is a human gate");
     assert_eq!(e.needs(), [Need::Human]);
+    assert_eq!(e.gate(), Some(gate), "the refusal names the gate itself");
     denied(env.as_("ops", ops(), |tx| tx.resolve_gate(gate, None, true, None)), "only a person can open it");
     denied(env.as_("bot", bot(), |tx| tx.close_issue(gate, &CloseOptions::default())), "open it");
     let pin = patch(|p| p.status = Some(Status::Pinned));
@@ -584,7 +591,8 @@ fn human_gates_open_only_for_a_person() {
         ("t-1.deploy.upload", "waits for human gate t-1.gate-deploy"),
         (run.as_str(), "holds work that waits for human gate"),
     ] {
-        denied(env.as_("bot", bot(), |tx| tx.close_issue(id, &force)), why);
+        let e = denied(env.as_("bot", bot(), |tx| tx.close_issue(id, &force)), why);
+        assert_eq!((e.gate(), e.needs()), (Some(gate), &[Need::Human][..]), "{id}: held work names its gate");
         denied(env.as_("bot", bot(), |tx| tx.update_issue(id, &pin, &none, false)), why);
         denied(env.as_("bot", bot(), |tx| tx.delete_issues(&[id.to_string()], &del)), why);
     }
@@ -1491,10 +1499,13 @@ fn who_may_change_a_gates_approvers() {
     let mut fx = approved_fixture();
     let g = fx.gate.clone();
     // A human admin is bound by them to resolve, but may change them, and then resolve.
-    denied(
+    let e = denied(
         fx.env.as_("dave", human_admin("dave"), |tx| tx.resolve_gate(&g, None, false, None)),
         "only carol can open it",
     );
+    assert_eq!((e.gate(), e.needs()), (None, &[][..]), "an approver refusal names no gate and no right");
+    let e = denied(fx.env.as_("dave", person("dave"), |tx| tx.resolve_gate(&g, None, false, None)), "only carol");
+    assert_eq!((e.gate(), e.needs()), (None, &[][..]), "a person who is not an approver");
     fx.env.as_("dave", human_admin("dave"), |tx| tx.set_gate_approvers(&g, set(&["dave"]))).unwrap();
     fx.env.as_("dave", human_admin("dave"), |tx| tx.resolve_gate(&g, None, false, None)).unwrap();
     assert_eq!(fx.env.issue(&g).status, Status::Closed);

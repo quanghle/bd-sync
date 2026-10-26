@@ -28,6 +28,8 @@ pub fn access(cmd: &Command) -> Access {
         | C::BenchWorker(_)
         | C::Completion(_) => Access::Local,
         C::Events(a) if a.follow => Access::Local,
+        // It asks a person at the terminal and sends its own requests (with the keychain token remotely).
+        C::Gate(GateCommand::Review(_)) => Access::Local,
         C::Events(a) if a.action.is_none() => Access::Read,
         C::Playbook(PlaybookCommand::Extract(a)) if a.save => Access::Local,
         // They write into the client's checkout, reading the server's sets with Read requests.
@@ -211,6 +213,15 @@ mod tests {
         let names: Vec<&str> = crate::mcp::tools::TOOLS.iter().map(|t| t.name).collect();
         assert!(!names.iter().any(|n| n.contains("publish")), "{names:?}");
         assert!(Cli::try_parse_from(["bd", "publish", "--rollback", "--from", "x"]).is_err());
+    }
+
+    #[test]
+    fn gate_review_runs_only_on_the_client() {
+        let cmd = Cli::try_parse_from(["bd", "gate", "review", "t-1", "-r", "ship it"]).unwrap().command;
+        assert_eq!(access(&cmd), Access::Local);
+        assert!(!crate::always_local(&cmd), "in a remote workspace the client runs it against the server");
+        let Command::Gate(GateCommand::Review(a)) = cmd else { panic!("not gate review") };
+        assert_eq!((a.ids, a.reason.as_deref()), (vec!["t-1".to_string()], Some("ship it")));
     }
 
     #[test]

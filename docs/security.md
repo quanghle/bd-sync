@@ -279,13 +279,34 @@ consent page and more.
   8 sign-in slots; approvals waiting for their `POST` are kept in memory,
   at most 1024, the oldest dropped first. Refusals end on this server's
   pages, never a redirect elsewhere.
+- **Links grant nothing.** `bd prime`, refusals at a human gate, `bd
+  playbook status`, `bd gate show` and `bd gate list --json` name a gate's
+  approval page when `bd serve` offers one ([Approval
+  links](playbooks.md#gates)). The link only leads to the sign-in above;
+  whoever opens it must still sign in as a person who may open the gate.
+  The server composes it from `--public-url` and the gate's id (letters,
+  digits, `.`, `_` and `-` only), never from stored text, and the lines
+  that carry it are escaped to one line, so a title an agent wrote cannot
+  forge another link or line.
+- **People only at the terminal.** `bd gate review` refuses inside an
+  agent session and without a terminal on stdin, before it reads any
+  token, the remote configuration or a gate, with no flag to get past
+  either; remotely it sends only the person's keychain token, never
+  `$BD_TOKEN` or a saved one, and it reads each gate again just before
+  asking about it. Locally that is a convention: anyone who can write
+  `bd.db` can open a gate. Remotely the server's human and approver
+  checks back it, as for `bd gate resolve`. What it shows from the server
+  is escaped to one line, so a title cannot add a prompt.
 
 Residual risks, accepted:
 
 - **A person may approve without reading.** An agent can send a person
-  the link of a gate it wants opened. The page shows what the gate holds
-  back and who is signed in, but bd cannot make anyone read it. Open only
-  links you expect, and name approvers on gates that matter.
+  the link of a gate it wants opened, or paste one of its own that looks
+  like it. The page shows what the gate holds back and who is signed in,
+  but bd cannot make anyone read it. Open only links you expect, check
+  that a link's host and path start with your server's public URL, and
+  name approvers on gates that matter. The trusted paths are `bd gate
+  show` and `bd gate review`, run in a terminal of your own.
 - **Approvers are informational in local workspaces**, as human gates
   are: anyone who can write `bd.db` can open them.
 - **A rollback** to a `bd serve` that predates approvers ignores them:

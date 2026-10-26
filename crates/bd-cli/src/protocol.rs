@@ -12,6 +12,12 @@
 //! {"exit":{"exit_code":0,"stderr":"","replayed":false}}
 //! ```
 //!
+//! An exit frame whose command was refused for want of a right a token may
+//! carry, and that committed no write, also names those rights:
+//! `"needs":["admin","human"]` (sorted; left out when empty). A person's
+//! client may then send the command again, once, with their own token
+//! (`bd remote login --human`).
+//!
 //! Blank lines are keep-alives. A stream that ends without an exit frame was
 //! cut off: the command's outcome is unknown. Small answers arrive whole
 //! (with a `Content-Length`) once the command finishes; larger ones are sent
@@ -127,6 +133,10 @@ pub struct Exit {
     /// The answer of an earlier attempt with the same request id, replayed.
     #[serde(default)]
     pub replayed: bool,
+    /// The rights a refusal said would get past it (`admin`, `human`),
+    /// sent only when the request committed no write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<bd_core::Need>,
 }
 
 /// A whole answer, gathered from its frames: what `bd serve` stores to
@@ -151,6 +161,9 @@ pub struct ExecResponse {
     /// This is the stored response of an earlier attempt with the same request id.
     #[serde(default)]
     pub replayed: bool,
+    /// The exit frame's `needs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<bd_core::Need>,
 }
 
 /// Body of every non-200 response.

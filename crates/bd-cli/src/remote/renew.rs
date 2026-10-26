@@ -1,17 +1,19 @@
-//! Saved sign-in tokens: renewal under the credentials file's lock, and
+//! Saved sign-in tokens: renewal under the credentials file's lock, of a
+//! token in the credentials file or the person's in the keychain, and
 //! revocation on the server when one is taken out of the file.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bd_core::{Error, Result, Timestamp};
 use serde_json::{Value, json};
 
-use super::{Configured, Remote, Source, Trust, configured, env};
+use super::{Configured, Remote, Source, Trust, config, configured, env};
 use crate::app::App;
 use crate::credentials::{self, Renewal};
 use crate::io;
+use crate::keychain::{self, Bounded};
 use crate::protocol::{RefreshRequest, RevokeAnswer};
 use crate::tokens::random_hex;
 
@@ -36,11 +38,37 @@ impl Remote {
         if saved.renewal.is_some() {
             let expires_at = saved.renewal.as_ref().map_or(Timestamp(i64::MAX), |ren| ren.expires_at);
             let r = Renewing {
-                path: saved.path.clone(),
+                place: Place::File(saved.path.clone()),
                 key: saved.key.clone(),
                 renewal: saved.renewal.clone(),
                 expires_at,
             };
+            self.renewing = Some(Mutex::new(r));
+        }
+        self
+    }
+
+    /// Send the person's token saved in the keychain `store` under `key`,
+    /// renewing it when due as [`Remote::renewing`] does a saved one. Its
+    /// item, read again under the lock, is used only while its CA trust
+    /// still passes against this remote's.
+    pub(super) fn renewing_keychain(self, store: Arc<Bounded>, key: String, renewal: Option<Renewal>) -> Remote {
+        self.keychain_at(store, key, renewal, None)
+    }
+
+    /// [`Remote::renewing_keychain`], its lock beside the credentials file
+    /// `lock` (default: the user's).
+    fn keychain_at(
+        mut self,
+        store: Arc<Bounded>,
+        key: String,
+        renewal: Option<Renewal>,
+        lock: Option<PathBuf>,
+    ) -> Remote {
+        self.human = true;
+        if let Some(ren) = &renewal {
+            let place = Place::Keychain { store, trust: self.trust().clone(), lock };
+            let r = Renewing { place, key, expires_at: ren.expires_at, renewal };
             self.renewing = Some(Mutex::new(r));
         }
         self
@@ -94,30 +122,31 @@ impl Remote {
             true => Duration::ZERO,
             false => self.time_left().unwrap_or(RENEW_LOCK_WAIT).min(RENEW_LOCK_WAIT),
         };
-        let held = credentials::lock(&r.path, wait)?;
-        let Some(saved) = credentials::lookup_key(&held, &r.path, &r.key)? else {
+        let held = r.lock(wait)?;
+        // A keychain item replaced by one saved for another CA fails here, before its token is used.
+        let Some((saved_token, saved_renewal)) = r.lookup(&held, &self.url)? else {
             // Logged out meanwhile: the token goes as it is.
             r.renewal = None;
             return Ok(current.to_string());
         };
         let set = |token: &str| *self.token.lock().unwrap_or_else(|p| p.into_inner()) = token.to_string();
-        set(&saved.token);
-        r.adopt(saved.renewal.clone());
+        set(&saved_token);
+        r.adopt(saved_renewal.clone());
         let now = Timestamp::now();
         // Another process renewed it, or a login replaced it.
-        if saved.token != current && saved.renewal.as_ref().is_none_or(|ren| now < ren.refresh_after) {
-            return Ok(saved.token);
+        if saved_token != current && saved_renewal.as_ref().is_none_or(|ren| now < ren.refresh_after) {
+            return Ok(saved_token);
         }
-        let Some(mut ren) = saved.renewal.clone() else { return Ok(saved.token) };
+        let Some(mut ren) = saved_renewal else { return Ok(saved_token) };
         if !force && now < ren.refresh_after {
-            return Ok(saved.token);
+            return Ok(saved_token);
         }
         let request_id = match &ren.pending {
             Some(id) => id.clone(),
             None => {
                 let id = random_hex(16)?;
                 ren.pending = Some(id.clone());
-                credentials::renewed(&held, &r.path, &r.key, &saved.token, Some(&ren))?;
+                r.save(&held, &saved_token, Some(&ren))?;
                 r.adopt(Some(ren.clone()));
                 id
             }
@@ -137,7 +166,7 @@ impl Remote {
                 })?;
                 let renewal =
                     issued.refresh_token.map(|t| Renewal::new(t, Duration::from_secs(issued.expires_in.max(1))));
-                credentials::renewed(&held, &r.path, &r.key, &issued.token, renewal.as_ref())?;
+                r.save(&held, &issued.token, renewal.as_ref())?;
                 tracing::debug!(target: "bd::remote", url = %self.url, "access token renewed");
                 r.adopt(renewal);
                 set(&issued.token);
@@ -145,7 +174,7 @@ impl Remote {
             }
             Err(Error::Unauthorized(why)) => {
                 // Never again: the token works as it is until it expires.
-                credentials::renewed(&held, &r.path, &r.key, &saved.token, None)?;
+                r.save(&held, &saved_token, None)?;
                 r.renewal = None;
                 let why = crate::agents::show::printable(&why);
                 Err(Error::Unauthorized(format!("the access token could not be renewed: {why}")))
@@ -157,8 +186,8 @@ impl Remote {
 
 /// A saved sign-in token a [`Remote`] renews.
 pub(super) struct Renewing {
-    /// The credentials file, and the entry it is saved under.
-    path: PathBuf,
+    /// Where it is saved, and the entry or item it is saved under.
+    place: Place,
     key: String,
     /// How it is renewed, as last read: `None` once it is not.
     renewal: Option<Renewal>,
@@ -166,7 +195,72 @@ pub(super) struct Renewing {
     expires_at: Timestamp,
 }
 
+/// Where a renewed token is saved.
+enum Place {
+    /// The credentials file.
+    File(PathBuf),
+    /// The person's token in the keychain, used only while its item's CA
+    /// trust passes against `trust`, the remote's; `lock`: the credentials
+    /// file whose lock serializes its writers (default: the user's).
+    Keychain { store: Arc<Bounded>, trust: Trust, lock: Option<PathBuf> },
+}
+
+/// `credentials.lock`, held while a token is renewed.
+enum Guard {
+    File(credentials::Lock),
+    Keychain(keychain::Held),
+}
+
 impl Renewing {
+    /// Take the lock that serializes changes to the saved token, waiting up to `wait`.
+    fn lock(&self, wait: Duration) -> Result<Guard> {
+        match &self.place {
+            Place::File(path) => Ok(Guard::File(credentials::lock(path, wait)?)),
+            Place::Keychain { lock, .. } => {
+                let path = match lock {
+                    Some(path) => path.clone(),
+                    None => credentials::default_path()?,
+                };
+                Ok(Guard::Keychain(keychain::lock_at(&path, wait)?))
+            }
+        }
+    }
+
+    /// The token saved now, and how it is renewed, read under the lock;
+    /// `None` once it is gone. A keychain item saved trusting another CA
+    /// than the remote's is refused, untouched.
+    fn lookup(&self, held: &Guard, url: &str) -> Result<Option<(String, Option<Renewal>)>> {
+        match (&self.place, held) {
+            (Place::File(path), Guard::File(lock)) => {
+                Ok(credentials::lookup_key(lock, path, &self.key)?.map(|saved| (saved.token, saved.renewal)))
+            }
+            (Place::Keychain { store, trust, .. }, Guard::Keychain(_)) => {
+                let Some(found) = keychain::lookup_key(store, &self.key)? else { return Ok(None) };
+                if config::saved_trust_error(url, &self.key, &found.entry.ca, trust).is_some() {
+                    return Err(Error::Unauthorized(format!(
+                        "the person's token in the {} was replaced by one saved trusting another CA certificate, so it \
+                         was not sent; run the command again",
+                        store.name()
+                    )));
+                }
+                let renewal = found.entry.renewal();
+                Ok(Some((found.entry.token, renewal)))
+            }
+            _ => Err(Error::Remote("renewing a token: the lock taken is not its own".into())),
+        }
+    }
+
+    /// Replace the saved token, and how it is renewed, under the lock.
+    fn save(&self, held: &Guard, token: &str, renewal: Option<&Renewal>) -> Result<()> {
+        match (&self.place, held) {
+            (Place::File(path), Guard::File(lock)) => credentials::renewed(lock, path, &self.key, token, renewal),
+            (Place::Keychain { store, .. }, Guard::Keychain(lock)) => {
+                keychain::renewed(lock, store, &self.key, token, renewal)
+            }
+            _ => Err(Error::Remote("renewing a token: the lock taken is not its own".into())),
+        }
+    }
+
     /// Use `renewal`, read with the token now in use; a token without one
     /// keeps the expiry known before.
     fn adopt(&mut self, renewal: Option<Renewal>) {
@@ -270,4 +364,93 @@ pub(super) fn trust_for(app: &App, url: &str) -> Option<Trust> {
         _ => env("BD_CA_CERT").map(PathBuf::from),
     };
     Trust::load(ca_cert.as_deref()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credentials::Scope;
+    use crate::keychain::testing::{Items, entry_for, get, memory, put};
+    use crate::tokens::{Kind, Role};
+
+    const URL: &str = "https://127.0.0.1:1/w/x";
+
+    fn item() -> String {
+        keychain::account(Scope::Workspace, URL)
+    }
+
+    fn renewal(token: &str, due: bool) -> Renewal {
+        let now = Timestamp::now();
+        let refresh_after = if due { now.minus(Duration::from_secs(60)) } else { now.plus(Duration::from_secs(3000)) };
+        Renewal {
+            refresh_token: token.into(),
+            refresh_after,
+            expires_at: now.plus(Duration::from_secs(3600)),
+            pending: None,
+        }
+    }
+
+    /// A remote sending the person's token `bdt_one` from a memory keychain
+    /// holding it, due for renewal, saved trusting the system's CAs.
+    fn human_remote(dir: &tempfile::TempDir) -> (Remote, Items) {
+        let items = Items::default();
+        let first = entry_for("bdt_one", credentials::SYSTEM_CA, Some(&renewal("bdr_one", true)));
+        put(&items, &item(), &first);
+        let (store, _) = memory(&items, keychain::IMPLICIT);
+        let c = Configured { url: URL.into(), source: Source::Flag, ca_cert: None };
+        let remote = Remote::new(c, Trust::load(None).unwrap(), "bdt_one".into())
+            .within(Duration::from_secs(5))
+            .keychain_at(Arc::new(store), URL.into(), first.renewal(), Some(dir.path().join("credentials.toml")));
+        assert!(remote.human);
+        (remote, items)
+    }
+
+    fn current(remote: &Remote) -> String {
+        remote.token.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn a_replacement_saved_for_another_ca_is_not_adopted() {
+        if env("BD_CA_CERT").is_some() {
+            return; // the user's own CA setting passes any saved trust
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (remote, items) = human_remote(&dir);
+        let other = format!("sha256:{}", "00".repeat(32));
+        put(&items, &item(), &entry_for("bdt_two", &other, Some(&renewal("bdr_two", false))));
+
+        let e = remote.access_token(true).unwrap_err();
+        assert_eq!(e.exit_code(), 7, "{e}");
+        assert!(e.to_string().contains("saved trusting another CA certificate, so it was not sent"), "{e}");
+        assert!(e.to_string().contains("memory keychain"), "{e}");
+        assert!(!e.to_string().contains("bdt_") && !e.to_string().contains("bdr_"), "{e}");
+        assert_eq!(current(&remote), "bdt_one", "never the replacement's token");
+        let left = get(&items, &item()).unwrap();
+        assert_eq!((left.token.as_str(), left.ca.as_str()), ("bdt_two", other.as_str()), "the item is untouched");
+        assert!(left.refresh_request.is_none());
+    }
+
+    #[test]
+    fn a_replacement_with_the_same_ca_is_adopted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (remote, items) = human_remote(&dir);
+        put(&items, &item(), &entry_for("bdt_two", credentials::SYSTEM_CA, Some(&renewal("bdr_two", false))));
+
+        assert_eq!(remote.access_token(true).unwrap(), "bdt_two");
+        assert_eq!(current(&remote), "bdt_two");
+    }
+
+    #[test]
+    fn the_pending_request_id_is_saved_before_the_refresh() {
+        let dir = tempfile::tempdir().unwrap();
+        let (remote, items) = human_remote(&dir);
+
+        let e = remote.access_token(true).unwrap_err();
+        assert_eq!(e.exit_code(), 8, "nothing listens there: {e}");
+        let left = get(&items, &item()).unwrap();
+        assert_eq!(left.token, "bdt_one");
+        let ren = left.renewal().expect("still renewed");
+        assert!(ren.pending.as_deref().is_some_and(|id| id.len() == 32), "{:?}", left.refresh_request);
+        assert_eq!((left.kind, left.role, left.ca.as_str()), (Kind::Human, Role::Admin, credentials::SYSTEM_CA));
+    }
 }

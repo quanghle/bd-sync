@@ -11,7 +11,7 @@ pub enum RemoteCommand {
     Set(RemoteSetArgs),
     /// Show the remote workspace and check the connection
     #[command(long_about = REMOTE_SHOW_LONG_ABOUT)]
-    Show,
+    Show(RemoteShowArgs),
     /// Stop using the remote workspace
     #[command(alias = "rm", long_about = REMOTE_UNSET_LONG_ABOUT)]
     Unset,
@@ -35,7 +35,12 @@ Show the remote workspace and check the connection
 
 Shows the remote workspace in use and where it is configured, then checks the
 connection, the server's certificate, the access token and the actor the
-server resolves.";
+server resolves.
+
+With --human, also tells whether a person's token is saved in the OS
+keychain for the workspace (`bd remote login --human`), with its kind and
+role, never the token itself. Only --human reads the keychain, and not
+inside an agent session.";
 
 const REMOTE_UNSET_LONG_ABOUT: &str = "\
 Stop using the remote workspace
@@ -54,21 +59,35 @@ With --provider, sign in instead: bd shows a one-time code and the provider's
 verification URL; once the code is entered there and the server lets the
 account in, it issues a token. Otherwise the token is read from stdin when
 piped, else from a prompt that does not echo it, never from the command line,
-and is checked against the server first (--no-verify skips the check).";
+and is checked against the server first (--no-verify skips the check).
+
+With --human, a person saves their own token (kind human) in the OS keychain
+instead (Secret Service on Linux, the login Keychain on macOS, Credential
+Manager on Windows), never in a file: typed at a hidden prompt or from
+--provider. bd then uses it only for a command the server refuses because
+it needs a person's (or an admin's) token, and for `bd publish`, in a
+terminal outside agent sessions. It is refused inside an agent session,
+without a terminal, and for a token of any other kind.";
 
 const REMOTE_LOGOUT_LONG_ABOUT: &str = "\
 Forget saved tokens and revoke sign-in tokens
 
 Forgets the access tokens `bd remote login` saved for a workspace or server.
 Tokens from signing in are revoked on their server too; tokens an admin
-created stay valid, as they may be in use elsewhere.";
+created stay valid, as they may be in use elsewhere.
+
+With --human, forgets the person's token `bd remote login --human` saved in
+the OS keychain instead (a server URL: the one saved for the server only),
+leaving the credentials file alone.";
 
 #[derive(Args, Debug, Clone)]
 #[command(after_long_help = "\
 Examples:
   bd remote login --provider corp
   printf %s \"$TOKEN\" | bd remote login https://bd.example.com/w/proj
-  bd remote login https://bd.example.com/w/proj --workspace-only")]
+  bd remote login https://bd.example.com/w/proj --workspace-only
+  bd remote login --human
+  bd remote login --provider corp --human")]
 pub struct RemoteLoginArgs {
     /// Workspace URL, e.g. https://bd.example.com/w/proj (default: this checkout's remote workspace)
     pub url: Option<String>,
@@ -82,6 +101,9 @@ pub struct RemoteLoginArgs {
     /// Save the token without checking it against the server
     #[arg(long)]
     pub no_verify: bool,
+    /// Save a person's token (kind human) in the OS keychain, for the commands only a person may run
+    #[arg(long, conflicts_with = "no_verify")]
+    pub human: bool,
     /// Refused without being echoed: a token pasted after the URL
     #[arg(hide = true)]
     pub extra: Vec<String>,
@@ -90,8 +112,20 @@ pub struct RemoteLoginArgs {
 #[derive(Args, Debug, Clone)]
 #[command(after_long_help = "\
 Examples:
+  bd remote show
+  bd remote show --human")]
+pub struct RemoteShowArgs {
+    /// Also tell whether a person's token is saved in the OS keychain (`bd remote login --human`)
+    #[arg(long)]
+    pub human: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = "\
+Examples:
   bd remote logout
-  bd remote logout https://bd.example.com")]
+  bd remote logout https://bd.example.com
+  bd remote logout --human")]
 pub struct RemoteLogoutArgs {
     /// Workspace or server URL (default: this checkout's remote workspace); a server URL also forgets
     /// tokens saved for its workspaces
@@ -99,6 +133,9 @@ pub struct RemoteLogoutArgs {
     /// Forget only the token saved for this workspace with `login --workspace-only`
     #[arg(long)]
     pub workspace_only: bool,
+    /// Forget the person's token saved in the OS keychain by `login --human` instead
+    #[arg(long)]
+    pub human: bool,
     /// Refused without being echoed: a token pasted after the URL
     #[arg(hide = true)]
     pub extra: Vec<String>,

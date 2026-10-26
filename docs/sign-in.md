@@ -9,7 +9,10 @@ People sign in two ways:
 
 - **From the command line**: `bd remote login --provider <name>` shows a
   one-time code to enter at the provider (the OAuth device flow, RFC 8628),
-  then saves the token the server issues.
+  then saves the token the server issues. With `--human`, a person signing
+  in for a token of kind `human` keeps it in the OS keychain instead, and
+  renews it there; a token of another kind is revoked and not saved
+  ([Person's token in the keychain](remote.md#persons-token-in-the-keychain)).
 - **In a browser, through an MCP client**: when `[oauth]` turns on
   `bd serve`'s authorization server, MCP clients that sign people in send
   them to a page that offers the providers ([MCP: signing in with

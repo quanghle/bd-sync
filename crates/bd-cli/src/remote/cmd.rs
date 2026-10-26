@@ -1,4 +1,5 @@
-//! `bd remote`: set, show, unset, login and logout.
+//! `bd remote`: set, show, unset, login and logout, and with `--human`
+//! the person's token kept in the OS keychain.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -6,6 +7,7 @@ use std::time::Duration;
 use bd_core::{Error, Result};
 use serde_json::{Value, json};
 
+use super::config::saved_trust_error;
 use super::config::{RemoteFile, Token, check_url, missing_token, remote_file, token_for};
 use super::renew::{Revocation, revoke_saved, trust_for};
 use super::{Configured, Remote, Source, Trust, configured, env, identity, response_error};
@@ -13,16 +15,20 @@ use crate::app::{App, Out};
 use crate::cli::*;
 use crate::credentials::{self, Renewal, Scope};
 use crate::io;
+use crate::keychain::{self, HumanEntry};
 use crate::playbooks;
-use crate::protocol::ExecRequest;
+use crate::protocol::{ExecRequest, Issued};
+use crate::tokens::{Kind, Role};
 
 pub fn cmd_remote(app: &mut App, cmd: &RemoteCommand) -> Result<i32> {
     io::require_local("bd remote")?;
     match cmd {
         RemoteCommand::Set(a) => set(app, a).map(|_| 0),
-        RemoteCommand::Show => show(app),
+        RemoteCommand::Show(a) => show(app, a),
         RemoteCommand::Unset => unset(app).map(|_| 0),
+        RemoteCommand::Login(a) if a.human => login_human(app, a).map(|_| 0),
         RemoteCommand::Login(a) => login(app, a).map(|_| 0),
+        RemoteCommand::Logout(a) if a.human => logout_human(app, a).map(|_| 0),
         RemoteCommand::Logout(a) => logout(app, a).map(|_| 0),
     }
 }
@@ -133,7 +139,7 @@ fn agents_hint(app: &App, remote: Remote) -> Option<String> {
     ))
 }
 
-fn show(app: &mut App) -> Result<i32> {
+fn show(app: &mut App, a: &RemoteShowArgs) -> Result<i32> {
     let Some(c) = configured(app)? else {
         let local = app.db_path().ok();
         let line = match &local {
@@ -214,9 +220,53 @@ fn show(app: &mut App) -> Result<i32> {
             e.exit_code()
         }
     };
+    if a.human {
+        let (line, human) = show_human(&c);
+        lines.push(line);
+        view["human"] = human;
+    }
     // The server's info and errors are its own text: escaped, as anything a server sends.
     app.print(Out::new(view).lines(lines.iter().map(|l| crate::agents::show::printable(l))));
     Ok(code)
+}
+
+/// `bd remote show --human`: the person's token saved in the keychain for
+/// `c`, as a line and its JSON (null when there is none to show). Never the
+/// token, and never the command's exit code.
+fn show_human(c: &Configured) -> (String, Value) {
+    if !crate::actor::agent_session_vars(&crate::actor::env).is_empty() {
+        return ("human token  not checked inside an agent session".into(), Value::Null);
+    }
+    let found = keychain::open(keychain::EXPLICIT).and_then(|store| Ok((keychain::lookup(&store, &c.url)?, store)));
+    match found {
+        Ok((Some(human), store)) => {
+            let entry = &human.entry;
+            let renewal = entry.renewal();
+            let mut details = format!("kind {}, role {}", entry.kind.as_str(), entry.role.as_str());
+            if let Some(r) = &renewal {
+                details.push_str(&format!(", renewed automatically, next after {}", r.refresh_after));
+            }
+            let mut line = format!("human token  saved for {} in the {} ({details})", human.key, store.name());
+            let trusted = Trust::load(c.ca_cert.as_deref())
+                .is_ok_and(|trust| saved_trust_error(&c.url, &human.key, &entry.ca, &trust).is_none());
+            if !trusted {
+                line.push_str("; saved trusting another CA certificate, so it is not sent here");
+            }
+            let view = json!({
+                "key": human.key,
+                "scope": human.scope.as_str(),
+                "store": store.name(),
+                "kind": entry.kind,
+                "role": entry.role,
+                "signed_in": entry.signed_in,
+                "trusted": trusted,
+                "renewal": renewal.map(|r| json!({ "refresh_after": r.refresh_after, "expires_at": r.expires_at })),
+            });
+            (line, view)
+        }
+        Ok((None, _)) => ("human token  none: `bd remote login --human` saves one".into(), Value::Null),
+        Err(e) => (format!("human token  keychain unavailable: {}", keychain::reason(&e)), Value::Null),
+    }
 }
 
 /// `bd info` on the server: proves that the URL, certificate, token and actor all work.
@@ -316,23 +366,11 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
     let keys = credentials::keys(&c.url)?;
     let path = credentials::default_path()?;
     let trust = Trust::load(c.ca_cert.as_deref())?;
-    let (token, signed_in) = if let Some(provider) = a.provider.clone() {
-        let workspace = c.url.rsplit_once("/w/").map_or("", |(_, w)| w);
-        let remote = Remote::new(c.clone(), trust.clone(), String::new());
-        let issued = super::sign_in::sign_in(&remote, workspace, &keys.server, &provider)?;
-        credentials::check_token(&issued.token)
-            .map_err(|_| Error::Remote(format!("{}: unexpected sign-in answer: not an access token", keys.server)))?;
+    let (token, signed_in) = if let Some(provider) = &a.provider {
+        let issued = sign_in(&c, &trust, &keys, provider)?;
         (issued.token.clone(), Some(issued))
     } else {
-        let label = match scope {
-            Scope::Server => keys.server.clone(),
-            Scope::Workspace => c.url.clone(),
-        };
-        let label = match &trust.path {
-            Some(ca) => format!("{label}, trusting the CA certificate {}", ca.display()),
-            None => label,
-        };
-        let token = read_token(&label)?;
+        let token = read_token(&prompt_label(&c, &keys, scope, &trust))?;
         credentials::check_token(&token)?;
         (token, None)
     };
@@ -353,10 +391,7 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
             info["actor"].as_str().map(String::from)
         }
     };
-    let renewal = signed_in.as_ref().and_then(|issued| {
-        let refresh = issued.refresh_token.clone().filter(|t| credentials::check_token(t).is_ok())?;
-        Some(Renewal::new(refresh, Duration::from_secs(issued.expires_in.max(1))))
-    });
+    let renewal = signed_in.as_ref().and_then(issued_renewal);
     let saved = credentials::save(&path, &c.url, &token, &trust.anchor, scope, signed_in.is_some(), renewal.as_ref())?;
     // A sign-in token this one takes the place of ends on its server too (unless no server is to be asked).
     let revoke = |gone: &credentials::Gone| {
@@ -459,6 +494,271 @@ fn login(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
     Ok(())
 }
 
+/// Sign in with `provider` through `c`'s server: the token it issued.
+fn sign_in(c: &Configured, trust: &Trust, keys: &credentials::Keys, provider: &str) -> Result<Issued> {
+    let workspace = c.url.rsplit_once("/w/").map_or("", |(_, w)| w);
+    let remote = Remote::new(c.clone(), trust.clone(), String::new());
+    let issued = super::sign_in::sign_in(&remote, workspace, &keys.server, provider)?;
+    credentials::check_token(&issued.token)
+        .map_err(|_| Error::Remote(format!("{}: unexpected sign-in answer: not an access token", keys.server)))?;
+    Ok(issued)
+}
+
+/// How a sign-in token is renewed: with its refresh token, if it came with one.
+fn issued_renewal(issued: &Issued) -> Option<Renewal> {
+    let refresh = issued.refresh_token.clone().filter(|t| credentials::check_token(t).is_ok())?;
+    Some(Renewal::new(refresh, Duration::from_secs(issued.expires_in.max(1))))
+}
+
+/// What the token prompt names: where the token goes, and the CA it is bound to.
+fn prompt_label(c: &Configured, keys: &credentials::Keys, scope: Scope, trust: &Trust) -> String {
+    let label = match scope {
+        Scope::Server => keys.server.clone(),
+        Scope::Workspace => c.url.clone(),
+    };
+    match &trust.path {
+        Some(ca) => format!("{label}, trusting the CA certificate {}", ca.display()),
+        None => label,
+    }
+}
+
+/// Refuse `command` inside an agent session: a person's token is for the
+/// person, in a terminal of their own.
+fn refuse_in_agent_session(command: &str) -> Result<()> {
+    let vars = crate::actor::agent_session_vars(&crate::actor::env);
+    if vars.is_empty() {
+        return Ok(());
+    }
+    let set: Vec<String> = vars.iter().map(|v| format!("${v}")).collect();
+    Err(Error::Refused(format!(
+        "{command} does not run inside an agent session ({} set): ask the user to run it in a separate terminal",
+        set.join(", ")
+    )))
+}
+
+/// `bd remote login --human`: a person's own token (kind human), typed at a
+/// hidden prompt or from signing in, saved only in the OS keychain.
+fn login_human(app: &mut App, a: &RemoteLoginArgs) -> Result<()> {
+    no_extra_args("login", &a.extra)?;
+    refuse_in_agent_session("bd remote login --human")?;
+    if !keychain::stdin_is_terminal() {
+        return Err(Error::Refused(
+            "bd remote login --human runs only in a terminal, where the person types their token at a prompt that \
+             does not echo it or signs in with --provider; it never reads a piped token"
+                .into(),
+        ));
+    }
+    let c = login_target(app, a.url.as_deref())?;
+    let scope = if a.workspace_only { Scope::Workspace } else { Scope::Server };
+    let keys = credentials::keys(&c.url)?;
+    if a.workspace_only && keys.workspace.is_none() {
+        return Err(Error::invalid(format!("--workspace-only needs a workspace URL (…/w/<workspace>), not {}", c.url)));
+    }
+    let trust = Trust::load(c.ca_cert.as_deref())?;
+    let store = keychain::open(keychain::EXPLICIT)?;
+    // Whether the keychain answers at all, before the person is asked for anything.
+    let key = match scope {
+        Scope::Server => keys.server.clone(),
+        Scope::Workspace => keys.workspace.clone().unwrap_or_default(),
+    };
+    store.get(&keychain::account(scope, &key))?;
+    let (token, signed_in) = if let Some(provider) = &a.provider {
+        let issued = sign_in(&c, &trust, &keys, provider)?;
+        (issued.token.clone(), Some(issued))
+    } else {
+        let token = read_token_human(&prompt_label(&c, &keys, scope, &trust))?;
+        credentials::check_token(&token)?;
+        (token, None)
+    };
+    let renewal = signed_in.as_ref().and_then(issued_renewal);
+    let parse = |kind: &str, role: &str| -> Option<(Kind, Role)> {
+        Some((serde_json::from_value(json!(kind)).ok()?, serde_json::from_value(json!(role)).ok()?))
+    };
+    // What the server says the token is: the sign-in's answer, else its info.
+    let (actor, said) = match &signed_in {
+        Some(issued) => (issued.actor.clone(), parse(&issued.kind, &issued.role)),
+        None => {
+            let info = check(Remote::new(c.clone(), trust.clone(), token.clone()).quick(), (None, None)).map_err(
+                |e| match e {
+                    Error::Unauthorized(m) => Error::Unauthorized(format!("{m}; nothing was saved")),
+                    Error::Remote(m) => Error::Remote(format!("{m}; nothing was saved")),
+                    e => e,
+                },
+            )?;
+            let summary = &info["token"];
+            if !summary.is_object() {
+                return Err(Error::Refused(format!(
+                    "{}: the server did not say what kind of token this is (it may predate --human); nothing was saved",
+                    keys.server
+                )));
+            }
+            let text = |k: &str| summary[k].as_str().unwrap_or_default().to_string();
+            (info["actor"].as_str().unwrap_or_default().to_string(), parse(&text("kind"), &text("role")))
+        }
+    };
+    let role = match said {
+        Some((Kind::Human, role)) => role,
+        other => {
+            let what = match other {
+                Some((kind, _)) => format!("of kind {}", kind.as_str()),
+                None => "of a kind bd does not know".to_string(),
+            };
+            let mut message = format!(
+                "the server says this token is {what}, not a person's (kind human): --human keeps only a person's token, so nothing was saved"
+            );
+            // A token issued for this login and not kept would only linger: it ends now.
+            if signed_in.is_some() {
+                let gone = credentials::Gone {
+                    key: keys.server.clone(),
+                    token: token.clone(),
+                    ca: trust.anchor.clone(),
+                    signed_in: true,
+                    renewal: renewal.clone(),
+                };
+                message.push_str(&match revoke_saved(&gone, Some(&trust)) {
+                    Revocation::Revoked(name) => format!(
+                        "; the token issued ({}) was revoked on the server",
+                        crate::agents::show::printable(&name)
+                    ),
+                    Revocation::Gone => "; the server had already revoked the token issued".to_string(),
+                    Revocation::Kept => "; the server kept the token issued".to_string(),
+                    Revocation::NotRevoked(why) => {
+                        format!(
+                            "; the token issued was not revoked on the server ({why}): it works there until it expires"
+                        )
+                    }
+                });
+            }
+            return Err(Error::Refused(message));
+        }
+    };
+    let mut entry = HumanEntry {
+        token: token.clone(),
+        ca: trust.anchor.clone(),
+        signed_in: signed_in.is_some(),
+        refresh_token: None,
+        refresh_after: None,
+        expires_at: None,
+        refresh_request: None,
+        kind: Kind::Human,
+        role,
+    };
+    entry.set_renewal(renewal.as_ref());
+    let held = keychain::lock()?;
+    let saved = keychain::save(&held, &store, &c.url, scope, entry)?;
+    drop(held);
+    // A sign-in token this one takes the place of ends on its server too.
+    let revoke =
+        |gone: &credentials::Gone| (gone.signed_in && gone.token != token).then(|| revoke_saved(gone, Some(&trust)));
+    let replaced = saved.replaced.as_ref().map(|gone| (gone, revoke(gone)));
+    let dropped = saved.dropped.as_ref().map(|gone| (gone, revoke(gone)));
+    let revocations: Vec<Value> = replaced
+        .iter()
+        .chain(dropped.iter())
+        .filter_map(|(gone, revocation)| revocation.as_ref().map(|r| r.view(&gone.key)))
+        .collect();
+    let reach = match scope {
+        Scope::Server => format!("{} (every workspace it allows there)", saved.key),
+        Scope::Workspace => saved.key.clone(),
+    };
+    let mut view = json!({
+        "url": c.url,
+        "store": store.name(),
+        "human": true,
+        "key": saved.key,
+        "scope": scope.as_str(),
+        "verified": true,
+        "actor": actor,
+        "kind": Kind::Human,
+        "role": role,
+        "replaced": replaced.is_some(),
+        "dropped": dropped.as_ref().map(|(gone, _)| &gone.key),
+        "revocations": revocations,
+        "ca_cert": c.ca_cert,
+    });
+    use crate::agents::show::printable;
+    if let Some(issued) = &signed_in {
+        view["account"] = json!({ "login": issued.login, "via": issued.via });
+        view["token"] = json!({
+            "name": issued.name,
+            "workspaces": issued.workspaces,
+            "max_claims": issued.max_claims,
+            "expires_at": issued.expires_at,
+            "refreshable_until": renewal.as_ref().and(issued.refreshable_until.as_ref()),
+        });
+    }
+    let mut out = Out::new(view);
+    if let Some(issued) = &signed_in {
+        out = out.line(format!("✓ Signed in as {} ({})", printable(&issued.login), printable(&issued.via)));
+    }
+    out = out
+        .line(format!("✓ Saved the person's access token for {reach} in the {}", store.name()))
+        .line(printable(&format!("  acts as {actor}, role {}, kind human", role.as_str())));
+    if let (Some(issued), Some(_)) = (&signed_in, &renewal)
+        && let Some(until) = &issued.refreshable_until
+    {
+        out = out.line(printable(&format!("  renewed automatically until {until}")));
+    }
+    out = out.line("  used only for commands that need it, in a terminal outside agent sessions");
+    if let Some(ca) = &c.ca_cert {
+        out = out.line(format!("  bound to the CA certificate {}: it is not sent trusting any other", ca.display()));
+    }
+    if let Some((_, revocation)) = &replaced {
+        out = out.line("  it replaces the person's token saved there before");
+        out = out.lines(revocation.iter().map(Revocation::line));
+    }
+    if let Some((gone, revocation)) = &dropped {
+        out = out.line(format!(
+            "  removed the person's token saved for {} only, which would have taken precedence",
+            gone.key
+        ));
+        out = out.lines(revocation.iter().map(Revocation::line));
+    }
+    app.print(out.id(saved.key));
+    Ok(())
+}
+
+/// `bd remote logout --human`: forget the person's token saved in the OS
+/// keychain for a URL, revoking a sign-in token on its server.
+fn logout_human(app: &mut App, a: &RemoteLogoutArgs) -> Result<()> {
+    no_extra_args("logout", &a.extra)?;
+    refuse_in_agent_session("bd remote logout --human")?;
+    let url = match &a.url {
+        Some(url) => url_arg(url, "https://host[:port][/prefix][/w/<workspace>]")?.to_string(),
+        None => configured(app)?.ok_or_else(|| no_remote_here("logout"))?.url,
+    };
+    let store = keychain::open(keychain::EXPLICIT)?;
+    let held = keychain::lock()?;
+    let removed = keychain::remove(&held, &store, &url, a.workspace_only)?;
+    drop(held);
+    let trust = if removed.iter().any(|gone| gone.signed_in) { trust_for(app, &url) } else { None };
+    let revocations: Vec<Option<Revocation>> =
+        removed.iter().map(|gone| gone.signed_in.then(|| revoke_saved(gone, trust.as_ref()))).collect();
+    let keys: Vec<&str> = removed.iter().map(|gone| gone.key.as_str()).collect();
+    let views: Vec<Value> = removed
+        .iter()
+        .zip(&revocations)
+        .filter_map(|(gone, revocation)| revocation.as_ref().map(|r| r.view(&gone.key)))
+        .collect();
+    let mut out = Out::new(json!({ "store": store.name(), "human": true, "removed": keys, "revocations": views }));
+    if removed.is_empty() {
+        out = out.line(format!("= No person's access token saved for {} in the {}", url.trim(), store.name()));
+    }
+    for (gone, revocation) in removed.iter().zip(&revocations) {
+        out = out
+            .line(format!("✓ Removed the person's access token saved for {} from the {}", gone.key, store.name()))
+            .id(gone.key.clone());
+        out = out.lines(revocation.iter().map(Revocation::line));
+    }
+    if removed.iter().any(|gone| !gone.signed_in) {
+        out = out.line(
+            "  the server still accepts a token its admin created until it is revoked there (`bd serve token revoke`)",
+        );
+    }
+    app.print(out);
+    Ok(())
+}
+
 fn logout(app: &mut App, a: &RemoteLogoutArgs) -> Result<()> {
     no_extra_args("logout", &a.extra)?;
     let url = match &a.url {
@@ -517,6 +817,78 @@ fn read_token(label: &str) -> Result<String> {
     Ok(token.to_string())
 }
 
+/// The person's token for `bd remote login --human`: always typed at a
+/// prompt that does not echo it, never piped.
+fn read_token_human(label: &str) -> Result<String> {
+    let prompt = format!("The person's access token for {label} (input hidden)");
+    let refused = |why: String| {
+        Error::Refused(format!(
+            "{why}: sign in with `bd remote login --human --provider <name>` instead, if the server offers it"
+        ))
+    };
+    #[cfg(unix)]
+    let text = prompt_hidden(&format!("{prompt}: ")).map_err(|e| refused(e.to_string()))?;
+    #[cfg(windows)]
+    let text = prompt_hidden_windows(&prompt).map_err(|e| refused(e.to_string()))?;
+    #[cfg(not(any(unix, windows)))]
+    let text: String = return Err(refused(format!("bd does not prompt for {prompt} on this system")));
+    let token = text.trim();
+    if token.is_empty() {
+        return Err(Error::invalid("no access token given; nothing was saved"));
+    }
+    Ok(token.to_string())
+}
+
+/// The PowerShell script that reads a line at a prompt without echoing it
+/// and writes it to stdout. The prompt goes in a single-quoted string, so
+/// every quote character PowerShell reads as one is doubled.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_prompt_script(prompt: &str) -> String {
+    let mut quoted = String::new();
+    for c in io::printable(prompt).chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            quoted.push(c);
+        }
+        quoted.push(c);
+    }
+    format!(
+        "$s = Read-Host -AsSecureString '{quoted}'; [Console]::Out.Write([System.Net.NetworkCredential]::new('', \
+         $s).Password)"
+    )
+}
+
+/// What runs [`windows_prompt_script`]: Windows PowerShell by its full path,
+/// so no `PATH` entry can stand in for it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_prompt_argv(system_root: &str, prompt: &str) -> (PathBuf, Vec<String>) {
+    let exe = Path::new(system_root).join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+    let args = ["-NoLogo", "-NoProfile", "-Command"].map(String::from).into_iter();
+    (exe, args.chain([windows_prompt_script(prompt)]).collect())
+}
+
+/// Read a line from the console without echoing it, through PowerShell's
+/// `Read-Host -AsSecureString`: its stdin and stderr are this process's,
+/// and only the line comes back, on its stdout.
+#[cfg(windows)]
+fn prompt_hidden_windows(prompt: &str) -> Result<String> {
+    use std::process::{Command, Stdio};
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let (exe, args) = windows_prompt_argv(&root, prompt);
+    let child = Command::new(&exe)
+        .args(&args)
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|e| Error::Refused(format!("cannot run {}: {e}", exe.display())))?;
+    let out = child.wait_with_output()?;
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), b"\n");
+    if !out.status.success() {
+        return Err(Error::Refused(format!("the hidden prompt failed ({})", out.status)));
+    }
+    String::from_utf8(out.stdout).map_err(|_| Error::Refused("the hidden prompt gave text that is not UTF-8".into()))
+}
+
 fn how_to_pipe() -> &'static str {
     if cfg!(windows) {
         "pipe it in, e.g. `Read-Host -MaskInput Token | bd remote login` in PowerShell 7"
@@ -569,4 +941,29 @@ fn prompt_hidden(prompt: &str) -> Result<String> {
 #[cfg(not(unix))]
 fn prompt_hidden(_: &str) -> Result<String> {
     Err(Error::invalid(format!("bd remote login does not prompt on this system; {}", how_to_pipe())))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_windows_prompt_quotes_what_it_names() {
+        assert_eq!(
+            windows_prompt_script("The person's token for https://x/w/a (input hidden)"),
+            "$s = Read-Host -AsSecureString 'The person''s token for https://x/w/a (input hidden)'; \
+             [Console]::Out.Write([System.Net.NetworkCredential]::new('', $s).Password)"
+        );
+        // PowerShell ends a single-quoted string at typographic quotes too, and a terminal acts on escapes.
+        let script = windows_prompt_script("a\u{2018}b\u{2019}c\u{201A}d\u{201B}e\x1b[2Jf'; calc; '");
+        assert!(script.contains("a\u{2018}\u{2018}b\u{2019}\u{2019}c\u{201A}\u{201A}d\u{201B}\u{201B}e"), "{script}");
+        assert!(script.contains("f''; calc; '''; [Console]"), "{script}");
+        assert!(!script.contains('\x1b'), "{script}");
+        let (exe, args) = windows_prompt_argv(r"C:\Windows", "Token");
+        assert!(exe.ends_with(Path::new("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe")));
+        assert!(exe.starts_with(r"C:\Windows"), "{}", exe.display());
+        assert_eq!(args[..3], ["-NoLogo", "-NoProfile", "-Command"]);
+        assert_eq!(args[3], windows_prompt_script("Token"));
+        assert_eq!(args.len(), 4, "no -NonInteractive, which would turn Read-Host off");
+    }
 }

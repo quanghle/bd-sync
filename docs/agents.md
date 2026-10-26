@@ -201,7 +201,10 @@ file's SHA-256 and the counts per area, and `rollback`. The new set
 revisions are recorded in the same transaction, so `agents_changed` events
 reach `bd agents watch` at once. Through bd serve, publishing needs an
 admin token of a person (role `admin`, kind `human`); agents cannot
-publish, even with admin tokens. Publishing changes nothing about
+publish, even with admin tokens. A person who saved theirs with `bd remote
+login --human` publishes with it from the OS keychain, in a terminal
+outside agent sessions ([Person's token in the
+keychain](remote.md#persons-token-in-the-keychain)). Publishing changes nothing about
 [Trust](#trust): clients still approve new and changed skills and MCP
 definitions.
 

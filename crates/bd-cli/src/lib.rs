@@ -20,6 +20,7 @@ pub mod github;
 pub mod graph_view;
 pub mod hook;
 pub mod io;
+pub mod keychain;
 pub mod logging;
 pub mod mcp;
 pub mod paths;
@@ -56,7 +57,7 @@ pub fn run(cli: Cli) -> i32 {
         hook::take_session_id(&cli.command);
     }
     if !always_local(&cli.command) {
-        match remote::detect(&app) {
+        match remote::detect_for(&app, &cli.command) {
             Ok(Some(r)) => return remote::run(&mut app, r, &cli),
             Ok(None) => {}
             // `bd prime` from a session hook: report the problem as context, never fail the hook.
@@ -119,7 +120,10 @@ pub fn execute(app: &mut App, cmd: &Command) -> i32 {
     tracing::debug!(target: "bd::cli", command = name, total_us = elapsed.as_micros() as u64, ok = result.is_ok(), "done");
     match result {
         Ok(code) => code,
-        Err(e) => report_as(&e, app.g.json, app.known_actor()),
+        Err(e) => {
+            io::note_needs(e.needs());
+            report_as(&e, app.g.json, app.known_actor())
+        }
     }
 }
 
@@ -195,6 +199,11 @@ fn hint(e: &Error) -> Option<&'static str> {
         Error::EventsTruncated { .. } => "re-baseline with `bd export` and tail from its head_seq",
         Error::HistoryPruned { .. } => "pick a later --as-of or --since; `bd events -n 1` shows what is retained",
         Error::NoWorkspace(_) => "create one with `bd init`",
+        Error::Needs { .. } => {
+            "only a person (or an admin) may do this: a person runs it in a terminal outside agent sessions. In a \
+             remote workspace, `bd remote login --human` once saves their access token in the OS keychain, and bd \
+             then uses it for such commands"
+        }
         Error::Unauthorized(_) => {
             "check the access token (BD_TOKEN, or `bd remote login`), and its role, kind, workspaces and actor (`bd remote show`; `bd serve token list` on the server)"
         }
@@ -432,5 +441,15 @@ mod tests {
         let json: serde_json::Value =
             serde_json::from_str(&render_error(&Error::Locked("x".into()), true, None)).unwrap();
         assert_eq!((&json["error"]["code"], &json["error"]["exit_code"]), (&"busy".into(), &5.into()));
+    }
+
+    #[test]
+    fn a_refusal_that_needs_a_person_names_the_keychain_login() {
+        let e = Error::with_needs(&[bd_core::Need::Human], "resolving a human gate needs a person's access token");
+        let text = render_error(&e, false, None);
+        assert!(text.contains("hint: only a person (or an admin) may do this"), "{text}");
+        assert!(text.contains("`bd remote login --human`"), "{text}");
+        let plain = render_error(&Error::Unauthorized("x".into()), false, None);
+        assert!(!plain.contains("--human"), "{plain}");
     }
 }

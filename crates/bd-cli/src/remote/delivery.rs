@@ -118,6 +118,7 @@ impl Delivery {
             stdout: std::mem::take(&mut self.held),
             stderr: exit.stderr,
             replayed: exit.replayed,
+            needs: exit.needs,
             issue: self.issue.take(),
             cursor: self.cursor.take(),
             ..Default::default()

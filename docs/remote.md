@@ -199,7 +199,10 @@ the same answer as single commands:
   deleting it; and so does moving the work it holds back past it early
   (removing the edge, `close --force`, pinning or deleting the work or a
   container around it, moving either out of its parent). Imports are
-  checked too. Other gates may be resolved by any write token.
+  checked too. Other gates may be resolved by any write token. A person
+  whose agent token is refused here can have the command retried with
+  their own token from the OS keychain ([Person's token in the
+  keychain](#persons-token-in-the-keychain)).
 - **Playbook metadata.** Only admins change `metadata.playbook`, which
   makes runs and groups close themselves, on an existing issue.
 - **GitHub gates** may name only repositories in the workspace's
@@ -216,6 +219,7 @@ Point a checkout at the server once and commit the result:
 bd remote set https://bd.example.com/w/proj   # writes .bd/remote.toml (--ca-cert ca.pem for a private CA)
 bd remote login                               # paste a token from the admin; it is checked, then saved
 bd remote login --provider corp               # or sign in with one of the server's providers
+bd remote login --human                       # a person: keep your own token in the OS keychain
 bd remote show                                # checks URL, certificate, token and actor; shows the token's access
 bd ready                                      # every command now runs on the server
 ```
@@ -234,7 +238,9 @@ always means a local database and cannot be combined with `--remote`.
 ### Tokens on the client
 
 The token comes from `$BD_TOKEN`, else from those saved by `bd remote
-login`, never from the repository.
+login`, never from the repository. A person's token saved with `--human`
+is kept apart, in the OS keychain, and used only for the commands that
+need it ([Person's token in the keychain](#persons-token-in-the-keychain)).
 
 - **`$BD_TOKEN`** is sent only to the workspace URL that `--remote` or
   `$BD_REMOTE` names, never to one from a `.bd/remote.toml`: a cloned
@@ -263,9 +269,83 @@ login`, never from the repository.
   and its server (`--workspace-only` keeps the server's), or for a server
   URL and all its workspaces. A token from signing in is also revoked on
   the server; one an admin created stays valid until revoked there.
+- **`bd remote login [URL] --human`** saves a person's token (kind
+  `human`) in the OS keychain instead of the credentials file, with or
+  without `--provider` and `--workspace-only`: the Secret Service over
+  D-Bus on Linux (GNOME Keyring, KWallet, KeePassXC), the login Keychain
+  on macOS, Credential Manager on Windows, as one item of service `bd`
+  and account `server:<URL up to /w>` or `workspace:<workspace URL>`. It
+  is refused (exit 2, nothing saved) inside an agent session (any of
+  `CLAUDE_CODE_SESSION_ID`, `COPILOT_AGENT_SESSION_ID`, `CODEX_THREAD_ID`,
+  `CODEX_SESSION_ID` set: ask the person to run it in a separate
+  terminal), when stdin is not a terminal, where no keychain answers, and
+  for a token the server reports as any other kind than `human`; a
+  sign-in that issues one of another kind is revoked on the server. The
+  token is typed at a prompt without echo (on Windows, through
+  PowerShell's `Read-Host -AsSecureString`) and always checked with `bd
+  info` (`--no-verify` is refused). There is no file fallback: on Linux
+  without a reachable Secret Service, and on other systems, `--human`
+  exits 2 naming what is missing.
 
 `bd remote show` and `bd info` show a token's name, role, kind,
 workspaces, expiry and account, never its secret.
+
+### Person's token in the keychain
+
+Agents work with agent tokens, which cannot open human gates or publish,
+and should not be able to. A person who saved their own token with `bd
+remote login --human` keeps using the same checkout and the same `BD_TOKEN`
+or saved token; bd sends the person's token only where the server says it
+is needed:
+
+- **After a refusal that says what it needs.** When the server refuses a
+  command with exit 7 and names `needs` (a human gate needs a person's
+  token, taking over another actor's claim an admin's: see
+  [Protocol](#protocol)), and the request committed no write, the client
+  looks up the keychain token for the workspace URL (the workspace's item
+  first, then the server's) and, if its kind and role cover what the
+  refusal needs, sends the command once more with it, under a new request
+  id, printing on stderr `bd: using the person's access token saved in
+  the <keychain> (role R) for this command`. Nothing is retried after the
+  command printed output, and the retry is never retried with another
+  token.
+- **`bd publish`**, which always needs a person's admin token, takes the
+  keychain token before it sends anything, and also works with no other
+  token configured.
+- **Never otherwise.** The keychain is not read inside an agent session
+  (the variables above), when stdin is not a terminal, or for any other
+  command or refusal; `$BD_TOKEN` and saved tokens are used as before, and
+  a human token never comes from the environment. With no keychain token,
+  a locked or unreachable keychain (each read waits at most 5 seconds), a
+  token that does not cover the refusal, or one saved trusting another CA,
+  the command fails as it would have, its message naming `bd remote login
+  --human`; in text mode a note says why the keychain token was not used
+  (`bd: keychain unavailable: ...`).
+- **Bound to its URL and CA trust.** As with saved tokens, the keychain
+  token is sent only to the server it was saved for and only while the
+  CAs it was checked against are the ones trusted (`BD_CA_CERT` set by you
+  overrides that).
+- **Renewal.** A token from `--provider <name> --human` is renewed like a
+  saved sign-in ([Refreshing](sign-in.md#refreshing)), under
+  `credentials.lock`, with the new tokens written back to the keychain
+  item. The item is read again under the lock, and its CA trust checked
+  again, before its token is sent or its refresh token used; a refused
+  renewal is reported (exit 7), never replaced by the agent token.
+- **`bd remote show --human`** adds whether a person's token is saved for
+  the workspace, in which keychain, with its kind and role (`--json`: a
+  `human` object, or `null`), or that the keychain is unavailable; inside
+  an agent session it says the keychain was not checked. It never prints
+  the token. Plain `bd remote show` and `bd remote logout` never open the
+  keychain.
+- **`bd remote logout [URL] --human`** removes the keychain items (a
+  workspace URL: its own and its server's, `--workspace-only` its own; a
+  server URL: the server's only) and revokes a sign-in token on its
+  server, leaving the credentials file alone. It is refused inside an
+  agent session.
+
+The keychain keeps the token off disk and out of agents' environment, but
+it is not a security boundary against a determined agent running as the
+same user ([Security: Clients](security.md#clients)).
 
 ### Environment
 
@@ -492,7 +572,16 @@ order the command wrote them:
 | `{"file": {"path", "data"}}` | part of an output file |
 | `{"cursor": N}` | (`events`) the `--since` value that continues after this answer |
 | `{"issue": "ID"}` | (`events --issue`) the issue's full id |
-| `{"exit": {"exit_code", "stderr", "replayed"}}` | last: the result |
+| `{"exit": {"exit_code", "stderr", "replayed", "needs"}}` | last: the result |
+
+`needs` (left out when empty) names the rights a refusal (exit 7) said
+would get past it, `admin`, `human` or both: a human gate needs a person's
+token, taking over another actor's claim an admin's, `bd publish` a
+person's admin token. It is sent only when the request committed no write,
+so the command can be sent again, with a new request id, under a token
+that has them; any other refusal names none. bd's client does that once, with a person's
+token from the OS keychain ([Person's token in the
+keychain](#persons-token-in-the-keychain)).
 
 Blank lines are keep-alives; an answer without the exit frame was cut off.
 `["events", "--since", "N", "--wait", "25s", "--json"]` is a long poll.

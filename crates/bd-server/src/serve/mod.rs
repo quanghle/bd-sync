@@ -950,8 +950,9 @@ impl Server {
             counter.add();
         }
         let recorded = app.request.as_ref().filter(|k| k.recorded).map(|k| k.id.clone());
+        let needs = needs_for(captured.needs, !app.tx.is_empty());
         self.close_app(ws, token, &mut app);
-        let sent = out.borrow_mut().finish(Exit { exit_code, stderr: lossy(captured.stderr), replayed: false });
+        let sent = out.borrow_mut().finish(Exit { exit_code, stderr: lossy(captured.stderr), replayed: false, needs });
         let sent = match sent.held {
             // A write's answer is stored before it is sent, and the request
             // released: a retry after a lost answer gets the stored one.
@@ -1086,6 +1087,14 @@ impl Server {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn needs_are_sent_only_when_nothing_was_committed() {
+        use bd_core::Need;
+        assert_eq!(needs_for(vec![Need::Admin, Need::Human], false), [Need::Admin, Need::Human]);
+        assert!(needs_for(vec![Need::Human], true).is_empty(), "a write went through: retrying would apply it twice");
+        assert!(needs_for(Vec::new(), false).is_empty());
+    }
 
     #[test]
     fn one_address_holds_its_share_of_connections_and_loopback_is_not_counted() {

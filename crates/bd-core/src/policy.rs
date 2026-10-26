@@ -64,7 +64,7 @@ use rusqlite::params;
 use serde_json::{Value, json};
 
 use crate::claims;
-use crate::error::{Error, Result};
+use crate::error::{Error, Need, Result};
 use crate::gates::GateKind;
 use crate::graph;
 use crate::issues::{self, ISSUE_COLUMNS, issue_from_row};
@@ -227,7 +227,7 @@ fn check_playbook_metadata(policy: &Policy, old: &Issue, metadata: &Value) -> Re
 
 /// `what` completes "only a person can ...", e.g. "close it".
 fn human_only(id: &str, hold: &Hold, what: &str) -> Error {
-    Error::Unauthorized(match hold {
+    let message = match hold {
         Hold::Is => format!("{id} is a human gate: only a person can {what} (with a human access token)"),
         Hold::HeldBy(g) => format!(
             "{id} waits for human gate {g}: only a person can {what} before {g} is resolved (with a human access token)"
@@ -236,7 +236,8 @@ fn human_only(id: &str, hold: &Hold, what: &str) -> Error {
             "{id} holds work that waits for human gate {g}: only a person can {what} before {g} is resolved \
              (with a human access token)"
         ),
-    })
+    };
+    Error::with_needs(&[Need::Human], message)
 }
 
 /// One open human gate and the live work it holds back.
@@ -314,10 +315,11 @@ impl WriteCtx<'_> {
     pub(crate) fn check_claim_override(&self, issue: &Issue, take_over: bool) -> Result<Option<Value>> {
         let Some(LiveClaim { holder, lease }) = self.others_live_claim(issue)? else { return Ok(None) };
         if self.claim_limits().is_some_and(|p| !p.owns(&holder)) {
-            return Err(Error::Unauthorized(format!(
+            let message = format!(
                 "{} is claimed by {holder}: ending or taking over another actor's claim needs an admin access token",
                 issue.id
-            )));
+            );
+            return Err(Error::with_needs(&[Need::Admin], message));
         }
         if !take_over {
             return Err(Error::NotOwner { id: issue.id.clone(), holder: Some(holder), actor: self.actor().into() });

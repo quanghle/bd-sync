@@ -28,12 +28,13 @@ mod config;
 mod delivery;
 mod events;
 mod forward;
+mod human;
 mod renew;
 mod sign_in;
 
 pub use client::response_error;
 pub use cmd::cmd_remote;
-pub use config::{Trust, ca_certificates, configured, detect, is_loopback};
+pub use config::{Trust, ca_certificates, configured, detect, detect_for, is_loopback};
 pub use events::Polled;
 pub use forward::{is_hook, run, unavailable};
 
@@ -52,8 +53,12 @@ pub struct Remote {
     token: Mutex<String>,
     /// The saved sign-in token this remote renews, if it does.
     renewing: Option<Mutex<Renewing>>,
-    /// The CA certificates to trust instead of the system's, as read by [`Trust::load`].
-    roots: Option<Vec<ureq::tls::Certificate<'static>>>,
+    /// What the server's certificate is checked against, as read once by
+    /// [`Trust::load`]: every request uses it, and a keychain token's
+    /// renewal checks the entry it re-reads against it.
+    trust: Trust,
+    /// It sends the person's token from the keychain (`bd remote login --human`).
+    pub(super) human: bool,
     /// How long failures in transit are retried.
     retry: Duration,
     connect_timeout: Duration,

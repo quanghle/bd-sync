@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{ArgGroup, Args, Subcommand};
+use clap::{ArgAction, ArgGroup, Args, Subcommand};
 
 use super::*;
 
@@ -324,7 +324,7 @@ Creates a gate that each --blocks issue waits on, as on any blocker. The gate
 also takes on their prerequisites, so it arms only once that work could
 otherwise start; timers and timeouts count from arming. Gate types:
   human   opens with `bd gate resolve` (through bd serve, by a human token;
-          with --approver, only one of the approvers or their sub-actors)
+          with --approver or --oidc-approver, only one of the approvers)
   timer   opens once --timeout has passed
   issue   opens when the --await-id issue closes as done
   gh:pr   opens when pull request --await-id merges
@@ -332,12 +332,19 @@ otherwise start; timers and timeouts count from arming. Gate types:
           the first run started after arming
 A failed condition, or --timeout passing on a gate other than a timer,
 escalates the gate: it is flagged for a person, never opened. `bd gate check`
-evaluates gates.";
+evaluates gates.
+
+--approver and --oidc-approver together set a human gate's approval list:
+actor names, corresponding sub-actors and OIDC accounts specified by verified
+issuer and subject. OIDC pairs are stored only as oidc:sha256: identity
+references. An OIDC-signed-in account matches only the corresponding identity
+reference, never an actor.";
 
 const GATE_CREATE_EXAMPLES: &str = "\
 Examples:
   bd gate create -t human --blocks bd-12 -a alice
   bd gate create -t human --blocks bd-12 --approver github:alice,github:bob
+  bd gate create -t human --blocks bd-12 --oidc-approver https://login.example.com 248289761001
   bd gate create -t timer --timeout 24h --blocks bd-12
   bd gate create -t gh:pr --await-id 42 --blocks bd-12 --timeout 2d
   bd gate create -t gh:run --await-id ci.yml --branch main --blocks bd-12";
@@ -382,6 +389,15 @@ pub struct GateCreateArgs {
     pub assignee: Option<String>,
     #[arg(long = "approver", value_name = "ACTOR", value_delimiter = ',', help = APPROVER_HELP)]
     pub approvers: Vec<String>,
+    #[arg(
+        long = "oidc-approver",
+        num_args = 2,
+        value_names = ["ISSUER", "SUBJECT"],
+        action = ArgAction::Append,
+        allow_hyphen_values = true,
+        help = OIDC_APPROVER_HELP
+    )]
+    pub oidc_approvers: Vec<String>,
     /// Parent issue (default: the parent of the single issue it holds back, unless that parent is closed)
     #[arg(long, value_name = "ID")]
     pub parent: Option<String>,
@@ -394,11 +410,18 @@ pub struct GateCreateArgs {
 const APPROVER_HELP: &str = "Human gates only: who may open it through bd serve, an actor or any of its sub-actors \
 (repeatable or comma separated, at most 32; locally informational)";
 
+const OIDC_APPROVER_HELP: &str = "Human gates only: an OIDC account that may open it through bd serve, named by its \
+issuer and subject exactly as its provider states them, stored only as an oidc:sha256: identity reference \
+(repeatable; exactly two values per occurrence, taken verbatim; counts toward the 32 approvers; locally \
+informational)";
+
 const GATE_UPDATE_LONG_ABOUT: &str = "\
 Replace or clear the approvers of an open human gate
 
---approver replaces the whole list; --clear-approvers removes it, so any
-human token may open the gate again. A list stored invalid (which matches
+--approver and --oidc-approver together replace the whole list (an OIDC
+account, named by its issuer and subject, is stored only as an oidc:sha256:
+identity reference); --clear-approvers removes it, so any human token may
+open the gate again. A list stored invalid (which matches
 nobody) is replaced or cleared the same way. Through bd serve, this needs a
 human token of one of the gate's approvers (of any person when it has none),
 or a human admin's. Locally, approvers are informational.";
@@ -406,11 +429,14 @@ or a human admin's. Locally, approvers are informational.";
 const GATE_UPDATE_EXAMPLES: &str = "\
 Examples:
   bd gate update bd-15 --approver github:alice --approver github:bob
+  bd gate update bd-15 --approver github:alice --oidc-approver https://login.example.com 248289761001
   bd gate update bd-15 --clear-approvers";
 
 #[derive(Args, Debug, Clone)]
 #[command(after_long_help = GATE_UPDATE_EXAMPLES)]
-#[command(group(ArgGroup::new("change").required(true).args(["approvers", "clear_approvers"])))]
+#[command(group(
+    ArgGroup::new("change").required(true).multiple(true).args(["approvers", "oidc_approvers", "clear_approvers"])
+))]
 pub struct GateUpdateArgs {
     /// The gate
     pub id: String,
@@ -422,6 +448,16 @@ pub struct GateUpdateArgs {
         help = APPROVER_HELP
     )]
     pub approvers: Vec<String>,
+    #[arg(
+        long = "oidc-approver",
+        num_args = 2,
+        value_names = ["ISSUER", "SUBJECT"],
+        action = ArgAction::Append,
+        allow_hyphen_values = true,
+        conflicts_with = "clear_approvers",
+        help = OIDC_APPROVER_HELP
+    )]
+    pub oidc_approvers: Vec<String>,
     /// Remove the approvers
     #[arg(long)]
     pub clear_approvers: bool,
@@ -438,7 +474,9 @@ just before it is asked about. Only a person runs it: it refuses inside an
 agent session and without a terminal on stdin, with no flag to get past
 either. In a remote workspace it sends only the person's token saved in the
 OS keychain (`bd remote login --human`), never $BD_TOKEN or a token saved by
-`bd remote login`, and skips gates whose approvers do not name its actor.
+`bd remote login`, and skips gates whose approvers do not match the token:
+an account signed in with an OIDC provider matches only its own oidc:sha256:
+identity reference, never an actor.
 Prompts go to stderr; the summary goes to stdout (--json for JSON).";
 
 const GATE_REVIEW_EXAMPLES: &str = "\

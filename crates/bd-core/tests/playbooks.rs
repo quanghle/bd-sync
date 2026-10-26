@@ -694,6 +694,49 @@ fn gate_approvers_render_and_normalize() {
 }
 
 #[test]
+fn gate_approvers_take_oidc_references_and_refuse_malformed_ones() {
+    let reference = gates::oidc_approver("https://login.example.com", "248289761001");
+    let hex = &reference[gates::OIDC_APPROVER_PREFIX.len()..];
+
+    let plan = approver_plan(&format!(r#"["carol", "{reference}"]"#), &[]).unwrap();
+    assert_eq!(gate_approvers(&plan), Some(vec!["carol".into(), reference.clone()]));
+    let plan = approver_plan(r#"["{{approver}}"]"#, &[("approver", &reference)]).unwrap();
+    assert_eq!(gate_approvers(&plan), Some(vec![reference.clone()]));
+
+    let malformed = [
+        format!("OIDC:sha256:{hex}"),
+        format!("oidc:SHA256:{hex}"),
+        format!("oidc:sha256:{}", hex.to_ascii_uppercase()),
+        format!("oidc:sha256:{}", &hex[1..]),
+        format!("{reference}0"),
+        format!("{reference}/laptop"),
+    ];
+    for bad in &malformed {
+        let literal = format!("[[steps]]\nid = \"ship\"\n[steps.gate]\ntype = \"human\"\napprovers = [\"{bad}\"]\n");
+        let e = playbook::parse_toml(&literal, "test.toml", "test").unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{bad}: {e}");
+        assert!(e.to_string().contains("invalid approver"), "{bad}: {e}");
+        let e = approver_plan(r#"["{{approver}}"]"#, &[("approver", bad)]).unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{bad}: {e}");
+    }
+
+    let mut env = Env::new();
+    let toml = format!(
+        "[[steps]]\nid = \"build\"\n[[steps]]\nid = \"deploy\"\nneeds = [\"build\"]\n\
+         [steps.gate]\ntype = \"human\"\napprovers = [\"carol\", \"{reference}\"]\n"
+    );
+    let run = env.start(&toml, &[]);
+    let stored = env.issue("t-1.gate-deploy").metadata["gate"]["approvers"].clone();
+    assert_eq!(stored, json!(["carol", reference]));
+    let pb = env.store.read(|r| playbook::extract(r.conn(), &run, Some("again"))).unwrap();
+    let text = playbook::to_toml(&pb).unwrap();
+    let again = playbook::parse_toml(&text, "x.toml", "again").unwrap();
+    let plan = playbook::compile(&again, &RunRequest::default(), &Loader::default()).unwrap();
+    assert_eq!(gate_approvers(&plan), Some(vec!["carol".into(), reference.clone()]), "{text}");
+    env.assert_healthy();
+}
+
+#[test]
 fn extract_keeps_gate_approvers_and_refuses_invalid_ones() {
     let mut env = Env::new();
     let toml = "[[steps]]\nid = \"build\"\n[[steps]]\nid = \"deploy\"\nneeds = [\"build\"]\n\
@@ -912,7 +955,17 @@ fn closing_the_last_step_under_deep_groups_closes_them_in_linear_time() {
         .spawn(move || {
             for (step, prefix, policy) in [
                 (local, "a", None),
-                (served, "b", Some(Policy { actor: "alice".into(), admin: false, human: false, max_claims: None })),
+                (
+                    served,
+                    "b",
+                    Some(Policy {
+                        actor: "alice".into(),
+                        admin: false,
+                        human: false,
+                        max_claims: None,
+                        oidc_approver: None,
+                    }),
+                ),
             ] {
                 let started = std::time::Instant::now();
                 let out = env

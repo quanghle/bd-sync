@@ -221,8 +221,9 @@ pub struct StepGate {
     /// Who should act on it (e.g. the approver of a human gate).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
-    /// Human gates: the actors (or their sub-actors) who may open it through
-    /// bd serve. Templates; trimmed and deduplicated once rendered.
+    /// Human gates: who may open it through bd serve, each an actor (or its
+    /// sub-actors) or an `oidc:sha256:` OIDC identity reference. Templates;
+    /// trimmed and deduplicated once rendered.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub approvers: Vec<String>,
 }
@@ -250,7 +251,9 @@ impl StepGate {
     }
 
     /// The approvers that can be checked before rendering: human gates only,
-    /// each literal a valid actor, at most [`MAX_APPROVERS`] distinct ones.
+    /// each literal a valid actor or OIDC identity reference (a string under
+    /// the reserved `oidc:sha256:` prefix must be canonical), at most
+    /// [`MAX_APPROVERS`] distinct ones.
     /// Duplicates are dropped once rendered, so they are not refused here.
     fn check_approvers(&self) -> std::result::Result<(), String> {
         if self.approvers.is_empty() {

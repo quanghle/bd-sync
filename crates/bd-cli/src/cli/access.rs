@@ -183,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn gate_update_writes_and_takes_exactly_one_change() {
+    fn gate_update_writes_and_requires_a_change() {
         let access_of = |argv: &[&str]| access(&Cli::try_parse_from(argv).unwrap().command);
         assert_eq!(access_of(&["bd", "gate", "update", "t-1", "--approver", "a,b", "--approver", "c"]), Access::Write);
         assert_eq!(access_of(&["bd", "gate", "update", "t-1", "--clear-approvers"]), Access::Write);
@@ -201,6 +201,53 @@ mod tests {
             panic!("not gate update");
         };
         assert_eq!(a.approvers, ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn oidc_approvers_take_two_verbatim_values_per_occurrence() {
+        let parse = |argv: &[&str]| Cli::try_parse_from(argv).map(|c| c.command);
+        let update = |rest: &[&str]| {
+            let argv: Vec<&str> = ["bd", "gate", "update", "t-1"].iter().chain(rest).copied().collect();
+            match parse(&argv) {
+                Ok(Command::Gate(GateCommand::Update(a))) => Ok(a),
+                Ok(_) => panic!("not gate update"),
+                Err(e) => Err(e),
+            }
+        };
+        let a = update(&["--oidc-approver", "i1", "s1", "--oidc-approver", "i2", "s2"]).unwrap();
+        assert_eq!(a.oidc_approvers, ["i1", "s1", "i2", "s2"]);
+        assert!(a.approvers.is_empty() && !a.clear_approvers, "--oidc-approver alone is a change");
+        assert_eq!(update(&["--oidc-approver", "a,b", "c"]).unwrap().oidc_approvers, ["a,b", "c"]);
+        assert_eq!(update(&["--oidc-approver", "i", "-dash-subject"]).unwrap().oidc_approvers, ["i", "-dash-subject"]);
+        assert!(update(&["--oidc-approver", "i"]).is_err(), "one value");
+        assert!(update(&["--oidc-approver", "i", "s", "--clear-approvers"]).is_err());
+        assert!(update(&["--clear-approvers", "--oidc-approver", "i", "s"]).is_err());
+        let a = update(&["--approver", "x", "--oidc-approver", "i", "s"]).unwrap();
+        assert_eq!((a.approvers, a.oidc_approvers), (vec!["x".to_string()], vec!["i".to_string(), "s".to_string()]));
+        let both = parse(&["bd", "gate", "update", "t-1", "--approver", "x", "--oidc-approver", "i", "s"]).unwrap();
+        assert_eq!(access(&both), Access::Write);
+        let create = parse(&[
+            "bd",
+            "gate",
+            "create",
+            "-t",
+            "human",
+            "--blocks",
+            "t-2",
+            "--approver",
+            "a",
+            "--oidc-approver",
+            "i",
+            "s",
+        ])
+        .unwrap();
+        assert_eq!(access(&create), Access::Write);
+        let Command::Gate(GateCommand::Create(c)) = create else { panic!("not gate create") };
+        assert_eq!((c.approvers, c.oidc_approvers), (vec!["a".to_string()], vec!["i".to_string(), "s".to_string()]));
+        assert!(
+            parse(&["bd", "gate", "create", "-t", "human", "--blocks", "t-2", "--oidc-approver", "i"]).is_err(),
+            "one value"
+        );
     }
 
     #[test]

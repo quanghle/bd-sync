@@ -179,11 +179,11 @@ impl Ws {
 }
 
 fn agent() -> Option<Policy> {
-    Some(Policy { actor: "bot".into(), admin: false, human: false, max_claims: None })
+    Some(Policy { actor: "bot".into(), admin: false, human: false, max_claims: None, oidc_approver: None })
 }
 
 fn person() -> Option<Policy> {
-    Some(Policy { actor: "carol".into(), admin: false, human: true, max_claims: None })
+    Some(Policy { actor: "carol".into(), admin: false, human: true, max_claims: None, oidc_approver: None })
 }
 
 fn child(title: &str, parent: &str) -> NewIssue {

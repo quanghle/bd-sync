@@ -206,6 +206,9 @@ the same answer as single commands:
 - **Approvers.** A human gate that names [approvers](playbooks.md#approvers)
   is opened, on every one of those paths, only by a human token of an
   approver or a sub-actor of one; an admin token is no exception (exit 7).
+  An account signed in with an OIDC provider matches only an identity
+  reference to its issuer and subject, never an actor ([Approvers and
+  OIDC accounts](sign-in.md#approvers-and-oidc-accounts)).
   A stored list that is not valid matches nobody. Changing the approvers of
   an open human gate (`bd gate update`, `update --set-metadata`, an import)
   needs a human token of one of its approvers (of any person, when it has

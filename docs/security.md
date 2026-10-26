@@ -262,11 +262,28 @@ consent page and more.
 - **Approvers hold on every served path.** A gate's approvers are enforced
   in the engine on every path that can open a human gate or move work
   past it (`gate resolve`, `close`, pins, type changes, edges, moves,
-  deletes, run closing, imports), for tokens and browser approvals alike,
-  admins included. A stored list that is not valid matches nobody. Only
-  an approver's human token, any person's when there are none, or a human
-  admin's may change the list, and the change is recorded in the gate's
-  history.
+  deletes, run closing, imports), alone, in batches and in playbooks, for
+  tokens and browser approvals alike, admins included. A stored list that
+  is not valid matches nobody. Only an approver's human token, any
+  person's when there are none, or a human admin's may change the list,
+  and the change is recorded in the gate's history.
+- **OIDC approvers are bound to issuer and subject.** A login, and the
+  actor bound at an account's first sign-in, prove nothing: an account
+  that takes a login first squats the actor. So an account signed in with
+  an OIDC provider matches only an [identity
+  reference](playbooks.md#oidc-identity-references) to the exact issuer
+  and subject of its ID tokens, never an actor approver, with a token, a
+  refreshed token, a retry, a sub-actor, a linked account's shared actor
+  or a browser approval alike, and no actor matches a reference. The
+  reference comes only from the authenticated token's account or the
+  account the browser sign-in admitted, never from the request; the
+  browser approval keeps it in server memory from sign-in to the `POST`,
+  and the final transaction checks the current approvers against it.
+  `bd gate review` derives the same reference from the token's account in
+  the `info` answer and applies the same rule, stopping when that account
+  cannot be read. Approver lists that name OIDC accounts by actor fail
+  closed until an authorized human replaces the list; bd converts nothing
+  ([Approvers and OIDC accounts](sign-in.md#approvers-and-oidc-accounts)).
 - **Checked again when posting.** The approval resolves the gate in one
   transaction that checks again that it is an open human gate, ready to
   approve (not deferred or blocked again since the page), and that the
@@ -310,8 +327,20 @@ Residual risks, accepted:
 - **Approvers are informational in local workspaces**, as human gates
   are: anyone who can write `bd.db` can open them.
 - **A rollback** to a `bd serve` that predates approvers ignores them:
-  any human token opens such gates again. Gates resolved meanwhile stay
+  any human token opens such gates again. A rollback to one that predates
+  identity references matches OIDC accounts by actor again, squatted
+  actors included, and reads a reference as an ordinary actor name; a
+  fleet of mixed versions is as weak as its oldest server. Neither can
+  safely authorize sensitive gates. Gates resolved meanwhile stay
   resolved, and open approval pages fail (404).
+- **References are linkable identifiers, not anonymization.** The same
+  OIDC account has the same reference on every gate and every server, so
+  approver lists show which gates name one account, and a known issuer
+  and subject give the reference directly.
+- **A squatted actor stays bound** to the account that took it: the
+  identity rule keeps that account from approving, but recovering the
+  actor for the intended account is a separate task for the server's
+  admin ([Accounts and actors](sign-in.md#accounts-and-actors)).
 
 ## What bd keeps about people
 

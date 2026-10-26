@@ -217,6 +217,12 @@ survives renames, expiry and revocation.
   55) plus 8 random hex digits, so one account may sign in on several
   machines. Tokens issued to OAuth clients are named
   `oauth-<client>-<actor>-<random>` ([MCP](mcp.md#the-clients-tokens)).
+- **Not identity proof.** The login is what the provider reports at the
+  first sign-in, and the actor goes to whichever account signs in first
+  with that login. The login and the actor prove neither which person nor
+  which account is meant: an account of an OIDC provider is named on a gate's approvers by its issuer
+  and subject, never by its actor ([Approvers and OIDC
+  accounts](#approvers-and-oidc-accounts)).
 - **One actor, one principal.** A sign-in is refused while its actor
   belongs to another account (one that had the login before) or to a live
   token an admin created. `bd serve token create` refuses an account's
@@ -583,9 +589,12 @@ is judged for the gate's workspace as a sign-in is: `deny` first, then the
 [rules](#rules). Only a grant of kind `human` may approve, whatever its
 role; an account let in as an agent, a denied account, or one no rule
 lets in gets a refusal page that says nothing about the gate. When the
-gate names [approvers](playbooks.md#approvers), the account's actor
-(`github:alice`, `corp:alice`) must also be one of them or a sub-actor of
-one. An authorizer that may not grant `human` (`human = false`, the
+gate names [approvers](playbooks.md#approvers), the account must also
+match one of the approvers: an account of an OIDC provider only by the
+identity reference of its issuer and subject, a GitHub account by its
+actor (`github:alice`) or a sub-actor of that actor ([Approvers and OIDC
+accounts](#approvers-and-oidc-accounts)). An authorizer that may not
+grant `human` (`human = false`, the
 default) lets no one approve.
 
 **No token.** The account is bound to its actor as at any sign-in, and the
@@ -641,7 +650,7 @@ when the page then refuses or shows a notice:
 | sign-in cancelled at the provider | 403 |
 | the provider failed, or returned no code | 502, 400 |
 | account denied, let in by no rule, or granted kind `agent` | 403 |
-| not one of the gate's approvers, at sign-in or when posting (approvers changed since) | 403 |
+| not one of the gate's approvers (an OIDC account matches only its identity reference, never an actor), at sign-in or when posting (approvers changed since) | 403 |
 | a sign-in step or an approval expired, or a link this server did not give | 400 |
 | an approval posted again | 400 (`already used`) |
 | a post from another site, or with neither `Origin` nor `Sec-Fetch-Site` | 403 |
@@ -657,3 +666,60 @@ the approval's `POST` each take one. The server logs each approval
 refused`) with the provider, subject, login, actor, workspace and gate,
 never an email, and counts them in `/metrics`
 ([`bd_serve_approvals_total`](observability.md#server-metrics)).
+
+### Approvers and OIDC accounts
+
+A gate's approvers name an account of an OIDC provider by an [identity
+reference](playbooks.md#oidc-identity-references) to its issuer and
+subject, never by its actor, because the actor proves nothing about the
+account behind it:
+
+- **First-sign-in squatting.** An actor `<provider>:<login>` is bound to
+  the first account that signs in with that login. At a provider where
+  accounts choose or change the `preferred_username`, an account
+  can take the login `alice` before the intended person ever signs in to
+  bd, and bd then binds `corp:alice` to that account for good. Were
+  approvers matched by actor, a gate listing `corp:alice` would open for
+  that account, with a browser approval, a token issued earlier, a
+  refresh, a retry or a sub-actor. An identity reference matches only the
+  account with exactly that issuer and subject, so the squatting account
+  is refused on every path, and an OIDC account never matches an actor
+  approver at all (linked accounts sharing an actor included).
+- **Obtaining the issuer and subject.** The pair must come from a source
+  that verifies it independently of the login: the provider's own
+  administration (the account's record in the identity provider, read by
+  a trusted administrator), the account's own authenticated `bd info
+  --json` (`token.account.issuer` and `token.account.subject`, with the
+  token from that account's `bd remote login --provider <name>`), or, for
+  the server's admin, `bd serve token accounts --root <root>` (each
+  binding's subject and issuer). A pair, or a reference, received in a
+  message or copied from another gate authenticates nothing: a reference
+  is opaque and proves nothing about whose account it names.
+- **Setting a reference.** `bd gate create` or `bd gate update` with
+  `--oidc-approver <issuer> <subject>`, the values exactly as the
+  provider states the pair (`--oidc-approver https://login.example.com
+  248289761001`); for a playbook, the canonical string that `bd gate show
+  --json` then lists in `spec.approvers`.
+- **Logins may change.** A new `preferred_username` changes neither the
+  account's actor nor its reference, so the account still matches.
+- **Existing username-only lists fail closed.** A gate whose approvers
+  name an OIDC account by actor (`corp:alice`), written before identity
+  references existed, is opened by no OIDC account, through the browser,
+  a token or `bd gate review`. bd converts no list, renames no actor and
+  migrates nothing: a human admin, or a human token that still matches an
+  entry, replaces the list with `bd gate update`.
+- **A squatted actor stays squatted.** The identity rule keeps the
+  squatting account from approving, but the actor stays bound to that
+  account, and sign-ins of the intended account with the same login are
+  refused while that binding lasts ([One actor, one
+  principal](#accounts-and-actors)). Recovering the actor is a separate
+  task for the server's admin ([Accounts and
+  actors](#accounts-and-actors), `bd serve token revoke --account <actor>
+  --forget`).
+- **References are linkable identifiers.** The same account has the same
+  reference on every gate and every server, so references tie gates to
+  one account: references are not anonymization.
+- **No rollback.** A `bd serve` without identity references, or a fleet
+  of mixed versions, matches OIDC accounts by actor again and reads a
+  reference as an ordinary actor name: such servers cannot safely guard
+  sensitive gates.

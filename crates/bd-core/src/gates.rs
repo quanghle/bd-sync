@@ -31,8 +31,12 @@
 //! gates open only for a person: see [`crate::policy`].
 //!
 //! A human gate may name its **approvers** (`metadata.gate.approvers`, 1 to
-//! [`MAX_APPROVERS`] actors): through `bd serve`, only they or their
-//! sub-actors may open it. They are read apart from the condition
+//! [`MAX_APPROVERS`] entries, each an actor or an OIDC identity reference):
+//! through `bd serve`, only they may open it, an actor with its sub-actors,
+//! a reference only for the OIDC account whose verified issuer and subject
+//! it was computed from ([`oidc_approver`]; the `oidc:sha256:` prefix is
+//! reserved in any case, and never names an actor: [`crate::policy`]
+//! matches). They are read apart from the condition
 //! ([`approvers_in`]): a stored list that is not valid matches nobody, and
 //! never makes the condition unreadable, so a human admin can always replace
 //! or clear it ([`WriteCtx::set_gate_approvers`]). Locally they are
@@ -139,7 +143,8 @@ pub struct GateSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
     /// `human`: who may open it through bd serve (each an actor, or any of
-    /// its sub-actors). A spec read from metadata ([`spec_of`]) carries what
+    /// its sub-actors, or an OIDC identity reference, [`oidc_approver`],
+    /// for that account only). A spec read from metadata ([`spec_of`]) carries what
     /// [`approvers_in`] reads, `Some([])` for a stored list that is not
     /// valid, which matches nobody; [`GateSpec::validate`] is for new input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -149,9 +154,81 @@ pub struct GateSpec {
 /// The most approvers a human gate may name.
 pub const MAX_APPROVERS: usize = 32;
 
+/// The prefix of an OIDC identity reference ([`oidc_approver`]), reserved
+/// in any ASCII case: a string under it is a reference or invalid, never an
+/// actor.
+pub const OIDC_APPROVER_PREFIX: &str = "oidc:sha256:";
+
+/// The most bytes an issuer given to [`oidc_approver_input`] may have.
+const MAX_OIDC_ISSUER: usize = 4096;
+/// The most bytes a subject given to [`oidc_approver_input`] may have.
+const MAX_OIDC_SUBJECT: usize = 255;
+
+/// The approver reference of the OIDC account with this issuer and subject:
+/// `oidc:sha256:` and the lowercase hex SHA-256 of a domain separator and
+/// the exact bytes of each, length-prefixed (big-endian `u64`), so no two
+/// pairs share one. Nothing is normalized: the bytes are the provider's.
+pub fn oidc_approver(issuer: &str, subject: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"bd:oidc-approver:v1\0");
+    for part in [issuer, subject] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let hex: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("{OIDC_APPROVER_PREFIX}{hex}")
+}
+
+/// Whether `a` is under the reserved prefix (in any ASCII case), canonical
+/// or not.
+pub fn is_oidc_reference(a: &str) -> bool {
+    a.get(..OIDC_APPROVER_PREFIX.len()).is_some_and(|p| p.eq_ignore_ascii_case(OIDC_APPROVER_PREFIX))
+}
+
+/// Whether `a` is a canonical reference: the lowercase prefix, then exactly
+/// 64 lowercase hex digits.
+pub fn oidc_reference_ok(a: &str) -> bool {
+    a.strip_prefix(OIDC_APPROVER_PREFIX)
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+/// The reference of an issuer and subject given as input (`gate create
+/// --oidc-approver`), checked without trimming: the issuer 1 to 4096 bytes
+/// with no whitespace or control characters, the subject 1 to 255 bytes
+/// with no control characters, not all whitespace. Errors never repeat the
+/// values.
+pub fn oidc_approver_input(issuer: &str, subject: &str) -> Result<String> {
+    if issuer.is_empty() || issuer.len() > MAX_OIDC_ISSUER {
+        return Err(Error::invalid(format!("the OIDC approver's issuer must be 1 to {MAX_OIDC_ISSUER} bytes")));
+    }
+    if issuer.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(Error::invalid("the OIDC approver's issuer must have no whitespace or control characters"));
+    }
+    if subject.is_empty() || subject.len() > MAX_OIDC_SUBJECT {
+        return Err(Error::invalid(format!("the OIDC approver's subject must be 1 to {MAX_OIDC_SUBJECT} bytes")));
+    }
+    if subject.chars().any(char::is_control) {
+        return Err(Error::invalid("the OIDC approver's subject must have no control characters"));
+    }
+    if subject.chars().all(char::is_whitespace) {
+        return Err(Error::invalid("the OIDC approver's subject must not be blank"));
+    }
+    Ok(oidc_approver(issuer, subject))
+}
+
+/// The reference of a signed-in account, by its provider's name: `None`
+/// for `github`, the built-in GitHub provider (not OIDC; no OIDC provider
+/// may take that name), whose accounts match approvers by actor.
+pub fn account_oidc_approver(provider: &str, issuer: &str, subject: &str) -> Option<String> {
+    (provider != "github").then(|| oidc_approver(issuer, subject))
+}
+
 /// An approver as stored: an actor name with no surrounding spaces, at most
 /// 255 characters, no control characters, no `,` (lists are comma separated)
-/// and no `/` at either end (`a/b` names a sub-actor).
+/// and no `/` at either end (`a/b` names a sub-actor); or, under the
+/// reserved prefix, a canonical OIDC identity reference ([`oidc_reference_ok`]).
 pub fn approver_ok(a: &str) -> bool {
     !a.is_empty()
         && a == a.trim()
@@ -159,10 +236,21 @@ pub fn approver_ok(a: &str) -> bool {
         && !a.chars().any(|c| c.is_control() || c == ',')
         && !a.starts_with('/')
         && !a.ends_with('/')
+        && (!is_oidc_reference(a) || oidc_reference_ok(a))
+}
+
+/// What [`check_approvers`] and [`approvers_input`] say of a malformed
+/// reserved entry.
+fn bad_reference(a: &str) -> Error {
+    Error::invalid(format!(
+        "invalid approver {a:?} (the {OIDC_APPROVER_PREFIX} prefix is reserved, in any case, for OIDC identity \
+         references: exactly {OIDC_APPROVER_PREFIX} and 64 lowercase hex digits)"
+    ))
 }
 
 /// New approvers (from the command line or a rendered playbook): refused
-/// when one has a control character anywhere, then trimmed, later
+/// when one has a control character anywhere, then trimmed, refused when
+/// under the reserved prefix but not a canonical reference, later
 /// duplicates (ignoring ASCII case) dropped. Blank entries are kept for
 /// [`check_approvers`] to refuse.
 pub fn approvers_input(list: impl IntoIterator<Item = String>) -> Result<Vec<String>> {
@@ -172,6 +260,9 @@ pub fn approvers_input(list: impl IntoIterator<Item = String>) -> Result<Vec<Str
             return Err(Error::invalid(format!("approver {raw:?} has a control character")));
         }
         let a = raw.trim();
+        if is_oidc_reference(a) && !oidc_reference_ok(a) {
+            return Err(bad_reference(a));
+        }
         if !out.iter().any(|o| o.eq_ignore_ascii_case(a)) {
             out.push(a.to_string());
         }
@@ -180,7 +271,7 @@ pub fn approvers_input(list: impl IntoIterator<Item = String>) -> Result<Vec<Str
 }
 
 /// A list of approvers as stored: 1 to [`MAX_APPROVERS`] valid, distinct
-/// (ignoring ASCII case) actor names.
+/// (ignoring ASCII case) actor names or OIDC identity references.
 pub fn check_approvers(list: &[String]) -> Result<()> {
     if list.is_empty() {
         return Err(Error::invalid("approvers needs at least one actor"));
@@ -189,6 +280,9 @@ pub fn check_approvers(list: &[String]) -> Result<()> {
         return Err(Error::invalid(format!("at most {MAX_APPROVERS} approvers, got {}", list.len())));
     }
     for (i, a) in list.iter().enumerate() {
+        if is_oidc_reference(a) && !approver_ok(a) {
+            return Err(bad_reference(a));
+        }
         if !approver_ok(a) {
             return Err(Error::invalid(format!(
                 "invalid approver {a:?} (an actor name: not blank, no surrounding spaces, control characters or ',', \
@@ -1271,6 +1365,94 @@ mod tests {
         assert_eq!(spec.kind, GateKind::Human);
         assert_eq!(spec.timeout.as_deref(), Some("4h"));
         assert_eq!(spec.approvers, Some(vec![]));
+    }
+
+    #[test]
+    fn oidc_references_pin_the_exact_issuer_and_subject() {
+        // Computed apart from this code, with Python's hashlib:
+        // sha256(b"bd:oidc-approver:v1\0" + struct.pack(">Q", 25) + b"https://login.example.com"
+        //        + struct.pack(">Q", 12) + b"248289761001").hexdigest()
+        assert_eq!(
+            oidc_approver("https://login.example.com", "248289761001"),
+            "oidc:sha256:cc1c733abb44cc4515567045ad93eceb8b582889810bd9739c65c8d0e3c71247"
+        );
+        let r = oidc_approver("https://login.example.com", "248289761001");
+        assert!(oidc_reference_ok(&r) && is_oidc_reference(&r) && approver_ok(&r), "{r}");
+        for (a, b) in [
+            (("a", "bc"), ("ab", "c")),
+            (("https://login.example.com", "Alice"), ("https://login.example.com", "alice")),
+            (("https://login.example.com", "alice"), ("https://login.example.com/", "alice")),
+            (("https://login.example.com", " alice "), ("https://login.example.com", "alice")),
+        ] {
+            assert_ne!(oidc_approver(a.0, a.1), oidc_approver(b.0, b.1), "{a:?} {b:?}");
+        }
+        assert_eq!(account_oidc_approver("github", "https://github.com", "1"), None);
+        assert_eq!(
+            account_oidc_approver("acme", "https://login.example.com", "1"),
+            Some(oidc_approver("https://login.example.com", "1"))
+        );
+    }
+
+    #[test]
+    fn the_oidc_prefix_is_reserved_in_any_case() {
+        let r = oidc_approver("https://login.example.com", "248289761001");
+        let hex = &r[OIDC_APPROVER_PREFIX.len()..];
+        let bad = [
+            format!("OIDC:sha256:{hex}"),
+            format!("oidc:SHA256:{hex}"),
+            format!("oidc:sha256:{}", hex.to_ascii_uppercase()),
+            format!("oidc:sha256:{}", &hex[..63]),
+            format!("oidc:sha256:{hex}0"),
+            format!("oidc:sha256:{}g", &hex[..63]),
+            format!("{r}/x"),
+            "oidc:sha256:".to_string(),
+        ];
+        for b in &bad {
+            assert!(is_oidc_reference(b), "{b}");
+            assert!(!oidc_reference_ok(b) && !approver_ok(b), "{b}");
+            let e = approvers_input(["carol".to_string(), b.clone()]).unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{b}: {e}");
+            assert!(e.to_string().contains("reserved"), "{b}: {e}");
+            let e = check_approvers(&["carol".to_string(), b.clone()]).unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{b}: {e}");
+            assert!(e.to_string().contains("reserved"), "{b}: {e}");
+            let meta = json!({ "gate": { "type": "human", "approvers": ["carol", b] } });
+            assert_eq!(approvers_in(&meta), Some(vec![]), "{b}");
+        }
+        assert!(!is_oidc_reference("oidc:sha25") && !is_oidc_reference("oidc:sha256é") && !is_oidc_reference("é"));
+        let list = approvers_input(["carol".to_string(), format!(" {r} ")]).unwrap();
+        assert_eq!(list, vec!["carol".to_string(), r.clone()]);
+        check_approvers(&list).unwrap();
+        let meta = json!({ "gate": { "type": "human", "approvers": list } });
+        assert_eq!(approvers_in(&meta), Some(vec!["carol".to_string(), r]));
+    }
+
+    #[test]
+    fn oidc_approver_input_is_bounded_and_never_trimmed() {
+        let refused = |iss: &str, sub: &str| {
+            let e = oidc_approver_input(iss, sub).unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{iss:?} {sub:?}: {e}");
+            e.to_string()
+        };
+        let iss = "https://login.example.com";
+        refused("", "s");
+        oidc_approver_input(&"i".repeat(4096), "s").unwrap();
+        refused(&"i".repeat(4097), "s");
+        for bad in ["https://login.example.com/ x", "https://login\t.example.com", "https://login.example.com\n"] {
+            let e = refused(bad, "s");
+            assert!(!e.contains("login"), "{e}");
+        }
+        oidc_approver_input(iss, &"s".repeat(255)).unwrap();
+        refused(iss, &"s".repeat(256));
+        refused(iss, "");
+        for bad in ["secret-subject\u{7}", "secret\u{0}subject", "   ", "\u{3000}"] {
+            let e = refused(iss, bad);
+            assert!(!e.contains("secret") && !e.contains("login.example"), "{e}");
+        }
+        let padded = oidc_approver_input(iss, " a ").unwrap();
+        assert_eq!(padded, oidc_approver(iss, " a "));
+        assert_ne!(padded, oidc_approver_input(iss, "a").unwrap());
+        assert_eq!(oidc_approver_input(iss, "-dash").unwrap(), oidc_approver(iss, "-dash"));
     }
 
     #[test]

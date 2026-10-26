@@ -11,8 +11,13 @@
 //! The loop ([`review`]) runs over the [`Gates`] trait, so it is tested with
 //! a scripted fake on every OS. Each gate is read again right before it is
 //! asked about, and skipped when it is no longer a human gate, is resolved,
-//! is not armed, or (remotely) does not name the token's actor among its
-//! approvers. Every text that came from the store, the server or the
+//! is not armed, or (remotely) its approvers do not match the token's
+//! [`Caller`] by [`policy::approved_by`], the rule the server applies: an
+//! account signed in with an OIDC provider matches only the `oidc:sha256:`
+//! identity reference of its own issuer and subject, derived from the
+//! `token.account` of the server's `info` answer (a malformed account stops
+//! the review, never falling back to the actor), and any other token its
+//! actor and sub-actors. Every text that came from the store, the server or the
 //! configuration is shown escaped to one line, errors included
 //! ([`one_line`]), so none can forge a prompt or a link line.
 
@@ -108,14 +113,23 @@ pub(crate) struct Failure {
     pub exit_code: i32,
 }
 
+/// Who the server decides approvers by: the token's actor and, for an
+/// account signed in with an OIDC provider, its identity reference.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Caller {
+    pub actor: String,
+    /// The `oidc:sha256:` reference of the token's OIDC account, if any.
+    pub oidc_approver: Option<String>,
+}
+
 /// Where the review reads and resolves gates. An outer `Err` stops the
 /// review: a transport failure, a lost answer, an unreadable answer.
 pub(crate) trait Gates {
     /// Who resolves the gates, for the default reason.
     fn actor(&self) -> &str;
-    /// The actor approvers are checked against, where they are enforced
+    /// Who approvers are checked against, where they are enforced
     /// (remotely); `None` locally, where they are informational.
-    fn approver(&self) -> Option<&str>;
+    fn approver(&self) -> Option<&Caller>;
     /// The open gates, in `bd gate list` order.
     fn list(&mut self) -> Result<Vec<GateView>>;
     fn show(&mut self, id: &str) -> Result<Shown>;
@@ -268,8 +282,15 @@ pub(crate) fn review(
                     s.skip(id, "its approvers are not valid");
                     continue;
                 }
-                Some(list) if !list.iter().any(|a| policy::approves(a, me)) => {
-                    s.skip(id, format!("only {} may approve it (you are {me})", list.join(", ")));
+                Some(list) if !policy::approved_by(list, &me.actor, me.oidc_approver.as_deref()) => {
+                    let who = if me.oidc_approver.is_some() {
+                        "an account signed in with an OIDC provider matches only an oidc:sha256: identity \
+                         reference for its own issuer and subject"
+                            .to_string()
+                    } else {
+                        format!("you are {}", me.actor)
+                    };
+                    s.skip(id, format!("only {} may approve it ({who})", list.join(", ")));
                     continue;
                 }
                 _ => {}
@@ -425,7 +446,7 @@ impl Gates for LocalGates<'_> {
         &self.actor
     }
 
-    fn approver(&self) -> Option<&str> {
+    fn approver(&self) -> Option<&Caller> {
         None
     }
 
@@ -474,7 +495,7 @@ impl Gates for LocalGates<'_> {
 /// `info`, `gate list`, `gate show` and `gate resolve` are sent.
 struct RemoteGates<'a> {
     remote: &'a Remote,
-    actor: String,
+    caller: Caller,
 }
 
 impl<'a> RemoteGates<'a> {
@@ -487,7 +508,9 @@ impl<'a> RemoteGates<'a> {
             .map_err(|e| Error::Remote(format!("{}: unreadable answer to info: {e}", remote.url)))?;
         let actor = actor_of_info(&info)
             .ok_or_else(|| Error::Remote(format!("{}: the answer to info names no actor", remote.url)))?;
-        Ok(RemoteGates { remote, actor })
+        let oidc_approver = oidc_approver_of_info(&info)
+            .map_err(|e| Error::Remote(format!("{}: unreadable answer to info: {e}", remote.url)))?;
+        Ok(RemoteGates { remote, caller: Caller { actor, oidc_approver } })
     }
 
     fn unreadable(&self, what: &str, e: impl std::fmt::Display) -> Error {
@@ -513,6 +536,26 @@ pub(crate) fn actor_of_info(info: &Value) -> Option<String> {
         .or_else(|| info.get("actor").and_then(Value::as_str))
         .filter(|a| !a.is_empty())
         .map(String::from)
+}
+
+/// The identity reference the server matches the token's account by
+/// ([`gates::account_oidc_approver`]): `None` for a token with no account
+/// (absent or null) or a GitHub one; an error for an account that is not an
+/// object with non-empty `provider`, `issuer` and `subject` strings, so a
+/// malformed answer never falls back to matching the actor.
+pub(crate) fn oidc_approver_of_info(info: &Value) -> std::result::Result<Option<String>, String> {
+    let account = match info.get("token") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(t) => match t.get("account") {
+            None | Some(Value::Null) => return Ok(None),
+            Some(a) => a,
+        },
+    };
+    let field = |name: &str| account.get(name).and_then(Value::as_str).filter(|v| !v.is_empty());
+    match (field("provider"), field("issuer"), field("subject")) {
+        (Some(provider), Some(issuer), Some(subject)) => Ok(gates::account_oidc_approver(provider, issuer, subject)),
+        _ => Err("malformed token.account".to_string()),
+    }
 }
 
 /// The human gates of a `gate list --json` answer, each read strictly;
@@ -580,11 +623,11 @@ pub(crate) fn failure_of(r: &ExecResponse) -> Failure {
 
 impl Gates for RemoteGates<'_> {
     fn actor(&self) -> &str {
-        &self.actor
+        &self.caller.actor
     }
 
-    fn approver(&self) -> Option<&str> {
-        Some(&self.actor)
+    fn approver(&self) -> Option<&Caller> {
+        Some(&self.caller)
     }
 
     fn list(&mut self) -> Result<Vec<GateView>> {
@@ -683,7 +726,7 @@ mod tests {
 
     /// Scripted answers, counting each call.
     struct FakeGates {
-        approver: Option<String>,
+        approver: Option<Caller>,
         listed: Vec<GateView>,
         /// What `show` answers per id; a gate missing here is Missing.
         shows: std::collections::BTreeMap<String, VecDeque<Result<Shown>>>,
@@ -695,7 +738,7 @@ mod tests {
     impl FakeGates {
         fn new(approver: Option<&str>) -> FakeGates {
             FakeGates {
-                approver: approver.map(String::from),
+                approver: approver.map(|a| Caller { actor: a.into(), oidc_approver: None }),
                 listed: Vec::new(),
                 shows: Default::default(),
                 resolves: VecDeque::new(),
@@ -705,6 +748,12 @@ mod tests {
         }
 
         /// List `v` and show it as it is.
+        fn as_oidc(actor: &str, reference: &str) -> FakeGates {
+            let mut g = FakeGates::new(None);
+            g.approver = Some(Caller { actor: actor.into(), oidc_approver: Some(reference.into()) });
+            g
+        }
+
         fn with(mut self, v: GateView) -> FakeGates {
             self.listed.push(v.clone());
             self.shows_as(&v.id.clone(), v)
@@ -722,8 +771,8 @@ mod tests {
             "carol"
         }
 
-        fn approver(&self) -> Option<&str> {
-            self.approver.as_deref()
+        fn approver(&self) -> Option<&Caller> {
+            self.approver.as_ref()
         }
 
         fn list(&mut self) -> Result<Vec<GateView>> {
@@ -856,6 +905,83 @@ mod tests {
         let (s, shown) = run(&mut g, &[], "y\n");
         assert_eq!(s.unwrap().resolved.len(), 1);
         assert!(shown.contains("  approvers: github:alice (not checked in a local workspace)"), "{shown}");
+    }
+
+    #[test]
+    fn oidc_accounts_are_asked_only_about_their_own_reference() {
+        let reference = gates::oidc_approver("https://login.example.com", "248289761001");
+        let other = gates::oidc_approver("https://login.example.com", "248289761002");
+        let with = |id: &str, list: Vec<&str>| {
+            let mut g = human(id);
+            g.spec = Some(spec(GateKind::Human, Some(list)));
+            g
+        };
+        // Its own actor and an actor spelled as its reference are not its approvers.
+        let mut g = FakeGates::as_oidc("corp:alice", &reference)
+            .with(with("g-1", vec!["corp:alice"]))
+            .with(with("g-2", vec![&other]))
+            .with(with("g-3", vec!["carol", &reference]));
+        let (s, shown) = run(
+            &mut g,
+            &[],
+            "y
+",
+        );
+        let s = s.unwrap();
+        let skipped: Vec<_> = s.skipped.iter().map(|k| k.id.as_str()).collect();
+        assert_eq!(skipped, ["g-1", "g-2"]);
+        for k in &s.skipped {
+            assert!(k.reason.contains("matches only an oidc:sha256: identity reference"), "{}", k.reason);
+            assert!(!k.reason.contains(&reference), "the caller's reference is not shown: {}", k.reason);
+        }
+        assert_eq!(shown.matches("Resolve ").count(), 1, "{shown}");
+        assert!(shown.contains("Resolve g-3?"), "{shown}");
+        assert_eq!(g.resolved.len(), 1);
+
+        // An actor spelled as a reference matches nothing, nor does its sub-actor.
+        for actor in [reference.clone(), format!("{reference}/laptop")] {
+            let mut g = FakeGates::new(Some(&actor)).with(with("g-1", vec![&reference]));
+            let s = run(
+                &mut g,
+                &[],
+                "y
+",
+            )
+            .0
+            .unwrap();
+            assert_eq!(s.skipped.len(), 1, "{actor}");
+            assert!(g.resolved.is_empty(), "{actor}");
+        }
+    }
+
+    #[test]
+    fn the_account_of_the_info_answer_gives_the_reference() {
+        let account = |a: Value| json!({"actor": "corp:alice", "token": {"actor": "corp:alice", "account": a}});
+        assert_eq!(oidc_approver_of_info(&json!({"actor": "a"})), Ok(None), "no token");
+        assert_eq!(oidc_approver_of_info(&json!({"actor": "a", "token": null})), Ok(None));
+        assert_eq!(oidc_approver_of_info(&json!({"token": {"actor": "a"}})), Ok(None), "a manual token");
+        assert_eq!(oidc_approver_of_info(&account(Value::Null)), Ok(None));
+        let github = json!({"provider": "github", "issuer": "github.com", "subject": "583231", "login": "alice"});
+        assert_eq!(oidc_approver_of_info(&account(github)), Ok(None), "GitHub sign-ins match by actor");
+        let acme = json!({"provider": "acme", "issuer": "https://login.example.com", "subject": "248289761001",
+                          "login": "alice"});
+        assert_eq!(
+            oidc_approver_of_info(&account(acme)),
+            Ok(Some(gates::oidc_approver("https://login.example.com", "248289761001")))
+        );
+        for bad in [
+            json!("acme"),
+            json!([]),
+            json!({"provider": "acme", "subject": "1"}),
+            json!({"provider": "acme", "issuer": "https://login.example.com"}),
+            json!({"issuer": "https://login.example.com", "subject": "1"}),
+            json!({"provider": "acme", "issuer": "https://login.example.com", "subject": 1}),
+            json!({"provider": "acme", "issuer": null, "subject": "1"}),
+            json!({"provider": "acme", "issuer": "https://login.example.com", "subject": ""}),
+            json!({"provider": "", "issuer": "https://login.example.com", "subject": "1"}),
+        ] {
+            assert!(oidc_approver_of_info(&account(bad.clone())).is_err(), "{bad}");
+        }
     }
 
     #[test]

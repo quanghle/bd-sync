@@ -941,6 +941,8 @@ impl Server {
         app.location = request.location;
         app.request = key;
         // What the token may override: admin-only commands, other actors' claims, human gates.
+        // A tool call loses the rights but keeps the account's identity, which
+        // only ever narrows what approves.
         let mut policy = token.policy();
         if request.tool_call {
             policy.admin = false;
@@ -955,6 +957,7 @@ impl Server {
             human: policy.human,
             token_actor: policy.actor,
             max_claims: policy.max_claims,
+            oidc_approver: policy.oidc_approver,
             token: Some(token.summary()),
             approvals: self.approval_base(&ws.name),
             ..Capture::new(Box::new(out.clone()))

@@ -43,10 +43,17 @@
 //!   A playbook run or group whose last open step closes is refused too when
 //!   a human gate holds it. An import may not do any of that either.
 //! * **Approvers** narrow that further: a human gate whose
-//!   `metadata.gate.approvers` names actors ([`crate::gates::approvers_of`])
-//!   is shut, on every path above, to a person who is not one of them or a
-//!   sub-actor of one ([`approves`], ignoring ASCII case), admins included.
-//!   A list stored invalid matches nobody. Changing an open human gate's
+//!   `metadata.gate.approvers` names actors or OIDC identity references
+//!   ([`crate::gates::approvers_of`]) is shut, on every path above, to a
+//!   person it does not name ([`approved_by`]), admins included. A caller
+//!   signed in with an OIDC provider ([`Policy::oidc_approver`]) matches
+//!   only the reference of its own issuer and subject
+//!   ([`crate::gates::oidc_approver`]), never an actor: the actor an OIDC
+//!   account acts as is bound at its first sign-in from its login, which
+//!   proves nothing about who it is. Any other caller matches an actor
+//!   approver or a sub-actor of one ([`approves`], ignoring ASCII case),
+//!   and never a reference, however its actor is spelled. A list stored
+//!   invalid matches nobody. Changing an open human gate's
 //!   approvers (by update, `bd gate update` or import) needs a person who may
 //!   open it, or a human admin ([`may_edit_approvers`]), which is how an
 //!   invalid list is repaired. Without a policy approvers are informational.
@@ -92,6 +99,12 @@ pub struct Policy {
     /// The most issues the actor and its sub-actors may hold, claimed or
     /// reserved; `None` for no limit.
     pub max_claims: Option<u32>,
+    /// The canonical identity reference ([`crate::gates::oidc_approver`]) of
+    /// the verified OIDC account behind the caller, set only by `bd serve`
+    /// from an authenticated token's account or a browser sign-in, never
+    /// from what a request says. With one, the caller matches only gate
+    /// approvers equal to it ([`approved_by`]). `None` by default.
+    pub oidc_approver: Option<String>,
 }
 
 /// Issues `actor` and its sub-actors hold: assigned to one of them, and not
@@ -123,9 +136,10 @@ pub fn is_actor_or_sub_actor(root: &str, actor: &str) -> bool {
 }
 
 /// Whether `actor` is `approver` or one of its sub-actors
-/// (`<approver>/<name>`), ignoring ASCII case.
+/// (`<approver>/<name>`), ignoring ASCII case. An OIDC identity reference
+/// ([`gates::is_oidc_reference`], any spelling) is never matched by an actor.
 pub fn approves(approver: &str, actor: &str) -> bool {
-    if approver.is_empty() {
+    if approver.is_empty() || gates::is_oidc_reference(approver) {
         return false;
     }
     if approver.eq_ignore_ascii_case(actor) {
@@ -135,11 +149,26 @@ pub fn approves(approver: &str, actor: &str) -> bool {
         && actor[approver.len()..].strip_prefix('/').is_some_and(|rest| !rest.trim().is_empty())
 }
 
+/// Whether a caller acting as `actor`, with the verified OIDC identity
+/// reference `oidc_approver` when it signed in with an OIDC provider, is
+/// one of `approvers`. With a reference, only an approver equal to it
+/// counts (a malformed one matches nothing), never an actor; without one,
+/// an actor approver or a sub-actor of one ([`approves`]). The one rule
+/// every approval uses: the engine's ([`may_open`]), the browser's and
+/// `bd gate review`'s.
+pub fn approved_by(approvers: &[String], actor: &str, oidc_approver: Option<&str>) -> bool {
+    match oidc_approver {
+        Some(r) => gates::oidc_reference_ok(r) && approvers.iter().any(|a| a == r),
+        None => approvers.iter().any(|a| approves(a, actor)),
+    }
+}
+
 /// Whether `policy` may open human gate `gate`: a person, and one of its
-/// approvers (or a sub-actor of one) when it has any. A list stored invalid
+/// approvers ([`approved_by`]) when it has any. A list stored invalid
 /// reads as empty and matches nobody.
 pub fn may_open(policy: &Policy, gate: &Issue) -> bool {
-    policy.human && gates::approvers_of(gate).is_none_or(|l| l.iter().any(|a| approves(a, &policy.actor)))
+    policy.human
+        && gates::approvers_of(gate).is_none_or(|l| approved_by(&l, &policy.actor, policy.oidc_approver.as_deref()))
 }
 
 /// Whether `policy` may change the approvers of open human gate `gate`: a
@@ -294,7 +323,7 @@ fn human_only(id: &str, hold: &Hold, what: &str) -> Error {
 
 /// The refusal for a person who is not one of `approvers` (the gate's, as
 /// [`gates::approvers_of`] reads them): the shapes of [`human_only`].
-fn approvers_only(id: &str, hold: &Hold, what: &str, approvers: &[String], actor: &str) -> Error {
+fn approvers_only(id: &str, hold: &Hold, what: &str, approvers: &[String], policy: &Policy) -> Error {
     const FIX: &str = "a human admin can replace or clear them with bd gate update";
     let Some((last, rest)) = approvers.split_last() else {
         return Error::Unauthorized(match hold {
@@ -310,14 +339,23 @@ fn approvers_only(id: &str, hold: &Hold, what: &str, approvers: &[String], actor
         });
     };
     let who = if rest.is_empty() { last.clone() } else { format!("{} or {last}", rest.join(", ")) };
+    let actor = &policy.actor;
+    // The caller's own reference is never printed.
+    let note = if policy.oidc_approver.is_some() {
+        "; an account signed in with an OIDC provider matches only an oidc:sha256: identity reference for its own \
+         issuer and subject"
+    } else {
+        ""
+    };
     Error::Unauthorized(match hold {
-        Hold::Is => format!("{id} is a human gate: only {who} can {what} ({actor} is not an approver)"),
+        Hold::Is => format!("{id} is a human gate: only {who} can {what} ({actor} is not an approver{note})"),
         Hold::HeldBy(g) => format!(
-            "{id} waits for human gate {g}: only {who} can {what} before {g} is resolved ({actor} is not an approver)"
+            "{id} waits for human gate {g}: only {who} can {what} before {g} is resolved ({actor} is not an \
+             approver{note})"
         ),
         Hold::Contains(g) => format!(
             "{id} holds work that waits for human gate {g}: only {who} can {what} before {g} is resolved \
-             ({actor} is not an approver)"
+             ({actor} is not an approver{note})"
         ),
     })
 }
@@ -327,7 +365,7 @@ fn approvers_only(id: &str, hold: &Hold, what: &str, approvers: &[String], actor
 /// approvers are ([`approvers_only`]).
 fn gate_refusal_for(policy: Option<&Policy>, id: &str, hold: &Hold, what: &str, gate: Option<&Issue>) -> Error {
     match policy.filter(|p| p.human).zip(gate.and_then(gates::approvers_of)) {
-        Some((p, approvers)) => approvers_only(id, hold, what, &approvers, &p.actor),
+        Some((p, approvers)) => approvers_only(id, hold, what, &approvers, p),
         None => human_only(id, hold, what),
     }
 }
@@ -817,6 +855,89 @@ mod tests {
             assert!(!approves(approver, actor), "{approver} {actor}");
         }
         assert!(!approves("a", "\u{e9}/x"), "no panic off a char boundary");
+    }
+
+    #[test]
+    fn actors_never_match_identity_references() {
+        let r = gates::oidc_approver("https://login.example.com", "248289761001");
+        let upper = r.to_ascii_uppercase();
+        let mixed = format!("OIDC:SHA256:{}", &r[gates::OIDC_APPROVER_PREFIX.len()..]);
+        for approver in [r.as_str(), upper.as_str(), mixed.as_str(), "oidc:sha256:", "Oidc:Sha256:x"] {
+            for actor in [approver.to_string(), approver.to_ascii_lowercase(), format!("{approver}/x")] {
+                assert!(!approves(approver, &actor), "{approver} {actor}");
+            }
+        }
+        assert!(approves("oidc:sha25", "oidc:sha25"), "only the whole prefix is reserved");
+    }
+
+    #[test]
+    fn verified_references_and_actors_each_match_only_their_own_approvers() {
+        let iss = "https://login.example.com";
+        let r = gates::oidc_approver(iss, "248289761001");
+        let list = |l: &[&str]| l.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let legacy = list(&["corp:alice"]);
+        assert!(!approved_by(&legacy, "corp:alice", Some(&r)), "an OIDC caller never matches an actor");
+        assert!(!approved_by(&legacy, "corp:alice/laptop", Some(&r)));
+        assert!(approved_by(&legacy, "corp:alice", None));
+        assert!(approved_by(&legacy, "corp:alice/laptop", None));
+        let refs = list(&[&r]);
+        assert!(!approved_by(&refs, &r, None), "an actor spelled as the reference");
+        assert!(!approved_by(&refs, &format!("{r}/x"), None));
+        assert!(!approved_by(&refs, &r.to_ascii_uppercase(), None));
+        for actor in ["corp:alice", "anyone", ""] {
+            assert!(approved_by(&refs, actor, Some(&r)), "the right reference under {actor:?}");
+        }
+        for other in [
+            gates::oidc_approver("https://login.example.org", "248289761001"),
+            gates::oidc_approver(&format!("{iss}/"), "248289761001"),
+            gates::oidc_approver(iss, "248289761002"),
+            gates::oidc_approver(iss, "Alice"),
+        ] {
+            assert!(!approved_by(&refs, "corp:alice", Some(&other)), "{other}");
+        }
+        let case = list(&[&gates::oidc_approver(iss, "alice")]);
+        assert!(!approved_by(&case, "corp:alice", Some(&gates::oidc_approver(iss, "Alice"))), "subjects keep case");
+        let mixed = list(&["carol", &r]);
+        assert!(approved_by(&mixed, "carol", None));
+        assert!(approved_by(&mixed, "carol/laptop", None));
+        assert!(!approved_by(&mixed, "carol", Some(&gates::oidc_approver(iss, "carol"))));
+        assert!(approved_by(&mixed, "dave", Some(&r)));
+        assert!(!approved_by(&mixed, "dave", None));
+        for bad in
+            [r.to_ascii_uppercase(), r[..r.len() - 1].to_string(), format!("{r}0"), String::new(), "carol".into()]
+        {
+            let stored = list(&[&bad, "carol"]);
+            assert!(!approved_by(&stored, "carol", Some(&bad)), "a malformed reference matches nothing: {bad:?}");
+        }
+        assert!(!approved_by(&[], "carol", Some(&r)));
+        assert!(!approved_by(&[], "carol", None));
+    }
+
+    #[test]
+    fn only_people_open_gates_and_by_the_shared_rule() {
+        let r = gates::oidc_approver("https://login.example.com", "248289761001");
+        let gate = |approvers: &[&str]| -> Issue {
+            serde_json::from_value(serde_json::json!({
+                "id": "t-1", "title": "Approve", "status": "open", "priority": 2, "issue_type": "gate",
+                "metadata": { "gate": { "type": "human", "approvers": approvers } }, "created_at": 0, "updated_at": 0,
+            }))
+            .unwrap()
+        };
+        let person = |actor: &str, oidc: Option<&str>| Policy {
+            actor: actor.into(),
+            human: true,
+            oidc_approver: oidc.map(String::from),
+            ..Default::default()
+        };
+        assert!(may_open(&person("corp:alice", Some(&r)), &gate(&[&r])));
+        assert!(!may_open(&person("corp:alice", Some(&r)), &gate(&["corp:alice"])));
+        assert!(may_open(&person("corp:alice", None), &gate(&["corp:alice"])));
+        assert!(!may_open(&person(&r, None), &gate(&[&r])));
+        let agent = Policy { human: false, ..person("corp:alice", Some(&r)) };
+        assert!(!may_open(&agent, &gate(&[&r])), "a policy that is not a person's");
+        let admin = Policy { admin: true, ..person("ops", Some(&gates::oidc_approver("https://x.example", "1"))) };
+        assert!(!may_open(&admin, &gate(&[&r])), "admins are not implicit approvers");
+        assert!(may_edit_approvers(&admin, &gate(&[&r])), "but may replace the list");
     }
 
     #[test]

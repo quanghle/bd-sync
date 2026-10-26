@@ -15,15 +15,15 @@ use tempfile::TempDir;
 const T0: i64 = 1_700_000_000_000;
 
 fn agent(actor: &str) -> Option<Policy> {
-    Some(Policy { actor: actor.into(), admin: false, human: false, max_claims: None })
+    Some(Policy { actor: actor.into(), admin: false, human: false, max_claims: None, oidc_approver: None })
 }
 
 fn admin_agent(actor: &str) -> Option<Policy> {
-    Some(Policy { actor: actor.into(), admin: true, human: false, max_claims: None })
+    Some(Policy { actor: actor.into(), admin: true, human: false, max_claims: None, oidc_approver: None })
 }
 
 fn person(actor: &str) -> Option<Policy> {
-    Some(Policy { actor: actor.into(), admin: false, human: true, max_claims: None })
+    Some(Policy { actor: actor.into(), admin: false, human: true, max_claims: None, oidc_approver: None })
 }
 
 struct Env {
@@ -1318,7 +1318,12 @@ fn gate_approvers_are_set_replaced_and_cleared_as_stored() {
 }
 
 fn human_admin(actor: &str) -> Option<Policy> {
-    Some(Policy { actor: actor.into(), admin: true, human: true, max_claims: None })
+    Some(Policy { actor: actor.into(), admin: true, human: true, max_claims: None, oidc_approver: None })
+}
+
+/// A person acting as `actor`, signed in with the OIDC account `sub` of `iss`.
+fn oidc_person(actor: &str, iss: &str, sub: &str) -> Option<Policy> {
+    Some(Policy { oidc_approver: Some(gates::oidc_approver(iss, sub)), ..person(actor).unwrap() })
 }
 
 /// A human gate approved by carol only, the task it blocks, a container of
@@ -1333,6 +1338,11 @@ struct Approved {
 }
 
 fn approved_fixture() -> Approved {
+    approved_fixture_with(vec!["carol".into()])
+}
+
+/// [`approved_fixture`] with the gate approved by `approvers` instead.
+fn approved_fixture_with(approvers: Vec<String>) -> Approved {
     let mut env = Env::new();
     let container = env
         .as_("alice", None, |tx| {
@@ -1341,7 +1351,7 @@ fn approved_fixture() -> Approved {
         .unwrap()
         .id;
     let task = child(&mut env, "alice", None, &container, NewIssue::titled("Deploy"));
-    let spec = GateSpec { approvers: Some(vec!["carol".into()]), ..GateSpec::new(GateKind::Human) };
+    let spec = GateSpec { approvers: Some(approvers.clone()), ..GateSpec::new(GateKind::Human) };
     let gate = env
         .as_("alice", None, |tx| {
             tx.create_gate(NewGate {
@@ -1366,7 +1376,7 @@ fn approved_fixture() -> Approved {
     set_role(&mut env, &run, "run");
     let step =
         child(&mut env, "alice", None, &run, NewIssue { status: Some(Status::Pinned), ..NewIssue::titled("Step") });
-    assert_eq!(gates::approvers_of(&env.issue(&gate)), Some(vec!["carol".to_string()]));
+    assert_eq!(gates::approvers_of(&env.issue(&gate)), Some(approvers));
     Approved { env, container, task, gate, run, step }
 }
 
@@ -1563,5 +1573,120 @@ fn invalid_approvers_match_nobody_through_a_policy() {
     let mut fx = approved_fixture();
     let g = fx.gate.clone();
     fx.env.as_("dave", None, |tx| tx.resolve_gate(&g, None, false, None)).expect("informational locally");
+    fx.env.assert_healthy();
+}
+
+const ISS: &str = "https://login.example.com";
+const SUB: &str = "00uAbC248289761001";
+
+#[test]
+fn oidc_references_alone_get_past_their_gates_on_every_path() {
+    let r = gates::oidc_approver(ISS, SUB);
+    let wrong_admin = Policy { admin: true, ..oidc_person("ops", ISS, "00uOps1").unwrap() };
+    let agent_with_ref = Policy { human: false, ..oidc_person("corp:alice", ISS, SUB).unwrap() };
+    let sub_r = format!("{r}/laptop");
+    let refused: Vec<(&str, &str, Option<Policy>)> = vec![
+        ("a wrong subject", "corp:alice", oidc_person("corp:alice", ISS, "00uAbC248289761002")),
+        ("a wrong issuer", "corp:alice", oidc_person("corp:alice", "https://login.example.org", SUB)),
+        ("an issuer with a trailing slash", "corp:alice", oidc_person("corp:alice", &format!("{ISS}/"), SUB)),
+        ("a case-variant subject", "corp:alice", oidc_person("corp:alice", ISS, &SUB.to_ascii_lowercase())),
+        ("an actor spelled as the reference", &r, person(&r)),
+        ("a sub-actor of the reference", &sub_r, person(&sub_r)),
+        ("a human admin with another identity", "ops", Some(wrong_admin)),
+        ("an agent holding the reference", "corp:alice", Some(agent_with_ref)),
+    ];
+    for (name, path) in approver_paths() {
+        for (who, actor, policy) in &refused {
+            if *who == "a human admin with another identity" && name == "import changing its approvers" {
+                // The explicit approver change stays a human admin's.
+                let mut fx = approved_fixture_with(vec![r.clone()]);
+                path(&mut fx, actor, policy.clone()).unwrap_or_else(|e| panic!("{name} by {who}: {e}"));
+                continue;
+            }
+            let mut fx = approved_fixture_with(vec![r.clone()]);
+            match path(&mut fx, actor, policy.clone()) {
+                Err(e) if is_refusal(&e) => assert!(e.to_string().contains(&fx.gate), "{name} by {who}: {e}"),
+                other => panic!("{name}: expected {who} to be refused, got {other:?}"),
+            }
+            assert_eq!(fx.env.issue(&fx.gate).status, Status::Open, "{name} by {who}");
+            assert_eq!(gates::approvers_of(&fx.env.issue(&fx.gate)), Some(vec![r.clone()]), "{name} by {who}");
+        }
+        for actor in ["corp:alice", "acme:bob2", "someone/laptop"] {
+            let mut fx = approved_fixture_with(vec![r.clone()]);
+            path(&mut fx, actor, oidc_person(actor, ISS, SUB)).unwrap_or_else(|e| panic!("{name} as {actor}: {e}"));
+        }
+        let mut fx = approved_fixture_with(vec![r.clone()]);
+        path(&mut fx, "alice", None).unwrap_or_else(|e| panic!("{name} without a policy: {e}"));
+    }
+    let mut fx = approved_fixture_with(vec![r.clone()]);
+    let g = fx.gate.clone();
+    let e = denied(
+        fx.env.as_("corp:alice", oidc_person("corp:alice", ISS, "other"), |tx| tx.resolve_gate(&g, None, false, None)),
+        "matches only an oidc:sha256: identity reference",
+    );
+    assert!(!e.to_string().contains(&gates::oidc_approver(ISS, "other")), "the caller's reference is not printed: {e}");
+    fx.env.as_("corp:alice", oidc_person("corp:alice", ISS, SUB), |tx| tx.resolve_gate(&g, None, false, None)).unwrap();
+    assert_eq!(closed_event(&fx.env, &g)["reason"], "resolved by corp:alice", "the audit actor is unchanged");
+    assert!(!fx.env.issue(&fx.task).is_blocked);
+    fx.env.assert_healthy();
+}
+
+#[test]
+fn oidc_callers_never_match_actor_approvers() {
+    for (name, path) in approver_paths() {
+        // A legacy list naming the actor an OIDC account was bound to at its first sign-in.
+        let mut fx = approved_fixture_with(vec!["corp:alice".into()]);
+        match path(&mut fx, "corp:alice", oidc_person("corp:alice", ISS, SUB)) {
+            Err(e) if is_refusal(&e) => {}
+            other => panic!("{name}: expected the OIDC caller to be refused, got {other:?}"),
+        }
+        assert_eq!(fx.env.issue(&fx.gate).status, Status::Open, "{name}");
+        let sub = "corp:alice/laptop";
+        let mut fx = approved_fixture_with(vec!["corp:alice".into()]);
+        assert!(path(&mut fx, sub, oidc_person(sub, ISS, SUB)).is_err(), "{name}: an OIDC sub-actor");
+        for actor in ["corp:alice", "corp:alice/laptop"] {
+            let mut fx = approved_fixture_with(vec!["corp:alice".into()]);
+            path(&mut fx, actor, person(actor)).unwrap_or_else(|e| panic!("{name} as {actor}: {e}"));
+        }
+    }
+    // A mixed list: each caller matches through its own kind of approver only.
+    let r = gates::oidc_approver(ISS, SUB);
+    let mixed = vec!["carol".to_string(), r.clone()];
+    for (actor, policy, ok) in [
+        ("carol", person("carol"), true),
+        ("carol/laptop", person("carol/laptop"), true),
+        ("carol", oidc_person("carol", ISS, "00uCarol"), false),
+        ("dave", oidc_person("dave", ISS, SUB), true),
+        ("dave", person("dave"), false),
+        (r.as_str(), person(&r), false),
+    ] {
+        let mut fx = approved_fixture_with(mixed.clone());
+        let g = fx.gate.clone();
+        let res = fx.env.as_(actor, policy.clone(), |tx| tx.resolve_gate(&g, None, false, None));
+        assert_eq!(res.is_ok(), ok, "{actor} {policy:?}: {res:?}");
+        let want = if ok { Status::Closed } else { Status::Open };
+        assert_eq!(fx.env.issue(&g).status, want, "{actor}");
+    }
+}
+
+#[test]
+fn a_human_admin_replaces_legacy_lists_with_references() {
+    let r = gates::oidc_approver(ISS, SUB);
+    let mut fx = approved_fixture_with(vec!["corp:alice".into()]);
+    let g = fx.gate.clone();
+    let admin = Some(Policy { admin: true, ..oidc_person("ops", ISS, "00uOps1").unwrap() });
+    denied(fx.env.as_("ops", admin.clone(), |tx| tx.resolve_gate(&g, None, false, None)), "only corp:alice");
+    let alice = || oidc_person("corp:alice", ISS, SUB);
+    denied(fx.env.as_("corp:alice", alice(), |tx| tx.resolve_gate(&g, None, false, None)), "not an approver");
+    fx.env.as_("ops", admin.clone(), |tx| tx.set_gate_approvers(&g, Some(vec![r.clone()]))).unwrap();
+    assert_eq!(fx.env.issue(&g).metadata["gate"]["approvers"], json!([r]));
+    denied(fx.env.as_("ops", admin, |tx| tx.resolve_gate(&g, None, false, None)), "not an approver");
+    fx.env.as_("corp:alice", alice(), |tx| tx.resolve_gate(&g, None, false, None)).unwrap();
+    assert_eq!(fx.env.issue(&g).status, Status::Closed);
+    assert!(!fx.env.issue(&fx.task).is_blocked);
+
+    let mut fx = approved_fixture_with(vec![r.clone()]);
+    let g = fx.gate.clone();
+    fx.env.as_("alice", None, |tx| tx.resolve_gate(&g, None, false, None)).expect("informational locally");
     fx.env.assert_healthy();
 }

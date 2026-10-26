@@ -1786,6 +1786,78 @@ fn gate_approvers_are_set_shown_updated_and_repaired() {
         2
     );
 
+    // OIDC accounts are stored only as their identity references.
+    let (iss, sub) = ("https://login.example.com", "248289761001");
+    let reference = bd_core::gates::oidc_approver(iss, sub);
+    assert!(
+        reference
+            .strip_prefix("oidc:sha256:")
+            .is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+        "{reference}"
+    );
+    let no_raw = |text: &str| !text.contains(sub) && !text.contains("login.example.com");
+    let create = |extra: &[&str]| {
+        let mut argv = vec!["gate", "create", "-t", "human", "--blocks", work.as_str()];
+        argv.extend_from_slice(extra);
+        ws.run_as("tester", &argv)
+    };
+    let out = create(&["--approver", "carol", "--oidc-approver", iss, sub, "--oidc-approver", iss, sub]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(&format!("  approvers carol, {reference}\n")), "{text}");
+    assert!(no_raw(&text), "{text}");
+    let oidc_gate = text.split_whitespace().nth(3).unwrap().trim_end_matches(':').to_string();
+    assert_eq!(ws.json(&["gate", "show", &oidc_gate])["spec"]["approvers"], serde_json::json!(["carol", reference]));
+    let created = ws.json(&["gate", "create", "-t", "human", "--blocks", &work, "--oidc-approver", iss, sub]);
+    assert_eq!(created["spec"]["approvers"], serde_json::json!([reference]), "the same pair, the same reference");
+    let plain = ws.ok(&["gate", "create", "-t", "human", "--blocks", &work]);
+    assert!(!plain.contains("approvers"), "{plain}");
+
+    let other = bd_core::gates::oidc_approver(iss, "00uAbC248289761001");
+    let out = ws.run_as(
+        "tester",
+        &["gate", "update", &oidc_gate, "--approver", "dave", "--oidc-approver", iss, "00uAbC248289761001"],
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains(&format!("approvers dave, {other}")), "{text}");
+    assert!(!text.contains("00uAbC248289761001") && no_raw(&text), "{text}");
+    assert_eq!(ws.json(&["gate", "show", &oidc_gate])["spec"]["approvers"], serde_json::json!(["dave", other]));
+    let only = ws.json(&["gate", "update", &oidc_gate, "--oidc-approver", iss, sub]);
+    assert_eq!(only["spec"]["approvers"], serde_json::json!([reference]));
+
+    for (bad_iss, bad_sub, secret) in [
+        ("", "subject-secret-1", "subject-secret-1"),
+        ("https://issuer secret.example.com", "s", "issuer secret"),
+        ("https://issuer-secret.example.com", "subject-secret-2\u{7}x", "subject-secret-2"),
+        ("https://issuer-blank.example.com", "   ", "issuer-blank"),
+    ] {
+        for argv in [
+            vec!["gate", "create", "-t", "human", "--blocks", work.as_str(), "--oidc-approver", bad_iss, bad_sub],
+            vec!["gate", "update", oidc_gate.as_str(), "--oidc-approver", bad_iss, bad_sub],
+        ] {
+            let out = ws.run_as("tester", &argv);
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{argv:?}: {err}");
+            assert!(!err.contains(secret), "{err}");
+        }
+    }
+    let many: Vec<String> = (0..31).map(|i| format!("a{i}")).collect();
+    let many = many.join(",");
+    assert_eq!(
+        create(&["--approver", &many, "--oidc-approver", iss, sub, "--oidc-approver", iss, "other"]).status.code(),
+        Some(2),
+        "33 approvers in all"
+    );
+    assert_eq!(create(&["--approver", &many, "--oidc-approver", iss, sub]).status.code(), Some(0), "32 in all");
+    let spelled = reference.to_uppercase();
+    assert_eq!(create(&["--approver", &spelled]).status.code(), Some(2));
+    assert_eq!(ws.code_as("tester", &["gate", "update", &oidc_gate, "--approver", &spelled]), 2);
+    assert_eq!(
+        ws.code_as("tester", &["gate", "update", &oidc_gate, "--oidc-approver", iss, sub, "--clear-approvers"]),
+        2
+    );
+
     let updated = ws.json(&["gate", "update", &gate, "--approver", "carol"]);
     assert_eq!(updated["spec"]["approvers"], serde_json::json!(["carol"]));
     assert!(

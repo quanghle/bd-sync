@@ -2071,7 +2071,7 @@ fn rename_prefix_needs_an_admin_policy() {
     let mut env = Env::new();
     env.create("One", 1);
     let o = RenamePrefixOptions { to: "new".into(), from: None };
-    let policy = |admin| Policy { actor: "alice".into(), admin, human: false, max_claims: None };
+    let policy = |admin| Policy { actor: "alice".into(), admin, human: false, max_claims: None, oidc_approver: None };
     let err = env
         .store
         .write("rename-prefix", "alice", |tx| {

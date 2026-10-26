@@ -324,6 +324,7 @@ bd gate check [IDS] [--dry-run] [--type all|gh|local|<type>]
 bd gate resolve t-12.gate-publish -r "approved"   # --force: before it armed
 bd gate create -t gh:pr --await-id 42 --blocks t-7
 bd gate create -t human --blocks t-8 --approver github:alice,github:bob
+bd gate create -t human --blocks t-8 --oidc-approver https://login.example.com 248289761001
 bd gate update t-12.gate-publish --approver github:carol   # replace the approvers
 bd gate update t-12.gate-publish --clear-approvers        # anyone with a human token again
 bd gate create -t gh:run --await-id release.yml --branch v1.2.0 --event push --blocks t-9
@@ -402,8 +403,13 @@ prerequisites is skipped too, and counted.
   server's human and approver checks back it.
 - **Remotely it sends only the person's keychain token** ([Person's token
   in the keychain](remote.md#persons-token-in-the-keychain)) and skips
-  gates whose [approvers](#approvers) do not name its actor (or are not
-  valid). Locally approvers are shown, marked not checked.
+  gates whose [approvers](#approvers) do not match the token (or are not
+  valid), by the server's rule: an account signed in with an OIDC
+  provider matches only the identity reference of its issuer and subject,
+  read from the token's account in the `info` answer, and any other token
+  matches by actor. An `info` answer whose account cannot be read stops
+  the review before any gate (exit 8), with no fallback to the actor.
+  Locally approvers are shown, marked not checked.
 - **Summary** on stdout: `Resolved N, declined M, skipped K`, with `not
   asked`, `failed` and `N waiting for their work's prerequisites` when
   there are any, then a line per gate resolved, skipped or failed; or `No
@@ -422,7 +428,8 @@ prerequisites is skipped too, and counted.
 
 ### Approvers
 
-A human gate may name who may open it:
+A human gate may name who may open it: actors, and accounts of OIDC
+providers named by an [identity reference](#oidc-identity-references).
 
 ```toml
 [steps.gate]
@@ -431,37 +438,110 @@ approvers = ["github:alice", "{{reviewer}}"]   # templated like other gate field
 ```
 
 or `bd gate create -t human --approver <actor>` (repeatable, or comma
-separated), and `bd gate update <id> --approver <actor>` (replacing the
-list) or `--clear-approvers` on an open gate. Approvers apply to human
-gates only. A list holds 1 to 32 actors, each trimmed, at most 255
-characters, with no control characters, no `,`, and no `/` at either end;
-a later entry equal to an earlier one ignoring ASCII case is dropped, and
-any other bad entry (or a template that renders blank) is refused with
-exit 2. `bd gate show` and `bd gate list` show them (`human by
-github:alice or github:bob`), in text and in JSON (`spec.approvers`, `[]` for a stored list that is
-not valid).
+separated) and `--oidc-approver <issuer> <subject>`, and `bd gate update
+<id>` with either or both flags (replacing the list) or
+`--clear-approvers` on an open gate. Approvers apply to human gates only.
+A list holds 1 to 32 entries, each trimmed, at most 255 characters, with
+no control characters, no `,`, and no `/` at either end; a later entry
+equal to an earlier one ignoring ASCII case is dropped, and any other bad
+entry (or a template that renders blank) is refused with exit 2. `bd gate
+show` and `bd gate list` show them (`human by github:alice or
+github:bob`), in text and in JSON (`spec.approvers`, `[]` for a stored
+list that is not valid).
 
 An approver `github:alice` matches the actor `github:alice` and its
-sub-actors (`github:alice/laptop`), ignoring ASCII case. A signed-in
-person acts as `<provider>:<login>` ([Accounts and
-actors](sign-in.md#accounts-and-actors)).
+sub-actors (`github:alice/laptop`), ignoring ASCII case, for tokens an
+admin created and for GitHub sign-ins. A signed-in person acts as
+`<provider>:<login>` ([Accounts and
+actors](sign-in.md#accounts-and-actors)). An account signed in with an
+OIDC provider (its token, the same token after a refresh, or a browser
+approval) matches only the identity reference of its own issuer and
+subject, by exact equality, and never an actor: not the actor bound to
+the account at its first sign-in, not an actor shared with a linked
+account, and not a sub-actor of either. No actor matches an identity
+reference, however spelled. The login and the bound actor are not
+identity proof ([Approvers and OIDC
+accounts](sign-in.md#approvers-and-oidc-accounts)).
 
 - **Locally** approvers are informational: anyone may resolve the gate,
   as with human gates themselves.
-- **Through `bd serve`** only a human token of an approver, or of a
-  sub-actor of one, opens the gate or moves the work it holds back past it,
-  on every path a human token is needed for ([Roles and what tokens may
-  do](remote.md#roles-and-what-tokens-may-do)); an admin is no exception.
-  Changing the approvers of an open human gate (`bd gate update`, `bd
-  update --set-metadata`, an import) needs a human token of one of its
-  approvers (of any person, when it has none) or a human admin's; agent
-  tokens never may.
+- **Through `bd serve`** only a human token that matches an approver
+  opens the gate or moves the work it holds back past it, on every path a
+  human token is needed for ([Roles and what tokens may
+  do](remote.md#roles-and-what-tokens-may-do)), in batches, playbooks and
+  imports too; an admin is no exception. A [browser
+  approval](sign-in.md#approving-human-gates-in-the-browser) follows the
+  same rule. Changing the approvers of an open human gate (`bd gate
+  update`, `bd update --set-metadata`, an import) needs a human token
+  that matches one of its approvers (of any person, when it has none) or
+  a human admin's; agent tokens never may.
 - **A stored list that is not valid** (written by hand with `bd update
-  --set-metadata`, say) does not change the gate's condition, but matches
-  nobody: through `bd serve` nobody may open the gate until a human admin
+  --set-metadata`, say, or holding an `oidc:sha256:` entry that is not
+  canonical) does not change the gate's condition, but matches nobody:
+  through `bd serve` nobody may open the gate until a human admin
   replaces or clears it with `bd gate update`. `bd gate show` says so.
   `bd playbook extract` refuses a step held by a gate with such a list
   until it is fixed, rather than write the step without its gate.
+- **Lists naming OIDC accounts by actor** (`corp:alice` for an account of
+  the OIDC provider `corp`), as written before identity references
+  existed, fail closed: no OIDC account matches such a list any longer,
+  and bd converts nothing. A human allowed to change the list (a human
+  admin, or an approver whose token still matches) replaces the actor
+  with the account's reference.
+
+#### OIDC identity references
+
+An identity reference names one account of an OIDC provider by the
+issuer and subject (`sub`) of its ID tokens:
+
+```text
+oidc:sha256:<64 lowercase hex digits>
+```
+
+The digits are the SHA-256 of the bytes `bd:oidc-approver:v1` and a zero
+byte, then the issuer and then the subject, each as its length in bytes
+(8 bytes, big-endian) followed by its exact UTF-8 bytes. Nothing is
+normalized: a different case, a trailing `/` on the issuer or spaces
+around the subject give another reference, naming another account or
+none.
+Neither the provider's name in `auth.toml`, the login nor the actor goes
+into the digest. The prefix `oidc:sha256:` is reserved in any ASCII case:
+an entry under it that is not exactly this shape (uppercase hex, 63 or 65
+digits, a suffix such as `/laptop`) is refused with exit 2 and never read
+as an actor, and a stored list holding one matches nobody.
+
+`--oidc-approver ISSUER SUBJECT` computes the reference on `bd gate
+create` and `bd gate update`:
+
+- Each occurrence takes exactly two values, taken verbatim: never split
+  at `,`, never trimmed, and a subject may start with `-`. The flag may
+  be repeated.
+- The issuer has 1 to 4096 bytes with no whitespace or control
+  characters; the subject has 1 to 255 bytes with no control characters
+  and is not all whitespace.
+- The list is the `--approver` entries in order, then the references in
+  order, and the limit of 32 counts both. `--oidc-approver` cannot be
+  combined with `--clear-approvers`.
+- Errors never repeat the issuer or subject, and the commands print only
+  the stored list (an `approvers` line in text), so references appear
+  and the raw issuer and subject do not.
+
+A playbook names no issuer or subject: its `approvers` take the
+canonical reference as a string, a literal or a variable's value. To get
+one, create or update a gate with `--oidc-approver` and copy the entry
+from `bd gate show <id> --json` (`spec.approvers`):
+
+```bash
+bd gate update t-12.gate-publish --oidc-approver https://login.example.com 248289761001
+bd gate show t-12.gate-publish --json | jq -r '.spec.approvers[]'
+```
+
+A reference is only as good as the issuer and subject it was computed
+from: obtain the pair from a source that verifies the pair ([Approvers and OIDC
+accounts](sign-in.md#approvers-and-oidc-accounts)). A reference copied
+from elsewhere proves nothing about whose account it names. References
+are linkable identifiers, the same for the same account on every gate
+and server, not anonymization.
 
 People can approve a human gate in a browser at `<public-url>/w/<workspace>/gates/<gate id>`
 ([Approving human gates in the

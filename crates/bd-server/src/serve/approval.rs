@@ -81,15 +81,27 @@ impl authorize::Gates for Server {
         found
     }
 
-    fn approve(&self, workspace: &str, gate: &str, actor: &str) -> Result<authorize::Approved> {
+    fn approve(
+        &self,
+        workspace: &str,
+        gate: &str,
+        actor: &str,
+        oidc_approver: Option<&str>,
+    ) -> Result<authorize::Approved> {
         use authorize::{Approved, Found};
         let Some(ws) = self.workspace(workspace) else { return Ok(Approved::Gone(Found::NoWorkspace)) };
         let mut store = ws.take(&self.open)?;
         let reason = format!("approved in the browser by {actor}");
         let done = store.write("gate.resolve", actor, |tx| {
             // A person, as the approver's actor: the same checks as a human token's `bd gate resolve`, its
-            // approvers among them.
-            tx.set_policy(Some(Policy { actor: actor.to_string(), admin: false, human: true, max_claims: None }));
+            // approvers among them, an OIDC account matching only by the reference its sign-in proved.
+            tx.set_policy(Some(Policy {
+                actor: actor.to_string(),
+                admin: false,
+                human: true,
+                max_claims: None,
+                oidc_approver: oidc_approver.map(String::from),
+            }));
             let Some(issue) = issues::get(tx.conn(), gate)? else { return Ok(Approved::Gone(Found::NoIssue)) };
             if issue.issue_type != GATE_TYPE {
                 return Ok(Approved::Gone(Found::NotGate));

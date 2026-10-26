@@ -13,9 +13,14 @@
 //!    bound to its actor ([`auth::bind_account`]), and no token is issued.
 //!    Only then is it told whether the workspace, issue or gate exists, and
 //!    whether it is waiting for approval and the account one of its
-//!    approvers; if so, the approval page, with a cookie of its own.
+//!    approvers (`bd_core::policy::approved_by`: an OIDC account matches
+//!    only the `oidc:sha256:` reference of its own issuer and subject, never
+//!    an actor; a GitHub account matches by its actor); if so, the approval
+//!    page, with a cookie of its own. The approval kept in memory holds the
+//!    account's reference, computed from the identity the provider proved.
 //! 3. `POST` to the same path ([`approve`]): the approval, bound to that
 //!    cookie and posted once, resolves the gate as the account's actor
+//!    with the reference kept at step 2, never one the form names
 //!    ([`Gates::approve`]), its state, arming and approvers checked again in
 //!    the transaction.
 
@@ -82,8 +87,13 @@ pub trait Gates: Sync {
     /// The gate `gate` (an exact id) of `workspace`.
     fn find(&self, workspace: &str, gate: &str) -> Result<Found, Error>;
     /// Resolve it as `actor`, a person, in one transaction that checks it
-    /// again: still a human gate, open, armed, and `actor` one who may open it.
-    fn approve(&self, workspace: &str, gate: &str, actor: &str) -> Result<Approved, Error>;
+    /// again: still a human gate, open, armed, and the person one who may
+    /// open it. `oidc_approver` is the verified reference of the OIDC account
+    /// that signed in (`auth::Identity::oidc_approver`), None for a GitHub
+    /// account: with one, only that reference among the approvers lets it
+    /// open the gate, never `actor`.
+    fn approve(&self, workspace: &str, gate: &str, actor: &str, oidc_approver: Option<&str>)
+    -> Result<Approved, Error>;
 }
 
 /// The title of the pages refusing an approval.
@@ -303,6 +313,8 @@ pub(super) fn signed_in(
         }
         Err(e) => return internal(&e, "binding an account to approve a gate"),
     };
+    // From the identity the provider proved; never logged or shown.
+    let oidc_approver = user.oidc_approver();
     let found = if (cx.workspace_exists)(workspace) {
         match cx.gates.find(workspace, gate) {
             Ok(found) => found,
@@ -325,7 +337,7 @@ pub(super) fn signed_in(
         return Answer::Page(pages::notice(409, "Not ready", NOT_READY));
     }
     if let Some(list) = &info.approvers
-        && !list.iter().any(|a| bd_core::policy::approves(a, &actor))
+        && !bd_core::policy::approved_by(list, &actor, oidc_approver.as_deref())
     {
         metrics::APPROVALS_REFUSED.add();
         tracing::info!(
@@ -342,7 +354,16 @@ pub(super) fn signed_in(
             [] => "Its approvers aren't valid, so nobody can approve it. A human admin can replace or clear them with \
                    bd gate update."
                 .to_string(),
-            list => format!("Only {} can approve it; you're signed in as {actor}.", list.join(" or ")),
+            list => {
+                let mut why = format!("Only {} can approve it; you're signed in as {actor}.", list.join(" or "));
+                if oidc_approver.is_some() {
+                    why.push_str(&format!(
+                        " An account signed in with {label} matches only an oidc:sha256: identity reference for its \
+                         own issuer and subject."
+                    ));
+                }
+                why
+            }
         };
         return refusal(403, &bd_cli::io::printable(&why));
     }
@@ -372,6 +393,7 @@ pub(super) fn signed_in(
         provider: user.provider.clone(),
         login: user.login.clone(),
         subject: user.subject.clone(),
+        oidc_approver,
         browser: auth::hash(&value),
         cookie: suffix,
     };
@@ -445,7 +467,8 @@ pub fn approve(cx: &Ctx<'_>, workspace: &str, gate: &str, body: &str, cookies: &
         return (answer, cleared);
     }
     let actor = &approval.actor;
-    let (outcome, answer) = match cx.gates.approve(workspace, gate, actor) {
+    // The reference the sign-in proved, kept with the approval: nothing in the form is read but its id.
+    let (outcome, answer) = match cx.gates.approve(workspace, gate, actor, approval.oidc_approver.as_deref()) {
         Ok(Approved::Opened { unblocked, completed }) => {
             metrics::APPROVALS.add();
             let mut why = format!("Gate {gate} in {workspace} is resolved, recorded as approved by {actor}.");

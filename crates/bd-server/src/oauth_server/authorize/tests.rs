@@ -302,10 +302,13 @@ fn codes_are_redeemed_once_and_a_code_sent_again_names_its_token() {
 }
 
 /// Gates as a map, recording each approval asked for.
+/// An approval [`FakeGates`] was asked for: its workspace, gate, actor and OIDC approver reference.
+type Call = (String, String, String, Option<String>);
+
 struct FakeGates {
     found: Found,
     answer: Approved,
-    calls: std::sync::Mutex<Vec<(String, String, String)>>,
+    calls: std::sync::Mutex<Vec<Call>>,
 }
 
 impl FakeGates {
@@ -323,8 +326,15 @@ impl Gates for FakeGates {
         Ok(self.found.clone())
     }
 
-    fn approve(&self, workspace: &str, gate: &str, actor: &str) -> Result<Approved, bd_core::Error> {
-        self.calls.lock().unwrap().push((workspace.into(), gate.into(), actor.into()));
+    fn approve(
+        &self,
+        workspace: &str,
+        gate: &str,
+        actor: &str,
+        oidc_approver: Option<&str>,
+    ) -> Result<Approved, bd_core::Error> {
+        let call: Call = (workspace.into(), gate.into(), actor.into(), oidc_approver.map(String::from));
+        self.calls.lock().unwrap().push(call);
         Ok(self.answer.clone())
     }
 }
@@ -430,14 +440,21 @@ fn several_providers_are_chosen_from_for_the_gate() {
     });
 }
 
+/// The reference of the OIDC account [`approval`] signed in with.
+fn reference() -> String {
+    bd_core::gates::oidc_approver("https://login.example.com", "00u7")
+}
+
+/// An OIDC account's approval of bd-1, bound to the cookie `cookie` of value `value`.
 fn approval(cookie: &str, value: &str) -> Approval {
     Approval {
         workspace: "proj".into(),
         gate: "bd-1".into(),
-        actor: "github:alice".into(),
-        provider: "github".into(),
+        actor: "acme:alice".into(),
+        provider: "acme".into(),
         login: "alice".into(),
-        subject: "7".into(),
+        subject: "00u7".into(),
+        oidc_approver: Some(reference()),
         browser: auth::hash(value),
         cookie: cookie.into(),
     }
@@ -472,9 +489,13 @@ fn approvals_are_posted_once_from_their_own_browser() {
         // Another gate's page: refused.
         assert_eq!(page(&post("id1", "bd-2", &cookies).0).status, 400);
         assert_eq!(gates.calls(), 0);
-        let (answer, set) = post("id1", "bd-1", &cookies);
+        // The reference the sign-in proved goes with it, whatever else the form says.
+        let other = bd_core::gates::oidc_approver("https://login.example.com", "00u8");
+        let body = format!("approval=id1&oidc_approver={other}&actor=acme:bob");
+        let (answer, set) = gate::approve(cx, "proj", "bd-1", &body, &cookies);
         assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
-        assert_eq!(*gates.calls.lock().unwrap(), [("proj".into(), "bd-1".into(), "github:alice".into())]);
+        let call: Call = ("proj".into(), "bd-1".into(), "acme:alice".into(), Some(reference()));
+        assert_eq!(*gates.calls.lock().unwrap(), [call]);
         assert_eq!(set, vec![set_gate_cookie(ISSUER, "proj", "bd-1", "ab12", "", Duration::ZERO)], "cleared");
         let again = post("id1", "bd-1", &cookies);
         assert_eq!((page(&again.0).status, html(&again).contains("already used")), (400, true));

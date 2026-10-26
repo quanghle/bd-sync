@@ -73,6 +73,11 @@ pub struct Capture {
     pub token_actor: String,
     /// The most issues the token's actor and sub-actors may hold.
     pub max_claims: Option<u32>,
+    /// The canonical `oidc:sha256:` reference of the verified OIDC account
+    /// behind the request's token (see [`bd_core::Policy::oidc_approver`]).
+    /// Trusted: set only by `bd serve` from the authenticated token, never
+    /// from the request's command line, actor or session.
+    pub oidc_approver: Option<String>,
     /// What `bd info` tells its client of the request's access token (the
     /// server's summary of it); the fields above are what it may override.
     pub token: Option<serde_json::Value>,
@@ -100,6 +105,7 @@ impl Capture {
             human: false,
             token_actor: String::new(),
             max_claims: None,
+            oidc_approver: None,
             token: None,
             needs: Vec::new(),
             approvals: None,
@@ -195,6 +201,7 @@ pub fn policy() -> Option<bd_core::Policy> {
         admin: c.admin,
         human: c.human,
         max_claims: c.max_claims,
+        oidc_approver: c.oidc_approver.clone(),
     })
 }
 
@@ -858,6 +865,28 @@ mod tests {
         assert_eq!(p, Some(bd_core::Policy::default()), "nor do the server's own commands");
         let c = Capture { human: true, token_actor: "alice".into(), ..recording().1 };
         let (p, _) = capture(c, policy);
-        assert_eq!(p, Some(bd_core::Policy { actor: "alice".into(), admin: false, human: true, max_claims: None }));
+        assert_eq!(
+            p,
+            Some(bd_core::Policy {
+                actor: "alice".into(),
+                admin: false,
+                human: true,
+                max_claims: None,
+                oidc_approver: None
+            })
+        );
+        let reference = bd_core::gates::oidc_approver("https://login.example.com", "248289761001");
+        let c = Capture {
+            human: true,
+            token_actor: "corp:alice".into(),
+            oidc_approver: Some(reference.clone()),
+            ..recording().1
+        };
+        let (p, _) = capture(c, policy);
+        assert_eq!(
+            p.and_then(|p| p.oidc_approver),
+            Some(reference),
+            "the token's verified identity reaches the policy"
+        );
     }
 }

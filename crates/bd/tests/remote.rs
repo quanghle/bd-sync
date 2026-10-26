@@ -11413,44 +11413,58 @@ fn approvals_refuse_foreign_posts_replays_and_resolved_gates() {
     assert_eq!(ops.json(&["gate", "show", &ids.human])["status"], "open");
 }
 
+/// Add provider acme (`idp`, labelled `Acme SSO`) to the gate tests' `auth.toml` in `root`, letting in accounts by
+/// `allow`, the body of one `[[oidc.acme.allow]]` rule.
+#[cfg(unix)]
+fn with_acme(root: &Path, idp: &FakeOidc, allow: &str) {
+    std::fs::write(root.join("acme-secret"), "oidc-s3cret\n").unwrap();
+    let config = std::fs::read_to_string(root.join("auth.toml")).unwrap();
+    let oidc = format!(
+        "\n[oidc.acme]\nissuer = \"{}\"\nclient_id = \"bd-client\"\nclient_secret_file = \"acme-secret\"\n\
+         label = \"Acme SSO\"\nscopes = [\"email\"]\n\n[[oidc.acme.allow]]\n{allow}",
+        idp.url
+    );
+    std::fs::write(root.join("auth.toml"), config + &oidc).unwrap();
+}
+
+/// Open gate `id`'s link in a fresh browser, choose Acme SSO and sign in there as `subject` with `claims`.
+#[cfg(unix)]
+fn approve_flow_at_acme(server: &Server, idp: &FakeOidc, id: &str, subject: &str, claims: Value) -> Signed {
+    let (_, (status, headers, page)) = gate_begin(server, "proj", id);
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains(&format!("<h1>Sign in to approve gate {id} in proj</h1>")), "{page}");
+    assert!(page.contains(">Continue with GitHub<") && page.contains(">Continue with Acme SSO<"), "{page}");
+    let oauth = bd_oauth(&headers);
+    let at = page.find(">Continue with Acme SSO<").unwrap();
+    let start = page[..at].rfind("href=\"").unwrap() + "href=\"".len();
+    let acme = page[start..at - 1].replace("&amp;", "&");
+    let (status, headers, body) = browse(&local_url(server, &acme), Some(&oauth), None);
+    assert_eq!(status, 302, "{body}");
+    let to_idp = location(&headers);
+    assert!(to_idp.starts_with(&format!("{}/authorize?", idp.url)), "{to_idp}");
+    idp.next(subject, claims);
+    let (_, headers, _) = browse(&to_idp, None, None);
+    let back = location(&headers);
+    assert!(back.starts_with(&format!("{PUBLIC}/bd/oauth/acme/callback?")), "{back}");
+    let (status, headers, page) = browse(&local_url(server, &back), Some(&oauth), None);
+    Signed { status, headers, page }
+}
+
 #[cfg(unix)]
 #[test]
 fn gates_are_approved_through_a_chosen_oidc_provider() {
     let github = FakeGithub::start();
     let idp = FakeOidc::start();
     let (root, ids) = gate_root(&github, GATE_RULES);
-    std::fs::write(root.path().join("acme-secret"), "oidc-s3cret\n").unwrap();
-    let config = std::fs::read_to_string(root.path().join("auth.toml")).unwrap();
-    let oidc = format!(
-        "\n[oidc.acme]\nissuer = \"{}\"\nclient_id = \"bd-client\"\nclient_secret_file = \"acme-secret\"\n\
-         label = \"Acme SSO\"\nscopes = [\"email\"]\n\n[[oidc.acme.allow]]\nemails = [\"alice@acme.example\"]\n\
-         role = \"write\"\nkind = \"human\"\nworkspaces = [\"proj\"]\n",
-        idp.url
+    with_acme(
+        root.path(),
+        &idp,
+        "emails = [\"alice@acme.example\"]\nrole = \"write\"\nkind = \"human\"\nworkspaces = [\"proj\"]\n",
     );
-    std::fs::write(root.path().join("auth.toml"), config + &oidc).unwrap();
     let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let alice = || json!({ "preferred_username": "alice", "email": "alice@acme.example", "email_verified": true });
 
-    let (_, (status, headers, page)) = gate_begin(&server, "proj", &ids.human);
-    assert_eq!(status, 200, "{page}");
-    assert!(page.contains(&format!("<h1>Sign in to approve gate {} in proj</h1>", ids.human)), "{page}");
-    assert!(page.contains(">Continue with GitHub<") && page.contains(">Continue with Acme SSO<"), "{page}");
-    let oauth = bd_oauth(&headers);
-    let at = page.find(">Continue with Acme SSO<").unwrap();
-    let start = page[..at].rfind("href=\"").unwrap() + "href=\"".len();
-    let acme = page[start..at - 1].replace("&amp;", "&");
-    let (status, headers, body) = browse(&local_url(&server, &acme), Some(&oauth), None);
-    assert_eq!(status, 302, "{body}");
-    let to_idp = location(&headers);
-    assert!(to_idp.starts_with(&format!("{}/authorize?", idp.url)), "{to_idp}");
-    idp.next(
-        "248289761001",
-        json!({ "preferred_username": "alice", "email": "alice@acme.example", "email_verified": true }),
-    );
-    let (_, headers, _) = browse(&to_idp, None, None);
-    let back = location(&headers);
-    assert!(back.starts_with(&format!("{PUBLIC}/bd/oauth/acme/callback?")), "{back}");
-    let (status, headers, page) = browse(&local_url(&server, &back), Some(&oauth), None);
-    let signed = Signed { status, headers, page };
+    let signed = approve_flow_at_acme(&server, &idp, &ids.human, "248289761001", alice());
     assert_eq!(signed.status, 200, "{}", signed.page);
     assert!(signed.page.contains("You're signed in to Acme SSO as <b>acme:alice</b>."), "{}", signed.page);
     assert!(!signed.page.contains("alice@acme.example"), "never the email: {}", signed.page);
@@ -11459,6 +11473,196 @@ fn gates_are_approved_through_a_chosen_oidc_provider() {
     let closed = closed_events(&server, &ids.human);
     assert_eq!(closed[0]["actor"], "acme:alice");
     assert_eq!(closed[0]["data"]["via"], "browser");
+
+    // A gate naming the account's actor, not its identity reference: an OIDC account is never that approver.
+    let ops = server.client(&server.token("ops", "ops", &["--role", "admin", "--kind", "human"]));
+    let legacy = &ids.spares[0];
+    ops.ok(&["gate", "update", legacy, "--approver", "acme:alice"]);
+    let signed = approve_flow_at_acme(&server, &idp, legacy, "248289761001", alice());
+    assert_eq!(signed.status, 403, "{}", signed.page);
+    assert!(!signed.has_form(), "{}", signed.page);
+    assert_eq!(ops.json(&["gate", "show", legacy])["status"], "open");
+}
+
+/// `bd remote login --provider acme` on a fresh client machine, signing in at `idp` as `subject` with
+/// `preferred_username` `login`: the machine and the actor its token acts as.
+#[cfg(unix)]
+fn acme_login(idp: &FakeOidc, url: &str, subject: &str, login: &str) -> (TempDir, String) {
+    idp.next(subject, json!({ "preferred_username": login }));
+    let dir = tempfile::tempdir().unwrap();
+    let args = ["--json", "remote", "login", "--provider", "acme", url];
+    let out = bd(dir.path()).args(args).stdin(Stdio::null()).output().unwrap();
+    let v: Value = serde_json::from_str(&check(out, &format!("{subject}'s sign-in"))).unwrap();
+    (dir, v["actor"].as_str().unwrap().to_string())
+}
+
+#[cfg(unix)]
+#[test]
+fn oidc_gate_approvers_are_bound_to_issuer_and_subject() {
+    let github = FakeGithub::start();
+    let idp = FakeOidc::start();
+    let (root, _) = gate_root(&github, GATE_RULES);
+    with_acme(
+        root.path(),
+        &idp,
+        "subjects = [\"squatter-9\", \"intended-2\", \"linked-3\"]\nrole = \"write\"\nkind = \"human\"\n\
+         workspaces = [\"proj\"]\n",
+    );
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let (url, root) = (server.url(), server.root.path().to_path_buf());
+    let ops = server.client(&server.token("ops", "ops", &["--role", "admin", "--kind", "human"]));
+    let admin = |args: &[&str]| -> Value {
+        let out =
+            bd(&root).arg("--json").args(["serve", "token"]).args(args).arg("--root").arg(&root).output().unwrap();
+        serde_json::from_str(&check(out, &format!("token {args:?}"))).unwrap()
+    };
+    let reference = |subject: &str| bd_core::gates::oidc_approver(&idp.url, subject);
+    let intended = reference("intended-2");
+    // Each gate holds back an issue of its own: (gate, held).
+    let gate = |n: u32, approvers: &[&str]| -> (String, String) {
+        let task = ops.json(&["create", &format!("Held {n}")])["id"].as_str().unwrap().to_string();
+        let title = format!("Gate {n}");
+        let mut args = vec!["gate", "create", "-t", "human", "--blocks", &task, "--title", &title];
+        args.extend_from_slice(approvers);
+        (ops.json(&args)["id"].as_str().unwrap().to_string(), task)
+    };
+    let (g1, held1) = gate(1, &["--approver", "acme:alice"]);
+    let (g2, _) = gate(2, &["--oidc-approver", &idp.url, "intended-alice"]);
+    let (g3, _) = gate(3, &["--oidc-approver", &idp.url, "intended-2"]);
+    let (g4, _) = gate(4, &["--oidc-approver", &idp.url, "intended-2"]);
+    let (g5, _) = gate(5, &["--approver", "acme:bob2"]);
+    let (g6, _) = gate(6, &["--oidc-approver", &idp.url, "intended-2"]);
+    for (g, list) in [
+        (&g1, json!(["acme:alice"])),
+        (&g2, json!([reference("intended-alice")])),
+        (&g3, json!([intended])),
+        (&g4, json!([intended])),
+        (&g5, json!(["acme:bob2"])),
+        (&g6, json!([intended])),
+    ] {
+        assert_eq!(ops.json(&["gate", "show", g])["spec"]["approvers"], list, "{g}");
+    }
+    let open = |id: &str| ops.json(&["show", id])["status"] == "open";
+    let refused = |dir: &Path, args: &[&str]| {
+        let out = signed_in(dir, &url, args);
+        assert_eq!(out.status.code(), Some(7), "{args:?}: {}{}", String::from_utf8_lossy(&out.stdout), stderr_of(&out));
+        stderr_of(&out)
+    };
+    // Refused by the identity rule, never naming the caller's own reference (that of `subject`).
+    let by_identity = |subject: &str, told: &str| {
+        assert!(told.contains("identity reference"), "{told}");
+        assert!(!told.contains(&reference(subject)), "{told}");
+    };
+    let batch = |dir: &Path, script: &str| {
+        let mut cmd = bd(dir);
+        cmd.env("BD_REMOTE", &url).arg("batch").stdout(Stdio::piped()).stderr(Stdio::piped());
+        piped::output_with_input(&mut cmd, script)
+    };
+    let alice = || json!({ "preferred_username": "alice" });
+
+    // 1. The first account to sign in as `alice` binds acme:alice, whoever it is; a list naming that actor still
+    // does not let it approve.
+    let signed = approve_flow_at_acme(&server, &idp, &g1, "squatter-9", alice());
+    assert!(
+        stored(&root, "accounts").iter().any(|a| a["actor"] == "acme:alice" && a["subject"] == "squatter-9"),
+        "the squatter bound acme:alice: {:?}",
+        stored(&root, "accounts")
+    );
+    assert_eq!(signed.status, 403, "{}", signed.page);
+    assert!(signed.page.contains("Only acme:alice can approve it"), "{}", signed.page);
+    assert!(!signed.has_form() && !signed.page.contains(&reference("squatter-9")), "{}", signed.page);
+
+    // 2. Its token, issued once bound: no command path gets it past the gate, before or after a refresh.
+    let (squatter, actor) = acme_login(&idp, &url, "squatter-9", "alice");
+    assert_eq!(actor, "acme:alice");
+    let info: Value =
+        serde_json::from_str(&check(signed_in(squatter.path(), &url, &["--json", "info"]), "info")).unwrap();
+    let account = &info["token"]["account"];
+    assert_eq!((&account["issuer"], &account["subject"]), (&json!(idp.url), &json!("squatter-9")), "{info}");
+    by_identity("squatter-9", &refused(squatter.path(), &["gate", "resolve", &g1, "-r", "mine"]));
+    by_identity(
+        "squatter-9",
+        &refused(squatter.path(), &["--actor", "acme:alice/x", "gate", "resolve", &g1, "-r", "mine"]),
+    );
+    by_identity("squatter-9", &refused(squatter.path(), &["close", &held1, "--force", "-r", "mine"]));
+    // `bd batch` has no `gate` commands: closing the gate there is resolving it.
+    let out = batch(squatter.path(), &format!("close {g1} -r mine\n"));
+    assert_eq!(out.status.code(), Some(7), "batch: {}", stderr_of(&out));
+    by_identity("squatter-9", &stderr_of(&out));
+    renewal_due(squatter.path());
+    let before = saved(squatter.path(), "refresh_token").unwrap();
+    by_identity("squatter-9", &refused(squatter.path(), &["gate", "resolve", &g1, "-r", "mine"]));
+    assert_ne!(saved(squatter.path(), "refresh_token").unwrap(), before, "refreshed");
+    by_identity("squatter-9", &refused(squatter.path(), &["gate", "resolve", &g1, "-r", "mine"]));
+    let signed = approve_flow_at_acme(&server, &idp, &g1, "squatter-9", alice());
+    assert_eq!(signed.status, 403, "{}", signed.page);
+    assert!(open(&g1) && open(&held1));
+
+    // 3. A gate naming the person meant by its issuer and subject: the squatter's login is no help either.
+    let signed = approve_flow_at_acme(&server, &idp, &g2, "squatter-9", alice());
+    assert_eq!(signed.status, 403, "{}", signed.page);
+    assert!(!signed.has_form(), "{}", signed.page);
+    by_identity("squatter-9", &refused(squatter.path(), &["gate", "resolve", &g2, "-r", "mine"]));
+    assert!(open(&g2));
+
+    // 4. The account its reference names approves in the browser.
+    let bob2 = || json!({ "preferred_username": "bob2" });
+    let signed = approve_flow_at_acme(&server, &idp, &g3, "intended-2", bob2());
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = post_approval(&server, &g3, &signed);
+    assert_eq!(status, 200, "{page}");
+    let closed = closed_events(&server, &g3);
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!((&closed[0]["actor"], &closed[0]["data"]["via"]), (&json!("acme:bob2"), &json!("browser")));
+
+    // 5. Its approvers changed between the page and the approval: checked again when posted.
+    let signed = approve_flow_at_acme(&server, &idp, &g4, "intended-2", bob2());
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    ops.ok(&["gate", "update", &g4, "--oidc-approver", &idp.url, "someone-else"]);
+    let (status, _, page) = post_approval(&server, &g4, &signed);
+    assert_eq!(status, 403, "{page}");
+    assert!(open(&g4) && closed_events(&server, &g4).is_empty());
+
+    // 6. A login changed at the provider changes neither the actor nor the reference: its token approves.
+    ops.ok(&["gate", "update", &g4, "--oidc-approver", &idp.url, "intended-2"]);
+    let (renamed, actor) = acme_login(&idp, &url, "intended-2", "bob-renamed");
+    assert_eq!(actor, "acme:bob2", "bound at its first sign-in");
+    renewal_due(renamed.path());
+    let before = saved(renamed.path(), "refresh_token").unwrap();
+    check(
+        signed_in(renamed.path(), &url, &["gate", "resolve", &g4, "-r", "approved"]),
+        "the intended account resolves",
+    );
+    assert_ne!(saved(renamed.path(), "refresh_token").unwrap(), before, "refreshed");
+    assert!(!open(&g4));
+    assert_eq!(closed_events(&server, &g4)[0]["actor"], "acme:bob2");
+
+    // 7. Another account linked to the same actor shares the actor, not the identity.
+    let (linked, actor) = acme_login(&idp, &url, "linked-3", "carol3");
+    assert_eq!(actor, "acme:carol3");
+    let link = admin(&["link", "acme:carol3", "--to", "acme:bob2"]);
+    assert_eq!((link["was"].as_str(), link["actor"].as_str()), (Some("acme:carol3"), Some("acme:bob2")));
+    refused(linked.path(), &["list"]);
+    let (linked, actor) = acme_login(&idp, &url, "linked-3", "carol3");
+    assert_eq!(actor, "acme:bob2", "one actor for both accounts");
+    check(signed_in(linked.path(), &url, &["list"]), "the linked account works as acme:bob2");
+    by_identity("linked-3", &refused(linked.path(), &["gate", "resolve", &g6, "-r", "mine"]));
+    let signed = approve_flow_at_acme(&server, &idp, &g6, "linked-3", json!({ "preferred_username": "carol3" }));
+    assert_eq!(signed.status, 403, "{}", signed.page);
+    assert!(signed.page.contains("acme:bob2") && signed.page.contains(&intended), "{}", signed.page);
+    assert!(!signed.has_form(), "{}", signed.page);
+    // Neither account matches a list naming their shared actor.
+    by_identity("intended-2", &refused(renamed.path(), &["gate", "resolve", &g5, "-r", "mine"]));
+    by_identity("linked-3", &refused(linked.path(), &["gate", "resolve", &g5, "-r", "mine"]));
+    assert!(open(&g5) && open(&g6));
+
+    // 8. The intended account's own token, through the MCP endpoint: a tool call never opens a human gate.
+    let token = saved_token(renamed.path()).unwrap();
+    let close = mcp_tool_call("close", json!({ "ids": [g6], "reason": "approved by the model" }));
+    let (status, _, r) = mcp_post(&server, Some(&token), "", &[], &close);
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(mcp_tool_error(&r).unwrap()["code"], "unauthorized", "{r}");
+    assert!(open(&g6));
 }
 
 #[test]

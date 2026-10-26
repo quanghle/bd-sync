@@ -205,6 +205,13 @@ impl Identity {
     pub fn actor(&self) -> String {
         format!("{}:{}", self.provider, self.login.replace('/', "-"))
     }
+
+    /// The `oidc:sha256:` reference human-gate approver lists name this
+    /// account by, from its exact issuer and subject; None for a GitHub
+    /// account, which approves by its actor.
+    pub fn oidc_approver(&self) -> Option<String> {
+        bd_core::gates::account_oidc_approver(&self.provider, &self.issuer, &self.subject)
+    }
 }
 
 /// An account that signed in, bound to the actor its tokens act as.
@@ -308,6 +315,9 @@ impl Token {
             admin: self.role == Role::Admin,
             human: self.kind == Kind::Human,
             max_claims: self.max_claims,
+            // Only from the account the token was issued to, never from what
+            // a request says.
+            oidc_approver: self.identity.as_ref().and_then(Identity::oidc_approver),
         }
     }
 
@@ -884,6 +894,66 @@ mod tests {
         let once = Lifetime { ttl: hour, refresh: None, rule: None };
         let plain = issue_sign_in_token(dir.path(), &alice, grant, once, "proj", true).unwrap();
         assert!(plain.refresh_secret.is_none() && plain.token.refresh.is_none());
+    }
+
+    #[test]
+    fn oidc_sign_ins_approve_by_their_issuer_and_subject_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Human, workspaces: vec!["proj".into()], max_claims: None };
+        let (hour, week) = (Duration::from_secs(3600), Duration::from_secs(7 * 24 * 3600));
+        let acme = |subject: &str, login: &str| Identity {
+            provider: "acme".into(),
+            issuer: "https://login.example.com".into(),
+            subject: subject.into(),
+            login: login.into(),
+        };
+        let reference = |subject: &str| bd_core::gates::oidc_approver("https://login.example.com", subject);
+        let now = Timestamp::now();
+        let life = Lifetime { ttl: hour, refresh: Some((now.plus(week * 4), week)), rule: None };
+        let bob = acme("00uBob2", "bob");
+        let issued = issue_sign_in_token(dir.path(), &bob, grant.clone(), life, "proj", true).unwrap();
+        let policy = issued.token.policy();
+        assert_eq!((policy.actor.as_str(), policy.human), ("acme:bob", true));
+        assert_eq!(policy.oidc_approver, Some(reference("00uBob2")));
+
+        // GitHub accounts and an admin's tokens approve by their actor.
+        let (github, _) = github_token(dir.path(), &gh("alice", 1), grant.clone(), hour, true).unwrap();
+        assert_eq!(github.policy().oidc_approver, None);
+        let (manual, _) = issue_token(dir.path(), "ops", "ops", Role::Admin, Kind::Human, &[]).unwrap();
+        assert_eq!(manual.policy().oidc_approver, None);
+
+        // A refresh, with a new login, keeps the account's reference.
+        let first = issued.refresh_secret.unwrap();
+        let last = LastRefresh { spent: hash(&first), request: hash("r1") };
+        let renamed = acme("00uBob2", "bob-renamed");
+        let rotated = rotate_with(
+            dir.path(),
+            &issued.token.id,
+            &hash(&first),
+            last,
+            &renamed,
+            true,
+            grant.clone(),
+            false,
+            true,
+            None,
+            now.plus(hour),
+            now.plus(week),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rotated.token.actor, "acme:bob");
+        assert_eq!(rotated.token.policy().oidc_approver, policy.oidc_approver);
+
+        // An account linked to the same actor acts as it, under a reference of its own.
+        let sign_in = |user: &Identity| github_token(dir.path(), user, grant.clone(), hour, true);
+        let carol = acme("00uCarol3", "carol");
+        sign_in(&carol).unwrap();
+        link(dir.path(), "acme:carol", "acme:bob").unwrap();
+        let linked = sign_in(&carol).unwrap().0.policy();
+        assert_eq!(linked.actor, "acme:bob");
+        assert_eq!(linked.oidc_approver, Some(reference("00uCarol3")));
+        assert_ne!(linked.oidc_approver, policy.oidc_approver);
     }
 
     #[test]
@@ -1616,7 +1686,7 @@ mod tests {
         let (agent, _) = issue_token(dir.path(), "ci", "alice", Role::Admin, Kind::Agent, &[]).unwrap();
         assert_eq!(
             agent.policy(),
-            bd_core::Policy { actor: "alice".into(), admin: true, human: false, max_claims: None }
+            bd_core::Policy { actor: "alice".into(), admin: true, human: false, max_claims: None, oidc_approver: None }
         );
         assert!(agent.describe().contains("kind agent"), "{}", agent.describe());
         let text = raw(dir.path());

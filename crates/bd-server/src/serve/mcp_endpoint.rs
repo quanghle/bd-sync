@@ -208,6 +208,7 @@ impl mcp::Runner for ToolRunner<'_> {
         let capture = Capture {
             token_actor: policy.actor,
             max_claims: policy.max_claims,
+            oidc_approver: policy.oidc_approver,
             token: Some(self.token.summary()),
             approvals: self.server.approval_base(&self.ws.name),
             ..capture

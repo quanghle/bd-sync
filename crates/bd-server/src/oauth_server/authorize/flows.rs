@@ -143,6 +143,10 @@ pub(super) struct Approval {
     pub(super) provider: String,
     pub(super) login: String,
     pub(super) subject: String,
+    /// The account's verified `oidc:sha256:` approver reference, from the
+    /// identity its provider proved (`auth::Identity::oidc_approver`), None
+    /// for a GitHub account. Never logged.
+    pub(super) oidc_approver: Option<String>,
     /// The hash of the value of its own cookie ([`gate_cookie`]).
     pub(super) browser: String,
     /// What names its cookie.

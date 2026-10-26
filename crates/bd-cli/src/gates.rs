@@ -229,7 +229,11 @@ pub fn exec_create(tx: &mut WriteCtx<'_>, a: &GateCreateArgs) -> Result<Out> {
         repo: a.repo.clone().filter(|s| !s.trim().is_empty()),
         branch: a.branch.clone().filter(|s| !s.trim().is_empty()),
         event: a.event.clone().filter(|s| !s.trim().is_empty()),
-        approvers: if a.approvers.is_empty() { None } else { Some(gates::approvers_input(a.approvers.clone())?) },
+        approvers: if a.approvers.is_empty() && a.oidc_approvers.is_empty() {
+            None
+        } else {
+            Some(approver_list(&a.approvers, &a.oidc_approvers)?)
+        },
     };
     let blocks =
         a.blocks.iter().filter(|b| !b.trim().is_empty()).map(|b| tx.resolve_id(b)).collect::<Result<Vec<_>>>()?;
@@ -245,15 +249,31 @@ pub fn exec_create(tx: &mut WriteCtx<'_>, a: &GateCreateArgs) -> Result<Out> {
     })?;
     let view = gates::view_of(tx.conn(), &gate)?;
     let now = tx.now();
-    Ok(Out::new(&view)
+    let mut out = Out::new(&view)
         .line(format!("✓ Created gate {}: {} (holds back {})", gate.id, gate.title, blocks.join(", ")))
-        .line(format!("  {}", state_text(&view, now)))
-        .id(gate.id))
+        .line(format!("  {}", state_text(&view, now)));
+    if let Some(list) = gates::approvers_of(&gate) {
+        out = out.line(format!("  approvers {}", shown_approvers(&list, ", ")));
+    }
+    Ok(out.id(gate.id))
+}
+
+/// The approvers `--approver` and `--oidc-approver` name: the actors in
+/// order, then each issuer and subject pair's identity reference, the raw
+/// pair never repeated in an error.
+fn approver_list(actors: &[String], pairs: &[String]) -> Result<Vec<String>> {
+    let (pairs, rest) = pairs.as_chunks::<2>();
+    if !rest.is_empty() {
+        return Err(Error::invalid("--oidc-approver takes an issuer and a subject"));
+    }
+    let refs = pairs.iter().map(|[i, s]| gates::oidc_approver_input(i, s)).collect::<Result<Vec<_>>>()?;
+    gates::approvers_input(actors.iter().cloned().chain(refs))
 }
 
 pub fn exec_update(tx: &mut WriteCtx<'_>, a: &GateUpdateArgs) -> Result<Out> {
     let id = tx.resolve_id(&a.id)?;
-    let done = tx.set_gate_approvers(&id, (!a.clear_approvers).then(|| a.approvers.clone()))?;
+    let list = if a.clear_approvers { None } else { Some(approver_list(&a.approvers, &a.oidc_approvers)?) };
+    let done = tx.set_gate_approvers(&id, list)?;
     let view = gates::view_of(tx.conn(), &done.issue)?;
     let line = match gates::approvers_of(&done.issue) {
         Some(list) => format!("✓ Gate {id}: approvers {}", shown_approvers(&list, ", ")),

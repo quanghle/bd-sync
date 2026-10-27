@@ -4,8 +4,10 @@
 //! providers (`oauth`, `oidc`, `authorizer`, with the admin's commands in
 //! `helper` and secrets fetched by one in `secrets`), and the MCP endpoint
 //! (`mcp_http`) with its authorization server (`oauth_server`), and the key
-//! sealing operation approval links (`link_key`). Each request runs
-//! `bd-cli`'s commands in-process ([`bd_cli::execute`]).
+//! sealing operation approval links (`link_key`), and the WebAuthn verifier
+//! behind the browser approval pages' passkeys (`webauthn`), with the
+//! passkeys themselves kept in `server.db` (`passkeys`). Each request
+//! runs `bd-cli`'s commands in-process ([`bd_cli::execute`]).
 
 pub mod auth;
 pub mod authorizer;
@@ -18,7 +20,9 @@ pub mod metrics;
 pub mod oauth;
 pub mod oauth_server;
 pub mod oidc;
+pub mod passkeys;
 pub mod secrets;
 pub mod serve;
 pub mod server_db;
 pub mod stream;
+pub mod webauthn;

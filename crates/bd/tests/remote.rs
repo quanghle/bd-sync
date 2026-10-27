@@ -10911,6 +10911,90 @@ const PUBLIC: &str = "https://bd.example.com";
 /// `--public-url` of the gate tests' servers.
 const PUBLIC_URL: &[&str] = &["--public-url", "https://bd.example.com/bd"];
 
+// A software authenticator for the approval pages' passkeys: ES256 keys from ring, by credential id (base64url),
+// with their PKCS#8 document and signature counter, across every test in the process.
+static KEYS: std::sync::Mutex<std::collections::BTreeMap<String, (Vec<u8>, u32)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn b64url(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The value of the attribute `name` on an approval page, its entities read back.
+fn page_attribute(page: &str, name: &str) -> Option<String> {
+    let at = page.find(&format!(" {name}=\""))? + name.len() + 3;
+    let value = &page[at..at + page[at..].find('"')?];
+    Some(
+        value
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// The WebAuthn fields a browser posts with the approval `page` shows, as form fields: a new passkey's registration
+/// where the page asks to create one, else an assertion by the first of its credentials this authenticator holds.
+fn passkey_fields(page: &str) -> String {
+    use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
+    use sha2::{Digest, Sha256};
+    let rng = ring::rand::SystemRandom::new();
+    let mode = page_attribute(page, "data-passkey").unwrap_or_else(|| panic!("no passkey ceremony: {page}"));
+    let challenge = page_attribute(page, "data-challenge").unwrap();
+    let rp = page_attribute(page, "data-rp").unwrap();
+    let create = mode == "create";
+    let kind = if create { "webauthn.create" } else { "webauthn.get" };
+    let client_data = json!({"type": kind, "challenge": challenge, "origin": PUBLIC, "crossOrigin": false}).to_string();
+    let mut auth = Sha256::digest(rp.as_bytes()).to_vec();
+    let mut keys = KEYS.lock().unwrap();
+    if create {
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng).unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8.as_ref(), &rng).unwrap();
+        let mut id = [0u8; 32];
+        ring::rand::SecureRandom::fill(&rng, &mut id).unwrap();
+        // UP, UV and AT; counter 0; a zero AAGUID; the id; an empty COSE map, which the server never reads.
+        auth.push(0x45);
+        auth.extend_from_slice(&0u32.to_be_bytes());
+        auth.extend_from_slice(&[0; 16]);
+        auth.extend_from_slice(&32u16.to_be_bytes());
+        auth.extend_from_slice(&id);
+        auth.push(0xa0);
+        // SubjectPublicKeyInfo of a P-256 key: id-ecPublicKey, prime256v1, then the point.
+        let mut spki = vec![
+            0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+            0xce, 0x3d, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+        ];
+        spki.extend_from_slice(pair.public_key().as_ref());
+        keys.insert(b64url(&id), (pkcs8.as_ref().to_vec(), 0));
+        format!(
+            "credential={}&client_data={}&authenticator_data={}&public_key={}&algorithm=-7",
+            b64url(&id),
+            b64url(client_data.as_bytes()),
+            b64url(&auth),
+            b64url(&spki)
+        )
+    } else {
+        let listed = page_attribute(page, "data-credentials").unwrap_or_default();
+        let id = listed.split(' ').find(|id| keys.contains_key(*id)).unwrap_or_else(|| panic!("no key for {listed}"));
+        let (pkcs8, counter) = keys.get_mut(id).unwrap();
+        *counter += 1;
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8, &rng).unwrap();
+        auth.push(0x05);
+        auth.extend_from_slice(&counter.to_be_bytes());
+        let mut signed = auth.clone();
+        signed.extend_from_slice(&Sha256::digest(client_data.as_bytes()));
+        let signature = pair.sign(&rng, &signed).unwrap();
+        format!(
+            "credential={id}&client_data={}&authenticator_data={}&signature={}",
+            b64url(client_data.as_bytes()),
+            b64url(&auth),
+            b64url(signature.as_ref())
+        )
+    }
+}
+
 /// The GitHub rules of the gate tests: people (kind human) in proj and in nosuch, which is granted but never
 /// created; mallory's account (id 4242) denied; bob let in as an agent.
 const GATE_RULES: &str = "deny = [\"4242\"]\n\n\
@@ -11163,7 +11247,7 @@ fn post_gate(url: &str, origin: Option<&str>, site: Option<&str>, cookie: &str, 
 
 /// Approve what `signed` shows, from its browser, as the approval page posts it.
 fn post_approval(server: &Server, id: &str, signed: &Signed) -> Answered {
-    let body = format!("approval={}", signed.approval());
+    let body = format!("approval={}&{}", signed.approval(), passkey_fields(&signed.page));
     post_gate(&gate_url(server, "proj", id), Some(PUBLIC), None, &signed.cookie(), &body)
 }
 
@@ -11271,6 +11355,216 @@ fn people_approve_human_gates_in_the_browser() {
         assert!(detail.contains("to approve gate") && detail.contains("no token issued"), "{e}");
     }
     assert_eq!(approvals_counted(&server, &ops), (2, 0));
+}
+
+/// The exact value of the tracing field `name` on a log `line`: quoted (its quotes left out) or bare (up to the next
+/// space, empty when nothing follows the `=`).
+fn field<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+    let key = format!(" {name}=");
+    let at = line.find(&key)? + key.len();
+    let rest = &line[at..];
+    match rest.strip_prefix('"') {
+        Some(quoted) => {
+            let mut escaped = false;
+            for (i, c) in quoted.char_indices() {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => return Some(&quoted[..i]),
+                    _ => {}
+                }
+            }
+            None
+        }
+        None => Some(&rest[..rest.find(' ').unwrap_or(rest.len())]),
+    }
+}
+
+/// The value of the form field `name` in the urlencoded `body` (the fields [`passkey_fields`] builds need no
+/// decoding).
+fn form_value<'a>(body: &'a str, name: &str) -> &'a str {
+    body.split('&')
+        .find_map(|pair| pair.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+        .unwrap_or_else(|| panic!("no {name}: {body}"))
+}
+
+/// The value of the metric `series` (name and labels) on `/metrics`, read with the admin token `admin`.
+fn metric(server: &Server, admin: &str, series: &str) -> u64 {
+    let agent: ureq::Agent = ureq::Agent::config_builder().proxy(None).build().into();
+    let mut answer = agent.get(format!("{}/metrics", server.base)).header("authorization", bearer(admin)).call();
+    let text = answer.as_mut().unwrap().body_mut().read_to_string().unwrap();
+    let prefix = format!("{series} ");
+    let line = text.lines().find(|l| l.starts_with(&prefix)).unwrap_or_else(|| panic!("{series}: {text}"));
+    line[prefix.len()..].parse().unwrap()
+}
+
+/// `bd serve token events --kind <kind> --json` on the server's root.
+fn auth_events(server: &Server, kind: &str) -> Vec<Value> {
+    let root = server.root.path();
+    let out =
+        bd(root).args(["--json", "serve", "token", "events", "--kind", kind, "--root"]).arg(root).output().unwrap();
+    let events: Value = serde_json::from_str(&check(out, "token events")).unwrap();
+    events.as_array().unwrap().clone()
+}
+
+#[test]
+fn every_browser_approval_needs_a_passkey() {
+    let github = FakeGithub::start();
+    let (root, ids, op) = op_root(&github);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let ops = server.token("ops", "ops", &["--role", "admin"]);
+    let agent = server.client(&server.token("agent", AGENT, &[]));
+    let gate_status = |id: &str| -> Value {
+        let out = server.local("ops", &["--json", "gate", "show", id]);
+        serde_json::from_str::<Value>(&check(out, "gate show")).unwrap()["status"].clone()
+    };
+
+    // (a) The first approval registers a passkey with the same click.
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.human);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("data-passkey=\"create\""), "{}", signed.page);
+    let fields = passkey_fields(&signed.page);
+    let body = format!("approval={}&{fields}", signed.approval());
+    let (status, _, page) =
+        post_gate(&gate_url(&server, "proj", &ids.human), Some(PUBLIC), None, &signed.cookie(), &body);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(gate_status(&ids.human), "closed");
+    let credential = form_value(&fields, "credential").to_string();
+    let prefix = &credential[..12];
+    let public_key = form_value(&fields, "public_key");
+    let registered = auth_events(&server, "passkey_registered");
+    let alice: Vec<&Value> = registered.iter().filter(|e| e["actor"] == "github:alice").collect();
+    assert_eq!(alice.len(), 1, "{registered:?}");
+    let detail = alice[0]["detail"].as_str().unwrap();
+    assert!(detail.contains(prefix) && detail.contains("ES256"), "{detail}");
+    let shown = serde_json::to_string(&registered).unwrap();
+    assert!(!shown.contains(public_key) && !shown.contains(&credential), "{shown}");
+    assert_eq!(metric(&server, &ops, "bd_serve_passkeys_registered_total"), 1);
+
+    // (b) The next gate asks for that passkey; a post without the ceremony approves nothing.
+    let gate = &ids.spares[0];
+    let signed = approve_flow(&server, &github, "alice", "proj", gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("data-passkey=\"get\""), "{}", signed.page);
+    assert_eq!(page_attribute(&signed.page, "data-credentials").as_deref(), Some(credential.as_str()));
+    let body = format!("approval={}", signed.approval());
+    let (status, _, page) = post_gate(&gate_url(&server, "proj", gate), Some(PUBLIC), None, &signed.cookie(), &body);
+    assert_eq!(status, 403, "{page}");
+    assert!(page.contains("passkey check failed"), "{page}");
+    assert_eq!(gate_status(gate), "open");
+    assert!(closed_events(&server, gate).is_empty());
+    assert!(metric(&server, &ops, "bd_serve_approvals_total{outcome=\"passkey_refused\"}") >= 1);
+    assert_eq!(approvals_counted(&server, &ops).0, 1);
+
+    // (c) A fresh page, approved with the passkey.
+    let signed = approve_flow(&server, &github, "alice", "proj", gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = post_approval(&server, gate, &signed);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(gate_status(gate), "closed");
+    assert_eq!(approvals_counted(&server, &ops).0, 2);
+
+    // (d) Once an admin removes it, the next approval registers a new one.
+    let root = server.root.path();
+    let args = ["serve", "passkey", "remove", "--account", "github:alice", "--root"];
+    let out = bd(root).args(args).arg(root).output().unwrap();
+    assert!(check(out, "passkey remove").contains("Removed 1 passkey"));
+    let gate = &ids.spares[1];
+    let signed = approve_flow(&server, &github, "alice", "proj", gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("data-passkey=\"create\""), "{}", signed.page);
+    let (status, _, page) = post_approval(&server, gate, &signed);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(gate_status(gate), "closed");
+    assert_eq!(auth_events(&server, "passkey_removed").len(), 1);
+    assert_eq!(metric(&server, &ops, "bd_serve_passkeys_registered_total"), 2);
+
+    // (e) A close approved in the browser: refused without the ceremony, done with it.
+    let out = agent.run(&["close", &op.run, "--force", "-r", "abandoned"]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    let url = op_link(&stderr_of(&out));
+    let path = op_path("close", &op.run);
+    let signed = approve_op_flow(&server, &github, "alice", &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("data-passkey=\"get\""), "{}", signed.page);
+    let body = format!("approval={}", signed.approval());
+    let (status, _, page) = post_gate(&format!("{}{path}", server.base), Some(PUBLIC), None, &signed.cookie(), &body);
+    assert_eq!(status, 403, "{page}");
+    assert!(page.contains("passkey check failed"), "{page}");
+    assert_eq!(shown_on_host(&server, &op.run)["status"], "open");
+    assert!(closed_events(&server, &op.run).is_empty());
+    let signed = approve_op_flow(&server, &github, "alice", &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = post_op(&server, &path, &signed);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(shown_on_host(&server, &op.run)["status"], "closed");
+    assert_eq!(operations_not_zero(&server, &ops), [("approved", 1), ("passkey_refused", 1)]);
+}
+
+#[test]
+fn gate_approvals_are_logged_with_their_credential() {
+    let github = FakeGithub::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let (server, log) = logged_server(root, PUBLIC_URL);
+    let mut sent = Vec::new();
+
+    // Registered with the first approval.
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.human);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let fields = passkey_fields(&signed.page);
+    let body = format!("approval={}&{fields}", signed.approval());
+    let (status, _, page) =
+        post_gate(&gate_url(&server, "proj", &ids.human), Some(PUBLIC), None, &signed.cookie(), &body);
+    assert_eq!(status, 200, "{page}");
+    let credential = form_value(&fields, "credential").to_string();
+    sent.push(fields);
+
+    // Without the ceremony: refused.
+    let gate = &ids.spares[0];
+    let signed = approve_flow(&server, &github, "alice", "proj", gate);
+    let body = format!("approval={}", signed.approval());
+    let (status, _, page) = post_gate(&gate_url(&server, "proj", gate), Some(PUBLIC), None, &signed.cookie(), &body);
+    assert_eq!(status, 403, "{page}");
+
+    // Asserted with the passkey.
+    let signed = approve_flow(&server, &github, "alice", "proj", gate);
+    let fields = passkey_fields(&signed.page);
+    let body = format!("approval={}&{fields}", signed.approval());
+    let (status, _, page) = post_gate(&gate_url(&server, "proj", gate), Some(PUBLIC), None, &signed.cookie(), &body);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(form_value(&fields, "credential"), credential);
+    sent.push(fields);
+
+    let lines = || -> Vec<String> {
+        let text = std::fs::read_to_string(&log).unwrap();
+        text.lines().filter(|l| l.contains("gate approval")).map(String::from).collect()
+    };
+    eventually("the approvals' log lines", || lines().len() >= 3);
+    let lines = lines();
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+    let prefix = &credential[..12];
+    for (line, outcome, passkey, logged_credential) in [
+        (&lines[0], "approved", "registered", prefix),
+        (&lines[1], "passkey refused", "missing fields", ""),
+        (&lines[2], "approved", "verified", prefix),
+    ] {
+        assert_eq!(field(line, "outcome"), Some(outcome), "{line}");
+        assert_eq!(field(line, "passkey"), Some(passkey), "{line}");
+        assert_eq!(field(line, "credential"), Some(logged_credential), "{line}");
+        assert_eq!(field(line, "actor"), Some("github:alice"), "{line}");
+        assert_eq!(field(line, "workspace"), Some("proj"), "{line}");
+    }
+    assert_eq!(field(&lines[0], "gate"), Some(ids.human.as_str()));
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains(&credential), "never the whole credential id: {text}");
+    for fields in &sent {
+        for name in ["public_key", "signature", "authenticator_data", "client_data"] {
+            if let Some(value) = fields.split('&').find_map(|p| p.strip_prefix(name).and_then(|v| v.strip_prefix('=')))
+            {
+                assert!(!text.contains(value), "never {name}: {text}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -11499,7 +11793,7 @@ fn approvals_refuse_foreign_posts_replays_and_resolved_gates() {
     let signed = approve_flow(&server, &github, "alice", "proj", gate);
     assert_eq!(signed.status, 200, "{}", signed.page);
     assert!(signed.page.contains("Approval packet") && signed.page.contains("SPARE-PKT 1"), "{}", signed.page);
-    let body = format!("approval={}", signed.approval());
+    let body = format!("approval={}&{}", signed.approval(), passkey_fields(&signed.page));
     let cookie = signed.cookie();
 
     // Another site's form, or a post that does not say where it came from.
@@ -12377,7 +12671,7 @@ fn op_path(op: &str, id: &str) -> String {
 
 /// Approve what `signed` shows at `path`, from its browser, as the approval page posts it.
 fn post_op(server: &Server, path: &str, signed: &Signed) -> Answered {
-    let body = format!("approval={}", signed.approval());
+    let body = format!("approval={}&{}", signed.approval(), passkey_fields(&signed.page));
     post_gate(&format!("{}{path}", server.base), Some(PUBLIC), None, &signed.cookie(), &body)
 }
 
@@ -12387,7 +12681,7 @@ fn operations_counted(server: &Server, admin: &str) -> std::collections::BTreeMa
     let mut answer =
         agent.get(format!("{}/metrics", server.base)).header("authorization", format!("Bearer {admin}")).call();
     let text = answer.as_mut().unwrap().body_mut().read_to_string().unwrap();
-    ["approved", "refused", "not_ready", "gone", "busy", "failed"]
+    ["approved", "refused", "not_ready", "gone", "busy", "failed", "passkey_refused"]
         .into_iter()
         .map(|outcome| {
             let series = format!("bd_serve_operation_approvals_total{{outcome=\"{outcome}\"}} ");
@@ -12656,7 +12950,7 @@ fn operation_approvals_refuse_tampering_foreign_posts_replays_and_ineligible_peo
 #[test]
 fn operation_approvals_are_logged_once_each_without_the_reason() {
     let github = FakeGithub::start();
-    let (root, ids, _) = op_root(&github);
+    let (root, ids, op) = op_root(&github);
     let (server, log) = logged_server(root, PUBLIC_URL);
     let agent = server.client(&server.token("agent", AGENT, &[]));
     let out = agent.run(&["close", &ids.task, "--force", "-r", "SECRET-REASON-PKT"]);
@@ -12670,8 +12964,11 @@ fn operation_approvals_are_logged_once_each_without_the_reason() {
     let target = format!("{}{path}", server.base);
     let (status, _, _) = post_gate(&target, Some("https://evil.example"), None, &signed.cookie(), &body);
     assert_eq!(status, 403);
-    assert_eq!(post_op(&server, &path, &signed).0, 200);
-    assert_eq!(post_op(&server, &path, &signed).0, 400);
+    let fields = passkey_fields(&signed.page);
+    let credential = form_value(&fields, "credential").to_string();
+    let approving = format!("{body}&{fields}");
+    assert_eq!(post_gate(&target, Some(PUBLIC), None, &signed.cookie(), &approving).0, 200);
+    assert_eq!(post_gate(&target, Some(PUBLIC), None, &signed.cookie(), &approving).0, 400);
 
     // A callback from a client without the browser's cookie: refused, and logged as one too.
     github.next("alice", 0);
@@ -12683,13 +12980,22 @@ fn operation_approvals_are_logged_once_each_without_the_reason() {
     assert_eq!(status, 400, "{page}");
     assert!(page.contains("different browser"), "{page}");
 
+    // Another operation, posted without the passkey ceremony: refused as such.
+    let out = agent.run(&["close", &op.run, "--force", "-r", "SECRET-REASON-PKT"]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    let signed = approve_op_flow(&server, &github, "alice", &op_link(&stderr_of(&out)));
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let body = format!("approval={}", signed.approval());
+    let run_target = format!("{}{}", server.base, op_path("close", &op.run));
+    assert_eq!(post_gate(&run_target, Some(PUBLIC), None, &signed.cookie(), &body).0, 403);
+
     let lines = || -> Vec<String> {
         let text = std::fs::read_to_string(&log).unwrap();
         text.lines().filter(|l| l.contains("operation approval")).map(String::from).collect()
     };
-    eventually("the approvals' log lines", || lines().len() >= 4);
+    eventually("the approvals' log lines", || lines().len() >= 5);
     let lines = lines();
-    assert_eq!(lines.len(), 4, "{lines:#?}");
+    assert_eq!(lines.len(), 5, "{lines:#?}");
     let has = |line: &str, field: &str, value: &str| {
         line.contains(&format!("{field}={value}")) || line.contains(&format!("{field}=\"{value}\""))
     };
@@ -12709,8 +13015,24 @@ fn operation_approvals_are_logged_once_each_without_the_reason() {
     }
     // Only the provider the sign-in started with is known when its callback is refused.
     assert!(has(&lines[3], "provider", "github"), "{}", lines[3]);
+    // The credential's prefix once the passkey was checked; nothing before.
+    assert_eq!(field(&lines[1], "credential"), Some(&credential[..12]), "{}", lines[1]);
+    for line in [&lines[0], &lines[2], &lines[3]] {
+        assert_eq!(field(line, "credential"), Some(""), "{line}");
+    }
+    let refused = &lines[4];
+    assert_eq!(field(refused, "outcome"), Some("passkey_refused"), "{refused}");
+    assert_eq!(field(refused, "detail"), Some("passkey refused: missing fields"), "{refused}");
+    assert_eq!(field(refused, "credential"), Some(""), "{refused}");
+    assert_eq!(field(refused, "issue"), Some(op.run.as_str()), "{refused}");
+    assert_eq!(field(refused, "actor"), Some("github:alice"), "{refused}");
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(!text.contains("SECRET-REASON-PKT"), "never the reason: {text}");
+    assert!(!text.contains(&credential), "never the whole credential id: {text}");
+    for name in ["public_key", "authenticator_data", "client_data"] {
+        let value = form_value(&fields, name);
+        assert!(!text.contains(value), "never {name}: {text}");
+    }
 }
 
 #[test]

@@ -160,7 +160,7 @@ fn sign_in_help_names_no_products() {
         for product in ["github.com", "apple", "chatgpt", "claude.ai", "google"] {
             assert!(!text.contains(product), "`{path}`: help names {product:?}");
         }
-        if path.starts_with("bd remote") || path.starts_with("bd serve token") {
+        if path.starts_with("bd remote") || path.starts_with("bd serve token") || path.starts_with("bd serve passkey") {
             assert!(!text.contains("github:"), "`{path}`: examples must not use a github: account");
         }
     }
@@ -405,6 +405,8 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd serve token revoke",
         "bd serve token link",
         "bd serve token name",
+        "bd serve passkey list",
+        "bd serve passkey remove",
         "bd remote set",
         "bd remote login",
         "bd remote logout",

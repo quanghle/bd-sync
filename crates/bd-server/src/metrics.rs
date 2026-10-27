@@ -49,6 +49,9 @@ pub static PUBLISHES_REFUSED: Counter = Counter::new();
 /// that may not approve, a foreign post, a refusal at the approval).
 pub static APPROVALS: Counter = Counter::new();
 pub static APPROVALS_REFUSED: Counter = Counter::new();
+/// Gate approvals refused at the passkey: missing or failed WebAuthn fields,
+/// or an address passkeys cannot be used at.
+pub static APPROVALS_PASSKEY_REFUSED: Counter = Counter::new();
 /// Closes and discards approved in the browser after human gates refused
 /// them, by outcome (`oauth_server::authorize::operation::record`, the only
 /// place that counts them).
@@ -58,6 +61,9 @@ pub static OPERATIONS_NOT_READY: Counter = Counter::new();
 pub static OPERATIONS_GONE: Counter = Counter::new();
 pub static OPERATIONS_BUSY: Counter = Counter::new();
 pub static OPERATIONS_FAILED: Counter = Counter::new();
+pub static OPERATIONS_PASSKEY_REFUSED: Counter = Counter::new();
+/// Passkeys registered at a browser approval.
+pub static PASSKEYS_REGISTERED: Counter = Counter::new();
 /// Connections open now.
 pub static OPEN: AtomicI64 = AtomicI64::new(0);
 
@@ -136,7 +142,11 @@ pub fn render() -> String {
     counter(
         "approvals_total",
         "Human gates approved in the browser, by outcome.",
-        &[("{outcome=\"approved\"}", APPROVALS.get()), ("{outcome=\"refused\"}", APPROVALS_REFUSED.get())],
+        &[
+            ("{outcome=\"approved\"}", APPROVALS.get()),
+            ("{outcome=\"refused\"}", APPROVALS_REFUSED.get()),
+            ("{outcome=\"passkey_refused\"}", APPROVALS_PASSKEY_REFUSED.get()),
+        ],
     );
     counter(
         "operation_approvals_total",
@@ -148,7 +158,13 @@ pub fn render() -> String {
             ("{outcome=\"gone\"}", OPERATIONS_GONE.get()),
             ("{outcome=\"busy\"}", OPERATIONS_BUSY.get()),
             ("{outcome=\"failed\"}", OPERATIONS_FAILED.get()),
+            ("{outcome=\"passkey_refused\"}", OPERATIONS_PASSKEY_REFUSED.get()),
         ],
+    );
+    counter(
+        "passkeys_registered_total",
+        "Passkeys registered at a browser approval.",
+        &[("", PASSKEYS_REGISTERED.get())],
     );
     let _ = writeln!(
         out,
@@ -227,9 +243,18 @@ mod tests {
     fn approvals_render_by_outcome() {
         APPROVALS.add();
         APPROVALS_REFUSED.add();
+        APPROVALS_PASSKEY_REFUSED.add();
+        PASSKEYS_REGISTERED.add();
         let text = render();
         assert!(text.contains("# TYPE bd_serve_approvals_total counter"), "{text}");
-        for outcome in ["approved", "refused"] {
+        assert!(text.contains("# TYPE bd_serve_passkeys_registered_total counter"), "{text}");
+        let n = |series: &str| -> u64 {
+            let line = text.lines().find(|l| l.starts_with(&format!("{series} ")));
+            line.and_then(|l| l.rsplit(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0)
+        };
+        assert!(n("bd_serve_passkeys_registered_total") >= 1, "{text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("bd_serve_approvals_total")).count(), 3, "{text}");
+        for outcome in ["approved", "refused", "passkey_refused"] {
             let line =
                 text.lines().find(|l| l.starts_with(&format!("bd_serve_approvals_total{{outcome=\"{outcome}\"}} ")));
             let n: u64 = line.and_then(|l| l.rsplit(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
@@ -241,11 +266,11 @@ mod tests {
     fn operation_approvals_render_every_outcome() {
         let text = render();
         assert!(text.contains("# TYPE bd_serve_operation_approvals_total counter"), "{text}");
-        for outcome in ["approved", "refused", "not_ready", "gone", "busy", "failed"] {
+        for outcome in ["approved", "refused", "not_ready", "gone", "busy", "failed", "passkey_refused"] {
             let series = format!("bd_serve_operation_approvals_total{{outcome=\"{outcome}\"}} ");
             assert_eq!(text.lines().filter(|l| l.starts_with(&series)).count(), 1, "{outcome}: {text}");
         }
         let series = text.lines().filter(|l| l.starts_with("bd_serve_operation_approvals_total")).count();
-        assert_eq!(series, 6, "{text}");
+        assert_eq!(series, 7, "{text}");
     }
 }

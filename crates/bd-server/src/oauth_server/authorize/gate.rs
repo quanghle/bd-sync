@@ -18,11 +18,15 @@
 //!    an actor; a GitHub account matches by its actor); if so, the approval
 //!    page, with a cookie of its own. The approval kept in memory holds the
 //!    account's reference, computed from the identity the provider proved.
+//!    The page asks for a passkey (`super::passkey`): the account's first
+//!    is registered with the approval, later approvals use it; where the
+//!    issuer cannot be a relying party, a notice and no form ([`unavailable`]).
 //! 3. `POST` to the same path ([`approve`]): the approval, bound to that
-//!    cookie and posted once, resolves the gate as the account's actor
-//!    with the reference kept at step 2, never one the form names
-//!    ([`Gates::approve`]), its state, arming and approvers checked again in
-//!    the transaction.
+//!    cookie and posted once, then its passkey ceremony checked, resolves
+//!    the gate as the account's actor with the reference kept at step 2,
+//!    never one the form names ([`Gates::approve`]), its state, arming and
+//!    approvers checked again in the transaction. Each POST taken is logged
+//!    once ([`log_approval`]), with the credential's prefix once it decoded.
 
 use std::time::Duration;
 
@@ -31,8 +35,9 @@ use bd_core::Error;
 
 use super::super::pages::{self};
 use super::super::{CHOOSE, form};
+use super::passkey::{self, Failure, Prepared};
 use crate::oauth::{self, SignIn};
-use crate::{auth, metrics};
+use crate::{auth, metrics, webauthn};
 
 use super::*;
 
@@ -128,6 +133,53 @@ pub fn gate_id_ok(id: &str) -> bool {
 
 fn not_found() -> Answer {
     approval_not_found()
+}
+
+/// One `gate approval` log line: how a POST taken ended, for whom, and
+/// what the passkey ceremony made of it (`credential`: the first
+/// characters of its id once it decoded, else empty; `passkey`: a fixed
+/// phrase, empty before the ceremony was checked).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Logged {
+    pub(crate) outcome: &'static str,
+    pub(crate) provider: String,
+    pub(crate) login: String,
+    pub(crate) subject: String,
+    pub(crate) actor: String,
+    pub(crate) workspace: String,
+    pub(crate) gate: String,
+    pub(crate) credential: String,
+    pub(crate) passkey: &'static str,
+}
+
+/// Log `l`: the one place a gate approval is logged.
+fn log_approval(l: Logged) {
+    tracing::info!(
+        target: "bd::serve",
+        outcome = l.outcome,
+        provider = %l.provider,
+        login = %l.login,
+        subject = %l.subject,
+        actor = %l.actor,
+        workspace = %l.workspace,
+        gate = %l.gate,
+        credential = %l.credential,
+        passkey = l.passkey,
+        "gate approval"
+    );
+    #[cfg(test)]
+    LOGGED.with(|logged| logged.borrow_mut().push(l));
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOGGED: std::cell::RefCell<Vec<Logged>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// What [`log_approval`] logged on this thread since the last call.
+#[cfg(test)]
+pub(crate) fn take_logged() -> Vec<Logged> {
+    LOGGED.with(|logged| std::mem::take(&mut *logged.borrow_mut()))
 }
 
 fn refusal(status: u16, why: &str) -> Answer {
@@ -374,6 +426,14 @@ pub(super) fn signed_in(
         };
         return refusal(403, &bd_cli::io::printable(&why));
     }
+    let (ceremony, credentials) = match passkey::prepare(cx, user, &actor) {
+        Ok(Prepared::Ask { ceremony, credentials }) => (*ceremony, credentials),
+        Ok(Prepared::Unavailable(why)) => return unavailable(&label, user, &actor, workspace, gate, &info, why),
+        Err(Error::Busy(_) | Error::Locked(_)) => {
+            return refusal(503, "The server is busy. Try again in a moment.");
+        }
+        Err(e) => return internal(&e, "asking for a gate's approval"),
+    };
     let secrets = (|| Ok::<_, Error>((auth::random_hex(32)?, auth::random_hex(32)?, auth::random_hex(4)?)))();
     let (id, value, suffix) = match secrets {
         Ok(s) => s,
@@ -392,6 +452,7 @@ pub(super) fn signed_in(
         id: &id,
         action: &action,
         packet: info.packet.as_ref(),
+        passkey: passkey::ask(&ceremony, &credentials),
     });
     *fresh = Some(set_gate_cookie(cx.issuer, workspace, gate, &suffix, &value, STEP_TTL));
     let approval = Approval {
@@ -404,9 +465,52 @@ pub(super) fn signed_in(
         oidc_approver,
         browser: auth::hash(&value),
         cookie: suffix,
+        passkey: ceremony,
     };
     lock(cx.flows).approvals.put(auth::hash(&id), approval);
     Answer::Page(page)
+}
+
+/// The approval page of `info` where the issuer cannot be a WebAuthn
+/// relying party (`why`): what it would approve, a notice, and no form.
+/// Nothing is kept and no cookie set; the refusal is counted and logged.
+/// `provider` is the provider as the page names it.
+pub(super) fn unavailable(
+    provider: &str,
+    user: &auth::Identity,
+    actor: &str,
+    workspace: &str,
+    gate: &str,
+    info: &GateInfo,
+    why: webauthn::NoRp,
+) -> Answer {
+    metrics::APPROVALS_PASSKEY_REFUSED.add();
+    tracing::warn!(target: "bd::serve", reason = why.label(), "passkeys unavailable at this server's address");
+    log_approval(Logged {
+        outcome: "passkey refused",
+        provider: user.provider.clone(),
+        login: user.login.clone(),
+        subject: user.subject.clone(),
+        actor: actor.to_string(),
+        workspace: workspace.to_string(),
+        gate: gate.to_string(),
+        credential: String::new(),
+        passkey: "unavailable",
+    });
+    Answer::Page(pages::approve_gate(&pages::ApproveGate {
+        workspace,
+        gate: &info.id,
+        title: &info.title,
+        holds: &info.holds,
+        part_of: info.part_of.as_ref().map(|(id, title)| (id.as_str(), title.as_str())),
+        approvers: info.approvers.as_deref(),
+        provider,
+        actor,
+        id: "",
+        action: "",
+        packet: info.packet.as_ref(),
+        passkey: pages::PasskeyAsk::Unavailable { why },
+    }))
 }
 
 /// The page for a path that names no human gate: told only to a person
@@ -441,8 +545,8 @@ pub fn approve(cx: &Ctx<'_>, workspace: &str, gate: &str, body: &str, cookies: &
         return (not_found(), Vec::new());
     }
     let pairs = form::decode(body).unwrap_or_default();
-    let Some(id) = pairs.iter().find(|(k, _)| k == "approval").map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
-    else {
+    // Read only if it occurs exactly once, before anything is looked up or taken.
+    let Some(id) = form::single(&pairs, "approval").filter(|v| !v.is_empty()) else {
         return (refusal(400, "The form arrived incomplete. Open the gate's link again."), Vec::new());
     };
     let key = auth::hash(id);
@@ -475,7 +579,36 @@ pub fn approve(cx: &Ctx<'_>, workspace: &str, gate: &str, body: &str, cookies: &
         return (answer, cleared);
     }
     let actor = &approval.actor;
-    // The reference the sign-in proved, kept with the approval: nothing in the form is read but its id.
+    let logged = |outcome, credential: &str, passkey| Logged {
+        outcome,
+        provider: approval.provider.clone(),
+        login: approval.login.clone(),
+        subject: approval.subject.clone(),
+        actor: actor.clone(),
+        workspace: workspace.to_string(),
+        gate: gate.to_string(),
+        credential: credential.to_string(),
+        passkey,
+    };
+    // The passkey ceremony the page asked for, checked once the approval is taken: nothing is approved without it.
+    let verified = match passkey::verify(cx, &approval.passkey, &pairs) {
+        Ok(verified) => verified,
+        Err(Failure::Refused { why, credential }) => {
+            metrics::APPROVALS_PASSKEY_REFUSED.add();
+            log_approval(logged("passkey refused", &credential, why.label()));
+            return (refusal(403, pages::PASSKEY_FAILED_GATE), cleared);
+        }
+        Err(Failure::Store { error: Error::Busy(_) | Error::Locked(_), credential }) => {
+            log_approval(logged("busy", &credential, "store busy"));
+            return (refusal(503, "The server is busy. Open the gate's link again in a moment."), cleared);
+        }
+        Err(Failure::Store { error, credential }) => {
+            log_approval(logged("failed", &credential, "store failed"));
+            return (internal(&error, "checking a gate approval's passkey"), cleared);
+        }
+    };
+    // The reference the sign-in proved, kept with the approval: nothing in the form is read but its id and
+    // the passkey's fields.
     let (outcome, answer) = match cx.gates.approve(workspace, gate, actor, approval.oidc_approver.as_deref()) {
         Ok(Approved::Opened { unblocked, completed }) => {
             metrics::APPROVALS.add();
@@ -500,16 +633,6 @@ pub fn approve(cx: &Ctx<'_>, workspace: &str, gate: &str, body: &str, cookies: &
         }
         Err(e) => ("failed", internal(&e, "approving a gate")),
     };
-    tracing::info!(
-        target: "bd::serve",
-        outcome,
-        provider = %approval.provider,
-        login = %approval.login,
-        subject = %approval.subject,
-        %actor,
-        %workspace,
-        %gate,
-        "gate approval"
-    );
+    log_approval(logged(outcome, &verified.credential, verified.label()));
     (answer, cleared)
 }

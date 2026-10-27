@@ -232,6 +232,12 @@ pub fn forget_account(root: &Path, issuer: &str, subject: &str) -> Result<bool> 
     Ok(found)
 }
 
+/// The account `name` names (its actor, or its login), for an admin's
+/// commands: not found, or refused as ambiguous, as the token commands are.
+pub fn account_named(root: &Path, name: &str) -> Result<Account> {
+    one_account(&read(root)?.accounts, name).cloned()
+}
+
 /// The one account `name` names: its actor (unless linked accounts share
 /// it), else its latest login at one provider.
 fn one_account<'a>(accounts: &'a [Account], name: &str) -> Result<&'a Account> {

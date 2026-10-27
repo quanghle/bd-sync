@@ -190,6 +190,25 @@ pub(super) struct Consent {
     pub(super) cookie: String,
 }
 
+/// The passkey ceremony an approval page asked for (`super::passkey`):
+/// what its POST's WebAuthn fields are checked against.
+#[derive(Clone, Debug)]
+pub(super) struct Ceremony {
+    /// The single-use challenge the page gave the browser.
+    pub(super) challenge: [u8; 32],
+    /// The relying party id (the issuer's host) and the origin expected.
+    pub(super) rp_id: String,
+    pub(super) origin: String,
+    /// The account signed in: its passkeys are the ones it may use.
+    pub(super) issuer: String,
+    pub(super) subject: String,
+    pub(super) provider: String,
+    pub(super) actor: String,
+    /// Whether the page asked to register the account's first passkey
+    /// (`create()`), else to use one (`get()`).
+    pub(super) enroll: bool,
+}
+
 /// A human gate's approval page, shown to a person the rules let in:
 /// waiting for its one POST ([`super::gate::approve`]).
 #[derive(Debug)]
@@ -210,6 +229,8 @@ pub(super) struct Approval {
     pub(super) browser: String,
     /// What names its cookie.
     pub(super) cookie: String,
+    /// The passkey ceremony its POST must complete.
+    pub(super) passkey: Ceremony,
 }
 
 /// The approval page of a close or discard that human gates refused, shown
@@ -232,6 +253,8 @@ pub(super) struct OperationApproval {
     pub(super) browser: String,
     /// What names its cookie.
     pub(super) cookie: String,
+    /// The passkey ceremony its POST must complete.
+    pub(super) passkey: Ceremony,
 }
 
 /// Authorizations under way, by the hash of their secret at each step

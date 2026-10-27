@@ -40,6 +40,16 @@ pub fn decode(query: &str) -> Option<Vec<(String, String)>> {
         .collect()
 }
 
+/// The value of the one pair named `name`: None when no pair or several
+/// pairs have that name, so a field given twice is never read.
+pub fn single<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let mut found = pairs.iter().filter(|(k, _)| k == name);
+    match (found.next(), found.next()) {
+        (Some((_, value)), None) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
 fn unescape(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -79,5 +89,15 @@ mod tests {
         for bad in ["a=%", "a=%4", "a=%zz", "a=%+1", "a=%ff", "%c3=1"] {
             assert_eq!(decode(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn single_reads_a_field_only_when_it_occurs_once() {
+        let pairs = decode("a=1&b=2&b=2&c=3&c=4&d=").unwrap();
+        assert_eq!(single(&pairs, "a"), Some("1"));
+        assert_eq!(single(&pairs, "d"), Some(""));
+        assert_eq!(single(&pairs, "b"), None, "the same value twice");
+        assert_eq!(single(&pairs, "c"), None, "two values");
+        assert_eq!(single(&pairs, "e"), None, "none");
     }
 }

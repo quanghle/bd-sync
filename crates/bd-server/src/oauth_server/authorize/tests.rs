@@ -8,6 +8,8 @@ use super::super::form;
 use super::super::pages;
 use crate::auth;
 use crate::oauth::OauthConfig;
+use crate::passkeys;
+use crate::webauthn::testkit::{Fields, SoftKey, Tamper};
 use bd_cli::approval_link::{self, LinkKey, MAX_QUERY, Op, OperationRequest, TTL};
 
 use super::*;
@@ -359,7 +361,78 @@ fn gate_root(oidc: bool) -> tempfile::TempDir {
     }
     config.push_str("[oauth]\nredirect_hosts = [\"app.example\"]\n");
     std::fs::write(root.path().join("auth.toml"), config).unwrap();
+    // The OIDC account the approvals below were shown to, bound as a sign-in binds it: its passkey is kept for it.
+    let actor = auth::bind_account(root.path(), &acme(), true, "to approve gates").unwrap();
+    assert_eq!(actor, "acme:alice");
     root
+}
+
+/// The issuer and subject of the OIDC account [`approval`] signed in with.
+const ACME_ISSUER: &str = "https://login.example.com";
+const ACME_SUBJECT: &str = "00u7";
+
+fn acme() -> auth::Identity {
+    auth::Identity {
+        provider: "acme".into(),
+        issuer: ACME_ISSUER.into(),
+        subject: ACME_SUBJECT.into(),
+        login: "alice".into(),
+    }
+}
+
+/// A ceremony for the acme account, with a fresh challenge: registering its
+/// first passkey if `enroll`, else using one.
+fn ceremony(enroll: bool) -> Ceremony {
+    use ring::rand::SecureRandom;
+    let mut challenge = [0u8; 32];
+    ring::rand::SystemRandom::new().fill(&mut challenge).unwrap();
+    Ceremony::for_test(ACME_ISSUER, ACME_SUBJECT, enroll, challenge)
+}
+
+/// `fields` as an approval's form fields: a registration's if `enroll`,
+/// else an assertion's.
+fn webauthn_body(fields: &Fields, enroll: bool) -> String {
+    let b64 = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
+    let mut pairs = vec![
+        ("credential", b64(&fields.credential)),
+        ("client_data", b64(&fields.client_data)),
+        ("authenticator_data", b64(&fields.authenticator_data)),
+    ];
+    if enroll {
+        pairs.push(("public_key", b64(&fields.public_key)));
+        pairs.push(("algorithm", fields.algorithm.to_string()));
+    } else {
+        pairs.push(("signature", b64(&fields.signature)));
+    }
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    form::encode(&pairs)
+}
+
+/// `key`'s registration in `c`, as form fields.
+fn registration(key: &SoftKey, c: &Ceremony, t: &Tamper) -> String {
+    webauthn_body(&key.register(&c.expect(), t), true)
+}
+
+/// `key`'s assertion in `c` at `counter`, as form fields.
+fn assertion(key: &SoftKey, c: &Ceremony, counter: u32, t: &Tamper) -> String {
+    webauthn_body(&key.assert(&c.expect(), counter, t), false)
+}
+
+/// The credential id of `key`, base64url, and the prefix logs show of it.
+fn credential_of(key: &SoftKey) -> (String, String) {
+    let id = URL_SAFE_NO_PAD.encode(&key.credential);
+    let prefix = passkeys::prefix(&id).to_string();
+    (id, prefix)
+}
+
+/// The acme account's passkeys.
+fn kept_passkeys(root: &std::path::Path) -> Vec<passkeys::Passkey> {
+    passkeys::for_account(root, ACME_ISSUER, ACME_SUBJECT).unwrap()
+}
+
+/// The `kind` events kept in `root`'s server.db.
+fn events_of(root: &std::path::Path, kind: &str) -> Vec<crate::server_db::AuthEvent> {
+    crate::server_db::events(root, 0, None, &[kind.to_string()], 100).unwrap().into_iter().map(|e| e.event).collect()
 }
 
 fn with_ctx<T>(root: &std::path::Path, flows: &Mutex<Flows>, gates: &FakeGates, f: impl FnOnce(&Ctx<'_>) -> T) -> T {
@@ -456,8 +529,15 @@ fn reference() -> String {
     bd_core::gates::oidc_approver("https://login.example.com", "00u7")
 }
 
-/// An OIDC account's approval of bd-1, bound to the cookie `cookie` of value `value`.
+/// An OIDC account's approval of bd-1, bound to the cookie `cookie` of
+/// value `value`, registering its first passkey: for posts refused before
+/// the passkey is checked.
 fn approval(cookie: &str, value: &str) -> Approval {
+    approval_with(cookie, value, ceremony(true))
+}
+
+/// [`approval`], asking for the passkey ceremony `passkey`.
+fn approval_with(cookie: &str, value: &str, passkey: Ceremony) -> Approval {
     Approval {
         workspace: "proj".into(),
         gate: "bd-1".into(),
@@ -468,17 +548,23 @@ fn approval(cookie: &str, value: &str) -> Approval {
         oidc_approver: Some(reference()),
         browser: auth::hash(value),
         cookie: cookie.into(),
+        passkey,
     }
 }
 
 #[test]
 fn approvals_are_posted_once_from_their_own_browser() {
+    let _ = gate::take_logged();
     let root = gate_root(false);
     let flows = Mutex::new(Flows::default());
     let opened = Approved::Opened { unblocked: vec!["bd-2".into()], completed: vec![] };
     let gates = FakeGates::answering(opened);
     let value = "c".repeat(64);
     let cookies = format!("x=1; __Secure-bd_gate_ab12={value}");
+    let key = SoftKey::es256();
+    let (credential, prefix) = credential_of(&key);
+    let waiting = |id: &str| lock(&flows).approvals.get_mut(&auth::hash(id)).is_some();
+    let spent = |id: &str| lock(&flows).approvals_spent.get_mut(&auth::hash(id)).is_some();
     with_ctx(root.path(), &flows, &gates, |cx| {
         let post =
             |id: &str, gate: &str, cookies: &str| gate::approve(cx, "proj", gate, &format!("approval={id}"), cookies);
@@ -490,34 +576,134 @@ fn approvals_are_posted_once_from_their_own_browser() {
         let expired = post("old", "bd-1", &cookies);
         assert_eq!((page(&expired.0).status, html(&expired).contains("expired")), (400, true));
         assert_eq!(gates.calls(), 0);
-        lock(&flows).approvals.put(auth::hash("id1"), approval("ab12", &value));
-        // Another browser's: refused, and the approval stays for its own.
+        let enroll = ceremony(true);
+        lock(&flows).approvals.put(auth::hash("id1"), approval_with("ab12", &value, enroll.clone()));
+        let fields = registration(&key, &enroll, &Tamper::default());
+        // Another browser's: refused before the passkey is looked at, and the approval stays for its own.
         for other in
             ["", "__Secure-bd_gate_ab12=".to_string().as_str(), &format!("__Secure-bd_gate_ab12={}", "d".repeat(64))]
         {
             assert_eq!(page(&post("id1", "bd-1", other).0).status, 403, "{other:?}");
+            let body = format!("approval=id1&{fields}");
+            assert_eq!(page(&gate::approve(cx, "proj", "bd-1", &body, other).0).status, 403, "{other:?}");
         }
+        assert!(waiting("id1") && kept_passkeys(root.path()).is_empty());
         // Another gate's page: refused.
         assert_eq!(page(&post("id1", "bd-2", &cookies).0).status, 400);
         assert_eq!(gates.calls(), 0);
-        // The reference the sign-in proved goes with it, whatever else the form says.
+        assert_eq!(gate::take_logged(), vec![], "nothing taken, nothing logged");
+
+        // A registration without user verification: refused, nothing stored, nothing approved.
+        let uv = ceremony(true);
+        lock(&flows).approvals.put(auth::hash("idU"), approval_with("ab12", &value, uv.clone()));
+        let body =
+            format!("approval=idU&{}", registration(&key, &uv, &Tamper { flags: Some(0x41), ..Tamper::default() }));
+        let (answer, _) = gate::approve(cx, "proj", "bd-1", &body, &cookies);
+        assert_eq!(page(&answer).status, 403, "{}", page(&answer).html);
+        assert!(page(&answer).html.contains("passkey"), "{}", page(&answer).html);
+        assert!(kept_passkeys(root.path()).is_empty() && events_of(root.path(), "passkey_registered").is_empty());
+        let logged = gate::take_logged();
+        assert_eq!(logged.len(), 1);
+        assert_eq!((logged[0].outcome, logged[0].passkey), ("passkey refused", "user not verified"));
+        assert_eq!(logged[0].credential, prefix);
+        // A field sent twice: malformed, refused.
+        let dup = ceremony(true);
+        lock(&flows).approvals.put(auth::hash("idD"), approval_with("ab12", &value, dup.clone()));
+        let fields_dup = registration(&key, &dup, &Tamper::default());
+        let body = format!("approval=idD&{fields_dup}&credential={credential}");
+        let (answer, _) = gate::approve(cx, "proj", "bd-1", &body, &cookies);
+        assert_eq!(page(&answer).status, 403);
+        let logged = gate::take_logged();
+        assert_eq!(
+            (logged[0].outcome, logged[0].passkey, logged[0].credential.as_str()),
+            ("passkey refused", "malformed fields", "")
+        );
+        assert!(kept_passkeys(root.path()).is_empty());
+        assert_eq!(gates.calls(), 0);
+
+        // The reference the sign-in proved goes with it, whatever else the form says; the passkey registered.
         let other = bd_core::gates::oidc_approver("https://login.example.com", "00u8");
-        let body = format!("approval=id1&oidc_approver={other}&actor=acme:bob");
+        let body = format!("approval=id1&{fields}&oidc_approver={other}&actor=acme:bob&reason=x");
         let (answer, set) = gate::approve(cx, "proj", "bd-1", &body, &cookies);
         assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
         let call: Call = ("proj".into(), "bd-1".into(), "acme:alice".into(), Some(reference()));
         assert_eq!(*gates.calls.lock().unwrap(), [call]);
         assert_eq!(set, vec![set_gate_cookie(ISSUER, "proj", "bd-1", "ab12", "", Duration::ZERO)], "cleared");
+        let kept = kept_passkeys(root.path());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].credential.as_str(), kept[0].alg_name(), kept[0].counter),
+            (credential.as_str(), "ES256", 0)
+        );
+        let registered = events_of(root.path(), "passkey_registered");
+        assert_eq!(registered.len(), 1);
+        assert_eq!(registered[0].actor.as_deref(), Some("acme:alice"));
+        assert!(registered[0].detail.as_deref().unwrap().contains(&format!("credential {prefix} (ES256)")));
         let again = post("id1", "bd-1", &cookies);
         assert_eq!((page(&again.0).status, html(&again).contains("already used")), (400, true));
         assert_eq!(gates.calls(), 1);
+
+        // The approval's id alone: taken, refused at the passkey, nothing approved; then used.
+        lock(&flows).approvals.put(auth::hash("idX"), approval_with("ab12", &value, ceremony(false)));
+        let (answer, _) = gate::approve(cx, "proj", "bd-1", "approval=idX", &cookies);
+        assert_eq!(page(&answer).status, 403);
+        assert!(page(&answer).html.contains(&pages::escape(pages::PASSKEY_FAILED_GATE)), "{}", page(&answer).html);
+        assert_eq!(gates.calls(), 1);
+        let again = post("idX", "bd-1", &cookies);
+        assert_eq!((page(&again.0).status, html(&again).contains("already used")), (400, true));
+
+        // The approval id twice, the same or two values: incomplete, before anything is taken or checked.
+        let assert_y = ceremony(false);
+        lock(&flows).approvals.put(auth::hash("idY"), approval_with("ab12", &value, assert_y.clone()));
+        let fields_y = assertion(&key, &assert_y, 1, &Tamper::default());
+        for twice in ["approval=idY&approval=idY", "approval=idY&approval=idX"] {
+            let (answer, set) = gate::approve(cx, "proj", "bd-1", &format!("{twice}&{fields_y}"), &cookies);
+            assert_eq!(page(&answer).status, 400, "{twice}");
+            assert!(page(&answer).html.contains("incomplete"), "{}", page(&answer).html);
+            assert!(set.is_empty(), "{twice}");
+            assert!(waiting("idY") && !spent("idY"), "{twice}");
+        }
+        let kept = kept_passkeys(root.path());
+        assert_eq!((kept.len(), kept[0].counter, kept[0].last_used_at), (1, 0, None));
+        assert_eq!(gates.calls(), 1);
+        let (answer, _) = gate::approve(cx, "proj", "bd-1", &format!("approval=idY&{fields_y}"), &cookies);
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert_eq!(gates.calls(), 2);
+        let kept = kept_passkeys(root.path());
+        assert_eq!(kept[0].counter, 1);
+        assert!(kept[0].last_used_at.is_some());
+
+        // What was logged: the prefix once the credential decoded, never more of it, nor the key.
+        let logged = gate::take_logged();
+        let lines: Vec<(&str, &str, &str)> =
+            logged.iter().map(|l| (l.outcome, l.credential.as_str(), l.passkey)).collect();
+        assert_eq!(
+            lines,
+            [
+                ("approved", prefix.as_str(), "registered"),
+                ("passkey refused", "", "missing fields"),
+                ("approved", prefix.as_str(), "verified"),
+            ]
+        );
+        let public_key = URL_SAFE_NO_PAD.encode(key.spki());
+        for l in &logged {
+            assert_eq!((l.actor.as_str(), l.workspace.as_str(), l.gate.as_str()), ("acme:alice", "proj", "bd-1"));
+            let line = format!("{l:?}");
+            assert!(!line.contains(&credential) && !line.contains(&public_key), "{line}");
+        }
     });
     let gates = FakeGates::answering(Approved::NotArmed);
     with_ctx(root.path(), &flows, &gates, |cx| {
-        lock(&flows).approvals.put(auth::hash("id2"), approval("ab12", &value));
-        let (answer, _) = gate::approve(cx, "proj", "bd-1", "approval=id2", &cookies);
+        // id1's passkey, in a ceremony of its own: the gate is asked, and is no longer ready.
+        let use_it = ceremony(false);
+        lock(&flows).approvals.put(auth::hash("id2"), approval_with("ab12", &value, use_it.clone()));
+        let body = format!("approval=id2&{}", assertion(&key, &use_it, 2, &Tamper::default()));
+        let (answer, _) = gate::approve(cx, "proj", "bd-1", &body, &cookies);
         assert_eq!(page(&answer).status, 409);
         assert!(page(&answer).html.contains("not ready"), "{}", page(&answer).html);
+        assert_eq!(gates.calls(), 1);
+        let logged = gate::take_logged();
+        assert_eq!((logged[0].outcome, logged[0].credential.as_str()), ("not ready", prefix.as_str()));
     });
     let mut flows = Flows::default();
     for i in 0..=MAX_FLOWS {
@@ -525,6 +711,209 @@ fn approvals_are_posted_once_from_their_own_browser() {
     }
     assert_eq!(flows.approvals.map.len(), MAX_FLOWS);
     assert!(flows.approvals.take("0").is_none(), "the oldest went first");
+}
+
+/// Post `fields` for a fresh approval (`id`) asking for `c`, from its own browser.
+fn post_gate(cx: &Ctx<'_>, flows: &Mutex<Flows>, id: &str, c: &Ceremony, fields: &str) -> (Answer, Vec<String>) {
+    let value = "c".repeat(64);
+    lock(flows).approvals.put(auth::hash(id), approval_with("ab12", &value, c.clone()));
+    let cookies = format!("__Secure-bd_gate_ab12={value}");
+    gate::approve(cx, "proj", "bd-1", &format!("approval={id}&{fields}"), &cookies)
+}
+
+#[test]
+fn an_enrolled_account_approves_with_its_passkey_only() {
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let key = SoftKey::es256();
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let enroll = ceremony(true);
+        let (answer, _) = post_gate(cx, &flows, "e", &enroll, &registration(&key, &enroll, &Tamper::default()));
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        // A valid assertion approves, moving the counter on and noting the passkey used.
+        let first = ceremony(false);
+        let fields = assertion(&key, &first, 5, &Tamper::default());
+        assert_eq!(page(&post_gate(cx, &flows, "a1", &first, &fields).0).status, 200);
+        let kept = kept_passkeys(root.path());
+        assert_eq!((kept[0].counter, kept[0].last_used_at.is_some()), (5, true));
+        assert_eq!(gates.calls(), 2);
+        // The same assertion on a fresh approval: its challenge is not this one's.
+        assert_eq!(page(&post_gate(cx, &flows, "a2", &ceremony(false), &fields).0).status, 403);
+        // Another account's passkey, and a counter that went back, and a credential nobody registered.
+        let bob = auth::Identity { subject: "00u8".into(), login: "bob".into(), ..acme() };
+        auth::bind_account(root.path(), &bob, true, "test").unwrap();
+        let bobs = SoftKey::es256();
+        let bob_enroll = Ceremony::for_test(ACME_ISSUER, "00u8", true, [3; 32]);
+        let fields = registration(&bobs, &bob_enroll, &Tamper::default());
+        assert_eq!(page(&post_gate(cx, &flows, "b", &bob_enroll, &fields).0).status, 200);
+        let c = ceremony(false);
+        assert_eq!(page(&post_gate(cx, &flows, "a3", &c, &assertion(&bobs, &c, 1, &Tamper::default())).0).status, 403);
+        let c = ceremony(false);
+        assert_eq!(page(&post_gate(cx, &flows, "a4", &c, &assertion(&key, &c, 5, &Tamper::default())).0).status, 403);
+        let c = ceremony(false);
+        let stranger = SoftKey::es256();
+        let fields = assertion(&stranger, &c, 9, &Tamper::default());
+        assert_eq!(page(&post_gate(cx, &flows, "a5", &c, &fields).0).status, 403);
+        assert_eq!(gates.calls(), 3, "only the enrollments and the first assertion approved");
+        let passkeys: Vec<&str> = gate::take_logged().iter().map(|l| l.passkey).collect();
+        assert_eq!(
+            passkeys,
+            [
+                "registered",
+                "verified",
+                "wrong challenge",
+                "registered",
+                "another account's credential",
+                "counter regression",
+                "unknown credential"
+            ]
+        );
+        assert_eq!(kept_passkeys(root.path())[0].counter, 5, "unchanged by the refusals");
+    });
+
+    // RS256: a 256-byte signature, 342 characters.
+    let root = gate_root(false);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let key = SoftKey::rs256();
+        let enroll = ceremony(true);
+        let (answer, _) = post_gate(cx, &flows, "r1", &enroll, &registration(&key, &enroll, &Tamper::default()));
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert_eq!(kept_passkeys(root.path())[0].alg_name(), "RS256");
+        let c = ceremony(false);
+        let fields = key.assert(&c.expect(), 1, &Tamper::default());
+        assert_eq!(URL_SAFE_NO_PAD.encode(&fields.signature).len(), 342);
+        assert_eq!(page(&post_gate(cx, &flows, "r2", &c, &webauthn_body(&fields, false)).0).status, 200);
+    });
+    let _ = gate::take_logged();
+}
+
+#[test]
+fn webauthn_fields_are_capped_before_they_are_decoded() {
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let key = SoftKey::es256();
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let enroll = ceremony(true);
+        let (answer, _) = post_gate(cx, &flows, "e", &enroll, &registration(&key, &enroll, &Tamper::default()));
+        assert_eq!(page(&answer).status, 200);
+        let _ = gate::take_logged();
+        let fields = |credential: &str, signature: &str, c: &Ceremony| {
+            let real = key.assert(&c.expect(), 1, &Tamper::default());
+            form::encode(&[
+                ("credential", credential),
+                ("client_data", &URL_SAFE_NO_PAD.encode(&real.client_data)),
+                ("authenticator_data", &URL_SAFE_NO_PAD.encode(&real.authenticator_data)),
+                ("signature", signature),
+            ])
+        };
+        let real_id = URL_SAFE_NO_PAD.encode(&key.credential);
+        let sig = URL_SAFE_NO_PAD.encode(key.assert(&ceremony(false).expect(), 1, &Tamper::default()).signature);
+        for (n, (credential, signature, passkey)) in [
+            // 1023 bytes, 1364 characters: within the cap, an unknown credential.
+            (URL_SAFE_NO_PAD.encode([7u8; 1023]), sig.clone(), "unknown credential"),
+            (format!("{}A", URL_SAFE_NO_PAD.encode([7u8; 1023])), sig.clone(), "malformed fields"),
+            // 600 bytes, 800 characters: within the cap, a bad signature.
+            (real_id.clone(), URL_SAFE_NO_PAD.encode([7u8; 600]), "bad signature"),
+            (real_id.clone(), format!("{}A", URL_SAFE_NO_PAD.encode([7u8; 600])), "malformed fields"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(matches!(credential.len(), 1364 | 1365) || matches!(signature.len(), 800 | 801));
+            let c = ceremony(false);
+            let (answer, _) = post_gate(cx, &flows, &format!("cap{n}"), &c, &fields(&credential, &signature, &c));
+            assert_eq!(page(&answer).status, 403, "{passkey}");
+            let logged = gate::take_logged();
+            assert_eq!(logged[0].passkey, passkey, "{n}");
+        }
+        assert_eq!(gates.calls(), 1);
+    });
+}
+
+#[test]
+fn store_failures_after_decoding_keep_the_credential_prefix() {
+    use operation::{Outcome, take_recorded_with_credential};
+    let _ = gate::take_logged();
+    let _ = take_recorded_with_credential();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let key = SoftKey::es256();
+    let (_, prefix) = credential_of(&key);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let enroll = ceremony(true);
+        let (answer, _) = post_gate(cx, &flows, "e", &enroll, &registration(&key, &enroll, &Tamper::default()));
+        assert_eq!(page(&answer).status, 200);
+    });
+    let _ = gate::take_logged();
+    // The table gone at version 4: every lookup fails, and server.db is not migrated again.
+    let conn = rusqlite::Connection::open(crate::server_db::path(root.path())).unwrap();
+    conn.execute_batch("DROP TABLE passkeys").unwrap();
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    assert_eq!(version, 4);
+    drop(conn);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let c = ceremony(false);
+        let (answer, _) = post_gate(cx, &flows, "g", &c, &assertion(&key, &c, 1, &Tamper::default()));
+        assert_eq!(page(&answer).status, 500);
+    });
+    assert_eq!(gates.calls(), 1, "the enrollment only");
+    let logged = gate::take_logged();
+    assert_eq!(logged.len(), 1);
+    assert_eq!((logged[0].outcome, logged[0].credential.as_str()), ("failed", prefix.as_str()));
+    // An operation's the same way.
+    let ops = FakeOperations::new(OpFound::NoIssue, Performed::Closed);
+    let value = "c".repeat(64);
+    let cookies = format!("__Secure-bd_op_ab12={value}");
+    with_ops(root.path(), &flows, &ops, |cx| {
+        let c = ceremony(false);
+        let approval =
+            OperationApproval { passkey: c.clone(), ..op_approval("ab12", &value, close_request("proj", "bd-1")) };
+        lock(&flows).operations.put(auth::hash("o"), approval);
+        let body = format!("approval=o&{}", assertion(&key, &c, 1, &Tamper::default()));
+        let (answer, _) = operation::approve(cx, "proj", "close", "bd-1", &body, &cookies);
+        assert_eq!(page(&answer).status, 500);
+    });
+    assert!(ops.performs().is_empty());
+    let recorded = take_recorded_with_credential();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        (recorded[0].0.0, recorded[0].0.4, recorded[0].1.as_str()),
+        (Outcome::Failed, "internal error", prefix.as_str())
+    );
+}
+
+#[test]
+fn a_gate_on_an_ip_address_shows_a_notice() {
+    let _ = gate::take_logged();
+    let before = crate::metrics::APPROVALS_PASSKEY_REFUSED.get();
+    let info = GateInfo {
+        id: "bd-1".into(),
+        title: "Ship it".into(),
+        resolved: false,
+        armed: true,
+        approvers: None,
+        holds: vec![],
+        part_of: None,
+        packet: None,
+    };
+    let answer =
+        gate::unavailable("Acme SSO", &acme(), "acme:alice", "proj", "bd-1", &info, crate::webauthn::NoRp::IpLiteral);
+    let p = page(&answer);
+    assert!(!p.html.contains("<form") && !p.html.contains("<script"), "{}", p.html);
+    assert!(p.html.contains(&pages::escape(pages::PASSKEY_UNAVAILABLE_HOST)), "{}", p.html);
+    assert!(crate::metrics::APPROVALS_PASSKEY_REFUSED.get() > before);
+    let logged = gate::take_logged();
+    assert_eq!(logged.len(), 1);
+    assert_eq!(
+        (logged[0].outcome, logged[0].credential.as_str(), logged[0].passkey),
+        ("passkey refused", "", "unavailable")
+    );
+    assert_eq!((logged[0].actor.as_str(), logged[0].provider.as_str()), ("acme:alice", "acme"));
 }
 
 #[test]
@@ -681,12 +1070,26 @@ fn op_cookies_are_strict_to_their_page() {
 fn each_outcome_is_recorded_once_per_call() {
     use operation::{Outcome, Who, record, take_recorded};
     let _ = take_recorded();
-    let who = Who { provider: "github", login: "alice", subject: "1", actor: "github:alice" };
+    let who =
+        Who { provider: "github", login: "alice", subject: "1", actor: "github:alice", credential: "AAAAAAAAAAAA" };
     record(Outcome::Approved, &who, "proj", "close", "bd-1", "performed");
-    assert_eq!(take_recorded(), vec![(Outcome::Approved, "proj".into(), "close".into(), "bd-1".into(), "performed")]);
+    assert_eq!(
+        operation::take_recorded_with_credential(),
+        vec![(
+            (Outcome::Approved, "proj".into(), "close".into(), "bd-1".into(), "performed"),
+            "AAAAAAAAAAAA".to_string()
+        )]
+    );
     assert_eq!(take_recorded(), vec![], "drained");
-    let outcomes =
-        [Outcome::Approved, Outcome::Refused, Outcome::NotReady, Outcome::Gone, Outcome::Busy, Outcome::Failed];
+    let outcomes = [
+        Outcome::Approved,
+        Outcome::Refused,
+        Outcome::NotReady,
+        Outcome::Gone,
+        Outcome::Busy,
+        Outcome::Failed,
+        Outcome::PasskeyRefused,
+    ];
     for outcome in outcomes {
         record(outcome, &Who::provider_only("acme"), "proj", "discard", "bd-2", "flow expired");
     }
@@ -694,8 +1097,8 @@ fn each_outcome_is_recorded_once_per_call() {
     assert_eq!(recorded.iter().map(|r| r.0).collect::<Vec<_>>(), outcomes);
     assert!(recorded.iter().all(|r| (r.1.as_str(), r.2.as_str(), r.3.as_str()) == ("proj", "discard", "bd-2")));
     let labels: Vec<_> = outcomes.iter().map(|o| o.label()).collect();
-    assert_eq!(labels, ["approved", "refused", "not_ready", "gone", "busy", "failed"]);
-    assert_eq!(Who::provider_only("acme"), Who { provider: "acme", login: "", subject: "", actor: "" });
+    assert_eq!(labels, ["approved", "refused", "not_ready", "gone", "busy", "failed", "passkey_refused"]);
+    assert_eq!(Who::provider_only("acme"), Who { provider: "acme", login: "", subject: "", actor: "", credential: "" });
 }
 
 /// What [`FakeOperations::perform`] was asked: the request, the actor and the OIDC approver reference.
@@ -750,13 +1153,24 @@ fn with_ops<T>(
     operations: &FakeOperations,
     f: impl FnOnce(&Ctx<'_>) -> T,
 ) -> T {
+    with_ops_at(ISSUER, root, flows, operations, f)
+}
+
+/// [`with_ops`], at `issuer`.
+fn with_ops_at<T>(
+    issuer: &str,
+    root: &std::path::Path,
+    flows: &Mutex<Flows>,
+    operations: &FakeOperations,
+    f: impl FnOnce(&Ctx<'_>) -> T,
+) -> T {
     let documents = super::super::cimd::Documents::new();
     let exists = |_: &str| true;
     let gates = FakeGates::answering(Approved::Resolved);
     let key = link_key();
     f(&Ctx {
         root,
-        issuer: ISSUER,
+        issuer,
         documents: &documents,
         flows,
         workspace_exists: &exists,
@@ -1147,6 +1561,51 @@ fn an_operation_page_is_shown_only_to_an_admitted_person_who_may_open_every_gate
     assert!(fresh.ends_with("; Path=/bd/w/proj/close/bd-1; Max-Age=600; HttpOnly; SameSite=Strict; Secure"), "{fresh}");
     assert_eq!(take_recorded(), vec![], "a page shown ends nothing");
     assert_eq!(ops.finds(), 1);
+    // The account's first approval registers its passkey, with the page's one script.
+    assert!(p.html.contains("data-passkey=\"create\"") && p.html.contains("data-rp=\"bd.example.com\""), "{}", p.html);
+    assert_eq!(p.html.matches("<script").count(), 1);
+    let script = p.html.split("<script>").nth(1).unwrap().split("</script>").next().unwrap();
+    assert_eq!(script, pages::APPROVE);
+    // Once it has one, the page asks for it.
+    let user = admitted_as(auth::Kind::Human).user;
+    let row = passkeys::NewRow {
+        credential: "AAAAAAAAAAAAx1zQ",
+        issuer: &user.issuer,
+        subject: &user.subject,
+        provider: &user.provider,
+        actor: "github:alice",
+        alg: crate::webauthn::Alg::Es256,
+        public_key: &SoftKey::es256().spki(),
+        counter: 0,
+    };
+    assert_eq!(passkeys::insert_first(root.path(), &row).unwrap(), passkeys::Inserted::Inserted);
+    let (answer, _, waiting) = run(&ops, Ok(admitted_as(auth::Kind::Human)), &cookies);
+    let p = page(&answer);
+    assert_eq!((p.status, waiting), (200, 1));
+    assert!(p.html.contains("data-passkey=\"get\"") && p.html.contains("data-credentials=\"AAAAAAAAAAAAx1zQ\""));
+    assert_eq!(take_recorded(), vec![]);
+
+    // An address passkeys cannot be used at: the page says so, has no form, keeps nothing and sets no cookie.
+    let at = "http://127.0.0.1:7420";
+    let cookies = sent(&set_request_cookies(at, &flow.digest, &token, STEP_TTL));
+    let flows = Mutex::new(Flows::default());
+    let mut fresh = None;
+    let answer = with_ops_at(at, root.path(), &flows, &ops, |cx| {
+        operation::after_sign_in(
+            cx,
+            "GitHub",
+            "github",
+            Ok(admitted_as(auth::Kind::Human)),
+            &flow,
+            &cookies,
+            &mut fresh,
+        )
+    });
+    let p = page(&answer);
+    assert!(!p.html.contains("<form") && !p.html.contains("<script"), "{}", p.html);
+    assert!(p.html.contains(&pages::escape(pages::PASSKEY_UNAVAILABLE_HOST)), "{}", p.html);
+    assert_eq!((fresh, lock(&flows).operations.map.len()), (None, 0));
+    assert_eq!(take_recorded(), recorded(Outcome::PasskeyRefused, "passkeys unavailable at this address"));
 }
 
 /// An OIDC account's approval of `request`, bound to the cookie `cookie` of value `value`.
@@ -1160,12 +1619,13 @@ fn op_approval(cookie: &str, value: &str, request: OperationRequest) -> Operatio
         oidc_approver: Some(reference()),
         browser: auth::hash(value),
         cookie: cookie.into(),
+        passkey: ceremony(true),
     }
 }
 
 #[test]
 fn operation_approvals_are_posted_once_from_their_own_browser_and_recorded_once() {
-    use operation::{Outcome, take_recorded};
+    use operation::{Outcome, take_recorded, take_recorded_with_credential};
     let _ = take_recorded();
     let root = gate_root(false);
     let flows = Mutex::new(Flows::default());
@@ -1175,6 +1635,10 @@ fn operation_approvals_are_posted_once_from_their_own_browser_and_recorded_once(
     let request = close_request("proj", "bd-1");
     let one =
         |outcome: Outcome, detail: &'static str| vec![(outcome, "proj".into(), "close".into(), "bd-1".into(), detail)];
+    let key = SoftKey::es256();
+    let (credential, prefix) = credential_of(&key);
+    let enroll = ceremony(true);
+    let waiting = |id: &str| lock(&flows).operations.get_mut(&auth::hash(id)).is_some();
     with_ops(root.path(), &flows, &ops, |cx| {
         let post = |id: &str, issue: &str, cookies: &str| {
             operation::approve(cx, "proj", "close", issue, &format!("approval={id}"), cookies)
@@ -1185,12 +1649,25 @@ fn operation_approvals_are_posted_once_from_their_own_browser_and_recorded_once(
         let incomplete = operation::approve(cx, "proj", "close", "bd-1", "", &cookies);
         assert_eq!(page(&incomplete.0).status, 400);
         assert_eq!(take_recorded(), one(Outcome::Refused, "form incomplete"));
-        lock(&flows).operations.put(auth::hash("id1"), op_approval("ab12", &value, request.clone()));
-        // Another browser's: refused, and the approval stays for its own.
+        let id1 = OperationApproval { passkey: enroll.clone(), ..op_approval("ab12", &value, request.clone()) };
+        lock(&flows).operations.put(auth::hash("id1"), id1);
+        let fields = registration(&key, &enroll, &Tamper::default());
+        // Another browser's: refused before the passkey is looked at, and the approval stays for its own.
         for other in ["", "__Secure-bd_op_ab12=", &format!("__Secure-bd_op_ab12={}", "d".repeat(64))] {
             assert_eq!(page(&post("id1", "bd-1", other).0).status, 403, "{other:?}");
             assert_eq!(take_recorded(), one(Outcome::Refused, "different browser"));
+            let body = format!("approval=id1&{fields}");
+            assert_eq!(page(&operation::approve(cx, "proj", "close", "bd-1", &body, other).0).status, 403);
+            assert_eq!(take_recorded(), one(Outcome::Refused, "different browser"));
         }
+        // The approval id twice: incomplete, nothing taken.
+        for twice in ["approval=id1&approval=id1", "approval=id1&approval=nope"] {
+            let body = format!("{twice}&{fields}");
+            assert_eq!(page(&operation::approve(cx, "proj", "close", "bd-1", &body, &cookies).0).status, 400);
+            assert_eq!(take_recorded(), one(Outcome::Refused, "form incomplete"));
+            assert!(waiting("id1"), "{twice}");
+        }
+        assert!(kept_passkeys(root.path()).is_empty());
         // Another path: refused.
         assert_eq!(page(&post("id1", "bd-2", &cookies).0).status, 400);
         assert_eq!(
@@ -1200,14 +1677,37 @@ fn operation_approvals_are_posted_once_from_their_own_browser_and_recorded_once(
         assert_eq!(page(&operation::approve(cx, "proj", "discard", "bd-1", "approval=id1", &cookies).0).status, 400);
         assert_eq!(take_recorded().len(), 1);
         assert!(ops.performs().is_empty());
+        // The approval's id alone: taken, refused at the passkey, nothing performed.
+        lock(&flows).operations.put(auth::hash("idM"), op_approval("ab12", &value, request.clone()));
+        assert_eq!(page(&post("idM", "bd-1", &cookies).0).status, 403);
+        assert_eq!(
+            take_recorded_with_credential(),
+            vec![(
+                (
+                    Outcome::PasskeyRefused,
+                    "proj".into(),
+                    "close".into(),
+                    "bd-1".into(),
+                    "passkey refused: missing fields"
+                ),
+                String::new()
+            )]
+        );
+        assert_eq!(page(&post("idM", "bd-1", &cookies).0).status, 400);
+        assert_eq!(take_recorded(), one(Outcome::Refused, "already used"));
+        assert!(ops.performs().is_empty());
         // The sealed request and the reference the sign-in proved, whatever else the form says.
-        let body = format!("approval=id1&reason=other&force=false&actor=acme:bob&oidc_approver={}", "x".repeat(8));
+        let body =
+            format!("approval=id1&{fields}&reason=other&force=false&actor=acme:bob&oidc_approver={}", "x".repeat(8));
         let (answer, set) = operation::approve(cx, "proj", "close", "bd-1", &body, &cookies);
         assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
         assert_eq!(ops.performs(), vec![(request.clone(), "acme:alice".to_string(), Some(reference()))]);
         assert_eq!(ops.performs()[0].0.reason.as_deref(), Some("  why\n"), "byte for byte");
         assert_eq!(set, vec![set_op_cookie(ISSUER, "proj", "close", "bd-1", "ab12", "", Duration::ZERO)], "cleared");
-        assert_eq!(take_recorded(), one(Outcome::Approved, "performed"));
+        let recorded = take_recorded_with_credential();
+        assert_eq!(recorded, vec![(one(Outcome::Approved, "performed").remove(0), prefix.clone())]);
+        assert_ne!(prefix, credential);
+        assert_eq!(kept_passkeys(root.path()).len(), 1);
         let again = post("id1", "bd-1", &cookies);
         assert_eq!(page(&again.0).status, 400);
         assert!(page(&again.0).html.contains("already used"), "{}", page(&again.0).html);
@@ -1221,20 +1721,27 @@ fn operation_approvals_are_posted_once_from_their_own_browser_and_recorded_once(
         assert_eq!(take_recorded(), one(Outcome::Refused, "request expired"));
         assert_eq!(ops.performs().len(), 1);
     });
-    for (performed, status, outcome, detail) in [
+    for (counter, (performed, status, outcome, detail)) in [
         (Performed::Discarded { count: 3 }, 200, Outcome::Approved, "performed"),
         (Performed::Done, 409, Outcome::Gone, "already closed"),
         (Performed::Gone(OpFound::NoIssue), 404, Outcome::Gone, "no such issue"),
         (Performed::NotHeld, 409, Outcome::NotReady, "no longer held"),
         (Performed::Changed("bd-1 is pinned now.".into()), 409, Outcome::NotReady, "target changed"),
         (Performed::Refused("bd-1 is claimed by bob".into()), 403, Outcome::Refused, "refused by the workspace"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let ops = FakeOperations::new(OpFound::NoIssue, performed);
         with_ops(root.path(), &flows, &ops, |cx| {
-            lock(&flows).operations.put(auth::hash("id3"), op_approval("ab12", &value, request.clone()));
-            let (answer, _) = operation::approve(cx, "proj", "close", "bd-1", "approval=id3", &cookies);
+            // The passkey registered by id1, in a ceremony of each approval's own.
+            let c = ceremony(false);
+            let id3 = OperationApproval { passkey: c.clone(), ..op_approval("ab12", &value, request.clone()) };
+            lock(&flows).operations.put(auth::hash("id3"), id3);
+            let body = format!("approval=id3&{}", assertion(&key, &c, counter as u32 + 1, &Tamper::default()));
+            let (answer, _) = operation::approve(cx, "proj", "close", "bd-1", &body, &cookies);
             assert_eq!(page(&answer).status, status, "{detail}");
-            assert_eq!(take_recorded(), one(outcome, detail));
+            assert_eq!(take_recorded_with_credential(), vec![(one(outcome, detail).remove(0), prefix.clone())]);
             lock(&flows).operations_spent.map.clear();
         });
     }

@@ -13,8 +13,8 @@ pub(super) struct TokenFile {
     pub(super) accounts: Vec<Account>,
     /// What the change did, for the audit trail: recorded with its rows.
     pub(super) events: Vec<AuthEvent>,
-    /// Accounts (issuer, subject) forgotten: their events are erased, after
-    /// this change's own are recorded.
+    /// Accounts (issuer, subject) forgotten: their events and passkeys are
+    /// erased, after this change's own events are recorded.
     pub(super) erased: Vec<(String, String)>,
 }
 
@@ -222,6 +222,7 @@ pub(super) fn save(tx: &rusqlite::Transaction, before: &TokenFile, after: &Token
     }
     for (issuer, subject) in &after.erased {
         server_db::erase_events(tx, issuer, subject)?;
+        server_db::erase_passkeys(tx, issuer, subject)?;
     }
     server_db::sync_rows(
         &before.tokens,

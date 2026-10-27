@@ -1195,17 +1195,36 @@ mod tests {
         github_token(dir.path(), &gh("forgettable-login", 41), grant.clone(), hour, true).unwrap();
         github_token(dir.path(), &gh("forgettable-login", 41), grant.clone(), hour, true).unwrap();
         github_token(dir.path(), &gh("keeper", 42), grant, hour, true).unwrap();
+        let passkey = |login: &'static str, subject: &'static str, credential: &'static str| {
+            let row = crate::passkeys::NewRow {
+                credential,
+                issuer: GITHUB,
+                subject,
+                provider: "github",
+                actor: login,
+                alg: crate::webauthn::Alg::Es256,
+                public_key: b"spki",
+                counter: 0,
+            };
+            assert_eq!(crate::passkeys::insert_first(dir.path(), &row).unwrap(), crate::passkeys::Inserted::Inserted);
+        };
+        passkey("github:forgettable-login", "41", "forgettable-credential");
+        passkey("github:keeper", "42", "keeper-credential");
+        let passkeys = |subject: &str| crate::passkeys::for_account(dir.path(), GITHUB, subject).unwrap().len();
         assert!(has(&files(), "forgettable-login"));
 
         let done = revoke_account(dir.path(), "forgettable-login", false).unwrap();
         assert_eq!((done.revoked.len(), done.erased), (2, None));
         assert_eq!(read(dir.path()).unwrap().tokens.len(), 3, "revoked, still listed");
+        assert_eq!(passkeys("41"), 1, "revoking alone keeps the passkey");
         let done = revoke_account(dir.path(), "github:forgettable-login", true).unwrap();
         assert_eq!(done.erased, Some(true));
         let file = read(dir.path()).unwrap();
         assert_eq!((file.tokens.len(), file.accounts.len()), (1, 1), "only keeper's");
+        assert_eq!((passkeys("41"), passkeys("42")), (0, 1), "its passkey erased with it");
         let bytes = files();
         assert!(!has(&bytes, "forgettable-login") && has(&bytes, "keeper"), "erased from the files themselves");
+        assert!(!has(&bytes, "forgettable-credential") && has(&bytes, "keeper-credential"));
     }
 
     #[test]
@@ -1542,7 +1561,20 @@ mod tests {
         issue_sign_in_token(dir.path(), &gh("alice", 1), grant.clone(), life.clone(), "proj", true).unwrap();
         issue_sign_in_token(dir.path(), &apple, grant, life, "proj", true).unwrap();
         link(dir.path(), "apple:u-0123456789ab", "github:alice").unwrap();
+        let row = crate::passkeys::NewRow {
+            credential: "apple-credential",
+            issuer: &apple.issuer,
+            subject: &apple.subject,
+            provider: "apple",
+            actor: "github:alice",
+            alg: crate::webauthn::Alg::Es256,
+            public_key: b"spki",
+            counter: 0,
+        };
+        assert_eq!(crate::passkeys::insert_first(dir.path(), &row).unwrap(), crate::passkeys::Inserted::Inserted);
         assert!(forget_account(dir.path(), &apple.issuer, &apple.subject).unwrap());
+        assert!(crate::passkeys::for_account(dir.path(), &apple.issuer, &apple.subject).unwrap().is_empty());
+        assert_eq!(crate::passkeys::by_credential(dir.path(), "apple-credential").unwrap(), None);
         let tokens = read(dir.path()).unwrap().tokens;
         assert!(tokens.iter().all(|t| t.identity.as_ref().is_none_or(|g| !g.same(&apple))), "{tokens:?}");
         assert_eq!(tokens.len(), 1, "github:alice's stays");

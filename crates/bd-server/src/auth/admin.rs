@@ -2,7 +2,9 @@
 
 use super::*;
 
-fn root_dir(a: &TokenRootArgs) -> Result<PathBuf> {
+/// The server root `--root` names, refused when it is not a directory or is
+/// a workspace's own.
+pub(crate) fn root_dir(a: &TokenRootArgs) -> Result<PathBuf> {
     if !a.root.is_dir() {
         return Err(Error::invalid(format!("--root {}: not a directory", a.root.display())));
     }

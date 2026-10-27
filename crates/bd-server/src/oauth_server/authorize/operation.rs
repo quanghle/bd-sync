@@ -19,9 +19,13 @@
 //!    target looked up ([`Operations::find`]): the page names the gates the
 //!    operation gets past, and is shown only to a person who may open every
 //!    one, with a cookie of its own (`bd_op_<suffix>`) and a one-time id.
+//!    The page asks for a passkey (`super::passkey`), registering the
+//!    account's first; where the issuer cannot be a relying party, a notice
+//!    and no form, recorded as a passkey refusal.
 //! 3. `POST` to the same path ([`approve`]): taken once, from that browser,
-//!    the sealed request is performed exactly ([`Operations::perform`]) as
-//!    the approver, never anything the form names.
+//!    its passkey ceremony checked, the sealed request is performed exactly
+//!    ([`Operations::perform`]) as the approver, never anything the form
+//!    names but the approval id and the passkey's fields.
 //!
 //! Every way an operation's approval ends, once its flow is known to be
 //! one, is counted and logged once, by [`record`] alone.
@@ -36,6 +40,7 @@ use bd_core::Error;
 use super::super::pages::{self};
 use super::super::{CHOOSE, form};
 use super::gate::{Approver, Returned};
+use super::passkey::{self, Failure, Prepared};
 use crate::oauth::{self, Admitted, SignIn};
 use crate::{auth, metrics};
 
@@ -130,6 +135,9 @@ pub enum Outcome {
     Busy,
     /// Something went wrong here: settings, or an internal error.
     Failed,
+    /// Refused at the passkey: missing or failed WebAuthn fields, or an
+    /// address passkeys cannot be used at.
+    PasskeyRefused,
 }
 
 impl Outcome {
@@ -142,6 +150,7 @@ impl Outcome {
             Outcome::Gone => "gone",
             Outcome::Busy => "busy",
             Outcome::Failed => "failed",
+            Outcome::PasskeyRefused => "passkey_refused",
         }
     }
 
@@ -153,19 +162,22 @@ impl Outcome {
             Outcome::Gone => &metrics::OPERATIONS_GONE,
             Outcome::Busy => &metrics::OPERATIONS_BUSY,
             Outcome::Failed => &metrics::OPERATIONS_FAILED,
+            Outcome::PasskeyRefused => &metrics::OPERATIONS_PASSKEY_REFUSED,
         }
     }
 }
 
 /// Who an approval was for, as far as it is known: the provider the sign-in
 /// started with, then, once the provider identified the account, its login,
-/// subject and actor (never an email). Empty where unknown.
+/// subject and actor (never an email), and the first characters of the
+/// passkey credential its POST sent, once it decoded. Empty where unknown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Who<'a> {
     pub provider: &'a str,
     pub login: &'a str,
     pub subject: &'a str,
     pub actor: &'a str,
+    pub credential: &'a str,
 }
 
 impl<'a> Who<'a> {
@@ -191,10 +203,13 @@ pub fn record(outcome: Outcome, who: &Who<'_>, workspace: &str, op: &str, issue:
         %issue,
         %op,
         detail,
+        credential = %who.credential,
         "operation approval"
     );
     #[cfg(test)]
-    RECORDED.with(|r| r.borrow_mut().push((outcome, workspace.into(), op.into(), issue.into(), detail)));
+    RECORDED.with(|r| {
+        r.borrow_mut().push(((outcome, workspace.into(), op.into(), issue.into(), detail), who.credential.into()))
+    });
 }
 
 /// What [`record`] was called with, as tests see it: the outcome, workspace,
@@ -204,12 +219,18 @@ pub(crate) type Recorded = (Outcome, String, String, String, &'static str);
 
 #[cfg(test)]
 thread_local! {
-    static RECORDED: std::cell::RefCell<Vec<Recorded>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RECORDED: std::cell::RefCell<Vec<(Recorded, String)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What [`record`] recorded on this thread since the last call.
 #[cfg(test)]
 pub(crate) fn take_recorded() -> Vec<Recorded> {
+    take_recorded_with_credential().into_iter().map(|(r, _)| r).collect()
+}
+
+/// [`take_recorded`], each with the credential prefix it logged.
+#[cfg(test)]
+pub(crate) fn take_recorded_with_credential() -> Vec<(Recorded, String)> {
     RECORDED.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
@@ -393,11 +414,18 @@ struct Seen {
     login: String,
     subject: String,
     actor: String,
+    credential: String,
 }
 
 impl Seen {
     fn who(&self) -> Who<'_> {
-        Who { provider: &self.provider, login: &self.login, subject: &self.subject, actor: &self.actor }
+        Who {
+            provider: &self.provider,
+            login: &self.login,
+            subject: &self.subject,
+            actor: &self.actor,
+            credential: &self.credential,
+        }
     }
 }
 
@@ -487,6 +515,7 @@ pub fn test_put_operation(flows: &Mutex<Flows>, id: &str, request: OperationRequ
         oidc_approver: None,
         browser: auth::hash("value"),
         cookie: "ab12".into(),
+        passkey: Ceremony::for_test("https://github.com", "1", true, [0; 32]),
     };
     lock(flows).operations.put(auth::hash(id), approval);
 }
@@ -681,6 +710,47 @@ fn admitted_step(
         let answer = refusal(403, &bd_cli::io::printable(&why));
         return Step::ended(Outcome::Refused, &seen, "not an approver", answer);
     }
+    let gates: Vec<(String, String, Option<Vec<String>>)> =
+        info.gates.iter().map(|g| (g.id.clone(), g.title.clone(), g.approvers.clone())).collect();
+    let action = format!("{}/w/{workspace}/{op}/{}", cx.issuer, flow.issue);
+    let shown = |id: &str, passkey: pages::PasskeyAsk<'_>| {
+        pages::approve_operation(&pages::ApproveOperation {
+            workspace,
+            op_label: op.as_str(),
+            issue: &info.id,
+            title: &info.title,
+            status: &info.status,
+            part_of: info.part_of.as_ref().map(|(id, title)| (id.as_str(), title.as_str())),
+            reason: request.reason.as_deref(),
+            requester: &request.requester,
+            at: request.at,
+            failed: request.failed,
+            force: request.force,
+            gates: &gates,
+            deletes: info.deletes.as_ref().map(|(listed, total)| (listed.as_slice(), *total)),
+            provider: label,
+            actor: &actor,
+            id,
+            action: &action,
+            passkey,
+        })
+    };
+    let (ceremony, credentials) = match passkey::prepare(cx, user, &actor) {
+        Ok(Prepared::Ask { ceremony, credentials }) => (*ceremony, credentials),
+        Ok(Prepared::Unavailable(why)) => {
+            tracing::warn!(target: "bd::serve", reason = why.label(), "passkeys unavailable at this server's address");
+            let answer = Answer::Page(shown("", pages::PasskeyAsk::Unavailable { why }));
+            return Step::ended(Outcome::PasskeyRefused, &seen, "passkeys unavailable at this address", answer);
+        }
+        Err(Error::Busy(_) | Error::Locked(_)) => {
+            let why = "The server is busy. Try again in a moment.";
+            return Step::ended(Outcome::Busy, &seen, "server busy", refusal(503, why));
+        }
+        Err(e) => {
+            let answer = internal(&e, "asking for an operation's approval");
+            return Step::ended(Outcome::Failed, &seen, "internal error", answer);
+        }
+    };
     let secrets = (|| Ok::<_, Error>((auth::random_hex(32)?, auth::random_hex(32)?, auth::random_hex(4)?)))();
     let (id, value, suffix) = match secrets {
         Ok(s) => s,
@@ -689,28 +759,7 @@ fn admitted_step(
             return Step::ended(Outcome::Failed, &seen, "internal error", answer);
         }
     };
-    let action = format!("{}/w/{workspace}/{op}/{}", cx.issuer, flow.issue);
-    let gates: Vec<(String, String, Option<Vec<String>>)> =
-        info.gates.iter().map(|g| (g.id.clone(), g.title.clone(), g.approvers.clone())).collect();
-    let page = pages::approve_operation(&pages::ApproveOperation {
-        workspace,
-        op_label: op.as_str(),
-        issue: &info.id,
-        title: &info.title,
-        status: &info.status,
-        part_of: info.part_of.as_ref().map(|(id, title)| (id.as_str(), title.as_str())),
-        reason: request.reason.as_deref(),
-        requester: &request.requester,
-        at: request.at,
-        failed: request.failed,
-        force: request.force,
-        gates: &gates,
-        deletes: info.deletes.as_ref().map(|(listed, total)| (listed.as_slice(), *total)),
-        provider: label,
-        actor: &actor,
-        id: &id,
-        action: &action,
-    });
+    let page = shown(&id, passkey::ask(&ceremony, &credentials));
     *fresh = Some(set_op_cookie(cx.issuer, workspace, op.as_str(), &flow.issue, &suffix, &value, STEP_TTL));
     let approval = OperationApproval {
         request,
@@ -721,6 +770,7 @@ fn admitted_step(
         oidc_approver,
         browser: auth::hash(&value),
         cookie: suffix,
+        passkey: ceremony,
     };
     lock(cx.flows).operations.put(auth::hash(&id), approval);
     Step { answer: Answer::Page(page), outcome: None, who: seen, detail: "" }
@@ -802,8 +852,8 @@ fn approve_inner(
         return ended(Outcome::Refused, &nobody, "malformed path", not_found());
     };
     let pairs = form::decode(body).unwrap_or_default();
-    let Some(id) = pairs.iter().find(|(k, _)| k == "approval").map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
-    else {
+    // Read only if it occurs exactly once, before anything is looked up or taken.
+    let Some(id) = form::single(&pairs, "approval").filter(|v| !v.is_empty()) else {
         let answer = refusal(400, "The form arrived incomplete. Open the approval link again.");
         return ended(Outcome::Refused, &nobody, "form incomplete", answer);
     };
@@ -824,6 +874,7 @@ fn approve_inner(
             login: a.login.clone(),
             subject: a.subject.clone(),
             actor: a.actor.clone(),
+            credential: String::new(),
         };
         match flows.operations.get_mut(&key).map(|a| (bound(a), here(a), seen(a))) {
             None => return ended(Outcome::Refused, &nobody, "unknown or expired", refusal(400, EXPIRED)),
@@ -843,25 +894,48 @@ fn approve_inner(
         flows.operations_spent.put(key, ());
         approval
     };
-    let who = Seen {
+    let mut who = Seen {
         provider: approval.provider.clone(),
         login: approval.login.clone(),
         subject: approval.subject.clone(),
         actor: approval.actor.clone(),
+        credential: String::new(),
     };
     let cleared = vec![set_op_cookie(cx.issuer, workspace, op.as_str(), issue, &approval.cookie, "", Duration::ZERO)];
-    let with = |outcome, detail, answer| (Step::ended(outcome, &who, detail, answer), cleared.clone());
+    let ended_as = |outcome, who: &Seen, detail, answer| (Step::ended(outcome, who, detail, answer), cleared.clone());
     // `[oauth]` may have been turned off since the page was shown.
     if let Err(answer) = settings(cx) {
-        return with(Outcome::Failed, "sign-in settings unavailable", answer);
+        return ended_as(Outcome::Failed, &who, "sign-in settings unavailable", answer);
     }
     let request = &approval.request;
     if request.until <= now_millis() {
         let why = "This approval link has expired. Ask for the operation again to get a new one.";
-        return with(Outcome::Refused, "request expired", Answer::Page(pages::notice(410, "Link expired", why)));
+        let answer = Answer::Page(pages::notice(410, "Link expired", why));
+        return ended_as(Outcome::Refused, &who, "request expired", answer);
     }
+    // The passkey ceremony the page asked for, checked once the approval is taken: nothing is performed without it.
+    match passkey::verify(cx, &approval.passkey, &pairs) {
+        Ok(verified) => who.credential = verified.credential,
+        Err(Failure::Refused { why, credential }) => {
+            who.credential = credential;
+            let answer = refusal(403, pages::PASSKEY_FAILED_OP);
+            return ended_as(Outcome::PasskeyRefused, &who, why.detail(), answer);
+        }
+        Err(Failure::Store { error: Error::Busy(_) | Error::Locked(_), credential }) => {
+            who.credential = credential;
+            let answer = refusal(503, "The server is busy. Open the approval link again in a moment.");
+            return ended_as(Outcome::Busy, &who, "server busy", answer);
+        }
+        Err(Failure::Store { error, credential }) => {
+            who.credential = credential;
+            let answer = internal(&error, "checking an operation approval's passkey");
+            return ended_as(Outcome::Failed, &who, "internal error", answer);
+        }
+    }
+    let with = |outcome, detail, answer| ended_as(outcome, &who, detail, answer);
     let actor = &approval.actor;
-    // The request as sealed and the reference the sign-in proved: nothing in the form is read but its id.
+    // The request as sealed and the reference the sign-in proved: nothing in the form is read but its id and
+    // the passkey's fields.
     let performed = cx.operations.perform(request, actor, approval.oidc_approver.as_deref());
     let page =
         |status, title: &str, why: String| Answer::Page(pages::notice(status, title, &bd_cli::io::printable(&why)));

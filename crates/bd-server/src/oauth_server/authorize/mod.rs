@@ -29,7 +29,9 @@
 //! own page, `<public url>/w/<ws>/gates/<id>` ([`gate`]), and so does the
 //! approval of a close or discard that open human gates refused, from its
 //! sealed link, `<public url>/w/<ws>/(close|discard)/<id>?request=...`
-//! ([`operation`]).
+//! ([`operation`]). Every Approve on those two pages needs a passkey
+//! ceremony with user verification (`passkey`): the account's first
+//! registers its passkey, later ones use it.
 
 mod begin;
 mod callback;
@@ -38,6 +40,7 @@ mod cookies;
 mod flows;
 pub mod gate;
 pub mod operation;
+mod passkey;
 mod request;
 #[cfg(test)]
 mod tests;

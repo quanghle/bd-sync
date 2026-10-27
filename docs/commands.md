@@ -23,10 +23,10 @@ and error codes.
 | Data | `export`, `import`, `batch`, `backup` | [below](#data) |
 | GitHub | `github status/pull/push/sync` | [GitHub Issues sync](github.md) |
 | Operations | `metrics`, `bench` | [Observability](observability.md), [Benchmarks](benchmarks.md) |
-| Remote | `serve`, `serve check`, `serve token create/list/revoke/events/accounts/link/name`, `remote set/show/unset/login/logout`, `remote login/logout/show --human` (a person's token in the OS keychain) | [Remote server](remote.md), [Signing in](sign-in.md) |
+| Remote | `serve`, `serve check`, `serve token create/list/revoke/events/accounts/link/name`, `serve passkey list/remove` (passkeys for browser approvals), `remote set/show/unset/login/logout`, `remote login/logout/show --human` (a person's token in the OS keychain) | [Remote server](remote.md), [Signing in](sign-in.md) |
 
 `rm` subcommands also answer to `remove`, and `list` subcommands of
-`playbook`, `gate` and `serve token` to `ls`.
+`playbook`, `gate`, `serve token` and `serve passkey` to `ls`.
 
 ### Issues
 
@@ -845,7 +845,7 @@ Besides those of the global options:
 | `BD_PLAYBOOK_PATH` | extra playbook directories, `:`-separated (`;` on Windows) |
 | `BD_GH` | the `gh` binary GitHub gates and `bd github` run |
 | `BD_TOKEN`, `BD_CA_CERT`, `BD_REMOTE_RETRY_SECS`, `BD_INSECURE_HTTP` | remote clients ([Environment](remote.md#environment)) |
-| `BD_SERVE_ROOT`, `BD_SERVE_PUBLIC_URL` | `--root` of `bd serve`, `bd serve check` and `bd serve token`; `--public-url` of `bd serve` and `bd serve check` |
+| `BD_SERVE_ROOT`, `BD_SERVE_PUBLIC_URL` | `--root` of `bd serve`, `bd serve check`, `bd serve token` and `bd serve passkey`; `--public-url` of `bd serve` and `bd serve check` |
 | `XDG_CONFIG_HOME`, `APPDATA`, `HOME`, `USERPROFILE` | where saved tokens and user playbooks live |
 | `USER`, `USERNAME` | the user, when `git config user.name` is unset |
 

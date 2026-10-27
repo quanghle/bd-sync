@@ -272,6 +272,37 @@ mod tests {
     }
 
     #[test]
+    fn serve_passkey_runs_only_on_the_server_host() {
+        for args in [
+            &["bd", "serve", "passkey", "list", "--account", "corp:alice", "--root", "/srv/bd"][..],
+            &[
+                "bd",
+                "serve",
+                "passkey",
+                "remove",
+                "--account",
+                "corp:alice",
+                "--credential",
+                "AAAA",
+                "--root",
+                "/srv/bd",
+            ],
+            &["bd", "serve", "passkey", "remove", "--account", "corp:alice", "--root", "/srv/bd"],
+        ] {
+            let cmd = Cli::try_parse_from(args).unwrap().command;
+            assert_eq!(access(&cmd), Access::Local, "{args:?}");
+            assert!(crate::always_local(&cmd), "{args:?}");
+        }
+        let cmd = Cli::try_parse_from(["bd", "serve", "passkey", "remove", "--account", "a", "--root", "r"]).unwrap();
+        let Command::Serve(ServeArgs { action: Some(ServeAction::Passkey(PasskeyCommand::Remove(a))), .. }) =
+            cmd.command
+        else {
+            panic!("not serve passkey remove")
+        };
+        assert_eq!((a.account.as_str(), a.credential), ("a", None));
+    }
+
+    #[test]
     fn setup_runs_only_on_the_client() {
         let cmd =
             Command::Setup(SetupArgs { harness: Some(SetupTarget::Claude), list: false, remove: false, dry_run: true });

@@ -11,6 +11,10 @@
 //! subject, actor and login; a client's ID. Actors and logins are kept
 //! lowercase (`*_key`), as accounts and tokens are told apart regardless of
 //! case. `seq` keeps the order rows were added in.
+//!
+//! The passkeys of the accounts that approve in the browser (schema 4,
+//! [`PASSKEYS`]) are plain columns, read and written by `crate::passkeys`,
+//! and erased with their account ([`erase_passkeys`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -30,9 +34,10 @@ fn busy_wait() -> Duration {
 }
 
 /// The schema this bd writes (`PRAGMA user_version`).
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 
-const SCHEMA: &str = "
+/// The schema of version 3, which version 4 adds [`PASSKEYS`] to.
+const SCHEMA_V3: &str = "
 CREATE TABLE accounts (
     seq INTEGER PRIMARY KEY,
     issuer TEXT NOT NULL,
@@ -82,6 +87,30 @@ CREATE INDEX auth_events_actor ON auth_events (actor_key) WHERE actor_key IS NOT
 CREATE INDEX auth_events_kind ON auth_events (kind, seq);
 CREATE INDEX auth_events_account ON auth_events (issuer, subject) WHERE subject IS NOT NULL;
 ";
+
+/// Version 4: the passkeys accounts approve with in the browser, one row
+/// each, by credential id (base64url); its public key as SPKI DER and the
+/// signature counter last seen. Looked up by credential and by account.
+const PASSKEYS: &str = "
+CREATE TABLE passkeys (
+    seq INTEGER PRIMARY KEY,
+    credential TEXT NOT NULL UNIQUE,
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    actor_key TEXT NOT NULL,
+    algorithm INTEGER NOT NULL,
+    public_key BLOB NOT NULL,
+    counter INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    last_used_at INTEGER
+);
+CREATE INDEX passkeys_account ON passkeys (issuer, subject);
+";
+
+/// What takes a database of version 4 back to version 3, for a rollback to
+/// an older bd (docs/security.md quotes it): its passkeys are lost.
+#[cfg(test)]
+pub(crate) const ROLLBACK: &str = "DROP TABLE passkeys; PRAGMA user_version = 3;";
 
 pub fn path(root: &Path) -> PathBuf {
     root.join("server.db")
@@ -150,7 +179,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // Another process may have created it meanwhile.
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let done = match version {
-        0 => conn.execute_batch(&format!("{SCHEMA}PRAGMA user_version = {VERSION};")),
+        0 => conn.execute_batch(&format!("{SCHEMA_V3}{PASSKEYS}PRAGMA user_version = {VERSION};")),
+        3 => conn.execute_batch(&format!("{PASSKEYS}PRAGMA user_version = {VERSION};")),
         VERSION => Ok(()),
         other => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -297,7 +327,8 @@ pub const EVENTS_KEPT: Duration = Duration::from_secs(90 * 24 * 3600);
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct AuthEvent {
     /// `signed_in`, `token_created`, `refreshed`, `revoked`, `forgotten`,
-    /// `client_registered`, `linked`, `named`.
+    /// `client_registered`, `linked`, `named`, `passkey_registered`,
+    /// `passkey_removed`.
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
@@ -374,6 +405,13 @@ pub fn erase_events(tx: &rusqlite::Transaction, issuer: &str, subject: &str) -> 
     Ok(())
 }
 
+/// Delete the passkeys of the account with this issuer and subject (it is
+/// being forgotten).
+pub fn erase_passkeys(tx: &rusqlite::Transaction, issuer: &str, subject: &str) -> Result<()> {
+    tx.execute("DELETE FROM passkeys WHERE issuer = ?1 AND subject = ?2", [issuer, subject])?;
+    Ok(())
+}
+
 /// An event as kept: when, and what.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct KeptEvent {
@@ -427,8 +465,18 @@ pub fn events(root: &Path, since: i64, actor: Option<&str>, kinds: &[String], li
 }
 
 /// The kinds of [`AuthEvent`].
-pub const KINDS: &[&str] =
-    &["signed_in", "token_created", "refreshed", "revoked", "forgotten", "client_registered", "linked", "named"];
+pub const KINDS: &[&str] = &[
+    "signed_in",
+    "token_created",
+    "refreshed",
+    "revoked",
+    "forgotten",
+    "client_registered",
+    "linked",
+    "named",
+    "passkey_registered",
+    "passkey_removed",
+];
 
 /// How actors and logins are compared: regardless of case.
 pub fn key(name: &str) -> String {
@@ -593,6 +641,14 @@ mod tests {
              WHERE kind = 'client_registered' ORDER BY seq DESC LIMIT 1 OFFSET ?1)",
             "SELECT at FROM auth_events WHERE at >= ?1 AND (actor_key = ?2 OR (actor_key > ?3 AND actor_key < ?4)) \
              ORDER BY seq DESC LIMIT ?5",
+            "DELETE FROM passkeys WHERE issuer = ?1 AND subject = ?2",
+            crate::passkeys::BY_ACCOUNT,
+            crate::passkeys::BY_CREDENTIAL,
+            crate::passkeys::ACCOUNT_EXISTS,
+            crate::passkeys::ENROLLED,
+            crate::passkeys::TAKEN,
+            crate::passkeys::USE_COUNTER,
+            crate::passkeys::DELETE,
         ];
         let dir = tempfile::tempdir().unwrap();
         let conn = open(dir.path()).unwrap();
@@ -629,6 +685,81 @@ mod tests {
         conn.execute_batch("PRAGMA user_version = 9").unwrap();
         let e = open(dir.path()).unwrap_err().to_string();
         assert!(e.contains("server.db") && e.contains("schema 9"), "{e}");
+    }
+
+    /// The schema of a database: its (type, name, sql) rows, sorted.
+    fn schema_of(conn: &Connection) -> Vec<(String, String, Option<String>)> {
+        conn.prepare("SELECT type, name, sql FROM sqlite_master ORDER BY type, name")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    fn user_version(conn: &Connection) -> i64 {
+        conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn a_v3_database_migrates_to_v4_keeping_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = [
+            "SELECT issuer, subject, actor_key, login_key, data FROM accounts",
+            "SELECT id, sha256, actor_key, name, data FROM tokens",
+            "SELECT client_id, data FROM oauth_clients",
+            "SELECT at, kind, actor, detail FROM auth_events",
+        ];
+        let dump = |conn: &Connection| -> Vec<Vec<String>> {
+            rows.iter()
+                .map(|sql| {
+                    let mut stmt = conn.prepare(sql).unwrap();
+                    let n = stmt.column_count();
+                    stmt.query_map([], |r| {
+                        (0..n).map(|i| r.get::<_, rusqlite::types::Value>(i).map(|v| format!("{v:?}"))).collect()
+                    })
+                    .unwrap()
+                    .map(|r: rusqlite::Result<Vec<String>>| r.unwrap().join("|"))
+                    .collect()
+                })
+                .collect()
+        };
+        let v3 = Connection::open(path(dir.path())).unwrap();
+        v3.execute_batch(&format!(
+            "{SCHEMA_V3}PRAGMA user_version = 3; \
+             INSERT INTO accounts (issuer, subject, actor_key, login_key, data) VALUES ('https://idp', 's1', 'corp:alice', 'alice', '{{}}'); \
+             INSERT INTO tokens (id, sha256, actor_key, name, data) VALUES ('t1', 'h1', 'corp:alice', 'n1', '{{}}'); \
+             INSERT INTO oauth_clients (client_id, data) VALUES ('c1', '{{}}'); \
+             INSERT INTO auth_events (at, kind, actor, detail) VALUES (1, 'signed_in', 'corp:alice', 'why');"
+        ))
+        .unwrap();
+        let before = dump(&v3);
+        assert!(before.iter().all(|t| t.len() == 1), "{before:?}");
+        drop(v3);
+
+        let conn = open(dir.path()).unwrap();
+        assert_eq!(user_version(&conn), 4);
+        assert_eq!(dump(&conn), before, "every row as it was");
+        let passkeys: i64 = conn.query_row("SELECT count(*) FROM passkeys", [], |r| r.get(0)).unwrap();
+        assert_eq!(passkeys, 0);
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch(&format!("{SCHEMA_V3}{PASSKEYS}")).unwrap();
+        assert_eq!(schema_of(&conn), schema_of(&fresh), "as a database created at version 4");
+    }
+
+    #[test]
+    fn the_rollback_leaves_exactly_the_v3_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path()).unwrap();
+        assert_eq!(user_version(&conn), 4);
+        conn.execute_batch(ROLLBACK).unwrap();
+        let v3 = Connection::open_in_memory().unwrap();
+        v3.execute_batch(SCHEMA_V3).unwrap();
+        assert_eq!(schema_of(&conn), schema_of(&v3));
+        assert_eq!(user_version(&conn), 3);
+        drop(conn);
+        // And the next open brings it back to version 4.
+        assert_eq!(user_version(&open(dir.path()).unwrap()), 4);
     }
 
     #[test]

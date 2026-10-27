@@ -304,6 +304,39 @@ consent page and more.
   approve (not deferred or blocked again since the page), and that the
   person may open it; otherwise it writes nothing. The `closed` event
   names the person's actor and `"via": "browser"`.
+- **A passkey for every approval.** Signing in proves the account at the
+  provider; the passkey proves that a person is at the device the account
+  registered, each time. Every Approve runs a WebAuthn ceremony with user
+  verification required, and the server verifies it before anything is
+  approved, after every check above: the client data's type, the
+  approval's own challenge (32 random bytes, kept in server memory with
+  the approval and good once), the origin (exactly the server's public
+  URL's), no cross-origin or `topOrigin` frame, the hash of the relying
+  party id (the public URL's host), the user-present and user-verified
+  flags, and for a registered passkey that it is the signed-in account's
+  (by issuer and subject), its signature under the stored public key
+  (ES256 or RS256), and a signature counter that, once non-zero, must
+  grow, stored by compare-and-set so two posts of one assertion cannot
+  both pass. Each form field counts only when it occurs exactly once, the
+  approval id included, and is bounded in length before it is decoded
+  (the whole `POST` is at most 8 KiB). There is no fallback: a missing or
+  failed ceremony approves nothing (403), and the approval id, taken
+  before the check, is used up. User verification is a fingerprint, a
+  face or the device's PIN, as the authenticator offers; bd cannot tell
+  which, or insist on a biometric. No attestation is asked for or checked:
+  bd does not know which authenticator holds a passkey, and does not
+  restrict authenticators.
+- **Passkeys only at a host name over https.** The relying party id is the
+  host of the public URL (`--public-url`, else `[oauth]`'s issuer).
+  Browsers refuse passkeys at an IP address, so there, and for plain http
+  on any host but `localhost`, the page shows a notice with no Approve
+  button, and the refusal is counted and logged
+  (`passkey refused`, `passkey=unavailable`).
+- **The credential in the logs.** `gate approval` lines carry
+  `credential`, the first 12 characters of the credential id once the
+  posted one has been read (empty before), so an admin can tell which
+  passkey approved or failed; never the whole id, the public key, the
+  signature or the client data.
 - **Emails are never shown or logged.** The page shows the provider and
   actor; the logs name the provider, subject, login, actor, workspace and
   gate.
@@ -356,6 +389,34 @@ Residual risks, accepted:
   identity rule keeps that account from approving, but recovering the
   actor for the intended account is a separate task for the server's
   admin ([Accounts and actors](sign-in.md#accounts-and-actors)).
+- **Passkeys are registered on first use.** An account's first approval
+  registers its passkey with the same click, so whoever completes the
+  first approval as an account (someone who signed in to the provider as
+  it) registers the passkey that account's later approvals need. Watch
+  the audit trail's `passkey_registered` events (`bd serve token events
+  --kind passkey_registered`, each naming the account, the credential's
+  first 12 characters and its algorithm) for registrations no one
+  expected, and remove such a passkey with `bd serve passkey remove
+  --account <actor or login> [--credential <prefix>]` (without
+  `--credential`, every passkey of the account), on the server host; the
+  account's next approval registers again. A lost device is recovered the
+  same way. The page registers one passkey per account and never a
+  second.
+- **A rollback** to a `bd serve` that predates passkeys approves with the
+  click alone again.
+
+**Rolling back passkeys.** `bd serve` moves `server.db` from schema 3 to 4
+at its first start, adding a `passkeys` table. An older `bd serve`
+refuses schema 4, so to go back:
+
+1. Stop `bd serve` and back up `server.db`.
+2. Run `sqlite3 server.db 'DROP TABLE passkeys; PRAGMA user_version = 3;'`
+   in the root.
+3. Start the older bd.
+
+Accounts, tokens, OAuth clients and the audit trail survive; the
+passkeys are gone, and each account registers a new one at its first
+approval after upgrading again.
 
 ## Approving a close or discard in the browser
 
@@ -381,7 +442,7 @@ human-gate override without a token, so it gets the protections of
   `--failed`, `--force`, the requester and when they asked); nothing in
   it can be changed without the link becoming invalid, and nothing else
   (`--token`, `--if-*` guards) carries over. The `POST` reads nothing
-  from the form but the one-time approval id.
+  from the form but the one-time approval id and the passkey's fields.
 - **Nothing is looked up before admission.** Opening a link checks only
   the path's shape and the seal: a link this server did not seal, or one
   for another path, answers 404 like an unknown path; an expired one 410;
@@ -401,6 +462,22 @@ human-gate override without a token, so it gets the protections of
   `human` only, no token issued), and the page has the same Content
   Security Policy, framing refusal, focus arming, same-origin `POST` and
   shared sign-in slots.
+- **The same passkey.** Every Approve needs the account's passkey, the
+  one its gate approvals use, verified as for [gate
+  approval](#approving-gates-in-the-browser) (origin, relying party id
+  hash, user verification, a per-approval challenge, the signature, the
+  counter by compare-and-set, each form field exactly once) after the
+  checks of this section, the request's expiry included, and before the
+  operation is performed. No attestation is checked, verification may be
+  a PIN or a biometric, and there is no fallback: a missing or failed
+  ceremony performs nothing (403, outcome `passkey_refused`) and uses the
+  approval up. At an IP address, or plain http on a host other than
+  `localhost`, the callback shows a notice with no Approve button and
+  records `passkey_refused`. First-use registration is the residual risk
+  described for gate approval. `operation approval` lines carry
+  `credential`, the credential id's first 12 characters once it has been
+  read (empty before), never the whole id, the public key, the signature
+  or the client data.
 - **Every gate in the way.** The person must be able to open every open
   human gate the operation gets past: one of its approvers when it names
   them, an OIDC account only by its identity reference. Otherwise the
@@ -444,6 +521,16 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   It never holds a token's secret, a provider's tokens, an ID token or its
   claims, a name from a provider, or an email. The only name is one an
   admin gives an account (`bd serve token name`), erased with it.
+- **Passkeys.** For each passkey registered at a browser approval,
+  `server.db` keeps its credential id, its public key (as
+  SubjectPublicKeyInfo), its algorithm (ES256 or RS256), its signature
+  counter, when it was registered and last used, and the account it
+  belongs to (issuer, subject and actor). It keeps no biometric
+  (fingerprints and faces never leave the device), no attestation and no
+  AAGUID, so nothing says which authenticator holds it. Forgetting an
+  account (`bd serve token revoke --account <login> --forget`, or a
+  provider's `account-deleted` notification) erases its passkeys in the
+  same transaction.
 - **Logins are never emails.** An account's login is the provider's
   `preferred_username` unless that is an email (or otherwise unsuitable),
   else a pseudonym (`u-` and 12 hex digits of a hash of its issuer and
@@ -457,22 +544,22 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   its login and dates are all it holds. A registered OAuth client never
   used within a day, or unused for 90 days, is deleted.
 - **Erasure.** `bd serve token revoke --account <login> --forget` deletes
-  the account and every token of it. Deleted rows are overwritten
-  (`secure_delete`) and the write-ahead log is emptied, so nothing of them
-  stays in the database's files (if `bd serve` is reading at that moment,
-  its next checkpoint does it, and the command says so). A provider's
-  `account-deleted` notification erases an account the same way. Workspace
-  histories keep the actor; copies outside `server.db` (logs, backups) are
-  the admin's to expire.
-- **Audit trail.** `server.db` records each sign-in (one to approve a
-  gate in a browser too, as a `signed_in` event without a token), token created,
-  refresh, revocation (and why), account forgotten, linked or named, and
-  client registered, in the same transaction as the change, for 90 days
-  (client registrations, which anyone may make: the latest 5000).
-  `bd serve token events` shows it. An event names the actor, provider,
-  subject, token and client, never a secret or an email. Forgetting an
-  account erases its events too, leaving one that says an account of that
-  provider was forgotten, and why.
+  the account and every token and passkey of it. Deleted rows are
+  overwritten (`secure_delete`) and the write-ahead log is emptied, so
+  nothing of them stays in the database's files (if `bd serve` is reading
+  at that moment, its next checkpoint does it, and the command says so). A
+  provider's `account-deleted` notification erases an account the same
+  way. Workspace histories keep the actor; copies outside `server.db`
+  (logs, backups) are the admin's to expire.
+- **Audit trail.** `server.db` records each sign-in (one to approve a gate
+  in a browser too, as a `signed_in` event without a token), token
+  created, refresh, revocation (and why), account forgotten, linked or
+  named, passkey registered or removed, and client registered, in the same
+  transaction as the change, for 90 days (client registrations, which
+  anyone may make: the latest 5000). `bd serve token events` shows it. An
+  event names the actor, provider, subject, token and client, never a
+  secret or an email. Forgetting an account erases its events too, leaving
+  one that says an account of that provider was forgotten, and why.
 - **Logs.** `bd serve` logs sign-ins, refreshes, refusals and revocations
   with the provider, subject, login, actor and token name, never a secret,
   a hash or an email. An erased account is not named by its subject. An

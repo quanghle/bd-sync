@@ -129,6 +129,165 @@ document.querySelector('form.actions').addEventListener('submit',function(e){\
 if(!since||Date.now()-since<600)e.preventDefault();});\
 })();";
 
+/// The approval pages' script: [`ARMING`]'s focus rule, and the passkey
+/// ceremony every Approve needs (`authorize::passkey`). It reads what the
+/// server gave it only from the form's escaped `data-` attributes (the
+/// ceremony) and the status line's (its messages), and writes messages
+/// with `textContent` alone. The button is rendered disabled, and enabled
+/// once the browser has what the ceremony needs (`getPublicKey` too, to
+/// register a passkey). A submit asks for the passkey (`create()` for the
+/// account's first, `get()` after), fills in the hidden fields and posts
+/// the form; a cancelled or failed ceremony posts nothing, so the same page
+/// can try again.
+pub(crate) const APPROVE: &str = "(function(){\
+var since=document.hasFocus()?Date.now():0;\
+addEventListener('focus',function(){since=Date.now();});\
+addEventListener('blur',function(){since=0;});\
+document.addEventListener('visibilitychange',function(){\
+since=!document.hidden&&document.hasFocus()?Date.now():0;});\
+var form=document.querySelector('form.actions');\
+var status=document.querySelector('p[role=status]');\
+if(!form||!status)return;\
+var button=form.querySelector('button');\
+var d=form.dataset,m=status.dataset,create=d.passkey==='create';\
+function say(t){status.textContent=t||'';}\
+function bytes(s){s=(s||'').replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';\
+var b=atob(s),u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;}\
+function text(buf){var u=new Uint8Array(buf),s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);\
+return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}\
+function put(name,value){form.elements[name].value=value;}\
+var able=window.PublicKeyCredential&&navigator.credentials&&(!create||(window.AuthenticatorAttestationResponse&&\
+typeof AuthenticatorAttestationResponse.prototype.getPublicKey==='function'));\
+if(!able){say(m.unsupported);return;}\
+button.disabled=false;\
+var busy=false;\
+form.addEventListener('submit',function(e){\
+e.preventDefault();\
+if(busy||!since||Date.now()-since<600)return;\
+busy=true;button.disabled=true;say(m.waiting);\
+var challenge=bytes(d.challenge),asked;\
+if(create){asked=navigator.credentials.create({publicKey:{rp:{id:d.rp,name:'bd'},\
+user:{id:bytes(d.user),name:d.name,displayName:d.name},challenge:challenge,\
+pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],\
+authenticatorSelection:{userVerification:'required',residentKey:'preferred'},\
+attestation:'none',timeout:300000}});}\
+else{asked=navigator.credentials.get({publicKey:{rpId:d.rp,challenge:challenge,\
+allowCredentials:(d.credentials||'').split(' ').filter(Boolean).map(function(c){return{type:'public-key',id:bytes(c)};}),\
+userVerification:'required',timeout:300000}});}\
+asked.then(function(c){\
+var r=c.response;\
+put('credential',text(c.rawId));\
+put('client_data',text(r.clientDataJSON));\
+if(create){var k=r.getPublicKey();if(!k)throw new Error('no public key');\
+put('authenticator_data',text(r.getAuthenticatorData()));\
+put('public_key',text(k));put('algorithm',String(r.getPublicKeyAlgorithm()));}\
+else{put('authenticator_data',text(r.authenticatorData));put('signature',text(r.signature));}\
+form.submit();\
+}).catch(function(){busy=false;button.disabled=false;say(m.cancelled);});\
+});\
+})();";
+
+/// What the approval pages say about the passkey every approval needs. No
+/// copy here names a person (`a_passkeys_copy_names_no_one`).
+pub const PASSKEY_ENROLL: &str = "Approving first registers a passkey for this account: the browser asks for a \
+fingerprint, face or device PIN. Later approvals ask for the same passkey.";
+pub const PASSKEY_ASSERT: &str =
+    "Approving asks for this account's passkey, unlocked with a fingerprint, face or device PIN.";
+pub const PASSKEY_NO_SCRIPT: &str =
+    "Approving needs a passkey, and passkeys need scripts: turn them on in this browser, then open the link again.";
+pub const PASSKEY_UNSUPPORTED: &str = "This browser can't use passkeys here, so nothing can be approved from it. \
+Open the link in a current browser.";
+pub const PASSKEY_WAITING: &str = "Waiting for the passkey…";
+pub const PASSKEY_CANCELLED: &str =
+    "The passkey check was cancelled or didn't complete, so nothing was approved. Press Approve to try again.";
+pub const PASSKEY_UNAVAILABLE_HOST: &str = "Approvals need a passkey, and passkeys work only at an https address \
+with a host name. This server's address is an IP address, so nothing can be approved here. Ask the server's admin \
+to serve bd at a host name.";
+pub const PASSKEY_UNAVAILABLE_HTTPS: &str = "Approvals need a passkey, and passkeys work only at an https address \
+with a host name (or http://localhost). This server's address is plain http, so nothing can be approved here. Ask \
+the server's admin to serve bd over https.";
+pub const PASSKEY_FAILED_GATE: &str =
+    "The passkey check failed, so the gate was not approved. Open the gate's link again to try again.";
+pub const PASSKEY_FAILED_OP: &str =
+    "The passkey check failed, so nothing was changed. Open the approval link again to try again.";
+
+/// The passkey ceremony an approval page asks for.
+#[derive(Clone, Debug)]
+pub enum PasskeyAsk<'a> {
+    /// The account's first approval: register a passkey (`create()`).
+    Enroll {
+        /// The challenge and the user handle, base64url.
+        challenge: String,
+        rp_id: &'a str,
+        user: String,
+        /// The account's actor, as the passkey is named.
+        name: &'a str,
+    },
+    /// Use one of the account's passkeys (`get()`), by credential id (base64url).
+    Assert { challenge: String, rp_id: &'a str, credentials: &'a [String] },
+    /// The server's address cannot be a relying party: no form, a notice.
+    Unavailable { why: crate::webauthn::NoRp },
+}
+
+/// An approval page's form, posting `id` to `action` with the fields the
+/// ceremony fills in, and what goes with it in the body (the status line,
+/// the notes); or, where passkeys cannot be used, no form and a notice.
+/// Every value is escaped. Returns the actions, the body's addition, and
+/// the script to run.
+fn approval_form(action: &str, id: &str, ask: &PasskeyAsk<'_>) -> (String, String, Option<&'static str>) {
+    let (mode, data, note) = match ask {
+        PasskeyAsk::Enroll { challenge, rp_id, user, name } => (
+            "create",
+            format!(
+                " data-challenge=\"{}\" data-rp=\"{}\" data-user=\"{}\" data-name=\"{}\"",
+                escape(challenge),
+                escape(rp_id),
+                escape(user),
+                escape(name)
+            ),
+            PASSKEY_ENROLL,
+        ),
+        PasskeyAsk::Assert { challenge, rp_id, credentials } => (
+            "get",
+            format!(
+                " data-challenge=\"{}\" data-rp=\"{}\" data-credentials=\"{}\"",
+                escape(challenge),
+                escape(rp_id),
+                escape(&credentials.join(" "))
+            ),
+            PASSKEY_ASSERT,
+        ),
+        PasskeyAsk::Unavailable { why } => {
+            let why = match why {
+                crate::webauthn::NoRp::IpLiteral => PASSKEY_UNAVAILABLE_HOST,
+                crate::webauthn::NoRp::NotSecure => PASSKEY_UNAVAILABLE_HTTPS,
+            };
+            return (String::new(), format!("<p class=\"lead\">{}</p>\n", escape(why)), None);
+        }
+    };
+    let mut fields = format!("<input type=\"hidden\" name=\"approval\" value=\"{}\">\n", escape(id));
+    for name in ["credential", "client_data", "authenticator_data", "signature", "public_key", "algorithm"] {
+        fields.push_str(&format!("<input type=\"hidden\" name=\"{name}\" value=\"\">\n"));
+    }
+    let actions = format!(
+        "<form method=\"post\" action=\"{action}\" class=\"actions\" data-passkey=\"{mode}\"{data}>\n\
+{fields}<button type=\"submit\" class=\"primary\" disabled>Approve</button>\n\
+</form>\n",
+        action = escape(action),
+    );
+    let body = format!(
+        "<p class=\"note\">{}</p>\n<noscript><p class=\"lead\">{}</p></noscript>\n\
+<p class=\"lead\" role=\"status\" aria-live=\"polite\" data-unsupported=\"{}\" data-waiting=\"{}\" \
+data-cancelled=\"{}\"></p>\n",
+        escape(note),
+        escape(PASSKEY_NO_SCRIPT),
+        escape(PASSKEY_UNSUPPORTED),
+        escape(PASSKEY_WAITING),
+        escape(PASSKEY_CANCELLED),
+    );
+    (actions, body, Some(APPROVE))
+}
+
 /// What vouches for a client being who it says.
 pub enum Identity<'a> {
     /// Its metadata document, served at `url` on `host`. Anyone who can
@@ -302,12 +461,16 @@ pub struct ApproveGate<'a> {
     /// The gate's approval packet, shown below the facts when there is one
     /// ([`packet_section`]).
     pub packet: Option<&'a Packet>,
+    /// The passkey ceremony the approval needs.
+    pub passkey: PasskeyAsk<'a>,
 }
 
 /// The page asking a person to approve a human gate: what the gate is,
 /// what it holds back, and who the approval is recorded as, with one
-/// button. Its form posts only to this server (`'self'`), and the consent
-/// page's script ([`ARMING`]) keeps a double click from sending it.
+/// button. Its form posts only to this server (`'self'`), and its script
+/// ([`APPROVE`]) keeps a double click from sending it and asks for the
+/// passkey the approval needs ([`PasskeyAsk`]); where passkeys cannot be
+/// used, the page has a notice and no form.
 /// Titles come from whoever may write to the workspace, agents included,
 /// so every value is shown escaped ([`shown`]): nothing in them can pass
 /// for the page's own text. The approval packet, workspace-authored too,
@@ -362,16 +525,11 @@ in this browser.</span></p>\n",
         provider = shown(a.provider, MAX_TITLE),
         gate = shown(a.gate, MAX_TITLE),
     );
-    let actions = format!(
-        "<form method=\"post\" action=\"{action}\" class=\"actions\">\n\
-<input type=\"hidden\" name=\"approval\" value=\"{id}\">\n\
-<button type=\"submit\" class=\"primary\">Approve</button>\n\
-</form>\n",
-        action = escape(a.action),
-        id = escape(a.id),
-    );
-    let parts = Parts { actions: &actions, form_action: "'self'", script: Some(ARMING), ..Parts::default() };
-    page(200, "Approve a gate", &body, parts)
+    let (actions, passkey, script) = approval_form(a.action, a.id, &a.passkey);
+    let body = body + &passkey;
+    let status = if script.is_some() { 200 } else { 403 };
+    let parts = Parts { actions: &actions, form_action: "'self'", script, ..Parts::default() };
+    page(status, "Approve a gate", &body, parts)
 }
 
 /// The most issues the operation approval page lists as deleted by a discard.
@@ -411,13 +569,16 @@ pub struct ApproveOperation<'a> {
     pub id: &'a str,
     /// Where the approval is posted: the link's path, without its query.
     pub action: &'a str,
+    /// The passkey ceremony the approval needs.
+    pub passkey: PasskeyAsk<'a>,
 }
 
 /// The page asking a person to approve a close or discard that open human
 /// gates refused: what it does, to what, at whose request and for what
 /// reason, and the gates it gets past, with one button. As on the gate
 /// approval page, every value is shown escaped, the form posts only to this
-/// server and [`ARMING`] keeps a double click from sending it.
+/// server and [`APPROVE`] keeps a double click from sending it and asks for
+/// the passkey.
 pub fn approve_operation(a: &ApproveOperation<'_>) -> Page {
     let op = shown(a.op_label, MAX_TITLE);
     let issue = shown_id(a.issue);
@@ -507,16 +668,11 @@ be released first. Only approve if you opened this link just now, in this browse
         status = shown(a.status, MAX_TITLE),
         at = escape(&bd_core::Timestamp(a.at).to_rfc3339()),
     );
-    let actions = format!(
-        "<form method=\"post\" action=\"{action}\" class=\"actions\">\n\
-<input type=\"hidden\" name=\"approval\" value=\"{id}\">\n\
-<button type=\"submit\" class=\"primary\">Approve</button>\n\
-</form>\n",
-        action = escape(a.action),
-        id = escape(a.id),
-    );
-    let parts = Parts { actions: &actions, form_action: "'self'", script: Some(ARMING), ..Parts::default() };
-    page(200, "Approve an operation", &body, parts)
+    let (actions, passkey, script) = approval_form(a.action, a.id, &a.passkey);
+    let body = body + &passkey;
+    let status = if script.is_some() { 200 } else { 403 };
+    let parts = Parts { actions: &actions, form_action: "'self'", script, ..Parts::default() };
+    page(status, "Approve an operation", &body, parts)
 }
 
 /// A reason as HTML, escaped as [`shown`] escapes text but whole, with its
@@ -984,6 +1140,21 @@ pub fn escape(s: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The ceremony of an account's first approval, as the tests show it.
+    fn enroll() -> PasskeyAsk<'static> {
+        PasskeyAsk::Enroll {
+            challenge: "Y2hhbGxlbmdl".into(),
+            rp_id: "bd.example.com",
+            user: "dXNlcg".into(),
+            name: "github:octocat",
+        }
+    }
+
+    /// The ceremony of a later approval, with the account's `credentials`.
+    fn assert_with(credentials: &[String]) -> PasskeyAsk<'_> {
+        PasskeyAsk::Assert { challenge: "Y2hhbGxlbmdl".into(), rp_id: "bd.example.com", credentials }
+    }
+
     #[test]
     fn pages_escape_what_they_show() {
         assert_eq!(escape(r#"<a href="x">'&'</a>"#), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;");
@@ -1130,6 +1301,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let back = "https://chatgpt.com/connector_platform_oauth_redirect?error=access_denied&state=s";
         let packet = preview_packet();
+        let credentials = ["AAAAAAAAAAAAx1zQ".to_string(), "AAAAAAAAAAAAy2zQ".to_string()];
         let pages = [
             (
                 "consent",
@@ -1232,6 +1404,7 @@ mod tests {
                     id: "c0ffee",
                     action: "https://bd.example.com/w/proj/gates/proj-a1b2",
                     packet: None,
+                    passkey: enroll(),
                 }),
             ),
             (
@@ -1249,6 +1422,7 @@ mod tests {
                     id: "c0ffee",
                     action: "https://bd.example.com/w/proj/gates/proj-r1.gate-build",
                     packet: Some(&packet),
+                    passkey: assert_with(&credentials),
                 }),
             ),
             (
@@ -1276,6 +1450,7 @@ mod tests {
                     actor: "github:octocat",
                     id: "c0ffee",
                     action: "https://bd.example.com/w/proj/close/proj-r1",
+                    passkey: assert_with(&credentials),
                 }),
             ),
             (
@@ -1306,6 +1481,25 @@ mod tests {
                     actor: "github:octocat",
                     id: "c0ffee",
                     action: "https://bd.example.com/w/proj/discard/proj-r1",
+                    passkey: enroll(),
+                }),
+            ),
+            (
+                "approve-gate-unavailable",
+                "Approving a human gate at an IP address: no passkeys, no form",
+                approve_gate(&ApproveGate {
+                    workspace: "proj",
+                    gate: "proj-a1b2",
+                    title: "Release sign-off",
+                    holds: &[],
+                    part_of: None,
+                    approvers: None,
+                    provider: "GitHub",
+                    actor: "github:octocat",
+                    id: "",
+                    action: "",
+                    packet: None,
+                    passkey: PasskeyAsk::Unavailable { why: crate::webauthn::NoRp::IpLiteral },
                 }),
             ),
             (
@@ -1413,6 +1607,7 @@ mod tests {
             id: "c0ffee",
             action: GATE_ACTION,
             packet: None,
+            passkey: enroll(),
         })
     }
 
@@ -1447,14 +1642,17 @@ mod tests {
         assert!(page.csp.contains(&format!("; script-src 'sha256-{hash}';")), "{}", page.csp);
         assert_eq!(page.html.matches("<script").count(), 1);
 
-        // The approval page runs the same script, and only it.
+        assert_eq!(script_of(&page), ARMING, "the consent page keeps its own");
+
+        // The approval pages run their own script, and only it.
         let page = gate_page("Ship it", "proj");
         assert_eq!(page.html.matches("<script").count(), 1);
-        assert_eq!(script_of(&page), ARMING);
-        let arming = STANDARD.encode(Sha256::digest(ARMING.as_bytes()));
-        assert!(page.csp.contains(&format!("; script-src 'sha256-{arming}';")), "{}", page.csp);
+        assert_eq!(script_of(&page), APPROVE);
+        let approve = STANDARD.encode(Sha256::digest(APPROVE.as_bytes()));
+        assert!(page.csp.contains(&format!("; script-src 'sha256-{approve}';")), "{}", page.csp);
         let form = "<form method=\"post\" action=\"https://bd.example.com/w/proj/gates/g&quot;&gt;&lt;x&gt;\" \
-class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
+class=\"actions\" data-passkey=\"create\" data-challenge=\"Y2hhbGxlbmdl\" data-rp=\"bd.example.com\" \
+data-user=\"dXNlcg\" data-name=\"github:octocat\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
         assert!(page.html.contains(form), "{}", page.html);
 
         let options = [("GitHub".to_string(), "https://bd.example.com/oauth/choose?flow=f".to_string())];
@@ -1465,6 +1663,138 @@ class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
             choose("Sign in to approve gate g in proj", &options),
         ] {
             assert!(!other.html.contains("<script") && !other.csp.contains("script-src"), "{}", other.csp);
+        }
+    }
+
+    /// The gate approval page asking for `passkey`.
+    fn gate_asking(passkey: PasskeyAsk<'_>) -> Page {
+        approve_gate(&ApproveGate {
+            workspace: "proj",
+            gate: "g",
+            title: "Ship it",
+            holds: &[],
+            part_of: None,
+            approvers: None,
+            provider: "GitHub",
+            actor: "github:octocat",
+            id: "c0ffee",
+            action: "https://bd.example.com/w/proj/gates/g",
+            packet: None,
+            passkey,
+        })
+    }
+
+    #[test]
+    fn the_approval_pages_ask_for_a_passkey_with_their_one_script() {
+        let approve = STANDARD.encode(Sha256::digest(APPROVE.as_bytes()));
+        let evil = "\"><script>alert(1)</script>";
+        let credentials = [evil.to_string(), "AAAAAAAAAAAAx1zQ".to_string()];
+        let hostile_enroll = PasskeyAsk::Enroll { challenge: evil.into(), rp_id: evil, user: evil.into(), name: evil };
+        let pages = [
+            ("enroll", gate_asking(enroll()), "create"),
+            ("assert", gate_asking(assert_with(&credentials)), "get"),
+            ("hostile", gate_asking(hostile_enroll), "create"),
+            ("operation", operation_page("proj", None, &[], None), "create"),
+        ];
+        for (what, page, mode) in &pages {
+            let html = &page.html;
+            assert_eq!(page.status, 200, "{what}");
+            assert_eq!(html.matches("<script").count(), 1, "{what}: {html}");
+            assert_eq!(script_of(page), APPROVE, "{what}");
+            assert!(page.csp.contains(&format!("; script-src 'sha256-{approve}';")), "{what}: {}", page.csp);
+            assert!(html.contains(&format!("data-passkey=\"{mode}\"")), "{what}: {html}");
+            // Rendered disabled: only the script, once it found what the ceremony needs, enables it.
+            assert_eq!(html.matches("<button").count(), 1, "{what}: {html}");
+            assert!(html.contains("<button type=\"submit\" class=\"primary\" disabled>Approve</button>"), "{what}");
+            assert!(
+                html.contains(&format!("<noscript><p class=\"lead\">{}</p></noscript>", escape(PASSKEY_NO_SCRIPT)))
+            );
+            assert!(html.contains("role=\"status\" aria-live=\"polite\""), "{what}: {html}");
+            let note = if *mode == "create" { PASSKEY_ENROLL } else { PASSKEY_ASSERT };
+            assert!(html.contains(&escape(note)), "{what}: {html}");
+            assert!(!html.contains("<script>alert"), "{what}: {html}");
+            for tag in tags(html) {
+                assert!(!tag.split_whitespace().skip(1).any(|a| a.to_ascii_lowercase().starts_with("on")), "{tag}");
+            }
+        }
+        let html = &pages[1].1.html;
+        assert!(
+            html.contains("data-credentials=\"&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt; AAAAAAAAAAAAx1zQ\""),
+            "{html}"
+        );
+        let html = &pages[2].1.html;
+        let shown = "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;";
+        for attribute in ["data-challenge", "data-rp", "data-user", "data-name"] {
+            assert!(html.contains(&format!("{attribute}=\"{shown}\"")), "{attribute}: {html}");
+        }
+        // The script writes messages as text, runs nothing it is given, and has no handlers in the page.
+        for banned in ["innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "Function(", "document.write"] {
+            assert!(!APPROVE.contains(banned), "{banned}");
+        }
+        assert!(APPROVE.contains("textContent") && APPROVE.contains("userVerification:'required'"));
+        assert!(APPROVE.contains("alg:-7") && APPROVE.contains("alg:-257") && APPROVE.contains("timeout:300000"));
+        assert!(APPROVE.contains("attestation:'none'") && APPROVE.contains("residentKey:'preferred'"));
+        assert!(APPROVE.contains("getPublicKey") && APPROVE.contains("Date.now()-since<600"));
+
+        // Where passkeys cannot be used: the facts and a notice, no form, button or script.
+        for (why, notice) in [
+            (crate::webauthn::NoRp::IpLiteral, PASSKEY_UNAVAILABLE_HOST),
+            (crate::webauthn::NoRp::NotSecure, PASSKEY_UNAVAILABLE_HTTPS),
+        ] {
+            let page = gate_asking(PasskeyAsk::Unavailable { why });
+            assert_eq!(page.status, 403);
+            assert!(page.html.contains("<h1>Approve Ship it?</h1>"), "{}", page.html);
+            assert!(page.html.contains(&escape(notice)), "{}", page.html);
+            assert!(!page.html.contains("<form") && !page.html.contains("<button"), "{}", page.html);
+            assert!(!page.html.contains("<script") && !page.csp.contains("script-src"), "{}", page.csp);
+            assert!(!page.html.contains(">Approve<"), "{}", page.html);
+        }
+        let mut page = operation_page("proj", None, &[], None);
+        assert!(page.html.contains("<form"));
+        page = approve_operation(&ApproveOperation {
+            workspace: "proj",
+            op_label: "close",
+            issue: "bd-1",
+            title: "t",
+            status: "open",
+            part_of: None,
+            reason: None,
+            requester: "alice",
+            at: 0,
+            failed: false,
+            force: false,
+            gates: &[],
+            deletes: None,
+            provider: "GitHub",
+            actor: "github:octocat",
+            id: "",
+            action: "",
+            passkey: PasskeyAsk::Unavailable { why: crate::webauthn::NoRp::IpLiteral },
+        });
+        assert_eq!(page.status, 403);
+        assert!(!page.html.contains("<form") && !page.html.contains("<script"), "{}", page.html);
+        assert!(page.html.contains(&escape(PASSKEY_UNAVAILABLE_HOST)), "{}", page.html);
+    }
+
+    #[test]
+    fn a_passkeys_copy_names_no_one() {
+        const PRONOUNS: [&str; 10] = ["i", "me", "my", "we", "our", "us", "you", "your", "yours", "you're"];
+        for copy in [
+            PASSKEY_ENROLL,
+            PASSKEY_ASSERT,
+            PASSKEY_NO_SCRIPT,
+            PASSKEY_UNSUPPORTED,
+            PASSKEY_WAITING,
+            PASSKEY_CANCELLED,
+            PASSKEY_UNAVAILABLE_HOST,
+            PASSKEY_UNAVAILABLE_HTTPS,
+            PASSKEY_FAILED_GATE,
+            PASSKEY_FAILED_OP,
+        ] {
+            for word in copy.split(|c: char| !c.is_alphanumeric() && c != '\'').filter(|w| !w.is_empty()) {
+                let word = word.to_lowercase().replace('\u{2019}', "'");
+                assert!(!PRONOUNS.contains(&word.as_str()), "{word:?} in {copy:?}");
+            }
         }
     }
 
@@ -1515,6 +1845,7 @@ class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
             id: "i",
             action: "a",
             packet: None,
+            passkey: enroll(),
         });
         assert!(page.html.contains("<dt>Approvers</dt><dd>None valid"), "{}", page.html);
         assert!(page.html.contains("<dt>Holds back</dt><dd>Nothing</dd>"), "{}", page.html);
@@ -1547,6 +1878,7 @@ class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
             actor: other,
             id: "c0ffee",
             action: GATE_ACTION,
+            passkey: enroll(),
         })
     }
 
@@ -1580,11 +1912,11 @@ class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
         assert!(page.csp.contains("frame-ancestors 'none'"), "{}", page.csp);
         assert!(page.csp.contains("form-action 'self';"), "{}", page.csp);
         assert_eq!(page.html.matches("<script").count(), 1);
-        assert_eq!(script_of(&page), ARMING);
-        let arming = STANDARD.encode(Sha256::digest(ARMING.as_bytes()));
-        assert!(page.csp.contains(&format!("; script-src 'sha256-{arming}';")), "{}", page.csp);
+        assert_eq!(script_of(&page), APPROVE);
+        let approve = STANDARD.encode(Sha256::digest(APPROVE.as_bytes()));
+        assert!(page.csp.contains(&format!("; script-src 'sha256-{approve}';")), "{}", page.csp);
         let form = "<form method=\"post\" action=\"https://bd.example.com/w/proj/gates/g&quot;&gt;&lt;x&gt;\" \
-class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
+class=\"actions\" data-passkey=\"create\"";
         assert!(page.html.contains(form), "{}", page.html);
         let start = page.html.find("<style>").unwrap() + "<style>".len();
         let end = page.html.find("</style>").unwrap();
@@ -1656,6 +1988,7 @@ class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
             id: "c0ffee",
             action: "https://bd.example.com/w/proj/gates/g",
             packet,
+            passkey: enroll(),
         })
     }
 
@@ -1702,11 +2035,17 @@ class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
         assert_eq!(html.matches("<button").count(), 1, "{html}");
         assert_eq!(html.matches("name=\"approval\"").count(), 1, "{html}");
         assert_eq!(html.matches("<script").count(), 1, "{html}");
-        assert_eq!(script_of(&page), ARMING);
+        assert_eq!(script_of(&page), APPROVE);
+        let hidden: Vec<String> =
+            ["credential", "client_data", "authenticator_data", "signature", "public_key", "algorithm"]
+                .iter()
+                .map(|name| format!("input type=\"hidden\" name=\"{name}\" value=\"\""))
+                .collect();
         for tag in tags(html) {
             if tag.starts_with("input") {
                 assert!(
                     tag == "input type=\"hidden\" name=\"approval\" value=\"c0ffee\""
+                        || hidden.iter().any(|h| h == tag)
                         || tag.starts_with("input type=\"checkbox\" disabled"),
                     "{tag}"
                 );

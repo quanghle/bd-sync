@@ -7543,3 +7543,101 @@ fn gate_review_reports_a_broken_remote_configuration_on_one_line() {
     }
     assert!(!tmp.path().join("keychain.json.log").exists(), "the keychain was not read");
 }
+
+#[test]
+fn serve_passkey_list_and_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let root_s = root.to_str().unwrap();
+    let run = |args: &[&str]| Ws::cmd_in(dir.path(), "tester", args).output().unwrap();
+    let ok = |args: &[&str]| {
+        let out = run(args);
+        assert!(out.status.success(), "bd {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let json = |args: &[&str]| -> Value {
+        let mut a = vec!["--json"];
+        a.extend_from_slice(args);
+        serde_json::from_str(&ok(&a)).unwrap()
+    };
+    // An admin token makes server.db; the account and its passkeys go in as a sign-in and approvals keep them.
+    ok(&["serve", "token", "create", "seed", "--as", "seed", "--root", root_s]);
+    let conn = rusqlite::Connection::open(root.join("server.db")).unwrap();
+    let account = serde_json::json!({
+        "provider": "corp", "issuer": "https://idp.example", "subject": "s1", "actor": "corp:alice",
+        "login": "alice", "first_seen": 1, "last_seen": 1,
+    });
+    conn.execute(
+        "INSERT INTO accounts (issuer, subject, actor_key, login_key, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params!["https://idp.example", "s1", "corp:alice", "alice", account.to_string()],
+    )
+    .unwrap();
+    for (n, credential) in ["AAAAAAAAAAAAx1", "AAAAAAAAAAAAy2", "AAAAAAAAAAAAy3"].into_iter().enumerate() {
+        conn.execute(
+            "INSERT INTO passkeys (credential, issuer, subject, actor_key, algorithm, public_key, counter, created_at, \
+             last_used_at) VALUES (?1, 'https://idp.example', 's1', 'corp:alice', -7, x'3059', ?2, ?3, ?4)",
+            rusqlite::params![credential, n as i64, 1_700_000_000_000i64, (n == 1).then_some(1_700_000_100_000i64)],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let list = ["serve", "passkey", "list", "--account", "corp:alice", "--root", root_s];
+    let rows = json(&list);
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[0]["credential_prefix"], "AAAAAAAAAAAA");
+    assert_eq!(rows[0]["algorithm"], "ES256");
+    assert_eq!(rows[0]["created_at"], "2023-11-14T22:13:20.000Z");
+    assert_eq!(rows[0]["last_used_at"], Value::Null);
+    assert_eq!(
+        (rows[1]["counter"].as_i64(), rows[1]["last_used_at"].as_str()),
+        (Some(1), Some("2023-11-14T22:15:00.000Z"))
+    );
+    let text = ok(&list);
+    assert_eq!(text.lines().filter(|l| l.starts_with("AAAAAAAAAAAA  ES256  created ")).count(), 3, "{text}");
+    assert!(text.contains("last used never, counter 0") && text.contains("counter 2"), "{text}");
+    assert!(!text.contains("x1") && !text.contains("y2"), "only the prefix is shown: {text}");
+    let by_login = json(&["serve", "passkey", "list", "--account", "alice", "--root", root_s]);
+    assert_eq!(by_login.as_array().unwrap().len(), 3, "the login names the account too");
+
+    let remove = |extra: &[&str]| {
+        let mut a = vec!["serve", "passkey", "remove", "--account", "corp:alice", "--root", root_s];
+        a.extend_from_slice(extra);
+        run(&a)
+    };
+    let out = remove(&["--credential", "AAAA"]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("give a longer prefix"));
+    assert_eq!(json(&list).as_array().unwrap().len(), 3, "nothing removed");
+
+    let out = remove(&["--credential", "AAAAAAAAAAAAx"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("✓ Removed 1 passkey of corp:alice"));
+    assert_eq!(json(&list).as_array().unwrap().len(), 2);
+
+    let mut all = vec!["--json", "serve", "passkey", "remove", "--account", "corp:alice", "--root", root_s];
+    let removed: Value = serde_json::from_str(&ok(&all)).unwrap();
+    assert_eq!(removed["account"], "corp:alice");
+    assert_eq!(removed["removed"], serde_json::json!(["AAAAAAAAAAAA", "AAAAAAAAAAAA"]), "both, in one call");
+    assert!(json(&list).as_array().unwrap().is_empty());
+    assert!(ok(&list).contains("No passkeys for corp:alice: its next browser approval registers one."));
+    all.remove(0);
+    let out = run(&all);
+    assert_eq!(out.status.code(), Some(3), "none left: {}", String::from_utf8_lossy(&out.stderr));
+
+    let out = run(&["serve", "passkey", "list", "--account", "nobody", "--root", root_s]);
+    assert_eq!(out.status.code(), Some(3), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("nobody"));
+
+    let events = json(&["serve", "token", "events", "--kind", "passkey_removed", "--root", root_s]);
+    let events = events.as_array().unwrap();
+    assert_eq!(events.len(), 3, "{events:?}");
+    for e in events {
+        assert_eq!(e["actor"], "corp:alice", "{e}");
+        let detail = e["detail"].as_str().unwrap();
+        assert!(detail.contains("AAAAAAAAAAAA") && detail.contains("ES256"), "{detail}");
+        assert!(!detail.contains("AAAAAAAAAAAAx1") && !detail.contains("AAAAAAAAAAAAy"), "{detail}");
+    }
+}

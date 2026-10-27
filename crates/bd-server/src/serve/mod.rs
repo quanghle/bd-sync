@@ -190,6 +190,10 @@ const MAX_REGISTERING: usize = 2;
 const MAX_SIGN_IN_BODY: usize = 16 << 10;
 /// The largest body of a consent page's decision.
 const MAX_CONSENT_BODY: usize = 4 << 10;
+/// The largest body of an approval page's post: the approval id and the
+/// WebAuthn fields, each capped before decoding (an RS256 registration's
+/// largest fields come to about 6 KiB).
+const MAX_APPROVAL_BODY: usize = 8 << 10;
 /// The largest provider's answer posted to a callback (an ID token and the
 /// user's name with the code, which are not read).
 const MAX_RELAYED_BODY: usize = 32 << 10;
@@ -206,6 +210,7 @@ pub fn cmd_serve(app: &mut App, a: &ServeArgs) -> Result<()> {
     io::require_local("bd serve")?;
     match &a.action {
         Some(ServeAction::Token(cmd)) => auth::cmd_token(app, cmd),
+        Some(ServeAction::Passkey(cmd)) => crate::passkeys::cmd_passkey(app, cmd),
         Some(ServeAction::Check(c)) => check::check(app, c),
         None => run(a),
     }
@@ -1459,7 +1464,7 @@ mod tests {
             let still = authorize::pending_operation(&server.flows, "live", "proj", "close", "t-1");
             assert!(still.is_some(), "{spoiled:?}: left waiting");
             // Nothing that names no page shown for this path is recorded, nor a GET.
-            let big = format!("approval=live&x={}", "y".repeat(MAX_CONSENT_BODY));
+            let big = format!("approval=live&x={}", "y".repeat(MAX_APPROVAL_BODY));
             for (op, issue, req) in [
                 (Op::Close, "t-1", post("/bd/w/proj/close/t-1", "approval=nope")),
                 (Op::Discard, "t-1", post("/bd/w/proj/discard/t-1", "approval=live")),
@@ -1490,6 +1495,26 @@ mod tests {
         .await;
         assert_eq!(r.status(), StatusCode::NOT_FOUND);
         assert_eq!(take_recorded(), vec![]);
+    }
+
+    #[test]
+    fn an_approval_body_fits_the_largest_passkey_fields() {
+        use crate::webauthn::{
+            MAX_AUTH_DATA, MAX_CLIENT_DATA, MAX_CREDENTIAL, MAX_PUBLIC_KEY, MAX_SIGNATURE, encoded_len,
+        };
+        // Every field the page posts, each at its longest (the browser sends the empty ones too).
+        let fields = [
+            ("approval", 64),
+            ("credential", encoded_len(MAX_CREDENTIAL)),
+            ("client_data", encoded_len(MAX_CLIENT_DATA)),
+            ("authenticator_data", encoded_len(MAX_AUTH_DATA)),
+            ("signature", encoded_len(MAX_SIGNATURE)),
+            ("public_key", encoded_len(MAX_PUBLIC_KEY)),
+            ("algorithm", 20),
+        ];
+        let body: usize = fields.iter().map(|(name, len)| name.len() + len + 2).sum();
+        assert!(body <= MAX_APPROVAL_BODY, "{body}");
+        assert!(body > MAX_CONSENT_BODY, "the consent's cap would refuse it: {body}");
     }
 
     #[tokio::test(flavor = "current_thread")]

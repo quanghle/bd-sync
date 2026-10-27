@@ -72,7 +72,7 @@ where
     }
     let cookies: String =
         req.headers().get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join("; ");
-    let Ok(body) = read_body(req.into_body(), MAX_CONSENT_BODY, HEADER_TIMEOUT).await else {
+    let Ok(body) = read_body(req.into_body(), MAX_APPROVAL_BODY, HEADER_TIMEOUT).await else {
         let why = "The approval didn't arrive complete. Open the gate's link again.";
         return html_page(pages::notice(400, "Couldn't approve the gate", why));
     };
@@ -156,7 +156,7 @@ where
     }
     let cookies: String =
         req.headers().get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join("; ");
-    let Ok(body) = read_body(req.into_body(), MAX_CONSENT_BODY, HEADER_TIMEOUT).await else {
+    let Ok(body) = read_body(req.into_body(), MAX_APPROVAL_BODY, HEADER_TIMEOUT).await else {
         record(authorize::Outcome::Refused, "form unreadable");
         let why = "The approval didn't arrive complete. Open the approval link again.";
         return html_page(pages::notice(400, TITLE, why));
@@ -196,7 +196,7 @@ where
     if req.method() != Method::POST || server.public_issuer().is_none() {
         return;
     }
-    let Ok(body) = read_body(req.into_body(), MAX_CONSENT_BODY, HEADER_TIMEOUT).await else { return };
+    let Ok(body) = read_body(req.into_body(), MAX_APPROVAL_BODY, HEADER_TIMEOUT).await else { return };
     let pairs = form::decode(&String::from_utf8_lossy(&body)).unwrap_or_default();
     let Some(id) = pairs.iter().find(|(k, _)| k == "approval").map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
     else {
@@ -205,7 +205,13 @@ where
     if let Some((provider, login, subject, actor)) =
         authorize::pending_operation(&server.flows, id, workspace, op.as_str(), issue)
     {
-        let who = authorize::Who { provider: &provider, login: &login, subject: &subject, actor: &actor };
+        let who = authorize::Who {
+            provider: &provider,
+            login: &login,
+            subject: &subject,
+            actor: &actor,
+            ..Default::default()
+        };
         authorize::record(
             authorize::Outcome::Failed,
             &who,

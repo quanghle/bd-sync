@@ -1,4 +1,4 @@
-//! `bd mcp`, `bd serve` and `bd serve token`.
+//! `bd mcp`, `bd serve`, `bd serve token` and `bd serve passkey`.
 
 use std::path::PathBuf;
 
@@ -115,6 +115,9 @@ pub enum ServeAction {
     /// Manage access tokens (on the server host)
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Manage passkeys for browser approvals (on the server host)
+    #[command(subcommand)]
+    Passkey(PasskeyCommand),
     /// Check auth.toml as the server reads it and print what to register
     #[command(long_about = SERVE_CHECK_LONG_ABOUT)]
     Check(ServeCheckArgs),
@@ -244,13 +247,74 @@ pub struct TokenEventsArgs {
     /// Only this actor's, and its sub-actors'
     #[arg(long, visible_alias = "by", value_name = "ACTOR")]
     pub actor: Option<String>,
-    /// Only these kinds: signed_in, token_created, refreshed, revoked, forgotten, client_registered, linked or
-    /// named (repeatable or comma separated)
+    /// Only these kinds: signed_in, token_created, refreshed, revoked, forgotten, client_registered, linked,
+    /// named, passkey_registered or passkey_removed (repeatable or comma separated)
     #[arg(long = "kind", value_name = "KIND", value_delimiter = ',')]
     pub kinds: Vec<String>,
     /// Show at most this many, the latest
     #[arg(short = 'n', long, default_value_t = 100, value_name = "N")]
     pub limit: usize,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum PasskeyCommand {
+    /// List an account's passkeys (never their keys)
+    #[command(alias = "ls", long_about = PASSKEY_LIST_LONG_ABOUT)]
+    List(PasskeyListArgs),
+    /// Remove an account's passkeys: its next browser approval registers a new one
+    #[command(long_about = PASSKEY_REMOVE_LONG_ABOUT)]
+    Remove(PasskeyRemoveArgs),
+}
+
+const PASSKEY_LIST_LONG_ABOUT: &str = "\
+List an account's passkeys (never their keys)
+
+Every Approve on bd serve's browser approval pages (human gates, and refused
+closes and discards) needs a passkey with user verification: an account's
+first approval registers one, and later approvals ask for it. This lists the
+passkeys of one account, by the first 12 characters of each credential id,
+with its algorithm, when it was registered and last used, and its signature
+counter.";
+
+const PASSKEY_REMOVE_LONG_ABOUT: &str = "\
+Remove an account's passkeys: its next browser approval registers a new one
+
+Use it when a person has lost the device holding a passkey, or a passkey was
+registered by someone else. Without --credential every passkey of the account
+is removed; with it, only the one whose credential id starts with that prefix
+(as `bd serve passkey list` shows it), refused when the prefix names none or
+several. Each removal is recorded in the audit trail as a passkey_removed
+event. The account's next browser approval registers a new passkey, so check
+who signs in next.";
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = "\
+Examples:
+  bd serve passkey list --account corp:alice --root /srv/bd
+  bd serve passkey list --account corp:alice --root /srv/bd --json")]
+pub struct PasskeyListArgs {
+    /// Account: its actor, or its login
+    #[arg(long, value_name = "ACCOUNT")]
+    pub account: String,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = "\
+Examples:
+  bd serve passkey remove --account corp:alice --root /srv/bd
+  bd serve passkey remove --account corp:alice --credential q3ZbX0aLm1Pc --root /srv/bd")]
+pub struct PasskeyRemoveArgs {
+    /// Account: its actor, or its login
+    #[arg(long, value_name = "ACCOUNT")]
+    pub account: String,
+    /// Remove only the passkey whose credential id starts with this prefix (default: every passkey of the
+    /// account)
+    #[arg(long, value_name = "PREFIX")]
+    pub credential: Option<String>,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }

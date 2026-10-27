@@ -9061,6 +9061,27 @@ fn browse(url: &str, cookie: Option<&str>, post: Option<(&str, &str)>) -> (u16, 
     (r.status().as_u16(), r.headers().clone(), text)
 }
 
+/// The methods a gate's page does not take.
+const UNSUPPORTED: &[&str] = &["PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"];
+
+/// A request by one of [`UNSUPPORTED`]'s methods, without cookies, following no redirects: the status, headers
+/// and body.
+fn send_method(method: &str, url: &str) -> (u16, ureq::http::HeaderMap, String) {
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).proxy(None).build().into();
+    let mut r = match method {
+        "PUT" => agent.put(url).send_empty(),
+        "PATCH" => agent.patch(url).send_empty(),
+        "DELETE" => agent.delete(url).call(),
+        "OPTIONS" => agent.options(url).call(),
+        "HEAD" => agent.head(url).call(),
+        other => panic!("no such method here: {other}"),
+    }
+    .unwrap();
+    let text = r.body_mut().read_to_string().unwrap_or_default();
+    (r.status().as_u16(), r.headers().clone(), text)
+}
+
 fn location(headers: &ureq::http::HeaderMap) -> String {
     headers.get("location").expect("a redirect").to_str().unwrap().to_string()
 }
@@ -11801,35 +11822,63 @@ fn oidc_gate_approvers_are_bound_to_issuer_and_subject() {
     assert!(open(&g6));
 }
 
+/// `url` serves no gate page: every method, GET and POST included, gets 404, with no `Allow`, redirect or cookie.
+fn no_gate_page(url: &str) {
+    let mut answers = vec![("GET", browse(url, None, None)), ("POST", browse(url, None, Some((PUBLIC, ""))))];
+    answers.extend(UNSUPPORTED.iter().map(|&method| (method, send_method(method, url))));
+    for (method, (status, headers, body)) in answers {
+        assert_eq!(status, 404, "{method} {url}: {body}");
+        for name in ["allow", "location", "set-cookie"] {
+            assert!(headers.get(name).is_none(), "{method} {url}: {name} {:?}", headers.get(name));
+        }
+    }
+}
+
 #[test]
 fn no_oauth_no_gate_page() {
     // A server without sign-in.
     let server = Server::start();
     for path in ["/w/proj/gates/t-1", "/bd/w/proj/gates/t-1"] {
-        assert_eq!(browse(&format!("{}{path}", server.base), None, None).0, 404, "{path}");
+        no_gate_page(&format!("{}{path}", server.base));
     }
     drop(server);
 
-    // Started with sign-in but without [oauth] and --public-url; [oauth] added later serves no approvals.
+    // Without [oauth], the client secret of GitHub's web sign-in has nothing to serve.
+    let strip_oauth = |full: &str| {
+        let (without, _) = full.split_once("\n[oauth]\n").unwrap();
+        without.replacen("client_secret_file = \"github-secret\"\n", "", 1)
+    };
+
+    // Started with sign-in and --public-url but without [oauth]: no approvals, whatever the method. Nothing is
+    // looked up before that, so neither the workspace nor the gate needs to exist.
     let github = FakeGithub::start();
+    let root = oauth_root_at(Some(&github), GATE_RULES, "");
+    let config = std::fs::read_to_string(root.path().join("auth.toml")).unwrap();
+    std::fs::write(root.path().join("auth.toml"), strip_oauth(&config)).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    for path in ["/w/proj/gates/t-1", "/bd/w/proj/gates/t-1"] {
+        no_gate_page(&format!("{}{path}", server.base));
+    }
+    drop(server);
+
+    // Started with sign-in but without [oauth] and --public-url; [oauth] added later serves no approvals. (Without
+    // a public URL the /bd path is no gate path at all: the generic 404.)
     let (root, ids) = gate_root(&github, GATE_RULES);
     let full = std::fs::read_to_string(root.path().join("auth.toml")).unwrap();
-    let (without, _) = full.split_once("\n[oauth]\n").unwrap();
-    // Without [oauth], the client secret of GitHub's web sign-in has nothing to serve.
-    let without = without.replacen("client_secret_file = \"github-secret\"\n", "", 1);
-    std::fs::write(root.path().join("auth.toml"), without).unwrap();
+    std::fs::write(root.path().join("auth.toml"), strip_oauth(&full)).unwrap();
     let server = Server::launch(root, "127.0.0.1:0", &[]);
     let paths = [format!("/w/proj/gates/{}", ids.human), format!("/bd/w/proj/gates/{}", ids.human)];
     for path in &paths {
-        assert_eq!(browse(&format!("{}{path}", server.base), None, None).0, 404, "{path}");
+        no_gate_page(&format!("{}{path}", server.base));
     }
     std::fs::write(server.root.path().join("auth.toml"), &full).unwrap();
     for path in &paths {
-        assert_eq!(browse(&format!("{}{path}", server.base), None, None).0, 404, "{path}");
+        no_gate_page(&format!("{}{path}", server.base));
     }
     drop(server);
 
-    // Started able to serve them; then auth.toml loses its browser provider (GitHub's client secret).
+    // Started able to serve them: other methods than GET and POST get 405, under the public path or stripped, and
+    // start no sign-in. Then auth.toml loses its browser provider (GitHub's client secret): every method gets 404.
     let (root, ids) = gate_root(&github, GATE_RULES);
     let check_out = bd(root.path()).args(["serve", "check", "--root"]).arg(root.path()).args(PUBLIC_URL).output();
     let said = check_out.unwrap();
@@ -11837,7 +11886,18 @@ fn no_oauth_no_gate_page() {
     assert!(!said.contains("/gates"), "nothing new to register: {said}");
     let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
     let url = gate_url(&server, "proj", &ids.human);
+    let stripped = format!("{}/w/proj/gates/{}", server.base, ids.human);
+    for url in [&url, &stripped] {
+        for &method in UNSUPPORTED {
+            let (status, headers, body) = send_method(method, url);
+            assert_eq!(status, 405, "{method} {url}: {body}");
+            assert_eq!(headers.get("allow").and_then(|v| v.to_str().ok()), Some("GET, POST"), "{method} {url}");
+            assert!(headers.get("location").is_none(), "{method} {url}");
+            assert!(headers.get("set-cookie").is_none(), "{method} {url}");
+        }
+    }
     assert_eq!(browse(&url, None, None).0, 302);
+    assert_eq!(browse(&stripped, None, None).0, 302);
     let config = std::fs::read_to_string(server.root.path().join("auth.toml")).unwrap();
     let edited = config.replacen("client_secret_file = \"github-secret\"\n", "", 1);
     assert_ne!(edited, config);
@@ -11845,6 +11905,8 @@ fn no_oauth_no_gate_page() {
     let (status, headers, page) = browse(&url, None, None);
     assert_eq!(status, 404, "{page}");
     assert!(headers.get("location").is_none());
+    no_gate_page(&url);
+    no_gate_page(&stripped);
 }
 
 // Where a person is pointed at a waiting human gate: approval links in views and refusals, and `bd gate review`.

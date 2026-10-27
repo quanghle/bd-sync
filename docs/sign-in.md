@@ -571,7 +571,9 @@ provider when there is one, and back at that provider's callback,
 and `bd serve check` prints none. Without `--public-url`, without
 `[oauth]`, or with an `auth.toml` edited since start into one the server
 would refuse (`[oauth]` with no browser provider, say), the path answers
-404. bd composes the link only where the server offers this page, from
+404 to every method. Where the page is served, methods other than GET and
+POST get 405 with `Allow: GET, POST`. bd composes the link only where the
+server offers this page, from
 `--public-url`, the workspace and the gate's id, never from stored text
 (a gate title cannot supply one): `bd prime` (with a sentence telling
 agents to hand the link over, or to ask the person to run `bd gate

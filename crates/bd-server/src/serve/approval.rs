@@ -17,8 +17,10 @@ fn no_approvals() -> Response<Body> {
 }
 
 /// `GET` (the approval page, after a sign-in) or `POST` (the approval) at
-/// `<public url>/w/<workspace>/gates/<gate>`. Without `--public-url`,
-/// `[oauth]`, or a browser provider, there is no such page.
+/// `<public url>/w/<workspace>/gates/<gate>`; any other method gets 405
+/// (`Allow: GET, POST`) once the page is served. Without `--public-url`,
+/// `[oauth]`, or a browser provider, there is no such page: every method
+/// gets 404.
 pub(super) async fn gate_approval(
     server: &Arc<Server>,
     workspace: &str,
@@ -35,6 +37,12 @@ pub(super) async fn gate_approval(
         }
         Err(e) => return sign_in_misconfigured(&e),
     };
+    // Only once the page is served, so a server without approvals answers 404 to every method.
+    if req.method() != Method::GET && req.method() != Method::POST {
+        let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET or POST", 2).response();
+        r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
+        return r;
+    }
     let (workspace, gate) = (workspace.to_string(), gate.to_string());
     let srv = server.clone();
     if req.method() != Method::POST {

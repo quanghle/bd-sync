@@ -171,14 +171,8 @@ pub(super) async fn handle(
             r
         }
     } else if let Some((workspace, gate)) = gate_path(&server, &path) {
-        if req.method() == Method::GET || req.method() == Method::POST {
-            let (workspace, gate) = (workspace.to_string(), gate.to_string());
-            gate_approval(&server, &workspace, &gate, req).await
-        } else {
-            let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET or POST", 2).response();
-            r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
-            r
-        }
+        let (workspace, gate) = (workspace.to_string(), gate.to_string());
+        gate_approval(&server, &workspace, &gate, req).await
     } else if let Some((prefix, workspace)) = mcp_path(&path) {
         if req.method() == Method::POST {
             let endpoint = Endpoint::of(&server, prefix, workspace, &req);

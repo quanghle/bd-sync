@@ -10370,6 +10370,7 @@ impl Keychain {
     }
 
     /// The items, each entry parsed.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn items(&self) -> serde_json::Map<String, Value> {
         let Ok(text) = std::fs::read_to_string(&self.path) else { return Default::default() };
         let items: serde_json::Map<String, Value> = serde_json::from_str(&text).unwrap();
@@ -10389,6 +10390,7 @@ impl Keychain {
     }
 
     /// The operations logged since the log read `before`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn since(&self, before: &str) -> String {
         let log = self.log();
         assert!(log.starts_with(before), "{log}");
@@ -10655,6 +10657,7 @@ fn save_human(keychain: &Keychain, alice: &Client, secret: &str, workspace_only:
     assert!(out.status.success(), "{shown}");
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 const HUMAN_NOTE: &str = "bd: using the person's access token saved in the test keychain";
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]

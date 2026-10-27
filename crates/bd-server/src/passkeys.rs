@@ -1,10 +1,13 @@
 //! The passkeys accounts approve with on the browser approval pages, in
-//! `<root>/server.db`'s `passkeys` table: one per account, registered at its
-//! first approval (`insert_first`), its counter moved on by each approval
-//! (`use_counter`), removed by an admin (`remove`), and erased with a
-//! forgotten account (`server_db::erase_passkeys`). Registrations and
-//! removals are recorded in the audit trail by the credential id's first
-//! [`PREFIX`] characters and the algorithm, never the key. `bd serve passkey
+//! `<root>/server.db`'s `passkeys` table: several per account, at most
+//! [`MAX_PER_ACCOUNT`]. The first is registered at the account's first
+//! approval (`insert_first`); more are added at an approval vouched for by a
+//! verified assertion of one the account has (`add`). Each approval moves
+//! its passkey's counter on (`use_counter`, or `add` for the vouching one);
+//! an admin removes them (`remove`), and they are erased with a forgotten
+//! account (`server_db::erase_passkeys`). Registrations and removals are
+//! recorded in the audit trail by the credential id's first [`PREFIX`]
+//! characters and the algorithm, never the key. `bd serve passkey
 //! list|remove` is the admin's command over them (`cmd_passkey`).
 
 use std::path::Path;
@@ -17,6 +20,10 @@ use serde_json::json;
 use crate::auth::{self, Account};
 use crate::server_db::{self, AuthEvent};
 use crate::webauthn::Alg;
+
+/// The most passkeys an account may hold: an approval offers to add one only
+/// below it, and [`add`] refuses past it.
+pub const MAX_PER_ACCOUNT: usize = 99;
 
 /// How many characters of a credential id (base64url) logs, events and
 /// listings show.
@@ -70,6 +77,10 @@ pub(crate) const INSERT: &str = "INSERT INTO passkeys (credential, issuer, subje
 pub(crate) const USE_COUNTER: &str =
     "UPDATE passkeys SET counter = ?1, last_used_at = ?2 WHERE credential = ?3 AND counter = ?4";
 pub(crate) const DELETE: &str = "DELETE FROM passkeys WHERE credential = ?1";
+pub(crate) const COUNT_BY_ACCOUNT: &str = "SELECT COUNT(*) FROM passkeys WHERE issuer = ?1 AND subject = ?2";
+pub(crate) const OWNED: &str = "SELECT 1 FROM passkeys WHERE credential = ?1 AND issuer = ?2 AND subject = ?3";
+pub(crate) const USE_COUNTER_OWNED: &str = "UPDATE passkeys SET counter = ?1, last_used_at = ?2 WHERE credential = ?3 \
+                                            AND issuer = ?4 AND subject = ?5 AND counter = ?6";
 
 fn select(tx: &rusqlite::Transaction, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Passkey>> {
     let mut stmt = tx.prepare_cached(sql)?;
@@ -174,6 +185,91 @@ pub fn insert_first(root: &Path, row: &NewRow) -> Result<Inserted> {
         )?;
         server_db::prune_events(tx)?;
         Ok(Inserted::Inserted)
+    })
+}
+
+/// What [`add`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Added {
+    Added,
+    /// The account is not there (any more).
+    NoAccount,
+    /// The account has [`MAX_PER_ACCOUNT`] passkeys already.
+    LimitReached,
+    /// Another passkey has the new credential id.
+    CredentialTaken,
+    /// The vouching passkey is no longer the account's, or its counter moved
+    /// since it was read: another approval or an admin changed it meanwhile.
+    Raced,
+}
+
+/// Add `row` to its account's passkeys at an approval vouched for by the
+/// account's passkey `asserted`, whose counter was `read` and moves to
+/// `new`, in one transaction: only if the account is there, `asserted` is
+/// still one of its passkeys, it has fewer than [`MAX_PER_ACCOUNT`], no
+/// passkey has the new credential id, and `asserted`'s counter is still at
+/// `read`. Every check runs before the first change, so a refusal changes
+/// nothing; otherwise the counter moves, the row goes in, and a
+/// `passkey_registered` event names both credentials' prefixes.
+pub fn add(root: &Path, row: &NewRow, asserted: &str, read: u32, new: u32) -> Result<Added> {
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| {
+        let exists =
+            |sql: &str, args: &[&dyn rusqlite::ToSql]| -> Result<bool> { Ok(tx.prepare_cached(sql)?.exists(args)?) };
+        if !exists(ACCOUNT_EXISTS, &[&row.issuer, &row.subject])? {
+            return Ok(Added::NoAccount);
+        }
+        if !exists(OWNED, &[&asserted, &row.issuer, &row.subject])? {
+            return Ok(Added::Raced);
+        }
+        let count: i64 =
+            tx.prepare_cached(COUNT_BY_ACCOUNT)?.query_row(rusqlite::params![row.issuer, row.subject], |r| r.get(0))?;
+        if count >= MAX_PER_ACCOUNT as i64 {
+            return Ok(Added::LimitReached);
+        }
+        if exists(TAKEN, &[&row.credential])? {
+            return Ok(Added::CredentialTaken);
+        }
+        let moved = tx.prepare_cached(USE_COUNTER_OWNED)?.execute(rusqlite::params![
+            new,
+            Timestamp::now().millis(),
+            asserted,
+            row.issuer,
+            row.subject,
+            read
+        ])?;
+        if moved != 1 {
+            return Ok(Added::Raced);
+        }
+        tx.prepare_cached(INSERT)?.execute(rusqlite::params![
+            row.credential,
+            row.issuer,
+            row.subject,
+            server_db::key(row.actor),
+            row.alg.cose(),
+            row.public_key,
+            row.counter,
+            Timestamp::now().millis(),
+        ])?;
+        server_db::record(
+            tx,
+            &AuthEvent {
+                kind: "passkey_registered",
+                actor: Some(row.actor.to_string()),
+                provider: Some(row.provider.to_string()),
+                issuer: Some(row.issuer.to_string()),
+                subject: Some(row.subject.to_string()),
+                detail: Some(format!(
+                    "credential {} ({}), added at a browser approval with credential {}",
+                    prefix(row.credential),
+                    row.alg.name(),
+                    prefix(asserted)
+                )),
+                ..AuthEvent::default()
+            },
+        )?;
+        server_db::prune_events(tx)?;
+        Ok(Added::Added)
     })
 }
 
@@ -347,7 +443,8 @@ mod tests {
         server_db::events(root, 0, None, &[kind.to_string()], 100).unwrap().into_iter().map(|e| e.event).collect()
     }
 
-    /// Put a passkey in as it is kept, beside insert_first's one per account.
+    /// Put a passkey in as it is kept, without insert_first's or add's checks
+    /// and event.
     fn put(root: &Path, account: &Account, credential: &str, alg: Alg, key: &[u8]) {
         let conn = server_db::open(root).unwrap();
         conn.execute(
@@ -498,5 +595,118 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn adding_a_passkey_moves_the_vouching_counter_and_records_both_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = account(root, &user("alice", "s1"));
+        let (first, second) = (SoftKey::es256(), SoftKey::rs256());
+        let (asserted, added) = (URL_SAFE_NO_PAD.encode(&first.credential), URL_SAFE_NO_PAD.encode(&second.credential));
+        let (first_key, second_key) = (first.spki(), second.spki());
+        assert_eq!(insert_first(root, &row(&alice, &asserted, &first_key, Alg::Es256)).unwrap(), Inserted::Inserted);
+        let before = kept(root, "passkey_registered").len();
+
+        let new = NewRow { counter: 3, ..row(&alice, &added, &second_key, second.alg()) };
+        assert_eq!(add(root, &new, &asserted, 0, 5).unwrap(), Added::Added);
+
+        let now = for_account(root, &alice.issuer, &alice.subject).unwrap();
+        let credentials: Vec<&str> = now.iter().map(|p| p.credential.as_str()).collect();
+        assert_eq!(credentials, [asserted.as_str(), added.as_str()], "in the order they came");
+        assert_eq!((now[0].counter, now[0].last_used_at.is_some()), (5, true), "the vouching one moved on");
+        assert_eq!((now[1].counter, now[1].last_used_at, now[1].alg_name()), (3, None, "RS256"));
+        assert_eq!(now[1].public_key, second_key);
+
+        let events = kept(root, "passkey_registered");
+        assert_eq!(events.len(), before + 1);
+        let event = events.iter().find(|e| e.detail.as_deref().is_some_and(|d| d.contains("added"))).unwrap();
+        assert_eq!(event.actor.as_deref(), Some(alice.actor.as_str()));
+        assert_eq!(
+            (event.provider.as_deref(), event.issuer.as_deref(), event.subject.as_deref()),
+            (Some("corp"), Some("https://idp.example"), Some("s1"))
+        );
+        let detail = event.detail.as_deref().unwrap();
+        assert_eq!(
+            detail,
+            format!(
+                "credential {} (RS256), added at a browser approval with credential {}",
+                prefix(&added),
+                prefix(&asserted)
+            )
+        );
+        assert!(!detail.contains(&added) && !detail.contains(&asserted), "{detail}");
+        for spki in [&first_key, &second_key] {
+            for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+                let encoded = engine.encode(spki);
+                let tail = &encoded[encoded.len() - 16..];
+                assert!(!detail.contains(&encoded) && !detail.contains(tail), "{detail}");
+            }
+        }
+    }
+
+    /// A passkey's credential id, counter and last use.
+    type Kept = (String, u32, Option<i64>);
+
+    /// The accounts' passkeys with their counters and use, and how many
+    /// passkey events the root has: what a refused add must leave as it was.
+    fn snapshot(root: &Path, accounts: &[&Account]) -> (Vec<Vec<Kept>>, usize) {
+        let rows = accounts
+            .iter()
+            .map(|a| {
+                for_account(root, &a.issuer, &a.subject)
+                    .unwrap()
+                    .into_iter()
+                    .map(|p| (p.credential, p.counter, p.last_used_at))
+                    .collect()
+            })
+            .collect();
+        let events = server_db::events(root, 0, None, &[], 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event.kind.starts_with("passkey_"))
+            .count();
+        (rows, events)
+    }
+
+    #[test]
+    fn an_add_refused_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = account(root, &user("alice", "s1"));
+        let bob = account(root, &user("bob", "s2"));
+        let key = SoftKey::es256().spki();
+        let asserted = "AAAAAAAAAAAAx1";
+        insert_first(root, &row(&alice, asserted, &key, Alg::Es256)).unwrap();
+        insert_first(root, &row(&bob, "BBBBBBBBBBBBx1", &key, Alg::Es256)).unwrap();
+        let refused = |new: &NewRow, asserted: &str, read: u32, expected: Added| {
+            let before = snapshot(root, &[&alice, &bob]);
+            assert_eq!(add(root, new, asserted, read, read + 1).unwrap(), expected, "{}", new.credential);
+            assert_eq!(snapshot(root, &[&alice, &bob]), before, "{expected:?} changed something");
+        };
+
+        refused(&row(&alice, asserted, &key, Alg::Es256), asserted, 0, Added::CredentialTaken);
+        refused(&row(&alice, "BBBBBBBBBBBBx1", &key, Alg::Es256), asserted, 0, Added::CredentialTaken);
+        let gone = Account { subject: "s9".into(), ..alice.clone() };
+        refused(&row(&gone, "CCCCCCCCCCCCx1", &key, Alg::Es256), asserted, 0, Added::NoAccount);
+        assert!(use_counter(root, asserted, 0, 4).unwrap());
+        refused(&row(&alice, "CCCCCCCCCCCCx1", &key, Alg::Es256), asserted, 0, Added::Raced);
+        refused(&row(&alice, "CCCCCCCCCCCCx1", &key, Alg::Es256), "BBBBBBBBBBBBx1", 0, Added::Raced);
+        put(root, &alice, "DDDDDDDDDDDDx1", Alg::Es256, &key);
+        remove(root, &alice, Some("DDDDDDDDDDDDx1")).unwrap();
+        refused(&row(&alice, "CCCCCCCCCCCCx1", &key, Alg::Es256), "DDDDDDDDDDDDx1", 0, Added::Raced);
+
+        for n in 2..MAX_PER_ACCOUNT {
+            put(root, &alice, &format!("EEEEEEEEEEEE{n:02}"), Alg::Es256, &key);
+        }
+        assert_eq!(for_account(root, &alice.issuer, &alice.subject).unwrap().len(), MAX_PER_ACCOUNT - 1);
+        assert_eq!(
+            add(root, &row(&alice, "FFFFFFFFFFFFx1", &key, Alg::Es256), asserted, 4, 5).unwrap(),
+            Added::Added,
+            "the 99th"
+        );
+        assert_eq!(for_account(root, &alice.issuer, &alice.subject).unwrap().len(), MAX_PER_ACCOUNT);
+        refused(&row(&alice, "FFFFFFFFFFFFx2", &key, Alg::Es256), asserted, 5, Added::LimitReached);
+        refused(&row(&alice, asserted, &key, Alg::Es256), asserted, 5, Added::LimitReached);
     }
 }

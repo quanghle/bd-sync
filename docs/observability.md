@@ -81,12 +81,14 @@ malformed spec parts) do not.
   refused` lines, with the provider, subject, login, actor, workspace and
   gate; `gate approval` lines also carry `credential` (the first 12
   characters of the passkey's credential id once the posted one has been
-  read, else empty) and `passkey` (`registered`, `verified`, a refusal's
-  reason, `unavailable`). [Close and discard
+  read, else empty), `added` (the first 12 characters of a passkey added
+  at that approval, else empty) and `passkey` (`registered`, `verified`,
+  `verified and added`, a refusal's reason such as `adding not offered`,
+  `limit reached` or `new passkey: <reason>`, `unavailable`). [Close and discard
   approvals](sign-in.md#approving-a-close-or-discard) log one `operation
   approval` line per outcome, with `outcome`, `provider`, `login`,
-  `subject`, `actor`, `workspace`, `issue`, `op`, `detail` and
-  `credential`, never the reason or a title. Neither ever carries a
+  `subject`, `actor`, `workspace`, `issue`, `op`, `detail`,
+  `credential` and `added`, never the reason or a title. Neither ever carries a
   passkey's public key, signature, client data or whole credential id.
 - **Sign-in secrets** ([from a command](sign-in.md#secrets-from-a-command)):
   at start, which command fetches how many secrets, then (once known, the
@@ -129,9 +131,9 @@ Prometheus text:
 | `bd_serve_commands_total` | commands run |
 | `bd_serve_tool_calls_total` | MCP tool calls |
 | `bd_serve_publishes_total{outcome}` | `bd publish` runs (dry runs aside), `applied` or `refused` |
-| `bd_serve_approvals_total{outcome}` | human gates [approved in the browser](sign-in.md#approving-human-gates-in-the-browser), `approved`, or approvals `refused` (an account not let in, whose actor is taken, not granted kind `human` or not an approver, a refusal when posting, a post from another site), or `passkey_refused` (the passkey's fields missing, a failed passkey check, or an address passkeys cannot be used at); notices (expired, used, resolved, not ready, not found) are not counted |
-| `bd_serve_operation_approvals_total{outcome}` | closes and discards [approved in the browser](sign-in.md#approving-a-close-or-discard): `approved`, `refused`, `not_ready` (no longer held back, or no longer what was asked), `gone` (already closed, or no such workspace or issue), `busy`, `failed`, `passkey_refused` (the passkey's fields missing, a failed passkey check, or an address passkeys cannot be used at); every callback of an operation's sign-in and every answer to its `POST` counts once, the page itself aside |
-| `bd_serve_passkeys_registered_total` | passkeys registered at a browser approval (an account's first approval) |
+| `bd_serve_approvals_total{outcome}` | human gates [approved in the browser](sign-in.md#approving-human-gates-in-the-browser), `approved`, or approvals `refused` (an account not let in, whose actor is taken, not granted kind `human` or not an approver, a refusal when posting, a post from another site), or `passkey_refused` (the passkey's fields missing, a failed passkey check, a refused add of a passkey, or an address passkeys cannot be used at); notices (expired, used, resolved, not ready, not found) are not counted |
+| `bd_serve_operation_approvals_total{outcome}` | closes and discards [approved in the browser](sign-in.md#approving-a-close-or-discard): `approved`, `refused`, `not_ready` (no longer held back, or no longer what was asked), `gone` (already closed, or no such workspace or issue), `busy`, `failed`, `passkey_refused` (the passkey's fields missing, a failed passkey check, a refused add of a passkey, or an address passkeys cannot be used at); every callback of an operation's sign-in and every answer to its `POST` counts once, the page itself aside |
+| `bd_serve_passkeys_registered_total` | passkeys registered at a browser approval: an account's first, and passkeys added at an approval with an existing one |
 | `bd_serve_panics_total` | panics |
 | `bd_serve_start_time_seconds` | when the server started |
 

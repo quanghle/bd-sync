@@ -6,14 +6,24 @@
 //! Once the person signed in and may approve, [`prepare`] reads the
 //! account's passkeys and mints a single-use challenge, kept with the
 //! approval ([`Ceremony`]); the page asks the browser to register the
-//! account's first passkey, or to use one of its passkeys ([`ask`]). The
-//! approval's POST is taken once, as before, and only then are its WebAuthn
-//! fields checked ([`verify`]): each read only if it occurs exactly once,
-//! its length capped before decoding and its bytes after. A registration is
+//! account's first passkey, or to use one of its passkeys ([`ask`]). An
+//! account with 1 to [`passkeys::MAX_PER_ACCOUNT`] - 1 passkeys is also
+//! offered to add a passkey on this device, after the one it uses: a second
+//! single-use challenge (`Ceremony.add`), minted apart from the first and
+//! kept and spent with the approval. The approval's POST is taken once, as
+//! before, and only then are its WebAuthn fields checked ([`verify`]): each
+//! read only if it occurs exactly once, its length capped before decoding
+//! and its bytes after. A registration is
 //! stored only if the account still has no passkey ([`passkeys::insert_first`]);
 //! an assertion moves the counter on by compare-and-set
-//! ([`passkeys::use_counter`]). What the log may show of the credential is
-//! its first [`passkeys::PREFIX`] characters, once it decoded.
+//! ([`passkeys::use_counter`]). A POST adding a passkey sends the
+//! registration's `new_*` fields beside the assertion's: refused outright
+//! where the page did not offer adding, else the assertion is verified,
+//! then the registration against the add challenge, and only then is the
+//! new passkey stored with the counter's compare-and-set in one write
+//! ([`passkeys::add`]); any refusal stores nothing. What the log may show
+//! of a credential is its first [`passkeys::PREFIX`] characters, once it
+//! decoded.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -23,7 +33,7 @@ use sha2::{Digest, Sha256};
 
 use super::super::{form, pages};
 use super::{Ceremony, Ctx, origin};
-use crate::passkeys::{self, Inserted, NewRow};
+use crate::passkeys::{self, Added, Inserted, NewRow};
 use crate::webauthn::{self, Alg, Assertion, Expect, Refusal, Registration, Stored};
 use crate::{auth, metrics};
 
@@ -46,10 +56,15 @@ pub(super) fn prepare(cx: &Ctx<'_>, user: &auth::Identity, actor: &str) -> Resul
     };
     let credentials: Vec<String> =
         passkeys::for_account(cx.root, &user.issuer, &user.subject)?.into_iter().map(|p| p.credential).collect();
-    let mut challenge = [0u8; 32];
-    SystemRandom::new()
-        .fill(&mut challenge)
-        .map_err(|_| Error::Io(std::io::Error::other("the system's random number generator failed")))?;
+    let random = || {
+        let mut bytes = [0u8; 32];
+        SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| Error::Io(std::io::Error::other("the system's random number generator failed")))?;
+        Ok::<_, Error>(bytes)
+    };
+    let challenge = random()?;
+    let add = if (1..passkeys::MAX_PER_ACCOUNT).contains(&credentials.len()) { Some(random()?) } else { None };
     let ceremony = Ceremony {
         challenge,
         rp_id,
@@ -59,6 +74,7 @@ pub(super) fn prepare(cx: &Ctx<'_>, user: &auth::Identity, actor: &str) -> Resul
         provider: user.provider.clone(),
         actor: actor.to_string(),
         enroll: credentials.is_empty(),
+        add,
     };
     Ok(Prepared::Ask { ceremony: Box::new(ceremony), credentials })
 }
@@ -82,9 +98,23 @@ pub(super) fn ask<'a>(ceremony: &'a Ceremony, credentials: &'a [String]) -> page
             name: &ceremony.actor,
         }
     } else {
-        pages::PasskeyAsk::Assert { challenge, rp_id: &ceremony.rp_id, credentials }
+        pages::PasskeyAsk::Assert {
+            challenge,
+            rp_id: &ceremony.rp_id,
+            credentials,
+            add: ceremony.add.map(|add| pages::PasskeyAdd {
+                challenge: URL_SAFE_NO_PAD.encode(add),
+                user: user_handle(&ceremony.issuer, &ceremony.subject),
+                name: &ceremony.actor,
+            }),
+        }
     }
 }
+
+/// The fields of a registration added beside an assertion. Any of them in
+/// a POST means it adds a passkey, even with an empty value.
+const NEW_FIELDS: [&str; 5] =
+    ["new_credential", "new_client_data", "new_authenticator_data", "new_public_key", "new_algorithm"];
 
 /// Why a ceremony's POST was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +137,51 @@ pub(super) enum Why {
     NoAccount,
     /// Another approval used the passkey meanwhile.
     Raced,
+    /// A passkey added where the page did not offer adding.
+    NotOffered,
+    /// The account had [`passkeys::MAX_PER_ACCOUNT`] passkeys by the time a
+    /// passkey was added.
+    LimitReached,
+    /// The ceremony registering the added passkey.
+    New(Refusal),
+}
+
+/// The fixed phrases of a refused added passkey's ceremony: its label and
+/// its detail, each `new passkey: ` and the refusal's label.
+macro_rules! new_passkey_phrases {
+    ($($variant:ident => $label:literal,)*) => {
+        fn new_label(r: Refusal) -> &'static str {
+            match r {
+                $(Refusal::$variant => concat!("new passkey: ", $label),)*
+            }
+        }
+
+        fn new_detail(r: Refusal) -> &'static str {
+            match r {
+                $(Refusal::$variant => concat!("passkey refused: new passkey: ", $label),)*
+            }
+        }
+    };
+}
+
+new_passkey_phrases! {
+    ClientDataTooLong => "client data too long",
+    ClientDataUnreadable => "client data unreadable",
+    WrongType => "wrong ceremony type",
+    WrongChallenge => "wrong challenge",
+    WrongOrigin => "wrong origin",
+    CrossOrigin => "cross-origin",
+    TopOrigin => "top origin present",
+    AuthDataMalformed => "authenticator data malformed",
+    WrongRpId => "wrong relying party",
+    UserNotPresent => "user not present",
+    UserNotVerified => "user not verified",
+    NoCredentialData => "no credential data",
+    CredentialMismatch => "credential mismatch",
+    UnsupportedAlgorithm => "unsupported algorithm",
+    BadPublicKey => "bad public key",
+    BadSignature => "bad signature",
+    CounterRegression => "counter regression",
 }
 
 impl Why {
@@ -122,6 +197,9 @@ impl Why {
             Why::CredentialTaken => "credential taken",
             Why::NoAccount => "no account",
             Why::Raced => "used meanwhile",
+            Why::NotOffered => "adding not offered",
+            Why::LimitReached => "limit reached",
+            Why::New(r) => new_label(r),
         }
     }
 
@@ -156,23 +234,53 @@ impl Why {
             Why::CredentialTaken => "passkey refused: credential taken",
             Why::NoAccount => "passkey refused: no account",
             Why::Raced => "passkey refused: used meanwhile",
+            Why::NotOffered => "passkey refused: adding not offered",
+            Why::LimitReached => "passkey refused: limit reached",
+            Why::New(r) => new_detail(r),
         }
     }
 }
 
-/// A ceremony that passed: the credential's prefix, and whether it
-/// registered a passkey (else it used one).
+/// A ceremony that passed: the credential's prefix, whether it registered
+/// a passkey (else it used one), and the prefix of the passkey it added
+/// beside the one it used, if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Verified {
     pub(super) credential: String,
     pub(super) registered: bool,
+    pub(super) added: Option<String>,
 }
 
 impl Verified {
     /// What the gate approval log's `passkey` says of it.
     pub(super) fn label(&self) -> &'static str {
-        if self.registered { "registered" } else { "verified" }
+        if self.registered {
+            "registered"
+        } else if self.added.is_some() {
+            "verified and added"
+        } else {
+            "verified"
+        }
     }
+}
+
+/// Count a passkey registered, first or added: the one place
+/// `passkeys_registered_total` moves.
+fn registered() {
+    metrics::PASSKEYS_REGISTERED.add();
+    #[cfg(test)]
+    REGISTERED.with(|n| n.set(n.get() + 1));
+}
+
+#[cfg(test)]
+thread_local! {
+    static REGISTERED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many passkeys [`registered`] counted on this thread since the last call.
+#[cfg(test)]
+pub(crate) fn take_registered() -> u64 {
+    REGISTERED.with(|n| n.replace(0))
 }
 
 /// A ceremony that did not pass. Both carry the credential's prefix: empty
@@ -222,9 +330,16 @@ fn fields<'p>(pairs: &'p [(String, String)], names: &[&str]) -> Result<Vec<&'p s
 
 /// Check the WebAuthn fields of an approval's POST (`pairs`) against the
 /// ceremony its page asked for: a registration is stored, an assertion's
-/// counter moved on. Nothing else in the form is read.
+/// counter moved on, and a passkey added beside an assertion stored with
+/// that move in one write. Nothing else in the form is read.
 pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> Result<Verified, Failure> {
     let refused = |why: Why, credential: &str| Failure::Refused { why, credential: credential.to_string() };
+    let adding = pairs.iter().any(|(k, _)| NEW_FIELDS.contains(&k.as_str()));
+    let add = match (adding, c.enroll, c.add) {
+        (false, _, _) => None,
+        (true, false, Some(add)) => Some(add),
+        (true, _, _) => return Err(refused(Why::NotOffered, "")),
+    };
     let names: &[&str] = if c.enroll {
         &["credential", "client_data", "authenticator_data", "public_key", "algorithm"]
     } else {
@@ -262,8 +377,8 @@ pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> 
         };
         return match passkeys::insert_first(cx.root, &row).map_err(store)? {
             Inserted::Inserted => {
-                metrics::PASSKEYS_REGISTERED.add();
-                Ok(Verified { credential: prefix.clone(), registered: true })
+                registered();
+                Ok(Verified { credential: prefix.clone(), registered: true, added: None })
             }
             Inserted::AlreadyEnrolled => Err(refused(Why::AlreadyEnrolled)),
             Inserted::CredentialTaken => Err(refused(Why::CredentialTaken)),
@@ -271,6 +386,19 @@ pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> 
         };
     }
     let signature = decoded(values[3], webauthn::MAX_SIGNATURE).map_err(refused)?;
+    // Every field of an added passkey is read and decoded before anything is looked up.
+    let new = match add {
+        None => None,
+        Some(add) => {
+            let values = fields(pairs, &NEW_FIELDS).map_err(refused)?;
+            let credential = decoded(values[0], webauthn::MAX_CREDENTIAL).map_err(refused)?;
+            let client_data = decoded(values[1], webauthn::MAX_CLIENT_DATA).map_err(refused)?;
+            let authenticator_data = decoded(values[2], webauthn::MAX_AUTH_DATA).map_err(refused)?;
+            let public_key = decoded(values[3], webauthn::MAX_PUBLIC_KEY).map_err(refused)?;
+            let algorithm: i64 = values[4].parse().map_err(|_| refused(Why::Malformed))?;
+            Some((add, credential, client_data, authenticator_data, public_key, algorithm))
+        }
+    };
     let passkey =
         passkeys::by_credential(cx.root, &encoded).map_err(store)?.ok_or_else(|| refused(Why::UnknownCredential))?;
     if passkey.issuer != c.issuer || passkey.subject != c.subject {
@@ -281,10 +409,48 @@ pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> 
     let assertion =
         Assertion { client_data: &client_data, authenticator_data: &authenticator_data, signature: &signature };
     let counter = webauthn::verify_assertion(&expect, &stored, &assertion).map_err(|r| refused(Why::Webauthn(r)))?;
-    if !passkeys::use_counter(cx.root, &encoded, passkey.counter, counter).map_err(store)? {
-        return Err(refused(Why::Raced));
+    let Some((add, credential, client_data, authenticator_data, public_key, algorithm)) = new else {
+        if !passkeys::use_counter(cx.root, &encoded, passkey.counter, counter).map_err(store)? {
+            return Err(refused(Why::Raced));
+        }
+        return Ok(Verified { credential: prefix.clone(), registered: false, added: None });
+    };
+    // The added passkey's own ceremony, against the add challenge, once the assertion vouched for it.
+    let expect = Expect { challenge: &add, origin: &c.origin, rp_id: &c.rp_id };
+    let registration = Registration {
+        credential: &credential,
+        client_data: &client_data,
+        authenticator_data: &authenticator_data,
+        public_key: &public_key,
+        algorithm,
+    };
+    let new = webauthn::verify_registration(&expect, &registration).map_err(|r| refused(Why::New(r)))?;
+    let added = URL_SAFE_NO_PAD.encode(&credential);
+    // The account is the one the sign-in proved, kept with the approval: never one the form names.
+    let row = NewRow {
+        credential: &added,
+        issuer: &c.issuer,
+        subject: &c.subject,
+        provider: &c.provider,
+        actor: &c.actor,
+        alg: new.alg,
+        public_key: &new.public_key,
+        counter: new.counter,
+    };
+    match passkeys::add(cx.root, &row, &encoded, passkey.counter, counter).map_err(store)? {
+        Added::Added => {
+            registered();
+            Ok(Verified {
+                credential: prefix.clone(),
+                registered: false,
+                added: Some(passkeys::prefix(&added).to_string()),
+            })
+        }
+        Added::LimitReached => Err(refused(Why::LimitReached)),
+        Added::CredentialTaken => Err(refused(Why::CredentialTaken)),
+        Added::NoAccount => Err(refused(Why::NoAccount)),
+        Added::Raced => Err(refused(Why::Raced)),
     }
-    Ok(Verified { credential: prefix.clone(), registered: false })
 }
 
 #[cfg(test)]
@@ -301,11 +467,25 @@ impl Ceremony {
             provider: "acme".into(),
             actor: "acme:alice".into(),
             enroll,
+            add: None,
         }
+    }
+
+    /// The ceremony, offering to add a passkey with the challenge `add`.
+    pub(super) fn with_add(mut self, add: [u8; 32]) -> Ceremony {
+        self.add = Some(add);
+        self
     }
 
     /// What a software authenticator expects of it.
     pub(super) fn expect(&self) -> Expect<'_> {
         Expect { challenge: &self.challenge, origin: &self.origin, rp_id: &self.rp_id }
+    }
+
+    /// What a software authenticator adding a passkey expects of it: its
+    /// add challenge, which it must offer.
+    pub(super) fn expect_add(&self) -> Expect<'_> {
+        let add = self.add.as_ref().expect("a ceremony offering to add a passkey");
+        Expect { challenge: add, origin: &self.origin, rp_id: &self.rp_id }
     }
 }

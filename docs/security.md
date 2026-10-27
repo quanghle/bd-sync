@@ -319,13 +319,32 @@ consent page and more.
   grow, stored by compare-and-set so two posts of one assertion cannot
   both pass. Each form field counts only when it occurs exactly once, the
   approval id included, and is bounded in length before it is decoded
-  (the whole `POST` is at most 8 KiB). There is no fallback: a missing or
+  (the whole `POST` is at most 16 KiB). There is no fallback: a missing or
   failed ceremony approves nothing (403), and the approval id, taken
   before the check, is used up. User verification is a fingerprint, a
   face or the device's PIN, as the authenticator offers; bd cannot tell
   which, or insist on a biometric. No attestation is asked for or checked:
   bd does not know which authenticator holds a passkey, and does not
   restrict authenticators.
+- **Adding a passkey needs one of the account's.** An account with 1 to
+  98 passkeys may add one at an approval, in the same `POST` as a
+  verified assertion of one of its passkeys; new passkey fields on a page
+  that did not offer adding are refused. The new passkey's registration
+  is checked as a first one is (the client data's type, its own challenge,
+  a second 32 random bytes kept and spent with the approval, the origin,
+  no cross-origin frame, the relying party id hash, the user-present and
+  user-verified flags, ES256 or RS256), and only after the assertion has
+  passed. Then one `server.db` transaction checks that the account still
+  exists, that the asserted passkey is still its own, that it holds fewer
+  than 99 passkeys and that the new credential id is not registered, moves
+  the asserted passkey's counter by compare-and-set, stores the new
+  passkey and records a `passkey_registered` event naming both
+  credentials' prefixes. A refusal at any of these checks stores no
+  passkey, moves no counter and approves nothing. A workspace failure
+  after that transaction (the gate no longer armed, the workspace busy,
+  a refusal) keeps the added passkey and approves nothing, as a
+  first-use registration is kept: accepted, since the person can approve
+  again with either passkey.
 - **Passkeys only at a host name over https.** The relying party id is the
   host of the public URL (`--public-url`, else `[oauth]`'s issuer).
   Browsers refuse passkeys at an IP address, so there, and for plain http
@@ -335,8 +354,9 @@ consent page and more.
 - **The credential in the logs.** `gate approval` lines carry
   `credential`, the first 12 characters of the credential id once the
   posted one has been read (empty before), so an admin can tell which
-  passkey approved or failed; never the whole id, the public key, the
-  signature or the client data.
+  passkey approved or failed, and `added`, the first 12 characters of a
+  passkey added at that approval (empty otherwise); never the whole id,
+  the public key, the signature or the client data.
 - **Emails are never shown or logged.** The page shows the provider and
   actor; the logs name the provider, subject, login, actor, workspace and
   gate.
@@ -400,10 +420,20 @@ Residual risks, accepted:
   --account <actor or login> [--credential <prefix>]` (without
   `--credential`, every passkey of the account), on the server host; the
   account's next approval registers again. A lost device is recovered the
-  same way. The page registers one passkey per account and never a
-  second.
+  same way. Another passkey can be added only at an approval, backed by a
+  verified assertion of one of the account's passkeys in the same `POST`
+  (at most 99 an account). So someone holding the provider account who
+  gets the person to complete the existing passkey's prompt for them (the
+  cross-device prompt on the person's phone, say) can add a passkey of
+  their own; a phishing page cannot ask for that assertion, as it is bound
+  to the server's origin and relying party. Watch for `passkey_registered`
+  events whose detail names a vouching credential (`added at a browser
+  approval with credential <prefix>`) on an add no one expected, and
+  remove the passkey as above.
 - **A rollback** to a `bd serve` that predates passkeys approves with the
-  click alone again.
+  click alone again. A rollback to one that predates adding passkeys keeps
+  every stored passkey usable (any of an account's passkeys approves) and
+  only stops offering the add.
 
 **Rolling back passkeys.** `bd serve` moves `server.db` from schema 3 to 4
 at its first start, adding a `passkeys` table. An older `bd serve`
@@ -462,8 +492,8 @@ human-gate override without a token, so it gets the protections of
   `human` only, no token issued), and the page has the same Content
   Security Policy, framing refusal, focus arming, same-origin `POST` and
   shared sign-in slots.
-- **The same passkey.** Every Approve needs the account's passkey, the
-  one its gate approvals use, verified as for [gate
+- **The same passkeys.** Every Approve needs one of the account's
+  passkeys, those its gate approvals use, verified as for [gate
   approval](#approving-gates-in-the-browser) (origin, relying party id
   hash, user verification, a per-approval challenge, the signature, the
   counter by compare-and-set, each form field exactly once) after the
@@ -473,11 +503,16 @@ human-gate override without a token, so it gets the protections of
   ceremony performs nothing (403, outcome `passkey_refused`) and uses the
   approval up. At an IP address, or plain http on a host other than
   `localhost`, the callback shows a notice with no Approve button and
-  records `passkey_refused`. First-use registration is the residual risk
+  records `passkey_refused`. An account with 1 to 98 passkeys is offered
+  to add one, with the gate page's checks and the same all-or-nothing
+  store ([gate approval](#approving-gates-in-the-browser)); a workspace
+  failure after the store keeps the added passkey and performs nothing.
+  First-use registration and adding are the residual risks
   described for gate approval. `operation approval` lines carry
   `credential`, the credential id's first 12 characters once it has been
-  read (empty before), never the whole id, the public key, the signature
-  or the client data.
+  read (empty before), and `added`, an added passkey's first 12
+  characters (empty otherwise), never the whole id, the public key, the
+  signature or the client data.
 - **Every gate in the way.** The person must be able to open every open
   human gate the operation gets past: one of its approvers when it names
   them, an OIDC account only by its identity reference. Otherwise the
@@ -521,7 +556,8 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   It never holds a token's secret, a provider's tokens, an ID token or its
   claims, a name from a provider, or an email. The only name is one an
   admin gives an account (`bd serve token name`), erased with it.
-- **Passkeys.** For each passkey registered at a browser approval,
+- **Passkeys.** For each passkey registered at a browser approval (up to
+  99 an account),
   `server.db` keeps its credential id, its public key (as
   SubjectPublicKeyInfo), its algorithm (ES256 or RS256), its signature
   counter, when it was registered and last used, and the account it

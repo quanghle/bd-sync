@@ -169,8 +169,9 @@ impl Outcome {
 
 /// Who an approval was for, as far as it is known: the provider the sign-in
 /// started with, then, once the provider identified the account, its login,
-/// subject and actor (never an email), and the first characters of the
-/// passkey credential its POST sent, once it decoded. Empty where unknown.
+/// subject and actor (never an email), the first characters of the
+/// passkey credential its POST sent, once it decoded, and those of a passkey
+/// it added. Empty where unknown.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Who<'a> {
     pub provider: &'a str,
@@ -178,6 +179,7 @@ pub struct Who<'a> {
     pub subject: &'a str,
     pub actor: &'a str,
     pub credential: &'a str,
+    pub added: &'a str,
 }
 
 impl<'a> Who<'a> {
@@ -204,11 +206,16 @@ pub fn record(outcome: Outcome, who: &Who<'_>, workspace: &str, op: &str, issue:
         %op,
         detail,
         credential = %who.credential,
+        added = %who.added,
         "operation approval"
     );
     #[cfg(test)]
     RECORDED.with(|r| {
-        r.borrow_mut().push(((outcome, workspace.into(), op.into(), issue.into(), detail), who.credential.into()))
+        r.borrow_mut().push((
+            (outcome, workspace.into(), op.into(), issue.into(), detail),
+            who.credential.into(),
+            who.added.into(),
+        ))
     });
 }
 
@@ -219,18 +226,26 @@ pub(crate) type Recorded = (Outcome, String, String, String, &'static str);
 
 #[cfg(test)]
 thread_local! {
-    static RECORDED: std::cell::RefCell<Vec<(Recorded, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static RECORDED: std::cell::RefCell<Vec<(Recorded, String, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What [`record`] recorded on this thread since the last call.
 #[cfg(test)]
 pub(crate) fn take_recorded() -> Vec<Recorded> {
-    take_recorded_with_credential().into_iter().map(|(r, _)| r).collect()
+    take_recorded_with_passkeys().into_iter().map(|(r, _, _)| r).collect()
 }
 
 /// [`take_recorded`], each with the credential prefix it logged.
 #[cfg(test)]
 pub(crate) fn take_recorded_with_credential() -> Vec<(Recorded, String)> {
+    take_recorded_with_passkeys().into_iter().map(|(r, credential, _)| (r, credential)).collect()
+}
+
+/// [`take_recorded`], each with the credential prefix it logged and that of
+/// the passkey it added (else empty).
+#[cfg(test)]
+pub(crate) fn take_recorded_with_passkeys() -> Vec<(Recorded, String, String)> {
     RECORDED.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
@@ -415,6 +430,7 @@ struct Seen {
     subject: String,
     actor: String,
     credential: String,
+    added: String,
 }
 
 impl Seen {
@@ -425,6 +441,7 @@ impl Seen {
             subject: &self.subject,
             actor: &self.actor,
             credential: &self.credential,
+            added: &self.added,
         }
     }
 }
@@ -875,6 +892,7 @@ fn approve_inner(
             subject: a.subject.clone(),
             actor: a.actor.clone(),
             credential: String::new(),
+            added: String::new(),
         };
         match flows.operations.get_mut(&key).map(|a| (bound(a), here(a), seen(a))) {
             None => return ended(Outcome::Refused, &nobody, "unknown or expired", refusal(400, EXPIRED)),
@@ -900,6 +918,7 @@ fn approve_inner(
         subject: approval.subject.clone(),
         actor: approval.actor.clone(),
         credential: String::new(),
+        added: String::new(),
     };
     let cleared = vec![set_op_cookie(cx.issuer, workspace, op.as_str(), issue, &approval.cookie, "", Duration::ZERO)];
     let ended_as = |outcome, who: &Seen, detail, answer| (Step::ended(outcome, who, detail, answer), cleared.clone());
@@ -915,7 +934,10 @@ fn approve_inner(
     }
     // The passkey ceremony the page asked for, checked once the approval is taken: nothing is performed without it.
     match passkey::verify(cx, &approval.passkey, &pairs) {
-        Ok(verified) => who.credential = verified.credential,
+        Ok(verified) => {
+            who.credential = verified.credential;
+            who.added = verified.added.unwrap_or_default();
+        }
         Err(Failure::Refused { why, credential }) => {
             who.credential = credential;
             let answer = refusal(403, pages::PASSKEY_FAILED_OP);

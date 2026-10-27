@@ -649,6 +649,9 @@ mod tests {
             crate::passkeys::TAKEN,
             crate::passkeys::USE_COUNTER,
             crate::passkeys::DELETE,
+            crate::passkeys::COUNT_BY_ACCOUNT,
+            crate::passkeys::OWNED,
+            crate::passkeys::USE_COUNTER_OWNED,
         ];
         let dir = tempfile::tempdir().unwrap();
         let conn = open(dir.path()).unwrap();

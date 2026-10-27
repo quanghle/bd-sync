@@ -78,6 +78,7 @@ button.primary,.button{background:var(--fg);color:var(--bg)}
 .actions button:not(.primary){padding:0;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:4px}
 button:focus-visible,.button:focus-visible,a:focus-visible{outline:2px solid var(--fg);outline-offset:4px}
 @media (prefers-reduced-motion:reduce){button,.button{transition:none}}
+[hidden]{display:none!important}
 .packet{margin:24px 0}
 .packet h2{margin:0 0 8px;font-size:20px;line-height:1.3;font-weight:600;letter-spacing:-.02em}
 .packet h3{margin:16px 0 4px;font-size:1em;font-weight:600}
@@ -139,6 +140,17 @@ if(!since||Date.now()-since<600)e.preventDefault();});\
 /// account's first, `get()` after), fills in the hidden fields and posts
 /// the form; a cancelled or failed ceremony posts nothing, so the same page
 /// can try again.
+///
+/// Where the page offers to add a passkey (`data-add-challenge`) and the
+/// browser can register one, ticking the unnamed checkbox makes Approve stop
+/// after `get()`, its fields filled, and show the second button: under the
+/// same focus rule it runs `create()` with the add challenge, the account's
+/// user handle and name, and its passkeys as `excludeCredentials`, then
+/// enables and fills the five `new_*` fields (rendered disabled, so an
+/// approval without adding never sends them) and posts both ceremonies'
+/// fields. A cancelled `create()` disables them again and posts nothing.
+/// Where the browser cannot register a passkey, the offer is hidden and the
+/// page works as one without it.
 pub(crate) const APPROVE: &str = "(function(){\
 var since=document.hasFocus()?Date.now():0;\
 addEventListener('focus',function(){since=Date.now();});\
@@ -150,21 +162,29 @@ var status=document.querySelector('p[role=status]');\
 if(!form||!status)return;\
 var button=form.querySelector('button');\
 var d=form.dataset,m=status.dataset,create=d.passkey==='create';\
+var add=!!d.addChallenge&&!create,box=form.querySelector('input[type=checkbox]'),next=form.querySelectorAll('button')[1];\
+var news=['new_credential','new_client_data','new_authenticator_data','new_public_key','new_algorithm'];\
 function say(t){status.textContent=t||'';}\
 function bytes(s){s=(s||'').replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';\
 var b=atob(s),u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;}\
 function text(buf){var u=new Uint8Array(buf),s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);\
 return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}\
 function put(name,value){form.elements[name].value=value;}\
-var able=window.PublicKeyCredential&&navigator.credentials&&(!create||(window.AuthenticatorAttestationResponse&&\
-typeof AuthenticatorAttestationResponse.prototype.getPublicKey==='function'));\
-if(!able){say(m.unsupported);return;}\
+function known(){return(d.credentials||'').split(' ').filter(Boolean).map(function(c){return{type:'public-key',id:bytes(c)};});}\
+function hide(){if(box&&box.parentNode)box.parentNode.hidden=true;if(next){next.hidden=true;next.disabled=true;}}\
+function quiet(){for(var i=0;i<news.length;i++)form.elements[news[i]].disabled=true;}\
+var registers=window.AuthenticatorAttestationResponse&&\
+typeof AuthenticatorAttestationResponse.prototype.getPublicKey==='function';\
+var able=window.PublicKeyCredential&&navigator.credentials&&(!create||registers);\
+if(!able){hide();say(m.unsupported);return;}\
+if(add&&!registers)add=false;\
+if(!add)hide();\
 button.disabled=false;\
 var busy=false;\
 form.addEventListener('submit',function(e){\
 e.preventDefault();\
 if(busy||!since||Date.now()-since<600)return;\
-busy=true;button.disabled=true;say(m.waiting);\
+busy=true;button.disabled=true;if(next)next.disabled=true;say(m.waiting);\
 var challenge=bytes(d.challenge),asked;\
 if(create){asked=navigator.credentials.create({publicKey:{rp:{id:d.rp,name:'bd'},\
 user:{id:bytes(d.user),name:d.name,displayName:d.name},challenge:challenge,\
@@ -172,8 +192,7 @@ pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],\
 authenticatorSelection:{userVerification:'required',residentKey:'preferred'},\
 attestation:'none',timeout:300000}});}\
 else{asked=navigator.credentials.get({publicKey:{rpId:d.rp,challenge:challenge,\
-allowCredentials:(d.credentials||'').split(' ').filter(Boolean).map(function(c){return{type:'public-key',id:bytes(c)};}),\
-userVerification:'required',timeout:300000}});}\
+allowCredentials:known(),userVerification:'required',timeout:300000}});}\
 asked.then(function(c){\
 var r=c.response;\
 put('credential',text(c.rawId));\
@@ -182,9 +201,27 @@ if(create){var k=r.getPublicKey();if(!k)throw new Error('no public key');\
 put('authenticator_data',text(r.getAuthenticatorData()));\
 put('public_key',text(k));put('algorithm',String(r.getPublicKeyAlgorithm()));}\
 else{put('authenticator_data',text(r.authenticatorData));put('signature',text(r.signature));}\
+if(add&&box&&box.checked){busy=false;button.disabled=false;next.hidden=false;next.disabled=false;say(m.added);return;}\
 form.submit();\
-}).catch(function(){busy=false;button.disabled=false;say(m.cancelled);});\
+}).catch(function(){busy=false;button.disabled=false;if(next&&!next.hidden)next.disabled=false;say(m.cancelled);});\
 });\
+if(add&&box&&next){\
+box.addEventListener('change',function(){if(!box.checked){next.hidden=true;next.disabled=true;}});\
+next.addEventListener('click',function(){\
+if(busy||!box.checked||!since||Date.now()-since<600)return;\
+busy=true;button.disabled=true;next.disabled=true;say(m.waiting);\
+navigator.credentials.create({publicKey:{rp:{id:d.rp,name:'bd'},\
+user:{id:bytes(d.user),name:d.name,displayName:d.name},challenge:bytes(d.addChallenge),\
+pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],excludeCredentials:known(),\
+authenticatorSelection:{userVerification:'required',residentKey:'preferred'},\
+attestation:'none',timeout:300000}}).then(function(c){\
+var r=c.response,k=r.getPublicKey();if(!k)throw new Error('no public key');\
+var v=[text(c.rawId),text(r.clientDataJSON),text(r.getAuthenticatorData()),text(k),String(r.getPublicKeyAlgorithm())];\
+for(var i=0;i<news.length;i++){var f=form.elements[news[i]];f.disabled=false;f.value=v[i];}\
+form.submit();\
+}).catch(function(){quiet();busy=false;button.disabled=false;next.disabled=false;say(m.cancelled);});\
+});\
+}\
 })();";
 
 /// What the approval pages say about the passkey every approval needs. No
@@ -210,6 +247,10 @@ pub const PASSKEY_FAILED_GATE: &str =
     "The passkey check failed, so the gate was not approved. Open the gate's link again to try again.";
 pub const PASSKEY_FAILED_OP: &str =
     "The passkey check failed, so nothing was changed. Open the approval link again to try again.";
+pub const PASSKEY_ADD_OPTION: &str = "Also add a passkey on this device";
+pub const PASSKEY_ADD_NEXT: &str = "The passkey was checked. Press Add the passkey and approve to register a passkey \
+on this device and approve.";
+pub const PASSKEY_ADD_BUTTON: &str = "Add the passkey and approve";
 
 /// The passkey ceremony an approval page asks for.
 #[derive(Clone, Debug)]
@@ -223,10 +264,23 @@ pub enum PasskeyAsk<'a> {
         /// The account's actor, as the passkey is named.
         name: &'a str,
     },
-    /// Use one of the account's passkeys (`get()`), by credential id (base64url).
-    Assert { challenge: String, rp_id: &'a str, credentials: &'a [String] },
+    /// Use one of the account's passkeys (`get()`), by credential id
+    /// (base64url); with `add`, also offer to add a passkey on this device.
+    Assert { challenge: String, rp_id: &'a str, credentials: &'a [String], add: Option<PasskeyAdd<'a>> },
     /// The server's address cannot be a relying party: no form, a notice.
     Unavailable { why: crate::webauthn::NoRp },
+}
+
+/// What an approval page offers for adding a passkey on this device after
+/// one of the account's passkeys was used (`create()` with
+/// `excludeCredentials`).
+#[derive(Clone, Debug)]
+pub struct PasskeyAdd<'a> {
+    /// Its own challenge and the account's user handle, base64url.
+    pub challenge: String,
+    pub user: String,
+    /// The account's actor, as the passkey is named.
+    pub name: &'a str,
 }
 
 /// An approval page's form, posting `id` to `action` with the fields the
@@ -235,7 +289,7 @@ pub enum PasskeyAsk<'a> {
 /// Every value is escaped. Returns the actions, the body's addition, and
 /// the script to run.
 fn approval_form(action: &str, id: &str, ask: &PasskeyAsk<'_>) -> (String, String, Option<&'static str>) {
-    let (mode, data, note) = match ask {
+    let (mode, data, note, add) = match ask {
         PasskeyAsk::Enroll { challenge, rp_id, user, name } => (
             "create",
             format!(
@@ -246,17 +300,25 @@ fn approval_form(action: &str, id: &str, ask: &PasskeyAsk<'_>) -> (String, Strin
                 escape(name)
             ),
             PASSKEY_ENROLL,
+            None,
         ),
-        PasskeyAsk::Assert { challenge, rp_id, credentials } => (
-            "get",
-            format!(
+        PasskeyAsk::Assert { challenge, rp_id, credentials, add } => {
+            let mut data = format!(
                 " data-challenge=\"{}\" data-rp=\"{}\" data-credentials=\"{}\"",
                 escape(challenge),
                 escape(rp_id),
                 escape(&credentials.join(" "))
-            ),
-            PASSKEY_ASSERT,
-        ),
+            );
+            if let Some(add) = add {
+                data.push_str(&format!(
+                    " data-add-challenge=\"{}\" data-user=\"{}\" data-name=\"{}\"",
+                    escape(&add.challenge),
+                    escape(&add.user),
+                    escape(add.name)
+                ));
+            }
+            ("get", data, PASSKEY_ASSERT, add.as_ref())
+        }
         PasskeyAsk::Unavailable { why } => {
             let why = match why {
                 crate::webauthn::NoRp::IpLiteral => PASSKEY_UNAVAILABLE_HOST,
@@ -269,16 +331,33 @@ fn approval_form(action: &str, id: &str, ask: &PasskeyAsk<'_>) -> (String, Strin
     for name in ["credential", "client_data", "authenticator_data", "signature", "public_key", "algorithm"] {
         fields.push_str(&format!("<input type=\"hidden\" name=\"{name}\" value=\"\">\n"));
     }
+    // Adding a passkey: its fields rendered disabled, so that only the
+    // script's add, enabling them, sends them; an unnamed checkbox; and the
+    // second button, hidden until the passkey in use was checked.
+    let mut adding = String::new();
+    let mut added = String::new();
+    if add.is_some() {
+        for name in ["new_credential", "new_client_data", "new_authenticator_data", "new_public_key", "new_algorithm"] {
+            fields.push_str(&format!("<input type=\"hidden\" name=\"{name}\" value=\"\" disabled>\n"));
+        }
+        adding = format!(
+            "<label class=\"note\"><input type=\"checkbox\"> {}</label>\n\
+<button type=\"button\" class=\"primary\" hidden disabled>{}</button>\n",
+            escape(PASSKEY_ADD_OPTION),
+            escape(PASSKEY_ADD_BUTTON)
+        );
+        added = format!(" data-added=\"{}\"", escape(PASSKEY_ADD_NEXT));
+    }
     let actions = format!(
         "<form method=\"post\" action=\"{action}\" class=\"actions\" data-passkey=\"{mode}\"{data}>\n\
 {fields}<button type=\"submit\" class=\"primary\" disabled>Approve</button>\n\
-</form>\n",
+{adding}</form>\n",
         action = escape(action),
     );
     let body = format!(
         "<p class=\"note\">{}</p>\n<noscript><p class=\"lead\">{}</p></noscript>\n\
 <p class=\"lead\" role=\"status\" aria-live=\"polite\" data-unsupported=\"{}\" data-waiting=\"{}\" \
-data-cancelled=\"{}\"></p>\n",
+data-cancelled=\"{}\"{added}></p>\n",
         escape(note),
         escape(PASSKEY_NO_SCRIPT),
         escape(PASSKEY_UNSUPPORTED),
@@ -1152,7 +1231,13 @@ mod tests {
 
     /// The ceremony of a later approval, with the account's `credentials`.
     fn assert_with(credentials: &[String]) -> PasskeyAsk<'_> {
-        PasskeyAsk::Assert { challenge: "Y2hhbGxlbmdl".into(), rp_id: "bd.example.com", credentials }
+        PasskeyAsk::Assert { challenge: "Y2hhbGxlbmdl".into(), rp_id: "bd.example.com", credentials, add: None }
+    }
+
+    /// The ceremony of a later approval, with the account's `credentials`,
+    /// offering to add a passkey with `add`.
+    fn assert_adding<'a>(credentials: &'a [String], add: PasskeyAdd<'a>) -> PasskeyAsk<'a> {
+        PasskeyAsk::Assert { challenge: "Y2hhbGxlbmdl".into(), rp_id: "bd.example.com", credentials, add: Some(add) }
     }
 
     #[test]
@@ -1423,6 +1508,31 @@ mod tests {
                     action: "https://bd.example.com/w/proj/gates/proj-r1.gate-build",
                     packet: Some(&packet),
                     passkey: assert_with(&credentials),
+                }),
+            ),
+            (
+                "approve-gate-adding",
+                "Approving a human gate, offering to add a passkey on this device",
+                approve_gate(&ApproveGate {
+                    workspace: "proj",
+                    gate: "proj-a1b2",
+                    title: "Release sign-off",
+                    holds: &[("proj-c3d4".to_string(), "Deploy to production".to_string(), "open".to_string())],
+                    part_of: None,
+                    approvers: Some(&["github:octocat".to_string()]),
+                    provider: "GitHub",
+                    actor: "github:octocat",
+                    id: "c0ffee",
+                    action: "https://bd.example.com/w/proj/gates/proj-a1b2",
+                    packet: None,
+                    passkey: assert_adding(
+                        &credentials,
+                        PasskeyAdd {
+                            challenge: "YWRkLWNoYWxsZW5nZQ".into(),
+                            user: "dXNlcg".into(),
+                            name: "github:octocat",
+                        },
+                    ),
                 }),
             ),
             (
@@ -1735,6 +1845,15 @@ data-user=\"dXNlcg\" data-name=\"github:octocat\">\n<input type=\"hidden\" name=
         assert!(APPROVE.contains("alg:-7") && APPROVE.contains("alg:-257") && APPROVE.contains("timeout:300000"));
         assert!(APPROVE.contains("attestation:'none'") && APPROVE.contains("residentKey:'preferred'"));
         assert!(APPROVE.contains("getPublicKey") && APPROVE.contains("Date.now()-since<600"));
+        // Adding a passkey: a second create(), with its own challenge, never one of the account's passkeys again.
+        assert_eq!(APPROVE.matches("navigator.credentials.create(").count(), 2);
+        assert!(APPROVE.contains("excludeCredentials:known()") && APPROVE.contains("challenge:bytes(d.addChallenge)"));
+        assert!(APPROVE.contains("allowCredentials:known()") && APPROVE.contains("say(m.added)"));
+        assert_eq!(APPROVE.matches("userVerification:'required'").count(), 3);
+        assert_eq!(APPROVE.matches("attestation:'none'").count(), 2);
+        assert_eq!(APPROVE.matches("alg:-7}").count(), 2);
+        assert_eq!(APPROVE.matches("alg:-257}").count(), 2);
+        assert!(APPROVE.contains("next.addEventListener('click'"));
 
         // Where passkeys cannot be used: the facts and a notice, no form, button or script.
         for (why, notice) in [
@@ -1777,6 +1896,73 @@ data-user=\"dXNlcg\" data-name=\"github:octocat\">\n<input type=\"hidden\" name=
     }
 
     #[test]
+    fn the_add_option_is_offered_only_with_its_part() {
+        let approve = STANDARD.encode(Sha256::digest(APPROVE.as_bytes()));
+        let evil = "\"><script>alert(1)</script>";
+        let shown = "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;";
+        let credentials = [evil.to_string(), "AAAAAAAAAAAAx1zQ".to_string()];
+        let adding = PasskeyAdd { challenge: evil.into(), user: evil.into(), name: evil };
+        let page = gate_asking(assert_adding(&credentials, adding));
+        let html = &page.html;
+        assert_eq!(page.status, 200);
+        assert!(html.contains("data-passkey=\"get\""), "{html}");
+        assert_eq!(html.matches("<button").count(), 2, "{html}");
+        assert!(html.contains("<button type=\"submit\" class=\"primary\" disabled>Approve</button>"), "{html}");
+        let second = html.match_indices("<button").nth(1).map(|(at, _)| &html[at..]).unwrap();
+        let second = &second[..second.find("</button>").unwrap() + "</button>".len()];
+        assert_eq!(
+            second,
+            "<button type=\"button\" class=\"primary\" hidden disabled>Add the passkey and approve</button>"
+        );
+        assert_eq!(html.matches("<input type=\"checkbox\"").count(), 1, "{html}");
+        assert!(
+            html.contains(&format!(
+                "<label class=\"note\"><input type=\"checkbox\"> {}</label>",
+                escape(PASSKEY_ADD_OPTION)
+            )),
+            "{html}"
+        );
+        let checkbox = tags(html).into_iter().find(|t| t.contains("checkbox")).unwrap();
+        assert!(
+            !checkbox.contains("name=") && !checkbox.contains("checked") && !checkbox.contains("id="),
+            "{checkbox}"
+        );
+        for name in ["new_credential", "new_client_data", "new_authenticator_data", "new_public_key", "new_algorithm"] {
+            assert!(html.contains(&format!("<input type=\"hidden\" name=\"{name}\" value=\"\" disabled>")), "{name}");
+        }
+        assert_eq!(html.matches("name=\"new_").count(), 5, "{html}");
+        assert!(html.contains(&format!("data-added=\"{}\"", escape(PASSKEY_ADD_NEXT))), "{html}");
+        for attribute in ["data-add-challenge", "data-user", "data-name"] {
+            assert!(html.contains(&format!("{attribute}=\"{shown}\"")), "{attribute}: {html}");
+        }
+        assert!(html.contains(&format!("data-credentials=\"{shown} AAAAAAAAAAAAx1zQ\"")), "{html}");
+        assert!(!html.contains("<script>alert"), "{html}");
+        assert_eq!(html.matches("<script").count(), 1, "{html}");
+        assert_eq!(script_of(&page), APPROVE);
+        assert!(page.csp.contains(&format!("; script-src 'sha256-{approve}';")), "{}", page.csp);
+        // No handlers: attribute names only, as the copy in values says "on this device".
+        for tag in tags(html) {
+            let names = tag.split('"').step_by(2).collect::<Vec<_>>().join(" ");
+            assert!(!names.split_whitespace().skip(1).any(|a| a.to_ascii_lowercase().starts_with("on")), "{tag}");
+        }
+        assert!(
+            html.contains(&format!("<noscript><p class=\"lead\">{}</p></noscript>", escape(PASSKEY_NO_SCRIPT))),
+            "{html}"
+        );
+
+        // Without its part: the page as it was, nothing of adding.
+        let plain = gate_asking(assert_with(&credentials));
+        for absent in ["name=\"new_", "type=\"checkbox\"", "data-add-challenge", "data-added", "data-user", "data-name"]
+        {
+            assert!(!plain.html.contains(absent), "{absent}: {}", plain.html);
+        }
+        assert_eq!(plain.html.matches("<button").count(), 1, "{}", plain.html);
+        // And an enrollment never offers it.
+        let enrolling = gate_asking(enroll());
+        assert!(!enrolling.html.contains("data-add-challenge") && !enrolling.html.contains("type=\"checkbox\""));
+    }
+
+    #[test]
     fn a_passkeys_copy_names_no_one() {
         const PRONOUNS: [&str; 10] = ["i", "me", "my", "we", "our", "us", "you", "your", "yours", "you're"];
         for copy in [
@@ -1790,6 +1976,9 @@ data-user=\"dXNlcg\" data-name=\"github:octocat\">\n<input type=\"hidden\" name=
             PASSKEY_UNAVAILABLE_HTTPS,
             PASSKEY_FAILED_GATE,
             PASSKEY_FAILED_OP,
+            PASSKEY_ADD_OPTION,
+            PASSKEY_ADD_NEXT,
+            PASSKEY_ADD_BUTTON,
         ] {
             for word in copy.split(|c: char| !c.is_alphanumeric() && c != '\'').filter(|w| !w.is_empty()) {
                 let word = word.to_lowercase().replace('\u{2019}', "'");

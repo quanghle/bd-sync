@@ -192,8 +192,9 @@ const MAX_SIGN_IN_BODY: usize = 16 << 10;
 const MAX_CONSENT_BODY: usize = 4 << 10;
 /// The largest body of an approval page's post: the approval id and the
 /// WebAuthn fields, each capped before decoding (an RS256 registration's
-/// largest fields come to about 6 KiB).
-const MAX_APPROVAL_BODY: usize = 8 << 10;
+/// largest fields come to about 6 KiB; an assertion with an added
+/// passkey's registration, every field at its cap, about 13.3 KiB).
+const MAX_APPROVAL_BODY: usize = 16 << 10;
 /// The largest provider's answer posted to a callback (an ID token and the
 /// user's name with the code, which are not read).
 const MAX_RELAYED_BODY: usize = 32 << 10;
@@ -1502,7 +1503,8 @@ mod tests {
         use crate::webauthn::{
             MAX_AUTH_DATA, MAX_CLIENT_DATA, MAX_CREDENTIAL, MAX_PUBLIC_KEY, MAX_SIGNATURE, encoded_len,
         };
-        // Every field the page posts, each at its longest (the browser sends the empty ones too).
+        // Every field the page posts, each at its longest (the browser sends the empty ones too),
+        // with an added passkey's registration.
         let fields = [
             ("approval", 64),
             ("credential", encoded_len(MAX_CREDENTIAL)),
@@ -1511,9 +1513,16 @@ mod tests {
             ("signature", encoded_len(MAX_SIGNATURE)),
             ("public_key", encoded_len(MAX_PUBLIC_KEY)),
             ("algorithm", 20),
+            // An added passkey's registration, posted with the assertion.
+            ("new_credential", encoded_len(MAX_CREDENTIAL)),
+            ("new_client_data", encoded_len(MAX_CLIENT_DATA)),
+            ("new_authenticator_data", encoded_len(MAX_AUTH_DATA)),
+            ("new_public_key", encoded_len(MAX_PUBLIC_KEY)),
+            ("new_algorithm", 20),
         ];
         let body: usize = fields.iter().map(|(name, len)| name.len() + len + 2).sum();
         assert!(body <= MAX_APPROVAL_BODY, "{body}");
+        assert!(body > 8 << 10, "the former 8 KiB cap would refuse it: {body}");
         assert!(body > MAX_CONSENT_BODY, "the consent's cap would refuse it: {body}");
     }
 

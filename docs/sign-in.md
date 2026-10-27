@@ -681,7 +681,7 @@ verification: the browser asks for a fingerprint, a face or the device's
 PIN (bd asks for verification, and the browser and authenticator choose
 how: bd cannot insist on a biometric). An account's first approval
 registers its passkey with the same click, and later approvals ask for
-that passkey. The page needs scripts and WebAuthn with `getPublicKey`
+one of the account's passkeys. The page needs scripts and WebAuthn with `getPublicKey`
 (Chrome and Edge 85+, Safari 16+, Firefox 119+); without them its Approve
 button stays disabled and the page says why, and nothing can be approved
 from it. Passkeys work only at an https address with a host name, or at
@@ -694,15 +694,42 @@ there, and an admin removes them (below) so that each account registers
 again. When the passkey check fails, nothing is approved and the approval
 is used up: open the gate's link again. A prompt cancelled in the browser
 posts nothing, so Approve can be pressed again while the approval lasts.
-There is no way to approve without a passkey. An admin lists an account's
+There is no way to approve without a passkey.
+
+**Adding a passkey.** An account that has 1 to 98 passkeys is also
+offered an unchecked box, `Also add a passkey on this device` (on a phone
+or a second computer, say). With it checked, Approve checks one of the
+account's passkeys as usual, then a second button, `Add the passkey and
+approve`, registers a new passkey on this device, and both are posted
+with the approval. The browser refuses an authenticator that already
+holds one of the account's passkeys, and an account holds at most 99
+passkeys. The new passkey is checked as a first one is (its own
+challenge, the origin, the relying party, user verification), after the
+existing passkey's check, and then stored in one transaction with that
+passkey's counter. A refusal at those checks (the existing passkey's
+check, the new passkey's, the limit reached meanwhile, a credential id
+already registered, or the passkey used or removed meanwhile) adds no
+passkey, moves no counter and approves nothing, and the approval is used
+up. Once the new passkey is stored, though, it stays registered even
+when the workspace's answer does not approve (the gate no longer armed,
+gone, refused, the workspace busy or failing): nothing is approved, and
+the approval can be tried again from the gate's link with either
+passkey. Without the box checked, or where the browser cannot register
+passkeys (no `getPublicKey`), the page approves with the existing
+passkey alone, as before. A passkey can be added only this way, at an
+approval; one is never removed from the browser.
+
+An admin lists an account's
 passkeys with `bd serve passkey list --account <actor or login>` on the
 server host and removes them with `bd serve passkey remove --account
 <actor or login> [--credential <prefix>]` (a lost device, say): without
 `--credential` it removes every passkey of the account, and the account's
 next approval registers a new one ([commands](commands.md)). Registrations
-and removals are in the audit trail (`bd serve token events --kind
-passkey_registered`, `passkey_removed`), each naming the credential's
-first 12 characters and its algorithm.
+(first ones and added ones) and removals are in the audit trail (`bd serve
+token events --kind passkey_registered`, `passkey_removed`), each naming
+the credential's first 12 characters and its algorithm; an added
+passkey's event also names the passkey that vouched for it (`added at a
+browser approval with credential <prefix>`).
 
 **Refusals** end on a page of this server, never a redirect elsewhere, and
 write nothing to the workspace. Once the provider has admitted an account
@@ -720,7 +747,7 @@ when the page then refuses or shows a notice:
 | an approval posted again | 400 (`already used`) |
 | a post from another site, or with neither `Origin` nor `Sec-Fetch-Site` | 403 |
 | a post without the approval's cookie (another browser) | 403; the approval stays usable from its own browser |
-| a post without the passkey's fields, or whose passkey check fails | 403; the approval is used up |
+| a post without the passkey's fields, or whose passkey check fails, or a refused add (a new passkey's fields where adding was not offered, incomplete, or failing their check; the limit reached; a credential id already registered) | 403; the approval is used up, nothing is stored |
 | an address passkeys cannot be used at (an IP address, or http on a host other than `localhost`) | 403, a notice with no Approve button |
 | no such workspace, issue or gate, not a gate, not a human gate (after admission) | 404 |
 | already resolved | 409 |
@@ -729,19 +756,25 @@ when the page then refuses or shows a notice:
 
 Approval sign-ins share the 8 sign-in slots: the provider's callback and
 the approval's `POST` each take one. The approval's `POST` is at most
-8 KiB. The server logs each approval (`gate approval`, with its
-`outcome`, `passkey refused` for a failed or missing passkey check) and
-refusal (`gate approval refused`) with the provider, subject, login,
-actor, workspace and gate, never an email; `gate approval` lines also
-carry `credential`, the first 12 characters of the passkey's credential
-id once the posted one could be read (empty otherwise), and `passkey`,
-what became of the check (`registered`, `verified`, a refusal's reason
-such as `missing fields`, `store busy`, `store failed`, or `unavailable`
-where the address cannot use passkeys). They never carry the public key,
-the signature, the client data or the whole credential id. The approvals
-are counted in `/metrics`
-([`bd_serve_approvals_total`](observability.md#server-metrics),
-`bd_serve_passkeys_registered_total`).
+16 KiB (room for an existing passkey's check and a new passkey's
+registration). The server logs each approval (`gate approval`, with its
+`outcome`, `passkey refused` for a failed or missing passkey check or a
+refused add) and refusal (`gate approval refused`) with the provider,
+subject, login, actor, workspace and gate, never an email; `gate
+approval` lines also carry `credential`, the first 12 characters of the
+passkey's credential id once the posted one could be read (empty
+otherwise), `added`, the first 12 characters of the passkey added at
+this approval (empty otherwise, a refused add included), and `passkey`,
+what became of the check (`registered`, `verified`, `verified and
+added`, a refusal's reason such as `missing fields`, `store busy`, `store
+failed`, `adding not offered`, `limit reached`, `new passkey: <reason>`
+for a new passkey's failed check (`new passkey: wrong challenge`, say),
+or `unavailable` where the address cannot use passkeys). They never
+carry the public key, the signature, the client data or the whole
+credential id. The approvals are counted in `/metrics`
+([`bd_serve_approvals_total`](observability.md#server-metrics), and
+`bd_serve_passkeys_registered_total`, which counts first registrations
+and passkeys added at an approval).
 
 ### Approving a close or discard
 
@@ -854,20 +887,32 @@ included, refuses the approval (403, nothing changed): release it first,
 then ask again.
 
 **Passkeys.** As for a gate ([Passkeys](#approving-human-gates-in-the-browser)
-above), every Approve needs the account's passkey with user verification
+above), every Approve needs one of the account's passkeys with user verification
 (a fingerprint, a face or the device's PIN; the browser cannot be made to
 insist on a biometric). The first approval of an account, whether of a
 gate or of an operation, registers its passkey with the same click, and
-later ones ask for it. Scripts and WebAuthn with `getPublicKey` are needed
+later ones ask for one of its passkeys. Scripts and WebAuthn with `getPublicKey` are needed
 (Chrome and Edge 85+, Safari 16+, Firefox 119+). The address must be https
 with a host name, or `http://localhost`: at an IP address, or plain http
 elsewhere, the callback shows a notice with no Approve button and records
 the outcome `passkey_refused` (`passkeys unavailable at this address`). A
 missing or failed passkey check performs nothing (403) and uses the
-approval up; open the link again. An admin recovers a lost passkey with
+approval up; open the link again. An account with 1 to 98 passkeys is
+offered the same box as on a gate's page, `Also add a passkey on this
+device` ([Adding a passkey](#approving-human-gates-in-the-browser)
+above): with it checked, Approve checks an existing passkey, a second
+button registers one on this device, and both are posted with the
+approval, at most 99 passkeys an account. A refusal at those checks adds
+no passkey, moves no counter and performs nothing; once the new passkey
+is stored, a workspace answer that does not perform the operation (no
+longer held back, gone, refused, busy or failed) leaves it registered,
+with nothing performed, and the operation can be approved again from its
+link with either passkey. An admin recovers a lost passkey with
 `bd serve passkey list|remove --account <actor or login>`; `remove`
 without `--credential` removes every passkey of the account, and its next
-approval registers a new one.
+approval registers a new one. First registrations and added passkeys are
+in the audit trail (`passkey_registered`), an added one naming the
+passkey that vouched for it.
 
 **What is recorded.** The `closed` event (a close) or each `deleted`
 event (a discard) has the approver's actor, `"via": "browser"`,
@@ -877,8 +922,11 @@ byte (none when it was empty or only whitespace).
 **Logs and metrics.** Each outcome is logged once as `operation approval`
 (target `bd::serve`) with `outcome`, `provider`, `login`, `subject`,
 `actor`, `workspace`, `issue`, `op`, a short `detail` (`passkey refused:
-bad signature`, say) and `credential` (the first 12 characters of the
-passkey's credential id once the posted one could be read, else empty),
+bad signature`, say, or `passkey refused: new passkey: wrong challenge`
+for an added passkey's failed check), `credential` (the first 12
+characters of the passkey's credential id once the posted one could be
+read, else empty) and `added` (the first 12 characters of the passkey
+added at this approval, else empty),
 never the reason, a title, an email, or the passkey's public key,
 signature, client data or whole credential id, and counted in
 [`bd_serve_operation_approvals_total{outcome}`](observability.md#server-metrics),

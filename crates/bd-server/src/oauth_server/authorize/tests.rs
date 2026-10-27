@@ -789,6 +789,617 @@ fn an_enrolled_account_approves_with_its_passkey_only() {
     let _ = gate::take_logged();
 }
 
+/// Store a passkey of `key` for the account `subject` (bound to `actor`) at
+/// the acme issuer, as a registration stores it, but without counting it.
+fn put_passkey(root: &std::path::Path, credential: &str, subject: &str, actor: &str, key: &SoftKey) {
+    let conn = crate::server_db::open(root).unwrap();
+    let params = rusqlite::params![
+        credential,
+        ACME_ISSUER,
+        subject,
+        crate::server_db::key(actor),
+        key.alg().cose(),
+        key.spki(),
+        0,
+        1
+    ];
+    conn.execute(passkeys::INSERT, params).unwrap();
+}
+
+/// Fill the acme account up to `n` passkeys.
+fn fill_to(root: &std::path::Path, n: usize) {
+    let key = SoftKey::es256();
+    for i in kept_passkeys(root).len()..n {
+        put_passkey(root, &format!("AAAAAAAAAAAA{i:04}"), ACME_SUBJECT, "acme:alice", &key);
+    }
+    assert_eq!(kept_passkeys(root).len(), n);
+}
+
+/// A ceremony using one of the acme account's passkeys and offering to add
+/// another, each with a fresh challenge.
+fn adding() -> Ceremony {
+    use ring::rand::SecureRandom;
+    let mut add = [0u8; 32];
+    ring::rand::SystemRandom::new().fill(&mut add).unwrap();
+    ceremony(false).with_add(add)
+}
+
+/// The fields of a registration added beside an assertion, by name and value.
+fn new_pairs(f: &Fields) -> Vec<(&'static str, String)> {
+    let b64 = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
+    vec![
+        ("new_credential", b64(&f.credential)),
+        ("new_client_data", b64(&f.client_data)),
+        ("new_authenticator_data", b64(&f.authenticator_data)),
+        ("new_public_key", b64(&f.public_key)),
+        ("new_algorithm", f.algorithm.to_string()),
+    ]
+}
+
+fn encoded(pairs: &[(&str, String)]) -> String {
+    let pairs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    form::encode(&pairs)
+}
+
+/// `f` as the `new_*` form fields of an added passkey.
+fn new_fields(f: &Fields) -> String {
+    encoded(&new_pairs(f))
+}
+
+/// `asserting`'s assertion in `c` at `counter` (changed by `ta`), and
+/// `new`'s registration against `c`'s add challenge (changed by `tr`).
+fn add_body(asserting: &SoftKey, new: &SoftKey, c: &Ceremony, counter: u32, ta: &Tamper, tr: &Tamper) -> String {
+    format!("{}&{}", assertion(asserting, c, counter, ta), new_fields(&new.register(&c.expect_add(), tr)))
+}
+
+/// Register `key` as the acme account's first passkey, by an enrollment
+/// POST, and check that it alone was counted: whatever is counted after is
+/// the caller's.
+fn enrolled(cx: &Ctx<'_>, flows: &Mutex<Flows>, key: &SoftKey) {
+    settled();
+    let c = ceremony(true);
+    let (answer, _) = post_gate(cx, flows, "enrolled", &c, &registration(key, &c, &Tamper::default()));
+    assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+    assert_eq!(passkey::take_registered(), 1, "the enrollment, counted once");
+    lock(flows).approvals_spent.map.clear();
+}
+
+/// The passkeys counted as registered on this thread so far, which are
+/// then forgotten: called after fixtures, before the POST a test measures.
+fn settled() -> u64 {
+    passkey::take_registered()
+}
+
+/// What an add refused must leave as it was: the acme account's passkeys
+/// with their counters and last use, and the `passkey_registered` events.
+fn snapshot(root: &std::path::Path) -> (Vec<(String, u32, Option<i64>)>, usize) {
+    let kept = kept_passkeys(root).into_iter().map(|p| (p.credential, p.counter, p.last_used_at)).collect();
+    (kept, events_of(root, "passkey_registered").len())
+}
+
+#[test]
+fn the_add_option_is_offered_for_one_to_ninety_eight_passkeys() {
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        for (n, offered) in [(0, false), (1, true), (98, true), (99, false)] {
+            fill_to(root.path(), n);
+            let passkey::Prepared::Ask { ceremony, credentials } = passkey::prepare(cx, &acme(), "acme:alice").unwrap()
+            else {
+                panic!("{n}: a ceremony at an https issuer");
+            };
+            assert_eq!(credentials.len(), n);
+            assert_eq!(ceremony.enroll, n == 0, "{n}");
+            assert_eq!(ceremony.add.is_some(), offered, "{n}");
+            if let Some(add) = ceremony.add {
+                assert_ne!(add, ceremony.challenge, "{n}: a challenge of its own");
+                assert_eq!(ceremony.expect_add().challenge, &add);
+            }
+            match passkey::ask(&ceremony, &credentials) {
+                pages::PasskeyAsk::Assert { add: Some(add), challenge, .. } => {
+                    assert!(offered, "{n}");
+                    assert_eq!(add.challenge, URL_SAFE_NO_PAD.encode(ceremony.add.unwrap()));
+                    assert_ne!(add.challenge, challenge);
+                    assert_eq!(add.user, passkey::user_handle(ACME_ISSUER, ACME_SUBJECT));
+                    assert_eq!(add.name, "acme:alice");
+                }
+                pages::PasskeyAsk::Assert { add: None, .. } => assert!(!offered && n > 0, "{n}"),
+                pages::PasskeyAsk::Enroll { .. } => assert_eq!(n, 0),
+                pages::PasskeyAsk::Unavailable { .. } => panic!("{n}: unavailable"),
+            }
+        }
+    });
+}
+
+#[test]
+fn an_added_passkey_answers_its_own_challenge_only() {
+    use crate::webauthn::{Refusal, Registration, verify_registration};
+    let check = |c: &Ceremony, f: &Fields| {
+        let reg = Registration {
+            credential: &f.credential,
+            client_data: &f.client_data,
+            authenticator_data: &f.authenticator_data,
+            public_key: &f.public_key,
+            algorithm: f.algorithm,
+        };
+        verify_registration(&c.expect_add(), &reg).map(|_| ())
+    };
+    let c = ceremony(false).with_add([7; 32]);
+    let other = ceremony(false).with_add([8; 32]);
+    let key = SoftKey::rs256();
+    assert_eq!(check(&c, &key.register(&c.expect_add(), &Tamper::default())), Ok(()));
+    // Made with the assertion's challenge, or another approval's add challenge.
+    assert_eq!(check(&c, &key.register(&c.expect(), &Tamper::default())), Err(Refusal::WrongChallenge));
+    assert_eq!(check(&c, &key.register(&other.expect_add(), &Tamper::default())), Err(Refusal::WrongChallenge));
+}
+
+#[test]
+fn an_enrolled_account_adds_a_passkey_while_approving() {
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let (a, b) = (SoftKey::es256(), SoftKey::rs256());
+    let ((a_id, a_prefix), (b_id, b_prefix)) = (credential_of(&a), credential_of(&b));
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        let _ = gate::take_logged();
+        let (calls, registered_before) = (gates.calls(), crate::metrics::PASSKEYS_REGISTERED.get());
+        let events = events_of(root.path(), "passkey_registered").len();
+        // A's assertion vouches for B's registration: both stored in one write, then the gate approved.
+        let c = adding();
+        let body = add_body(&a, &b, &c, 3, &Tamper::default(), &Tamper::default());
+        assert_eq!(settled(), 0);
+        let (answer, _) = post_gate(cx, &flows, "add", &c, &body);
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert_eq!(passkey::take_registered(), 1);
+        assert!(crate::metrics::PASSKEYS_REGISTERED.get() > registered_before);
+        assert_eq!(gates.calls(), calls + 1);
+        let kept = kept_passkeys(root.path());
+        let ids: Vec<&str> = kept.iter().map(|p| p.credential.as_str()).collect();
+        assert_eq!(ids, [a_id.as_str(), b_id.as_str()]);
+        assert_eq!((kept[0].counter, kept[0].last_used_at.is_some()), (3, true));
+        assert_eq!((kept[1].alg_name(), kept[1].counter, kept[1].last_used_at), ("RS256", 0, None));
+        let registered = events_of(root.path(), "passkey_registered");
+        assert_eq!(registered.len(), events + 1);
+        let detail = registered.iter().map(|e| e.detail.clone().unwrap_or_default()).find(|d| d.contains("added"));
+        assert_eq!(
+            detail.as_deref(),
+            Some(
+                format!("credential {b_prefix} (RS256), added at a browser approval with credential {a_prefix}")
+                    .as_str()
+            )
+        );
+        let logged = gate::take_logged();
+        assert_eq!(logged.len(), 1);
+        assert_eq!(
+            (logged[0].outcome, logged[0].credential.as_str(), logged[0].added.as_str(), logged[0].passkey),
+            ("approved", a_prefix.as_str(), b_prefix.as_str(), "verified and added")
+        );
+        let line = format!("{:?}", logged[0]);
+        assert!(!line.contains(&a_id) && !line.contains(&b_id), "{line}");
+
+        // B alone approves now.
+        let c = ceremony(false);
+        let body = assertion(&b, &c, 1, &Tamper::default());
+        assert_eq!(settled(), 0);
+        assert_eq!(page(&post_gate(cx, &flows, "b", &c, &body).0).status, 200);
+        assert_eq!(passkey::take_registered(), 0);
+        let logged = gate::take_logged();
+        assert_eq!(
+            (logged[0].outcome, logged[0].credential.as_str(), logged[0].added.as_str(), logged[0].passkey),
+            ("approved", b_prefix.as_str(), "", "verified")
+        );
+
+        // Adding offered, not taken: the assertion alone approves, as without the offer.
+        let c = adding();
+        let body = assertion(&a, &c, 4, &Tamper::default());
+        assert_eq!(settled(), 0);
+        assert_eq!(page(&post_gate(cx, &flows, "plain", &c, &body).0).status, 200);
+        assert_eq!(passkey::take_registered(), 0);
+        assert_eq!(kept_passkeys(root.path()).len(), 2);
+        assert_eq!(kept_passkeys(root.path())[0].counter, 4);
+        let logged = gate::take_logged();
+        assert_eq!(
+            (logged[0].outcome, logged[0].credential.as_str(), logged[0].added.as_str(), logged[0].passkey),
+            ("approved", a_prefix.as_str(), "", "verified")
+        );
+        assert_eq!(gates.calls(), calls + 3);
+    });
+}
+
+#[test]
+fn an_add_refused_stores_nothing_and_approves_nothing() {
+    let _ = gate::take_logged();
+    let a = SoftKey::es256();
+    let (a_id, a_prefix) = credential_of(&a);
+    let bob_key = SoftKey::es256();
+    let (bob_id, _) = credential_of(&bob_key);
+    let ok = Tamper::default;
+    // What a case posts, given its ceremony and the new key; and what it sets up first.
+    type Body = Box<dyn Fn(&Ceremony, &SoftKey) -> String>;
+    type Prepare = Box<dyn Fn(&std::path::Path, &Ctx<'_>) -> Ceremony>;
+    struct Case {
+        name: &'static str,
+        ceremony: Prepare,
+        before_post: Box<dyn Fn(&std::path::Path)>,
+        body: Body,
+        new: Box<dyn Fn() -> SoftKey>,
+        label: &'static str,
+        vouched: bool,
+    }
+    let fresh = || -> Box<dyn Fn() -> SoftKey> { Box::new(SoftKey::es256) };
+    let nothing = || -> Box<dyn Fn(&std::path::Path)> { Box::new(|_: &std::path::Path| {}) };
+    let with_add = || -> Prepare { Box::new(|_, _| adding()) };
+    let a = std::rc::Rc::new(a);
+    let full = {
+        let a = a.clone();
+        move |c: &Ceremony, new: &SoftKey| add_body(&a, new, c, 1, &Tamper::default(), &Tamper::default())
+    };
+    let tampered = |tr: Tamper| -> Body {
+        let a = a.clone();
+        Box::new(move |c: &Ceremony, new: &SoftKey| add_body(&a, new, c, 1, &Tamper::default(), &tr))
+    };
+    let with_pairs = |change: fn(&mut Vec<(&'static str, String)>)| -> Body {
+        let a = a.clone();
+        Box::new(move |c: &Ceremony, new: &SoftKey| {
+            let mut pairs = new_pairs(&new.register(&c.expect_add(), &Tamper::default()));
+            change(&mut pairs);
+            format!("{}&{}", assertion(&a, c, 1, &Tamper::default()), encoded(&pairs))
+        })
+    };
+    let cases = vec![
+        Case {
+            name: "on an enrollment",
+            ceremony: Box::new(|_, _| ceremony(true)),
+            before_post: nothing(),
+            body: Box::new(|c: &Ceremony, new: &SoftKey| {
+                let other = SoftKey::es256();
+                format!(
+                    "{}&{}",
+                    registration(&other, c, &Tamper::default()),
+                    new_fields(&new.register(&c.expect(), &Tamper::default()))
+                )
+            }),
+            new: fresh(),
+            label: "adding not offered",
+            vouched: false,
+        },
+        Case {
+            name: "on an assertion without the offer",
+            ceremony: Box::new(|_, _| ceremony(false)),
+            before_post: nothing(),
+            body: {
+                let a = a.clone();
+                Box::new(move |c: &Ceremony, new: &SoftKey| {
+                    let r = new.register(&c.expect(), &Tamper::default());
+                    format!("{}&{}", assertion(&a, c, 1, &Tamper::default()), new_fields(&r))
+                })
+            },
+            new: fresh(),
+            label: "adding not offered",
+            vouched: false,
+        },
+        Case {
+            name: "an account at the limit when the page was shown",
+            ceremony: Box::new(|root, cx| {
+                fill_to(root, passkeys::MAX_PER_ACCOUNT);
+                let passkey::Prepared::Ask { ceremony, .. } = passkey::prepare(cx, &acme(), "acme:alice").unwrap()
+                else {
+                    panic!("a ceremony")
+                };
+                assert!(ceremony.add.is_none() && !ceremony.enroll);
+                *ceremony
+            }),
+            before_post: nothing(),
+            body: {
+                let a = a.clone();
+                Box::new(move |c: &Ceremony, new: &SoftKey| {
+                    let r = new.register(&c.expect(), &Tamper::default());
+                    format!("{}&{}", assertion(&a, c, 1, &Tamper::default()), new_fields(&r))
+                })
+            },
+            new: fresh(),
+            label: "adding not offered",
+            vouched: false,
+        },
+        Case {
+            name: "the limit reached after the page was shown",
+            ceremony: with_add(),
+            before_post: Box::new(|root| fill_to(root, passkeys::MAX_PER_ACCOUNT)),
+            body: Box::new(full.clone()),
+            new: fresh(),
+            label: "limit reached",
+            vouched: true,
+        },
+        Case {
+            name: "four of the five new fields",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: with_pairs(|p| {
+                p.pop();
+            }),
+            new: fresh(),
+            label: "missing fields",
+            vouched: true,
+        },
+        Case {
+            name: "new_credential twice",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: with_pairs(|p| {
+                let again = p[0].1.clone();
+                p.push(("new_credential", again));
+            }),
+            new: fresh(),
+            label: "malformed fields",
+            vouched: true,
+        },
+        Case {
+            name: "the new fields without an assertion",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: Box::new(|c: &Ceremony, new: &SoftKey| {
+                new_fields(&new.register(&c.expect_add(), &Tamper::default()))
+            }),
+            new: fresh(),
+            label: "missing fields",
+            vouched: false,
+        },
+        Case {
+            name: "a tampered assertion",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: {
+                let a = a.clone();
+                Box::new(move |c: &Ceremony, new: &SoftKey| {
+                    let ta = Tamper { challenge: Some(vec![7; 32]), ..Tamper::default() };
+                    add_body(&a, new, c, 1, &ta, &Tamper::default())
+                })
+            },
+            new: fresh(),
+            label: "wrong challenge",
+            vouched: true,
+        },
+        Case {
+            name: "a registration over the assertion's challenge",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: {
+                let a = a.clone();
+                Box::new(move |c: &Ceremony, new: &SoftKey| {
+                    let r = new.register(&c.expect(), &Tamper::default());
+                    format!("{}&{}", assertion(&a, c, 1, &Tamper::default()), new_fields(&r))
+                })
+            },
+            new: fresh(),
+            label: "new passkey: wrong challenge",
+            vouched: true,
+        },
+        Case {
+            name: "a registration for another approval's add challenge",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: {
+                let a = a.clone();
+                Box::new(move |c: &Ceremony, new: &SoftKey| {
+                    let r = new.register(&adding().expect_add(), &Tamper::default());
+                    format!("{}&{}", assertion(&a, c, 1, &Tamper::default()), new_fields(&r))
+                })
+            },
+            new: fresh(),
+            label: "new passkey: wrong challenge",
+            vouched: true,
+        },
+        Case {
+            name: "a registration without user verification",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: tampered(Tamper { flags: Some(0x41), ..ok() }),
+            new: fresh(),
+            label: "new passkey: user not verified",
+            vouched: true,
+        },
+        Case {
+            name: "a registration from another origin",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: tampered(Tamper { origin: Some("https://evil.example".into()), ..ok() }),
+            new: fresh(),
+            label: "new passkey: wrong origin",
+            vouched: true,
+        },
+        Case {
+            name: "a registration of type webauthn.get",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: tampered(Tamper { kind: Some("webauthn.get"), ..ok() }),
+            new: fresh(),
+            label: "new passkey: wrong ceremony type",
+            vouched: true,
+        },
+        Case {
+            name: "the asserted credential registered again",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: Box::new(full.clone()),
+            new: {
+                let a_credential = a.credential.clone();
+                Box::new(move || {
+                    let mut k = SoftKey::rs256();
+                    k.credential = a_credential.clone();
+                    k
+                })
+            },
+            label: "credential taken",
+            vouched: true,
+        },
+        Case {
+            name: "another account's credential",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: Box::new(full.clone()),
+            new: {
+                let bob_credential = bob_key.credential.clone();
+                Box::new(move || {
+                    let mut k = SoftKey::es256();
+                    k.credential = bob_credential.clone();
+                    k
+                })
+            },
+            label: "credential taken",
+            vouched: true,
+        },
+        Case {
+            name: "an oversize new_public_key",
+            ceremony: with_add(),
+            before_post: nothing(),
+            body: with_pairs(|p| {
+                p[3].1 = "A".repeat(crate::webauthn::encoded_len(crate::webauthn::MAX_PUBLIC_KEY) + 1)
+            }),
+            new: fresh(),
+            label: "malformed fields",
+            vouched: true,
+        },
+    ];
+    let value = "c".repeat(64);
+    let cookies = format!("__Secure-bd_gate_ab12={value}");
+    for (n, case) in cases.iter().enumerate() {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+        let bob = auth::Identity { subject: "00u8".into(), login: "bob".into(), ..acme() };
+        auth::bind_account(root.path(), &bob, true, "test").unwrap();
+        put_passkey(root.path(), &bob_id, "00u8", "acme:bob", &bob_key);
+        with_ctx(root.path(), &flows, &gates, |cx| {
+            enrolled(cx, &flows, &a);
+            assert_eq!(kept_passkeys(root.path())[0].credential, a_id);
+            let c = (case.ceremony)(root.path(), cx);
+            let new = (case.new)();
+            let body = (case.body)(&c, &new);
+            (case.before_post)(root.path());
+            let _ = gate::take_logged();
+            let (before, calls) = (snapshot(root.path()), gates.calls());
+            let refused_before = crate::metrics::APPROVALS_PASSKEY_REFUSED.get();
+            assert_eq!(settled(), 0, "{}", case.name);
+            let id = format!("refused{n}");
+            let (answer, _) = post_gate(cx, &flows, &id, &c, &body);
+            assert_eq!(page(&answer).status, 403, "{}: {}", case.name, page(&answer).html);
+            assert_eq!(passkey::take_registered(), 0, "{}", case.name);
+            assert_eq!(gates.calls(), calls, "{}", case.name);
+            assert_eq!(snapshot(root.path()), before, "{}", case.name);
+            assert!(crate::metrics::APPROVALS_PASSKEY_REFUSED.get() > refused_before, "{}", case.name);
+            let logged = gate::take_logged();
+            assert_eq!(logged.len(), 1, "{}", case.name);
+            let credential = if case.vouched { a_prefix.as_str() } else { "" };
+            assert_eq!(
+                (logged[0].outcome, logged[0].passkey, logged[0].credential.as_str(), logged[0].added.as_str()),
+                ("passkey refused", case.label, credential, ""),
+                "{}",
+                case.name
+            );
+            let (again, _) = gate::approve(cx, "proj", "bd-1", &format!("approval={id}"), &cookies);
+            assert_eq!(page(&again).status, 400, "{}", case.name);
+            assert!(page(&again).html.contains("already used"), "{}: {}", case.name, page(&again).html);
+            assert_eq!(gates.calls(), calls, "{}", case.name);
+        });
+    }
+}
+
+#[test]
+fn an_operation_adds_a_passkey_while_approving() {
+    use operation::{Outcome, take_recorded_with_passkeys};
+    let _ = take_recorded_with_passkeys();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let (a, b) = (SoftKey::es256(), SoftKey::rs256());
+    let ((_, a_prefix), (b_id, b_prefix)) = (credential_of(&a), credential_of(&b));
+    with_ctx(root.path(), &flows, &gates, |cx| enrolled(cx, &flows, &a));
+    let ops = FakeOperations::new(OpFound::NoIssue, Performed::Closed);
+    let value = "c".repeat(64);
+    let cookies = format!("__Secure-bd_op_ab12={value}");
+    let request = close_request("proj", "bd-1");
+    let one = |outcome: Outcome, detail: &'static str| (outcome, "proj".into(), "close".into(), "bd-1".into(), detail);
+    with_ops(root.path(), &flows, &ops, |cx| {
+        let post = |id: &str, c: &Ceremony, fields: &str| {
+            let approval = OperationApproval { passkey: c.clone(), ..op_approval("ab12", &value, request.clone()) };
+            lock(&flows).operations.put(auth::hash(id), approval);
+            operation::approve(cx, "proj", "close", "bd-1", &format!("approval={id}&{fields}"), &cookies)
+        };
+        let c = adding();
+        let body = add_body(&a, &b, &c, 1, &Tamper::default(), &Tamper::default());
+        assert_eq!(settled(), 0);
+        let (answer, _) = post("o1", &c, &body);
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert_eq!(ops.performs().len(), 1);
+        assert_eq!(passkey::take_registered(), 1);
+        assert_eq!(
+            take_recorded_with_passkeys(),
+            vec![(one(Outcome::Approved, "performed"), a_prefix.clone(), b_prefix.clone())]
+        );
+        assert_eq!(kept_passkeys(root.path())[1].credential, b_id);
+
+        // A registration for the assertion's challenge: refused, nothing stored or performed.
+        let c = adding();
+        let new = SoftKey::es256();
+        let body = format!(
+            "{}&{}",
+            assertion(&a, &c, 2, &Tamper::default()),
+            new_fields(&new.register(&c.expect(), &Tamper::default()))
+        );
+        let (before, refused_before) = (snapshot(root.path()), crate::metrics::OPERATIONS_PASSKEY_REFUSED.get());
+        assert_eq!(settled(), 0);
+        let (answer, _) = post("o2", &c, &body);
+        assert_eq!(page(&answer).status, 403, "{}", page(&answer).html);
+        assert_eq!(ops.performs().len(), 1);
+        assert_eq!(passkey::take_registered(), 0);
+        assert_eq!(snapshot(root.path()), before);
+        assert!(crate::metrics::OPERATIONS_PASSKEY_REFUSED.get() > refused_before);
+        assert_eq!(
+            take_recorded_with_passkeys(),
+            vec![(
+                one(Outcome::PasskeyRefused, "passkey refused: new passkey: wrong challenge"),
+                a_prefix.clone(),
+                String::new()
+            )]
+        );
+    });
+}
+
+#[test]
+fn an_added_passkeys_refusals_are_named_after_the_ceremony() {
+    use crate::webauthn::Refusal;
+    for r in [
+        Refusal::ClientDataTooLong,
+        Refusal::ClientDataUnreadable,
+        Refusal::WrongType,
+        Refusal::WrongChallenge,
+        Refusal::WrongOrigin,
+        Refusal::CrossOrigin,
+        Refusal::TopOrigin,
+        Refusal::AuthDataMalformed,
+        Refusal::WrongRpId,
+        Refusal::UserNotPresent,
+        Refusal::UserNotVerified,
+        Refusal::NoCredentialData,
+        Refusal::CredentialMismatch,
+        Refusal::UnsupportedAlgorithm,
+        Refusal::BadPublicKey,
+        Refusal::BadSignature,
+        Refusal::CounterRegression,
+    ] {
+        assert_eq!(passkey::Why::New(r).label(), format!("new passkey: {}", r.label()));
+        assert_eq!(passkey::Why::New(r).detail(), format!("passkey refused: new passkey: {}", r.label()));
+        assert_eq!(passkey::Why::Webauthn(r).detail(), format!("passkey refused: {}", r.label()));
+    }
+    assert_eq!(passkey::Why::NotOffered.label(), "adding not offered");
+    assert_eq!(passkey::Why::NotOffered.detail(), "passkey refused: adding not offered");
+    assert_eq!(passkey::Why::LimitReached.label(), "limit reached");
+    assert_eq!(passkey::Why::LimitReached.detail(), "passkey refused: limit reached");
+}
+
 #[test]
 fn webauthn_fields_are_capped_before_they_are_decoded() {
     let _ = gate::take_logged();
@@ -1070,8 +1681,14 @@ fn op_cookies_are_strict_to_their_page() {
 fn each_outcome_is_recorded_once_per_call() {
     use operation::{Outcome, Who, record, take_recorded};
     let _ = take_recorded();
-    let who =
-        Who { provider: "github", login: "alice", subject: "1", actor: "github:alice", credential: "AAAAAAAAAAAA" };
+    let who = Who {
+        provider: "github",
+        login: "alice",
+        subject: "1",
+        actor: "github:alice",
+        credential: "AAAAAAAAAAAA",
+        added: "",
+    };
     record(Outcome::Approved, &who, "proj", "close", "bd-1", "performed");
     assert_eq!(
         operation::take_recorded_with_credential(),
@@ -1098,7 +1715,10 @@ fn each_outcome_is_recorded_once_per_call() {
     assert!(recorded.iter().all(|r| (r.1.as_str(), r.2.as_str(), r.3.as_str()) == ("proj", "discard", "bd-2")));
     let labels: Vec<_> = outcomes.iter().map(|o| o.label()).collect();
     assert_eq!(labels, ["approved", "refused", "not_ready", "gone", "busy", "failed", "passkey_refused"]);
-    assert_eq!(Who::provider_only("acme"), Who { provider: "acme", login: "", subject: "", actor: "", credential: "" });
+    assert_eq!(
+        Who::provider_only("acme"),
+        Who { provider: "acme", login: "", subject: "", actor: "", credential: "", added: "" }
+    );
 }
 
 /// What [`FakeOperations::perform`] was asked: the request, the actor and the OIDC approver reference.

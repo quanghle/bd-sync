@@ -207,6 +207,11 @@ pub(super) struct Ceremony {
     /// Whether the page asked to register the account's first passkey
     /// (`create()`), else to use one (`get()`).
     pub(super) enroll: bool,
+    /// The second single-use challenge, for adding a passkey on this device
+    /// once one of the account's passkeys was used: offered only when the
+    /// account has 1 to [`crate::passkeys::MAX_PER_ACCOUNT`] - 1 passkeys,
+    /// kept and spent with the approval.
+    pub(super) add: Option<[u8; 32]>,
 }
 
 /// A human gate's approval page, shown to a person the rules let in:

@@ -94,11 +94,13 @@ answered `503`, which clients retry.
 
 Run one `bd serve` per root: two would each run the background jobs, and
 neither would know the other's sign-ins in progress. What lasts is on
-disk: the workspaces' databases and `<root>/server.db` (accounts, tokens,
-registered OAuth clients, the audit trail). A restart loses what is kept
-in memory: OAuth authorizations in progress (the person starts again), a
-device-flow answer the client did not receive (it signs in again),
-cached provider and client metadata (fetched again), and the [secrets
+disk: the workspaces' databases, `<root>/server.db` (accounts, tokens,
+registered OAuth clients, the audit trail) and
+`<root>/approval-links.key` (the key sealing close and discard approval
+links). A restart loses what is kept in memory: OAuth authorizations in
+progress (the person starts again), a device-flow answer the client did
+not receive (it signs in again), cached provider and client metadata
+(fetched again), and the [secrets
 command](sign-in.md#secrets-from-a-command)'s answers (asked again at
 start: while the command fails, sign-in needing them is unavailable, the
 `max_stale` grace gone with them). Tokens, accounts and refreshes carry
@@ -220,7 +222,11 @@ the same answer as single commands:
   authorizer grant kind `human` in that workspace, and one of the gate's
   approvers when it names them; the page shows the gate's approval
   packet ([Approving human gates in the
-  browser](sign-in.md#approving-human-gates-in-the-browser)).
+  browser](sign-in.md#approving-human-gates-in-the-browser)). A person
+  who may open every such gate may likewise approve a
+  `bd close <id> --force` or `bd playbook discard` refused only for open
+  human gates, at the link the refusal prints ([Approving a close or
+  discard](sign-in.md#approving-a-close-or-discard)).
 - **Playbook metadata.** Only admins change `metadata.playbook`, which
   makes runs and groups close themselves, on an existing issue.
 - **GitHub gates** may name only repositories in the workspace's

@@ -830,8 +830,9 @@ failure (`auth.toml` missing, without `[oauth]` or invalid since the
 sign-in began, counted `failed`), and no free sign-in slot (`busy`). So is
 every answer to an approval's `POST`, a settings failure included when
 the post names an approval this server showed. Opening a link, a callback
-whose sign-in cookie is missing or not this server's, and a `POST` naming
-no approval are not counted.
+whose sign-in cookie is missing or not this server's, and, while the
+sign-in settings cannot be used, a `POST` naming no approval this server
+showed are not counted.
 
 ### Approvers and OIDC accounts
 

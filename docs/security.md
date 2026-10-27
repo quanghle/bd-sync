@@ -38,6 +38,10 @@ playbook run gets the same answer as a single command
 - **Access tokens.** `<root>/server.db` (SQLite, mode 0600) holds only the
   SHA-256 of each secret; secrets are printed once. `bd serve token revoke`
   takes effect at once.
+- **Approval link key.** `<root>/approval-links.key` (mode 0600) seals
+  the requests in close and discard approval links; whoever reads it can
+  forge them, so guard it like `server.db` ([Approving a close or discard
+  in the browser](#approving-a-close-or-discard-in-the-browser)).
 - **Roles and kinds.** A token's role (`read`, `write`, `admin`) limits the
   commands it runs; a read token's database connection is query-only. Its
   kind (`agent` or `human`) says who holds it: only human tokens open
@@ -352,6 +356,81 @@ Residual risks, accepted:
   identity rule keeps that account from approving, but recovering the
   actor for the intended account is a separate task for the server's
   admin ([Accounts and actors](sign-in.md#accounts-and-actors)).
+
+## Approving a close or discard in the browser
+
+When `bd close <id> --force` or `bd playbook discard <run>` is refused
+only because of open human gates, a `bd serve` that offers gate pages
+prints a link where a person can approve that very operation
+([Approving a close or
+discard](sign-in.md#approving-a-close-or-discard)). It is a second
+human-gate override without a token, so it gets the protections of
+[gate approval](#approving-gates-in-the-browser) and more.
+
+- **Offered narrowly.** Only for `bd close` of one id with `--force`
+  (not `--take-over`) and `bd playbook discard` (not `--take-over` or
+  `--dry-run`), and only for a refusal due to open human gates alone,
+  none of which has a stored approver list that is not valid (which no
+  one could match); a gate naming no approvers, or a valid list,
+  qualifies. Never for closing a gate itself, a claim refusal, several
+  ids, batches or any other command.
+- **The request is sealed, not stored.** The server seals it with
+  ChaCha20-Poly1305 under its link key, bound to the path's workspace,
+  operation and issue, and it expires 7 days after it was asked. It holds
+  exactly what was asked (the operation, the issue, the reason,
+  `--failed`, `--force`, the requester and when they asked); nothing in
+  it can be changed without the link becoming invalid, and nothing else
+  (`--token`, `--if-*` guards) carries over. The `POST` reads nothing
+  from the form but the one-time approval id.
+- **Nothing is looked up before admission.** Opening a link checks only
+  the path's shape and the seal: a link this server did not seal, or one
+  for another path, answers 404 like an unknown path; an expired one 410;
+  a query over 8 KiB 400. Up to the account's admission every genuine
+  link gets the same answer, whatever workspace or issue it names.
+- **Each step is bound to the browser.** Through the sign-in the request
+  rides in `bd_opreq_<digest>_<n>` cookies (`__Secure-` on https;
+  `Path=<issuer path>/oauth`, `HttpOnly`, `SameSite=Lax`, 20 minutes),
+  checked against a digest the sealed sign-in carries and cleared at the
+  provider's callback. The sign-in is sealed under a label of its own, so
+  it cannot finish as a gate's approval or an MCP client's authorization.
+  The approval's `bd_op_<suffix>` cookie is `HttpOnly`,
+  `SameSite=Strict` and scoped to the operation's path, and its one-time
+  id lasts 10 minutes.
+- **The gate page's protections.** The account is admitted, bound and
+  audited as for [gate approval](#approving-gates-in-the-browser) (kind
+  `human` only, no token issued), and the page has the same Content
+  Security Policy, framing refusal, focus arming, same-origin `POST` and
+  shared sign-in slots.
+- **Every gate in the way.** The person must be able to open every open
+  human gate the operation gets past: one of its approvers when it names
+  them, an OIDC account only by its identity reference. Otherwise the
+  page refuses (403), naming each gate it may not open and its
+  approvers, and nothing is performed.
+- **Checked again, performed exactly.** One transaction, as the person's
+  actor with a human, non-admin token's rights, checks the target again
+  and runs exactly the sealed close or discard. It never takes over a
+  claim: another actor's live claim, the requester's included, refuses
+  the approval (403, nothing written). It cascades nothing. The `closed`
+  or `deleted` events name the approver's actor, `"via": "browser"` and
+  `"requested_by"`.
+- **The link key.** `<root>/approval-links.key` holds 32 random bytes,
+  created at the first start (mode 0600 on Unix, with a warning at start
+  when others can read it), never in `server.db` or its backups, and its
+  bytes are never logged. Whoever reads it can forge links for any
+  workspace and issue (an admitted person who may open the gates must
+  still approve) and can open the sealed requests in links and request
+  cookies, reasons included: guard it like `server.db`. Delete it and
+  restart `bd serve` to invalidate every link; a root restored without
+  it gets a new key.
+
+Residual risks, accepted:
+
+- **A person may approve without reading.** An agent can send a person
+  a link to its own refused close or discard. The page shows the
+  operation, the issue, the reason, the requester, the gates it gets past
+  and a discard's deletes, but bd cannot make anyone read it. Open only
+  links you expect, check that a link's host and path start with your
+  server's public URL, and name approvers on gates that matter.
 
 ## What bd keeps about people
 

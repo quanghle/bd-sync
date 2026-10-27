@@ -259,6 +259,17 @@ consent page and more.
   recorded as. Titles, which agents write, are escaped, with control,
   direction and invisible characters shown as escapes, so they cannot fake
   the page; the gate posted is the one the approval id was issued for.
+  The [approval packet](sign-in.md#approving-human-gates-in-the-browser)
+  below them, the gate's, held work's and run's text and comments, is
+  read only for a person who passed admission and the gate's checks
+  (open, ready to approve, and one of its approvers when it names them),
+  and is shown as untrusted, in a section of its own above the form:
+  Markdown rendered by the server with raw HTML shown as text, images as
+  their alt text (nothing fetched), only `http`/`https` and same-page `#`
+  links active, control and invisible characters escaped, under the same
+  Content Security Policy and with no script of its own. It is bounded,
+  each omission named with `bd show`, and is not a signed record: the
+  approval is checked against the gate as it is when posted.
 - **Approvers hold on every served path.** A gate's approvers are enforced
   in the engine on every path that can open a human gate or move work
   past it (`gate resolve`, `close`, pins, type changes, edges, moves,

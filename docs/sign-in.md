@@ -621,6 +621,41 @@ consent page's protections: a strict Content Security Policy, no framing,
 and a form that is not sent until the page has had focus for 600 ms
 ([Security](security.md#approving-gates-in-the-browser)).
 
+**The approval packet.** Below those facts and above the Approve button,
+the page shows what the approval is about, in a section headed `Approval
+packet`: the description, acceptance criteria, design and notes (those
+not empty) of the gate and of the issues it holds back (at most 8 of
+them; the rest are counted in a notice that gives `bd show <gate id>`
+for the full list, and Holds back names up to 20), then its run or parent.
+For a gate in a playbook run it also shows the run's earlier steps the
+gate and its held steps wait for, followed through `blocks`,
+`conditional-blocks` and `waits-for` edges within the same run, and the
+records of type `decision` (ADRs) directly under the held steps and those
+earlier steps. Each record shows its role, full id, title and status, and
+its 8 newest comments (a run's comments include the score judge's
+evidence). The packet never follows `related`, `discovered-from` or
+other links, never shows later steps, and never reads files, URLs or the
+repository. It is read, and shown, only for a person who may approve the
+gate: admitted with human access, the gate open and ready to approve, and
+one of its approvers when it names them; every other answer is the same
+as without it. It is bounded: 32 records, 256 dependency rows read, 8
+comments per record, 16 KiB per field or comment, 128 KiB of text in
+all, and 512 KiB of page. What a limit leaves out is said where it
+happens, naming the record and how to read it in full, `bd show <id>` or
+`bd comment list <id>`; when the page's limit is reached, each record
+not shown in full still appears with its role, id, title, status and
+those two commands. The text is Markdown, which agents write, so it is
+shown as untrusted, apart from the page's own text: headings (placed
+below the page's own), lists, task lists (as disabled checkboxes),
+emphasis, tables, quotes and code. Raw HTML is shown as text, images as
+their alt text (nothing is fetched), and only links to `http` and `https`
+URLs (opening in a new tab, without a referrer) and to `#` places on the
+page are links; any other link is shown as text with its destination.
+Control, direction and invisible characters are shown escaped. The
+packet is read when the page loads and is not a signed record of what is
+approved: the approval is checked against the gate as it is when it is
+posted, as before.
+
 **The approval** lasts 10 minutes and works once, from the browser that
 signed in: it is bound to a cookie of its own,
 

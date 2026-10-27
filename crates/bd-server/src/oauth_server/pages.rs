@@ -9,7 +9,10 @@
 //! the page, as a `data:` URL.
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use bd_core::gates::packet::{MAX_EDGES, MAX_RECORDS, MAX_SOURCE_BYTES, Note, Packet, Role, Source, Text, Walk};
 use sha2::{Digest, Sha256};
+
+use super::markdown;
 
 /// An HTML page, its status, and its Content-Security-Policy.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +77,26 @@ button.primary,.button{background:var(--fg);color:var(--bg)}
 .actions button:not(.primary){padding:0;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:4px}
 button:focus-visible,.button:focus-visible,a:focus-visible{outline:2px solid var(--fg);outline-offset:4px}
 @media (prefers-reduced-motion:reduce){button,.button{transition:none}}
+.packet{margin:24px 0}
+.packet h2{margin:0 0 8px;font-size:20px;line-height:1.3;font-weight:600;letter-spacing:-.02em}
+.packet h3{margin:16px 0 4px;font-size:1em;font-weight:600}
+.packet .notice{opacity:.7;font-size:.88em;margin:4px 0 12px}
+.packet details.src{margin:12px 0}
+.packet summary{cursor:pointer;overflow-wrap:anywhere}
+.packet summary .note{display:inline}
+.packet .src-role{font-weight:600}
+.packet .src-body{padding:4px 0 0 16px;min-width:0}
+.packet .md,.packet code{overflow-wrap:anywhere}
+.packet .md :is(h4,h5,h6){margin:16px 0 4px;font-size:1em;font-weight:600}
+.packet .md :is(ul,ol){margin:0 0 16px;padding-left:24px}
+.packet .md pre{overflow:auto;white-space:pre;max-width:100%;margin:0 0 16px}
+.packet .md-table{overflow-x:auto;max-width:100%;margin:0 0 16px}
+.packet .md table{border-collapse:collapse}
+.packet .md :is(th,td){padding:4px 8px;text-align:left;border:1px solid color-mix(in srgb,currentColor 30%,transparent)}
+.packet .md blockquote{margin:0 0 16px;padding:0 0 0 12px;opacity:.8}
+.packet :is(.md-raw,.md-dest,.md-inert){opacity:.7}
+.packet .md input[type=checkbox]{margin:0 6px 0 0}
+.packet .comment{margin:8px 0 12px}
 "#;
 
 /// bd's mark: three beads on a thread.
@@ -275,6 +298,9 @@ pub struct ApproveGate<'a> {
     pub id: &'a str,
     /// Where the approval is posted.
     pub action: &'a str,
+    /// The gate's approval packet, shown below the facts when there is one
+    /// ([`packet_section`]).
+    pub packet: Option<&'a Packet>,
 }
 
 /// The page asking a person to approve a human gate: what the gate is,
@@ -283,7 +309,8 @@ pub struct ApproveGate<'a> {
 /// page's script ([`ARMING`]) keeps a double click from sending it.
 /// Titles come from whoever may write to the workspace, agents included,
 /// so every value is shown escaped ([`shown`]): nothing in them can pass
-/// for the page's own text.
+/// for the page's own text. The approval packet, workspace-authored too,
+/// sits between the facts and the callout, in a section of its own.
 pub fn approve_gate(a: &ApproveGate<'_>) -> Page {
     let title = shown(a.title, MAX_TITLE);
     let actor = shown(a.actor, MAX_TITLE);
@@ -318,6 +345,7 @@ pub fn approve_gate(a: &ApproveGate<'_>) -> Page {
             list.iter().map(|a| shown(a, MAX_TITLE)).collect::<Vec<_>>().join(", ")
         ),
     };
+    let packet = a.packet.map(packet_section).unwrap_or_default();
     let body = format!(
         "<div class=\"link\" aria-hidden=\"true\"><div class=\"avatar\">{MARK}</div></div>\n\
 <h1>Approve {title}?</h1>\n\
@@ -327,7 +355,7 @@ pub fn approve_gate(a: &ApproveGate<'_>) -> Page {
 <div><dt>Gate</dt><dd><code>{gate}</code> {title}</dd></div>\n\
 <div><dt>Holds back</dt><dd>{holds}</dd></div>\n\
 {part_of}{approvers}</dl>\n\
-<p class=\"callout\">{SHIELD}<span>Approving resolves this gate, so the work it holds back can go ahead. \
+{packet}<p class=\"callout\">{SHIELD}<span>Approving resolves this gate, so the work it holds back can go ahead. \
 It is recorded in {workspace} as approved by <b>{actor}</b>. Only approve if you opened this link just now, \
 in this browser.</span></p>\n",
         provider = shown(a.provider, MAX_TITLE),
@@ -361,7 +389,14 @@ fn shown(text: &str, max: usize) -> String {
     } else {
         text.to_string()
     };
-    let printable = bd_cli::io::printable(&cut);
+    shown_id(&cut)
+}
+
+/// An id as HTML, escaped as [`shown`] escapes text but never shortened, so
+/// that `bd show <id>` stays a command that works. A valid id is at most
+/// 255 ASCII bytes.
+fn shown_id(text: &str) -> String {
+    let printable = bd_cli::io::printable(text);
     let mut out = String::with_capacity(printable.len());
     for c in printable.chars() {
         if super::clients::hidden(c) {
@@ -371,6 +406,312 @@ fn shown(text: &str, max: usize) -> String {
         }
     }
     escape(&out)
+}
+
+/// The most bytes of HTML an approval packet takes on the page.
+const MAX_PACKET_HTML: usize = 512 * 1024;
+
+/// The end of the packet's section.
+const PACKET_CLOSE: &str = "</section>\n";
+
+/// The end of one source of the packet.
+const SOURCE_END: &str = "</div>\n</details>\n";
+
+/// The approval packet as a section of the approval page, within
+/// [`MAX_PACKET_HTML`] bytes.
+fn packet_section(p: &Packet) -> String {
+    packet_section_within(p, MAX_PACKET_HTML)
+}
+
+/// The approval packet's section, at most `max` bytes of HTML.
+///
+/// Everything in the packet is workspace-authored, so every value is
+/// escaped ([`shown`], [`shown_id`]) and every text rendered by
+/// [`markdown::render`], confined to the section. The section's header and
+/// the packet's notes come first; then each source in order, whole if it
+/// fits. Room for every source's stub ([`stub`]: its role, full id, title,
+/// status and the commands showing it in full) is set aside before any
+/// Markdown is rendered, so a source that does not fit is still named, and
+/// a field or comment that does not fit is replaced whole by a notice.
+/// Generated HTML is never cut, so the section always nests.
+fn packet_section_within(p: &Packet, max: usize) -> String {
+    let mut out = String::from(
+        "<section class=\"packet\" aria-labelledby=\"packet-h\">\n<h2 id=\"packet-h\">Approval packet</h2>\n\
+<p class=\"note\">Workspace-authored material, shown as stored when this page loaded. It is not the server's own \
+text, is not a signed record of what is approved, and can change before approval. Full records: \
+<code>bd show &lt;id&gt;</code>.</p>\n",
+    );
+    for note in &p.notes {
+        out.push_str(&note_html(note));
+    }
+    let stubs: Vec<String> = p.sources.iter().map(stub).collect();
+    let mut reserved: usize = stubs.iter().map(String::len).sum();
+    if out.len() + reserved + PACKET_CLOSE.len() > max {
+        debug_assert!(max < MAX_PACKET_HTML, "an approval packet's stubs always fit on the page");
+        return stubs_within(out, &stubs, max);
+    }
+    for (s, stub) in p.sources.iter().zip(&stubs) {
+        // What is left once every later source's stub is set aside: at
+        // least this source's own stub.
+        reserved -= stub.len();
+        let available = max - out.len() - reserved - PACKET_CLOSE.len();
+        match source_html(s, available) {
+            Some(html) if html.len() <= available => out.push_str(&html),
+            _ => out.push_str(stub),
+        }
+    }
+    out.push_str(PACKET_CLOSE);
+    out
+}
+
+/// The section with as many `stubs` as fit in `max` after `out`, then a
+/// notice of how many did not. Only for a `max` too small for every stub,
+/// which [`MAX_PACKET_HTML`] never is.
+fn stubs_within(mut out: String, stubs: &[String], max: usize) -> String {
+    let notice = |n: usize| {
+        format!(
+            "<p class=\"notice\">Display limit reached: {n} more record{} not shown. Full records: \
+<code>bd show &lt;id&gt;</code>.</p>\n",
+            if n == 1 { "" } else { "s" }
+        )
+    };
+    let mut left = stubs.len();
+    for stub in stubs {
+        let after = if left > 1 { notice(left - 1).len() } else { 0 };
+        if out.len() + stub.len() + after + PACKET_CLOSE.len() > max {
+            break;
+        }
+        out.push_str(stub);
+        left -= 1;
+    }
+    if left > 0 {
+        out.push_str(&notice(left));
+    }
+    out.push_str(PACKET_CLOSE);
+    out
+}
+
+/// A packet note as a notice naming the record it is about.
+fn note_html(note: &Note) -> String {
+    let body = match note {
+        Note::HeldLimit { gate, more } => format!(
+            "{more} more held issue{} not included. Full list: <code>bd show {}</code>.",
+            if *more == 1 { "" } else { "s" },
+            shown_id(gate)
+        ),
+        Note::Unavailable { id } => {
+            let id = shown_id(id);
+            format!("Record <code>{id}</code> unavailable. Full record: <code>bd show {id}</code>.")
+        }
+        Note::EdgeLimit { at, during } => {
+            let at = shown_id(at);
+            let what = match during {
+                Walk::Run => format!(
+                    "while looking up the run or parent of <code>{at}</code>: run, prerequisite and decision \
+records not shown"
+                ),
+                Walk::Prerequisites => format!(
+                    "while reading the prerequisites of <code>{at}</code>: further prerequisite records not shown"
+                ),
+                Walk::Decisions => format!(
+                    "while reading the child records of <code>{at}</code>: its decision records and later records \
+not shown"
+                ),
+            };
+            format!("Dependency read limit reached ({MAX_EDGES} rows) {what}. Full record: <code>bd show {at}</code>.")
+        }
+        Note::RecordLimit { at, during } => {
+            let at = shown_id(at);
+            let what = match during {
+                Walk::Run => "the run or parent",
+                Walk::Prerequisites => "the prerequisites",
+                Walk::Decisions => "the decision records",
+            };
+            format!(
+                "Record limit reached ({MAX_RECORDS} records) at {what} of <code>{at}</code>: further records not \
+shown. Full record: <code>bd show {at}</code>."
+            )
+        }
+    };
+    format!("<p class=\"notice\">{body}</p>\n")
+}
+
+/// The start of a source: its details, summary and body, open for the gate
+/// and the work it holds back.
+fn source_head(s: &Source) -> String {
+    let open = if matches!(s.role, Role::Gate | Role::Held) { " open" } else { "" };
+    let under = s
+        .under
+        .as_deref()
+        .map(|u| format!(" <span class=\"note\">under <code>{}</code></span>", shown_id(u)))
+        .unwrap_or_default();
+    format!(
+        "<details class=\"src\"{open}><summary><span class=\"src-role\">{}</span> <code>{}</code> {} \
+<span class=\"note\">{}</span>{under}</summary>\n<div class=\"src-body\">\n",
+        escape(s.role.label()),
+        shown_id(&s.id),
+        shown(&s.title, MAX_TITLE),
+        escape(s.status.as_str()),
+    )
+}
+
+/// A source shown by what identifies it only, with the commands showing it
+/// in full.
+fn stub(s: &Source) -> String {
+    let id = shown_id(&s.id);
+    format!(
+        "{}<p class=\"notice\">Not shown: the page's display limit was reached. Full record: \
+<code>bd show {id}</code>. Comments: <code>bd comment list {id}</code>.</p>\n{SOURCE_END}",
+        source_head(s)
+    )
+}
+
+/// A size in words, rounded down or `up`.
+fn size(bytes: u64, up: bool) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} bytes");
+    }
+    let kib = if up { bytes.div_ceil(1024) } else { bytes / 1024 };
+    format!("{kib} KiB")
+}
+
+/// What a source's text leaves out, if anything, and where to read it all.
+fn text_notice(text: &Text, command: &str) -> String {
+    match text {
+        Text::Full(_) => String::new(),
+        Text::Truncated { text, total_bytes } => format!(
+            "<p class=\"notice\">Shown: the first {} of {}. Full text: <code>{command}</code>.</p>\n",
+            size(text.len() as u64, false),
+            size(*total_bytes, true)
+        ),
+        Text::Omitted { .. } => format!(
+            "<p class=\"notice\">Not shown: the packet's {} KiB source limit was reached. Full text: \
+<code>{command}</code>.</p>\n",
+            MAX_SOURCE_BYTES / 1024
+        ),
+    }
+}
+
+/// A part of a source: `before` and `after` around its Markdown `text`, or
+/// `instead` when the text does not fit.
+struct Piece<'a> {
+    before: String,
+    text: Option<&'a str>,
+    after: String,
+    instead: String,
+}
+
+/// Source `s` in full, as far as it fits in `available` bytes: a field or
+/// comment that does not fit is replaced by a notice, and once not even
+/// that fits, one notice names what is left out. None when not even the
+/// source's summary and its first part fit: its stub says more then.
+fn source_html(s: &Source, available: usize) -> Option<String> {
+    let id = shown_id(&s.id);
+    let show = format!("bd show {id}");
+    let list = format!("bd comment list {id}");
+    let further = format!(
+        "<p class=\"notice\">Further fields and comments not shown: <code>{show}</code>, <code>{list}</code>.</p>\n"
+    );
+    let mut html = source_head(s);
+    let limit = available.checked_sub(further.len() + SOURCE_END.len())?;
+    if html.len() > limit {
+        return None;
+    }
+    let too_big = |command: &str| {
+        format!(
+            "<p class=\"notice\">Not shown: the rendered text exceeds the page's display limit. Full text: \
+<code>{command}</code>.</p>\n"
+        )
+    };
+    let mut pieces = Vec::new();
+    if s.fields.is_empty() && s.comments.is_empty() && s.earlier_comments == 0 {
+        pieces.push(Piece {
+            before: "<p class=\"note\">No fields or comments.</p>\n".to_string(),
+            text: None,
+            after: String::new(),
+            instead: String::new(),
+        });
+    }
+    for f in &s.fields {
+        let label = format!("<h3>{}</h3>\n", escape(f.kind.label()));
+        let notice = text_notice(&f.text, &show);
+        pieces.push(match &f.text {
+            Text::Full(text) | Text::Truncated { text, .. } => Piece {
+                before: format!("{label}<div class=\"md\">"),
+                text: Some(text),
+                after: format!("</div>\n{notice}"),
+                instead: format!("{label}{}", too_big(&show)),
+            },
+            Text::Omitted { .. } => {
+                Piece { before: format!("{label}{notice}"), text: None, after: String::new(), instead: String::new() }
+            }
+        });
+    }
+    if !s.comments.is_empty() || s.earlier_comments > 0 {
+        let earlier = match s.earlier_comments {
+            0 => String::new(),
+            n => format!(
+                "<p class=\"notice\">{n} earlier comment{} not shown: <code>{list}</code>.</p>\n",
+                if n == 1 { "" } else { "s" }
+            ),
+        };
+        pieces.push(Piece {
+            before: format!("<h3>Comments</h3>\n{earlier}"),
+            text: None,
+            after: String::new(),
+            instead: String::new(),
+        });
+    }
+    for c in &s.comments {
+        let by = format!(
+            "<div class=\"comment\"><p class=\"note\">{} · {}</p>\n",
+            shown(&c.author, MAX_TITLE),
+            escape(&c.created_at.to_rfc3339())
+        );
+        let notice = text_notice(&c.text, &list);
+        pieces.push(match &c.text {
+            Text::Full(text) | Text::Truncated { text, .. } => Piece {
+                before: format!("{by}<div class=\"md\">"),
+                text: Some(text),
+                after: format!("</div>\n{notice}</div>\n"),
+                instead: format!("{by}{}</div>\n", too_big(&list)),
+            },
+            Text::Omitted { .. } => Piece {
+                before: format!("{by}{notice}</div>\n"),
+                text: None,
+                after: String::new(),
+                instead: String::new(),
+            },
+        });
+    }
+    for (i, piece) in pieces.into_iter().enumerate() {
+        let frame = html.len() + piece.before.len() + piece.after.len();
+        let whole = if frame > limit {
+            None
+        } else {
+            match piece.text {
+                None => Some(String::new()),
+                Some(text) => markdown::render(text, limit - frame),
+            }
+        };
+        match whole {
+            Some(md) => {
+                html.push_str(&piece.before);
+                html.push_str(&md);
+                html.push_str(&piece.after);
+            }
+            None if !piece.instead.is_empty() && html.len() + piece.instead.len() <= limit => {
+                html.push_str(&piece.instead)
+            }
+            None if i == 0 => return None,
+            None => {
+                html.push_str(&further);
+                break;
+            }
+        }
+    }
+    html.push_str(SOURCE_END);
+    Some(html)
 }
 
 /// The page asking which provider to sign in with, under `heading` (what
@@ -613,7 +954,7 @@ mod tests {
     /// Write every page to `$BD_PAGES_DIR` (default `<temp>/bd-pages`) to
     /// look at in a browser, each with its policy in a `<meta>` (which
     /// browsers apply, but for `frame-ancestors`):
-    /// `cargo test -p bd --bin bd preview_pages -- --ignored --nocapture`.
+    /// `cargo test -p bd-server preview_pages -- --ignored --nocapture`.
     /// A logo for the preview: a green disc.
     const PREVIEW_LOGO: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E\
 %3Ccircle cx='5' cy='5' r='5' fill='%2310a37f'/%3E%3C/svg%3E";
@@ -626,6 +967,7 @@ mod tests {
             .unwrap_or_else(|| std::env::temp_dir().join("bd-pages"));
         std::fs::create_dir_all(&dir).unwrap();
         let back = "https://chatgpt.com/connector_platform_oauth_redirect?error=access_denied&state=s";
+        let packet = preview_packet();
         let pages = [
             (
                 "consent",
@@ -727,6 +1069,24 @@ mod tests {
                     actor: "github:octocat",
                     id: "c0ffee",
                     action: "https://bd.example.com/w/proj/gates/proj-a1b2",
+                    packet: None,
+                }),
+            ),
+            (
+                "approve-gate-packet",
+                "Approving a playbook gate, with its approval packet",
+                approve_gate(&ApproveGate {
+                    workspace: "proj",
+                    gate: "proj-r1.gate-build",
+                    title: "Approve the build",
+                    holds: &[("proj-r1.build".to_string(), "Build".to_string(), "open".to_string())],
+                    part_of: Some(("proj-r1", "Release <b>1.4</b>")),
+                    approvers: Some(&["github:octocat".to_string()]),
+                    provider: "GitHub",
+                    actor: "github:octocat",
+                    id: "c0ffee",
+                    action: "https://bd.example.com/w/proj/gates/proj-r1.gate-build",
+                    packet: Some(&packet),
                 }),
             ),
             (
@@ -753,6 +1113,67 @@ mod tests {
         println!("{}", dir.join("index.html").display());
     }
 
+    /// A made-up approval packet for the preview: rich Markdown, hostile
+    /// samples, a truncated field, a graph-limit notice, and collapsed
+    /// prerequisites and decision records.
+    fn preview_packet() -> Packet {
+        let mut gate = source(Role::Gate, "proj-r1.gate-build", "Approve the build");
+        gate.fields = vec![full(
+            FieldKind::Description,
+            "Approve once the design below is settled. [Back to the top of the packet](#packet-h).",
+        )];
+        let mut held = source(Role::Held, "proj-r1.build", "Build");
+        held.fields = vec![
+            full(
+                FieldKind::Description,
+                "## Plan\n\nBuild the **release** artifacts:\n\n\
+                 1. Compile with `cargo build --release`.\n2. Sign the archives.\n\n\
+                 | Target | Archive |\n|---|---|\n| Linux | `bd-linux.tar.gz` |\n| macOS | `bd-macos.tar.gz` |\n\n\
+                 > Keep the old archives until the new ones are verified.\n\n\
+                 ```sh\nmake release\t# tabs and newlines kept\n```\n\n\
+                 See [the release notes](https://example.com/releases/1.4) and ~~the old plan~~.",
+            ),
+            full(FieldKind::AcceptanceCriteria, "- [x] Archives built\n- [ ] Archives signed"),
+            Field {
+                kind: FieldKind::Notes,
+                text: Text::Truncated {
+                    text: "Build log excerpt: ".to_string() + &"ok ".repeat(40),
+                    total_bytes: 40_000,
+                },
+            },
+        ];
+        held.comments =
+            vec![comment("github:hubot", Text::Full("Built on the *second* try; the first timed out.".into()))];
+        held.earlier_comments = 2;
+        let mut held_adr = source(Role::Decision, "proj-r1.build.1", "Use reproducible builds");
+        held_adr.under = Some("proj-r1.build".into());
+        held_adr.fields = vec![full(FieldKind::Design, "Pin the toolchain and set `SOURCE_DATE_EPOCH`.")];
+        let mut run = source(Role::Run, "proj-r1", "Release <b>1.4</b>");
+        run.status = Status::InProgress;
+        run.comments = vec![comment("judge", Text::Full("Score draft: correctness 4, scope 5.".into()))];
+        let mut requirements = source(Role::Prerequisite, "proj-r1.requirements", "Requirements");
+        requirements.status = Status::Closed;
+        requirements.fields = vec![full(
+            FieldKind::Description,
+            "Hostile samples, shown as text:\n\n<script>alert(1)</script>\n\n\
+             Inline <img src=x onerror=alert(1)> and <form action=https://evil.example><button>Approve</button></form>.\n\n\
+             [a script link](javascript:alert(1)), ![a pixel](https://evil.example/p.png), \
+             a direction override \u{202E}reversed\u{202C} and a zero-width\u{200B}space.",
+        )];
+        let mut decide = source(Role::Prerequisite, "proj-r1.decide", "Decide");
+        decide.status = Status::Closed;
+        decide.fields = vec![full(FieldKind::Design, "Ship static binaries for every target.")];
+        let mut adr = source(Role::Decision, "proj-r1.decide.1", "ADR: static binaries");
+        adr.status = Status::Closed;
+        adr.under = Some("proj-r1.decide".into());
+        adr.fields = vec![full(FieldKind::Design, "Static binaries avoid glibc version drift.")];
+        Packet {
+            playbook: true,
+            sources: vec![gate, held, held_adr, run, requirements, decide, adr],
+            notes: vec![Note::EdgeLimit { at: "proj-r1.decide".into(), during: Walk::Prerequisites }],
+        }
+    }
+
     /// Where [`gate_page`]'s form posts: a URL with markup in it.
     const GATE_ACTION: &str = "https://bd.example.com/w/proj/gates/g\"><x>";
 
@@ -772,6 +1193,7 @@ mod tests {
             actor: other,
             id: "c0ffee",
             action: GATE_ACTION,
+            packet: None,
         })
     }
 
@@ -873,9 +1295,457 @@ class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
             actor: "github:alice",
             id: "i",
             action: "a",
+            packet: None,
         });
         assert!(page.html.contains("<dt>Approvers</dt><dd>None valid"), "{}", page.html);
         assert!(page.html.contains("<dt>Holds back</dt><dd>Nothing</dd>"), "{}", page.html);
         assert!(!page.html.contains("<dt>Part of</dt>"), "{}", page.html);
+    }
+
+    use bd_core::gates::packet::{Field, FieldKind, MAX_HELD, PacketComment};
+    use bd_core::model::Status;
+    use bd_core::time::Timestamp;
+
+    use super::super::markdown::balanced;
+
+    fn source(role: Role, id: &str, title: &str) -> Source {
+        Source {
+            role,
+            id: id.to_string(),
+            title: title.to_string(),
+            status: Status::Open,
+            under: None,
+            fields: Vec::new(),
+            comments: Vec::new(),
+            earlier_comments: 0,
+        }
+    }
+
+    fn full(kind: FieldKind, text: &str) -> Field {
+        Field { kind, text: Text::Full(text.to_string()) }
+    }
+
+    fn comment(author: &str, text: Text) -> PacketComment {
+        PacketComment { author: author.to_string(), created_at: Timestamp(1_700_000_000_000), text }
+    }
+
+    /// The approval page for gate `g` with `packet`.
+    fn packet_page(packet: Option<&Packet>) -> Page {
+        approve_gate(&ApproveGate {
+            workspace: "proj",
+            gate: "g",
+            title: "Ship it",
+            holds: &[("h".to_string(), "Deploy".to_string(), "open".to_string())],
+            part_of: None,
+            approvers: None,
+            provider: "GitHub",
+            actor: "github:alice",
+            id: "c0ffee",
+            action: "https://bd.example.com/w/proj/gates/g",
+            packet,
+        })
+    }
+
+    /// The packet's section of `html`.
+    fn section_of(html: &str) -> &str {
+        let start = html.find("<section class=\"packet\"").expect("a packet section");
+        let end = html.find(PACKET_CLOSE).expect("the section's end") + PACKET_CLOSE.len();
+        &html[start..end]
+    }
+
+    /// The tags of `html`, between `<` and `>`.
+    fn tags(html: &str) -> Vec<&str> {
+        html.split('<').skip(1).map(|t| t.split('>').next().unwrap_or("")).collect()
+    }
+
+    #[test]
+    fn the_approval_packet_is_confined_and_escaped() {
+        let markdown = "# AUTHORED head\n\n<script>alert(1)</script>\n\n<img src=x onerror=alert(1)>\n\n\
+<form action=//evil><button>Approve</button></form>\n\n- [x] done\n- [ ] todo\n\n\
+[top](#packet-h) [x](javascript:alert(1)) ![PIX](https://evil.example/p.png) AUTHORED\n\n\
+| a | b |\n|---|---|\n| 1 | AUTHORED |\n\n```\"><script>\n<script>alert(2)</script>\n```\n\n\u{202E}rtl AUTHORED\n";
+        let mut gate = source(Role::Gate, "g\"<x>\u{202E}", "<script>alert(1)</script>\u{202E}");
+        gate.fields = vec![full(FieldKind::Description, markdown), full(FieldKind::Notes, "<b>AUTHORED</b>")];
+        gate.comments = vec![comment("<b>mallory</b>\u{200B}", Text::Full("<script>bad()</script> AUTHORED".into()))];
+        let mut held = source(Role::Held, "h", "Deploy <i>prod</i>");
+        held.fields = vec![full(FieldKind::AcceptanceCriteria, "- [ ] AUTHORED")];
+        let packet = Packet { playbook: false, sources: vec![gate, held], notes: Vec::new() };
+        let page = packet_page(Some(&packet));
+        let html = &page.html;
+
+        let dl = html.find("</dl>").unwrap();
+        let start = html.find("<section class=\"packet\"").unwrap();
+        let end = html.find(PACKET_CLOSE).unwrap();
+        let callout = html.find("<p class=\"callout\">").unwrap();
+        assert!(dl < start && start < end && end < callout, "{html}");
+        let section = section_of(html);
+        assert!(balanced(section), "{section}");
+        assert_eq!(html.matches("AUTHORED").count(), section.matches("AUTHORED").count(), "{html}");
+        assert_eq!(section.matches("AUTHORED").count(), 7, "{section}");
+        assert!(section.contains("<h2 id=\"packet-h\">Approval packet</h2>"), "{section}");
+
+        // The page's own controls, once each; authored markup is text.
+        assert_eq!(html.matches("<form").count(), 1, "{html}");
+        assert_eq!(html.matches("<button").count(), 1, "{html}");
+        assert_eq!(html.matches("name=\"approval\"").count(), 1, "{html}");
+        assert_eq!(html.matches("<script").count(), 1, "{html}");
+        assert_eq!(script_of(&page), ARMING);
+        for tag in tags(html) {
+            if tag.starts_with("input") {
+                assert!(
+                    tag == "input type=\"hidden\" name=\"approval\" value=\"c0ffee\""
+                        || tag.starts_with("input type=\"checkbox\" disabled"),
+                    "{tag}"
+                );
+            }
+            assert!(!tag.split_whitespace().skip(1).any(|a| a.to_ascii_lowercase().starts_with("on")), "{tag}");
+            assert!(!tag.starts_with("img") && !tag.contains("src="), "{tag}");
+        }
+        assert!(section.contains("<input type=\"checkbox\" disabled checked>"), "{section}");
+        assert!(section.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), "{section}");
+        assert!(section.contains("&lt;script&gt;alert(2)&lt;/script&gt;"), "{section}");
+        assert!(section.contains("&lt;form action=//evil&gt;&lt;button&gt;Approve"), "{section}");
+        assert!(section.contains("&lt;b&gt;mallory&lt;/b&gt;\\u200b"), "{section}");
+        assert!(section.contains("<code>g&quot;&lt;x&gt;\\u202e</code> &lt;script&gt;"), "{section}");
+        assert!(section.contains("\\u202ertl"), "{section}");
+        assert!(section.contains("[image: PIX]") && !html.contains("evil.example/p.png\""), "{section}");
+        assert!(!html.contains("href=\"javascript"), "{section}");
+        assert!(section.contains("<div class=\"md-table\"><table>"), "{section}");
+        assert!(section.contains("<h4>AUTHORED head</h4>"), "{section}");
+        assert!(!html.contains('\u{202E}') && !html.contains('\u{200B}'), "{html}");
+        // A jump to the server's own heading stays on the page.
+        assert!(section.contains("<a href=\"#packet-h\">top</a>"), "{section}");
+
+        // The policy is the page's without a packet.
+        assert_eq!(page.csp, packet_page(None).csp);
+        assert!(page.csp.contains("form-action 'self';") && !page.csp.contains("img-src"), "{}", page.csp);
+        assert!(!packet_page(None).html.contains("class=\"packet\""));
+    }
+
+    #[test]
+    fn sources_show_their_role_and_place() {
+        let mut decision = source(Role::Decision, "d", "ADR");
+        decision.under = Some("p<1>".into());
+        decision.status = Status::Closed;
+        let packet = Packet {
+            playbook: true,
+            sources: vec![
+                source(Role::Gate, "g", "Gate"),
+                source(Role::Held, "h", "Held"),
+                source(Role::Run, "r", "Run"),
+                source(Role::Prerequisite, "p<1>", "Prereq"),
+                decision,
+                source(Role::Parent, "pa", "Parent"),
+            ],
+            notes: Vec::new(),
+        };
+        let section = packet_section(&packet);
+        assert!(balanced(&section), "{section}");
+        for (open, role, id) in [
+            (true, "Gate", "g"),
+            (true, "Held work", "h"),
+            (false, "Run", "r"),
+            (false, "Prerequisite", "p&lt;1&gt;"),
+            (false, "Decision record", "d"),
+            (false, "Parent", "pa"),
+        ] {
+            let open = if open { " open" } else { "" };
+            let head = format!(
+                "<details class=\"src\"{open}><summary><span class=\"src-role\">{role}</span> <code>{id}</code> "
+            );
+            assert!(section.contains(&head), "{head} in {section}");
+        }
+        assert!(
+            section.contains(
+                "<code>d</code> ADR <span class=\"note\">closed</span> <span class=\"note\">under \
+<code>p&lt;1&gt;</code></span></summary>"
+            ),
+            "{section}"
+        );
+        assert_eq!(section.matches("<p class=\"note\">No fields or comments.</p>").count(), 6, "{section}");
+    }
+
+    #[test]
+    fn notices_name_the_record_and_how_to_read_it() {
+        let notes = [
+            (
+                Note::HeldLimit { gate: "g<1>".into(), more: 1 },
+                "1 more held issue not included. Full list: <code>bd show g&lt;1&gt;</code>.",
+            ),
+            (
+                Note::HeldLimit { gate: "g<1>".into(), more: 3 },
+                "3 more held issues not included. Full list: <code>bd show g&lt;1&gt;</code>.",
+            ),
+            (
+                Note::Unavailable { id: "u<1>".into() },
+                "Record <code>u&lt;1&gt;</code> unavailable. Full record: <code>bd show u&lt;1&gt;</code>.",
+            ),
+            (
+                Note::EdgeLimit { at: "g".into(), during: Walk::Run },
+                "Dependency read limit reached (256 rows) while looking up the run or parent of <code>g</code>: run, \
+prerequisite and decision records not shown. Full record: <code>bd show g</code>.",
+            ),
+            (
+                Note::EdgeLimit { at: "x".into(), during: Walk::Prerequisites },
+                "Dependency read limit reached (256 rows) while reading the prerequisites of <code>x</code>: further \
+prerequisite records not shown. Full record: <code>bd show x</code>.",
+            ),
+            (
+                Note::EdgeLimit { at: "y".into(), during: Walk::Decisions },
+                "Dependency read limit reached (256 rows) while reading the child records of <code>y</code>: its \
+decision records and later records not shown. Full record: <code>bd show y</code>.",
+            ),
+            (
+                Note::RecordLimit { at: "x".into(), during: Walk::Prerequisites },
+                "Record limit reached (32 records) at the prerequisites of <code>x</code>: further records not shown. \
+Full record: <code>bd show x</code>.",
+            ),
+            (
+                Note::RecordLimit { at: "y".into(), during: Walk::Decisions },
+                "Record limit reached (32 records) at the decision records of <code>y</code>: further records not \
+shown. Full record: <code>bd show y</code>.",
+            ),
+        ];
+        for (note, text) in &notes {
+            assert_eq!(note_html(note), format!("<p class=\"notice\">{text}</p>\n"));
+        }
+        let packet = Packet {
+            playbook: true,
+            sources: vec![source(Role::Gate, "g", "Gate")],
+            notes: notes.iter().map(|(n, _)| n.clone()).collect(),
+        };
+        let section = packet_section(&packet);
+        assert!(balanced(&section), "{section}");
+        assert!(notes.iter().all(|(_, text)| section.contains(text)), "{section}");
+
+        let mut held = source(Role::Held, "h", "Held");
+        held.fields = vec![
+            Field {
+                kind: FieldKind::Description,
+                text: Text::Truncated { text: "a".repeat(16 * 1024), total_bytes: 21_000 },
+            },
+            Field { kind: FieldKind::Design, text: Text::Omitted { total_bytes: 5 } },
+        ];
+        held.comments = vec![
+            comment("bob", Text::Truncated { text: "c".repeat(100), total_bytes: 2000 }),
+            comment("bob", Text::Omitted { total_bytes: 2000 }),
+        ];
+        held.earlier_comments = 1;
+        let section = packet_section(&Packet { playbook: false, sources: vec![held], notes: Vec::new() });
+        for text in [
+            "Shown: the first 16 KiB of 21 KiB. Full text: <code>bd show h</code>.",
+            "<h3>Design</h3>\n<p class=\"notice\">Not shown: the packet's 128 KiB source limit was reached. Full text: \
+<code>bd show h</code>.</p>",
+            "1 earlier comment not shown: <code>bd comment list h</code>.",
+            "Shown: the first 100 bytes of 2 KiB. Full text: <code>bd comment list h</code>.",
+            "Not shown: the packet's 128 KiB source limit was reached. Full text: <code>bd comment list h</code>.",
+            "<p class=\"note\">bob · 2023-11-14T22:13:20.000Z</p>",
+        ] {
+            assert!(section.contains(text), "{text} in {section}");
+        }
+        assert!(balanced(&section), "{section}");
+    }
+
+    #[test]
+    fn long_ids_are_shown_whole() {
+        let id = format!("proj-{}", "a".repeat(250));
+        let decision_id = format!("proj-{}", "d".repeat(250));
+        assert_eq!(id.len(), 255);
+        let mut held = source(Role::Held, &id, "Held");
+        held.fields = vec![
+            Field { kind: FieldKind::Description, text: Text::Truncated { text: "x".into(), total_bytes: 20_000 } },
+            Field { kind: FieldKind::Notes, text: Text::Omitted { total_bytes: 20_000 } },
+        ];
+        held.comments = vec![comment("bob", Text::Truncated { text: "y".into(), total_bytes: 20_000 })];
+        held.earlier_comments = 3;
+        let mut decision = source(Role::Decision, &decision_id, "ADR");
+        decision.under = Some(id.clone());
+        decision.fields = vec![full(FieldKind::Design, &"z".repeat(1000))];
+        let packet = Packet { playbook: true, sources: vec![held, decision], notes: Vec::new() };
+        let section = packet_section(&packet);
+        assert!(balanced(&section), "{section}");
+        assert!(!section.contains('…'), "{section}");
+        assert!(section.contains(&format!("<code>{id}</code> Held")), "{section}");
+        assert!(section.contains(&format!("under <code>{id}</code>")), "{section}");
+        assert!(section.contains(&format!("<code>{decision_id}</code> ADR")), "{section}");
+        assert_eq!(section.matches(&format!("<code>bd show {id}</code>")).count(), 2, "{section}");
+        assert_eq!(section.matches(&format!("<code>bd comment list {id}</code>")).count(), 2, "{section}");
+
+        // Its stub too, when the page has no room for more.
+        let small = packet_section_within(&packet, 3500);
+        assert!(balanced(&small) && small.len() <= 3500, "{small}");
+        for id in [&id, &decision_id] {
+            assert!(small.contains(&format!("<code>bd show {id}</code>")), "{small}");
+            assert!(small.contains(&format!("<code>bd comment list {id}</code>")), "{small}");
+        }
+    }
+
+    /// Text that is 1 byte stored and 6 shown, `n` times.
+    fn expanding(n: usize) -> String {
+        "\u{1}".repeat(n)
+    }
+
+    #[test]
+    fn the_packet_stays_within_its_budget() {
+        let big = 16 * 1024;
+        let sources: Vec<Source> = (0..MAX_RECORDS)
+            .map(|i| {
+                let mut s = source(if i == 0 { Role::Gate } else { Role::Prerequisite }, &format!("proj-s{i:02}"), "t");
+                s.fields = FieldKind::ALL.iter().map(|k| full(*k, &expanding(big))).collect();
+                s.comments = (0..8).map(|_| comment("bob", Text::Full(expanding(big)))).collect();
+                s.earlier_comments = 2;
+                s
+            })
+            .collect();
+        let packet = Packet { playbook: true, sources, notes: Vec::new() };
+        let section = packet_section(&packet);
+        assert!(section.len() <= MAX_PACKET_HTML, "{}", section.len());
+        assert!(balanced(&section));
+        // The first source's text took what room there was, piece by
+        // piece; every later one still names itself and how to read it.
+        assert!(section.contains("<h3>Notes</h3>\n<div class=\"md\"><p>\\u0001"), "rendered");
+        assert!(section.contains(
+            "Not shown: the rendered text exceeds the page's display limit. Full text: <code>bd comment list proj-s00</code>"
+        ));
+        for i in 1..MAX_RECORDS {
+            let id = format!("proj-s{i:02}");
+            assert!(section.contains(&format!("<code>bd show {id}</code>")), "{id}");
+            assert!(section.contains(&format!("<code>bd comment list {id}</code>")), "{id}");
+            assert!(section.contains(&format!("<code>{id}</code> t <span class=\"note\">open</span>")), "{id}");
+        }
+
+        // A fragment that does not fit is replaced whole.
+        let table: String = std::iter::once("| a | b |\n|---|---|\n".to_string())
+            .chain((0..200).map(|_| format!("| {} | x |\n", expanding(20))))
+            .collect();
+        let mut gate = source(Role::Gate, "g", "Gate");
+        gate.fields = vec![full(FieldKind::Description, &table), full(FieldKind::Notes, "short NOTES")];
+        let packet = Packet { playbook: false, sources: vec![gate], notes: Vec::new() };
+        assert!(packet_section(&packet).contains("<table>"));
+        let section = packet_section_within(&packet, 8 * 1024);
+        assert!(section.len() <= 8 * 1024 && balanced(&section), "{section}");
+        assert!(!section.contains("<table") && !section.contains("md-table"), "{section}");
+        assert!(
+            section.contains(
+                "<h3>Description</h3>\n<p class=\"notice\">Not shown: the rendered text exceeds the page's display \
+limit. Full text: <code>bd show g</code>.</p>"
+            ),
+            "{section}"
+        );
+        assert!(section.contains("short NOTES"), "{section}");
+
+        // Too small for every stub (never so at MAX_PACKET_HTML): those that
+        // fit, and how many did not.
+        let packet = Packet {
+            playbook: true,
+            sources: (0..4).map(|i| source(Role::Prerequisite, &format!("p{i}"), "t")).collect(),
+            notes: Vec::new(),
+        };
+        let section = packet_section_within(&packet, 1500);
+        assert!(section.len() <= 1500 && balanced(&section), "{section}");
+        assert!(section.contains("<code>bd show p0</code>"), "{section}");
+        assert!(section.contains("Display limit reached: 1 more record not shown."), "{section}");
+        let section = packet_section_within(&packet, 1200);
+        assert!(section.len() <= 1200 && balanced(&section), "{section}");
+        assert!(section.contains("Display limit reached: 2 more records not shown."), "{section}");
+    }
+
+    #[test]
+    fn exhausted_budget_keeps_each_source_identifiable() {
+        let mut gate = source(Role::Gate, "proj-gate", "Gate");
+        gate.fields = vec![full(FieldKind::Description, &"g".repeat(3000))];
+        let mut held = source(Role::Held, "proj-held", "Held");
+        held.fields = FieldKind::ALL.iter().map(|k| full(*k, &"h".repeat(3000))).collect();
+        held.comments = (0..8).map(|_| comment("bob", Text::Full("c".repeat(40)))).collect();
+        let mut prereq = source(Role::Prerequisite, "proj-run.requirements", "Requirements <x>");
+        prereq.fields = vec![full(FieldKind::Description, &format!("PREREQ-TEXT {}", "p".repeat(2000)))];
+        prereq.comments = vec![comment("bob", Text::Full("PREREQ-COMMENT".into()))];
+        prereq.status = Status::Closed;
+        let mut decision = source(Role::Decision, "proj-run.requirements.adr", "ADR");
+        decision.fields = vec![full(FieldKind::Design, &format!("DECISION-TEXT {}", "d".repeat(2000)))];
+        decision.comments = vec![comment("bob", Text::Full("DECISION-COMMENT".into()))];
+        decision.under = Some("proj-run.requirements".into());
+        let packet = Packet { playbook: true, sources: vec![gate, held, prereq, decision], notes: Vec::new() };
+        let max = 12 * 1024;
+        let section = packet_section_within(&packet, max);
+        assert!(section.len() <= max && balanced(&section), "{section}");
+        assert!(section.contains(&"g".repeat(3000)), "the gate in full");
+        assert!(section.contains(&"h".repeat(3000)), "the held work's first field");
+        assert!(!section.contains("PREREQ-TEXT") && !section.contains("DECISION-TEXT"), "{section}");
+        assert!(
+            section.contains(
+                "<summary><span class=\"src-role\">Prerequisite</span> <code>proj-run.requirements</code> \
+Requirements &lt;x&gt; <span class=\"note\">closed</span></summary>"
+            ),
+            "{section}"
+        );
+        assert!(
+            section.contains(
+                "<summary><span class=\"src-role\">Decision record</span> <code>proj-run.requirements.adr</code> ADR \
+<span class=\"note\">open</span> <span class=\"note\">under <code>proj-run.requirements</code></span></summary>"
+            ),
+            "{section}"
+        );
+        for id in ["proj-run.requirements", "proj-run.requirements.adr"] {
+            assert!(section.contains(&format!("<code>bd show {id}</code>")), "{id} in {section}");
+            assert!(section.contains(&format!("<code>bd comment list {id}</code>")), "{id} in {section}");
+        }
+        assert!(section.contains("Not shown: the page's display limit was reached."), "{section}");
+        // With room, they show in full.
+        let section = packet_section(&packet);
+        assert!(section.contains("PREREQ-TEXT") && section.contains("DECISION-TEXT"), "{section}");
+    }
+
+    #[test]
+    fn worst_case_stubs_fit() {
+        let ids: Vec<String> = (0..MAX_RECORDS).map(|i| format!("{i:02}-{}", "z".repeat(252))).collect();
+        // The title that comes out longest, cut to 500 characters as SQL cuts it.
+        let title = ['\u{1}', '&', '"', '\u{202E}', '\u{FEFF}', '\u{E0001}', '\u{10FFFF}']
+            .iter()
+            .map(|c| c.to_string().repeat(500))
+            .max_by_key(|t| shown(t, MAX_TITLE).len())
+            .unwrap();
+        let sources: Vec<Source> = ids
+            .iter()
+            .map(|id| {
+                let mut s = source(Role::Decision, id, &title);
+                s.under = Some(ids[0].clone());
+                s
+            })
+            .collect();
+        let mut notes = vec![Note::HeldLimit { gate: ids[0].clone(), more: usize::MAX }];
+        notes.extend(ids.iter().take(MAX_HELD).map(|id| Note::Unavailable { id: id.clone() }));
+        for during in [Walk::Run, Walk::Prerequisites, Walk::Decisions] {
+            notes.push(Note::EdgeLimit { at: ids[1].clone(), during });
+            notes.push(Note::RecordLimit { at: ids[1].clone(), during });
+        }
+        let header = packet_section(&Packet { playbook: true, sources: Vec::new(), notes: notes.clone() });
+        let stubs: usize = sources.iter().map(|s| stub(s).len()).sum();
+        let total = header.len() + stubs;
+        assert!(total < MAX_PACKET_HTML / 4, "{total}");
+        let section = packet_section(&Packet { playbook: true, sources, notes });
+        assert!(balanced(&section) && section.len() <= total, "{}", section.len());
+        assert!(!section.contains("Display limit reached"));
+    }
+
+    #[test]
+    fn packet_styles_are_scoped() {
+        let lines: Vec<&str> = STYLE.lines().skip_while(|l| !l.starts_with(".packet")).collect();
+        assert!(lines.len() > 10);
+        for line in lines.iter().filter(|l| !l.is_empty()) {
+            let selectors = line.split('{').next().unwrap();
+            // Commas outside parentheses separate selectors.
+            let mut depth = 0;
+            let top = selectors.char_indices().filter(|&(_, c)| {
+                depth += (c == '(') as i32 - (c == ')') as i32;
+                c == ',' && depth == 0
+            });
+            let mut from = 0;
+            for (at, _) in top.chain(std::iter::once((selectors.len(), ','))) {
+                assert!(selectors[from..at].starts_with(".packet"), "{line}");
+                from = at + 1;
+            }
+            assert!(!line.contains("url("), "{line}");
+        }
     }
 }

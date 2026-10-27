@@ -43,7 +43,7 @@ pub use callback::*;
 pub use consent::*;
 pub use cookies::*;
 pub use flows::*;
-pub use gate::{Approved, Found, GateInfo, Gates};
+pub use gate::{Approved, Approver, Found, GateInfo, Gates};
 use request::*;
 
 use std::path::Path;

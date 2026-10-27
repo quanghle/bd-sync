@@ -218,7 +218,8 @@ the same answer as single commands:
   approve a human gate at `<public-url>/w/<workspace>/gates/<gate id>`
   after signing in, without a token: only an account the rules or the
   authorizer grant kind `human` in that workspace, and one of the gate's
-  approvers when it names them ([Approving human gates in the
+  approvers when it names them; the page shows the gate's approval
+  packet ([Approving human gates in the
   browser](sign-in.md#approving-human-gates-in-the-browser)).
 - **Playbook metadata.** Only admins change `metadata.playbook`, which
   makes runs and groups close themselves, on an existing issue.

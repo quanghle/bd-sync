@@ -10909,6 +10909,36 @@ struct GateIds {
     run_gate: String,
     /// More human gates, each holding back a task of its own.
     spares: Vec<String>,
+    /// A playbook run (`Review <b>run</b>`) whose build step waits for its human gate [`GateIds::packet_gate`]:
+    /// requirements and decide closed, decide's decision record closed, build's own open, a later step after it.
+    packet_run: String,
+    packet_gate: String,
+    /// A human gate holding back [`GateIds::big_task`], whose description is longer than a packet shows.
+    big_gate: String,
+    big_task: String,
+}
+
+/// The description of [`GateIds::task`]: a sentinel, Markdown, and hostile HTML, links, an image and a U+202E.
+const HELD_MARKDOWN: &str = "PKT-HELD: deploy **prod** \u{202e}rtl\n\n\
+    - [x] done\n- [ ] pending\n\n\
+    | env | state |\n|---|---|\n| prod | ready |\n\n\
+    ```sh\n<script>alert(1)</script>\n```\n\n\
+    <script>alert(1)</script>\n\n\
+    <form action=https://evil.example><button>Approve</button></form>\n\n\
+    [x](javascript:alert(1)) ![PIXEL](https://evil.example/p.png)\n";
+
+/// The playbook of [`GateIds::packet_run`].
+const REVIEW_PLAYBOOK: &str = "title = \"Review <b>run</b>\"\n\
+    [[steps]]\nid = \"requirements\"\ntitle = \"Requirements\"\ndescription = \"REQ-PKT **bold**\"\n\
+    acceptance_criteria = \"- [ ] ACCEPT-PKT\"\n\
+    [[steps]]\nid = \"decide\"\ntitle = \"Decide\"\nneeds = [\"requirements\"]\ndesign = \"DESIGN-PKT\"\n\
+    [[steps]]\nid = \"build\"\ntitle = \"Build\"\nneeds = [\"decide\"]\n[steps.gate]\ntype = \"human\"\n\
+    [[steps]]\nid = \"later\"\ntitle = \"Later step\"\nneeds = [\"build\"]\ndescription = \"FUTURE-PKT\"\n";
+
+/// No approval packet in `page`: none of [`gate_root`]'s sentinels (each holds `PKT`), no packet section.
+fn no_packet(what: &str, page: &str) {
+    assert!(!page.contains("PKT"), "{what}: packet material: {page}");
+    assert!(!page.contains("Approval packet") && !page.contains("class=\"packet\""), "{what}: {page}");
 }
 
 /// [`oauth_root_at`] with these GitHub `rules`, and workspace proj holding the gates of [`GateIds`], made with
@@ -10925,14 +10955,15 @@ fn gate_root(github: &FakeGithub, rules: &str) -> (TempDir, GateIds) {
         args.extend_from_slice(extra);
         run(&args)
     };
-    let task = run(&["-q", "create", "Deploy <b>prod</b>"]);
-    let gate = human("Approve <i>prod</i>", &task, &[]);
-    let keys = run(&["-q", "create", "Rotate keys"]);
+    let task = run(&["-q", "create", "Deploy <b>prod</b>", "-d", HELD_MARKDOWN]);
+    run(&["comment", "add", &task, "PKT-COMMENT: checked *twice*"]);
+    let gate = human("Approve <i>prod</i>", &task, &["--description", "PKT-GATE: approve the **deploy**"]);
+    let keys = run(&["-q", "create", "Rotate keys", "-d", "CAROL-PKT"]);
     let carol = human("Rotate the keys", &keys, &["--approver", "github:carol"]);
     let later = run(&["-q", "create", "Later"]);
     let timer = run(&["-q", "gate", "create", "-t", "timer", "--timeout", "24h", "--blocks", &later]);
     let prerequisite = run(&["-q", "create", "Prerequisite"]);
-    let held = run(&["-q", "create", "Held"]);
+    let held = run(&["-q", "create", "Held", "-d", "UNARMED-PKT"]);
     let unarmed = human("Not yet", &held, &[]);
     run(&["dep", "add", &unarmed, &prerequisite]);
     write(
@@ -10946,10 +10977,35 @@ fn gate_root(github: &FakeGithub, rules: &str) -> (TempDir, GateIds) {
     run(&["close", &format!("{run_id}.ship"), "--force"]);
     let spares = (1..=4)
         .map(|n| {
-            let task = run(&["-q", "create", &format!("Spare {n}")]);
+            let task = run(&["-q", "create", &format!("Spare {n}"), "-d", &format!("SPARE-PKT {n}")]);
             human(&format!("Spare gate {n}"), &task, &[])
         })
         .collect();
+
+    // A run whose build step waits for a person, its earlier steps and their decision records done.
+    write(&ws.join(".bd").join("playbooks"), "review.toml", REVIEW_PLAYBOOK);
+    let started: Value = serde_json::from_str(&run(&["--json", "playbook", "run", "review"])).unwrap();
+    let packet_run = started["run"]["id"].as_str().unwrap().to_string();
+    let step = |name: &str| format!("{packet_run}.{name}");
+    let (decide, build) = (step("decide"), step("build"));
+    let adr = run(&["-q", "create", "ADR", "-t", "decision", "--parent", &decide, "--design", "ADR-PKT"]);
+    run(&["-q", "create", "Build ADR", "-t", "decision", "--parent", &build, "--design", "HELD-ADR-PKT"]);
+    let related = run(&["-q", "create", "Related note", "-d", "RELATED-PKT"]);
+    run(&["dep", "add", &build, &related, "--type", "related"]);
+    run(&["comment", "add", &packet_run, "SCORE-PKT: judged"]);
+    run(&["comment", "add", &step("requirements"), "EVIDENCE-PKT: tested"]);
+    for id in [step("requirements"), adr, decide] {
+        run(&["close", &id]);
+    }
+    let packet_gate = step("gate-build");
+    let shown: Value = serde_json::from_str(&run(&["--json", "gate", "show", &packet_gate])).unwrap();
+    assert_eq!(shown["phase"], "armed", "{shown}");
+
+    // A description past the packet's 16 KiB a field, its sentinel at the end.
+    let long = format!("{}TAIL-PKT", "Long text. ".repeat(1545));
+    let big_task = run(&["-q", "create", "Big", "-d", &long]);
+    let big_gate = human("Big gate", &big_task, &[]);
+
     let ids = GateIds {
         task,
         human: gate,
@@ -10959,6 +11015,10 @@ fn gate_root(github: &FakeGithub, rules: &str) -> (TempDir, GateIds) {
         run_gate: format!("{run_id}.gate-ship"),
         run: run_id,
         spares,
+        packet_run,
+        packet_gate,
+        big_gate,
+        big_task,
     };
     (root, ids)
 }
@@ -11187,6 +11247,71 @@ fn people_approve_human_gates_in_the_browser() {
 }
 
 #[test]
+fn the_approval_page_shows_the_packet_safely() {
+    let github = FakeGithub::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+
+    // A gate and the work it holds back: their fields and comments, as Markdown, below the facts.
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.human);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let page = &signed.page;
+    let section = page.find("<section class=\"packet\"").unwrap_or_else(|| panic!("no packet: {page}"));
+    assert!(page.contains("<h2 id=\"packet-h\">Approval packet</h2>"), "{page}");
+    assert!(page.find("</dl>").unwrap() < section, "below the facts: {page}");
+    assert!(section < page.find("<form").unwrap(), "above the form: {page}");
+    for shown in [
+        "PKT-GATE: approve the <strong>deploy</strong>",
+        "PKT-HELD: deploy <strong>prod</strong>",
+        "PKT-COMMENT: checked <em>twice</em>",
+        "<h3>Description</h3>",
+        "<input type=\"checkbox\" disabled checked>",
+        "<table>",
+        "&lt;script&gt;alert(1)&lt;/script&gt;",
+        "[image: PIXEL]",
+        "\\u202ertl",
+    ] {
+        assert!(page.contains(shown), "{shown}: {page}");
+    }
+    for (tag, count) in [("<script", 1), ("<form", 1), ("<button", 1), ("name=\"approval\"", 1)] {
+        assert_eq!(page.matches(tag).count(), count, "{tag}: {page}");
+    }
+    for never in ["href=\"javascript", "<img", "evil.example/p.png\"", "src=", "\u{202e}"] {
+        assert!(!page.contains(never), "{never}: {page}");
+    }
+    let (status, _, posted) = post_approval(&server, &ids.human, &signed);
+    assert_eq!(status, 200, "{posted}");
+    assert_eq!(shown_on_host(&server, &ids.human)["status"], "closed");
+
+    // A playbook gate: its held step and that step's decision record, the run with its comments, the earlier
+    // steps in order and their decision record; never a later step or a related issue.
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.packet_gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let page = &signed.page;
+    for shown in ["HELD-ADR-PKT", "ACCEPT-PKT", "EVIDENCE-PKT", "SCORE-PKT", "<h3>Acceptance criteria</h3>"] {
+        assert!(page.contains(shown), "{shown}: {page}");
+    }
+    let at = |s: &str| page.find(s).unwrap_or_else(|| panic!("{s}: {page}"));
+    // HELD-ADR-PKT holds ADR-PKT: the decide step's record is the paragraph of its own.
+    assert!(
+        at("REQ-PKT <strong>bold</strong>") < at("DESIGN-PKT") && at("DESIGN-PKT") < at("<p>ADR-PKT</p>"),
+        "{page}"
+    );
+    assert!(at(&format!("under <code>{}.decide</code>", ids.packet_run)) < at("<p>ADR-PKT</p>"), "{page}");
+    assert!(at(&format!("\">Run</span> <code>{}</code>", ids.packet_run)) < at("REQ-PKT"), "{page}");
+    for never in ["FUTURE-PKT", "RELATED-PKT"] {
+        assert!(!page.contains(never), "{never}: {page}");
+    }
+
+    // A description longer than a packet shows: its first 16 KiB, and where to read the rest.
+    let signed = approve_flow(&server, &github, "alice", "proj", &ids.big_gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let notice = format!("Shown: the first 16 KiB of 17 KiB. Full text: <code>bd show {}</code>.", ids.big_task);
+    assert!(signed.page.contains(&notice), "{}", signed.page);
+    assert!(!signed.page.contains("TAIL-PKT"), "{}", signed.page);
+}
+
+#[test]
 fn agent_kind_grants_and_denied_accounts_cannot_approve_gates() {
     let github = FakeGithub::start();
     github.set_id("mallory", 4242);
@@ -11201,6 +11326,7 @@ fn agent_kind_grants_and_denied_accounts_cannot_approve_gates() {
             assert!(!signed.page.contains(told), "{login}: nothing of the gate ({told}): {}", signed.page);
         }
         assert!(!signed.has_form() && cookie_line(&signed.headers, "__Secure-bd_gate_").is_none(), "{login}");
+        no_packet(login, &signed.page);
     }
     assert_eq!(shown_on_host(&server, &ids.human)["status"], "open");
     let (approved, refused) = approvals_counted(&server, &ops);
@@ -11227,6 +11353,7 @@ fn an_authorizer_decides_who_approves_gates_and_must_allow_people() {
     let signed = approve_flow(&server, &github, "alice", "proj", &ids.human);
     assert_eq!(signed.status, 403, "{}", signed.page);
     assert!(!signed.page.contains(&ids.human), "{}", signed.page);
+    no_packet("authorizer refusal", &signed.page);
     let asked = std::fs::read_to_string(root.join("requests.log")).unwrap();
     for told in ["\"event\":\"sign_in\"", "\"workspace\":\"proj\"", "\"client\":null"] {
         assert!(asked.contains(told), "{told}: {asked}");
@@ -11256,6 +11383,7 @@ fn approvers_narrow_who_may_approve_a_gate() {
     assert_eq!(signed.status, 403, "{}", signed.page);
     assert!(signed.page.contains("Only github:carol can approve it"), "{}", signed.page);
     assert!(!signed.has_form());
+    no_packet("alice on carol's gate", &signed.page);
 
     // The same holds for tokens: a human admin token of someone else may not resolve it; carol's may.
     let out = ops.run(&["gate", "resolve", &ids.carol]);
@@ -11303,6 +11431,8 @@ fn gate_pages_tell_nothing_before_sign_in() {
     for (ws, id, _) in cases {
         github.next("alice", 0);
         let (first, choose) = gate_begin(&server, ws, id);
+        no_packet(&format!("{ws}/{id} before sign-in"), &first.2);
+        no_packet(&format!("{ws}/{id} at the chooser"), &choose.2);
         let to = location(&first.1);
         let shape = (first.0, names(&first.1), to[..to.find("flow=").unwrap()].to_string());
         assert_eq!(choose.0, 302, "{ws}/{id}: {}", choose.2);
@@ -11322,8 +11452,10 @@ fn gate_pages_tell_nothing_before_sign_in() {
         if signed.has_form() {
             forms += 1;
             assert_eq!((*ws, *id), ("proj", ids.human.as_str()));
+            assert!(signed.page.contains("PKT-GATE"), "{}", signed.page);
         } else {
             assert_eq!(signed.status, 404, "{ws}/{id}: {}", signed.page);
+            no_packet(&format!("{ws}/{id}"), &signed.page);
         }
     }
     assert_eq!(forms, 1);
@@ -11339,6 +11471,7 @@ fn approvals_refuse_foreign_posts_replays_and_resolved_gates() {
     let url = gate_url(&server, "proj", gate);
     let signed = approve_flow(&server, &github, "alice", "proj", gate);
     assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("Approval packet") && signed.page.contains("SPARE-PKT 1"), "{}", signed.page);
     let body = format!("approval={}", signed.approval());
     let cookie = signed.cookie();
 
@@ -11374,6 +11507,7 @@ fn approvals_refuse_foreign_posts_replays_and_resolved_gates() {
     let signed = approve_flow(&server, &github, "alice", "proj", gate);
     assert_eq!(signed.status, 409, "{}", signed.page);
     assert!(signed.page.contains("Already resolved") && !signed.has_form(), "{}", signed.page);
+    no_packet("resolved", &signed.page);
 
     // Resolved between the page and the approval.
     let gate = &ids.spares[1];
@@ -11401,6 +11535,7 @@ fn approvals_refuse_foreign_posts_replays_and_resolved_gates() {
     let signed = approve_flow(&server, &github, "alice", "proj", &ids.unarmed);
     assert_eq!(signed.status, 409, "{}", signed.page);
     assert!(signed.page.contains("not ready to approve") && !signed.has_form(), "{}", signed.page);
+    no_packet("unarmed", &signed.page);
 
     // Cancelled at the provider: a page of this server's, no redirect.
     github.next("alice", 0);
@@ -11410,6 +11545,7 @@ fn approvals_refuse_foreign_posts_replays_and_resolved_gates() {
     assert_eq!(signed.status, 403, "{}", signed.page);
     assert!(signed.headers.get("location").is_none());
     assert!(signed.page.contains("cancelled") && !signed.has_form(), "{}", signed.page);
+    no_packet("cancelled", &signed.page);
     assert_eq!(ops.json(&["gate", "show", &ids.human])["status"], "open");
 }
 

@@ -322,7 +322,7 @@ impl FakeGates {
 }
 
 impl Gates for FakeGates {
-    fn find(&self, _: &str, _: &str) -> Result<Found, bd_core::Error> {
+    fn find(&self, _: &str, _: &str, _: &Approver<'_>) -> Result<Found, bd_core::Error> {
         Ok(self.found.clone())
     }
 

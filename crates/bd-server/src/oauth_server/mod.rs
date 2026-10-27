@@ -11,6 +11,7 @@ pub mod authorize;
 pub mod cimd;
 pub mod clients;
 pub mod form;
+pub mod markdown;
 pub mod pages;
 pub mod token;
 

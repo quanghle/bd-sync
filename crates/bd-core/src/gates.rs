@@ -1179,6 +1179,8 @@ impl WriteCtx<'_> {
     }
 }
 
+pub mod packet;
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -64,6 +64,19 @@ pub struct GateInfo {
     pub holds: Vec<(String, String, String)>,
     /// The run or parent it belongs to: id and title.
     pub part_of: Option<(String, String)>,
+    /// The approval packet (`bd_core::gates::packet`), read with the gate
+    /// only when it is open and armed and the approver [`Gates::find`] was
+    /// given may open it; None otherwise.
+    pub packet: Option<bd_core::gates::packet::Packet>,
+}
+
+/// Who signed in to approve a gate, as [`Gates::find`] checks it: the
+/// account's actor and, for an OIDC account, the verified reference of its
+/// identity (`auth::Identity::oidc_approver`).
+#[derive(Clone, Copy, Debug)]
+pub struct Approver<'a> {
+    pub actor: &'a str,
+    pub oidc_approver: Option<&'a str>,
 }
 
 /// What came of an approval.
@@ -84,8 +97,11 @@ pub enum Approved {
 
 /// The server's gates, as approvals need them.
 pub trait Gates: Sync {
-    /// The gate `gate` (an exact id) of `workspace`.
-    fn find(&self, workspace: &str, gate: &str) -> Result<Found, Error>;
+    /// The gate `gate` (an exact id) of `workspace`. `approver` is the
+    /// person whose eligibility (`bd_core::policy::approved_by`, on an open,
+    /// armed gate) decides whether the approval packet is read; the answer is
+    /// otherwise the same for anyone.
+    fn find(&self, workspace: &str, gate: &str, approver: &Approver<'_>) -> Result<Found, Error>;
     /// Resolve it as `actor`, a person, in one transaction that checks it
     /// again: still a human gate, open, armed, and the person one who may
     /// open it. `oidc_approver` is the verified reference of the OIDC account
@@ -316,7 +332,8 @@ pub(super) fn signed_in(
     // From the identity the provider proved; never logged or shown.
     let oidc_approver = user.oidc_approver();
     let found = if (cx.workspace_exists)(workspace) {
-        match cx.gates.find(workspace, gate) {
+        let approver = Approver { actor: &actor, oidc_approver: oidc_approver.as_deref() };
+        match cx.gates.find(workspace, gate, &approver) {
             Ok(found) => found,
             Err(Error::Busy(_) | Error::Locked(_)) => {
                 return refusal(503, "The workspace is busy. Try again in a moment.");
@@ -384,6 +401,7 @@ pub(super) fn signed_in(
         actor: &actor,
         id: &id,
         action: &action,
+        packet: info.packet.as_ref(),
     });
     *fresh = Some(set_gate_cookie(cx.issuer, workspace, gate, &suffix, &value, STEP_TTL));
     let approval = Approval {

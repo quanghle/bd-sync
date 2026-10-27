@@ -697,6 +697,53 @@ fn github_sync(ws: &mut Ws) {
     ws.write("sync", None, |tx| tx.github_apply(&apply, &cfg));
 }
 
+/// The approval packets of a playbook gate (its held step, the run, the
+/// same-run prerequisites, their decision records and comments) and of a
+/// plain human gate (its held work and parent).
+fn approval_packets(ws: &mut Ws) {
+    let run = ws.create(container("Run", "run", None));
+    let req = ws.create(NewIssue { description: "Requirements".into(), ..child("Requirements", &run) });
+    let decide = ws.create(NewIssue { design: "Design".into(), ..child("Decide", &run) });
+    let build = ws.create(NewIssue { notes: "Notes".into(), ..child("Build", &run) });
+    let decision = |title: &str, parent: &str| NewIssue {
+        issue_type: Some("decision".into()),
+        design: format!("{title} design"),
+        ..child(title, parent)
+    };
+    ws.create(decision("ADR", &decide));
+    ws.create(decision("Build ADR", &build));
+    let plain = ws.create(NewIssue::titled("Plain parent"));
+    let task = ws.create(NewIssue { description: "Task".into(), ..child("Task", &plain) });
+    let gate = |blocks: &str, parent: &str| NewGate {
+        spec: GateSpec::new(GateKind::Human),
+        blocks: vec![blocks.to_string()],
+        title: None,
+        description: "Approve".into(),
+        assignee: None,
+        parent: Some(parent.to_string()),
+        priority: None,
+        ephemeral: false,
+    };
+    let (run_gate, plain_gate) = ws.write("alice", None, |tx| {
+        tx.add_dependency(&decide, &req, DepType::Blocks, None)?;
+        tx.add_dependency(&build, &decide, DepType::Blocks, None)?;
+        tx.add_comment(&run, "Score")?;
+        tx.add_comment(&req, "Evidence")?;
+        tx.add_comment(&task, "Context")?;
+        Ok((tx.create_gate(gate(&build, &run))?.id, tx.create_gate(gate(&task, &plain))?.id))
+    });
+    ws.store
+        .read(|r| {
+            for gate in [&run_gate, &plain_gate] {
+                let packet = gates::packet::collect(r.conn(), gate, &gates::view(r.conn(), gate)?.blocks)?;
+                assert!(packet.notes.is_empty(), "{packet:?}");
+                assert_eq!(packet.playbook, *gate == run_gate, "{packet:?}");
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
 /// The commands, then renaming the prefix: every issue, edge, comment,
 /// lease and event moves. Kept out of [`no_statement_is_prepared_again`]:
 /// the rename's `PRAGMA defer_foreign_keys` expires the connection's cached
@@ -819,8 +866,9 @@ fn failures(name: &str, ws: &Ws, statements: &BTreeSet<String>) -> Vec<String> {
 
 #[test]
 fn graph_walks_plan_index_lookups_under_stale_statistics() {
-    let statements = statements_of(walk_the_graph);
+    let mut statements = statements_of(walk_the_graph);
     assert!(statements.len() > 50, "{} statements", statements.len());
+    statements.extend(statements_of(approval_packets));
 
     let mut failures = Vec::new();
     for (name, setup) in [("young", YOUNG), ("grown", GROWN), ("never analyzed", "")] {
@@ -904,6 +952,19 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         assert!(commands.iter().any(|s| s.contains(needle)), "no statement with {needle:?} ran");
     }
     statements.extend(commands);
+    // Approval packets: texts as bounded byte prefixes, prerequisites by their
+    // edges, comments newest first, the run and decision tests as booleans.
+    let packets = statements_of(approval_packets);
+    for needle in [
+        "CAST(substr(CAST(i.description AS BLOB)",
+        "dep_type IN ('blocks','conditional-blocks','waits-for')",
+        "substr(author,1,256)",
+        "json_extract(i.metadata, '$.playbook.role') IS 'run'",
+        "c.issue_type = 'decision'",
+    ] {
+        assert!(packets.iter().any(|s| s.contains(needle)), "no statement with {needle:?} ran");
+    }
+    statements.extend(packets);
 
     let mut failures = Vec::new();
     for (name, ws) in [
@@ -927,7 +988,7 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
 #[test]
 fn no_statement_is_prepared_again() {
     let mut again = BTreeMap::new();
-    for work in [walk_the_graph as fn(&mut Ws), run_the_commands] {
+    for work in [walk_the_graph as fn(&mut Ws), run_the_commands, approval_packets] {
         again.extend(recorded(work).1);
     }
     assert!(again.is_empty(), "{} statements prepared again: {again:#?}", again.len());

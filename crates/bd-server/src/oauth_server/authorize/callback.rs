@@ -1,5 +1,5 @@
 //! Back from the provider: `/oauth/<provider>/callback` (relayed first when posted), then the consent page (or, for
-//! a human gate's approval, its approval page: `gate::signed_in`).
+//! a human gate's approval, its approval page: `gate::signed_in`; for an operation's, `operation::signed_in`).
 
 use std::time::Duration;
 
@@ -46,7 +46,9 @@ pub fn relay(cx: &Ctx<'_>, provider: &str, body: &str) -> Answer {
 /// `GET <issuer>/oauth/<provider>/callback?<query>`: the provider sent the
 /// browser back. Find out who signed in and what the rules or the
 /// authorizer let the account do in the workspace, and ask whether the
-/// client may; or, signed in to approve a human gate, whether to approve it.
+/// client may; or, signed in to approve a human gate or an operation,
+/// whether to approve it. A callback whose flow is an operation's is
+/// recorded once, whichever way it ends (`operation::record`).
 pub fn callback(
     cx: &Ctx<'_>,
     provider: &str,
@@ -55,66 +57,120 @@ pub fn callback(
     cookies: &str,
 ) -> (Answer, Vec<String>) {
     let mut fresh = None;
-    let answer = signed_in(cx, provider, query, browser, cookies, &mut fresh);
-    // The flow's cookie has served: gone, whatever came of it.
+    // The flow, opened first whether or not it has expired: an operation's is recorded however it ends.
+    let opened = operation::opened_flow(cx, query, cookies);
+    let op_flow = opened.as_ref().and_then(|p| Some((p.then.operation()?, p.at.as_ref()?.provider.clone())));
+    let answer = match common(cx, provider, query, browser, opened) {
+        Ok(common) => signed_in(cx, provider, common, cookies, &mut fresh),
+        Err(early) => {
+            if let Some((flow, started_with)) = &op_flow {
+                let who = operation::Who::provider_only(started_with);
+                operation::record(early.outcome, &who, &flow.workspace, &flow.op, &flow.issue, early.detail);
+            }
+            early.answer
+        }
+    };
+    // The flow's cookie has served: gone, whatever came of it; and an operation's request cookies with it.
     let state = form::decode(query).unwrap_or_default().into_iter().find(|(k, _)| k == "state").map(|(_, v)| v);
     let gone = state.map(|state| set_flow_cookie(cx.issuer, &state, "", Duration::ZERO));
-    (answer, fresh.into_iter().chain(gone).collect())
+    let requests = op_flow.map(|(f, _)| clear_request_cookies(cx.issuer, &f.digest, f.parts)).unwrap_or_default();
+    (answer, fresh.into_iter().chain(gone).chain(requests).collect())
 }
 
-/// [`callback`]'s answer. Once the person signed in, the browser gets a
-/// cookie of the consent's own (`fresh`, its `Set-Cookie`), which the
-/// consent is bound to: a cookie known or planted before the sign-in is good
-/// for nothing after it, and other sign-ins under way in the same browser
-/// keep theirs.
-fn signed_in(
+/// What the checks every callback passes found: the flow and the settings.
+struct Common {
+    then: Then,
+    verifier: String,
+    nonce: String,
+    error: Option<String>,
+    code: Option<String>,
+    sign_in: oauth::SignIn,
+    oauth_config: crate::oauth::OauthConfig,
+}
+
+/// How a callback ended before it was dispatched: the answer, and for an
+/// operation's flow the outcome and detail to record.
+struct Early {
+    answer: Answer,
+    outcome: operation::Outcome,
+    detail: &'static str,
+}
+
+/// The checks every callback passes, in order, before it goes on to what
+/// its flow (`opened`, as the browser brought it back) is for.
+fn common(
     cx: &Ctx<'_>,
     provider: &str,
     query: &str,
     browser: Option<&str>,
-    cookies: &str,
-    fresh: &mut Option<String>,
-) -> Answer {
+    opened: Option<Pending>,
+) -> Result<Common, Early> {
+    use operation::Outcome::{Failed, Refused};
+    let early = |answer, outcome, detail| Early { answer, outcome, detail };
     let pairs = form::decode(query).unwrap_or_default();
     let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
     // The flow the browser carries for the state the provider sent back; a provider's code is used once, so a
     // flow brought back twice gets no second account.
     let state = get("state").unwrap_or_default();
-    let pending =
-        flow_cookie(cx.issuer, cookies, state).and_then(|sealed| lock(cx.flows).sealer.open(AT_PROVIDER, sealed));
-    let pending = pending.filter(|p| p.until > now_millis() && p.at.as_ref().is_some_and(|at| at.state == state));
+    let pending = opened.filter(|p| p.until > now_millis() && p.at.as_ref().is_some_and(|at| at.state == state));
     let Some(Pending { then, browser: started_in, at: Some(at), .. }) = pending else {
-        return refused(400, "This sign-in has expired. Start again from the application.");
+        let answer = refused(400, "This sign-in has expired. Start again from the application.");
+        return Err(early(answer, Refused, "flow expired"));
     };
     let AtProvider { provider: started_with, verifier, nonce, .. } = at;
     if browser.map(auth::hash).as_deref() != Some(started_in.as_str()) {
-        return refused(400, "This sign-in started in a different browser. Start again from the application.");
+        let answer = refused(400, "This sign-in started in a different browser. Start again from the application.");
+        return Err(early(answer, Refused, "different browser"));
     }
     if started_with != provider {
-        return refused(400, "This sign-in came back from another provider. Start again from the application.");
+        let answer = refused(400, "This sign-in came back from another provider. Start again from the application.");
+        return Err(early(answer, Refused, "another provider"));
     }
     let (sign_in, oauth_config) = match oauth_settings(cx) {
         Ok(s) => s,
-        Err(answer) => return answer,
+        Err(answer) => return Err(early(answer, Failed, "sign-in settings unavailable")),
     };
     // Mix-up: an OIDC provider's answer names it (RFC 9207), where it says it does, and never another one.
     if let Some(oidc) = sign_in.oidc(provider) {
-        let required = oidc.metadata().is_ok_and(|md| md.iss_parameter);
         let ok = match get("iss") {
             Some(iss) => iss == oidc.issuer,
-            None => !required,
+            None => !oidc.metadata().is_ok_and(|md| md.iss_parameter),
         };
         if !ok {
             tracing::warn!(target: "bd::serve", %provider, iss = ?get("iss"), "a sign-in came back naming another issuer");
-            return refused(400, "This sign-in came back from another provider. Start again from the application.");
+            let answer =
+                refused(400, "This sign-in came back from another provider. Start again from the application.");
+            return Err(early(answer, Refused, "another issuer"));
         }
     }
+    let (error, code) = (get("error").map(String::from), get("code").map(String::from));
+    Ok(Common { then, verifier, nonce, error, code, sign_in, oauth_config })
+}
+
+/// [`callback`]'s answer once the checks every callback passes passed.
+/// Once the person signed in, the browser gets a cookie of the consent's
+/// own (`fresh`, its `Set-Cookie`), which the consent is bound to: a cookie
+/// known or planted before the sign-in is good for nothing after it, and
+/// other sign-ins under way in the same browser keep theirs.
+fn signed_in(cx: &Ctx<'_>, provider: &str, common: Common, cookies: &str, fresh: &mut Option<String>) -> Answer {
+    let Common { then, verifier, nonce, error, code, sign_in, oauth_config } = common;
+    let get = |name: &str| match name {
+        "error" => error.as_deref(),
+        "code" => code.as_deref(),
+        _ => None,
+    };
     let requested = match then {
         Then::Authorize { query } => query,
         Then::Gate { workspace, gate } => {
             let back =
                 gate::Returned { provider, error: get("error"), code: get("code"), verifier: &verifier, nonce: &nonce };
             return gate::signed_in(cx, &sign_in, &back, &workspace, &gate, fresh);
+        }
+        then @ Then::Operation { .. } => {
+            let back =
+                gate::Returned { provider, error: get("error"), code: get("code"), verifier: &verifier, nonce: &nonce };
+            let Some(flow) = then.operation() else { return refused(400, MALFORMED) };
+            return operation::signed_in(cx, &sign_in, &back, &flow, cookies, fresh);
         }
     };
     let request = match request_of(cx, &oauth_config, &requested) {

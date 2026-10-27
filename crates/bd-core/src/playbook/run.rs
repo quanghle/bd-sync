@@ -189,6 +189,12 @@ pub struct DiscardOptions {
     /// steps (recorded in each `deleted` event; see [`crate::policy`]).
     pub take_over: bool,
     pub dry_run: bool,
+    /// Why, recorded in each `deleted` event ([`DeleteOptions::reason`]).
+    pub reason: Option<String>,
+    /// How, recorded in each `deleted` event ([`DeleteOptions::via`]).
+    pub via: Option<String>,
+    /// Who asked, recorded in each `deleted` event ([`DeleteOptions::requested_by`]).
+    pub requested_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -534,6 +540,13 @@ pub fn runs(conn: &Connection, q: &RunsQuery, now: Timestamp) -> Result<Vec<RunS
         .collect())
 }
 
+/// Every issue discarding `run` deletes: the run, then each issue below it
+/// in walk order. Refused, as a discard is, when `run` is not a run.
+pub fn run_issues(conn: &Connection, run: &str) -> Result<Vec<Issue>> {
+    let root = require_run(conn, run)?;
+    Ok(std::iter::once(root).chain(walk(conn, run)?.into_iter().map(|(_, i)| i)).collect())
+}
+
 fn require_run(conn: &Connection, id: &str) -> Result<Issue> {
     let issue = issues::require(conn, id)?;
     if role_of(&issue) != Some(Role::Run) {
@@ -744,9 +757,7 @@ impl WriteCtx<'_> {
 
     /// Delete a run and every issue in it.
     pub fn discard_run(&mut self, run: &str, opts: &DiscardOptions) -> Result<DeleteOutcome> {
-        let root = require_run(self.conn(), run)?;
-        let all: Vec<Issue> =
-            std::iter::once(root).chain(walk(self.conn(), run)?.into_iter().map(|(_, i)| i)).collect();
+        let all = run_issues(self.conn(), run)?;
         // Other actors' live claims, on the run itself or a step, come first.
         let taken = self.check_claim_overrides(all.iter().cloned(), opts.take_over, &format!("discarding {run}"))?;
         let active: Vec<String> = all
@@ -762,7 +773,15 @@ impl WriteCtx<'_> {
         }
         let ids: Vec<String> = all.into_iter().map(|i| i.id).collect();
         // `force` here only drops edges from outside the run; claims keep the caller's answer.
-        let delete = DeleteOptions { cascade: false, force: true, take_over: opts.take_over, dry_run: opts.dry_run };
+        let delete = DeleteOptions {
+            cascade: false,
+            force: true,
+            take_over: opts.take_over,
+            dry_run: opts.dry_run,
+            reason: opts.reason.clone(),
+            via: opts.via.clone(),
+            requested_by: opts.requested_by.clone(),
+        };
         self.delete_issues(&ids, &delete)
     }
 }

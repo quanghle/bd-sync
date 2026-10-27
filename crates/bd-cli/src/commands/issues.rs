@@ -138,6 +138,7 @@ pub fn exec_close(tx: &mut WriteCtx<'_>, a: &CloseArgs) -> Result<Out> {
         guard: guard_from(&a.guard)?,
         token: a.token,
         via: None,
+        requested_by: None,
     };
     let ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
     // The next issue's query and --ttl, parsed before anything is written
@@ -385,7 +386,13 @@ pub fn exec_undefer(tx: &mut WriteCtx<'_>, a: &IdArg) -> Result<Out> {
 
 pub fn exec_delete(tx: &mut WriteCtx<'_>, a: &DeleteArgs) -> Result<Out> {
     let ids = a.ids.iter().map(|raw| tx.resolve_id(raw)).collect::<Result<Vec<_>>>()?;
-    let opts = DeleteOptions { cascade: a.cascade, force: a.force, take_over: a.take_over, dry_run: a.dry_run };
+    let opts = DeleteOptions {
+        cascade: a.cascade,
+        force: a.force,
+        take_over: a.take_over,
+        dry_run: a.dry_run,
+        ..Default::default()
+    };
     let r = tx.delete_issues(&ids, &opts)?;
     let verb = if r.dry_run { "Would delete" } else { "✓ Deleted" };
     let mut out = Out::new(&r).line(format!("{verb} {} issue(s): {}", r.deleted.len(), r.deleted.join(", ")));

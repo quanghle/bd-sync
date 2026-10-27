@@ -127,21 +127,11 @@ pub fn gate_id_ok(id: &str) -> bool {
 }
 
 fn not_found() -> Answer {
-    Answer::Page(pages::notice(404, "Not found", "There is nothing to approve here."))
+    approval_not_found()
 }
 
 fn refusal(status: u16, why: &str) -> Answer {
     Answer::Page(pages::notice(status, TITLE, why))
-}
-
-/// Sign-in settings that approve gates: `[oauth]` with a provider people
-/// sign in with in a browser; else not found.
-fn settings(cx: &Ctx<'_>) -> Result<SignIn, Answer> {
-    match oauth::load(cx.root) {
-        Ok(Some(s)) if s.oauth.is_some() && !s.browser_providers().is_empty() => Ok(s),
-        Ok(_) | Err(Error::Invalid(_)) => Err(not_found()),
-        Err(e) => Err(internal(&e, "reading auth.toml for a gate's approval")),
-    }
 }
 
 /// `GET <public url>/w/<workspace>/gates/<gate>`: on to the chooser, with

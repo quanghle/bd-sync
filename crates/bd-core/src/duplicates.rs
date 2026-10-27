@@ -181,6 +181,7 @@ impl WriteCtx<'_> {
                 guard: Guard::default(),
                 token: None,
                 via: None,
+                requested_by: None,
             },
         )?;
         Ok(CloseAsOutcome {

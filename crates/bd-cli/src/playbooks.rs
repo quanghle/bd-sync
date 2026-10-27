@@ -722,7 +722,14 @@ fn cmd_compact(app: &mut App, a: &CompactArgs) -> Result<()> {
 fn cmd_discard(app: &mut App, a: &DiscardArgs) -> Result<()> {
     let r = app.write("playbook.discard", |tx| {
         let id = tx.resolve_id(&a.id)?;
-        tx.discard_run(&id, &DiscardOptions { force: a.force, take_over: a.take_over, dry_run: a.dry_run })
+        let opts = DiscardOptions {
+            force: a.force,
+            take_over: a.take_over,
+            dry_run: a.dry_run,
+            reason: a.reason.clone(),
+            ..Default::default()
+        };
+        tx.discard_run(&id, &opts).map_err(|e| crate::approval_link::note_discard(tx, &id, a, e))
     })?;
     let verb = if r.dry_run { "Would discard" } else { "✓ Discarded" };
     let mut out = Out::new(&r).line(format!("{verb} {} issue(s): {}", r.deleted.len(), r.deleted.join(", ")));

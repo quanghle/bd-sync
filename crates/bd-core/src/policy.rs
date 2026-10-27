@@ -208,8 +208,8 @@ enum Hold {
 /// Which open human gates are shut to the caller (see [`WriteCtx::shut`]).
 type Shut<'a> = &'a dyn Fn(&Issue) -> bool;
 
-/// Shut open human gates `id` depends on through its own `blocks` edges.
-fn human_gates_on(conn: &rusqlite::Connection, id: &str, shut: Shut<'_>) -> Result<Option<String>> {
+/// Open gates (of any condition) `id` depends on through its own `blocks` edges, in id order.
+fn open_gates_on(conn: &rusqlite::Connection, id: &str) -> Result<Vec<Issue>> {
     let sql = format!(
         "SELECT {ISSUE_COLUMNS} FROM dependencies d
          CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = d.depends_on_id
@@ -219,7 +219,57 @@ fn human_gates_on(conn: &rusqlite::Connection, id: &str, shut: Shut<'_>) -> Resu
     );
     let mut stmt = conn.prepare_cached(&sql)?;
     let gates = stmt.query_map([id], issue_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(gates.into_iter().find(|g| shut(g)).map(|g| g.id))
+    Ok(gates)
+}
+
+/// Shut open human gates `id` depends on through its own `blocks` edges.
+fn human_gates_on(conn: &rusqlite::Connection, id: &str, shut: Shut<'_>) -> Result<Option<String>> {
+    Ok(open_gates_on(conn, id)?.into_iter().find(|g| shut(g)).map(|g| g.id))
+}
+
+/// Every open human gate in the way of closing (with `force`) or deleting
+/// the live issues among `ids`, whoever the caller: each that is one, the
+/// gates on its own and its live ancestors' `blocks` edges (up to a terminal
+/// ancestor), the gates below it in the hierarchy, and those on its live
+/// descendants' `blocks` edges. Deduplicated, in id order.
+///
+/// It is the set the hold walks look through: for any policy `p`,
+/// `human_hold` with `shut` = open human gate not [`may_open`] by `p` finds
+/// a hold iff some gate returned here is not [`may_open`] by `p`. Read only
+/// on a refusal's path, so a close that succeeds pays nothing for it.
+pub fn gates_in_the_way(conn: &rusqlite::Connection, ids: &[String]) -> Result<Vec<Issue>> {
+    fn add(found: &mut BTreeMap<String, Issue>, gates: Vec<Issue>) {
+        for g in gates.into_iter().filter(is_open_human_gate) {
+            found.entry(g.id.clone()).or_insert(g);
+        }
+    }
+    let mut found: BTreeMap<String, Issue> = BTreeMap::new();
+    for id in ids {
+        let Some(issue) = issues::get(conn, id)? else { continue };
+        if issue.status.is_terminal() {
+            continue;
+        }
+        add(&mut found, vec![issue]);
+        let mut seen = HashSet::new();
+        let mut cur = id.clone();
+        loop {
+            add(&mut found, open_gates_on(conn, &cur)?);
+            let Some(p) = graph::parent_of(conn, &cur)? else { break };
+            if !seen.insert(p.clone()) || issues::get(conn, &p)?.is_none_or(|i| i.status.is_terminal()) {
+                break;
+            }
+            cur = p;
+        }
+        for d in issues::descendants(conn, id)? {
+            let live = !d.status.is_terminal();
+            let d_id = d.id.clone();
+            add(&mut found, vec![d]);
+            if live {
+                add(&mut found, open_gates_on(conn, &d_id)?);
+            }
+        }
+    }
+    Ok(found.into_values().collect())
 }
 
 /// The shut human gate holding `id` back: through `id`'s own `blocks` edges,
@@ -587,9 +637,26 @@ impl WriteCtx<'_> {
         }
         // Without force, a close that gets here is not held back by anything.
         if force && let Some(hold) = human_hold(self.conn(), issue, &|g| self.shut(g))? {
-            return Err(self.gate_refusal(&issue.id, &hold, "close it")?);
+            let refusal = self.gate_refusal(&issue.id, &hold, "close it")?;
+            if self.approvable(std::slice::from_ref(&issue.id), issue.issue_type == GATE_TYPE)? {
+                return Err(refusal.approvable());
+            }
+            return Err(refusal);
         }
         Ok(())
+    }
+
+    /// Whether a refusal to close (`target_gate`: the target is a gate) or
+    /// delete `ids` past human gates is one a person could approve in a
+    /// browser: the target is not a gate, and every open human gate in the
+    /// way ([`gates_in_the_way`]) names a valid approver list (or none), so
+    /// some person may open each. Called only once the hold is found.
+    fn approvable(&self, ids: &[String], target_gate: bool) -> Result<bool> {
+        if target_gate {
+            return Ok(false);
+        }
+        let gates = gates_in_the_way(self.conn(), ids)?;
+        Ok(!gates.is_empty() && gates.iter().all(|g| gates::approvers_of(g).is_none_or(|l| !l.is_empty())))
     }
 
     /// Updating `old` to `new`, moving it out from under `moved_from` (its
@@ -708,10 +775,15 @@ impl WriteCtx<'_> {
         if !self.gates_limited() {
             return Ok(());
         }
-        for id in ids {
+        let ids: Vec<String> = ids.into_iter().cloned().collect();
+        for id in &ids {
             let Some(issue) = issues::get(self.conn(), id)? else { continue };
             if let Some(hold) = human_hold(self.conn(), &issue, &|g| self.shut(g))? {
-                return Err(self.gate_refusal(id, &hold, "delete it")?);
+                let refusal = self.gate_refusal(id, &hold, "delete it")?;
+                if self.approvable(&ids, false)? {
+                    return Err(refusal.approvable());
+                }
+                return Err(refusal);
             }
         }
         Ok(())

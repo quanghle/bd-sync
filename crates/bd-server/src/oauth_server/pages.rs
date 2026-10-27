@@ -67,6 +67,7 @@ dd{margin:0;min-width:0;overflow-wrap:break-word}
 .note-line{display:block}
 .note-line .note{display:inline}
 .callout{display:flex;gap:10px;align-items:flex-start;margin:0 0 20px}
+.reason{margin:0;padding:0 0 0 12px;white-space:pre-wrap;overflow-wrap:anywhere}
 .callout svg{width:18px;height:18px;flex:none;margin-top:2px}
 .actions{display:flex;flex-wrap:wrap;align-items:center;gap:12px 24px;margin:0}
 button,.button{appearance:none;border:0;border-radius:999px;display:inline-flex;align-items:center;justify-content:center;
@@ -371,6 +372,167 @@ in this browser.</span></p>\n",
     );
     let parts = Parts { actions: &actions, form_action: "'self'", script: Some(ARMING), ..Parts::default() };
     page(200, "Approve a gate", &body, parts)
+}
+
+/// The most issues the operation approval page lists as deleted by a discard.
+pub const MAX_DELETES: usize = 50;
+
+/// What the approval page of a close or discard that human gates refused shows.
+pub struct ApproveOperation<'a> {
+    pub workspace: &'a str,
+    /// The operation, as the page names it: `close` or `discard`.
+    pub op_label: &'a str,
+    /// The issue closed, or the run discarded: its id, title and status.
+    pub issue: &'a str,
+    pub title: &'a str,
+    pub status: &'a str,
+    /// The run or parent the issue belongs to: id and title.
+    pub part_of: Option<(&'a str, &'a str)>,
+    /// The reason the requester gave, as sealed: shown with its whitespace.
+    pub reason: Option<&'a str>,
+    /// Who asked for it (the actor `bd serve` resolved), and when
+    /// (milliseconds since the epoch).
+    pub requester: &'a str,
+    pub at: i64,
+    /// The close's outcome is failed; the operation was forced.
+    pub failed: bool,
+    pub force: bool,
+    /// The open human gates it gets past: id, title and approvers (None:
+    /// any person; an empty list: a stored list that is not valid).
+    pub gates: &'a [(String, String, Option<Vec<String>>)],
+    /// For a discard, the issues it deletes (id and title, at most
+    /// [`MAX_DELETES`] shown) and how many there are in all.
+    pub deletes: Option<(&'a [(String, String)], usize)>,
+    /// The provider the person signed in with, as the page names it.
+    pub provider: &'a str,
+    /// The actor the operation is recorded as done by.
+    pub actor: &'a str,
+    /// The approval's id, posted back with it.
+    pub id: &'a str,
+    /// Where the approval is posted: the link's path, without its query.
+    pub action: &'a str,
+}
+
+/// The page asking a person to approve a close or discard that open human
+/// gates refused: what it does, to what, at whose request and for what
+/// reason, and the gates it gets past, with one button. As on the gate
+/// approval page, every value is shown escaped, the form posts only to this
+/// server and [`ARMING`] keeps a double click from sending it.
+pub fn approve_operation(a: &ApproveOperation<'_>) -> Page {
+    let op = shown(a.op_label, MAX_TITLE);
+    let issue = shown_id(a.issue);
+    let title = shown(a.title, MAX_TITLE);
+    let actor = shown(a.actor, MAX_TITLE);
+    let requester = shown(a.requester, MAX_TITLE);
+    let workspace = shown(a.workspace, MAX_TITLE);
+    let part_of = a.part_of.map_or(String::new(), |(id, title)| {
+        format!("<div><dt>Part of</dt><dd><code>{}</code> {}</dd></div>\n", shown_id(id), shown(title, MAX_TITLE))
+    });
+    let reason = match a.reason {
+        Some(reason) => format!("<blockquote class=\"reason\">{}</blockquote>", shown_reason(reason)),
+        None => "No reason given".to_string(),
+    };
+    let discard = a.deletes.is_some();
+    let mut options = Vec::new();
+    if a.force {
+        options.push(if discard {
+            "Forced: the run need not be finished"
+        } else {
+            "Forced past open work and blockers"
+        });
+    }
+    if a.failed {
+        options.push("Closed as failed");
+    }
+    let options = if options.is_empty() { "None".to_string() } else { options.join("; ") };
+    let mut gates = String::new();
+    for (id, title, approvers) in a.gates {
+        let approvers = match approvers.as_deref() {
+            None => "any person".to_string(),
+            Some([]) => "no valid approvers".to_string(),
+            Some(list) => list.iter().map(|a| shown(a, MAX_TITLE)).collect::<Vec<_>>().join(", "),
+        };
+        gates.push_str(&format!(
+            "<span class=\"note-line\"><code>{}</code> {} <span class=\"note\">approvers: {approvers}</span></span>",
+            shown_id(id),
+            shown(title, MAX_TITLE),
+        ));
+    }
+    if a.gates.is_empty() {
+        gates.push_str("None");
+    }
+    let deletes = a.deletes.map_or(String::new(), |(listed, total)| {
+        let mut out = format!(
+            "<div><dt>Deletes</dt><dd>Deletes {total} issue{}, with no undo",
+            if total == 1 { "" } else { "s" }
+        );
+        let listed = &listed[..listed.len().min(MAX_DELETES)];
+        for (id, title) in listed {
+            out.push_str(&format!(
+                "<span class=\"note-line\"><code>{}</code> {}</span>",
+                shown_id(id),
+                shown(title, MAX_TITLE)
+            ));
+        }
+        if total > listed.len() {
+            out.push_str(&format!("<span class=\"note\">and {} more</span>", total - listed.len()));
+        }
+        out.push_str("</dd></div>\n");
+        out
+    });
+    let what = if discard {
+        "It deletes the run and every issue in it, and cannot be undone"
+    } else {
+        "It closes nothing else: not the issue's open children, nor a run's steps"
+    };
+    let body = format!(
+        "<div class=\"link\" aria-hidden=\"true\"><div class=\"avatar\">{MARK}</div></div>\n\
+<h1>Approve the {op} of {issue}?</h1>\n\
+<p class=\"lead\">You're signed in to {provider} as <b>{actor}</b>. <b>{requester}</b> asked for this, and open human \
+gates refused it.</p>\n\
+<dl class=\"facts\">\n\
+<div><dt>Workspace</dt><dd>{workspace}</dd></div>\n\
+<div><dt>Operation</dt><dd>{op}</dd></div>\n\
+<div><dt>Issue</dt><dd><code>{issue}</code> {title} <span class=\"note\">{status}</span></dd></div>\n\
+{part_of}<div><dt>Reason</dt><dd>{reason}</dd></div>\n\
+<div><dt>Requested by</dt><dd>{requester}</dd></div>\n\
+<div><dt>Requested at</dt><dd>{at}</dd></div>\n\
+<div><dt>Options</dt><dd>{options}</dd></div>\n\
+<div><dt>Gets past</dt><dd>{gates}</dd></div>\n\
+{deletes}</dl>\n\
+<p class=\"callout\">{SHIELD}<span>Approving performs exactly this {op}, recorded in {workspace} as done by \
+<b>{actor}</b> at {requester}'s request. It does not resolve the gates. {what}. Work another actor has claimed must \
+be released first. Only approve if you opened this link just now, in this browser.</span></p>\n",
+        provider = shown(a.provider, MAX_TITLE),
+        status = shown(a.status, MAX_TITLE),
+        at = escape(&bd_core::Timestamp(a.at).to_rfc3339()),
+    );
+    let actions = format!(
+        "<form method=\"post\" action=\"{action}\" class=\"actions\">\n\
+<input type=\"hidden\" name=\"approval\" value=\"{id}\">\n\
+<button type=\"submit\" class=\"primary\">Approve</button>\n\
+</form>\n",
+        action = escape(a.action),
+        id = escape(a.id),
+    );
+    let parts = Parts { actions: &actions, form_action: "'self'", script: Some(ARMING), ..Parts::default() };
+    page(200, "Approve an operation", &body, parts)
+}
+
+/// A reason as HTML, escaped as [`shown`] escapes text but whole, with its
+/// newlines and tabs kept (the page shows it pre-wrapped), so that what is
+/// shown is what is recorded.
+fn shown_reason(text: &str) -> String {
+    let printable = bd_cli::io::printable(text);
+    let mut out = String::with_capacity(printable.len());
+    for c in printable.chars() {
+        if super::clients::hidden(c) && c != '\n' && c != '\t' {
+            out.push_str(&format!("\\u{:04x}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    escape(&out)
 }
 
 /// A page telling why there is nothing to approve, or why it cannot be: a
@@ -1090,6 +1252,63 @@ mod tests {
                 }),
             ),
             (
+                "approve-close",
+                "Approving a close that human gates refused",
+                approve_operation(&ApproveOperation {
+                    workspace: "proj",
+                    op_label: "close",
+                    issue: "proj-r1",
+                    title: "Release 1.4",
+                    status: "in_progress",
+                    part_of: None,
+                    reason: Some("  abandoned: superseded by 1.5\n  (see proj-r2)"),
+                    requester: "alice/copilot-1",
+                    at: 1_790_000_000_000,
+                    failed: true,
+                    force: true,
+                    gates: &[(
+                        "proj-r1.gate-ship".to_string(),
+                        "Approve the release".to_string(),
+                        Some(vec!["github:octocat".to_string()]),
+                    )],
+                    deletes: None,
+                    provider: "GitHub",
+                    actor: "github:octocat",
+                    id: "c0ffee",
+                    action: "https://bd.example.com/w/proj/close/proj-r1",
+                }),
+            ),
+            (
+                "approve-discard",
+                "Approving a discard that human gates refused",
+                approve_operation(&ApproveOperation {
+                    workspace: "proj",
+                    op_label: "discard",
+                    issue: "proj-r1",
+                    title: "Release 1.4",
+                    status: "closed",
+                    part_of: None,
+                    reason: None,
+                    requester: "alice/copilot-1",
+                    at: 1_790_000_000_000,
+                    failed: false,
+                    force: false,
+                    gates: &[("proj-r1.gate-ship".to_string(), "Approve the release".to_string(), None)],
+                    deletes: Some((
+                        &[
+                            ("proj-r1".to_string(), "Release 1.4".to_string()),
+                            ("proj-r1.build".to_string(), "Build".to_string()),
+                            ("proj-r1.gate-ship".to_string(), "Approve the release".to_string()),
+                        ],
+                        3,
+                    )),
+                    provider: "GitHub",
+                    actor: "github:octocat",
+                    id: "c0ffee",
+                    action: "https://bd.example.com/w/proj/discard/proj-r1",
+                }),
+            ),
+            (
                 "gate-notice",
                 "A gate already resolved",
                 notice(200, "Already resolved", "This gate was resolved already: there is nothing to approve."),
@@ -1300,6 +1519,100 @@ class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
         assert!(page.html.contains("<dt>Approvers</dt><dd>None valid"), "{}", page.html);
         assert!(page.html.contains("<dt>Holds back</dt><dd>Nothing</dd>"), "{}", page.html);
         assert!(!page.html.contains("<dt>Part of</dt>"), "{}", page.html);
+    }
+
+    /// An operation approval page, every value shown `other`, with `gates`
+    /// and `deletes`.
+    fn operation_page(
+        other: &str,
+        reason: Option<&str>,
+        gates: &[(String, String, Option<Vec<String>>)],
+        deletes: Option<(&[(String, String)], usize)>,
+    ) -> Page {
+        approve_operation(&ApproveOperation {
+            workspace: other,
+            op_label: if deletes.is_some() { "discard" } else { "close" },
+            issue: other,
+            title: other,
+            status: other,
+            part_of: Some((other, other)),
+            reason,
+            requester: other,
+            at: 0,
+            failed: true,
+            force: true,
+            gates,
+            deletes,
+            provider: other,
+            actor: other,
+            id: "c0ffee",
+            action: GATE_ACTION,
+        })
+    }
+
+    #[test]
+    fn the_operation_page_shows_hostile_values_escaped() {
+        let evil = "<script>alert(1)</script>\"'\u{202E}\u{200B}";
+        let gates = [
+            (evil.to_string(), evil.to_string(), Some(vec![evil.to_string(), "github:carol".to_string()])),
+            ("g-2".to_string(), "t".to_string(), Some(vec![])),
+            ("g-3".to_string(), "t".to_string(), None),
+        ];
+        let reason = format!("  {evil}\n\tsecond line  ");
+        let page = operation_page(evil, Some(&reason), &gates, None);
+        assert_eq!(page.status, 200);
+        assert!(!page.html.contains("<script>alert"), "{}", page.html);
+        assert!(!page.html.contains('\u{202E}') && !page.html.contains('\u{200B}'), "{}", page.html);
+        assert!(!page.html.contains(GATE_ACTION), "{}", page.html);
+        let shown = "&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#39;\\u202e\\u200b";
+        assert!(page.html.contains(&format!("<h1>Approve the close of {shown}?</h1>")), "{}", page.html);
+        // The reason keeps its whitespace, in a block that shows it.
+        let quote = format!("<blockquote class=\"reason\">  {shown}\n\tsecond line  </blockquote>");
+        assert!(page.html.contains(&quote), "{}", page.html);
+        assert!(page.html.contains(&format!("approvers: {shown}, github:carol")), "{}", page.html);
+        assert!(page.html.contains("<code>g-2</code> t <span class=\"note\">approvers: no valid approvers"));
+        assert!(page.html.contains("<code>g-3</code> t <span class=\"note\">approvers: any person"));
+        assert!(page.html.contains("Forced past open work and blockers; Closed as failed"), "{}", page.html);
+        assert!(page.html.contains("<dt>Requested at</dt><dd>1970-01-01T00:00:00.000Z</dd>"), "{}", page.html);
+        assert!(page.html.contains("It does not resolve the gates."), "{}", page.html);
+        assert!(!page.html.contains("<dt>Deletes</dt>"), "{}", page.html);
+        // The policy: no framing, a form posting here only, and the one script.
+        assert!(page.csp.contains("frame-ancestors 'none'"), "{}", page.csp);
+        assert!(page.csp.contains("form-action 'self';"), "{}", page.csp);
+        assert_eq!(page.html.matches("<script").count(), 1);
+        assert_eq!(script_of(&page), ARMING);
+        let arming = STANDARD.encode(Sha256::digest(ARMING.as_bytes()));
+        assert!(page.csp.contains(&format!("; script-src 'sha256-{arming}';")), "{}", page.csp);
+        let form = "<form method=\"post\" action=\"https://bd.example.com/w/proj/gates/g&quot;&gt;&lt;x&gt;\" \
+class=\"actions\">\n<input type=\"hidden\" name=\"approval\" value=\"c0ffee\">";
+        assert!(page.html.contains(form), "{}", page.html);
+        let start = page.html.find("<style>").unwrap() + "<style>".len();
+        let end = page.html.find("</style>").unwrap();
+        let hash = STANDARD.encode(Sha256::digest(&page.html.as_bytes()[start..end]));
+        assert!(page.csp.contains(&format!("style-src 'sha256-{hash}'")));
+
+        let page = operation_page("proj", None, &[], None);
+        assert!(page.html.contains("<dt>Reason</dt><dd>No reason given</dd>"), "{}", page.html);
+        assert!(page.html.contains("<dt>Gets past</dt><dd>None</dd>"), "{}", page.html);
+    }
+
+    #[test]
+    fn a_discard_lists_what_it_deletes_up_to_a_cap() {
+        let deleted: Vec<(String, String)> =
+            (0..MAX_DELETES + 7).map(|i| (format!("r-{i}"), format!("<i>step {i}</i>"))).collect();
+        let page = operation_page("proj", Some("cleanup"), &[], Some((&deleted, deleted.len() + 3)));
+        let html = &page.html;
+        assert!(html.contains("<h1>Approve the discard of proj?</h1>"), "{html}");
+        assert!(html.contains(&format!("Deletes {} issues, with no undo", MAX_DELETES + 10)), "{html}");
+        assert!(html.contains(&format!("<code>r-{}</code>", MAX_DELETES - 1)), "{html}");
+        assert!(!html.contains(&format!("<code>r-{}</code>", MAX_DELETES)), "{html}");
+        assert!(html.contains("&lt;i&gt;step 0&lt;/i&gt;"), "{html}");
+        assert!(html.contains("<span class=\"note\">and 10 more</span>"), "{html}");
+        assert!(html.contains("Forced: the run need not be finished"), "{html}");
+        assert!(html.contains("cannot be undone"), "{html}");
+        let one = [("r-1".to_string(), "t".to_string())];
+        let html = operation_page("proj", None, &[], Some((&one, 1))).html;
+        assert!(html.contains("Deletes 1 issue, with no undo") && !html.contains("more</span>"), "{html}");
     }
 
     use bd_core::gates::packet::{Field, FieldKind, MAX_HELD, PacketComment};

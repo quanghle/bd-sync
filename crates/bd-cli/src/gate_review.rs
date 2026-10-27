@@ -75,6 +75,7 @@ pub(crate) fn one_line(e: Error) -> Error {
         Error::Remote(m) => Error::Remote(p(m)),
         Error::AnswerLost(m) => Error::AnswerLost(p(m)),
         Error::Needs { message, needs, gate } => Error::Needs { message: p(message), needs, gate },
+        Error::Approvable(inner) => one_line(*inner).approvable(),
         other => other,
     }
 }

@@ -1,7 +1,8 @@
 //! `bd serve`'s counters since it started, served at `GET /metrics` in the
 //! Prometheus text format to admin tokens: answers by status class and the
 //! busy ones, requests refused for their access token, connections refused
-//! over the limits, panics, commands and MCP tool calls. Counts only: no
+//! over the limits, panics, commands, MCP tool calls, publishes and browser
+//! approvals of gates and of refused closes and discards. Counts only: no
 //! actor, token, workspace or address is a label, so nothing here names
 //! anyone. And [`Throttle`], which keeps a warning repeated under load from
 //! flooding the log.
@@ -48,6 +49,15 @@ pub static PUBLISHES_REFUSED: Counter = Counter::new();
 /// that may not approve, a foreign post, a refusal at the approval).
 pub static APPROVALS: Counter = Counter::new();
 pub static APPROVALS_REFUSED: Counter = Counter::new();
+/// Closes and discards approved in the browser after human gates refused
+/// them, by outcome (`oauth_server::authorize::operation::record`, the only
+/// place that counts them).
+pub static OPERATIONS_APPROVED: Counter = Counter::new();
+pub static OPERATIONS_REFUSED: Counter = Counter::new();
+pub static OPERATIONS_NOT_READY: Counter = Counter::new();
+pub static OPERATIONS_GONE: Counter = Counter::new();
+pub static OPERATIONS_BUSY: Counter = Counter::new();
+pub static OPERATIONS_FAILED: Counter = Counter::new();
 /// Connections open now.
 pub static OPEN: AtomicI64 = AtomicI64::new(0);
 
@@ -127,6 +137,18 @@ pub fn render() -> String {
         "approvals_total",
         "Human gates approved in the browser, by outcome.",
         &[("{outcome=\"approved\"}", APPROVALS.get()), ("{outcome=\"refused\"}", APPROVALS_REFUSED.get())],
+    );
+    counter(
+        "operation_approvals_total",
+        "Closes and discards approved in the browser past human gates, by outcome.",
+        &[
+            ("{outcome=\"approved\"}", OPERATIONS_APPROVED.get()),
+            ("{outcome=\"refused\"}", OPERATIONS_REFUSED.get()),
+            ("{outcome=\"not_ready\"}", OPERATIONS_NOT_READY.get()),
+            ("{outcome=\"gone\"}", OPERATIONS_GONE.get()),
+            ("{outcome=\"busy\"}", OPERATIONS_BUSY.get()),
+            ("{outcome=\"failed\"}", OPERATIONS_FAILED.get()),
+        ],
     );
     let _ = writeln!(
         out,
@@ -213,5 +235,17 @@ mod tests {
             let n: u64 = line.and_then(|l| l.rsplit(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
             assert!(n >= 1, "{outcome}: {text}");
         }
+    }
+
+    #[test]
+    fn operation_approvals_render_every_outcome() {
+        let text = render();
+        assert!(text.contains("# TYPE bd_serve_operation_approvals_total counter"), "{text}");
+        for outcome in ["approved", "refused", "not_ready", "gone", "busy", "failed"] {
+            let series = format!("bd_serve_operation_approvals_total{{outcome=\"{outcome}\"}} ");
+            assert_eq!(text.lines().filter(|l| l.starts_with(&series)).count(), 1, "{outcome}: {text}");
+        }
+        let series = text.lines().filter(|l| l.starts_with("bd_serve_operation_approvals_total")).count();
+        assert_eq!(series, 6, "{text}");
     }
 }

@@ -477,6 +477,29 @@ pub struct CloseOptions {
     /// (`browser`: a human gate approved on bd serve's approval page). No
     /// command-line flag sets it.
     pub via: Option<String>,
+    /// Who asked for the close when another made it, recorded as
+    /// `requested_by` in the `closed` event (an agent whose close a person
+    /// approved in a browser). No command-line flag sets it.
+    pub requested_by: Option<String>,
+}
+
+/// How a close or delete was made, beyond who made it: recorded in its
+/// event's data when set.
+#[derive(Clone, Copy, Default)]
+struct Provenance<'a> {
+    via: Option<&'a str>,
+    requested_by: Option<&'a str>,
+}
+
+impl Provenance<'_> {
+    fn record(self, data: &mut Value) {
+        if let Some(v) = self.via {
+            data["via"] = json!(v);
+        }
+        if let Some(r) = self.requested_by {
+            data["requested_by"] = json!(r);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -520,6 +543,15 @@ pub struct DeleteOptions {
     /// in each one's `deleted` event (see [`crate::policy`]).
     pub take_over: bool,
     pub dry_run: bool,
+    /// Why, recorded as `reason` in each `deleted` event: one empty or only
+    /// whitespace is none, any other is kept as given (as a close's is).
+    pub reason: Option<String>,
+    /// How the delete was made, recorded as `via` in each `deleted` event
+    /// (`browser`: approved on bd serve's approval page).
+    pub via: Option<String>,
+    /// Who asked for the delete when another made it, recorded as
+    /// `requested_by` in each `deleted` event.
+    pub requested_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -954,7 +986,8 @@ impl WriteCtx<'_> {
         self.check_close(&old, opts.force)?;
         let reason = opts.reason.clone().filter(|r| !r.trim().is_empty());
         let outcome = opts.outcome.unwrap_or(Outcome::Done);
-        let mut freed = self.mark_closed(&old, reason, outcome, false, claim_override, opts.via.as_deref())?;
+        let how = Provenance { via: opts.via.as_deref(), requested_by: opts.requested_by.as_deref() };
+        let mut freed = self.mark_closed(&old, reason, outcome, false, claim_override, how)?;
         let (completed, also_freed) = self.close_finished_containers(id)?;
         freed.extend(also_freed);
         let done: HashSet<&String> = completed.iter().collect();
@@ -969,8 +1002,8 @@ impl WriteCtx<'_> {
 
     /// Close one issue and recompute what it held back; returns the issues it
     /// freed. `auto`: a run or group closing after its last step; `claim_override`:
-    /// the live claim of another actor this close ended; `via`: how it was
-    /// closed ([`CloseOptions::via`]).
+    /// the live claim of another actor this close ended; `how`: how it was
+    /// closed ([`CloseOptions::via`], [`CloseOptions::requested_by`]).
     fn mark_closed(
         &mut self,
         old: &Issue,
@@ -978,7 +1011,7 @@ impl WriteCtx<'_> {
         outcome: Outcome,
         auto: bool,
         claim_override: Option<Value>,
-        via: Option<&str>,
+        how: Provenance<'_>,
     ) -> Result<Vec<String>> {
         let id = old.id.as_str();
         self.conn()
@@ -997,9 +1030,7 @@ impl WriteCtx<'_> {
         if let Some(o) = claim_override {
             data["claim_override"] = o;
         }
-        if let Some(v) = via {
-            data["via"] = json!(v);
-        }
+        how.record(&mut data);
         self.emit("closed", Some(id), data)?;
         let seeds = graph::seeds_for_terminal_flip(self.conn(), id)?;
         // A run or group closes itself only with nothing live below it: every
@@ -1047,7 +1078,7 @@ impl WriteCtx<'_> {
             } else {
                 (Outcome::Done, "every step closed")
             };
-            freed.extend(self.mark_closed(&p, Some(reason.into()), outcome, true, None, None)?);
+            freed.extend(self.mark_closed(&p, Some(reason.into()), outcome, true, None, Provenance::default())?);
             closed.push(parent.clone());
             settled = Some(parent);
         }
@@ -1231,11 +1262,17 @@ impl WriteCtx<'_> {
             }
         }
         self.emit_dropped_edges(&dropped)?;
+        let reason = opts.reason.as_deref().filter(|r| !r.trim().is_empty());
+        let how = Provenance { via: opts.via.as_deref(), requested_by: opts.requested_by.as_deref() };
         for s in &deleted {
             let mut data = json!({ "issue": snapshot(self.conn(), s)? });
             if let Some(o) = overrides.remove(s) {
                 data["claim_override"] = o;
             }
+            if let Some(r) = reason {
+                data["reason"] = json!(r);
+            }
+            how.record(&mut data);
             self.emit("deleted", Some(s), data)?;
         }
         for chunk in deleted.chunks(500) {

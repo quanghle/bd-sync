@@ -317,9 +317,10 @@ fn tool_error(code: &str, message: &str, exit_code: i32, extra: Map<String, Valu
     json!({ "content": [{ "type": "text", "text": text }], "isError": true })
 }
 
-/// The keys of a command's JSON error carried into its tool error: the
-/// human gate a refusal names and its approval link, when they are strings.
-const CARRIED_ERROR_KEYS: [&str; 2] = ["gate", "approval_url"];
+/// The keys of a command's JSON error carried into its tool error, when
+/// they are strings: the human gate a refusal names, its approval link, and
+/// the link to approve the refused operation itself.
+const CARRIED_ERROR_KEYS: [&str; 3] = ["gate", "approval_url", "operation_approval_url"];
 
 /// The tool result of a command that failed: the JSON error it printed on
 /// stderr, else its first line of stderr.
@@ -680,18 +681,21 @@ mod tests {
             assert!(err);
             serde_json::from_str::<Value>(items[0]["text"].as_str().unwrap()).unwrap()
         };
-        let linked = r#"{"error":{"approval_url":"https://x/bd/w/p/gates/t-1","code":"unauthorized","exit_code":7,"gate":"t-1","message":"held"}}"#;
+        let linked = r#"{"error":{"approval_url":"https://x/bd/w/p/gates/t-1","code":"unauthorized","exit_code":7,"gate":"t-1","message":"held","operation_approval_url":"https://x/bd/w/p/close/t-2?request=abc"}}"#;
         let v = failed(&format!("{linked}\nhint: x\n"));
         assert_eq!(v["error"]["gate"], "t-1");
         assert_eq!(v["error"]["approval_url"], "https://x/bd/w/p/gates/t-1");
+        assert_eq!(v["error"]["operation_approval_url"], "https://x/bd/w/p/close/t-2?request=abc");
         assert_eq!((&v["error"]["code"], &v["error"]["exit_code"]), (&"unauthorized".into(), &7.into()));
 
         let plain = r#"{"error":{"code":"unauthorized","exit_code":7,"message":"held"}}"#;
         let v = failed(&format!("{plain}\n"));
         assert!(v["error"].get("gate").is_none() && v["error"].get("approval_url").is_none(), "{v}");
+        assert!(v["error"].get("operation_approval_url").is_none(), "{v}");
         // Only strings are carried.
-        let odd = r#"{"error":{"approval_url":["x"],"code":"unauthorized","exit_code":7,"gate":1,"message":"held"}}"#;
+        let odd = r#"{"error":{"approval_url":["x"],"code":"unauthorized","exit_code":7,"gate":1,"message":"held","operation_approval_url":{"u":"x"}}}"#;
         let v = failed(&format!("{odd}\n"));
         assert!(v["error"].get("gate").is_none() && v["error"].get("approval_url").is_none(), "{v}");
+        assert!(v["error"].get("operation_approval_url").is_none(), "{v}");
     }
 }

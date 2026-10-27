@@ -51,6 +51,17 @@ pub(super) fn run(a: &ServeArgs) -> Result<()> {
         .map_err(|e| Error::invalid(format!("--public-url {e}")))?;
     // Opened now (created if new) so that an unwritable root or another bd's schema shows at once.
     crate::server_db::open(&root)?;
+    // Read (created at the first start) now, so that a damaged key shows at once; never in server.db or its backups.
+    let link_key = crate::link_key::load_or_create(&root)?;
+    let key_file = crate::link_key::path(&root);
+    if let Some(mode) = open_to_others(&key_file) {
+        tracing::warn!(
+            target: "bd::serve",
+            file = %key_file.display(),
+            mode = format!("{mode:o}"),
+            "the approval link key is readable by others than its owner: chmod 600 it"
+        );
+    }
     // The workspaces' databases hold actors and their histories, readable by whoever may enter the root.
     if let Some(mode) = dir_open_to_others(&root) {
         tracing::warn!(
@@ -157,6 +168,7 @@ pub(super) fn run(a: &ServeArgs) -> Result<()> {
     let mut server = Server::new(root, max_body, waits);
     server.https = tls.is_some();
     server.public_url = public_url;
+    server.link_key = Some(Arc::new(link_key));
     let server = Arc::new(server);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

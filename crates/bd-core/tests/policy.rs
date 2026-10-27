@@ -131,7 +131,7 @@ fn force_release() -> ReleaseOptions {
 }
 
 fn discard(force: bool, take_over: bool, dry_run: bool) -> DiscardOptions {
-    DiscardOptions { force, take_over, dry_run }
+    DiscardOptions { force, take_over, dry_run, ..Default::default() }
 }
 
 fn patch(f: impl FnOnce(&mut IssuePatch)) -> IssuePatch {
@@ -387,7 +387,8 @@ fn force_gets_past_structure_never_past_a_claim() {
         .unwrap()
         .id;
     env.as_("bob", None, |tx| tx.claim(&held, &ClaimOptions::default())).unwrap();
-    let del = |force: bool, cascade: bool, take_over: bool| DeleteOptions { force, cascade, take_over, dry_run: false };
+    let del =
+        |force: bool, cascade: bool, take_over: bool| DeleteOptions { force, cascade, take_over, ..Default::default() };
     for opts in [del(false, false, false), del(true, false, false), del(false, true, false)] {
         not_owner(env.as_("alice", None, |tx| tx.delete_issues(std::slice::from_ref(&held), &opts)), "bob");
     }
@@ -427,7 +428,7 @@ fn force_gets_past_structure_never_past_a_claim() {
 fn runs_with_others_claims_need_take_over_to_discard_or_compact() {
     let mut env = Env::new();
     let two = "[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\n";
-    let opts = |force: bool, take_over: bool| DiscardOptions { force, take_over, dry_run: false };
+    let opts = |force: bool, take_over: bool| DiscardOptions { force, take_over, ..Default::default() };
 
     // A claimed run issue (not just a step) is someone else's work too.
     let run = env.start(two, &[]).unwrap();
@@ -1479,9 +1480,12 @@ fn approvers_alone_get_past_their_gates_on_every_path() {
         let mut fx = approved_fixture();
         let r = path(&mut fx, "dave", person("dave"));
         match r {
-            Err(e @ Error::Unauthorized(_)) => {
+            // A forced close of the task or a delete is a refusal a person could approve.
+            Err(e) if matches!(e.unmarked(), Error::Unauthorized(_)) => {
                 let m = e.to_string();
                 assert!(m.contains("carol") && m.contains(&fx.gate), "{name}: {m}");
+                let approvable = matches!(name, "force-close the task" | "delete the gate" | "delete the container");
+                assert_eq!(e.is_approvable(), approvable, "{name}");
             }
             other => panic!("{name}: expected dave to be refused, got {other:?}"),
         }
@@ -1689,4 +1693,226 @@ fn a_human_admin_replaces_legacy_lists_with_references() {
     let g = fx.gate.clone();
     fx.env.as_("alice", None, |tx| tx.resolve_gate(&g, None, false, None)).expect("informational locally");
     fx.env.assert_healthy();
+}
+
+/// A human gate approved by `approvers` (`None`: any person), blocking each
+/// of `blocks`, under `parent`.
+fn approvers_gate(env: &mut Env, approvers: Option<&[&str]>, blocks: &[&str], parent: Option<&str>) -> String {
+    let spec = GateSpec {
+        approvers: approvers.map(|l| l.iter().map(|a| a.to_string()).collect()),
+        ..GateSpec::new(GateKind::Human)
+    };
+    let gate = NewGate {
+        spec,
+        blocks: blocks.iter().map(|b| b.to_string()).collect(),
+        title: None,
+        description: String::new(),
+        assignee: None,
+        parent: parent.map(String::from),
+        priority: None,
+        ephemeral: false,
+    };
+    env.as_("alice", None, |tx| tx.create_gate(gate)).unwrap().id
+}
+
+/// An issue marked as a playbook run, with one step below it.
+fn bare_run(env: &mut Env) -> (String, String) {
+    let run = env.create("Rollout");
+    set_role(env, &run, "run");
+    let step = child(env, "alice", None, &run, NewIssue::titled("Step"));
+    (run, step)
+}
+
+fn force_close() -> CloseOptions {
+    CloseOptions { force: true, ..Default::default() }
+}
+
+/// Asserts `e` is an approvable human-only refusal naming `gate`, worded as the unmarked one.
+fn approvable_human_only(e: &Error, gate: &str) {
+    assert!(e.is_approvable(), "{e}");
+    assert_eq!((e.code(), e.exit_code()), ("unauthorized", 7), "{e}");
+    assert_eq!(e.needs(), [Need::Human]);
+    assert_eq!(e.gate(), Some(gate));
+    assert_eq!(e.to_string(), e.unmarked().to_string());
+    assert!(!e.unmarked().is_approvable());
+}
+
+#[test]
+fn approvable_marks_keep_what_the_refusal_says() {
+    let e = Error::with_needs(&[Need::Human], "no").with_gate("t-1");
+    let marked = Error::with_needs(&[Need::Human], "no").with_gate("t-1").approvable().approvable();
+    assert!(marked.is_approvable() && !e.is_approvable());
+    assert!(matches!(&marked, Error::Approvable(inner) if !inner.is_approvable()), "never wrapped twice");
+    assert_eq!(
+        (marked.to_string(), marked.code(), marked.exit_code(), marked.needs(), marked.gate()),
+        (e.to_string(), e.code(), e.exit_code(), e.needs(), e.gate())
+    );
+    assert!(matches!(marked.into_unmarked(), Error::Needs { .. }));
+    let lost = Error::NotOwner { id: "t-1".into(), holder: Some("bob".into()), actor: "a".into() }.approvable();
+    assert!(lost.is_contention() && lost.exit_code() == 4);
+}
+
+#[test]
+fn forced_closes_and_discards_past_human_gates_are_approvable() {
+    let mut env = Env::new();
+    // (a) Held by a human gate, and a run containing one: an agent's forced close.
+    let (gate, work) = gate_with(&mut env, None);
+    let e = env.as_("bot", agent("bot"), |tx| tx.close_issue(&work, &force_close())).unwrap_err();
+    approvable_human_only(&e, &gate);
+    let (run, step) = bare_run(&mut env);
+    let inner = approvers_gate(&mut env, None, &[&step], Some(&run));
+    let e = env.as_("bot", agent("bot"), |tx| tx.close_issue(&run, &force_close())).unwrap_err();
+    approvable_human_only(&e, &inner);
+    // Without force the run's open child is the answer, not the gate.
+    let e = env.as_("bot", agent("bot"), |tx| tx.close_issue(&run, &CloseOptions::default())).unwrap_err();
+    assert!(matches!(e, Error::Refused(_)), "{e}");
+
+    // (b) Closing the gate itself never is.
+    for opts in [CloseOptions::default(), force_close()] {
+        let e = env.as_("bot", agent("bot"), |tx| tx.close_issue(&gate, &opts)).unwrap_err();
+        assert!(is_refusal(&e) && !e.is_approvable(), "{e}");
+    }
+
+    // (e) A person who is not an approver of a valid list.
+    let (carols, held) = gate_with(&mut env, Some(vec!["carol".into()]));
+    let e = env.as_("dave", person("dave"), |tx| tx.close_issue(&held, &force_close())).unwrap_err();
+    assert!(e.is_approvable() && matches!(e.unmarked(), Error::Unauthorized(_)), "{e}");
+    assert!(e.to_string().contains(&carols), "{e}");
+
+    // (f) Discarding a run with an open human gate in it, under an agent's policy...
+    let e = env.as_("bot", agent("bot"), |tx| tx.discard_run(&run, &discard(false, false, false))).unwrap_err();
+    assert!(e.is_approvable() && is_refusal(&e), "{e}");
+    // ...and a force-closed run whose gate is still open.
+    env.as_("alice", None, |tx| tx.close_issue(&run, &force_close())).unwrap();
+    assert_eq!(env.issue(&run).status, Status::Closed);
+    let e = env.as_("bot", agent("bot"), |tx| tx.discard_run(&run, &discard(false, false, false))).unwrap_err();
+    approvable_human_only(&e, &inner);
+    assert_eq!(env.issue(&inner).status, Status::Open, "nothing was deleted");
+}
+
+#[test]
+fn gate_targets_are_never_approvable() {
+    let mut env = Env::new();
+    // (c) A person who may open gate A, held by gate B that only carol may open.
+    let work = env.create("Deploy");
+    let a = approvers_gate(&mut env, Some(&["dave"]), &[&work], None);
+    let b = approvers_gate(&mut env, Some(&["carol"]), &[&a], None);
+    let e = env.as_("dave", person("dave"), |tx| tx.close_issue(&a, &force_close())).unwrap_err();
+    assert!(is_refusal(&e) && !e.is_approvable(), "{e}");
+    assert!(e.to_string().contains(&b), "{e}");
+    // A GitHub gate held by a human gate, closed with force by an agent.
+    let other = env.create("Merge");
+    let gh = env.as_("alice", None, |tx| tx.create_gate(gh_gate(GateKind::GhPr, None, &other))).unwrap().id;
+    approvers_gate(&mut env, None, &[&gh], None);
+    let e = env.as_("bot", agent("bot"), |tx| tx.close_issue(&gh, &force_close())).unwrap_err();
+    assert!(is_refusal(&e) && !e.is_approvable(), "{e}");
+    assert_eq!(env.issue(&gh).status, Status::Open);
+}
+
+#[test]
+fn an_invalid_approver_list_in_the_way_makes_nothing_approvable() {
+    // (d) A valid and an invalid list in the way, in both id orders.
+    for invalid_first in [true, false] {
+        let mut env = Env::new();
+        let work = env.create("Deploy");
+        let first = approvers_gate(&mut env, Some(&["carol"]), &[&work], None);
+        let second = approvers_gate(&mut env, Some(&["carol"]), &[&work], None);
+        store_approvers(&mut env, if invalid_first { &first } else { &second }, json!(42));
+        for policy in [agent("bot"), person("dave")] {
+            let e = env.as_("x", policy, |tx| tx.close_issue(&work, &force_close())).unwrap_err();
+            assert!(is_refusal(&e) && !e.is_approvable(), "invalid first {invalid_first}: {e}");
+        }
+
+        let (run, step) = bare_run(&mut env);
+        let first = approvers_gate(&mut env, Some(&["carol"]), &[&step], Some(&run));
+        let second = approvers_gate(&mut env, Some(&["carol"]), &[&step], Some(&run));
+        store_approvers(&mut env, if invalid_first { &first } else { &second }, json!(["ok", ""]));
+        for policy in [agent("bot"), person("dave")] {
+            let e = env.as_("x", policy, |tx| tx.discard_run(&run, &discard(false, false, false))).unwrap_err();
+            assert!(is_refusal(&e) && !e.is_approvable(), "invalid first {invalid_first}: {e}");
+        }
+    }
+}
+
+#[test]
+fn claim_pin_and_edge_refusals_are_not_approvable() {
+    // (g)
+    let mut env = Env::new();
+    let (gate, work) = gate_with(&mut env, None);
+    let claim = ClaimOptions { allow_blocked: true, ..Default::default() };
+    env.as_("bob", None, |tx| tx.claim(&work, &claim)).unwrap();
+    for opts in [force_close(), CloseOptions { force: true, take_over: true, ..Default::default() }] {
+        let e = env.as_("alice", agent("alice"), |tx| tx.close_issue(&work, &opts)).unwrap_err();
+        assert!(!e.is_approvable(), "{e}");
+    }
+    let e = env.as_("alice", None, |tx| tx.close_issue(&work, &force_close())).unwrap_err();
+    assert!(matches!(e, Error::NotOwner { .. }), "{e}");
+
+    let (run, step) = bare_run(&mut env);
+    approvers_gate(&mut env, None, &[&step], Some(&run));
+    env.as_("bob", None, |tx| tx.claim(&step, &claim)).unwrap();
+    let e = env.as_("alice", agent("alice"), |tx| tx.discard_run(&run, &discard(true, false, false))).unwrap_err();
+    assert!(e.needs() == [Need::Admin] && !e.is_approvable(), "{e}");
+    let e = env.as_("alice", None, |tx| tx.discard_run(&run, &discard(true, false, false))).unwrap_err();
+    assert!(matches!(e, Error::NotOwner { .. }), "{e}");
+
+    let (gate2, free) = gate_with(&mut env, None);
+    let pin = patch(|p| p.status = Some(Status::Pinned));
+    let e = env.as_("bot", agent("bot"), |tx| tx.update_issue(&free, &pin, &Guard::default(), false)).unwrap_err();
+    assert!(is_refusal(&e) && !e.is_approvable(), "{e}");
+    let e = env.as_("bot", agent("bot"), |tx| tx.remove_dependency(&free, &gate2)).unwrap_err();
+    assert!(is_refusal(&e) && !e.is_approvable(), "{e}");
+    let e = env.as_("bot", agent("bot"), |tx| tx.update_issue(&gate, &pin, &Guard::default(), false)).unwrap_err();
+    assert!(is_refusal(&e) && !e.is_approvable(), "{e}");
+}
+
+#[test]
+fn gates_in_the_way_are_the_gates_the_hold_walks_look_through() {
+    // (h) top <- g0; top > mid > task; g1 and g2 (in mid) block task; a GitHub gate does too.
+    let mut env = Env::new();
+    let epic = |title: &str| NewIssue { issue_type: Some("epic".into()), ..NewIssue::titled(title) };
+    let top = env.as_("alice", None, |tx| tx.create_issue(epic("Top"))).unwrap().id;
+    let g0 = approvers_gate(&mut env, None, &[&top], None);
+    let mid = child(&mut env, "alice", None, &top, epic("Mid"));
+    let task = child(&mut env, "alice", None, &mid, NewIssue::titled("Task"));
+    let g1 = approvers_gate(&mut env, Some(&["carol"]), &[&task], Some(&mid));
+    let g2 = approvers_gate(&mut env, Some(&["carol", "dave"]), &[&task], Some(&mid));
+    env.as_("alice", None, |tx| tx.create_gate(gh_gate(GateKind::GhPr, None, &task))).unwrap();
+    let done = env.create("Done");
+    approvers_gate(&mut env, None, &[&done], None);
+    env.as_("alice", None, |tx| tx.close_issue(&done, &force_close())).unwrap();
+
+    let in_the_way = |env: &Env, ids: &[&String]| -> Vec<String> {
+        let ids: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        env.store.read(|r| policy::gates_in_the_way(r.conn(), &ids)).unwrap().into_iter().map(|g| g.id).collect()
+    };
+    let sorted = |ids: &[&String]| -> Vec<String> {
+        let mut v: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        v.sort();
+        v
+    };
+    let all = sorted(&[&g0, &g1, &g2]);
+    assert_eq!(in_the_way(&env, &[&task]), all, "its own edges and an ancestor's");
+    assert_eq!(in_the_way(&env, &[&mid]), all, "contained, and on what it contains");
+    assert_eq!(in_the_way(&env, &[&top]), all);
+    assert_eq!(in_the_way(&env, &[&task, &mid, &top]), all, "deduplicated");
+    assert_eq!(in_the_way(&env, &[&g1]), sorted(&[&g0, &g1]), "itself, and an ancestor's");
+    assert_eq!(in_the_way(&env, &[&done]), Vec::<String>::new(), "a closed issue is in nobody's way");
+
+    // A delete (dry run) is refused past gates exactly when one of these is shut to the caller.
+    for policy in [person("carol"), person("dave"), person("erin"), agent("bot")] {
+        let p = policy.clone().unwrap();
+        for target in [&top, &mid, &task, &g0, &g1, &g2] {
+            let ids = vec![target.clone()];
+            let opts = DeleteOptions { force: true, dry_run: true, ..Default::default() };
+            let refused = env.as_(&p.actor, policy.clone(), |tx| tx.delete_issues(&ids, &opts)).is_err();
+            let shut = env
+                .store
+                .read(|r| policy::gates_in_the_way(r.conn(), &ids))
+                .unwrap()
+                .iter()
+                .any(|g| !policy::may_open(&p, g));
+            assert_eq!(refused, shut, "{} deleting {target}", p.actor);
+        }
+    }
 }

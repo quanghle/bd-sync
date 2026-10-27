@@ -21,12 +21,15 @@
 //! Each step is bound to the browser that started it by a cookie. The steps
 //! before a sign-in keep nothing on the server: the request is sealed into
 //! the chooser link ([`Pending`]) and a per-flow cookie (`Sealer`), with what
-//! the sign-in goes on to ([`Then`]: this authorization, or a human gate's
-//! approval), which also sets the AAD it is sealed with, so a flow of one
-//! kind never finishes as the other. Consents, codes and gate approvals are
-//! kept in memory for minutes ([`Flows`]): a restart ends authorizations
-//! under way. A human gate's approval goes through the same steps from its
-//! own page, `<public url>/w/<ws>/gates/<id>` ([`gate`]).
+//! the sign-in goes on to ([`Then`]: this authorization, a human gate's
+//! approval, or an operation's), which also sets the AAD it is sealed with,
+//! so a flow of one kind never finishes as another. Consents, codes and
+//! approvals are kept in memory for minutes ([`Flows`]): a restart ends
+//! authorizations under way. A human gate's approval goes through the same steps from its
+//! own page, `<public url>/w/<ws>/gates/<id>` ([`gate`]), and so does the
+//! approval of a close or discard that open human gates refused, from its
+//! sealed link, `<public url>/w/<ws>/(close|discard)/<id>?request=...`
+//! ([`operation`]).
 
 mod begin;
 mod callback;
@@ -34,6 +37,7 @@ mod consent;
 mod cookies;
 mod flows;
 pub mod gate;
+pub mod operation;
 mod request;
 #[cfg(test)]
 mod tests;
@@ -44,12 +48,16 @@ pub use consent::*;
 pub use cookies::*;
 pub use flows::*;
 pub use gate::{Approved, Approver, Found, GateInfo, Gates};
+pub use operation::{
+    GateInWay, OpFound, OpInfo, Operations, Outcome, Performed, Who, operation_flow, pending_operation, record,
+};
 use request::*;
 
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use bd_cli::approval_link::LinkKey;
 use bd_core::Error;
 
 use super::cimd::Documents;
@@ -58,7 +66,7 @@ use super::form;
 use super::pages::{self, Page};
 #[cfg(test)]
 use crate::auth;
-use crate::oauth::Admitted;
+use crate::oauth::{self, Admitted, SignIn};
 
 /// The cookie binding an authorization's steps to one browser.
 pub const COOKIE: &str = "bd_oauth";
@@ -91,6 +99,10 @@ pub struct Ctx<'a> {
     pub workspace_exists: &'a dyn Fn(&str) -> bool,
     /// The workspaces' gates, for approvals ([`gate`]).
     pub gates: &'a dyn Gates,
+    /// The key operation approval links are sealed with, once loaded.
+    pub links: Option<&'a LinkKey>,
+    /// The workspaces' closes and discards, for approvals ([`operation`]).
+    pub operations: &'a dyn Operations,
 }
 
 /// Where a step sends the browser.
@@ -199,6 +211,21 @@ const MALFORMED: &str = "The application sent a request this server can't use. S
 
 fn refused(status: u16, why: &str) -> Answer {
     Answer::Page(pages::refusal(status, "Couldn't connect the application", why, None))
+}
+
+/// Sign-in settings that approve gates and operations: `[oauth]` with a
+/// provider people sign in with in a browser; else not found.
+fn settings(cx: &Ctx<'_>) -> Result<SignIn, Answer> {
+    match oauth::load(cx.root) {
+        Ok(Some(s)) if s.oauth.is_some() && !s.browser_providers().is_empty() => Ok(s),
+        Ok(_) | Err(Error::Invalid(_)) => Err(approval_not_found()),
+        Err(e) => Err(internal(&e, "reading auth.toml for an approval")),
+    }
+}
+
+/// Not found, as for a path nothing is approved at.
+fn approval_not_found() -> Answer {
+    Answer::Page(pages::notice(404, "Not found", "There is nothing to approve here."))
 }
 
 /// When a step started now must be done by.

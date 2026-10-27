@@ -37,5 +37,5 @@ pub use model::{
 };
 pub use run::{
     CompactOptions, CompactOutcome, DiscardOptions, Progress, RunStarted, RunStatus, RunSummary, RunsQuery,
-    StartOptions, StatusNode, StepState, role_of, run_of, run_status, runs,
+    StartOptions, StatusNode, StepState, role_of, run_issues, run_of, run_status, runs,
 };

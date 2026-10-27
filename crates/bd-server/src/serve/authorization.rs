@@ -222,13 +222,41 @@ pub(super) enum Authorizing {
 /// thread, with a sign-in slot. The first step, which may fetch the client's
 /// metadata document, runs on a blocking thread too, bounded by the
 /// document fetches' own limits (`cimd`) rather than a slot.
-pub(super) async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Request<Incoming>) -> Response<Body> {
+///
+/// A provider's callback whose flow is an operation's approval
+/// (`authorize::operation_flow`, known from `--public-url` and the sealed
+/// flow alone) is recorded once however it ends here: settings that cannot
+/// be used now, no sign-in slot, or a step that failed to finish.
+pub(super) async fn authorizing<B>(server: &Arc<Server>, step: Authorizing, req: Request<B>) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let cookies: String =
+        req.headers().get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join("; ");
+    let query = req.uri().query().unwrap_or_default().to_string();
+    let op = match step {
+        Authorizing::Callback => server
+            .public_issuer()
+            .and_then(|i| server.authorizing(&i, |cx| authorize::operation_flow(cx, &query, &cookies))),
+        _ => None,
+    };
+    let record = |outcome, detail| {
+        if let Some((flow, provider)) = &op {
+            let who = authorize::Who::provider_only(provider);
+            authorize::record(outcome, &who, &flow.workspace, &flow.op, &flow.issue, detail);
+        }
+    };
     let issuer = match server.issuer() {
         Ok(Some(issuer)) => issuer,
         Ok(None) => {
+            record(authorize::Outcome::Failed, "sign-in settings unavailable");
             return Reject::new(StatusCode::NOT_FOUND, "not_found", "no such authorization server", 3).response();
         }
-        Err(e) => return sign_in_misconfigured(&e),
+        Err(e) => {
+            record(authorize::Outcome::Failed, "sign-in settings unavailable");
+            return sign_in_misconfigured(&e);
+        }
     };
     let browser = req
         .headers()
@@ -236,9 +264,6 @@ pub(super) async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Re
         .iter()
         .filter_map(|v| v.to_str().ok())
         .find_map(|h| authorize::cookie(&issuer, h).map(str::to_string));
-    let cookies: String =
-        req.headers().get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join("; ");
-    let query = req.uri().query().unwrap_or_default().to_string();
     let provider =
         oauth_server::callback_provider(under_issuer(server, req.uri().path())).unwrap_or_default().to_string();
     let srv = server.clone();
@@ -251,16 +276,22 @@ pub(super) async fn authorizing(server: &Arc<Server>, step: Authorizing, req: Re
         }
         Authorizing::Callback => {
             let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
+                record(authorize::Outcome::Busy, "too many sign-ins");
                 let why = "Too many sign-ins are in progress. Reload this page in a moment.";
                 return html_page(pages::refusal(503, "The server is busy", why, None));
             };
-            blocking(move || {
+            let done = blocking(move || {
                 let _permit = permit;
                 Ok(srv.authorizing(&issuer, |cx| {
                     authorize::callback(cx, &provider, &query, browser.as_deref(), &cookies)
                 }))
             })
-            .await
+            .await;
+            // The step did not finish (it panicked): it never recorded its outcome.
+            if done.is_err() {
+                record(authorize::Outcome::Failed, "internal error");
+            }
+            done
         }
         Authorizing::Relay => {
             let Ok(body) = read_body(req.into_body(), MAX_RELAYED_BODY, HEADER_TIMEOUT).await else {

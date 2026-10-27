@@ -89,6 +89,44 @@ pub struct Capture {
     /// offers this request (a gate's link is the base and its id), `None`
     /// when it offers none.
     pub approvals: Option<String>,
+    /// The operation approval links `bd serve` offers this request (see
+    /// [`note_operation`]), `None` when it offers none.
+    pub operation_links: Option<OperationLinks>,
+    /// The refused operation noted for a link, set only by
+    /// [`note_operation`].
+    pub operation: NotedOperation,
+}
+
+/// What `bd serve` needs to offer operation approval links: the base
+/// `<issuer>/w/<ws>/` of their pages, the workspace and the server's key.
+#[derive(Clone)]
+pub struct OperationLinks {
+    pub base: String,
+    pub workspace: String,
+    pub key: std::sync::Arc<crate::approval_link::LinkKey>,
+}
+
+impl std::fmt::Debug for OperationLinks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationLinks")
+            .field("base", &self.base)
+            .field("workspace", &self.workspace)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The refused operation a request noted for a link ([`note_operation`]):
+/// opaque, so only this module sets it.
+#[derive(Default)]
+pub struct NotedOperation(Option<crate::approval_link::OperationRequest>);
+
+/// The link to approve a refused operation, as [`operation_link`] makes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpLink {
+    pub op: crate::approval_link::Op,
+    pub issue: String,
+    /// The link, or why there is none.
+    pub outcome: std::result::Result<String, String>,
 }
 
 impl Capture {
@@ -109,6 +147,8 @@ impl Capture {
             token: None,
             needs: Vec::new(),
             approvals: None,
+            operation_links: None,
+            operation: NotedOperation::default(),
         }
     }
 
@@ -216,6 +256,56 @@ pub fn request_token() -> Option<serde_json::Value> {
 pub fn approval_url(gate: &str) -> Option<String> {
     let base = with_capture(|c| c.approvals.clone()).flatten()?;
     bd_core::gates::approval_id_ok(gate).then(|| format!("{base}{gate}"))
+}
+
+/// True when `bd serve` offers this request operation approval links.
+pub fn operation_links_offered() -> bool {
+    with_capture(|c| c.operation_links.is_some()).unwrap_or(false)
+}
+
+/// Note a refused operation a person could approve in a browser, for
+/// [`operation_link`]; does nothing unless `bd serve` offers this request
+/// links. A reason that is empty or only whitespace is none; any other is
+/// kept as given, never trimmed (as `bd close` and discard record it).
+pub fn note_operation(
+    op: crate::approval_link::Op,
+    issue: &str,
+    reason: Option<&str>,
+    failed: bool,
+    force: bool,
+    requester: &str,
+    at: i64,
+) {
+    with_capture(|c| {
+        let Some(links) = &c.operation_links else { return };
+        let req = crate::approval_link::OperationRequest {
+            reason: reason.filter(|r| !r.trim().is_empty()).map(str::to_string),
+            failed,
+            force,
+            ..crate::approval_link::OperationRequest::new(
+                links.workspace.clone(),
+                op,
+                issue.to_string(),
+                requester.to_string(),
+                at,
+            )
+        };
+        c.operation = NotedOperation(Some(req));
+    });
+}
+
+/// The link to approve the operation this request noted, sealed now, or
+/// why it has none; `None` when nothing was noted or no links are offered.
+pub fn operation_link() -> Option<OpLink> {
+    with_capture(|c| {
+        let links = c.operation_links.as_ref()?;
+        let req = c.operation.0.as_ref()?;
+        let outcome = crate::approval_link::seal(&links.key, req)
+            .map(|sealed| crate::approval_link::url(&links.base, req.op, &req.issue, &sealed))
+            .map_err(|why| why.message().to_string());
+        Some(OpLink { op: req.op, issue: req.issue.clone(), outcome })
+    })
+    .flatten()
 }
 
 /// Note the rights a refusal of the request said would get past it; does

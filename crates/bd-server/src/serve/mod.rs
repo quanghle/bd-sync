@@ -290,7 +290,11 @@ enum BodyError {
 }
 
 /// The whole body of a request, at most `max` bytes, within `wait`.
-async fn read_body(body: Incoming, max: usize, wait: Duration) -> std::result::Result<Bytes, BodyError> {
+async fn read_body<B>(body: B, max: usize, wait: Duration) -> std::result::Result<Bytes, BodyError>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     match tokio::time::timeout(wait, Limited::new(body, max).collect()).await {
         Ok(Ok(b)) => Ok(b.to_bytes()),
         Ok(Err(e)) if e.is::<LengthLimitError>() => Err(BodyError::TooLarge),
@@ -541,6 +545,9 @@ struct Server {
     public_url: Option<String>,
     /// Whether clients connect over TLS, for URLs derived from requests.
     https: bool,
+    /// The key sealing operation approval links (`<root>/approval-links.key`),
+    /// loaded at start.
+    link_key: Option<Arc<bd_cli::approval_link::LinkKey>>,
 }
 
 /// How a request waiting for events ended its wait.
@@ -736,6 +743,7 @@ impl Server {
             stopping: watch::Sender::new(false),
             public_url: None,
             https: false,
+            link_key: None,
         }
     }
 
@@ -766,6 +774,16 @@ impl Server {
         self.approvals_issuer().ok().flatten().map(|i| format!("{i}/w/{workspace}/gates/"))
     }
 
+    /// What a request in `workspace` needs to offer operation approval links
+    /// (`<issuer>/w/<workspace>/close/<id>?request=...`): only where approval
+    /// pages are offered ([`Server::approval_base`]) and the link key is
+    /// loaded, so a link never points at a page that answers 404.
+    pub(super) fn operation_links(&self, workspace: &str) -> Option<io::OperationLinks> {
+        let key = self.link_key.clone()?;
+        let issuer = self.approvals_issuer().ok().flatten()?;
+        Some(io::OperationLinks { base: format!("{issuer}/w/{workspace}/"), workspace: workspace.to_string(), key })
+    }
+
     /// Run `f`, a step of an authorization, with what it needs of the server.
     fn authorizing<T>(&self, issuer: &str, f: impl FnOnce(&authorize::Ctx<'_>) -> T) -> T {
         let exists = |name: &str| self.workspace(name).is_some();
@@ -776,7 +794,16 @@ impl Server {
             flows: &self.flows,
             workspace_exists: &exists,
             gates: self,
+            links: self.link_key.as_deref(),
+            operations: self,
         })
+    }
+
+    /// The issuer `--public-url` makes, without reading `auth.toml`: the one
+    /// [`Server::issuer`] gives whenever `[oauth]` is on, so it names the
+    /// cookies a sign-in started with, whatever the settings say now.
+    fn public_issuer(&self) -> Option<String> {
+        self.public_url.as_deref().and_then(|u| oauth_server::issuer(Some(u)).ok())
     }
 
     /// The server's URL as clients reach it: `--public-url`, else derived
@@ -960,6 +987,7 @@ impl Server {
             oidc_approver: policy.oidc_approver,
             token: Some(token.summary()),
             approvals: self.approval_base(&ws.name),
+            operation_links: self.operation_links(&ws.name),
             ..Capture::new(Box::new(out.clone()))
         };
         let (exit_code, captured) = io::capture(capture, || bd_cli::execute(&mut app, &cli.command));
@@ -1223,6 +1251,304 @@ mod tests {
         assert_eq!(server.approval_base("proj").as_deref(), Some("https://bd.example.com/bd/w/proj/gates/"));
         server.public_url = None;
         assert_eq!(server.approval_base("proj"), None, "[oauth] without --public-url");
+    }
+
+    fn test_link_key() -> Arc<bd_cli::approval_link::LinkKey> {
+        Arc::new(bd_cli::approval_link::LinkKey::from_bytes(&[7; 32]).unwrap())
+    }
+
+    const OAUTH_ON: &str = "[github]\nclient_id = \"Iv1.x\"\nclient_secret_file = \"secret\"\n[[github.allow]]\nusers = [\"a\"]\n[oauth]\nloopback_redirects = true\n";
+
+    /// A server offering approval pages at `https://bd.example.com/bd`, with a link key.
+    fn offering(root: &Path) -> Server {
+        std::fs::write(root.join("secret"), "s").unwrap();
+        std::fs::write(root.join("auth.toml"), OAUTH_ON).unwrap();
+        let mut server = Server::new(root.to_path_buf(), 1, Waits::default());
+        server.public_url = Some("https://bd.example.com/bd".into());
+        server.link_key = Some(test_link_key());
+        server
+    }
+
+    #[test]
+    fn operation_links_are_offered_only_with_approval_pages_and_a_key() {
+        let mut server = Server::new(PathBuf::from("."), 1, Waits::default());
+        server.link_key = Some(test_link_key());
+        assert!(server.operation_links("proj").is_none(), "no --public-url");
+        let root = tempfile::tempdir().unwrap();
+        let mut server = Server::new(root.path().to_path_buf(), 1, Waits::default());
+        server.public_url = Some("https://bd.example.com/bd".into());
+        server.link_key = Some(test_link_key());
+        assert!(server.operation_links("proj").is_none(), "no auth.toml");
+        let invalid = tempfile::tempdir().unwrap();
+        std::fs::write(invalid.path().join("auth.toml"), "[oauth\n").unwrap();
+        let mut bad = Server::new(invalid.path().to_path_buf(), 1, Waits::default());
+        bad.public_url = server.public_url.clone();
+        bad.link_key = Some(test_link_key());
+        assert!(bad.operation_links("proj").is_none(), "an invalid auth.toml");
+        let root = tempfile::tempdir().unwrap();
+        let mut server = offering(root.path());
+        let links = server.operation_links("proj").expect("offered");
+        assert_eq!(links.base, "https://bd.example.com/bd/w/proj/");
+        assert_eq!(links.workspace, "proj");
+        assert!(!format!("{links:?}").contains("key:"), "the key is never shown");
+        server.link_key = None;
+        assert!(server.operation_links("proj").is_none(), "no key");
+        server.link_key = Some(test_link_key());
+        server.public_url = None;
+        assert!(server.operation_links("proj").is_none(), "[oauth] without --public-url");
+    }
+
+    #[test]
+    fn tool_calls_are_offered_operation_links() {
+        let token = Token {
+            id: "i".into(),
+            name: "alice-laptop".into(),
+            actor: "alice".into(),
+            role: Role::Write,
+            kind: auth::Kind::Human,
+            workspaces: vec!["*".into()],
+            sha256: String::new(),
+            created_at: String::new(),
+            revoked_at: None,
+            expires_at: None,
+            identity: None,
+            max_claims: Some(3),
+            refresh: None,
+            resource: None,
+            client: None,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let server = offering(root.path());
+        let (_, capture) = Capture::buffered(1024);
+        let capture = mcp_endpoint::tool_capture(&server, "proj", &token, capture);
+        let links = capture.operation_links.as_ref().expect("offered to tool calls");
+        assert_eq!(links.base, "https://bd.example.com/bd/w/proj/");
+        assert_eq!(links.workspace, "proj");
+        assert_eq!(capture.approvals.as_deref(), Some("https://bd.example.com/bd/w/proj/gates/"));
+        assert_eq!(capture.token_actor, "alice");
+        assert_eq!(capture.max_claims, Some(3));
+        assert!(!capture.admin && !capture.human, "a tool call never carries a person's rights");
+        let plain = Server::new(root.path().to_path_buf(), 1, Waits::default());
+        let (_, capture) = Capture::buffered(1024);
+        assert!(mcp_endpoint::tool_capture(&plain, "proj", &token, capture).operation_links.is_none());
+    }
+
+    const PUBLIC: &str = "https://bd.example.com/bd";
+
+    /// A request to `uri` with `cookie`, posting `body` from this server's own page (`Origin`).
+    fn built(method: Method, uri: &str, cookie: &str, body: &str) -> Request<http_body_util::Full<Bytes>> {
+        let mut r = Request::builder().method(method).uri(uri).header(header::ORIGIN, "https://bd.example.com");
+        if !cookie.is_empty() {
+            r = r.header(header::COOKIE, cookie);
+        }
+        r.body(http_body_util::Full::new(Bytes::from(body.to_string()))).unwrap()
+    }
+
+    /// How the sign-in settings of a server offering approval pages are spoiled after a page or flow began.
+    #[derive(Clone, Copy, Debug)]
+    enum Spoiled {
+        Removed,
+        NoOauth,
+        Malformed,
+    }
+
+    impl Spoiled {
+        fn apply(self, root: &Path) {
+            match self {
+                Spoiled::Removed => std::fs::remove_file(root.join("auth.toml")).unwrap(),
+                Spoiled::NoOauth => std::fs::write(
+                    root.join("auth.toml"),
+                    // The client secret serves [oauth]'s web sign-in only: without [oauth], none.
+                    "[github]\nclient_id = \"Iv1.x\"\n[[github.allow]]\nusers = [\"a\"]\n",
+                )
+                .unwrap(),
+                Spoiled::Malformed => std::fs::write(root.join("auth.toml"), "[oauth\n").unwrap(),
+            }
+        }
+    }
+
+    const SPOILED: [Spoiled; 3] = [Spoiled::Removed, Spoiled::NoOauth, Spoiled::Malformed];
+
+    /// The flow cookies a callback may come back with: an operation's, a gate's, one tampered with, none.
+    fn callback_requests(server: &Server) -> [(bool, Request<http_body_util::Full<Bytes>>); 4] {
+        let browser = "b".repeat(64);
+        let uri = |query: &str| format!("/bd/oauth/github/callback?{query}");
+        let (query, cookie) = authorize::operation::test_callback(&server.flows, PUBLIC, true, &browser);
+        let op = built(Method::GET, &uri(&query), &format!("__Secure-bd_oauth={browser}; {cookie}"), "");
+        let (gate_query, gate_cookie) = authorize::operation::test_callback(&server.flows, PUBLIC, false, &browser);
+        let gate = built(Method::GET, &uri(&gate_query), &gate_cookie, "");
+        let tampered = built(Method::GET, &uri(&query), &cookie.replacen('=', "=x", 1), "");
+        let none = built(Method::GET, &uri(&query), "", "");
+        [(true, op), (false, gate), (false, tampered), (false, none)]
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_operation_callback_the_settings_or_slots_stop_is_recorded_once() {
+        use authorize::operation::take_recorded;
+        let _ = take_recorded();
+        let failed = vec![(
+            authorize::Outcome::Failed,
+            "proj".to_string(),
+            "close".to_string(),
+            "t-1".to_string(),
+            "sign-in settings unavailable",
+        )];
+        for spoiled in SPOILED {
+            let root = tempfile::tempdir().unwrap();
+            let server = Arc::new(offering(root.path()));
+            let requests = callback_requests(&server);
+            spoiled.apply(root.path());
+            let status = match spoiled {
+                Spoiled::Removed | Spoiled::NoOauth => StatusCode::NOT_FOUND,
+                Spoiled::Malformed => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            for (operation, req) in requests {
+                let r = authorizing(&server, Authorizing::Callback, req).await;
+                assert_eq!(r.status(), status, "{spoiled:?}");
+                let expected = if operation { failed.clone() } else { vec![] };
+                assert_eq!(take_recorded(), expected, "{spoiled:?}, an operation's: {operation}");
+            }
+        }
+        // Every sign-in slot taken: busy, recorded for an operation's flow only.
+        let root = tempfile::tempdir().unwrap();
+        let server = Arc::new(offering(root.path()));
+        let _held = server.sign_ins.clone().try_acquire_many_owned(MAX_SIGN_INS as u32).unwrap();
+        for (operation, req) in callback_requests(&server) {
+            let r = authorizing(&server, Authorizing::Callback, req).await;
+            assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let expected = if operation {
+                vec![(authorize::Outcome::Busy, "proj".into(), "close".into(), "t-1".into(), "too many sign-ins")]
+            } else {
+                vec![]
+            };
+            assert_eq!(take_recorded(), expected, "an operation's: {operation}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_operation_post_the_settings_stop_is_recorded_once_if_its_page_was_shown() {
+        use authorize::operation::take_recorded;
+        use bd_cli::approval_link::{Op, OperationRequest};
+        let _ = take_recorded();
+        for spoiled in SPOILED {
+            let root = tempfile::tempdir().unwrap();
+            let server = Arc::new(offering(root.path()));
+            let request = OperationRequest::new("proj".into(), Op::Close, "t-1".into(), "agent".into(), 0);
+            authorize::operation::test_put_operation(&server.flows, "live", request);
+            spoiled.apply(root.path());
+            let post = |path: &str, body: &str| built(Method::POST, path, "", body);
+            let gate = gate_approval(&server, "proj", "t-1", post("/bd/w/proj/gates/t-1", "approval=live")).await;
+            let r =
+                operation_approval(&server, "proj", Op::Close, "t-1", post("/bd/w/proj/close/t-1", "approval=live"))
+                    .await;
+            assert_eq!(r.status(), gate.status(), "{spoiled:?}: the gate page's answer");
+            // Settings that cannot be used are logged, and the page is not found, as for a gate's.
+            let status = StatusCode::NOT_FOUND;
+            assert_eq!(r.status(), status, "{spoiled:?}");
+            assert_eq!(
+                take_recorded(),
+                vec![(
+                    authorize::Outcome::Failed,
+                    "proj".to_string(),
+                    "close".to_string(),
+                    "t-1".to_string(),
+                    "sign-in settings unavailable"
+                )],
+                "{spoiled:?}"
+            );
+            let still = authorize::pending_operation(&server.flows, "live", "proj", "close", "t-1");
+            assert!(still.is_some(), "{spoiled:?}: left waiting");
+            // Nothing that names no page shown for this path is recorded, nor a GET.
+            let big = format!("approval=live&x={}", "y".repeat(MAX_CONSENT_BODY));
+            for (op, issue, req) in [
+                (Op::Close, "t-1", post("/bd/w/proj/close/t-1", "approval=nope")),
+                (Op::Discard, "t-1", post("/bd/w/proj/discard/t-1", "approval=live")),
+                (Op::Close, "t-2", post("/bd/w/proj/close/t-2", "approval=live")),
+                (Op::Close, "t-1", post("/bd/w/proj/close/t-1", "")),
+                (Op::Close, "t-1", post("/bd/w/proj/close/t-1", &big)),
+                (Op::Close, "t-1", built(Method::GET, "/bd/w/proj/close/t-1?request=x", "", "approval=live")),
+            ] {
+                let r = operation_approval(&server, "proj", op, issue, req).await;
+                assert_eq!(r.status(), status, "{spoiled:?} {op} {issue}");
+            }
+            assert_eq!(take_recorded(), vec![], "{spoiled:?}");
+        }
+        // Without --public-url, nothing is an operation's page: nothing recorded.
+        let root = tempfile::tempdir().unwrap();
+        let mut plain = offering(root.path());
+        plain.public_url = None;
+        let plain = Arc::new(plain);
+        let request = OperationRequest::new("proj".into(), Op::Close, "t-1".into(), "agent".into(), 0);
+        authorize::operation::test_put_operation(&plain.flows, "live", request);
+        let r = operation_approval(
+            &plain,
+            "proj",
+            Op::Close,
+            "t-1",
+            built(Method::POST, "/w/proj/close/t-1", "", "approval=live"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        assert_eq!(take_recorded(), vec![]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn operation_posts_from_other_sites_or_without_slots_are_refused_and_recorded() {
+        use authorize::operation::take_recorded;
+        use bd_cli::approval_link::Op;
+        let _ = take_recorded();
+        let root = tempfile::tempdir().unwrap();
+        let server = Arc::new(offering(root.path()));
+        let cross = Request::builder()
+            .method(Method::POST)
+            .uri("/bd/w/proj/close/t-1")
+            .header(header::ORIGIN, "https://evil.example")
+            .body(http_body_util::Full::new(Bytes::from("approval=x")))
+            .unwrap();
+        let r = operation_approval(&server, "proj", Op::Close, "t-1", cross).await;
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+        let recorded = take_recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!((recorded[0].0, recorded[0].4), (authorize::Outcome::Refused, "cross-site"));
+        let _held = server.sign_ins.clone().try_acquire_many_owned(MAX_SIGN_INS as u32).unwrap();
+        let r = operation_approval(
+            &server,
+            "proj",
+            Op::Close,
+            "t-1",
+            built(Method::POST, "/bd/w/proj/close/t-1", "", "approval=x"),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let recorded = take_recorded();
+        assert_eq!((recorded.len(), recorded[0].0), (1, authorize::Outcome::Busy));
+        // Other methods: 405, not recorded; a GET begins without recording.
+        let r =
+            operation_approval(&server, "proj", Op::Close, "t-1", built(Method::PUT, "/bd/w/proj/close/t-1", "", ""))
+                .await;
+        assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(take_recorded(), vec![]);
+    }
+
+    #[test]
+    fn operation_links_are_served_under_the_public_path_or_stripped_only() {
+        use bd_cli::approval_link::Op;
+        let mut server = Server::new(PathBuf::from("."), 1, Waits::default());
+        server.public_url = Some("https://x/bd".into());
+        assert_eq!(op_path(&server, "/bd/w/proj/close/t-1"), Some(("proj", Op::Close, "t-1")));
+        assert_eq!(op_path(&server, "/w/proj/discard/t-1.2"), Some(("proj", Op::Discard, "t-1.2")), "stripped");
+        for elsewhere in [
+            "/w/proj/delete/t-1",
+            "/w/proj/close/t-1/x",
+            "/w/proj/close/",
+            "/w//close/t-1",
+            "/other/w/proj/close/t-1",
+            "/w/proj/gates/t-1",
+            "/w/proj/mcp",
+            "/w/proj/v2/exec",
+        ] {
+            assert_eq!(op_path(&server, elsewhere), None, "{elsewhere}");
+        }
     }
 
     #[test]

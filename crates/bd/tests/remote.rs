@@ -9014,7 +9014,8 @@ fn oauth_clients_register_without_a_token_for_allowed_redirects() {
 }
 
 thread_local! {
-    /// The flow cookies the test browser was given (`bd_flow_*`), sent back as a browser would.
+    /// The flow cookies the test browser was given (`bd_flow_*`, and an operation link's `bd_opreq_*`), sent back
+    /// as a browser would.
     static FLOW_COOKIES: std::cell::RefCell<std::collections::BTreeMap<String, String>> = Default::default();
 }
 
@@ -9049,7 +9050,7 @@ fn browse(url: &str, cookie: Option<&str>, post: Option<(&str, &str)>) -> (u16, 
     };
     for set in r.headers().get_all("set-cookie").iter().filter_map(|v| v.to_str().ok()) {
         let Some((name, rest)) = set.split_once('=') else { continue };
-        if name.contains("bd_flow_") {
+        if name.contains("bd_flow_") || name.contains("bd_opreq_") {
             let value = rest.split(';').next().unwrap_or_default().to_string();
             FLOW_COOKIES.with(|jar| match set.contains("Max-Age=0") {
                 true => jar.borrow_mut().remove(name),
@@ -11099,9 +11100,11 @@ impl Signed {
         self.page[at..at + self.page[at..].find('"').unwrap()].to_string()
     }
 
-    /// The `Set-Cookie` line of the approval's own cookie.
+    /// The `Set-Cookie` line of the approval's own cookie: a gate's, or an operation's.
     fn cookie_line(&self) -> String {
-        cookie_line(&self.headers, "__Secure-bd_gate_").unwrap_or_else(|| panic!("no gate cookie: {:?}", self.headers))
+        cookie_line(&self.headers, "__Secure-bd_gate_")
+            .or_else(|| cookie_line(&self.headers, "__Secure-bd_op_"))
+            .unwrap_or_else(|| panic!("no approval cookie: {:?}", self.headers))
     }
 
     /// `name=value` of the approval's own cookie, as the browser sends it back.
@@ -12270,5 +12273,467 @@ fn people_review_waiting_gates_with_the_keychain_token_only() {
     assert!(exec.iter().any(|l| l.contains(r#"command="info""#)), "{text}");
     for l in &exec {
         assert!(l.contains("token=carol-desk") && !l.contains("alice-laptop"), "{l}");
+    }
+}
+
+// Closes and discards that open human gates refused, approved in the browser.
+
+/// The actor of the agent token asking for closes and discards in the operation tests.
+const AGENT: &str = "agent";
+
+/// The playbook of [`OpIds::run`]: a first step anyone can do, then a step behind a human gate that waits for it,
+/// so the gate is not armed yet, and a last step.
+const RETIRE_PLAYBOOK: &str = "title = \"Retire <b>old</b>\"\n\
+    [[steps]]\nid = \"first\"\ntitle = \"First\"\n\
+    [[steps]]\nid = \"second\"\ntitle = \"Second\"\nneeds = [\"first\"]\n[steps.gate]\ntype = \"human\"\n\
+    [[steps]]\nid = \"third\"\ntitle = \"Third\"\nneeds = [\"second\"]\n";
+
+/// The playbook of [`OpIds::carol_run`]: one step behind a gate only github:carol may approve.
+const ROTATE_PLAYBOOK: &str = "title = \"Rotate\"\n[[steps]]\nid = \"rotate\"\ntitle = \"Rotate\"\n\
+    [steps.gate]\ntype = \"human\"\napprovers = [\"github:carol\"]\n";
+
+/// What [`op_root`] adds to [`gate_root`]'s workspace proj.
+struct OpIds {
+    /// A run (`Retire <b>old</b>`) holding the human gate [`OpIds::run_gate`], not armed.
+    run: String,
+    run_gate: String,
+    /// A run whose only gate, [`OpIds::carol_gate`], names github:carol alone.
+    carol_run: String,
+    carol_gate: String,
+    /// A task [`AGENT`] claimed before a human gate came to hold it back.
+    claimed: String,
+}
+
+/// [`gate_root`] with the GitHub rules of the gate tests, and [`OpIds`] in workspace proj.
+fn op_root(github: &FakeGithub) -> (TempDir, GateIds, OpIds) {
+    let (root, ids) = gate_root(github, GATE_RULES);
+    let ws = root.path().join("proj");
+    let run = |actor: &str, args: &[&str]| {
+        let out = bd(&ws).env("BD_ACTOR", actor).args(args).output().unwrap();
+        check(out, &format!("bd {args:?}")).trim().to_string()
+    };
+    let playbooks = ws.join(".bd").join("playbooks");
+    write(&playbooks, "retire.toml", RETIRE_PLAYBOOK);
+    write(&playbooks, "rotate.toml", ROTATE_PLAYBOOK);
+    let started = |name: &str| {
+        let started: Value = serde_json::from_str(&run("setup", &["--json", "playbook", "run", name])).unwrap();
+        started["run"]["id"].as_str().unwrap().to_string()
+    };
+    let (retire, rotate) = (started("retire"), started("rotate"));
+    let run_gate = format!("{retire}.gate-second");
+    let shown: Value = serde_json::from_str(&run("setup", &["--json", "gate", "show", &run_gate])).unwrap();
+    assert_ne!(shown["phase"], "armed", "{shown}");
+    let claimed = run("setup", &["-q", "create", "Claimed work"]);
+    run(AGENT, &["claim", &claimed, "--ttl", "60m"]);
+    run("setup", &["-q", "gate", "create", "-t", "human", "--blocks", &claimed, "--title", "Hold the claimed work"]);
+    let op = OpIds { run: retire, run_gate, carol_gate: format!("{rotate}.gate-rotate"), carol_run: rotate, claimed };
+    (root, ids, op)
+}
+
+/// The URL of the line of `stderr` offering an operation's approval in a browser.
+fn op_link(stderr: &str) -> String {
+    let marker = " in a browser: ";
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("approve the close of ") || l.starts_with("approve the discard of "))
+        .unwrap_or_else(|| panic!("no operation link: {stderr}"));
+    line[line.find(marker).unwrap() + marker.len()..].to_string()
+}
+
+/// Whether `stderr` says anything of an operation's approval link: a link, why there is none, or the JSON key.
+fn says_op_link(stderr: &str) -> bool {
+    stderr.contains("approve the close of")
+        || stderr.contains("approve the discard of")
+        || stderr.contains("no browser approval link")
+        || stderr.contains("operation_approval_url")
+}
+
+/// GET an operation's link (`url`, on the public URL), then the chooser it leads to: both answers. The test browser
+/// keeps the request cookies the first sets, for the callback.
+fn op_begin(server: &Server, url: &str) -> (Answered, Answered) {
+    let first = browse(&local_url(server, url), None, None);
+    assert_eq!(first.0, 302, "{}", first.2);
+    assert!(cookies_from(&first.1).contains("__Secure-bd_opreq_"), "{:?}", first.1);
+    let choose = location(&first.1);
+    assert!(choose.starts_with(&format!("{PUBLIC}/bd/oauth/choose?flow=")), "{choose}");
+    let second = browse(&local_url(server, &choose), None, None);
+    (first, second)
+}
+
+/// Open an operation's link in a fresh browser and sign in at GitHub as `login`.
+fn approve_op_flow(server: &Server, github: &FakeGithub, login: &str, url: &str) -> Signed {
+    github.next(login, 0);
+    let (_, choose) = op_begin(server, url);
+    signed_in_at_github(server, github, &choose)
+}
+
+/// The path of the approval page of `op` of `id` in proj, under the public URL's path.
+fn op_path(op: &str, id: &str) -> String {
+    format!("/bd/w/proj/{op}/{id}")
+}
+
+/// Approve what `signed` shows at `path`, from its browser, as the approval page posts it.
+fn post_op(server: &Server, path: &str, signed: &Signed) -> Answered {
+    let body = format!("approval={}", signed.approval());
+    post_gate(&format!("{}{path}", server.base), Some(PUBLIC), None, &signed.cookie(), &body)
+}
+
+/// `bd_serve_operation_approvals_total` by outcome, read with the admin token `admin`.
+fn operations_counted(server: &Server, admin: &str) -> std::collections::BTreeMap<&'static str, u64> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().proxy(None).build().into();
+    let mut answer =
+        agent.get(format!("{}/metrics", server.base)).header("authorization", format!("Bearer {admin}")).call();
+    let text = answer.as_mut().unwrap().body_mut().read_to_string().unwrap();
+    ["approved", "refused", "not_ready", "gone", "busy", "failed"]
+        .into_iter()
+        .map(|outcome| {
+            let series = format!("bd_serve_operation_approvals_total{{outcome=\"{outcome}\"}} ");
+            let line = text.lines().find(|l| l.starts_with(&series)).unwrap_or_else(|| panic!("{series}: {text}"));
+            (outcome, line[series.len()..].parse().unwrap())
+        })
+        .collect()
+}
+
+/// [`operations_counted`]'s counts that are not zero.
+fn operations_not_zero(server: &Server, admin: &str) -> Vec<(&'static str, u64)> {
+    operations_counted(server, admin).into_iter().filter(|(_, n)| *n > 0).collect()
+}
+
+/// The `deleted` events, read on the server's host.
+fn deleted_events(server: &Server) -> Vec<Value> {
+    let out = server.local("ops", &["--json", "events", "--since", "0", "--op", "deleted"]);
+    check(out, "events")
+        .lines()
+        .map(|l| serde_json::from_str::<Value>(l).unwrap())
+        .filter(|e| e["op"] == "deleted")
+        .collect()
+}
+
+#[test]
+fn people_approve_a_close_then_a_discard_operation_in_the_browser() {
+    let github = FakeGithub::start();
+    let (root, _, op) = op_root(&github);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let ops = server.token("ops", "ops", &["--role", "admin"]);
+    let agent = server.client(&server.token("agent", AGENT, &[]));
+    assert_eq!(operations_not_zero(&server, &ops), []);
+
+    // The agent's forced close of the run, refused at the human gate inside it: a link to ask a person.
+    let out = agent.run(&["close", &op.run, "--force", "-r", "abandoned"]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert!(lines[0].starts_with("error: "), "{stderr}");
+    // After the gate's own link.
+    let gate = format!("approve in a browser: {PUBLIC}/bd/w/proj/gates/{}", op.run_gate);
+    let link = format!("approve the close of {0} in a browser: {PUBLIC}/bd/w/proj/close/{0}?request=", op.run);
+    assert!(lines[1] == gate && lines[2].starts_with(&link), "{stderr}");
+    let url = op_link(&stderr);
+    let out = agent.run(&["--json", "close", &op.run, "--force", "-r", "abandoned"]);
+    assert_eq!(out.status.code(), Some(7));
+    let error: Value = serde_json::from_str(stderr_of(&out).trim()).unwrap();
+    let json_url = error["error"]["operation_approval_url"].as_str().unwrap_or_else(|| panic!("{error}"));
+    assert!(json_url.starts_with(&format!("{PUBLIC}/bd/w/proj/close/{}?request=", op.run)), "{error}");
+    assert_eq!(shown_on_host(&server, &op.run)["status"], "open");
+
+    let signed = approve_op_flow(&server, &github, "alice", &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    for shown in [
+        format!("<h1>Approve the close of {}?</h1>", op.run),
+        "You're signed in to GitHub as <b>github:alice</b>. <b>agent</b> asked for this".to_string(),
+        "<div><dt>Workspace</dt><dd>proj</dd></div>".to_string(),
+        "<div><dt>Operation</dt><dd>close</dd></div>".to_string(),
+        format!("<code>{}</code> Retire &lt;b&gt;old&lt;/b&gt;", op.run),
+        "<blockquote class=\"reason\">abandoned</blockquote>".to_string(),
+        "<div><dt>Requested by</dt><dd>agent</dd></div>".to_string(),
+        "Forced past open work and blockers".to_string(),
+        format!("<code>{}</code>", op.run_gate),
+        "approvers: any person".to_string(),
+        format!("action=\"{PUBLIC}/bd/w/proj/close/{}\"", op.run),
+    ] {
+        assert!(signed.page.contains(&shown), "{shown}: {}", signed.page);
+    }
+    assert!(!signed.page.contains("<b>old</b>"), "escaped");
+    let set = signed.cookie_line();
+    let path = format!("; Path=/bd/w/proj/close/{}; Max-Age=600; HttpOnly; SameSite=Strict; Secure", op.run);
+    assert!(set.starts_with("__Secure-bd_op_") && set.ends_with(&path), "{set}");
+    let csp = signed.headers.get("content-security-policy").unwrap().to_str().unwrap();
+    for directive in ["form-action 'self'", "frame-ancestors 'none'", "script-src 'sha256-"] {
+        assert!(csp.contains(directive), "{directive}: {csp}");
+    }
+    assert_eq!(signed.headers.get("cache-control").unwrap(), "no-store");
+    // The request rode through the sign-in in cookies of its own, cleared once back.
+    assert!(cookies_from(&signed.headers).contains("bd_opreq_"), "{:?}", signed.headers);
+
+    let (status, headers, page) = post_op(&server, &op_path("close", &op.run), &signed);
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("recorded as done by github:alice"), "{page}");
+    assert!(cookies_from(&headers).contains("Max-Age=0"), "its cookie is cleared: {headers:?}");
+    let closed = closed_events(&server, &op.run);
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["actor"], "github:alice");
+    assert_eq!(closed[0]["data"]["reason"], "abandoned");
+    assert_eq!(closed[0]["data"]["via"], "browser");
+    assert_eq!(closed[0]["data"]["requested_by"], AGENT);
+    // Exactly the close asked for: the run's gate and steps stay as they were.
+    assert_eq!(shown_on_host(&server, &op.run)["status"], "closed");
+    assert_eq!(shown_on_host(&server, &op.run_gate)["status"], "open");
+    assert_eq!(operations_not_zero(&server, &ops), [("approved", 1)]);
+
+    // A discard removes what the forced close left: refused at the gate, approved by a person.
+    let out = agent.run(&["playbook", "discard", &op.run, "-r", "  cleanup "]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    let link = format!("approve the discard of {0} in a browser: {PUBLIC}/bd/w/proj/discard/{0}?request=", op.run);
+    assert!(stderr.lines().any(|l| l.starts_with(&link)), "{stderr}");
+    let signed = approve_op_flow(&server, &github, "alice", &op_link(&stderr));
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    for shown in [
+        format!("<h1>Approve the discard of {}?</h1>", op.run),
+        "<blockquote class=\"reason\">  cleanup </blockquote>".to_string(),
+        "Deletes 5 issues, with no undo".to_string(),
+        format!("<code>{}.third</code> Third", op.run),
+    ] {
+        assert!(signed.page.contains(&shown), "{shown}: {}", signed.page);
+    }
+    let (status, _, page) = post_op(&server, &op_path("discard", &op.run), &signed);
+    assert_eq!(status, 200, "{page}");
+    assert!(page.contains("5 issues deleted"), "{page}");
+    let deleted = deleted_events(&server);
+    let mut gone: Vec<&str> = deleted.iter().map(|e| e["issue_id"].as_str().unwrap()).collect();
+    gone.sort();
+    let mut expected: Vec<String> =
+        ["", ".first", ".second", ".gate-second", ".third"].iter().map(|s| format!("{}{s}", op.run)).collect();
+    expected.sort();
+    assert_eq!(gone, expected, "{deleted:?}");
+    for e in &deleted {
+        assert_eq!(e["actor"], "github:alice", "{e}");
+        assert_eq!(e["data"]["reason"], "  cleanup ", "{e}");
+        assert_eq!(e["data"]["via"], "browser", "{e}");
+        assert_eq!(e["data"]["requested_by"], AGENT, "{e}");
+    }
+    assert_eq!(operations_not_zero(&server, &ops), [("approved", 2)]);
+}
+
+#[test]
+fn operation_approval_carries_a_reason_of_2000_bytes_of_quotes_and_newlines() {
+    let github = FakeGithub::start();
+    let (root, ids, _) = op_root(&github);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let agent = server.client(&server.token("agent", AGENT, &[]));
+
+    // One byte too many: no link, and why.
+    let long = format!("{}x", "\"\n".repeat(1000));
+    let out = agent.run(&["close", &ids.task, "--force", "-r", &long]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    let why = format!("no browser approval link for the close of {}: the reason is longer than 2000 bytes", ids.task);
+    assert!(stderr.lines().any(|l| l == why), "{stderr}");
+    assert!(!stderr.contains("approve the close of"), "{stderr}");
+
+    let reason = "\"\n".repeat(1000);
+    let out = agent.run(&["close", &ids.task, "--force", "-r", &reason]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    // The armed gate's own link first, then the operation's.
+    let lines: Vec<&str> = stderr.lines().collect();
+    let gate = lines.iter().position(|l| l.starts_with("approve in a browser: ")).unwrap_or_else(|| panic!("{stderr}"));
+    let close = lines.iter().position(|l| l.starts_with("approve the close of ")).unwrap_or_else(|| panic!("{stderr}"));
+    assert!(lines[0].starts_with("error: ") && gate < close, "{stderr}");
+    let url = op_link(&stderr);
+    assert!(url.len() < 8192, "{}", url.len());
+
+    let signed = approve_op_flow(&server, &github, "alice", &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let shown = format!("<blockquote class=\"reason\">{}</blockquote>", "&quot;\n".repeat(1000));
+    assert!(signed.page.contains(&shown), "{}", signed.page);
+    let (status, _, page) = post_op(&server, &op_path("close", &ids.task), &signed);
+    assert_eq!(status, 200, "{page}");
+    let closed = closed_events(&server, &ids.task);
+    assert_eq!(closed.len(), 1, "{closed:?}");
+    assert_eq!(closed[0]["data"]["reason"], reason.as_str());
+    assert_eq!(closed[0]["data"]["requested_by"], AGENT);
+    // Exactly the close: the gate is left open.
+    assert_eq!(shown_on_host(&server, &ids.human)["status"], "open");
+}
+
+#[test]
+fn operation_approvals_refuse_tampering_foreign_posts_replays_and_ineligible_people() {
+    let github = FakeGithub::start();
+    let (root, ids, op) = op_root(&github);
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let ops = server.token("ops", "ops", &["--role", "admin"]);
+    let agent = server.client(&server.token("agent", AGENT, &[]));
+    let out = agent.run(&["close", &ids.task, "--force", "-r", "deploy is off"]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    let url = op_link(&stderr_of(&out));
+
+    // A link this server did not give, or not for this path: nothing is there. One too long: refused unread.
+    let (front, token) = url.split_once("?request=").unwrap();
+    let mut chars: Vec<char> = token.chars().collect();
+    chars[20] = if chars[20] == 'A' { 'B' } else { 'A' };
+    let tampered = format!("{front}?request={}", chars.into_iter().collect::<String>());
+    let discard = url.replacen("/close/", "/discard/", 1);
+    for (what, link) in [("tampered", tampered), ("another operation", discard)] {
+        let (status, headers, page) = browse(&local_url(&server, &link), None, None);
+        assert_eq!(status, 404, "{what}: {page}");
+        assert!(!cookies_from(&headers).contains("bd_opreq_"), "{what}: {headers:?}");
+    }
+    let (status, _, page) = browse(&local_url(&server, &format!("{url}&pad={}", "a".repeat(9000))), None, None);
+    assert_eq!(status, 400, "{page}");
+    assert!(page.contains("too long"), "{page}");
+
+    let signed = approve_op_flow(&server, &github, "alice", &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let target = format!("{}{}", server.base, op_path("close", &ids.task));
+    let body = format!("approval={}", signed.approval());
+    let cookie = signed.cookie();
+    // Another site's form.
+    let (status, _, page) = post_gate(&target, Some("https://evil.example"), None, &cookie, &body);
+    assert_eq!(status, 403, "{page}");
+    assert!(page.contains("another site"), "{page}");
+    // Another browser.
+    let (name, _) = cookie.split_once('=').unwrap();
+    let (status, _, page) = post_gate(&target, Some(PUBLIC), None, &format!("{name}={}", "0".repeat(64)), &body);
+    assert_eq!(status, 403, "{page}");
+    assert!(page.contains("different browser"), "{page}");
+    assert_eq!(shown_on_host(&server, &ids.task)["status"], "open");
+    // This browser: once.
+    let (status, _, page) = post_op(&server, &op_path("close", &ids.task), &signed);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(shown_on_host(&server, &ids.task)["status"], "closed");
+    let (status, _, page) = post_op(&server, &op_path("close", &ids.task), &signed);
+    assert_eq!(status, 400, "{page}");
+    assert!(page.contains("already used"), "{page}");
+    assert_eq!(closed_events(&server, &ids.task).len(), 1);
+
+    // A gate only carol may approve: alice may not get past it.
+    let out = agent.run(&["close", &op.carol_run, "--force"]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    let signed = approve_op_flow(&server, &github, "alice", &op_link(&stderr));
+    assert_eq!(signed.status, 403, "{}", signed.page);
+    assert!(signed.page.contains(&op.carol_gate) && signed.page.contains("github:carol"), "{}", signed.page);
+    assert!(!signed.has_form() && cookie_line(&signed.headers, "__Secure-bd_op_").is_none(), "{}", signed.page);
+    assert_eq!(shown_on_host(&server, &op.carol_run)["status"], "open");
+
+    // Work the requester itself claimed: the approval does not take the claim over.
+    let out = agent.run(&["close", &op.claimed, "--force", "-r", "done after all"]);
+    let stderr = stderr_of(&out);
+    assert_eq!(out.status.code(), Some(7), "{stderr}");
+    let signed = approve_op_flow(&server, &github, "alice", &op_link(&stderr));
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = post_op(&server, &op_path("close", &op.claimed), &signed);
+    assert_eq!(status, 403, "{page}");
+    assert!(page.contains("released first") && page.contains("Nothing was changed"), "{page}");
+    let shown = shown_on_host(&server, &op.claimed);
+    assert_eq!((&shown["status"], &shown["assignee"]), (&json!("in_progress"), &json!(AGENT)), "{shown}");
+    assert!(closed_events(&server, &op.claimed).is_empty());
+
+    // No link for what a person cannot approve here, or was not asked as one operation.
+    for args in [
+        vec!["close", &op.carol_gate, "--force"],
+        vec!["close", &op.claimed, &op.run, "--force"],
+        vec!["close", &op.run, "--force", "--take-over"],
+        vec!["playbook", "discard", &op.run, "--dry-run"],
+        vec!["playbook", "discard", &op.run, "--take-over"],
+        vec!["delete", &op.run_gate, "--force"],
+    ] {
+        for json in [false, true] {
+            let args = if json { [&["--json"][..], &args].concat() } else { args.clone() };
+            let out = agent.run(&args);
+            let stderr = stderr_of(&out);
+            assert!(!says_op_link(&stderr), "{args:?}: {stderr}");
+        }
+    }
+    assert_eq!(shown_on_host(&server, &op.run)["status"], "open");
+    assert_eq!(operations_not_zero(&server, &ops), [("approved", 1), ("refused", 5)]);
+}
+
+#[test]
+fn operation_approvals_are_logged_once_each_without_the_reason() {
+    let github = FakeGithub::start();
+    let (root, ids, _) = op_root(&github);
+    let (server, log) = logged_server(root, PUBLIC_URL);
+    let agent = server.client(&server.token("agent", AGENT, &[]));
+    let out = agent.run(&["close", &ids.task, "--force", "-r", "SECRET-REASON-PKT"]);
+    assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+    let url = op_link(&stderr_of(&out));
+
+    let signed = approve_op_flow(&server, &github, "alice", &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let path = op_path("close", &ids.task);
+    let body = format!("approval={}", signed.approval());
+    let target = format!("{}{path}", server.base);
+    let (status, _, _) = post_gate(&target, Some("https://evil.example"), None, &signed.cookie(), &body);
+    assert_eq!(status, 403);
+    assert_eq!(post_op(&server, &path, &signed).0, 200);
+    assert_eq!(post_op(&server, &path, &signed).0, 400);
+
+    // A callback from a client without the browser's cookie: refused, and logged as one too.
+    github.next("alice", 0);
+    let (_, choose) = op_begin(&server, &url);
+    assert_eq!(choose.0, 302, "{}", choose.2);
+    let (status, headers, _) = browse(&location(&choose.1), None, None);
+    assert_eq!(status, 302);
+    let (status, _, page) = browse(&local_url(&server, &location(&headers)), None, None);
+    assert_eq!(status, 400, "{page}");
+    assert!(page.contains("different browser"), "{page}");
+
+    let lines = || -> Vec<String> {
+        let text = std::fs::read_to_string(&log).unwrap();
+        text.lines().filter(|l| l.contains("operation approval")).map(String::from).collect()
+    };
+    eventually("the approvals' log lines", || lines().len() >= 4);
+    let lines = lines();
+    assert_eq!(lines.len(), 4, "{lines:#?}");
+    let has = |line: &str, field: &str, value: &str| {
+        line.contains(&format!("{field}={value}")) || line.contains(&format!("{field}=\"{value}\""))
+    };
+    for (line, outcome, detail, alice) in [
+        (&lines[0], "refused", "cross-site", false),
+        (&lines[1], "approved", "performed", true),
+        (&lines[2], "refused", "already used", false),
+        (&lines[3], "refused", "different browser", false),
+    ] {
+        assert!(has(line, "outcome", outcome) && has(line, "detail", detail), "{line}");
+        assert!(has(line, "workspace", "proj") && has(line, "op", "close") && has(line, "issue", &ids.task), "{line}");
+        assert!(line.contains("bd::serve"), "{line}");
+        if alice {
+            assert!(has(line, "provider", "github") && has(line, "login", "alice"), "{line}");
+            assert!(has(line, "actor", "github:alice"), "{line}");
+        }
+    }
+    // Only the provider the sign-in started with is known when its callback is refused.
+    assert!(has(&lines[3], "provider", "github"), "{}", lines[3]);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(!text.contains("SECRET-REASON-PKT"), "never the reason: {text}");
+}
+
+#[test]
+fn operation_links_need_a_public_url() {
+    let github = FakeGithub::start();
+    let (root, _, op) = op_root(&github);
+    // Sign-in without the authorization server and its browser sign-in, which need a public URL.
+    let config = root.path().join("auth.toml");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let (without, _) = text.split_once("\n[oauth]\n").unwrap();
+    std::fs::write(&config, without.replacen("client_secret_file = \"github-secret\"\n", "", 1)).unwrap();
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    let agent = server.client(&server.token("agent", AGENT, &[]));
+    for args in [
+        vec!["close", op.run.as_str(), "--force", "-r", "abandoned"],
+        vec!["--json", "close", &op.run, "--force"],
+        vec!["playbook", "discard", &op.run, "-r", "cleanup"],
+        vec!["--json", "playbook", "discard", &op.run],
+    ] {
+        let out = agent.run(&args);
+        let stderr = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(7), "{args:?}: {stderr}");
+        assert!(!says_op_link(&stderr), "{args:?}: {stderr}");
+    }
+    for path in [format!("/w/proj/close/{}", op.run), "/bd/w/proj/close/x".to_string(), "/w/proj/discard/x".into()] {
+        let (status, _, page) = browse(&format!("{}{path}?request=abc", server.base), None, None);
+        assert_eq!(status, 404, "{path}: {page}");
     }
 }

@@ -161,12 +161,17 @@ Delete a run and all its issues
 Deletes the run issue and every issue below it, with no undo, and drops the
 edges other issues have to them. Use it for a run started by mistake or given
 up. Work in progress in the run is refused unless --force (the actor's own or
-dead claims) or --take-over (other actors' live claims).";
+dead claims) or --take-over (other actors' live claims). The reason (-r) is
+recorded in each deleted event; one that is empty or only whitespace is none.
+Under bd serve, a discard refused only at open human gates may print a link
+for a person to approve it in a browser (`approve the discard of <run> in a
+browser: <url>`; `operation_approval_url` with --json).";
 
 const PLAYBOOK_DISCARD_EXAMPLES: &str = "\
 Examples:
   bd playbook discard bd-7 --dry-run
-  bd playbook discard bd-7 --force";
+  bd playbook discard bd-7 --force
+  bd playbook discard bd-7 -r 'started by mistake'";
 
 #[derive(Args, Debug, Clone)]
 #[command(after_long_help = PLAYBOOK_DISCARD_EXAMPLES)]
@@ -191,6 +196,9 @@ pub struct DiscardArgs {
     pub take_over: bool,
     #[arg(long, help = DRY_RUN_HELP)]
     pub dry_run: bool,
+    /// Reason recorded in each deleted event
+    #[arg(short, long)]
+    pub reason: Option<String>,
 }
 
 const PLAYBOOK_EXTRACT_LONG_ABOUT: &str = "\

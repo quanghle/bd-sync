@@ -243,7 +243,7 @@ directory.
 bd playbook run ship --var version=1.2.0 [--title T] [--assignee A] [--parent ID] [--after ID,...] [--ephemeral|--persistent] [--dry-run]
 bd playbook runs [--all] [--playbook NAME] [-n 50]   # runs and their progress
 bd playbook compact t-12 [-s SUMMARY]                # a finished run: digest in its notes, steps deleted
-bd playbook discard t-12                             # delete a run and every issue in it
+bd playbook discard t-12 [-r REASON]                 # delete a run and every issue in it
 bd playbook extract t-9 --save --name onboarding     # write a playbook from any epic (-o FILE)
 ```
 
@@ -261,6 +261,10 @@ and gate in a single transaction, with readable ids `<run>.<step>`.
   `--take-over` (other actors' claims in the run). `bd playbook compact`
   folds a run; to summarise the text of old closed issues instead, see `bd
   compact` ([Compaction](concepts.md#compaction)).
+- `discard -r <reason>` records the reason, byte for byte, in each
+  `deleted` event (`"reason"`); one that is empty or only whitespace is
+  none. A discard that open human gates in the run refuse (exit 7) can be
+  approved by a person in a browser through `bd serve` (below).
 
 **Fan-out at run time.** Give a collector step `needs = ["spawn"]` and
 `waits_for = "all-children"`, then create children under the spawner step
@@ -364,7 +368,22 @@ human gate that is armed or escalated:
   line (`--json`: `approval_url` on its node);
 - `bd gate show` adds `approve in a browser: <url>`, and for any gate in a
   run `part of: <id> <title>` (`--json`: `approval_url` and `part_of`
-  `{id, title}`); `bd gate list --json` adds `approval_url` to such gates.
+  `{id, title}`); `bd gate list --json` adds `approval_url` to such gates;
+- a `bd close <id> --force` or `bd playbook discard <run>` refused only
+  because open human gates in the way are shut to the caller prints, after
+  its `error:` line and the gate's line when there is one, `approve the
+  close of <id> in a browser: <url>` (or `approve the discard of <run> in
+  a browser: <url>`), armed gates or not (`--json`:
+  `operation_approval_url` on its error). The link carries the request
+  sealed, reason and flags included, for 7 days; a person who may open
+  every gate in the way performs exactly that close or discard in the
+  browser, as themselves, without resolving the gates or closing the run's
+  steps ([Approving a close or
+  discard](sign-in.md#approving-a-close-or-discard)). Live claims on the
+  work, the requester's included, must be released first. A reason over
+  2000 bytes gets
+  `no browser approval link for the close of <id>: the reason is longer
+  than 2000 bytes` instead.
 
 A link is `<public-url>/w/<workspace>/gates/<gate id>`, composed by the
 server from its public URL and the gate's id (ids of letters, digits,

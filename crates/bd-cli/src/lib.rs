@@ -8,6 +8,7 @@
 pub mod actor;
 pub mod agents;
 pub mod app;
+pub mod approval_link;
 pub mod backup;
 pub mod batch;
 pub mod cli;
@@ -134,6 +135,8 @@ pub fn execute(app: &mut App, cmd: &Command) -> i32 {
 pub fn render_error(e: &Error, json: bool, actor: Option<&actor::Resolved>) -> String {
     // A refusal at a human gate names it; bd serve may offer its approval page.
     let link = e.gate().and_then(io::approval_url);
+    // A refused close or discard a person could approve may have a link of its own.
+    let op = e.is_approvable().then(io::operation_link).flatten();
     if json {
         let mut error = json!({ "code": e.code(), "message": e.to_string(), "exit_code": e.exit_code() });
         if let Some(gate) = e.gate() {
@@ -142,11 +145,21 @@ pub fn render_error(e: &Error, json: bool, actor: Option<&actor::Resolved>) -> S
         if let Some(url) = link {
             error["approval_url"] = json!(url);
         }
+        if let Some(io::OpLink { outcome: Ok(url), .. }) = op {
+            error["operation_approval_url"] = json!(url);
+        }
         return format!("{}\n", json!({ "error": error }));
     }
     let mut s = format!("error: {e}\n");
     if let Some(url) = link {
         s.push_str(&format!("approve in a browser: {url}\n"));
+    }
+    if let Some(op) = op {
+        let phrase = op.op.phrase();
+        match op.outcome {
+            Ok(url) => s.push_str(&format!("approve {phrase} {} in a browser: {url}\n", op.issue)),
+            Err(why) => s.push_str(&format!("no browser approval link for {phrase} {}: {why}\n", op.issue)),
+        }
     }
     if let Some(h) = actor.and_then(|a| other_session_hint(e, a)).or_else(|| hint(e).map(String::from)) {
         s.push_str(&format!("hint: {h}\n"));
@@ -194,7 +207,7 @@ fn other_session_hint(e: &Error, resolved: &actor::Resolved) -> Option<String> {
 }
 
 fn hint(e: &Error) -> Option<&'static str> {
-    Some(match e {
+    Some(match e.unmarked() {
         Error::AlreadyClaimed { .. } => {
             "pick other work with `bd claim --next`; to renew a claim of yours, pass its lease token (`bd claim <id> --token <t>`). A claim whose holder stops heartbeating frees itself once its lease has been expired for lease.grace. Only to take it over deliberately: `bd update <id> --assignee <you> --take-over` (recorded in the event history)"
         }
@@ -279,7 +292,7 @@ pub fn dispatch(app: &mut App, cmd: &Command) -> Result<i32> {
         Command::Graph(a) => cmd_graph(app, a).map(|_| 0),
         Command::Update(a) => write_cmd(app, "update", |tx| exec_update(tx, a)),
         Command::Close(a) => write_cmd(app, "close", |tx| {
-            let mut out = exec_close(tx, a)?;
+            let mut out = exec_close(tx, a).map_err(|e| approval_link::note_close(tx, a, e))?;
             let closed = std::mem::take(&mut out.close_hint);
             if let Some(hint) = unlinked_note(tx, &closed)? {
                 out = out.note(hint);
@@ -496,5 +509,289 @@ mod tests {
         assert!(!text.contains("approve in a browser"), "{text}");
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!(v["error"].get("gate").is_none() && v["error"].get("approval_url").is_none(), "{v}");
+    }
+}
+
+#[cfg(test)]
+mod operation_link_tests {
+    //! The operation approval link a refused close or discard prints under
+    //! `bd serve` (`io::note_operation`, `render_error`).
+    use super::*;
+    use crate::approval_link::{self, LinkKey, Op, Opened, OperationRequest};
+    use bd_core::gates::{GateKind, GateSpec, NewGate};
+    use bd_core::{NewIssue, Queries};
+    use clap::Parser;
+
+    const KEY: [u8; 32] = [7; 32];
+    const BASE: &str = "https://x/bd/w/proj/";
+    /// Who runs a command: an actor, and whether its token is a person's.
+    type Who<'a> = (&'a str, bool);
+    const AGENT: Who = ("agent-1", false);
+
+    struct Ws {
+        _dir: tempfile::TempDir,
+        db: String,
+        store: bd_core::Store,
+    }
+
+    impl Ws {
+        fn new() -> Ws {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(".bd").join("bd.db");
+            let init = bd_core::InitOptions { prefix: "t".into(), id_mode: bd_core::IdMode::Counter };
+            let store = bd_core::Store::init(&path, init, bd_core::OpenOptions::default()).unwrap();
+            Ws { db: path.to_str().unwrap().to_string(), _dir: dir, store }
+        }
+
+        fn create(&mut self, new: NewIssue) -> String {
+            self.store.write("setup", "alice", |tx| tx.create_issue(new)).unwrap().id
+        }
+
+        fn gate(&mut self, blocks: &str, parent: Option<&str>, approvers: Option<Vec<String>>) -> String {
+            let gate = NewGate {
+                spec: GateSpec { approvers, ..GateSpec::new(GateKind::Human) },
+                blocks: vec![blocks.to_string()],
+                title: None,
+                description: String::new(),
+                assignee: None,
+                parent: parent.map(str::to_string),
+                priority: None,
+                ephemeral: false,
+            };
+            self.store.write("setup", "alice", |tx| tx.create_gate(gate)).unwrap().id
+        }
+
+        /// A task held by a human gate anyone human may open.
+        fn held(&mut self) -> (String, String) {
+            let work = self.create(NewIssue::titled("Deploy"));
+            let gate = self.gate(&work, None, None);
+            (work, gate)
+        }
+
+        /// A playbook run holding a human gate over its one step.
+        fn run_with_gate(&mut self) -> (String, String) {
+            let run = self.create(NewIssue {
+                issue_type: Some("epic".into()),
+                metadata: Some(json!({ "playbook": { "role": "run" } })),
+                ..NewIssue::titled("Run")
+            });
+            let step = self.create(NewIssue { parent: Some(run.clone()), ..NewIssue::titled("Step") });
+            let gate = self.gate(&step, Some(&run), None);
+            (run, gate)
+        }
+
+        /// `args` as `who` (actor, a person's token) under bd serve, offering
+        /// links when `links`: the exit code and stderr.
+        fn run(&self, who: Who, links: bool, args: &[&str], stdin: Option<&str>) -> (i32, String) {
+            let line = ["bd", "--db", &self.db, "--actor", who.0].into_iter().chain(args.iter().copied());
+            let cli = Cli::try_parse_from(line).unwrap();
+            let mut app = App::new(cli.global).unwrap();
+            let (_, c) = io::Capture::buffered(1 << 20);
+            let c = io::Capture {
+                token_actor: who.0.into(),
+                human: who.1,
+                stdin: stdin.map(str::to_string),
+                approvals: Some(format!("{BASE}gates/")),
+                operation_links: links.then(|| io::OperationLinks {
+                    base: BASE.into(),
+                    workspace: "proj".into(),
+                    key: std::sync::Arc::new(LinkKey::from_bytes(&KEY).unwrap()),
+                }),
+                ..c
+            };
+            let (code, c) = io::capture(c, || execute(&mut app, &cli.command));
+            (code, String::from_utf8(c.stderr).unwrap())
+        }
+    }
+
+    /// The request a link's `request=` value opens to, for `op` of `issue`.
+    fn opened(url: &str, op: Op, issue: &str) -> OperationRequest {
+        let prefix = format!("{BASE}{op}/{issue}?request=");
+        let sealed = url.strip_prefix(&prefix).unwrap_or_else(|| panic!("{url} does not start with {prefix}"));
+        let key = LinkKey::from_bytes(&KEY).unwrap();
+        match approval_link::open(&key, sealed, "proj", op, issue, 0) {
+            Opened::Valid(req) => *req,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn op_line<'a>(stderr: &'a str, op: Op, issue: &str) -> &'a str {
+        let start = format!("approve {} {issue} in a browser: ", op.phrase());
+        stderr
+            .lines()
+            .find_map(|l| l.strip_prefix(start.as_str()))
+            .unwrap_or_else(|| panic!("no operation line in {stderr}"))
+    }
+
+    fn no_op_line(stderr: &str) {
+        assert!(
+            !stderr.contains("in a browser: https://x/bd/w/proj/close/")
+                && !stderr.contains("/discard/")
+                && !stderr.contains("no browser approval link"),
+            "{stderr}"
+        );
+    }
+
+    #[test]
+    fn a_forced_close_held_at_a_human_gate_prints_its_link() {
+        let mut ws = Ws::new();
+        let (work, gate) = ws.held();
+        let (code, stderr) = ws.run(AGENT, true, &["close", &work, "--force", "-r", "why"], None);
+        assert_eq!(code, 7, "{stderr}");
+        let lines: Vec<_> = stderr.lines().collect();
+        assert!(lines[0].starts_with("error: "), "{stderr}");
+        assert_eq!(lines[1], format!("approve in a browser: {BASE}gates/{gate}"));
+        assert!(
+            lines[2].starts_with(&format!("approve the close of {work} in a browser: {BASE}close/{work}?request="))
+        );
+        assert!(lines[3].starts_with("hint: "), "{stderr}");
+        let req = opened(op_line(&stderr, Op::Close, &work), Op::Close, &work);
+        assert_eq!((req.workspace.as_str(), req.issue.as_str(), req.requester.as_str()), ("proj", &*work, "agent-1"));
+        assert_eq!((req.reason.as_deref(), req.failed, req.force), (Some("why"), false, true));
+        assert_eq!(req.until - req.at, approval_link::TTL);
+
+        // The reason as given, whitespace and all; a blank one is none. --failed is carried.
+        let (_, stderr) = ws.run(AGENT, true, &["close", &work, "--force", "--failed", "-r", "  why\n"], None);
+        let req = opened(op_line(&stderr, Op::Close, &work), Op::Close, &work);
+        assert_eq!((req.reason.as_deref(), req.failed), (Some("  why\n"), true));
+        let (_, stderr) = ws.run(AGENT, true, &["close", &work, "--force", "-r", "   "], None);
+        assert_eq!(opened(op_line(&stderr, Op::Close, &work), Op::Close, &work).reason, None);
+
+        // --json carries the link.
+        let (_, stderr) = ws.run(AGENT, true, &["--json", "close", &work, "--force", "-r", "why"], None);
+        let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert_eq!(v["error"]["gate"], json!(gate));
+        let url = v["error"]["operation_approval_url"].as_str().unwrap();
+        assert_eq!(opened(url, Op::Close, &work).reason.as_deref(), Some("why"));
+        assert_eq!(ws.store.read(|r| r.issue(&work)).unwrap().status, bd_core::Status::Open, "nothing written");
+    }
+
+    #[test]
+    fn without_links_a_refusal_prints_what_it_did_before() {
+        let mut ws = Ws::new();
+        let (work, _) = ws.held();
+        let args = ["close", work.as_str(), "--force", "-r", "why"];
+        let (with, without) = (ws.run(AGENT, true, &args, None).1, ws.run(AGENT, false, &args, None).1);
+        let op = with.lines().find(|l| l.starts_with("approve the close of")).unwrap();
+        assert_eq!(without, with.replace(&format!("{op}\n"), ""));
+        let json = ["--json", "close", work.as_str(), "--force"];
+        let v: serde_json::Value = serde_json::from_str(ws.run(AGENT, false, &json, None).1.trim()).unwrap();
+        assert!(v["error"].get("operation_approval_url").is_none() && v["error"]["gate"].is_string(), "{v}");
+
+        // Outside bd serve nothing is noted, and a marked error renders as the unmarked one.
+        io::note_operation(Op::Close, "t-1", Some("why"), false, true, "agent-1", 0);
+        assert_eq!(io::operation_link(), None);
+        let e = || Error::with_needs(&[bd_core::Need::Human], "held").with_gate("t-1");
+        assert_eq!(render_error(&e().approvable(), false, None), render_error(&e(), false, None));
+        assert_eq!(render_error(&e().approvable(), true, None), render_error(&e(), true, None));
+    }
+
+    #[test]
+    fn only_a_single_forced_close_or_a_discard_gets_a_link() {
+        let mut ws = Ws::new();
+        let (work, gate) = ws.held();
+        let (other, _) = ws.held();
+        // A gate held by a gate only carol may open: alice may open the first, not the second.
+        let target = ws.create(NewIssue::titled("Target"));
+        let gate_a = ws.gate(&target, None, None);
+        ws.gate(&gate_a, None, Some(vec!["github:carol".into()]));
+        let claimed = ws.create(NewIssue::titled("Claimed"));
+        ws.gate(&claimed, None, None);
+        let opts = bd_core::claims::ClaimOptions { allow_blocked: true, ..Default::default() };
+        ws.store.write("claim", "bob", |tx| tx.claim(&claimed, &opts)).unwrap();
+
+        let refused: [(&str, Who, Vec<&str>, i32); 6] = [
+            ("take-over", AGENT, vec!["close", &work, "--force", "--take-over"], 7),
+            ("two ids", AGENT, vec!["close", &work, &other, "--force"], 7),
+            ("no force", AGENT, vec!["close", &work], 2),
+            ("the gate itself", AGENT, vec!["close", &gate, "--force"], 7),
+            ("a gate held by a gate", ("alice", true), vec!["close", &gate_a, "--force"], 7),
+            ("a claim", AGENT, vec!["close", &claimed, "--force"], 7),
+        ];
+        for (what, who, args, exit) in refused {
+            let (code, stderr) = ws.run(who, true, &args, None);
+            assert_eq!(code, exit, "{what}: {stderr}");
+            assert!(what != "a claim" || stderr.contains("claimed by bob"), "{stderr}");
+            no_op_line(&stderr);
+        }
+        let (code, stderr) = ws.run(AGENT, true, &["batch"], Some(&format!("close {work} --force\n")));
+        assert_eq!(code, 7, "{stderr}");
+        no_op_line(&stderr);
+        for id in [&work, &other, &gate, &gate_a, &claimed] {
+            assert_ne!(ws.store.read(|r| r.issue(id)).unwrap().status, bd_core::Status::Closed, "{id}");
+        }
+    }
+
+    #[test]
+    fn a_reason_over_2000_bytes_gets_no_link_and_says_why() {
+        let mut ws = Ws::new();
+        let (work, _) = ws.held();
+        let long = "x".repeat(approval_link::MAX_REASON + 1);
+        let (_, stderr) = ws.run(AGENT, true, &["close", &work, "--force", "-r", &long], None);
+        let why = format!("no browser approval link for the close of {work}: the reason is longer than 2000 bytes");
+        assert!(stderr.lines().any(|l| l == why), "{stderr}");
+        assert!(!stderr.contains("/close/"), "{stderr}");
+        let (_, stderr) = ws.run(AGENT, true, &["--json", "close", &work, "--force", "-r", &long], None);
+        let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+        assert!(v["error"].get("operation_approval_url").is_none(), "{v}");
+
+        for fill in ["\"", "\u{1}\n\t"] {
+            let reason: String = fill.chars().cycle().take(approval_link::MAX_REASON).collect();
+            assert_eq!(reason.len(), approval_link::MAX_REASON);
+            let (_, stderr) = ws.run(AGENT, true, &["--json", "close", &work, "--force", "-r", &reason], None);
+            let v: serde_json::Value = serde_json::from_str(stderr.trim()).unwrap();
+            let url = v["error"]["operation_approval_url"].as_str().unwrap();
+            assert_eq!(opened(url, Op::Close, &work).reason.as_deref(), Some(reason.as_str()));
+        }
+    }
+
+    #[test]
+    fn a_discard_held_at_a_human_gate_prints_its_link() {
+        let mut ws = Ws::new();
+        let (run, _) = ws.run_with_gate();
+        let (code, stderr) = ws.run(AGENT, true, &["playbook", "discard", &run, "-r", "  cleanup "], None);
+        assert_eq!(code, 7, "{stderr}");
+        let req = opened(op_line(&stderr, Op::Discard, &run), Op::Discard, &run);
+        assert_eq!((req.reason.as_deref(), req.failed, req.force), (Some("  cleanup "), false, false));
+        let (_, stderr) = ws.run(AGENT, true, &["playbook", "discard", &run, "--force"], None);
+        assert!(opened(op_line(&stderr, Op::Discard, &run), Op::Discard, &run).force);
+        for flag in ["--dry-run", "--take-over"] {
+            let (code, stderr) = ws.run(AGENT, true, &["playbook", "discard", &run, flag], None);
+            assert_ne!(code, 0, "{flag}: {stderr}");
+            no_op_line(&stderr);
+        }
+        assert!(ws.store.read(|r| r.issue(&run)).is_ok(), "nothing deleted");
+    }
+
+    #[test]
+    fn discard_records_its_reason_in_each_deleted_event() {
+        let mut ws = Ws::new();
+        let run = ws.create(NewIssue {
+            issue_type: Some("epic".into()),
+            metadata: Some(json!({ "playbook": { "role": "run" } })),
+            ..NewIssue::titled("Run")
+        });
+        let step = ws.create(NewIssue { parent: Some(run.clone()), ..NewIssue::titled("Step") });
+        let cli = Cli::try_parse_from([
+            "bd",
+            "--db",
+            &ws.db,
+            "-q",
+            "playbook",
+            "discard",
+            &run,
+            "-r",
+            "  started by mistake\n",
+        ])
+        .unwrap();
+        let Command::Playbook(cli::PlaybookCommand::Discard(a)) = &cli.command else { panic!("{:?}", cli.command) };
+        assert_eq!(a.reason.as_deref(), Some("  started by mistake\n"));
+        let mut app = App::new(cli.global).unwrap();
+        assert_eq!(dispatch(&mut app, &cli.command).unwrap(), 0);
+        let q = bd_core::EventQuery { ops: vec!["deleted".into()], ..Default::default() };
+        let events = ws.store.read(|r| r.events(&q)).unwrap().events;
+        let ids: Vec<_> = events.iter().filter_map(|e| e.issue_id.clone()).collect();
+        assert!(ids.contains(&run) && ids.contains(&step), "{ids:?}");
+        assert!(events.iter().all(|e| e.data["reason"] == "  started by mistake\n"), "{events:?}");
     }
 }

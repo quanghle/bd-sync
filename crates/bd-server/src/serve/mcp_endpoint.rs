@@ -176,6 +176,22 @@ fn mcp_too_large() -> Response<Body> {
     Reject::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid", msg, 2).response()
 }
 
+/// `capture` for a tool call in `workspace` as `token`: the token's actor,
+/// claim cap and OIDC identity, never its admin or human rights; the approval
+/// pages and operation links the server offers.
+pub(super) fn tool_capture(server: &Server, workspace: &str, token: &Token, capture: Capture) -> Capture {
+    let policy = token.policy();
+    Capture {
+        token_actor: policy.actor,
+        max_claims: policy.max_claims,
+        oidc_approver: policy.oidc_approver,
+        token: Some(token.summary()),
+        approvals: server.approval_base(workspace),
+        operation_links: server.operation_links(workspace),
+        ..capture
+    }
+}
+
 /// Runs the tool calls of an MCP request in its workspace, as `token`.
 pub(super) struct ToolRunner<'a> {
     pub(super) server: &'a Server,
@@ -203,16 +219,8 @@ impl mcp::Runner for ToolRunner<'_> {
         let mut app = self.server.open_app(self.ws, self.token, &cli.global, resolved)?;
         // A model's tool calls never carry a person's rights: no admin-only
         // commands, other actors' claims or human gates.
-        let policy = self.token.policy();
         let (buffer, capture) = Capture::buffered(mcp::local::OUTPUT_LIMIT);
-        let capture = Capture {
-            token_actor: policy.actor,
-            max_claims: policy.max_claims,
-            oidc_approver: policy.oidc_approver,
-            token: Some(self.token.summary()),
-            approvals: self.server.approval_base(&self.ws.name),
-            ..capture
-        };
+        let capture = tool_capture(self.server, &self.ws.name, self.token, capture);
         let (exit_code, captured) = io::capture(capture, || bd_cli::execute(&mut app, &cli.command));
         if access == Access::Write {
             self.server.feeds.committed(&self.ws.name);

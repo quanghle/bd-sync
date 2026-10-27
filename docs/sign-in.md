@@ -704,6 +704,135 @@ refused`) with the provider, subject, login, actor, workspace and gate,
 never an email, and counts them in `/metrics`
 ([`bd_serve_approvals_total`](observability.md#server-metrics)).
 
+### Approving a close or discard
+
+An agent that runs `bd close <id> --force` on work open human gates hold
+back, or `bd playbook discard <run>` on a run that holds one, is refused
+(exit 7). With browser approvals offered, a person can approve that very
+close or discard in a browser instead, without resolving the gates.
+
+**When the link appears.** Only through a `bd serve` that offers gate
+pages (`--public-url` and a loadable `[oauth]`, as above), and only for a
+refusal due to open human gates alone: the target is held back by one,
+contains one, or contains work held back by one, the caller may not open
+them (not a person, or not one of their approvers), and none of them has
+a stored approver list that is not valid (which no one matches). It is
+offered for `bd close` of one id with `--force` (not `--take-over`) and
+for `bd playbook discard` (not `--take-over` or `--dry-run`); never for
+closing a gate itself, a claim refusal (another actor's live claim, or
+claims in the run), open children or blockers without `--force`, a
+discard refused for work in progress or dependents, several ids, `bd
+batch`, `bd delete` or any other command. The refusal then prints, after
+its `error:` line (and the gate's own `approve in a browser:` line, when
+there is one):
+
+```text
+approve the close of t-12 in a browser: https://bd.example.com/w/proj/close/t-12?request=<sealed>
+approve the discard of t-12 in a browser: https://bd.example.com/w/proj/discard/t-12?request=<sealed>
+```
+
+With `--json`, the error carries the link as `operation_approval_url`.
+A reason longer than 2000 bytes gets no link: the line says `no browser
+approval link for the close of t-12: the reason is longer than 2000
+bytes` instead. An MCP tool's error would carry `operation_approval_url`
+too, but none of today's tools can make such a request (`close` has no
+`force`, and there is no discard tool), so MCP clients do not get the
+link. A local workspace, a local `bd mcp` and a server without approvals
+show no link, and the paths answer 404, as gate pages do.
+
+**The link.** `<public-url>/w/<workspace>/close/<id>?request=<sealed>`
+or `/discard/<id>?request=...`. The request, sealed by the server with
+ChaCha20-Poly1305 and bound to the path's workspace, operation and issue,
+holds exactly what was asked: the operation, the issue, the reason as
+given, `--failed`, `--force`, the requester (the actor the server ran the
+command as), when it was asked, and an expiry 7 days later. Nothing in it
+can be changed without the link becoming invalid, and nothing else
+(`--token`, `--if-*` guards, `--claim-next`) carries over. Opening a link
+checks only its shape and its seal: one this server did not seal, or for
+another path, answers 404 like an unknown path; a genuine expired one
+answers 410; a query over 8 KiB answers 400. Up to the account's
+admission the answer is the same for any genuine link, whatever the
+workspace or issue: nothing is looked up. Through the sign-in the request
+rides in one or two cookies of its own,
+`bd_opreq_<the first 16 hex digits of the request's digest>_<n>`
+(`__Secure-bd_opreq_...` on https) with
+`Path=<public-url path>/oauth`, `HttpOnly`, `SameSite=Lax`, for 20
+minutes, checked against a digest the sealed sign-in carries and cleared
+at the provider's callback.
+
+**The key.** The seal's key is `<root>/approval-links.key`, 32 random
+bytes that `bd serve` creates at its first start (mode 0600 on Unix,
+with a warning when others can read it) and reads at every later one; a
+file of another size, or one that is not a regular file, stops the start.
+Delete it and restart `bd serve` to invalidate every link given so far.
+It is not in `server.db` or its backups: a root rebuilt from backups
+without it gets a new key at start, and earlier links no longer open.
+
+**Who may approve.** The account is admitted for the workspace as for a
+gate (above): `deny`, then the authorizer or the rules, and only a grant
+of kind `human`. It must also be one who may open every open human gate
+in the way: one of each gate's approvers when it names them (an OIDC
+account only by its identity reference, [below](#approvers-and-oidc-accounts)).
+Otherwise the page refuses (403), naming each gate it may not open and its
+approvers, and nothing is performed. As for a gate, the account is bound
+to its actor with a tokenless `signed_in` event and no token is issued.
+
+**The page** shows the workspace, the operation, the issue's id, title and
+status, the run it belongs to (for a close), the reason (or `No reason
+given`, with its whitespace kept), the requester and when they asked, the
+options (forced, closed as failed), every open human gate the operation
+gets past with its approvers, and for a discard `Deletes N issues, with no
+undo` and the first 50 of them (`and N more`). Everything is escaped, and
+the page has the gate page's protections: a strict Content Security
+Policy, no framing, and a form armed only after 600 ms of focus. A target
+already closed (a close), or gone, ends on a `Nothing to do` page; a
+target no longer held back by human gates, a close target that is now a
+gate or pinned, or a discard target that is no longer a run ends on a
+page saying so, with no form. A run closed meanwhile (by a forced close)
+can still be discarded.
+
+**The approval** lasts 10 minutes and works once, from the browser that
+signed in, bound to a cookie of its own:
+
+```text
+bd_op_<suffix>=<value>; Path=<public-url path>/w/<workspace>/<close|discard>/<id>; Max-Age=600; HttpOnly; SameSite=Strict
+```
+
+(`__Secure-bd_op_<suffix>` and `Secure` on https). The `POST` needs a
+same-origin `Origin` or `Sec-Fetch-Site`, a sign-in slot, the one-time id
+the page holds (nothing else in the form is read; posted again it is
+`already used`), and a request that has not expired. In one transaction,
+as the person's actor with a human, non-admin token's rights, the server
+checks the target again and performs exactly the operation sealed: `bd
+close <id> --force` (with `--failed` if asked) or `bd playbook discard
+<run>` (with `--force` if asked). It never takes over a claim, and
+cascades nothing: closing a run leaves its open steps and gates as they
+are, and a later discard of the run, approved the same way, removes what
+it leaves. A live claim of another actor on the work, the requester's
+included, refuses the approval (403, nothing changed): release it first,
+then ask again.
+
+**What is recorded.** The `closed` event (a close) or each `deleted`
+event (a discard) has the approver's actor, `"via": "browser"`,
+`"requested_by": "<requester>"`, and the requester's reason byte for
+byte (none when it was empty or only whitespace).
+
+**Logs and metrics.** Each outcome is logged once as `operation approval`
+(target `bd::serve`) with `outcome`, `provider`, `login`, `subject`,
+`actor`, `workspace`, `issue`, `op` and a short `detail`, never the reason,
+a title or an email, and counted in
+[`bd_serve_operation_approvals_total{outcome}`](observability.md#server-metrics),
+`outcome` one of `approved`, `refused`, `not_ready`, `gone`, `busy` and
+`failed`. Every answer to a provider's callback for an operation's
+sign-in is counted, except the page itself: refusals at the provider or
+by the rules, an expired sign-in, another browser, a sign-in settings
+failure (`auth.toml` missing, without `[oauth]` or invalid since the
+sign-in began, counted `failed`), and no free sign-in slot (`busy`). So is
+every answer to an approval's `POST`, a settings failure included when
+the post names an approval this server showed. Opening a link, a callback
+whose sign-in cookie is missing or not this server's, and a `POST` naming
+no approval are not counted.
+
 ### Approvers and OIDC accounts
 
 A gate's approvers name an account of an OIDC provider by an [identity

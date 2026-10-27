@@ -78,7 +78,11 @@ malformed spec parts) do not.
   [Gate approvals in the browser](sign-in.md#approving-human-gates-in-the-browser)
   log `gate approval` with its `outcome` (`approved`, `refused`, `already
   resolved`, `not ready`, ...) and `gate approval refused` lines, with the
-  provider, subject, login, actor, workspace and gate.
+  provider, subject, login, actor, workspace and gate. [Close and discard
+  approvals](sign-in.md#approving-a-close-or-discard) log one `operation
+  approval` line per outcome, with `outcome`, `provider`, `login`,
+  `subject`, `actor`, `workspace`, `issue`, `op` and `detail`, never the
+  reason or a title.
 - **Sign-in secrets** ([from a command](sign-in.md#secrets-from-a-command)):
   at start, which command fetches how many secrets, then (once known, the
   server serving meanwhile) that it answered, or why the steps needing
@@ -121,6 +125,7 @@ Prometheus text:
 | `bd_serve_tool_calls_total` | MCP tool calls |
 | `bd_serve_publishes_total{outcome}` | `bd publish` runs (dry runs aside), `applied` or `refused` |
 | `bd_serve_approvals_total{outcome}` | human gates [approved in the browser](sign-in.md#approving-human-gates-in-the-browser), `approved`, or approvals `refused` (an account not let in, whose actor is taken, not granted kind `human` or not an approver, a refusal when posting, a post from another site); notices (expired, used, resolved, not ready, not found) are not counted |
+| `bd_serve_operation_approvals_total{outcome}` | closes and discards [approved in the browser](sign-in.md#approving-a-close-or-discard): `approved`, `refused`, `not_ready` (no longer held back, or no longer what was asked), `gone` (already closed, or no such workspace or issue), `busy`, `failed`; every callback of an operation's sign-in and every answer to its `POST` counts once, the page itself aside |
 | `bd_serve_panics_total` | panics |
 | `bd_serve_start_time_seconds` | when the server started |
 

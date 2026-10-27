@@ -24,10 +24,15 @@ pub(super) const AT_PROVIDER: &str = "provider";
 /// browser's cookie is seen: a [`Then::Gate`] not yet bound to a browser.
 pub(super) const GATE_BEGIN: &str = "gate-begin";
 
+/// The hop from an operation's approval link to the chooser: a
+/// [`Then::Operation`] not yet bound to a browser.
+pub(super) const OP_BEGIN: &str = "op-begin";
+
 /// What a browser sign-in goes on to once the person signed in: an
-/// application's authorization, or a human gate's approval. It is sealed
-/// with the flow and decides its sealing's AAD ([`Sealer::seal`]), so a flow
-/// of one kind never finishes as the other.
+/// application's authorization, a human gate's approval, or the approval of
+/// a close or discard that human gates refused. It is sealed with the flow
+/// and decides its sealing's AAD ([`Sealer::seal`]), so a flow of one kind
+/// never finishes as another.
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "then", rename_all = "snake_case")]
 pub(super) enum Then {
@@ -35,6 +40,55 @@ pub(super) enum Then {
     Authorize { query: String },
     /// Approving the human gate `gate` of `workspace`.
     Gate { workspace: String, gate: String },
+    /// Approving the refused `op` (`close` or `discard`) of `issue` in
+    /// `workspace`. The sealed request itself rides in `parts` cookies of
+    /// its own (`set_request_cookies`), too long for this flow's: `digest`
+    /// is the hash of that link token, which the callback checks them against.
+    Operation { workspace: String, op: String, issue: String, digest: String, parts: u8 },
+}
+
+/// The kinds of [`Then`], each sealed under an AAD of its own ([`aad`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Kind {
+    Authorize,
+    Gate,
+    Operation,
+}
+
+/// What an operation's flow carries ([`Then::Operation`]), as a view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpFlow {
+    pub workspace: String,
+    pub op: String,
+    pub issue: String,
+    /// The hash of the link token the request cookies carry.
+    pub digest: String,
+    /// How many request cookies carry it.
+    pub parts: u8,
+}
+
+impl Then {
+    pub(super) fn kind(&self) -> Kind {
+        match self {
+            Then::Authorize { .. } => Kind::Authorize,
+            Then::Gate { .. } => Kind::Gate,
+            Then::Operation { .. } => Kind::Operation,
+        }
+    }
+
+    /// The operation this flow approves, if it approves one.
+    pub(super) fn operation(&self) -> Option<OpFlow> {
+        match self {
+            Then::Operation { workspace, op, issue, digest, parts } => Some(OpFlow {
+                workspace: workspace.clone(),
+                op: op.clone(),
+                issue: issue.clone(),
+                digest: digest.clone(),
+                parts: *parts,
+            }),
+            Then::Authorize { .. } | Then::Gate { .. } => None,
+        }
+    }
 }
 
 /// An authorization before anyone signed in: choosing a provider, then
@@ -78,14 +132,14 @@ impl Sealer {
     }
 
     /// `value`, sealed for `step`: base64url of a random nonce and the
-    /// ciphertext. The AAD is `step` for an authorization and `gate:<step>`
-    /// for a gate's approval ([`aad`]).
+    /// ciphertext. The AAD is `step` for an authorization, `gate:<step>` for
+    /// a gate's approval and `op:<step>` for an operation's ([`aad`]).
     pub(super) fn seal(&self, step: &str, value: &Pending) -> Result<String, Error> {
         let mut nonce = [0u8; 12];
         SecureRandom::fill(&SystemRandom::new(), &mut nonce)
             .map_err(|_| Error::Io(std::io::Error::other("the system's random number generator failed")))?;
         let mut data = serde_json::to_vec(value)?;
-        let aad = aad(step, matches!(value.then, Then::Gate { .. }));
+        let aad = aad(step, value.then.kind());
         let aad = ring::aead::Aad::from(aad.as_bytes());
         self.0
             .seal_in_place_append_tag(ring::aead::Nonce::assume_unique_for_key(nonce), aad, &mut data)
@@ -94,26 +148,31 @@ impl Sealer {
     }
 
     /// What [`Sealer::seal`] sealed for `step`, if `sealed` is that: opened
-    /// under either kind's AAD, and kept only if its kind is the one that AAD
+    /// under each kind's AAD, and kept only if its kind is the one that AAD
     /// is for.
     pub(super) fn open(&self, step: &str, sealed: &str) -> Option<Pending> {
         let bytes = URL_SAFE_NO_PAD.decode(sealed).ok()?;
         let (nonce, data) = bytes.split_at_checked(12)?;
-        [false, true].into_iter().find_map(|gate| {
+        [Kind::Authorize, Kind::Gate, Kind::Operation].into_iter().find_map(|kind| {
             let nonce = ring::aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
             let mut data = data.to_vec();
-            let aad = aad(step, gate);
+            let aad = aad(step, kind);
             let plain = self.0.open_in_place(nonce, ring::aead::Aad::from(aad.as_bytes()), &mut data).ok()?;
             let pending: Pending = serde_json::from_slice(plain).ok()?;
-            (matches!(pending.then, Then::Gate { .. }) == gate).then_some(pending)
+            (pending.then.kind() == kind).then_some(pending)
         })
     }
 }
 
-/// The AAD a flow is sealed with for `step`: the step itself for an
-/// authorization (as before gates had flows), `gate:<step>` for a gate's.
-fn aad(step: &str, gate: bool) -> String {
-    if gate { format!("gate:{step}") } else { step.to_string() }
+/// The AAD a flow of `kind` is sealed with for `step`: the step itself for
+/// an authorization (as before gates had flows), `gate:<step>` for a
+/// gate's, `op:<step>` for an operation's.
+fn aad(step: &str, kind: Kind) -> String {
+    match kind {
+        Kind::Authorize => step.to_string(),
+        Kind::Gate => format!("gate:{step}"),
+        Kind::Operation => format!("op:{step}"),
+    }
 }
 
 pub(super) fn now_millis() -> i64 {
@@ -153,9 +212,31 @@ pub(super) struct Approval {
     pub(super) cookie: String,
 }
 
+/// The approval page of a close or discard that human gates refused, shown
+/// to a person who may approve it: waiting for its one POST
+/// (`super::operation::approve`).
+#[derive(Debug)]
+pub(super) struct OperationApproval {
+    /// The sealed request, as opened at the sign-in: what the approval performs.
+    pub(super) request: bd_cli::approval_link::OperationRequest,
+    /// The account, for the log: its provider, login and subject (never an email).
+    pub(super) provider: String,
+    pub(super) login: String,
+    pub(super) subject: String,
+    /// The actor it is recorded as: the account's, bound at the sign-in.
+    pub(super) actor: String,
+    /// The account's verified `oidc:sha256:` approver reference, None for a
+    /// GitHub account. Never logged.
+    pub(super) oidc_approver: Option<String>,
+    /// The hash of the value of its own cookie (`op_cookie`).
+    pub(super) browser: String,
+    /// What names its cookie.
+    pub(super) cookie: String,
+}
+
 /// Authorizations under way, by the hash of their secret at each step
-/// (`state` at GitHub, the consent id, the code, the approval id); each
-/// taken once.
+/// (`state` at GitHub, the consent id, the code, the approval id, the
+/// operation approval id); each taken once.
 pub struct Flows {
     pub(super) sealer: Sealer,
     pub(super) consents: Kept<Consent>,
@@ -164,6 +245,9 @@ pub struct Flows {
     /// [`STEP_TTL`] after: one posted again is told it was used).
     pub(super) approvals: Kept<Approval>,
     pub(super) approvals_spent: Kept<()>,
+    /// Operation approval pages waiting for their POST, and those posted.
+    pub(super) operations: Kept<OperationApproval>,
+    pub(super) operations_spent: Kept<()>,
     /// Codes redeemed, for [`CODE_TTL`] after: one sent again revokes the
     /// token it issued (RFC 6749 section 4.1.2).
     spent: Kept<Spent>,
@@ -203,6 +287,8 @@ impl Default for Flows {
             spent: Kept::new(CODE_TTL),
             approvals: Kept::new(STEP_TTL),
             approvals_spent: Kept::new(STEP_TTL),
+            operations: Kept::new(STEP_TTL),
+            operations_spent: Kept::new(STEP_TTL),
         }
     }
 }

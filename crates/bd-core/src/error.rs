@@ -135,6 +135,13 @@ pub enum Error {
     Json(serde_json::Error),
 
     Io(std::io::Error),
+
+    /// A refusal a person could approve in a browser: one that only open
+    /// human gates shut to the caller stand in the way of, each naming a
+    /// valid approver list (see [`crate::policy`]). Text, code, exit code,
+    /// needs and gate are the inner error's. Built by [`Error::approvable`],
+    /// read by [`Error::is_approvable`].
+    Approvable(Box<Error>),
 }
 
 impl std::fmt::Display for Error {
@@ -181,6 +188,7 @@ impl std::fmt::Display for Error {
             Error::Sqlite(e) => write!(f, "sqlite: {e}"),
             Error::Json(e) => write!(f, "json: {e}"),
             Error::Io(e) => write!(f, "io: {e}"),
+            Error::Approvable(e) => std::fmt::Display::fmt(e, f),
         }
     }
 }
@@ -190,6 +198,7 @@ impl std::error::Error for Error {
         match self {
             Error::Json(e) => Some(e),
             Error::Io(e) => Some(e),
+            Error::Approvable(e) => e.source(),
             _ => None,
         }
     }
@@ -238,15 +247,21 @@ impl Error {
     /// Names the human gate a person must open to get past this refusal;
     /// a no-op on every error but [`Error::Needs`].
     pub fn with_gate(mut self, gate: impl Into<String>) -> Self {
-        if let Error::Needs { gate: g, .. } = &mut self {
-            *g = Some(gate.into());
+        match &mut self {
+            Error::Needs { gate: g, .. } => *g = Some(gate.into()),
+            Error::Approvable(e) => {
+                if let Error::Needs { gate: g, .. } = e.as_mut() {
+                    *g = Some(gate.into());
+                }
+            }
+            _ => {}
         }
         self
     }
 
     /// The human gate named by [`Error::with_gate`], if any.
     pub fn gate(&self) -> Option<&str> {
-        match self {
+        match self.unmarked() {
             Error::Needs { gate, .. } => gate.as_deref(),
             _ => None,
         }
@@ -254,9 +269,39 @@ impl Error {
 
     /// The rights that would get past this refusal; empty for every other error.
     pub fn needs(&self) -> &[Need] {
-        match self {
+        match self.unmarked() {
             Error::Needs { needs, .. } => needs,
             _ => &[],
+        }
+    }
+
+    /// Marks this refusal as one a person could approve in a browser
+    /// ([`Error::Approvable`]); never wraps twice.
+    pub fn approvable(self) -> Error {
+        match self {
+            e @ Error::Approvable(_) => e,
+            e => Error::Approvable(Box::new(e)),
+        }
+    }
+
+    /// Whether this refusal is marked by [`Error::approvable`].
+    pub fn is_approvable(&self) -> bool {
+        matches!(self, Error::Approvable(_))
+    }
+
+    /// The error without the [`Error::Approvable`] mark.
+    pub fn unmarked(&self) -> &Error {
+        match self {
+            Error::Approvable(e) => e,
+            e => e,
+        }
+    }
+
+    /// [`Error::unmarked`], by value.
+    pub fn into_unmarked(self) -> Error {
+        match self {
+            Error::Approvable(e) => *e,
+            e => e,
         }
     }
 
@@ -284,6 +329,7 @@ impl Error {
             Error::Sqlite(_) => "sqlite",
             Error::Json(_) => "json",
             Error::Io(_) => "io",
+            Error::Approvable(e) => e.code(),
         }
     }
 
@@ -306,13 +352,14 @@ impl Error {
             Error::AnswerLost(_) => 9,
             Error::Conflict { .. } => 13,
             Error::SchemaTooNew { .. } | Error::Sqlite(_) | Error::Json(_) | Error::Io(_) => 1,
+            Error::Approvable(e) => e.exit_code(),
         }
     }
 
     /// True for errors that mean "another actor changed shared state first".
     pub fn is_contention(&self) -> bool {
         matches!(
-            self,
+            self.unmarked(),
             Error::AlreadyClaimed { .. }
                 | Error::NotClaimable { .. }
                 | Error::Conflict { .. }

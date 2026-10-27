@@ -1,5 +1,7 @@
 //! Routing a request to its endpoint, by path and method.
 
+use bd_cli::approval_link::Op;
+
 use super::*;
 
 /// `[/<prefix>]/w/<name>/v2/exec` -> `<name>`: a proxy may serve bd under a
@@ -23,6 +25,16 @@ pub(super) fn mcp_path(path: &str) -> Option<(&str, &str)> {
 pub(super) fn gate_path<'p>(server: &Server, path: &'p str) -> Option<(&'p str, &'p str)> {
     let (workspace, gate) = under_issuer(server, path).strip_prefix("/w/")?.split_once("/gates/")?;
     Some((workspace, gate)).filter(|(w, g)| !w.is_empty() && !w.contains('/') && !g.is_empty() && !g.contains('/'))
+}
+
+/// `<public url path>/w/<name>/<close|discard>/<id>` (or with the public
+/// URL's path stripped) -> `<name>`, the operation and `<id>`: an operation's
+/// approval link. Their shapes are checked where it is served.
+pub(super) fn op_path<'p>(server: &Server, path: &'p str) -> Option<(&'p str, Op, &'p str)> {
+    let (workspace, rest) = under_issuer(server, path).strip_prefix("/w/")?.split_once('/')?;
+    let (op, issue) = rest.split_once('/')?;
+    let op = Op::from_path(op)?;
+    Some((workspace, op, issue)).filter(|(w, _, i)| !w.is_empty() && !i.is_empty() && !i.contains('/'))
 }
 
 /// A step of sign-in from the command line (the device flow).
@@ -173,6 +185,9 @@ pub(super) async fn handle(
     } else if let Some((workspace, gate)) = gate_path(&server, &path) {
         let (workspace, gate) = (workspace.to_string(), gate.to_string());
         gate_approval(&server, &workspace, &gate, req).await
+    } else if let Some((workspace, op, issue)) = op_path(&server, &path) {
+        let (workspace, issue) = (workspace.to_string(), issue.to_string());
+        operation_approval(&server, &workspace, op, &issue, req).await
     } else if let Some((prefix, workspace)) = mcp_path(&path) {
         if req.method() == Method::POST {
             let endpoint = Endpoint::of(&server, prefix, workspace, &req);

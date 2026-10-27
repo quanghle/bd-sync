@@ -610,7 +610,7 @@ fn compact_folds_a_finished_run_and_discard_removes_one() {
 
     let other = env.start(RELEASE, &[("version", "2.0.0")]);
     env.store.write("claim", "bob", |tx| tx.claim(&format!("{other}.bump"), &ClaimOptions::default())).unwrap();
-    let opts = |force: bool, take_over: bool| DiscardOptions { force, take_over, dry_run: false };
+    let opts = |force: bool, take_over: bool| DiscardOptions { force, take_over, ..Default::default() };
     for o in [opts(false, false), opts(true, false)] {
         let err = env.store.write("discard", "a", |tx| tx.discard_run(&other, &o)).unwrap_err();
         assert!(err.to_string().contains("held by bob"), "{err}");
@@ -1443,4 +1443,69 @@ fn a_renamed_run_keeps_its_steps_and_completes_itself() {
     let status = env.store.read(|r| playbook::run_status(r.conn(), "new-1", r.now())).unwrap();
     assert_eq!((status.progress.total, status.progress.done), (3, 3));
     env.assert_healthy();
+}
+
+#[test]
+fn discards_and_closes_record_why_how_and_at_whose_request() {
+    let mut env = Env::new();
+    let two = "[[steps]]\nid = \"a\"\n[[steps]]\nid = \"b\"\nneeds = [\"a\"]\n";
+    let deleted = |env: &Env, id: &str| {
+        let q = EventQuery { issue_id: Some(id.into()), ops: vec!["deleted".into()], ..Default::default() };
+        env.store.read(|r| r.events(&q)).unwrap().events.pop().expect("a deleted event").data
+    };
+    let closed = |env: &Env, id: &str| {
+        let q = EventQuery { issue_id: Some(id.into()), ops: vec!["closed".into()], ..Default::default() };
+        env.store.read(|r| r.events(&q)).unwrap().events.pop().expect("a closed event").data
+    };
+
+    let run = env.start(two, &[]);
+    let listed: Vec<String> =
+        env.store.read(|r| playbook::run_issues(r.conn(), &run)).unwrap().into_iter().map(|i| i.id).collect();
+    let opts = DiscardOptions {
+        reason: Some("  cleanup\n".into()),
+        via: Some("browser".into()),
+        requested_by: Some("alice/agent-1".into()),
+        ..Default::default()
+    };
+    let out = env.store.write("discard", "carol", |tx| tx.discard_run(&run, &opts)).unwrap();
+    assert_eq!(out.deleted.iter().collect::<BTreeSet<_>>(), listed.iter().collect::<BTreeSet<_>>());
+    assert_eq!(listed.len(), 3, "the run and its two steps");
+    for id in &listed {
+        let data = deleted(&env, id);
+        assert_eq!(data["reason"], "  cleanup\n", "kept byte for byte");
+        assert_eq!((data["via"].as_str(), data["requested_by"].as_str()), (Some("browser"), Some("alice/agent-1")));
+    }
+
+    // A reason of only whitespace is none, and nothing unset is recorded.
+    for reason in [Some(" \n\t ".to_string()), None] {
+        let run = env.start(two, &[]);
+        let opts = DiscardOptions { reason, ..Default::default() };
+        env.store.write("discard", "carol", |tx| tx.discard_run(&run, &opts)).unwrap();
+        let data = deleted(&env, &run);
+        for key in ["reason", "via", "requested_by"] {
+            assert!(data.get(key).is_none(), "{key}: {data}");
+        }
+    }
+    let err = env.store.read(|r| playbook::run_issues(r.conn(), "t-404")).unwrap_err();
+    assert!(matches!(err, Error::NotFound { .. }), "{err}");
+
+    let run = env.start(two, &[]);
+    let (a, b) = (format!("{run}.a"), format!("{run}.b"));
+    let opts = CloseOptions {
+        reason: Some(" why\n".into()),
+        via: Some("browser".into()),
+        requested_by: Some("alice/agent-1".into()),
+        ..Default::default()
+    };
+    env.store.write("close", "carol", |tx| tx.close_issue(&a, &opts)).unwrap();
+    let data = closed(&env, &a);
+    assert_eq!(
+        (data["reason"].as_str(), data["via"].as_str(), data["requested_by"].as_str()),
+        (Some(" why\n"), Some("browser"), Some("alice/agent-1"))
+    );
+    env.close(&b);
+    let data = closed(&env, &b);
+    assert!(data.get("via").is_none() && data.get("requested_by").is_none(), "{data}");
+    let data = closed(&env, &run);
+    assert!(data["auto"] == true && data.get("requested_by").is_none(), "the run closing itself: {data}");
 }

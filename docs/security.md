@@ -21,8 +21,9 @@ to the page with the details.
   `bd serve`, the server's, and only with an admin token), and can publish
   workspace content: `github.repos` lists the repositories it may sync,
   checked before any GitHub call, `push --create` publishes only issues
-  carrying the `--label` it names, and an issue marker links a bd issue only
-  on a GitHub issue opened by the account `gh` is signed in as
+  carrying the `--label` it names, an issue marker links a bd issue only on
+  a GitHub issue opened by the account `gh` is signed in as, and a comment
+  marker counts only on a comment that account wrote
   ([GitHub Issues sync](github.md)).
 
 ## Remote server

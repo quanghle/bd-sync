@@ -160,12 +160,21 @@ same one, is reported as an error.
 - With `--comments`, push and sync post the bd comments GitHub does not have
   yet, each ending with a comment marker `<!-- bd:<id>#c<comment> -->`, and
   record their GitHub ids.
-- A fetched comment carrying the marker of a comment of the same bd issue is
-  recorded, never imported or posted again, in every direction: a push
-  that crashed after posting duplicates nothing. A push-only run fetches
-  comments for this only for issues with bd comments to post; it imports
-  nothing, and records its count so that comments it did not import still
-  reach the next pull.
+- A fetched comment written by the account `gh` is signed in as and carrying
+  the marker of a comment of the same bd issue is recorded, never imported
+  or posted again, in every direction: a push that crashed after posting
+  duplicates nothing. A marker in anyone else's comment means nothing: the
+  comment is imported like any other and the bd comment it names is posted,
+  so no one can keep a bd comment off GitHub or hide their comment from bd by
+  writing a marker. A push-only run fetches comments for this only for issues
+  with bd comments to post; it imports nothing, and records its count so that
+  comments it did not import still reach the next pull.
+- `gh api user` is read only when a fetched comment could be recorded this
+  way. When GitHub will not say which account that is (`gh api user` refused,
+  as for an App installation or Actions token), every comment marker is
+  ignored for the run, which goes on, so a comment a crashed push left behind
+  is imported and posted again. The same holds for a rerun under another
+  account.
 - A bump of GitHub's `updated_at` alone (by a comment bd posted, say) is not
   a change and writes nothing.
 

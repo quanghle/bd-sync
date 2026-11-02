@@ -4,8 +4,9 @@
 //! A run reads one snapshot (the linked issues, their comments, the
 //! `--create` candidates), fetches from GitHub (the listing, linked issues
 //! missing from it, then comments where GitHub's count moved), resolves
-//! issue markers in a second short read, plans every issue with the pure
-//! engine in [`bd_core::github`], makes its GitHub writes, and finally
+//! issue markers in a second short read, looks up its login, once, when an
+//! issue marker or a fetched comment needs it, plans every issue with the
+//! pure engine in [`bd_core::github`], makes its GitHub writes, and finally
 //! applies everything in exactly one write transaction, each issue in its own
 //! savepoint. `gh` never runs while that transaction is open. Repositories
 //! are checked against `github.repos` before any GitHub call; through `bd
@@ -237,12 +238,13 @@ fn get_issue(api: &dyn GithubApi, repo: &Repo, n: u64) -> std::result::Result<Op
     }
 }
 
-/// The login `gh` is signed in as, which bd's own issues are opened by;
-/// None when this token cannot read `user` (401, 403 or 404: an App
-/// installation or Actions token), and then markers are ignored this run.
-/// Anyone can open an issue with a marker, so such a refusal must not stop
-/// the run; any other failure (5xx, a 429) does, as ignoring markers then
-/// could duplicate what a crashed push left unrecorded.
+/// The login `gh` is signed in as, the account bd's own issues and comments
+/// are written by; None when this token cannot read `user` (401, 403 or 404:
+/// an App installation or Actions token) or the answer names no login, and
+/// then issue and comment markers are both ignored this run. Anyone can
+/// write a marker, so such a refusal must not stop the run; any other
+/// failure (5xx, a 429) does, as ignoring markers then could duplicate what
+/// a crashed push left unrecorded.
 fn self_login(api: &dyn GithubApi) -> std::result::Result<Option<String>, Failure> {
     let resp = call(api, "GET", "user", None)?;
     match resp.status {
@@ -383,6 +385,12 @@ impl Item {
     }
 }
 
+/// Whether a fetched comment of `it` could be adopted, so the run needs its login.
+fn could_adopt(it: &Item) -> bool {
+    let Some((local, link, local_comments, _)) = it.local() else { return false };
+    it.fetched.iter().flatten().any(|c| github::adoption_target(&local.id, link, c, local_comments).is_some())
+}
+
 /// A bd issue `--create` publishes, and the results of doing so.
 struct Publish {
     local: Issue,
@@ -491,12 +499,13 @@ pub fn run(app: &mut App, api: &dyn GithubApi, o: &Opts) -> Result<Report> {
     }
 
     // 3. Issue markers of the unlinked ones, in a second short read.
-    let login = if unlinked.iter().any(|g| github::marker_of(&g.body).is_some()) {
-        self_login(api).map_err(fail_run)?
-    } else {
-        None
-    };
-    let markers = app.read(|r| github::resolve_markers(r.conn(), &unlinked, login.as_deref()))?;
+    // None until looked up: at most one `GET user` a run.
+    let mut login: Option<Option<String>> = None;
+    if unlinked.iter().any(|g| github::marker_of(&g.body).is_some()) {
+        login = Some(self_login(api).map_err(fail_run)?);
+    }
+    let markers =
+        app.read(|r| github::resolve_markers(r.conn(), &unlinked, login.as_ref().and_then(|l| l.as_deref())))?;
     for (gh, m) in unlinked.into_iter().zip(markers) {
         let kind = match m {
             MarkerMatch::None => Kind::New,
@@ -533,13 +542,26 @@ pub fn run(app: &mut App, api: &dyn GithubApi, o: &Opts) -> Result<Report> {
             it.fetched = Some(list_comments(api, &o.repo, it.gh.number).map_err(fail_run)?);
         }
     }
+    // After every fetch and before any write, so a failed lookup leaves nothing half done.
+    if login.is_none() && items.iter().any(could_adopt) {
+        login = Some(self_login(api).map_err(fail_run)?);
+    }
+    let login = login.flatten();
     for it in &mut items {
         if matches!(it.decision, Decision::Skip(_)) {
             continue;
         }
         let fetched = it.fetched.clone();
         let Some((local, link, local_comments, _)) = it.local() else { continue };
-        let plan = github::plan_comments(&local.id, link, fetched.as_deref(), local_comments, dir, o.comments);
+        let plan = github::plan_comments(
+            &local.id,
+            link,
+            fetched.as_deref(),
+            local_comments,
+            dir,
+            o.comments,
+            login.as_deref(),
+        );
         it.comments = plan;
     }
 

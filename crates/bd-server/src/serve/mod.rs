@@ -1870,7 +1870,7 @@ mod tests {
         };
         let (_, cookies, page) = got(passkey_link(&server, hostile(built(Method::GET, LANDING, "", ""))).await).await;
         let page = String::from_utf8_lossy(&page);
-        assert!(page.contains("action=\"https://bd.example.com/bd/oauth/passkey-link\""), "{page}");
+        assert!(page.contains("action=\"https://bd.example.com/bd/oauth/passkey-link?open\""), "{page}");
         assert!(!page.contains("evil") && !cookies[0].contains("evil"), "{page}");
         let post = hostile(built(Method::POST, LANDING, &browser, &link_body('a')));
         let (status, cookies, page) = got(passkey_link(&server, post).await).await;

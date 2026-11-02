@@ -735,6 +735,150 @@ describe('complexity tables per rubric version', () => {
 	})
 })
 
+describe('judge vs person', () => {
+	const score = (overall, dims, rubric = 3, by = 'Quang Le') => ({ rubric, overall, dims, complexity: 3, by })
+	const draft = (overall, dims, rubric = 3) => ({ rubric, overall, dims, complexity: 3, by: 'fable', confidence: 'high' })
+	const join = (issues) => joinRuns(issues, { followUpsOf: () => [], traceOf: () => ({ work: null, why: 'no agent sessions' }) })
+	const up = { person: { correctness: 4, scope: 5, quality: 3 }, judge: { correctness: 3, scope: 5, quality: null } }
+	const down = { person: { correctness: 2, scope: 4, quality: 3, process: 4 }, judge: { correctness: 4, scope: 4, quality: 4, process: 'high' } }
+	const dims = { correctness: 4 }
+	const rows = join([
+		run('j-up', { score: score(4, up.person), score_judge: draft(3, up.judge) }),
+		run('j-down', { score: score(2, down.person), score_judge: draft(4, down.judge) }),
+		run('j-accepted', { score: score(4, dims, 3, 'judge'), score_judge: draft(4, dims) }),
+		run('j-draft', { score_judge: draft(4, dims) }),
+		run('j-no-draft', { score: score(4, dims) }),
+		run('j-no-overall', { score: { rubric: 3, dims, complexity: 3, by: 'Quang Le' }, score_judge: draft(4, dims) }),
+		run('j-text', { score: score('4', dims), score_judge: draft(3, dims) }),
+		run('j-mixed', { score: score(4, dims, 4), score_judge: draft(3, dims) }),
+		run('j-unstated', { score: { overall: 3, by: 'Quang Le' }, score_judge: draft(3, dims) }),
+	])
+	const row = (id) => rows.find((r) => r.id === id)
+
+	it("keeps the judge's draft beside a person's score, and every existing field as it was", () => {
+		expect(row('j-up')).toMatchObject({
+			overall: 4,
+			overallFrom: 'person',
+			rubric: 3,
+			judged: 3,
+			confirmedComplexity: 3,
+			judgeOverall: 3,
+			judgeDims: up.judge,
+			judgeRubric: 3,
+			confirmedOverall: 4,
+			confirmedDims: up.person,
+		})
+	})
+
+	it('has no confirmed side for a draft alone, and no judge side for a score with no draft', () => {
+		expect(row('j-draft')).toMatchObject({ judgeOverall: 4, judgeDims: dims, judgeRubric: 3, confirmedOverall: null, confirmedDims: null })
+		expect(row('j-no-draft')).toMatchObject({ confirmedOverall: 4, confirmedDims: dims, judgeOverall: null, judgeDims: null, judgeRubric: null })
+	})
+
+	it('leaves all five null for a run with neither', () => {
+		const [neither] = join([run('j-neither', {})])
+		expect(neither).toMatchObject({ judgeOverall: null, judgeDims: null, judgeRubric: null, confirmedOverall: null, confirmedDims: null })
+	})
+
+	it("has no confirmed overall for a person's score without one, though `overall` falls back to the judge's", () => {
+		expect(row('j-no-overall')).toMatchObject({ overall: 4, overallFrom: 'person', judgeOverall: 4, confirmedOverall: null })
+	})
+
+	it('treats an overall that is not a number as absent, though `overall` keeps it', () => {
+		expect(row('j-text')).toMatchObject({ overall: '4', overallFrom: 'person', judgeOverall: 3, confirmedOverall: null })
+	})
+
+	it('reports person minus judge per version, over the runs a person confirmed, each dimension over its own pairs', () => {
+		expect(aggregate(rows).judgeGap).toEqual({
+			mixed: 2,
+			byRubric: [
+				{
+					rubric: 3,
+					runs: 2,
+					mean: -0.5,
+					meanAbsolute: 1.5,
+					distribution: [
+						[-2, 1],
+						[1, 1],
+					],
+					byDimension: { correctness: { runs: 2, mean: -0.5 }, quality: { runs: 1, mean: -1 }, scope: { runs: 2, mean: 0 } },
+				},
+			],
+		})
+	})
+
+	it('agrees two unknown versions as an unknown row, sorted after the known ones', () => {
+		const [unknown] = join([run('j-unknown', { score: { overall: 3, by: 'Quang Le' }, score_judge: { overall: 3 } })])
+		const { judgeGap } = aggregate([unknown, row('j-up')])
+		expect(judgeGap.mixed).toBe(0)
+		expect(judgeGap.byRubric.map((x) => [x.rubric, x.runs])).toEqual([
+			[3, 1],
+			[null, 1],
+		])
+	})
+
+	it('keeps the absolute mean when signed gaps cancel out', () => {
+		const pair = join([run('j-plus', { score: score(4, dims), score_judge: draft(3, dims) }), run('j-minus', { score: score(3, dims), score_judge: draft(4, dims) })])
+		expect(aggregate(pair).judgeGap.byRubric[0]).toMatchObject({ runs: 2, mean: 0, meanAbsolute: 1 })
+	})
+
+	it('counts nothing for rows without the new fields', () => {
+		expect(aggregate([vrow('a', 3, 3, 3, { overallFrom: 'person' })]).judgeGap).toEqual({ mixed: 0, byRubric: [] })
+	})
+
+	it('keeps a `__proto__` dimension as plain data', () => {
+		const proto = vrow('a', 3, 3, 3, {
+			overallFrom: 'person',
+			confirmedOverall: 4,
+			judgeOverall: 3,
+			judgeRubric: 3,
+			confirmedDims: JSON.parse('{"__proto__":4}'),
+			judgeDims: JSON.parse('{"__proto__":3}'),
+		})
+		const [x] = aggregate([proto]).judgeGap.byRubric
+		expect(Object.keys(x.byDimension)).toEqual(['__proto__'])
+		expect(Object.getPrototypeOf(x.byDimension)).toBe(Object.prototype)
+		expect({}.runs).toBeUndefined()
+	})
+
+	it('renders the gap between the complexity table and the score table', () => {
+		const out = render(rows, aggregate(rows))
+		expect(out).toContain('| rubric | runs | mean gap | mean absolute gap | distribution | by dimension |')
+		expect(out).toContain('| v3 | 2 | -0.50 | 1.50 | -2: 1, +1: 1 | correctness -0.50 over 2; quality -1 over 1; scope 0 over 2 |')
+		expect(out).toContain('Mixed versions: 2 runs whose judge and person used different rubric versions, counted in neither.')
+		const [complexity, section, scores] = ['## Complexity: estimate vs judged', '## Judge vs person', '## Score by complexity'].map((h) => out.indexOf(h))
+		expect(complexity).toBeGreaterThan(-1)
+		expect(section).toBeGreaterThan(complexity)
+		expect(scores).toBeGreaterThan(section)
+	})
+
+	it("leaves the Runs table's overall cell as it was", () => {
+		expect(render(rows, aggregate(rows))).toContain('| j-up | small | – | 3 | – | 4 | v3 |')
+	})
+
+	it('says so when no run has a gap yet', () => {
+		const out = render([], aggregate([]))
+		expect(out).toContain('## Judge vs person')
+		expect(out).toContain("No run has a person's score beside a judge's draft yet.")
+		expect(out).not.toContain('| rubric | runs | mean gap | mean absolute gap |')
+	})
+
+	it('marks a pair with no dimensions', () => {
+		const unknown = join([run('j-unknown', { score: { overall: 3, by: 'Quang Le' }, score_judge: { overall: 3 } })])
+		const out = render(unknown, aggregate(unknown))
+		expect(out).toContain('| unknown | 1 | 0 | 0 | 0: 1 | – |')
+		expect(out).toContain('Mixed versions: 0 runs whose judge')
+	})
+
+	it('shows only the Mixed line when every run is of two versions', () => {
+		const mixed = [row('j-mixed')]
+		const out = render(mixed, aggregate(mixed))
+		expect(out).toContain('Mixed versions: 1 run whose judge')
+		expect(out).not.toContain('| rubric | runs | mean gap | mean absolute gap |')
+		expect(out).not.toContain("No run has a person's score beside a judge's draft yet.")
+	})
+})
+
 // A traced run whose requests were made from active[0] to active[1] (by default its whole window).
 const traced = (id, created, closed, session, requests, active = [created, closed]) => ({
 	id,
@@ -1141,5 +1285,29 @@ describe('calibrate CLI', () => {
 		expect(out.status).toBe(0)
 		expect(out.stderr.split('could not check issue ids with bd').length - 1).toBe(1)
 		expect(labelsOf(out.stdout)).toContain('wf_gate:claim')
+	})
+
+	it("carries the judge's draft and the confirmed score side by side in --json, on the rows and in the aggregate", () => {
+		const script = fileURLToPath(new URL('./calibrate.mjs', import.meta.url))
+		const score = { rubric: 3, overall: 4, dims: { correctness: 4 }, by: 'Quang Le' }
+		const draft = { rubric: 3, overall: 3, dims: { correctness: 3 } }
+		const issues = [issue('squid-j.1', 'closed', { work: { sessions: [], steps: [] }, score, score_judge: draft })]
+		writeFileSync(
+			join(bin, 'bd'),
+			[
+				'#!/bin/sh',
+				'case " $* " in',
+				`  *" list --all -n 0 --json "*) echo '${JSON.stringify(issues)}' ;;`,
+				`  *" show "*) echo '{"status":"closed","dependents":[]}' ;;`,
+				`  *" list "*) echo '[]' ;;`,
+				'esac',
+				'',
+			].join('\n'),
+		)
+		const r = spawnSync('node', [script, '--json', '--sessions', bin], { encoding: 'utf8', env: { ...process.env, PATH: `${bin}:${process.env.PATH}` } })
+		if (r.status !== 0) throw new Error(`exit ${r.status}: ${r.stderr}`)
+		const { runs, aggregate: agg } = JSON.parse(r.stdout)
+		expect(runs[0]).toMatchObject({ judgeOverall: 3, judgeDims: { correctness: 3 }, judgeRubric: 3, confirmedOverall: 4, confirmedDims: { correctness: 4 } })
+		expect(agg.judgeGap).toEqual({ mixed: 0, byRubric: [{ rubric: 3, runs: 1, mean: 1, meanAbsolute: 1, distribution: [[1, 1]], byDimension: { correctness: { runs: 1, mean: 1 } } }] })
 	})
 })

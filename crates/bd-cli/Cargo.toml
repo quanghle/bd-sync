@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+publish.workspace = true
 description = "bd's commands: the command-line grammar, each command's implementation, and the client of remote workspaces"
 
 [dependencies]

@@ -638,6 +638,41 @@ fn bench_remote_mode_verifies_invariants() {
 }
 
 #[test]
+fn bench_runs_every_mode_at_the_requested_durability() {
+    // Off, not normal: `config get` falls back to normal, which would pass without the write.
+    let mut levels = Vec::new();
+    for mode in ["threads", "processes", "cli", "remote"] {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("w").join(".bd").join("bd.db");
+        let out = bd(dir.path())
+            .args([
+                "--json",
+                "bench",
+                "--mode",
+                mode,
+                "--durability",
+                "off",
+                "--workers",
+                "2",
+                "--issues",
+                "20",
+                "--keep",
+            ])
+            .arg(&keep)
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_str(&check(out, mode)).unwrap();
+        assert_eq!(report["mode"], mode);
+        assert_eq!(report["durability"], "off");
+        assert_eq!(report["verified"], true, "{report}");
+        let out = bd(dir.path()).arg("--db").arg(&keep).args(["config", "get", "durability"]).output().unwrap();
+        levels.push((mode, check(out, "config get durability").trim().to_string()));
+    }
+    let off = |mode| (mode, "off".to_string());
+    assert_eq!(levels, ["threads", "processes", "cli", "remote"].map(off));
+}
+
+#[test]
 fn remote_command_configures_a_checkout() {
     let server = Server::start();
     let secret = server.token("alice-laptop", "alice", &[]);

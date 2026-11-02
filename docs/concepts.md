@@ -69,6 +69,15 @@ written, with the cycle's path in the error; `bd dep cycles` checks a whole
 workspace. `bd dep list` and `bd dep tree` show edges (`--direction`,
 `--max-depth`), and `bd blocked` lists blocked issues with their blockers.
 
+An issue cannot wait on its own ancestor: a parent can't close before its
+children, and a blocked parent blocks its whole subtree, so neither could
+finish. A `blocks` or `conditional-blocks` edge between an issue and its
+ancestor or descendant is refused, and so is a move (`bd update --parent`,
+`bd dep add -t parent-child`) that would make one, naming the edge to
+remove. These checks ignore statuses. `bd import` refuses a file that would
+leave a new edge of this kind live, and `bd doctor` warns about any already
+in a workspace ([Health](observability.md#health)).
+
 `duplicates` and `supersedes` edges point from the closed issue to the one
 that replaces it, as in beads: `X duplicates Y` means X is a duplicate of Y,
 and `X supersedes Y` means X is superseded by Y. `bd duplicate X --of Y` and

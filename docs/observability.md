@@ -41,13 +41,16 @@ counter.
 - dependency cycles, event-sequence continuity and stale leases;
 - open issues under a closed parent (a warning: left by `bd close --force`
   or `bd reopen --force`; reopen the parent or close the issue);
+- issues blocked by their own ancestor (`ancestor_deadlocks`, a warning:
+  neither can finish; remove the edge with `bd dep rm`, as `--fix` leaves it
+  alone);
 - with feature specs on, spec parts not in the shape `bd spec` writes
   (`malformed_specs`, a warning: `bd spec drift` lists each problem and its
   fix).
 
 `--fix` repairs leases and blocked flags in one transaction. Problems exit
 with code 1; warnings (stale leases, open issues under a closed parent,
-malformed spec parts) do not.
+issues blocked by their own ancestor, malformed spec parts) do not.
 
 ## Server logs
 

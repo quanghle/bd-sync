@@ -45,6 +45,9 @@ const WHOLE_TABLE: &[(&str, &str)] = &[
     ("WITH RECURSIVE direct(id) AS", "issues"),
     ("SELECT id, is_blocked FROM issues ORDER BY id", "issues"),
     ("SELECT issue_id, depends_on_id FROM dependencies WHERE dep_type IN", "dependencies"),
+    // issues blocked by their own ancestor (`doctor`, imports): the live blocking edges, then the hierarchy
+    ("WHERE d.dep_type IN ('blocks','conditional-blocks') AND i.status NOT IN", "dependencies"),
+    ("WHERE d.dep_type = 'parent-child' ORDER BY d.issue_id, d.depends_on_id", "dependencies"),
     // stats: issues by status, blocked, closable epics, label counts
     ("SELECT status, COUNT(*) FROM issues GROUP BY status", "issues"),
     ("SELECT COUNT(*) FROM issues WHERE is_blocked = 1 AND status NOT IN", "issues"),
@@ -264,6 +267,7 @@ fn walk_the_graph(ws: &mut Ws) {
                 playbook::runs(r.conn(), &Default::default(), r.now())?;
                 playbook::extract(r.conn(), &run, Some("plans"))?;
                 graph::full_blocked_set(r.conn())?;
+                graph::stuck_ancestor_edges(r.conn())?;
                 r.stats()?;
                 r.export_jsonl(&mut Vec::new(), &ExportOptions::default())?;
                 Ok(())
@@ -868,6 +872,15 @@ fn failures(name: &str, ws: &Ws, statements: &BTreeSet<String>) -> Vec<String> {
 fn graph_walks_plan_index_lookups_under_stale_statistics() {
     let mut statements = statements_of(walk_the_graph);
     assert!(statements.len() > 50, "{} statements", statements.len());
+    // The ancestor deadlock checks ran: the two scans behind `bd doctor` and imports, and a move's check.
+    let flat: Vec<String> = statements.iter().map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+    for needle in [
+        "WHERE d.dep_type IN ('blocks','conditional-blocks') AND i.status NOT IN",
+        "WHERE d.dep_type = 'parent-child' ORDER BY d.issue_id, d.depends_on_id",
+        "dep_type IN ('blocks','conditional-blocks') ORDER BY depends_on_id",
+    ] {
+        assert!(flat.iter().any(|s| s.contains(needle)), "no statement with {needle:?} ran");
+    }
     statements.extend(statements_of(approval_packets));
 
     let mut failures = Vec::new();

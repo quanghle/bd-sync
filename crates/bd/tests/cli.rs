@@ -150,6 +150,132 @@ fn reopen_refuses_an_open_child_under_a_closed_parent() {
     assert_eq!(ws.code_as("tester", &["doctor"]), 0, "a warning, not a failure");
 }
 
+/// The message of a `refused` error from `bd --json args`, which exits 2.
+fn refused_with(ws: &Ws, args: &[&str]) -> String {
+    let mut a = vec!["--json"];
+    a.extend_from_slice(args);
+    let (code, stderr) = refusal(ws, "tester", &a);
+    assert_eq!(code, 2, "bd {args:?}: {stderr}");
+    let err: Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(err["error"]["code"], "refused", "{err}");
+    err["error"]["message"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn moves_that_would_block_an_issue_on_its_own_ancestor_are_refused() {
+    let ws = Ws::new();
+
+    // The subtree shape: a child of the moved issue blocks on the new parent.
+    let p = ws.id(&["create", "Parent"]);
+    let c = ws.id(&["create", "Moved"]);
+    let d = ws.id(&["create", "Child", "--parent", &c]);
+    ws.ok(&["dep", "add", &d, &p]);
+    let want = format!(
+        "{d} depends on {p} via blocks; moving {c} under {p} would make {p} an ancestor of {d} and deadlock; remove that edge first"
+    );
+    assert_eq!(refused_with(&ws, &["update", &c, "--parent", &p]), want);
+    assert_eq!(refused_with(&ws, &["dep", "add", &c, &p, "--type", "parent-child"]), want);
+    assert!(ws.json(&["show", &c])["parent"].is_null(), "the move left nothing behind");
+
+    // The ancestor shape: the moved issue blocks on the new parent's parent.
+    let g = ws.id(&["create", "Grandparent"]);
+    let p2 = ws.id(&["create", "Parent 2", "--parent", &g]);
+    let c2 = ws.id(&["create", "Moved 2"]);
+    ws.ok(&["dep", "add", &c2, &g]);
+    let want = format!(
+        "{c2} depends on {g} via blocks; moving {c2} under {p2} would make {g} an ancestor of {c2} and deadlock; remove that edge first"
+    );
+    assert_eq!(refused_with(&ws, &["update", &c2, "--parent", &p2]), want);
+    assert_eq!(refused_with(&ws, &["dep", "add", &c2, &p2, "--type", "parent-child"]), want);
+    assert!(ws.json(&["show", &c2])["parent"].is_null(), "the move left nothing behind");
+
+    // Doing what the message says lets both moves through.
+    ws.ok(&["dep", "rm", &d, &p]);
+    ws.ok(&["update", &c, "--parent", &p]);
+    assert_eq!(ws.json(&["show", &c])["parent"], p.as_str());
+    ws.ok(&["dep", "rm", &c2, &g]);
+    ws.ok(&["dep", "add", &c2, &p2, "--type", "parent-child"]);
+    assert_eq!(ws.json(&["show", &c2])["parent"], p2.as_str());
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn imports_that_would_block_an_issue_on_its_own_ancestor_are_refused() {
+    let ws = Ws::new();
+    let line = |id: &str, deps: Value| {
+        let issue = serde_json::json!({ "id": id, "title": id, "status": "open", "dependencies": deps });
+        format!("{issue}\n")
+    };
+    let top = line("t-1", serde_json::json!([]));
+    let middle = line("t-2", serde_json::json!([{ "depends_on_id": "t-1", "type": "parent-child" }]));
+    let stuck = line(
+        "t-3",
+        serde_json::json!([
+            { "depends_on_id": "t-2", "type": "parent-child" },
+            { "depends_on_id": "t-1", "type": "blocks" },
+        ]),
+    );
+    let file = ws.dir.path().join("stuck.jsonl");
+    std::fs::write(&file, format!("{top}{middle}{stuck}")).unwrap();
+    let file = file.to_str().unwrap();
+
+    let want =
+        "t-3 depends on t-1 via blocks, and t-1 is an ancestor of t-3: importing this would deadlock; remove that edge";
+    assert_eq!(refused_with(&ws, &["import", file]), want);
+    assert_eq!(refused_with(&ws, &["import", file, "--dry-run"]), want);
+    assert_eq!(refused_with(&ws, &["import", file, "--lenient"]), want);
+    assert_eq!(ws.json(&["list", "--all"]).as_array().unwrap().len(), 0, "all or nothing");
+
+    // The same file without that edge imports.
+    let fixed = line("t-3", serde_json::json!([{ "depends_on_id": "t-2", "type": "parent-child" }]));
+    let file = ws.dir.path().join("fixed.jsonl");
+    std::fs::write(&file, format!("{top}{middle}{fixed}")).unwrap();
+    assert_eq!(ws.json(&["import", file.to_str().unwrap()])["created"], 3);
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn doctor_warns_about_an_issue_blocked_by_its_own_ancestor_and_leaves_it() {
+    let ws = Ws::new();
+    let t = ws.id(&["create", "Top"]);
+    let m = ws.id(&["create", "Middle", "--parent", &t]);
+    let x = ws.id(&["create", "Held"]);
+    ws.ok(&["dep", "add", &x, &t]);
+    // Writers refuse the last link now, so seed it as an older bd would have left it.
+    let db = ws.dir.path().join(".bd").join("bd.db");
+    let mut store = bd_core::Store::open(&db, bd_core::OpenOptions::default()).unwrap();
+    store
+        .write("damage", "tester", |tx| {
+            tx.conn().execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+                 VALUES (?1, ?2, 'parent-child', 1700000000000)",
+                (&x, &m),
+            )?;
+            tx.recompute_blocked()
+        })
+        .unwrap();
+    drop(store);
+
+    let check = |d: &Value| {
+        d["checks"].as_array().unwrap().iter().find(|k| k["name"] == "ancestor_deadlocks").cloned().unwrap()
+    };
+    let doctor = ws.json(&["doctor"]);
+    assert_eq!(doctor["ok"], true, "{doctor}");
+    let found = check(&doctor);
+    assert_eq!(found["severity"], "warn");
+    assert_eq!(
+        found["detail"],
+        format!("1 issue(s) blocked by their own ancestor (remove the edge with `bd dep rm`): {x} -> {t} (blocks)")
+    );
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0, "a warning, not a failure");
+
+    assert_eq!(check(&ws.json(&["doctor", "--fix"])), found, "--fix leaves it alone");
+    assert_eq!(check(&ws.json(&["doctor"])), found, "the edge is still there");
+
+    ws.ok(&["dep", "rm", &x, &t]);
+    assert_eq!(check(&ws.json(&["doctor"]))["severity"], "ok");
+}
+
 #[test]
 fn stored_text_cannot_drive_the_terminal() {
     let ws = Ws::new();

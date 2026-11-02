@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bd_core::doctor;
 use bd_core::hierarchy;
-use bd_core::transfer::{ExportOptions, ImportOptions};
+use bd_core::transfer::{ExportOptions, ImportOptions, ImportSummary};
 use bd_core::*;
 use serde_json::json;
 use tempfile::TempDir;
@@ -52,6 +52,20 @@ impl Env {
 
     fn dep(&mut self, issue: &str, target: &str, t: DepType) {
         self.store.write("dep", "alice", |tx| tx.add_dependency(issue, target, t, None)).unwrap();
+    }
+
+    /// An edge plain SQL can add and the writers refuse, with the blocked
+    /// flags left correct, so the workspace holds that shape and nothing else.
+    fn raw_edge(&mut self, issue: &str, target: &str, t: &str) {
+        self.store
+            .write("damage", "alice", |tx| {
+                tx.conn().execute(
+                    "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    (issue, target, t, T0),
+                )?;
+                tx.recompute_blocked()
+            })
+            .unwrap();
     }
 
     fn close(&mut self, id: &str) -> CloseOutcome {
@@ -316,6 +330,338 @@ fn cycles_and_hierarchy_deadlocks_are_rejected() {
     assert!(err.to_string().contains("descendant") || matches!(err, Error::Cycle { .. }), "{err}");
     assert!(env.store.read(|r| r.cycles()).unwrap().is_empty());
     env.assert_healthy();
+}
+
+/// A new issue under `parent`.
+fn kid_of(env: &mut Env, title: &str, parent: &str) -> String {
+    env.create_with(NewIssue { title: title.into(), parent: Some(parent.into()), ..Default::default() })
+}
+
+/// `bd update id --parent parent`, or moving `id` out of its parent on `None`.
+fn reparent(env: &mut Env, id: &str, parent: Option<&str>) -> Result<UpdateOutcome> {
+    let patch = IssuePatch { parent: Some(parent.map(str::to_string)), ..Default::default() };
+    env.store.write("update", "alice", |tx| tx.update_issue(id, &patch, &Guard::default(), false))
+}
+
+/// `bd dep add id parent --type parent-child`.
+fn add_parent(env: &mut Env, id: &str, parent: &str) -> Result<DepChange> {
+    env.store.write("dep", "alice", |tx| tx.add_dependency(id, parent, DepType::ParentChild, None))
+}
+
+fn add_edge(env: &mut Env, issue: &str, target: &str, t: DepType) -> Result<DepChange> {
+    env.store.write("dep", "alice", |tx| tx.add_dependency(issue, target, t, None))
+}
+
+fn parent_of(env: &Env, id: &str) -> Option<String> {
+    env.store.read(|r| r.parent(id)).unwrap()
+}
+
+/// The refusal of moving `issue` under `target` while `holder` waits on `blocker`.
+fn move_refusal(holder: &str, blocker: &str, via: &DepType, issue: &str, target: &str) -> String {
+    format!(
+        "{holder} depends on {blocker} via {via}; moving {issue} under {target} would make {blocker} an ancestor of {holder} and deadlock; remove that edge first"
+    )
+}
+
+#[track_caller]
+fn assert_refused<T: std::fmt::Debug>(got: Result<T>, want: &str) {
+    let err = got.unwrap_err();
+    assert!(matches!(err, Error::Refused(_)), "{err:?}");
+    assert_eq!(err.to_string(), want);
+    assert_eq!((err.code(), err.exit_code()), ("refused", 2));
+}
+
+#[track_caller]
+fn assert_cycle<T: std::fmt::Debug>(got: Result<T>, want: &[&String]) {
+    match got.unwrap_err() {
+        Error::Cycle { path } => assert_eq!(path.iter().collect::<Vec<_>>(), want),
+        other => panic!("expected cycle, got {other}"),
+    }
+}
+
+#[test]
+fn moving_a_subtree_under_what_it_blocks_on_is_refused() {
+    for via in [DepType::Blocks, DepType::ConditionalBlocks] {
+        let mut env = Env::new();
+        let old = env.create("Old parent", 1);
+        let c = kid_of(&mut env, "C", &old);
+        let d = kid_of(&mut env, "D", &c);
+        let p = env.create("P", 1);
+        env.dep(&d, &p, via.clone());
+
+        let ids = [&old, &c, &d, &p];
+        let flags = |env: &Env| ids.map(|id| env.issue(id).is_blocked);
+        let (events, blocked) = (head(&env), flags(&env));
+        assert_refused(reparent(&mut env, &c, Some(&p)), &move_refusal(&d, &p, &via, &c, &p));
+        assert_eq!(parent_of(&env, &c).as_ref(), Some(&old), "the old parent edge is put back");
+        assert_eq!(head(&env), events);
+        assert_eq!(flags(&env), blocked);
+
+        // The whole update is refused, not just the move.
+        let patch = IssuePatch { title: Some("Renamed".into()), parent: Some(Some(p.clone())), ..Default::default() };
+        let got = env.store.write("update", "alice", |tx| tx.update_issue(&c, &patch, &Guard::default(), false));
+        assert_refused(got, &move_refusal(&d, &p, &via, &c, &p));
+        assert_eq!(env.issue(&c).title, "C");
+        env.assert_healthy();
+    }
+}
+
+#[test]
+fn a_move_refusal_names_the_nearest_edge_first() {
+    let mut env = Env::new();
+    let g = env.create("G", 1);
+    let p = kid_of(&mut env, "P", &g);
+    let c = env.create("C", 1);
+    let d1 = kid_of(&mut env, "D1", &c);
+    let d2 = kid_of(&mut env, "D2", &c);
+    env.dep(&d2, &g, DepType::Blocks);
+    env.dep(&d2, &p, DepType::ConditionalBlocks);
+    let blocks = DepType::Blocks;
+    assert_refused(reparent(&mut env, &c, Some(&p)), &move_refusal(&d2, &g, &blocks, &c, &p));
+    env.dep(&d1, &p, DepType::Blocks);
+    assert_refused(reparent(&mut env, &c, Some(&p)), &move_refusal(&d1, &p, &blocks, &c, &p));
+    env.dep(&c, &g, DepType::Blocks);
+    assert_refused(reparent(&mut env, &c, Some(&p)), &move_refusal(&c, &g, &blocks, &c, &p));
+}
+
+#[test]
+fn moving_under_a_descendant_of_a_blocker_is_refused() {
+    let mut env = Env::new();
+    let g = env.create("G", 1);
+    let p = kid_of(&mut env, "P", &g);
+    let lower = kid_of(&mut env, "Lower", &p);
+    let c = env.create("C", 1);
+    env.dep(&c, &g, DepType::Blocks);
+    let blocks = DepType::Blocks;
+    assert_refused(reparent(&mut env, &c, Some(&p)), &move_refusal(&c, &g, &blocks, &c, &p));
+    assert_refused(reparent(&mut env, &c, Some(&lower)), &move_refusal(&c, &g, &blocks, &c, &lower));
+
+    let held = env.create("Held below", 1);
+    let d = kid_of(&mut env, "D", &held);
+    env.dep(&d, &g, DepType::ConditionalBlocks);
+    let via = DepType::ConditionalBlocks;
+    assert_refused(reparent(&mut env, &held, Some(&p)), &move_refusal(&d, &g, &via, &held, &p));
+    assert_refused(reparent(&mut env, &held, Some(&lower)), &move_refusal(&d, &g, &via, &held, &lower));
+    assert_eq!(parent_of(&env, &c), None);
+    assert_eq!(parent_of(&env, &held), None);
+    env.assert_healthy();
+}
+
+#[test]
+fn adding_a_parent_edge_refuses_the_moves_shapes() {
+    for via in [DepType::Blocks, DepType::ConditionalBlocks] {
+        let mut env = Env::new();
+        let p = env.create("P", 1);
+        let c = env.create("C", 1);
+        let d = kid_of(&mut env, "D", &c);
+        env.dep(&d, &p, via.clone());
+        let g = env.create("G", 1);
+        let lower = kid_of(&mut env, "Lower", &g);
+        let c2 = env.create("C2", 1);
+        env.dep(&c2, &g, via.clone());
+
+        let events = head(&env);
+        assert_refused(add_parent(&mut env, &c, &p), &move_refusal(&d, &p, &via, &c, &p));
+        assert_refused(add_parent(&mut env, &c2, &lower), &move_refusal(&c2, &g, &via, &c2, &lower));
+        assert_eq!(head(&env), events);
+        assert_eq!((parent_of(&env, &c), parent_of(&env, &c2)), (None, None));
+        env.assert_healthy();
+    }
+}
+
+#[test]
+fn a_move_refusal_ignores_statuses_and_has_no_override() {
+    let blocks = DepType::Blocks;
+
+    // A closed holder and a pinned one wait on nothing, and are still refused.
+    let mut env = Env::new();
+    let p = env.create("P", 1);
+    let c = env.create("C", 1);
+    let d = kid_of(&mut env, "D", &c);
+    env.close(&d);
+    env.dep(&d, &p, DepType::Blocks);
+    assert_refused(reparent(&mut env, &c, Some(&p)), &move_refusal(&d, &p, &blocks, &c, &p));
+
+    let holder = env.create("Holder", 1);
+    let pinned = env.create_with(NewIssue {
+        title: "Pinned".into(),
+        parent: Some(holder.clone()),
+        status: Some(Status::Pinned),
+        ..Default::default()
+    });
+    env.dep(&pinned, &p, DepType::Blocks);
+    assert_refused(reparent(&mut env, &holder, Some(&p)), &move_refusal(&pinned, &p, &blocks, &holder, &p));
+
+    // A pinned target.
+    let target =
+        env.create_with(NewIssue { title: "Pinned target".into(), status: Some(Status::Pinned), ..Default::default() });
+    let c2 = env.create("C2", 1);
+    env.dep(&c2, &target, DepType::Blocks);
+    let d2 = env.create("D2", 1);
+    let d2_kid = kid_of(&mut env, "D2 kid", &d2);
+    env.dep(&d2_kid, &target, DepType::Blocks);
+    let under_target = kid_of(&mut env, "Under the target", &target);
+    assert_refused(
+        reparent(&mut env, &c2, Some(&under_target)),
+        &move_refusal(&c2, &target, &blocks, &c2, &under_target),
+    );
+    assert_refused(reparent(&mut env, &d2, Some(&target)), &move_refusal(&d2_kid, &target, &blocks, &d2, &target));
+
+    // All closed: the check that a closed parent takes only closed issues
+    // passes, so this refusal answers.
+    let mut env = Env::new();
+    let p = env.create("P", 1);
+    let c = env.create("C", 1);
+    let d = kid_of(&mut env, "D", &c);
+    env.close(&p);
+    env.dep(&d, &p, DepType::Blocks);
+    env.close(&d);
+    env.close(&c);
+    assert_refused(reparent(&mut env, &c, Some(&p)), &move_refusal(&d, &p, &blocks, &c, &p));
+
+    // `take_over` only speaks to claims.
+    let mut env = Env::new();
+    let p = env.create("P", 1);
+    let c = env.create("C", 1);
+    let d = kid_of(&mut env, "D", &c);
+    env.dep(&d, &p, DepType::Blocks);
+    let patch = IssuePatch { parent: Some(Some(p.clone())), ..Default::default() };
+    let got = env.store.write("update", "alice", |tx| tx.update_issue(&c, &patch, &Guard::default(), true));
+    assert_refused(got, &move_refusal(&d, &p, &blocks, &c, &p));
+    env.assert_healthy();
+}
+
+#[test]
+fn hierarchy_refusals_keep_their_own_answers() {
+    let mut env = Env::new();
+
+    // (a) The same pair: the move never gets as far as the new check.
+    let p = env.create("P", 1);
+    let c = env.create("C", 1);
+    env.dep(&c, &p, DepType::Blocks);
+    let want = format!("{c} already depends on {p} via blocks; remove that edge first");
+    assert_refused(reparent(&mut env, &c, Some(&p)), &want);
+    assert_refused(add_parent(&mut env, &c, &p), &want);
+
+    // (b) A child on its direct parent.
+    let parent = env.create("Parent", 1);
+    let kid = kid_of(&mut env, "Kid", &parent);
+    let got = add_edge(&mut env, &kid, &parent, DepType::Blocks);
+    assert_refused(got, &format!("{kid} already depends on {parent} via parent-child; remove that edge first"));
+
+    // (c) A deeper descendant on its ancestor.
+    let grandkid = kid_of(&mut env, "Grandkid", &kid);
+    let got = add_edge(&mut env, &grandkid, &parent, DepType::Blocks);
+    assert_refused(got, &format!("{parent} is an ancestor of {grandkid}; a blocks edge between them would deadlock"));
+    let got = add_edge(&mut env, &grandkid, &parent, DepType::ConditionalBlocks);
+    let want = format!("{parent} is an ancestor of {grandkid}; a conditional-blocks edge between them would deadlock");
+    assert_refused(got, &want);
+
+    // (d) An ancestor on its descendant: a cycle over the parent edges.
+    let got = add_edge(&mut env, &parent, &grandkid, DepType::Blocks);
+    assert_cycle(got, &[&parent, &grandkid, &kid, &parent]);
+    let got = add_edge(&mut env, &parent, &kid, DepType::Blocks);
+    assert_cycle(got, &[&parent, &kid, &parent]);
+
+    // (e) The reverse shapes: the new parent waits on the moved subtree.
+    let up = env.create("G", 1);
+    let new_parent = kid_of(&mut env, "P2", &up);
+    let c2 = env.create("C2", 1);
+    let d2 = kid_of(&mut env, "D2", &c2);
+    env.dep(&new_parent, &d2, DepType::Blocks);
+    assert_cycle(reparent(&mut env, &c2, Some(&new_parent)), &[&c2, &new_parent, &d2, &c2]);
+    let c3 = env.create("C3", 1);
+    let d3 = kid_of(&mut env, "D3", &c3);
+    env.dep(&up, &d3, DepType::Blocks);
+    assert_cycle(reparent(&mut env, &c3, Some(&new_parent)), &[&c3, &new_parent, &up, &d3, &c3]);
+
+    // (f) The moved issue's own informational edge: a pair holds one edge.
+    for via in [DepType::Related, DepType::WaitsFor] {
+        let p = env.create("P", 1);
+        let c = env.create("C", 1);
+        env.dep(&c, &p, via.clone());
+        let want = format!("{c} already depends on {p} via {via}; remove that edge first");
+        assert_refused(reparent(&mut env, &c, Some(&p)), &want);
+        assert_refused(add_parent(&mut env, &c, &p), &want);
+    }
+    env.assert_healthy();
+}
+
+#[test]
+fn moves_that_cannot_deadlock_go_through() {
+    let mut env = Env::new();
+    let g = env.create("G", 1);
+    let p = kid_of(&mut env, "P", &g);
+    let moved_ok = |env: &mut Env, id: &str, to: Option<&str>| {
+        reparent(env, id, to).unwrap();
+        assert_eq!(parent_of(env, id).as_deref(), to);
+    };
+
+    // A blocks edge inside the moved subtree.
+    let c = env.create("C", 1);
+    let a = kid_of(&mut env, "A", &c);
+    let b = kid_of(&mut env, "B", &c);
+    env.dep(&a, &b, DepType::Blocks);
+    moved_ok(&mut env, &c, Some(&p));
+
+    // Siblings under the new parent, ordered by blocks.
+    let first = env.create("First", 1);
+    let second = env.create("Second", 1);
+    env.dep(&second, &first, DepType::ConditionalBlocks);
+    let third = env.create("Third", 1);
+    env.dep(&third, &second, DepType::Blocks);
+    moved_ok(&mut env, &first, Some(&p));
+    moved_ok(&mut env, &second, Some(&p));
+    moved_ok(&mut env, &third, Some(&p));
+
+    // An edge to an unrelated issue.
+    let elsewhere = env.create("Elsewhere", 1);
+    let x = env.create("X", 1);
+    let x_kid = kid_of(&mut env, "X kid", &x);
+    env.dep(&x, &elsewhere, DepType::Blocks);
+    env.dep(&x_kid, &elsewhere, DepType::ConditionalBlocks);
+    moved_ok(&mut env, &x, Some(&p));
+
+    // Informational edges to the new parent, held below the moved issue.
+    let held = env.create("Held", 1);
+    let d1 = kid_of(&mut env, "D1", &held);
+    let d2 = kid_of(&mut env, "D2", &held);
+    env.dep(&d1, &p, DepType::Related);
+    env.dep(&d2, &p, DepType::WaitsFor);
+    moved_ok(&mut env, &held, Some(&p));
+
+    // And to an ancestor of it, held by the moved issue or below it.
+    let related = env.create("Related", 1);
+    env.dep(&related, &g, DepType::Related);
+    moved_ok(&mut env, &related, Some(&p));
+    let waiting = env.create("Waiting", 1);
+    env.dep(&waiting, &g, DepType::WaitsFor);
+    moved_ok(&mut env, &waiting, Some(&p));
+    let held = env.create("Held 2", 1);
+    let d3 = kid_of(&mut env, "D3", &held);
+    env.dep(&d3, &g, DepType::Related);
+    moved_ok(&mut env, &held, Some(&p));
+    env.assert_healthy();
+
+    // A workspace already stuck: nothing here adds to it.
+    let mut env = Env::new();
+    let top = env.create("Top", 1);
+    let mid = kid_of(&mut env, "Mid", &top);
+    let stuck = kid_of(&mut env, "Stuck", &mid);
+    env.raw_edge(&stuck, &top, "blocks");
+    let unrelated = env.create("Unrelated", 1);
+    let patch = IssuePatch { title: Some("Same parent".into()), parent: Some(Some(mid.clone())), ..Default::default() };
+    env.store.write("update", "alice", |tx| tx.update_issue(&stuck, &patch, &Guard::default(), false)).unwrap();
+    assert_eq!(env.issue(&stuck).title, "Same parent");
+    assert_eq!(parent_of(&env, &stuck).as_ref(), Some(&mid));
+
+    let cleared = kid_of(&mut env, "Cleared", &mid);
+    env.raw_edge(&cleared, &top, "blocks");
+    reparent(&mut env, &cleared, None).unwrap();
+    assert_eq!(parent_of(&env, &cleared), None);
+
+    reparent(&mut env, &stuck, Some(&unrelated)).unwrap();
+    assert_eq!(parent_of(&env, &stuck).as_ref(), Some(&unrelated));
 }
 
 #[test]
@@ -1594,6 +1940,194 @@ fn imports_beads_export_format() {
     env.assert_healthy();
 }
 
+/// An issue's import line, with its edges as (target, type) pairs.
+fn import_line(id: &str, status: &str, deps: &[(&str, &str)]) -> String {
+    let deps: Vec<_> = deps.iter().map(|(target, t)| json!({ "depends_on_id": target, "type": t })).collect();
+    json!({ "id": id, "title": id, "status": status, "dependencies": deps }).to_string() + "\n"
+}
+
+fn import_with(env: &mut Env, jsonl: &str, opts: &ImportOptions) -> Result<ImportSummary> {
+    env.store.write("import", "me", |tx| tx.import_jsonl(&mut jsonl.as_bytes(), opts))
+}
+
+fn import(env: &mut Env, jsonl: &str) -> Result<ImportSummary> {
+    import_with(env, jsonl, &ImportOptions::default())
+}
+
+fn count_rows(env: &Env, table: &str) -> i64 {
+    env.store.connection().query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+}
+
+fn import_refusal(x: &str, t: &str, via: &DepType, more: &str) -> String {
+    format!(
+        "{x} depends on {t} via {via}, and {t} is an ancestor of {x}: importing this would deadlock; remove that edge{more}"
+    )
+}
+
+/// The import is refused with `want`, and the workspace is as it was.
+#[track_caller]
+fn assert_import_refused(env: &mut Env, jsonl: &str, opts: &ImportOptions, want: &str) {
+    let before = (count_rows(env, "issues"), count_rows(env, "dependencies"), head(env));
+    assert_refused(import_with(env, jsonl, opts), want);
+    assert_eq!((count_rows(env, "issues"), count_rows(env, "dependencies"), head(env)), before);
+}
+
+/// A chain `t-g`, `t-t`, `t-m`, `t-x`, where `t-x` holds `via` on `top`.
+fn stuck_file(top: &str, via: &DepType) -> String {
+    let t = format!("{via}");
+    [
+        import_line("t-g", "open", &[]),
+        import_line("t-t", "open", &[("t-g", "parent-child")]),
+        import_line("t-m", "open", &[("t-t", "parent-child")]),
+        import_line("t-x", "open", &[("t-m", "parent-child"), (top, &t)]),
+    ]
+    .concat()
+}
+
+#[test]
+fn an_import_that_would_block_an_issue_on_its_own_ancestor_is_refused() {
+    for via in [DepType::Blocks, DepType::ConditionalBlocks] {
+        // Two levels up (the nearest a pair's one edge allows), and three.
+        for top in ["t-t", "t-g"] {
+            for lenient in [false, true] {
+                let mut env = Env::new();
+                let opts = ImportOptions { lenient, ..Default::default() };
+                let want = import_refusal("t-x", top, &via, "");
+                assert_import_refused(&mut env, &stuck_file(top, &via), &opts, &want);
+                assert_eq!(count_rows(&env, "issues"), 0);
+                env.assert_healthy();
+            }
+        }
+    }
+}
+
+#[test]
+fn an_import_is_refused_for_what_it_makes_together_with_the_workspace() {
+    for via in [DepType::Blocks, DepType::ConditionalBlocks] {
+        let t = format!("{via}");
+        let want_for = |x: &str, top: &str| import_refusal(x, top, &via, "");
+
+        // The hierarchy in the workspace, the edge in the file.
+        let mut env = Env::new();
+        let top = env.create("Top", 1);
+        let mid = kid_of(&mut env, "Mid", &top);
+        let low = kid_of(&mut env, "Low", &mid);
+        let jsonl = import_line(&low, "open", &[(&top, &t)]);
+        assert_import_refused(&mut env, &jsonl, &ImportOptions::default(), &want_for(&low, &top));
+        assert_eq!(env.issue(&low).title, "Low");
+        env.assert_healthy();
+
+        // The edge in the workspace, the hierarchy in the file.
+        let mut env = Env::new();
+        let top = env.create("Top", 1);
+        let mid = env.create("Mid", 1);
+        let low = env.create("Low", 1);
+        env.dep(&low, &top, via.clone());
+        let jsonl = import_line(&mid, "open", &[(&top, "parent-child")])
+            + &import_line(&low, "open", &[(&mid, "parent-child")]);
+        assert_import_refused(&mut env, &jsonl, &ImportOptions::default(), &want_for(&low, &top));
+        assert_eq!(parent_of(&env, &low), None);
+        env.assert_healthy();
+    }
+}
+
+#[test]
+fn an_import_refusal_names_the_first_new_edge_and_counts_the_rest() {
+    let via = DepType::Blocks;
+    let jsonl = [
+        import_line("t-t", "open", &[]),
+        import_line("t-m", "open", &[("t-t", "parent-child")]),
+        import_line("t-y", "open", &[("t-m", "parent-child"), ("t-t", "blocks")]),
+        import_line("t-x", "open", &[("t-m", "parent-child"), ("t-t", "blocks")]),
+    ]
+    .concat();
+    let mut env = Env::new();
+    let want = import_refusal("t-x", "t-t", &via, " (+1 more)");
+    assert_import_refused(&mut env, &jsonl, &ImportOptions::default(), &want);
+
+    // An edge already stuck is neither named nor counted.
+    let mut env = Env::new();
+    let top = env.create("Top", 1);
+    let mid = kid_of(&mut env, "Mid", &top);
+    let old = kid_of(&mut env, "Old", &mid);
+    let new = kid_of(&mut env, "New", &mid);
+    env.raw_edge(&old, &top, "blocks");
+    let jsonl = import_line(&new, "open", &[(&top, "blocks")]);
+    let want = import_refusal(&new, &top, &via, "");
+    assert_import_refused(&mut env, &jsonl, &ImportOptions::default(), &want);
+}
+
+#[test]
+fn an_import_with_a_cycle_keeps_the_cycle_error() {
+    let jsonl = stuck_file("t-t", &DepType::Blocks)
+        + &import_line("t-a", "open", &[("t-b", "blocks")])
+        + &import_line("t-b", "open", &[("t-a", "blocks")]);
+    let mut env = Env::new();
+    let err = import(&mut env, &jsonl).unwrap_err();
+    assert!(matches!(err, Error::Cycle { .. }), "{err:?}");
+}
+
+/// A workspace with `Low` under `Mid` under `Top`, and `Low` blocking on `Top`.
+fn stuck_workspace(env: &mut Env) -> (String, String, String) {
+    let top = env.create("Top", 1);
+    let mid = kid_of(env, "Mid", &top);
+    let low = kid_of(env, "Low", &mid);
+    env.raw_edge(&low, &top, "blocks");
+    (top, mid, low)
+}
+
+#[test]
+fn a_stuck_workspace_still_takes_imports() {
+    let mut env = Env::new();
+    let (.., low) = stuck_workspace(&mut env);
+    let stuck = stuck_edges(&env);
+    assert_eq!(stuck.iter().map(|e| e.issue.as_str()).collect::<Vec<_>>(), [low.as_str()]);
+
+    let out = import(&mut env, &import_line("t-new", "open", &[])).unwrap();
+    assert_eq!(out.created, 1);
+    assert_eq!(stuck_edges(&env), stuck);
+
+    let mut file = Vec::new();
+    env.store.read(|r| r.export_jsonl(&mut file, &ExportOptions::default())).unwrap();
+    let out = import(&mut env, std::str::from_utf8(&file).unwrap()).unwrap();
+    assert_eq!((out.created, out.updated, out.unchanged, out.dependencies), (0, 0, 4, 0));
+    assert_eq!(stuck_edges(&env), stuck);
+}
+
+#[test]
+fn an_import_of_a_finished_deadlock_goes_through() {
+    let cases = [
+        ("closed", "open", "closed"),
+        ("closed", "open", "open"),
+        ("open", "open", "closed"),
+        ("pinned", "open", "open"),
+        ("open", "open", "pinned"),
+        ("open", "closed", "open"),
+    ];
+    for (x, m, t) in cases {
+        let jsonl = [
+            import_line("t-t", t, &[]),
+            import_line("t-m", m, &[("t-t", "parent-child")]),
+            import_line("t-x", x, &[("t-m", "parent-child"), ("t-t", "blocks")]),
+        ]
+        .concat();
+        let mut env = Env::new();
+        import(&mut env, &jsonl).unwrap_or_else(|e| panic!("{x} under {m} under {t}: {e}"));
+        assert_eq!(count_rows(&env, "issues"), 3);
+        assert_eq!(count_rows(&env, "dependencies"), 3);
+        assert!(stuck_edges(&env).is_empty());
+    }
+}
+
+#[test]
+fn an_import_closing_the_blocker_of_a_stuck_edge_goes_through() {
+    let mut env = Env::new();
+    let (top, ..) = stuck_workspace(&mut env);
+    import(&mut env, &import_line(&top, "closed", &[])).unwrap();
+    assert_eq!(env.issue(&top).status, Status::Closed);
+    assert!(stuck_edges(&env).is_empty());
+}
+
 #[test]
 fn doctor_detects_and_repairs_drift() {
     let mut env = Env::new();
@@ -1612,6 +2146,95 @@ fn doctor_detects_and_repairs_drift() {
     assert!(fixed.ok);
     assert!(env.issue(&b).is_blocked);
     env.assert_healthy();
+}
+
+/// `name`'s check in a full doctor run, and whether the report is ok.
+fn doctor_check(env: &mut Env, name: &str, fix: bool) -> (doctor::Check, bool) {
+    let report = doctor::diagnose(&mut env.store, fix, true).unwrap();
+    (report.checks.iter().find(|c| c.name == name).unwrap().clone(), report.ok)
+}
+
+fn stuck_edges(env: &Env) -> Vec<graph::StuckEdge> {
+    graph::stuck_ancestor_edges(env.store.connection()).unwrap()
+}
+
+#[test]
+fn doctor_warns_about_an_issue_blocked_by_its_own_ancestor() {
+    let mut env = Env::new();
+    let (check, ok) = doctor_check(&mut env, "ancestor_deadlocks", false);
+    assert_eq!(check.severity, doctor::Severity::Ok);
+    assert_eq!(check.detail, "no issue is blocked by its own ancestor");
+    assert!(ok);
+
+    let top = env.create("Top", 1);
+    let mid = kid_of(&mut env, "Mid", &top);
+    let low = kid_of(&mut env, "Low", &mid);
+    env.raw_edge(&low, &top, "blocks");
+    let (check, ok) = doctor_check(&mut env, "ancestor_deadlocks", false);
+    assert_eq!(check.severity, doctor::Severity::Warn);
+    assert_eq!(
+        check.detail,
+        format!("1 issue(s) blocked by their own ancestor (remove the edge with `bd dep rm`): {low} -> {top} (blocks)")
+    );
+    assert!(ok, "a warning leaves the report ok");
+
+    // Each edge names its own type, and the issue that holds it.
+    let lower = kid_of(&mut env, "Lower", &low);
+    env.raw_edge(&lower, &mid, "conditional-blocks");
+    let (check, _) = doctor_check(&mut env, "ancestor_deadlocks", false);
+    assert!(check.detail.starts_with("2 issue(s) "), "{check:?}");
+    assert!(check.detail.ends_with(&format!("{low} -> {top} (blocks), {lower} -> {mid} (conditional-blocks)")));
+
+    // Removing the edge the warning names clears it.
+    env.store.write("dep", "alice", |tx| tx.remove_dependency(&low, &top)).unwrap();
+    env.store.write("dep", "alice", |tx| tx.remove_dependency(&lower, &mid)).unwrap();
+    env.assert_healthy();
+}
+
+#[test]
+fn doctor_shows_ten_ancestor_deadlocks_and_counts_the_rest() {
+    let mut env = Env::new();
+    let top = env.create("Top", 1);
+    let mid = kid_of(&mut env, "Mid", &top);
+    for i in 0..12 {
+        let kid = kid_of(&mut env, &format!("Kid {i}"), &mid);
+        env.raw_edge(&kid, &top, "blocks");
+    }
+    let (check, _) = doctor_check(&mut env, "ancestor_deadlocks", false);
+    assert_eq!(check.severity, doctor::Severity::Warn);
+    assert!(check.detail.starts_with("12 issue(s) "), "{check:?}");
+    assert!(check.detail.ends_with(" (+2 more)"), "{check:?}");
+    assert_eq!(check.detail.matches(" -> ").count(), 10, "{check:?}");
+}
+
+#[test]
+fn doctor_fix_leaves_an_ancestor_deadlock_alone() {
+    let mut env = Env::new();
+    let top = env.create("Top", 1);
+    let mid = kid_of(&mut env, "Mid", &top);
+    let low = kid_of(&mut env, "Low", &mid);
+    env.raw_edge(&low, &top, "blocks");
+    let stuck = stuck_edges(&env);
+    assert_eq!(stuck.len(), 1);
+
+    let head = env.events().len();
+    let (check, ok) = doctor_check(&mut env, "ancestor_deadlocks", true);
+    assert_eq!((check.severity, check.fixed), (doctor::Severity::Warn, false));
+    assert!(ok);
+    assert_eq!(stuck_edges(&env), stuck);
+    assert_eq!(env.events().len(), head, "with nothing to repair, --fix writes nothing");
+
+    // A repair of something else runs and still leaves the edge.
+    let bystander = env.create("Bystander", 1);
+    env.store.connection().execute("UPDATE issues SET is_blocked = 1 WHERE id = ?1", [&bystander]).unwrap();
+    let report = doctor::diagnose(&mut env.store, true, true).unwrap();
+    let by_name = |name: &str| report.checks.iter().find(|c| c.name == name).unwrap();
+    assert!(by_name("blocked_state").fixed);
+    assert_eq!(
+        (by_name("ancestor_deadlocks").severity, by_name("ancestor_deadlocks").fixed),
+        (doctor::Severity::Warn, false)
+    );
+    assert_eq!(stuck_edges(&env), stuck);
 }
 
 #[test]

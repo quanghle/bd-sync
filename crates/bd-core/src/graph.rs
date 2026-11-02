@@ -568,6 +568,43 @@ fn scheduling_path(conn: &Connection, from: &str, to: &str) -> Result<Option<Vec
     Ok(None)
 }
 
+/// The edge that makes putting `moved` under `target` a deadlock, if any: a
+/// `blocks` or `conditional-blocks` edge held by `moved` or a descendant of it,
+/// to `target` or an ancestor of `target`. That issue would then wait on its
+/// own ancestor, which can't close before it. Returned as (holder, blocker,
+/// type): the first found from `moved` down, children by id, blockers by id.
+/// Statuses don't matter: the shape is refused as the direct edges are.
+fn moved_edge_to_chain(conn: &Connection, moved: &str, target: &str) -> Result<Option<(String, String, DepType)>> {
+    // `target` and its ancestors, read once a blocking edge turns up: most
+    // moves, and every new issue, have none.
+    let mut chain: HashSet<String> = HashSet::new();
+    let mut queue = VecDeque::from([moved.to_string()]);
+    let mut seen = HashSet::from([moved.to_string()]);
+    while let Some(holder) = queue.pop_front() {
+        let edges: Vec<(String, DepType)> = conn
+            .prepare_cached(
+                "SELECT depends_on_id, dep_type FROM dependencies
+                 WHERE issue_id = ?1 AND dep_type IN ('blocks','conditional-blocks')
+                 ORDER BY depends_on_id",
+            )?
+            .query_map([&holder], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if chain.is_empty() && !edges.is_empty() {
+            chain.insert(target.to_string());
+            chain.extend(ancestors(conn, target)?);
+        }
+        if let Some((blocker, via)) = edges.into_iter().find(|(blocker, _)| chain.contains(blocker)) {
+            return Ok(Some((holder, blocker, via)));
+        }
+        for child in children(conn, &holder)? {
+            if seen.insert(child.clone()) {
+                queue.push_back(child);
+            }
+        }
+    }
+    Ok(None)
+}
+
 pub(crate) fn load_edge(conn: &Connection, issue: &str, target: &str) -> Result<Option<Dependency>> {
     Ok(conn
         .prepare_cached(
@@ -678,6 +715,14 @@ pub(crate) fn insert_edge_checked(
                 "{target} is a descendant of {issue}; a {dep_type} edge between them would deadlock"
             )));
         }
+    }
+    // The same deadlock, reached by adding the parent edge last.
+    if *dep_type == DepType::ParentChild
+        && let Some((holder, blocker, via)) = moved_edge_to_chain(conn, issue, target)?
+    {
+        return Err(Error::Refused(format!(
+            "{holder} depends on {blocker} via {via}; moving {issue} under {target} would make {blocker} an ancestor of {holder} and deadlock; remove that edge first"
+        )));
     }
 
     conn.prepare_cached(
@@ -945,6 +990,135 @@ fn cycles_of(edges: Vec<(String, String)>) -> Vec<Vec<String>> {
     cycles.into_iter().map(|cycle| cycle.into_iter().map(|i| ids[i].clone()).collect()).collect()
 }
 
+/// A `blocks` or `conditional-blocks` edge that keeps an issue waiting on its
+/// own ancestor for good: see [`stuck_ancestor_edges`].
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StuckEdge {
+    pub issue: String,
+    pub target: String,
+    pub dep_type: DepType,
+}
+
+/// The edges no issue can get past, sorted by issue, then target. T can't
+/// close before its children, each of them before theirs, down to X, which
+/// waits on T. The edge from X to T is reported when all of these hold:
+///
+/// * it is a `blocks` or `conditional-blocks` edge and T is an ancestor of X,
+///   by each issue's first parent by id ([`parent_of`]);
+/// * neither X nor T is closed or pinned: the edge holds nothing up then;
+/// * no issue from X up to just below T is closed: closing and claiming count
+///   only children that are not closed as open (`open_children`, for which a
+///   pinned child is open), so a closed one frees the issue above it;
+/// * no issue from X's parent up to T has waiters: a spawner may close and be
+///   claimed before its children ([`waiters_on`], whatever the waiter's status).
+///
+/// One pass over the edges, however deep the hierarchy. Issues on a parent
+/// cycle, and below one, have no root and are left out: [`find_cycles`] reports
+/// those.
+pub fn stuck_ancestor_edges(conn: &Connection) -> Result<Vec<StuckEdge>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT d.issue_id, d.depends_on_id, d.dep_type FROM dependencies d
+         CROSS JOIN issues i INDEXED BY sqlite_autoindex_issues_1 ON i.id = d.issue_id
+         CROSS JOIN issues t INDEXED BY sqlite_autoindex_issues_1 ON t.id = d.depends_on_id
+         WHERE d.dep_type IN ('blocks','conditional-blocks')
+           AND i.status NOT IN ('closed','pinned') AND t.status NOT IN ('closed','pinned')",
+    )?;
+    let rows = stmt.query_map([], |r| Ok(StuckEdge { issue: r.get(0)?, target: r.get(1)?, dep_type: r.get(2)? }))?;
+    let candidates = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT d.issue_id, d.depends_on_id, c.status = 'closed',
+                EXISTS (SELECT 1 FROM dependencies w INDEXED BY idx_deps_target
+                        WHERE w.depends_on_id = d.depends_on_id AND w.dep_type = 'waits-for')
+         FROM dependencies d
+         CROSS JOIN issues c INDEXED BY sqlite_autoindex_issues_1 ON c.id = d.issue_id
+         WHERE d.dep_type = 'parent-child'
+         ORDER BY d.issue_id, d.depends_on_id",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let (closed, waiters): (bool, bool) = (r.get(2)?, r.get(3)?);
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, !closed && !waiters))
+    })?;
+    // Each child's first parent only, which is what `parent_of` reads.
+    let mut links: Vec<(String, String, bool)> = Vec::new();
+    for row in rows {
+        let link = row?;
+        if links.last().is_none_or(|last| last.0 != link.0) {
+            links.push(link);
+        }
+    }
+    Ok(stuck_among(&candidates, &links))
+}
+
+/// [`stuck_ancestor_edges`] over `links` (child, parent, whether the link is
+/// unbroken: a stuck edge can run up it), each child once: a depth-first search
+/// from each root, in numbers as in [`cycles_of`]. Each issue on the path knows
+/// its depth, and `top`, how far up its unbroken links go, so an edge costs one
+/// comparison and no walk up. The result is sorted.
+fn stuck_among(candidates: &[StuckEdge], links: &[(String, String, bool)]) -> Vec<StuckEdge> {
+    let mut number: HashMap<&str, usize> = HashMap::new();
+    for id in links.iter().flat_map(|(child, parent, _)| [child, parent]) {
+        let next = number.len();
+        number.entry(id).or_insert(next);
+    }
+    let mut up: Vec<Option<(usize, bool)>> = vec![None; number.len()];
+    let mut kids: Vec<Vec<usize>> = vec![Vec::new(); number.len()];
+    for (child, parent, unbroken) in links {
+        let (child, parent) = (number[child.as_str()], number[parent.as_str()]);
+        up[child] = Some((parent, *unbroken));
+        kids[parent].push(child);
+    }
+    // Each issue's candidates, with their targets' numbers. An edge with an
+    // end in no link can't be between an issue and its ancestor.
+    let mut held: Vec<Vec<(usize, &StuckEdge)>> = vec![Vec::new(); number.len()];
+    for edge in candidates {
+        if let (Some(&issue), Some(&target)) = (number.get(edge.issue.as_str()), number.get(edge.target.as_str())) {
+            held[issue].push((target, edge));
+        }
+    }
+    // Each issue's depth while it is on the current path, and the smallest
+    // depth its unbroken links reach, which also says it was seen.
+    const OFF_PATH: usize = usize::MAX;
+    const UNSET: usize = usize::MAX;
+    let mut at = vec![OFF_PATH; number.len()];
+    let mut top = vec![UNSET; number.len()];
+    let mut stuck = Vec::new();
+    for root in (0..number.len()).filter(|&n| up[n].is_none()) {
+        // Iterative DFS: the path, and how many kids of each issue on it were followed.
+        let mut path = vec![(root, 0)];
+        while let Some(&(node, followed)) = path.last() {
+            let depth = path.len() - 1;
+            if followed == 0 {
+                if top[node] != UNSET {
+                    path.pop();
+                    continue;
+                }
+                at[node] = depth;
+                top[node] = match up[node] {
+                    Some((parent, true)) => top[parent],
+                    _ => depth,
+                };
+                for &(target, edge) in &held[node] {
+                    if at[target] < depth && at[target] >= top[node] {
+                        stuck.push(edge.clone());
+                    }
+                }
+            }
+            if let Some(&kid) = kids[node].get(followed) {
+                path[depth].1 += 1;
+                path.push((kid, 0));
+            } else {
+                at[node] = OFF_PATH;
+                path.pop();
+            }
+        }
+    }
+    stuck.sort();
+    stuck
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -983,5 +1157,265 @@ mod tests {
         let expected: Vec<usize> = ids.iter().map(|id| ancestors(&conn, id).unwrap().len()).collect();
         assert_eq!(depths(&conn, &ids).unwrap(), expected);
         assert_eq!(expected[..6], [3, 2, 1, 0, 0, 2]);
+    }
+
+    /// The tables [`stuck_ancestor_edges`] reads, with the indexes it names.
+    fn stuck_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issues (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'open');
+             CREATE TABLE dependencies (issue_id TEXT, depends_on_id TEXT, dep_type TEXT,
+                                        PRIMARY KEY (issue_id, depends_on_id)) WITHOUT ROWID;
+             CREATE INDEX idx_deps_target ON dependencies(depends_on_id, dep_type, issue_id);",
+        )
+        .unwrap();
+        conn
+    }
+
+    const NONE: [&str; 0] = [];
+
+    /// x under q under p under t.
+    const CHAIN: [(&str, &str, &str); 3] =
+        [("x", "q", "parent-child"), ("q", "p", "parent-child"), ("p", "t", "parent-child")];
+
+    /// A database of `edges` (issue, target, type), its issues open unless
+    /// `statuses` says otherwise.
+    fn seeded(edges: &[(&str, &str, &str)], statuses: &[(&str, &str)]) -> Connection {
+        let conn = stuck_db();
+        for (issue, target, dep_type) in edges {
+            conn.execute("INSERT OR IGNORE INTO issues (id) VALUES (?1), (?2)", [issue, target]).unwrap();
+            conn.execute("INSERT INTO dependencies VALUES (?1, ?2, ?3)", [issue, target, dep_type]).unwrap();
+        }
+        for (id, status) in statuses {
+            conn.execute("UPDATE issues SET status = ?2 WHERE id = ?1", [id, status]).unwrap();
+        }
+        conn
+    }
+
+    fn stuck(conn: &Connection) -> Vec<String> {
+        let edges = stuck_ancestor_edges(conn).unwrap();
+        edges.iter().map(|e| format!("{} -> {} ({})", e.issue, e.target, e.dep_type)).collect()
+    }
+
+    #[test]
+    fn stuck_edges_are_reported_sorted() {
+        // The nearest an ancestor can be: a parent's own pair holds its parent-child edge.
+        let nearest = [("x", "p", "parent-child"), ("p", "t", "parent-child"), ("x", "t", "blocks")];
+        assert_eq!(stuck(&seeded(&nearest, &[])), ["x -> t (blocks)"]);
+
+        let with = |extra: &[(&'static str, &'static str, &'static str)]| [&CHAIN[..], extra].concat();
+        let deep = with(&[("x", "t", "blocks")]);
+        assert_eq!(stuck(&seeded(&deep, &[])), ["x -> t (blocks)"]);
+        let conditional = with(&[("x", "t", "conditional-blocks")]);
+        assert_eq!(stuck(&seeded(&conditional, &[])), ["x -> t (conditional-blocks)"]);
+        let several = with(&[("x", "t", "blocks"), ("x", "p", "blocks"), ("q", "t", "conditional-blocks")]);
+        assert_eq!(
+            stuck(&seeded(&several, &[("x", "in_progress"), ("t", "blocked")])),
+            ["q -> t (conditional-blocks)", "x -> p (blocks)", "x -> t (blocks)"]
+        );
+
+        // What does not free anyone: a pinned issue between, which close and claim count as an
+        // open child; waiters on X itself; a broken link above T.
+        assert_eq!(stuck(&seeded(&deep, &[("q", "pinned")])), ["x -> t (blocks)"]);
+        let waiter_on_x = with(&[("x", "t", "blocks"), ("w", "x", "waits-for")]);
+        assert_eq!(stuck(&seeded(&waiter_on_x, &[])), ["x -> t (blocks)"]);
+        let above = with(&[("x", "t", "blocks"), ("t", "r", "parent-child"), ("w", "r", "waits-for")]);
+        assert_eq!(stuck(&seeded(&above, &[])), ["x -> t (blocks)"]);
+    }
+
+    #[test]
+    fn edges_something_can_finish_are_not_stuck() {
+        let with = |extra: &[(&'static str, &'static str, &'static str)]| [&CHAIN[..], extra].concat();
+        let edge = with(&[("x", "t", "blocks")]);
+        for (name, status) in
+            [("x", "closed"), ("x", "pinned"), ("t", "closed"), ("t", "pinned"), ("q", "closed"), ("p", "closed")]
+        {
+            assert_eq!(stuck(&seeded(&edge, &[(name, status)])), NONE, "{name} {status}");
+        }
+
+        // A spawner at T, in the middle, or at X's parent, whatever its waiter's status.
+        for spawner in ["t", "p", "q"] {
+            let waited = with(&[("x", "t", "blocks"), ("w", spawner, "waits-for")]);
+            assert_eq!(stuck(&seeded(&waited, &[])), NONE, "{spawner}");
+            assert_eq!(stuck(&seeded(&waited, &[("w", "closed")])), NONE, "{spawner}");
+        }
+
+        // Not an ancestor: an issue beside the chain, a descendant, an issue in no link; an X in no link.
+        let sibling = with(&[("s", "t", "parent-child"), ("x", "s", "blocks")]);
+        assert_eq!(stuck(&seeded(&sibling, &[])), NONE);
+        assert_eq!(stuck(&seeded(&with(&[("t", "x", "blocks")]), &[])), NONE);
+        assert_eq!(stuck(&seeded(&with(&[("x", "u", "blocks"), ("u", "t", "blocks")]), &[])), NONE);
+    }
+
+    #[test]
+    fn stuck_edges_follow_the_first_parent_by_id() {
+        let edges = [
+            ("x", "a", "parent-child"),
+            ("x", "z", "parent-child"),
+            ("a", "r", "parent-child"),
+            ("z", "t", "parent-child"),
+            ("x", "r", "blocks"),
+            ("x", "t", "blocks"),
+        ];
+        assert_eq!(stuck(&seeded(&edges, &[])), ["x -> r (blocks)"]);
+        // A closed second parent's waiters and status don't matter either.
+        let conn = seeded(&[&edges[..], &[("w", "z", "waits-for")]].concat(), &[("z", "closed")]);
+        assert_eq!(stuck(&conn), ["x -> r (blocks)"]);
+    }
+
+    #[test]
+    fn a_parent_cycle_ends_the_walk() {
+        // x1 -> x2 -> x3 -> x1 with y below it: no root reaches them, and the forest beside
+        // them still answers.
+        let edges = [
+            ("x1", "x2", "parent-child"),
+            ("x2", "x3", "parent-child"),
+            ("x3", "x1", "parent-child"),
+            ("y", "x1", "parent-child"),
+            ("y", "x2", "blocks"),
+            ("x1", "x3", "blocks"),
+        ];
+        assert_eq!(stuck(&seeded(&edges, &[])), NONE);
+        let conn = seeded(&[&edges[..], &CHAIN[..], &[("x", "t", "blocks")]].concat(), &[]);
+        assert_eq!(stuck(&conn), ["x -> t (blocks)"]);
+    }
+
+    /// [`stuck_ancestor_edges`]'s conditions, read off the helpers themselves
+    /// by a walk up from each edge.
+    fn naive_stuck(conn: &Connection) -> Vec<StuckEdge> {
+        let status = |id: &str| -> String {
+            conn.query_row("SELECT status FROM issues WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+        };
+        let live = |id: &str| !matches!(status(id).as_str(), "closed" | "pinned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT issue_id, depends_on_id, dep_type FROM dependencies
+                 WHERE dep_type IN ('blocks','conditional-blocks')",
+            )
+            .unwrap();
+        let rows = stmt.query_map([], |r| Ok(StuckEdge { issue: r.get(0)?, target: r.get(1)?, dep_type: r.get(2)? }));
+        let mut out = Vec::new();
+        for edge in rows.unwrap() {
+            let edge = edge.unwrap();
+            let up = ancestors(conn, &edge.issue).unwrap();
+            let Some(k) = up.iter().position(|a| *a == edge.target) else { continue };
+            if live(&edge.issue)
+                && live(&edge.target)
+                && up[..k].iter().all(|a| status(a) != "closed")
+                && up[..=k].iter().all(|a| waiters_on(conn, a).unwrap().is_empty())
+            {
+                out.push(edge);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// A linear congruential generator: enough for seeded shapes, with no dependency.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as usize % n
+        }
+    }
+
+    #[test]
+    fn stuck_edges_match_a_naive_walk_on_seeded_forests() {
+        const ISSUES: usize = 60;
+        const STATUSES: [&str; 8] = ["open", "open", "open", "open", "in_progress", "blocked", "closed", "pinned"];
+        let id = |n: usize| format!("i{n:02}");
+        let (mut reported, mut blocking) = (0, 0);
+        for seed in 1..=40 {
+            let mut rng = Lcg(seed);
+            let conn = stuck_db();
+            let insert = |issue: usize, target: usize, dep_type: &str| {
+                conn.execute(
+                    "INSERT OR IGNORE INTO dependencies VALUES (?1, ?2, ?3)",
+                    params![id(issue), id(target), dep_type],
+                )
+                .unwrap();
+            };
+            for n in 0..ISSUES {
+                let status = STATUSES[rng.below(STATUSES.len())];
+                conn.execute("INSERT INTO issues VALUES (?1, ?2)", params![id(n), status]).unwrap();
+            }
+            // Parents numbered lower, and near, for long chains; every so often a root or
+            // a second parent row, which may be the one that counts.
+            for n in 1..ISSUES {
+                if rng.below(8) != 0 {
+                    insert(n, n.saturating_sub(1 + rng.below(4)), "parent-child");
+                }
+                if rng.below(16) == 0 {
+                    insert(n, rng.below(n), "parent-child");
+                }
+            }
+            for _ in 0..30 {
+                let issue = rng.below(ISSUES);
+                let up = ancestors(&conn, &id(issue)).unwrap();
+                let target = if !up.is_empty() && rng.below(4) != 0 {
+                    up[rng.below(up.len())][1..].parse().unwrap()
+                } else {
+                    rng.below(ISSUES)
+                };
+                if target != issue {
+                    insert(issue, target, ["blocks", "conditional-blocks"][rng.below(2)]);
+                }
+            }
+            for _ in 0..3 {
+                let (issue, target) = (rng.below(ISSUES), rng.below(ISSUES));
+                if target != issue {
+                    insert(issue, target, "waits-for");
+                }
+            }
+            let want = naive_stuck(&conn);
+            assert_eq!(stuck_ancestor_edges(&conn).unwrap(), want, "seed {seed}");
+            reported += want.len();
+            blocking += conn
+                .query_row("SELECT COUNT(*) FROM dependencies WHERE dep_type LIKE '%blocks'", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+        }
+        // The seeds reach both answers.
+        assert!(reported > 40, "{reported} reported");
+        assert!(reported as i64 * 2 < blocking, "{reported} of {blocking}");
+    }
+
+    #[test]
+    fn stuck_edges_of_a_deep_chain_take_one_pass() {
+        const LEVELS: usize = 20_000;
+        let conn = stuck_db();
+        // Level 1 holds the pair with the root in its parent-child edge, so the blocks edges
+        // start at level 2: to the root, the worst case for a walk up per edge.
+        conn.execute_batch(&format!(
+            "WITH RECURSIVE n(k) AS (SELECT 0 UNION ALL SELECT k + 1 FROM n WHERE k < {last})
+             INSERT INTO issues (id) SELECT printf('l%06d', k) FROM n;
+             WITH RECURSIVE n(k) AS (SELECT 1 UNION ALL SELECT k + 1 FROM n WHERE k < {last})
+             INSERT INTO dependencies SELECT printf('l%06d', k), printf('l%06d', k - 1), 'parent-child' FROM n;
+             WITH RECURSIVE n(k) AS (SELECT 2 UNION ALL SELECT k + 1 FROM n WHERE k < {last})
+             INSERT INTO dependencies SELECT printf('l%06d', k), 'l000000', 'blocks' FROM n;",
+            last = LEVELS - 1
+        ))
+        .unwrap();
+        let levels = |range: std::ops::Range<usize>| -> Vec<StuckEdge> {
+            range
+                .map(|k| StuckEdge { issue: format!("l{k:06}"), target: "l000000".into(), dep_type: DepType::Blocks })
+                .collect()
+        };
+
+        let started = std::time::Instant::now();
+        let every_level = stuck_ancestor_edges(&conn).unwrap();
+        // Closed halfway: that level's edge is not live, and its link no longer holds the root.
+        conn.execute("UPDATE issues SET status = 'closed' WHERE id = 'l010000'", []).unwrap();
+        let above_the_closed_level = stuck_ancestor_edges(&conn).unwrap();
+        let took = started.elapsed();
+
+        assert_eq!(every_level.len(), LEVELS - 2);
+        assert_eq!(every_level, levels(2..LEVELS));
+        assert_eq!(above_the_closed_level.len(), 9_998);
+        assert_eq!(above_the_closed_level, levels(2..10_000));
+        assert!(took < std::time::Duration::from_secs(60), "stuck edges took {took:?}");
     }
 }

@@ -149,6 +149,9 @@ pub fn diagnose(store: &mut Store, fix: bool, full: bool) -> Result<DoctorReport
 
     let cycles = graph::find_cycles(conn)?;
     let cycle_text: Vec<String> = cycles.iter().map(|c| c.join(" -> ")).collect();
+    let stuck = graph::stuck_ancestor_edges(conn)?;
+    let stuck_text: Vec<String> =
+        stuck.iter().map(|e| format!("{} -> {} ({})", e.issue, e.target, e.dep_type)).collect();
 
     let (count, min, max): (i64, Option<i64>, Option<i64>) =
         conn.query_row("SELECT COUNT(*), MIN(seq), MAX(seq) FROM events", [], |r| {
@@ -206,6 +209,21 @@ pub fn diagnose(store: &mut Store, fix: bool, full: bool) -> Result<DoctorReport
         check("dependency_cycles", Severity::Ok, "scheduling graph is acyclic")
     } else {
         check("dependency_cycles", Severity::Error, preview(&cycle_text))
+    });
+    // An issue blocked by its own ancestor: neither can finish. Which edge
+    // goes is a person's choice, so `--fix` leaves it alone.
+    checks.push(if stuck.is_empty() {
+        check("ancestor_deadlocks", Severity::Ok, "no issue is blocked by its own ancestor")
+    } else {
+        check(
+            "ancestor_deadlocks",
+            Severity::Warn,
+            format!(
+                "{} issue(s) blocked by their own ancestor (remove the edge with `bd dep rm`): {}",
+                stuck.len(),
+                preview(&stuck_text)
+            ),
+        )
     });
     checks.push(if gaps == 0 {
         check("event_sequence", Severity::Ok, format!("{count} events, contiguous"))

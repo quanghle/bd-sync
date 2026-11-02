@@ -2124,6 +2124,29 @@ fn rename_prefix_from_the_new_prefix_only_sets_issue_prefix() {
 }
 
 #[test]
+fn open_takes_durability_from_the_config_unless_the_options_set_it() {
+    fn synchronous(store: &Store) -> i64 {
+        store.connection().query_row("PRAGMA synchronous", [], |r| r.get(0)).unwrap()
+    }
+
+    let mut env = Env::new();
+    // No key: the default, normal.
+    assert_eq!(synchronous(&env.open_another()), 1);
+
+    for (level, expected) in [("off", 0), ("normal", 1), ("full", 2)] {
+        env.store.write("config", "alice", |tx| config::set(tx, "durability", level)).unwrap();
+        assert_eq!(synchronous(&env.open_another()), expected, "{level}");
+    }
+
+    // The options win over a key that says otherwise, in both directions.
+    let opts = OpenOptions { durability: Some(Durability::Off), ..Default::default() };
+    assert_eq!(synchronous(&Store::open(&env.path, opts).unwrap()), 0);
+    env.store.write("config", "alice", |tx| config::set(tx, "durability", "off")).unwrap();
+    let opts = OpenOptions { durability: Some(Durability::Full), ..Default::default() };
+    assert_eq!(synchronous(&Store::open(&env.path, opts).unwrap()), 2);
+}
+
+#[test]
 fn rename_prefix_rewrites_a_gate_awaiting_a_unique_partial_id() {
     let mut env = Env::new();
     let awaited = env.create_with(NewIssue { id: Some("t-ab12x".into()), ..NewIssue::titled("Upstream") });

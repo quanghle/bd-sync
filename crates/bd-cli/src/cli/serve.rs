@@ -361,7 +361,7 @@ pub struct PasskeyRemoveArgs {
     pub account: String,
     /// Remove only the passkey whose credential id starts with this prefix (default: every passkey of the
     /// account)
-    #[arg(long, value_name = "PREFIX")]
+    #[arg(long, value_name = "PREFIX", allow_hyphen_values = true)]
     pub credential: Option<String>,
     #[command(flatten)]
     pub root: TokenRootArgs,

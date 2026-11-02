@@ -493,3 +493,55 @@ fn root_help_limits_plain_text_errors_to_clap() {
     );
     assert!(!joined.contains("reported before a command runs"), "{long:?}");
 }
+
+#[test]
+fn passkey_remove_credential_takes_a_leading_hyphen_value() {
+    let parse = |argv: &[&str]| Cli::try_parse_from(argv).map(|c| c.command);
+    let removal = |argv: &[&str]| -> Option<Option<String>> {
+        let super::Command::Serve(ServeArgs { action: Some(ServeAction::Passkey(PasskeyCommand::Remove(a))), .. }) =
+            parse(argv).ok()?
+        else {
+            return None;
+        };
+        Some(a.credential)
+    };
+    let base = ["bd", "serve", "passkey", "remove", "--account", "corp:alice", "--root", "/srv/bd"];
+    let with = |extra: &[&'static str]| -> Vec<&'static str> { [&base[..], extra].concat() };
+
+    // A value starting with a hyphen parses as the exact prefix, in the space-separated form.
+    let prefixes = ["-q3ZbX0aLm1P", "--q3ZbX0aLm1P", "-"];
+    for prefix in prefixes {
+        let argv = with(&["--credential", prefix]);
+        assert_eq!(removal(&argv), Some(Some(prefix.to_string())), "{argv:?}");
+    }
+    // The value may come before the other flags, and those flags still parse: --account is required, so a parse
+    // that swallowed it would fail.
+    for prefix in prefixes {
+        let argv = [
+            "bd",
+            "serve",
+            "passkey",
+            "remove",
+            "--credential",
+            prefix,
+            "--account",
+            "corp:alice",
+            "--root",
+            "/srv/bd",
+        ];
+        assert_eq!(removal(&argv), Some(Some(prefix.to_string())), "{argv:?}");
+    }
+    // Omitting --credential is the only way to name every passkey.
+    assert_eq!(removal(&base), Some(None));
+
+    // A mistaken use never parses as the omitted form: no value, or another flag in its place, is refused.
+    assert!(parse(&with(&["--credential"])).is_err(), "no value");
+    assert!(parse(&with(&["--credential", "--account", "corp:alice"])).is_err(), "a flag in place of the value");
+    assert!(parse(&with(&["--credential", "--root", "/srv/bd"])).is_err(), "a flag in place of the value");
+    // A flag with no separate value is read as the prefix, so it never parses as the omitted form: the lookup is
+    // what refuses it.
+    for flag in ["--json", "-q", "--root=/elsewhere"] {
+        let argv = with(&["--credential", flag]);
+        assert_eq!(removal(&argv), Some(Some(flag.to_string())), "{argv:?}");
+    }
+}

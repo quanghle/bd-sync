@@ -16,6 +16,25 @@
 //! A bare `{"additionalContext"}` is lost on Claude Code and fails the hook
 //! on Codex, so the format follows the harness, never one for all.
 //!
+//! Each harness also limits how much context a hook adds. Checked 2026-11-01,
+//! with these versions:
+//!
+//! - Claude Code 2.1.316: 10,000 characters per hook. Over that the text goes
+//!   to a file, and the model gets its path and a preview of the first 2,000
+//!   characters.
+//! - Codex 0.155.1: 2,500 tokens per hook, estimated as bytes/4, so 10,000
+//!   bytes, unless the hook sets `additionalContextLimit`. Over that the model
+//!   gets a preview of the head and tail, and a path.
+//! - Copilot CLI 1.0.105: over its byte limit, the whole additionalContext
+//!   aggregated over hooks is ignored. 20,000 bytes were probed and arrived
+//!   whole; the exact limit was not determined.
+//!
+//! So `bd prime --hook` keeps to one budget for all three, [`CONTEXT_BYTES`]:
+//! under the lowest limit known, with room for a harness's wrapping and a
+//! small change in how it counts. Copilot CLI would take more, but with its
+//! limit unknown and the whole context at stake, and with every request
+//! reading this text again, a larger budget there is not worth having.
+//!
 //! Each harness writes a JSON input on the hook's stdin, whose `cwd` is the
 //! session's directory: `bd hook session-start` and `bd prime --hook` work
 //! there ([`enter_session_dir`]), as Copilot CLI runs a plugin's hooks in
@@ -81,6 +100,12 @@ pub fn print_context(harness: Option<Harness>, event: Event, text: &str) {
         io::outln(out);
     }
 }
+
+/// The most bytes of context `bd prime --hook` prints, for every harness. In
+/// bytes because they bound characters and UTF-16 units from above; under the
+/// lowest limit, 10,000, to leave room for a harness's wrapping and a small
+/// change in how it counts.
+pub const CONTEXT_BYTES: usize = 9_500;
 
 /// How long a hook waits for its JSON input, which harnesses write on its
 /// stdin at once, then close.

@@ -346,7 +346,7 @@ pub enum Command {
     Events(EventsArgs),
     /// Show the event history of one issue
     History(HistoryArgs),
-    /// Print agent context: workflow, actor, claims, ready work, memories
+    /// Print agent context: actor, claims, ready work, workflow, memories
     #[command(long_about = PRIME_LONG_ABOUT)]
     Prime(PrimeArgs),
     /// Run agent session hooks (called by an agent harness)

@@ -409,6 +409,7 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd serve passkey list",
         "bd serve passkey remove",
         "bd serve passkey allow-add",
+        "bd serve passkey cancel-link",
         "bd remote set",
         "bd remote login",
         "bd remote logout",

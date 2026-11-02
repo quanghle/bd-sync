@@ -383,6 +383,82 @@ consent page and more.
   same transaction, so a first registration cannot be followed by a
   second with no assertion. The allowance's id is no secret: it is never
   accepted from a form and never shown on a page.
+- **A link carries one passkey's word to another device, once.** Provider
+  account plus link is enough to register one passkey, for 15 minutes;
+  neither alone does anything.
+  - *Making one.* An approval page for an account with 1 to 98 passkeys and
+    no live allowance has an unticked `make_link` box. The field is read
+    first: where the page did not offer it (first registrations, 99
+    passkeys, a live allowance), it is refused before anything else in the
+    form is read, and a duplicate or any value but `1` is refused too. A
+    link is made only in that `POST`, after the assertion (and with the add
+    box the new passkey's checks) passed, and the passkey vouching for it
+    is the asserted one, never one the form names. One `server.db`
+    transaction moves that passkey's counter by compare-and-set and stores
+    the link: a compare-and-set that moves nothing leaves no link, and a
+    link that cannot be written moves no counter and approves nothing. The
+    approval runs after that commit, and a workspace refusal keeps the link.
+  - *The secret.* 32 random bytes, 64 hex characters, compared by SHA-256,
+    which is all `server.db` keeps. It exists in the answer to that `POST`
+    alone, with `Cache-Control: no-store`, and the approval id, taken before
+    the check, is used up, so nothing shows it again: never in a cookie, a
+    sealed flow, a redirect, an event or a log line. The URL comes from the
+    configured public URL, never from `Host` or `X-Forwarded-*`.
+  - *Opening one.* The secret is a URL fragment,
+    `<public url>/oauth/passkey-link#<secret>`, which browsers send in no
+    request line and no `Referer`, so a proxy's access log and a link
+    preview's fetch do not see it. `GET` answers one constant page whatever
+    the URL holds, without reading its query, and its script moves the
+    fragment into a form and clears it from the address bar. The form
+    posts to that address with a fixed `?open` query, which nothing reads,
+    so a new link opened in the tab of a dead link's notice loads. A person
+    presses the button, so a scanner that runs scripts starts nothing. The
+    `POST`, whose body is the only request that carries the secret, is
+    checked in this order, each before any lookup: approvals offered at all
+    (else 404), a same-origin `Origin` or `Sec-Fetch-Site` and the
+    browser-bound `bd_oauth` cookie (else one 403, whatever the link), a
+    body of at most 1 KiB, a sign-in slot (else 503), usable sign-in
+    settings, and one `link` field of exactly 64 lowercase hex characters.
+    Only then is its hash looked up, in a unique index. A dead link gets one
+    404 notice, keeps nothing, sets no cookie and starts no sign-in. A live
+    one goes on to the sign-in with only the row's public id, sealed in a
+    flow of its own kind, and is not spent. That flow goes on in
+    `/oauth/choose`'s query, which a proxy's access log does see, so it is
+    bound at this `POST` to the browser's `bd_oauth` cookie: a logged URL
+    does nothing in another browser, which gets a 400, no cookie and no
+    sign-in.
+  - *The sign-in.* The row is read before the provider's code is exchanged.
+    The account is judged for the row's workspace with no client, as for a
+    gate. Its issuer and subject must be exactly the row's, before anything
+    is bound: another account, the same login at another issuer and an
+    account joined by `bd serve token link` get the same 404 notice, bind
+    nothing and leave no `signed_in` event. A denied account, one no rule
+    lets in and a grant not of kind `human` get that notice too; only the
+    log tells them apart. The workspace is only what the rules or the
+    authorizer are asked about: no workspace is opened or looked for, and
+    no gate is looked at.
+  - *Registering.* The page has its own one-time id, a challenge of its own
+    (32 random bytes, kept in server memory with the id) and a
+    `SameSite=Strict` `bd_passkey_<suffix>` cookie scoped to the `POST`'s
+    path. The `POST` needs same-origin, at most 16 KiB, a sign-in slot, the
+    id exactly once and the bound cookie, and the id is then taken once. An
+    assertion's, an add's, an allowance's or `make_link` field is refused
+    before anything is read, and the registration is checked as a first one
+    is, with user verification required. Then one `server.db` transaction
+    checks that the very link the page was opened under is still live and
+    the account's (a replacement has another id), that the account exists,
+    that it still holds the vouching passkey, that it holds fewer than 99
+    passkeys and that the credential id is not registered, removes the
+    link, stores the passkey and records a `passkey_registered` event naming
+    the new credential, the link and the vouching credential. So two posts
+    register at most one passkey, and a refusal at any of these checks
+    writes nothing and leaves the link live, with the page used up.
+  - *What it cannot do.* A link approves nothing, gives no access to any
+    workspace and issues no token. No approval reads the table, so a live
+    link counts as no passkey there. Sealed flows do not open across kinds,
+    and an id does not cross between an approval's `POST` and a
+    registration's. A link's id is no secret: it names the link in flows,
+    logs and events, and is never accepted in place of the secret.
 - **Passkeys only at a host name over https.** The relying party id is the
   host of the public URL (`--public-url`, else `[oauth]`'s issuer).
   Browsers refuse passkeys at an IP address, so there, and for plain http
@@ -396,14 +472,16 @@ consent page and more.
   passkey added at that approval (empty otherwise). Under an allowance
   `credential` is the new passkey's, `added` stays empty, and `passkey`
   says `registered under allowance` or `allowance: <reason>`. Never the
-  whole id, the public key, the signature or the client data.
+  whole id, the public key, the signature or the client data. A link's
+  `passkey link` lines hold prefixes likewise, never its secret or hash.
 - **Emails are never shown or logged.** The page shows the provider and
   actor; the logs name the provider, subject, login, actor, workspace and
   gate.
 - **Bounded.** The provider's callback and the approval's `POST` share the
-  8 sign-in slots; approvals waiting for their `POST` are kept in memory,
-  at most 1024, the oldest dropped first. Refusals end on this server's
-  pages, never a redirect elsewhere.
+  8 sign-in slots, as do a link's two `POST`s; approvals waiting for their
+  `POST` are kept in memory, at most 1024, the oldest dropped first, and so
+  are a link's registration pages. Refusals end on this server's pages,
+  never a redirect elsewhere.
 - **Links grant nothing.** `bd prime`, refusals at a human gate, `bd
   playbook status`, `bd gate show` and `bd gate list --json` name a gate's
   approval page when `bd serve` offers one ([Approval
@@ -461,7 +539,8 @@ Residual risks, accepted:
   `--credential`, every passkey of the account), on the server host; the
   account's next approval registers again. A lost device is recovered the
   same way.
-  Without an admin's allowance (below), another passkey can be added only at an
+  Without an admin's allowance or a link (both below), another passkey can be
+  added only at an
   approval, backed by a verified assertion of one of the account's passkeys in
   the same `POST` (at most 99 an account). So someone holding the provider
   account who
@@ -508,12 +587,51 @@ Residual risks, accepted:
   `--forget`.** Revoking ends tokens, and using an allowance takes a new
   sign-in at the provider. An admin who suspects an account should also run
   `bd serve passkey allow-add --account <actor or login> --cancel`.
+- **A person can be talked into handing over a link.** This is the link's
+  main risk. Someone who holds the provider account persuades the person,
+  as support staff or with a fake prompt, to tick the box at a real approval
+  and send the link. The person's own act is the mechanism, so nothing stops
+  it: the box is unticked, a real approval and a verified assertion are
+  needed, and the page warns against sending the link to anyone, whoever
+  asks. It yields one passkey in 15 minutes, and it is audited, but the
+  person is not told when a link is used: bd has no channel to them. To stop
+  an abuse, an admin runs `bd serve passkey cancel-link --account <actor or
+  login>`, then `bd serve passkey remove --account <actor or login>
+  --credential <prefix>`, the prefix read from the `credential <prefix>` that
+  starts the `passkey_registered` event's detail (the prefix after `vouched
+  by` is the passkey that vouched for it).
+- **A link and the provider account held together make a passkey.** That is
+  the delegation: the provider account is the first factor and the link the
+  second. A link stolen with the account is bounded as above.
+- **The person cannot cancel a link.** Only an admin can; the person can
+  replace it at another approval or wait the 15 minutes.
+- **The approval page changed for accounts with 1 to 98 passkeys.** The
+  unticked box is a visible change to pages that are pinned byte for byte,
+  made on purpose, and no setting takes it away. The rule is that nothing
+  else changes unless it is ticked: the pinned pages render without the box,
+  a test proves that the page shown, less that one fragment, hashes to the
+  pinned value, and an unticked `POST` and all that follows are as before.
+- **A proxy that logs `POST` bodies sees the secret.** The fragment keeps it
+  out of request lines, not out of the one body that carries it. That is
+  unusual, outside bd, and bounded as above.
+- **A restored backup can revive a used link.** It takes a restore less than
+  15 minutes after the link was made, a link used since, and the provider
+  account.
+- **Both boxes at 98 passkeys** leave a link that cannot be used: the add
+  fills the account. The page says so, and the link registers nothing until
+  a passkey is removed.
+- **Authorizers see a sign-in with no client** for a link: a `sign_in`
+  request for the workspace the link was made in, the shape of a gate's
+  approval, though no gate is involved and nothing is opened there.
 - **A rollback** to a `bd serve` that predates passkeys approves with the
   click alone again. A rollback to one that predates adding passkeys keeps
   every stored passkey usable (any of an account's passkeys approves) and
   only stops offering the add. A rollback to one that predates allowances
   keeps every stored passkey usable, those registered under an allowance
-  included, and ends the live allowances.
+  included, and ends the live allowances. A rollback to one that predates
+  links keeps every stored passkey usable, those registered through a link
+  included, and ends the live links: such a server has no link page, so a
+  link in anyone's hand gets a 404.
 
 **Upgrading to allowances.** `bd serve` moves `server.db` from schema 4 to
 5 at its first start, adding a `passkey_allowances` table (from schema 3
@@ -523,7 +641,29 @@ at its next open of `server.db`. So stop `bd serve`, replace the binary and
 start it, in that order, and do not run `bd serve passkey` from a new
 binary against a root an older server is still serving.
 
-**Rolling back allowances.** To go back to a bd without them:
+**Upgrading to links.** `bd serve` moves `server.db` from schema 5 to 6 at
+its first start, adding a `passkey_links` table (from an older schema it
+adds the missing tables at once). As for allowances, any `bd serve token`
+or `bd serve passkey` command migrates a root as well, and an older `bd
+serve` refuses schema 6 at its next open of `server.db`: stop `bd serve`,
+replace the binary and start it, in that order.
+
+**Rolling back links.** To go back to a bd without them:
+
+1. Stop `bd serve` and back up `server.db`.
+2. Run `sqlite3 server.db 'DROP TABLE passkey_links; PRAGMA user_version = 5;'`
+   in the root.
+3. Start the older bd.
+
+Accounts, tokens, OAuth clients, passkeys, allowances and the audit trail
+survive. Passkeys registered through a link are ordinary passkeys and stay
+valid; live links are gone; events of the new kinds read as `other`; open
+registration pages fail. Setting the version alone, without the `DROP`,
+leaves a stale table: the next upgrade fails at start naming the table,
+changing nothing, until it is dropped.
+
+**Rolling back allowances.** From schema 6, roll back links first, as above.
+Then, to go back to a bd without allowances:
 
 1. Stop `bd serve` and back up `server.db`.
 2. Run `sqlite3 server.db 'DROP TABLE passkey_allowances; PRAGMA user_version = 4;'`
@@ -540,7 +680,7 @@ naming the table, changing nothing, until it is dropped.
 **Rolling back passkeys.** `bd serve` moved `server.db` from schema 3 to 4
 at its first start, adding a `passkeys` table. An older `bd serve`
 refuses schema 4, so to go back from schema 5 to a bd that predates
-passkeys, both tables go:
+passkeys (from schema 6, roll back links first, as above), both tables go:
 
 1. Stop `bd serve` and back up `server.db`.
 2. Run `sqlite3 server.db 'DROP TABLE passkey_allowances; DROP TABLE passkeys; PRAGMA user_version = 3;'`
@@ -616,13 +756,16 @@ human-gate override without a token, so it gets the protections of
   A live allowance works as at a gate, with the same checks and the same
   one transaction spending it and storing the passkey before the operation
   is performed; a workspace failure after it keeps the passkey, with the
-  allowance spent, and performs nothing.
-  First-use registration, adding and allowances are the residual risks
-  described for gate approval. `operation approval` lines carry
+  allowance spent, and performs nothing. A link can be made here as at a
+  gate, in one transaction with the passkey's counter before the operation
+  is performed; a workspace failure after it keeps the link and performs
+  nothing.
+  First-use registration, adding, allowances and links are the residual
+  risks described for gate approval. `operation approval` lines carry
   `credential`, the credential id's first 12 characters once it has been
   read (empty before), `added`, an added passkey's first 12
-  characters (empty otherwise), and, only on an allowance's outcome,
-  `passkey`, never the whole id, the public key, the
+  characters (empty otherwise), and, only on an allowance's outcome or a
+  link's, `passkey`, never the whole id, the public key, the
   signature or the client data.
 - **Every gate in the way.** The person must be able to open every open
   human gate the operation gets past: one of its approvers when it names
@@ -684,6 +827,15 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   ends, at most an hour later. It goes when it is spent, cancelled or
   replaced; one that ran out is pruned at the next write; and forgetting
   the account erases it in the same transaction.
+- **Passkey links.** For an account that made a link at an approval,
+  `server.db` keeps its issuer and subject, a random id, the SHA-256 of the
+  link's secret (never the secret), the whole credential id of the passkey
+  that vouched for it, the workspace of that approval, and when the link
+  was made and when it ends, 15 minutes later. An account has one at most.
+  It goes when it is used, cancelled or replaced, or when the passkey that
+  vouched for it or the account's last passkey is removed; one that ran out
+  is pruned at the next write; and forgetting the account erases it in the
+  same transaction.
 - **Logins are never emails.** An account's login is the provider's
   `preferred_username` unless that is an email (or otherwise unsuitable),
   else a pseudonym (`u-` and 12 hex digits of a hash of its issuer and
@@ -697,7 +849,7 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   its login and dates are all it holds. A registered OAuth client never
   used within a day, or unused for 90 days, is deleted.
 - **Erasure.** `bd serve token revoke --account <login> --forget` deletes
-  the account and every token, passkey and allowance of it. Deleted rows are
+  the account and every token, passkey, allowance and link of it. Deleted rows are
   overwritten (`secure_delete`) and the write-ahead log is emptied, so
   nothing of them stays in the database's files (if `bd serve` is reading
   at that moment, its next checkpoint does it, and the command says so). A
@@ -708,7 +860,7 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   in a browser too, as a `signed_in` event without a token), token
   created, refresh, revocation (and why), account forgotten, linked or
   named, passkey registered or removed, passkey allowance granted or
-  cancelled, and client registered, in the same
+  cancelled, passkey link made or ended, and client registered, in the same
   transaction as the change, for 90 days (client registrations, which
   anyone may make: the latest 5000). `bd serve token events` shows it. An
   event names the actor, provider, subject, token and client, never a

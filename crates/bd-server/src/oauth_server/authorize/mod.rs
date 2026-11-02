@@ -31,7 +31,8 @@
 //! sealed link, `<public url>/w/<ws>/(close|discard)/<id>?request=...`
 //! ([`operation`]). Every Approve on those two pages needs a passkey
 //! ceremony with user verification (`passkey`): the account's first
-//! registers its passkey, later ones use it.
+//! registers its passkey, later ones use it, and one may vouch for a one-time
+//! link that adds a passkey on another device ([`link`]).
 
 mod begin;
 mod callback;
@@ -39,6 +40,7 @@ mod consent;
 mod cookies;
 mod flows;
 pub mod gate;
+pub mod link;
 pub mod operation;
 mod passkey;
 mod request;

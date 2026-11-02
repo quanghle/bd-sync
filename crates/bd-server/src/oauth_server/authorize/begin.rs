@@ -59,7 +59,8 @@ pub fn begin(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Vec<S
 /// chose a provider on the page [`begin`] (or a gate's or an operation's
 /// flow) showed; on to it. A flow from a gate's page or an operation's
 /// approval link comes here first, without a provider
-/// ([`super::gate::begun`], [`super::operation::begun`]).
+/// ([`super::gate::begun`], [`super::operation::begun`]), and so does a
+/// passkey link's ([`super::link::begun`]).
 pub fn choose(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Vec<String>) {
     let pairs = form::decode(query).unwrap_or_default();
     let get = |name: &str| pairs.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str());
@@ -75,6 +76,12 @@ pub fn choose(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Vec<
         && let Some(begun) = get("flow").and_then(|flow| lock(cx.flows).sealer.open(OP_BEGIN, flow))
     {
         return super::operation::begun(cx, begun, get("provider"), browser);
+    }
+    // From a passkey link's page: bound already, at its POST, so `begun` only checks it.
+    if pending.is_none()
+        && let Some(begun) = get("flow").and_then(|flow| lock(cx.flows).sealer.open(LINK_BEGIN, flow))
+    {
+        return super::link::begun(cx, begun, get("provider"), browser);
     }
     let Some(pending) = pending.filter(|p| p.until > now_millis()) else {
         return (refused(400, "This sign-in has expired. Start again from the application."), Vec::new());
@@ -101,7 +108,9 @@ pub fn choose(cx: &Ctx<'_>, query: &str, browser: Option<&str>) -> (Answer, Vec<
             };
             start(cx, &sign_in, Then::Authorize { query }, provider, browser, Some(&request))
         }
-        then @ (Then::Gate { .. } | Then::Operation { .. }) => start(cx, &sign_in, then, provider, browser, None),
+        then @ (Then::Gate { .. } | Then::Operation { .. } | Then::Link { .. }) => {
+            start(cx, &sign_in, then, provider, browser, None)
+        }
     }
 }
 
@@ -165,6 +174,9 @@ pub(super) fn start(
             }
             Then::Operation { .. } => {
                 tracing::info!(target: "bd::serve", "operation sign-in refused: its flow is too long to carry")
+            }
+            Then::Link { .. } => {
+                tracing::info!(target: "bd::serve", "link sign-in refused: its flow is too long to carry")
             }
         }
         return (refused(400, MALFORMED), Vec::new());

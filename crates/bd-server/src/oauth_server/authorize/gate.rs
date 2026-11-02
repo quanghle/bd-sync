@@ -30,7 +30,9 @@
 //!    gate is resolved, and stays if the gate then refuses), resolves
 //!    the gate as the account's actor with the reference kept at step 2,
 //!    never one the form names ([`Gates::approve`]), its state, arming and
-//!    approvers checked again in the transaction. Each POST taken is logged
+//!    approvers checked again in the transaction. A link made with the
+//!    ceremony is committed before that too, and shown on the POST's answer
+//!    whatever came of the gate (`passkey::shown`). Each POST taken is logged
 //!    once ([`log_approval`]), with the credential's prefix once it decoded
 //!    and that of a passkey it added.
 
@@ -602,7 +604,7 @@ pub fn approve(cx: &Ctx<'_>, workspace: &str, gate: &str, body: &str, cookies: &
         passkey,
     };
     // The passkey ceremony the page asked for, checked once the approval is taken: nothing is approved without it.
-    let verified = match passkey::verify(cx, &approval.passkey, &pairs) {
+    let verified = match passkey::verify(cx, &approval.passkey, &pairs, &approval.workspace) {
         Ok(verified) => verified,
         Err(Failure::Refused { why, credential }) => {
             metrics::APPROVALS_PASSKEY_REFUSED.add();
@@ -645,6 +647,7 @@ pub fn approve(cx: &Ctx<'_>, workspace: &str, gate: &str, body: &str, cookies: &
         }
         Err(e) => ("failed", internal(&e, "approving a gate")),
     };
+    let answer = passkey::shown(answer, verified.link.as_ref(), cx.issuer, outcome == "approved");
     let added = verified.added.clone().unwrap_or_default();
     log_approval(logged(outcome, &verified.credential, &added, verified.label()));
     (answer, cleared)

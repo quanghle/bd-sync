@@ -24,10 +24,12 @@
 //!    allowance is live; where the issuer cannot be a relying party, a notice
 //!    and no form, recorded as a passkey refusal.
 //! 3. `POST` to the same path ([`approve`]): taken once, from that browser,
-//!    its passkey ceremony checked (a passkey registered with it is stored
-//!    first, and stays if the workspace then refuses), the sealed request is
-//!    performed exactly ([`Operations::perform`]) as the approver, never
-//!    anything the form names but the approval id and the passkey's fields.
+//!    its passkey ceremony checked (a passkey registered or a link made with
+//!    it is stored first, and stays if the workspace then refuses; the link is
+//!    shown on the POST's answer whatever came of it, `passkey::shown`), the
+//!    sealed request is performed exactly ([`Operations::perform`]) as the
+//!    approver, never anything the form names but the approval id and the
+//!    passkey's fields.
 //!
 //! Every way an operation's approval ends, once its flow is known to be
 //! one, is counted and logged once, by [`record`] alone.
@@ -174,8 +176,8 @@ impl Outcome {
 /// subject and actor (never an email), the first characters of the
 /// passkey credential its POST sent, once it decoded, and those of a passkey
 /// it added. Empty where unknown. `passkey` is what came of a registration
-/// under an allowance, a fixed phrase, and None when no allowance was involved:
-/// the line then has no such field.
+/// under an allowance or of a link asked for, a fixed phrase, and None when
+/// neither was involved: the line then has no such field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Who<'a> {
     pub provider: &'a str,
@@ -954,16 +956,17 @@ fn approve_inner(
         return ended_as(Outcome::Refused, &who, "request expired", answer);
     }
     // The passkey ceremony the page asked for, checked once the approval is taken: nothing is performed without it.
-    match passkey::verify(cx, &approval.passkey, &pairs) {
+    let made = match passkey::verify(cx, &approval.passkey, &pairs, &request.workspace) {
         Ok(verified) => {
-            // Only an allowance's outcomes show in `passkey`: with none involved the line reads as ever.
-            who.passkey = verified.allowance.is_some().then(|| verified.label());
+            // Only an allowance's and a link's outcomes show in `passkey`: with neither the line reads as ever.
+            who.passkey = (verified.allowance.is_some() || verified.link.is_some()).then(|| verified.label());
             who.credential = verified.credential;
             who.added = verified.added.unwrap_or_default();
+            verified.link
         }
         Err(Failure::Refused { why, credential }) => {
             who.credential = credential;
-            who.passkey = why.is_allowance().then(|| why.label());
+            who.passkey = (why.is_allowance() || why.is_link()).then(|| why.label());
             let copy = if why.ended() { pages::PASSKEY_ALLOW_ENDED } else { pages::PASSKEY_FAILED_OP };
             return ended_as(Outcome::PasskeyRefused, &who, why.detail(), refusal(403, copy));
         }
@@ -977,8 +980,12 @@ fn approve_inner(
             let answer = internal(&error, "checking an operation approval's passkey");
             return ended_as(Outcome::Failed, &who, "internal error", answer);
         }
-    }
-    let with = |outcome, detail, answer| ended_as(outcome, &who, detail, answer);
+    };
+    // Every way the operation ends comes through here, so a link made above is on every answer.
+    let with = |outcome: Outcome, detail, answer| {
+        let approved = outcome == Outcome::Approved;
+        ended_as(outcome, &who, detail, passkey::shown(answer, made.as_ref(), cx.issuer, approved))
+    };
     let actor = &approval.actor;
     // The request as sealed and the reference the sign-in proved: nothing in the form is read but its id and
     // the passkey's fields.

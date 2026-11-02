@@ -28,9 +28,14 @@ pub(super) const GATE_BEGIN: &str = "gate-begin";
 /// [`Then::Operation`] not yet bound to a browser.
 pub(super) const OP_BEGIN: &str = "op-begin";
 
+/// The hop from a passkey link's page to the chooser: a [`Then::Link`] bound
+/// already, at that page's POST, to the browser that posted it.
+pub(super) const LINK_BEGIN: &str = "link-begin";
+
 /// What a browser sign-in goes on to once the person signed in: an
-/// application's authorization, a human gate's approval, or the approval of
-/// a close or discard that human gates refused. It is sealed with the flow
+/// application's authorization, a human gate's approval, the approval of a
+/// close or discard that human gates refused, or adding a passkey through a
+/// one-time link. It is sealed with the flow
 /// and decides its sealing's AAD ([`Sealer::seal`]), so a flow of one kind
 /// never finishes as another.
 #[derive(Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -45,6 +50,9 @@ pub(super) enum Then {
     /// its own (`set_request_cookies`), too long for this flow's: `digest`
     /// is the hash of that link token, which the callback checks them against.
     Operation { workspace: String, op: String, issue: String, digest: String, parts: u8 },
+    /// Adding a passkey through the link with the public id `id`: never its
+    /// secret, which was spent on nothing and is not needed again.
+    Link { id: String },
 }
 
 /// The kinds of [`Then`], each sealed under an AAD of its own ([`aad`]).
@@ -53,6 +61,7 @@ pub(super) enum Kind {
     Authorize,
     Gate,
     Operation,
+    Link,
 }
 
 /// What an operation's flow carries ([`Then::Operation`]), as a view.
@@ -73,6 +82,7 @@ impl Then {
             Then::Authorize { .. } => Kind::Authorize,
             Then::Gate { .. } => Kind::Gate,
             Then::Operation { .. } => Kind::Operation,
+            Then::Link { .. } => Kind::Link,
         }
     }
 
@@ -86,7 +96,15 @@ impl Then {
                 digest: digest.clone(),
                 parts: *parts,
             }),
-            Then::Authorize { .. } | Then::Gate { .. } => None,
+            Then::Authorize { .. } | Then::Gate { .. } | Then::Link { .. } => None,
+        }
+    }
+
+    /// The public id of the link this flow adds a passkey through, if it does.
+    pub(super) fn link(&self) -> Option<&str> {
+        match self {
+            Then::Link { id } => Some(id),
+            Then::Authorize { .. } | Then::Gate { .. } | Then::Operation { .. } => None,
         }
     }
 }
@@ -133,7 +151,8 @@ impl Sealer {
 
     /// `value`, sealed for `step`: base64url of a random nonce and the
     /// ciphertext. The AAD is `step` for an authorization, `gate:<step>` for
-    /// a gate's approval and `op:<step>` for an operation's ([`aad`]).
+    /// a gate's approval, `op:<step>` for an operation's and `link:<step>`
+    /// for a passkey link's ([`aad`]).
     pub(super) fn seal(&self, step: &str, value: &Pending) -> Result<String, Error> {
         let mut nonce = [0u8; 12];
         SecureRandom::fill(&SystemRandom::new(), &mut nonce)
@@ -153,7 +172,7 @@ impl Sealer {
     pub(super) fn open(&self, step: &str, sealed: &str) -> Option<Pending> {
         let bytes = URL_SAFE_NO_PAD.decode(sealed).ok()?;
         let (nonce, data) = bytes.split_at_checked(12)?;
-        [Kind::Authorize, Kind::Gate, Kind::Operation].into_iter().find_map(|kind| {
+        [Kind::Authorize, Kind::Gate, Kind::Operation, Kind::Link].into_iter().find_map(|kind| {
             let nonce = ring::aead::Nonce::try_assume_unique_for_key(nonce).ok()?;
             let mut data = data.to_vec();
             let aad = aad(step, kind);
@@ -166,12 +185,13 @@ impl Sealer {
 
 /// The AAD a flow of `kind` is sealed with for `step`: the step itself for
 /// an authorization (as before gates had flows), `gate:<step>` for a
-/// gate's, `op:<step>` for an operation's.
-fn aad(step: &str, kind: Kind) -> String {
+/// gate's, `op:<step>` for an operation's, `link:<step>` for a link's.
+pub(super) fn aad(step: &str, kind: Kind) -> String {
     match kind {
         Kind::Authorize => step.to_string(),
         Kind::Gate => format!("gate:{step}"),
         Kind::Operation => format!("op:{step}"),
+        Kind::Link => format!("link:{step}"),
     }
 }
 
@@ -217,6 +237,9 @@ pub(super) struct Ceremony {
     /// [`crate::passkeys::MAX_PER_ACCOUNT`] - 1 passkeys, and then never with
     /// `add`.
     pub(super) allowance: Option<Offer>,
+    /// Whether the page offered to make a link for another device: exactly
+    /// when it offered `add`. Only then may a POST carry `make_link`.
+    pub(super) link: bool,
 }
 
 /// What an approval page opened under a live allowance keeps of it. None of
@@ -282,9 +305,27 @@ pub(super) struct OperationApproval {
     pub(super) passkey: Ceremony,
 }
 
+/// A passkey link's registration page, shown to the very account the link
+/// belongs to: waiting for its one POST (`super::link::register`). It holds
+/// the link's public id, never its secret.
+#[derive(Debug)]
+pub(super) struct LinkPage {
+    /// The link's public id: its POST spends this one or none
+    /// ([`crate::passkeys::insert_linked`]).
+    pub(super) link: String,
+    /// The account's login, for the log (never an email).
+    pub(super) login: String,
+    /// The hash of the value of its own cookie (`link_page_cookie`).
+    pub(super) browser: String,
+    /// What names its cookie.
+    pub(super) cookie: String,
+    /// The passkey ceremony its POST must complete.
+    pub(super) ceremony: Ceremony,
+}
+
 /// Authorizations under way, by the hash of their secret at each step
 /// (`state` at GitHub, the consent id, the code, the approval id, the
-/// operation approval id); each taken once.
+/// operation approval id, the link page id); each taken once.
 pub struct Flows {
     pub(super) sealer: Sealer,
     pub(super) consents: Kept<Consent>,
@@ -296,6 +337,9 @@ pub struct Flows {
     /// Operation approval pages waiting for their POST, and those posted.
     pub(super) operations: Kept<OperationApproval>,
     pub(super) operations_spent: Kept<()>,
+    /// Passkey link pages waiting for their POST, and those posted.
+    pub(super) link_pages: Kept<LinkPage>,
+    pub(super) links_spent: Kept<()>,
     /// Codes redeemed, for [`CODE_TTL`] after: one sent again revokes the
     /// token it issued (RFC 6749 section 4.1.2).
     spent: Kept<Spent>,
@@ -337,6 +381,8 @@ impl Default for Flows {
             approvals_spent: Kept::new(STEP_TTL),
             operations: Kept::new(STEP_TTL),
             operations_spent: Kept::new(STEP_TTL),
+            link_pages: Kept::new(STEP_TTL),
+            links_spent: Kept::new(STEP_TTL),
         }
     }
 }

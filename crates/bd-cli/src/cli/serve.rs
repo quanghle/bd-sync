@@ -248,8 +248,8 @@ pub struct TokenEventsArgs {
     #[arg(long, visible_alias = "by", value_name = "ACTOR")]
     pub actor: Option<String>,
     /// Only these kinds: signed_in, token_created, refreshed, revoked, forgotten, client_registered, linked,
-    /// named, passkey_registered, passkey_removed, passkey_add_allowed or passkey_add_cancelled (repeatable or
-    /// comma separated)
+    /// named, passkey_registered, passkey_removed, passkey_add_allowed, passkey_add_cancelled, passkey_link_made
+    /// or passkey_link_ended (repeatable or comma separated)
     #[arg(long = "kind", value_name = "KIND", value_delimiter = ',')]
     pub kinds: Vec<String>,
     /// Show at most this many, the latest
@@ -270,6 +270,9 @@ pub enum PasskeyCommand {
     /// Allow an account to register one passkey without an existing one
     #[command(name = "allow-add", long_about = PASSKEY_ALLOW_ADD_LONG_ABOUT)]
     AllowAdd(PasskeyAllowAddArgs),
+    /// End an account's live link for adding a passkey on another device
+    #[command(name = "cancel-link", long_about = PASSKEY_CANCEL_LINK_LONG_ABOUT)]
+    CancelLink(PasskeyCancelLinkArgs),
 }
 
 const PASSKEY_LIST_LONG_ABOUT: &str = "\
@@ -281,7 +284,10 @@ first approval registers one, and later approvals ask for it. This lists the
 passkeys of one account, by the first 12 characters of each credential id,
 with its algorithm, when it was registered and last used, and its signature
 counter, and says until when a live allowance (`bd serve passkey allow-add`)
-lets the account register one without an existing one.";
+lets the account register one without an existing one. A live link, made at a
+browser approval to add a passkey on another device, is shown with when it
+ends and the prefix of the passkey that vouched for it, never the link itself,
+which only the approval's answer page ever showed.";
 
 const PASSKEY_REMOVE_LONG_ABOUT: &str = "\
 Remove an account's passkeys: its next browser approval registers a new one
@@ -294,7 +300,11 @@ several. Each removal is recorded in the audit trail as a passkey_removed
 event. The account's next browser approval registers a new passkey, so check
 who signs in next. Removing the account's last passkey also ends its live
 allowance (`bd serve passkey allow-add`), recorded as a passkey_add_cancelled
-event.";
+event. Removing the last passkey, or the one that vouched for the account's
+live link, ends that link too, recorded as a passkey_link_ended event; removing
+any other leaves it. To stop a link that was misused, run `bd serve passkey
+cancel-link` first, then remove what came through it: the passkey_registered
+event's detail names the new credential.";
 
 const PASSKEY_ALLOW_ADD_LONG_ABOUT: &str = "\
 Allow an account to register one passkey without an existing one
@@ -314,6 +324,18 @@ hour. A second allow-add replaces the first, and --cancel ends it; expiry needs
 nothing done. Refused for an account with no passkeys, whose next approval
 registers one anyway, and for one holding the limit of 99. Recorded in the
 audit trail as passkey_add_allowed and passkey_add_cancelled events.";
+
+const PASSKEY_CANCEL_LINK_LONG_ABOUT: &str = "\
+End an account's live link for adding a passkey on another device
+
+A person with a passkey can make a link at a browser approval, to register a
+passkey on another device: only the very account can use it, once, within 15
+minutes. Use this when a link went to the wrong place or the person changed
+their mind. It is ended at once, recorded in the audit trail as a
+passkey_link_ended event. With no live link it says so and changes nothing, so
+it is safe to run twice. Passkeys already registered through a link stay:
+`bd serve passkey remove` removes them. `bd serve passkey list` shows whether a
+link is live.";
 
 #[derive(Args, Debug, Clone)]
 #[command(after_long_help = "\
@@ -361,6 +383,19 @@ pub struct PasskeyAllowAddArgs {
     /// End the account's live allowance instead
     #[arg(long)]
     pub cancel: bool,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = "\
+Examples:
+  bd serve passkey cancel-link --account corp:alice --root /srv/bd
+  bd serve passkey cancel-link --account corp:alice --root /srv/bd --json")]
+pub struct PasskeyCancelLinkArgs {
+    /// Account: its actor, or its login
+    #[arg(long, value_name = "ACCOUNT")]
+    pub account: String,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }

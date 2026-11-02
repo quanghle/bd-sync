@@ -34,18 +34,35 @@
 //! ([`passkeys::insert_allowed`]), before the approval runs. A POST without
 //! them goes down the assertion's path, which leaves the allowance live.
 //!
+//! The page offering to add a passkey also offers, by an unticked box
+//! (`make_link`, `Ceremony.link`), to make a one-time link for another device.
+//! A box ticked where the page did not offer it is refused before anything
+//! else is read. Otherwise the verified assertion vouches for the link: its
+//! secret is drawn here, and its hash is stored with the counter's
+//! compare-and-set in one write ([`passkeys::vouch_link`], or
+//! [`passkeys::add`] with the added passkey), before the approval runs. The
+//! secret is kept nowhere but [`Verified`], on the stack of that POST, and
+//! [`shown`] puts it on that POST's answer, whatever came of the approval.
+//!
+//! Opening such a link is a ceremony of its own: [`prepare_link`] offers only
+//! `create()`, with the account's passkeys excluded, against one single-use
+//! challenge, and [`verify_link`] checks a POST carrying nothing of an approval
+//! and stores the passkey through that very link ([`passkeys::insert_linked`]).
+//! The account is the link's and the actor the sign-in's: never what the form
+//! names.
+//!
 //! What the log may show of a credential is its first
 //! [`passkeys::PREFIX`] characters, once it decoded.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bd_core::Error;
+use bd_core::{Error, Timestamp};
 use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
-use super::super::{form, pages};
-use super::{Ceremony, Ctx, Offer, now_millis, origin};
-use crate::passkeys::{self, Added, AllowedAdd, Inserted, NewRow};
+use super::super::{PASSKEY_LINK, form, pages};
+use super::{Answer, Ceremony, Ctx, Offer, link, now_millis, origin};
+use crate::passkeys::{self, Added, AllowedAdd, Inserted, LINK_TTL, Link, Linked, NewLink, NewRow, Vouched};
 use crate::webauthn::{self, Alg, Assertion, Expect, Refusal, Registration, Stored};
 use crate::{auth, metrics};
 
@@ -72,13 +89,6 @@ pub(super) fn prepare(cx: &Ctx<'_>, user: &auth::Identity, actor: &str) -> Resul
     };
     let (held, live) = passkeys::account_state(cx.root, &user.issuer, &user.subject)?;
     let credentials: Vec<String> = held.into_iter().map(|p| p.credential).collect();
-    let random = || {
-        let mut bytes = [0u8; 32];
-        SystemRandom::new()
-            .fill(&mut bytes)
-            .map_err(|_| Error::Io(std::io::Error::other("the system's random number generator failed")))?;
-        Ok::<_, Error>(bytes)
-    };
     let challenge = random()?;
     let room = (1..passkeys::MAX_PER_ACCOUNT).contains(&credentials.len());
     let allowance = match live {
@@ -95,10 +105,77 @@ pub(super) fn prepare(cx: &Ctx<'_>, user: &auth::Identity, actor: &str) -> Resul
         provider: user.provider.clone(),
         actor: actor.to_string(),
         enroll: credentials.is_empty(),
+        link: add.is_some(),
         add,
         allowance,
     };
     Ok(Prepared::Ask { ceremony: Box::new(ceremony), credentials })
+}
+
+/// 32 random bytes: a single-use challenge.
+fn random() -> Result<[u8; 32], Error> {
+    let mut bytes = [0u8; 32];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| Error::Io(std::io::Error::other("the system's random number generator failed")))?;
+    Ok(bytes)
+}
+
+/// What a link's registration page asks for, once its account signed in.
+pub(super) enum LinkPrepared {
+    /// A ceremony, and the account's credential ids (base64url), which the
+    /// page excludes.
+    Ask { ceremony: Box<Ceremony>, credentials: Vec<String> },
+    /// The account holds [`passkeys::MAX_PER_ACCOUNT`] passkeys: nothing was
+    /// spent, and the link stays live.
+    Full,
+    /// The issuer cannot be a relying party: the page shows a notice.
+    Unavailable(webauthn::NoRp),
+}
+
+/// The ceremony registering a passkey through `link` for its account, signed
+/// in as `user` (bound to `actor`): a fresh challenge, and nothing of an
+/// approval's (no add, no allowance, no link).
+pub(super) fn prepare_link(
+    cx: &Ctx<'_>,
+    user: &auth::Identity,
+    actor: &str,
+    link: &Link,
+) -> Result<LinkPrepared, Error> {
+    let rp_id = match webauthn::rp_id(cx.issuer) {
+        Ok(rp_id) => rp_id,
+        Err(why) => return Ok(LinkPrepared::Unavailable(why)),
+    };
+    let held = passkeys::for_account(cx.root, &link.issuer, &link.subject)?;
+    if held.len() >= passkeys::MAX_PER_ACCOUNT {
+        return Ok(LinkPrepared::Full);
+    }
+    let ceremony = Ceremony {
+        challenge: random()?,
+        rp_id,
+        origin: origin(cx.issuer).to_string(),
+        issuer: link.issuer.clone(),
+        subject: link.subject.clone(),
+        provider: user.provider.clone(),
+        actor: actor.to_string(),
+        enroll: false,
+        add: None,
+        allowance: None,
+        link: false,
+    };
+    let credentials = held.into_iter().map(|p| p.credential).collect();
+    Ok(LinkPrepared::Ask { ceremony: Box::new(ceremony), credentials })
+}
+
+/// What a link's registration page asks the browser for in `ceremony`.
+pub(super) fn link_ask<'a>(ceremony: &'a Ceremony, credentials: &'a [String]) -> pages::LinkAsk<'a> {
+    pages::LinkAsk {
+        challenge: URL_SAFE_NO_PAD.encode(ceremony.challenge),
+        rp_id: &ceremony.rp_id,
+        user_handle: user_handle(&ceremony.issuer, &ceremony.subject),
+        user_name: &ceremony.actor,
+        excluded: credentials,
+    }
 }
 
 /// The WebAuthn user handle of an account (base64url): the first 16 bytes
@@ -141,9 +218,13 @@ pub(super) fn ask<'a>(ceremony: &'a Ceremony, credentials: &'a [String]) -> page
                 user: user_handle(&ceremony.issuer, &ceremony.subject),
                 name: &ceremony.actor,
             }),
+            link: ceremony.link,
         }
     }
 }
+
+/// The fields of a registration through a link.
+const LINK_FIELDS: [&str; 5] = ["credential", "client_data", "authenticator_data", "public_key", "algorithm"];
 
 /// The fields of a registration added beside an assertion. Any of them in
 /// a POST means it adds a passkey, even with an empty value.
@@ -187,6 +268,8 @@ pub(super) enum Why {
     New(Refusal),
     /// A registration under an allowance.
     Allowance(AllowanceWhy),
+    /// A link asked for where the page did not offer one.
+    LinkNotOffered,
 }
 
 /// Why a registration under an allowance was refused.
@@ -270,6 +353,12 @@ impl Why {
         matches!(self, Why::Allowance(_))
     }
 
+    /// Whether it is a link that was refused: what an operation's log line
+    /// reports in `passkey`, as for an allowance.
+    pub(super) fn is_link(self) -> bool {
+        matches!(self, Why::LinkNotOffered)
+    }
+
     /// Whether the allowance itself is over, so the page says so: the person
     /// has to ask the admin again, or use an existing passkey.
     pub(super) fn ended(self) -> bool {
@@ -302,6 +391,7 @@ impl Why {
                 AllowanceWhy::NoAccount => "allowance: no account",
                 AllowanceWhy::Webauthn(r) => allowance_label(r),
             },
+            Why::LinkNotOffered => "link not offered",
         }
     }
 
@@ -350,32 +440,66 @@ impl Why {
                 AllowanceWhy::NoAccount => "passkey refused: allowance: no account",
                 AllowanceWhy::Webauthn(r) => allowance_detail(r),
             },
+            Why::LinkNotOffered => "passkey refused: link not offered",
         }
     }
 }
 
+/// A link's secret, on its way from [`verify`] to the one answer that shows
+/// it. Nothing formats it: no `Display`, no `Serialize`, and a `Debug` that
+/// prints none of it, so no log can hold it. [`LinkSecret::url`] alone reads it.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct LinkSecret(String);
+
+impl std::fmt::Debug for LinkSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LinkSecret(..)")
+    }
+}
+
+impl LinkSecret {
+    /// The link a person opens at `issuer`, the secret in its fragment, which
+    /// no request carries to a server.
+    pub(super) fn url(&self, issuer: &str) -> String {
+        format!("{issuer}{PASSKEY_LINK}#{}", self.0)
+    }
+}
+
+/// A link a ceremony made, committed by the time it exists: its secret, when
+/// it ends (milliseconds), and whether the passkey added with it filled the
+/// account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LinkMade {
+    pub(super) secret: LinkSecret,
+    pub(super) expires_at: i64,
+    pub(super) full: bool,
+}
+
 /// A ceremony that passed: the credential's prefix, whether it registered
 /// a passkey (else it used one), the prefix of the passkey it added beside
-/// the one it used, if any, and the id of the allowance it registered under,
-/// if any.
+/// the one it used, if any, the id of the allowance it registered under,
+/// if any, and the link it made, if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Verified {
     pub(super) credential: String,
     pub(super) registered: bool,
     pub(super) added: Option<String>,
     pub(super) allowance: Option<String>,
+    pub(super) link: Option<LinkMade>,
 }
 
 impl Verified {
     /// What the approval logs' `passkey` says of it: an operation's line says
-    /// it only of a registration under an allowance.
+    /// it only of a registration under an allowance or a link made.
     pub(super) fn label(&self) -> &'static str {
         if self.allowance.is_some() {
             "registered under allowance"
         } else if self.registered {
             "registered"
         } else if self.added.is_some() {
-            "verified and added"
+            if self.link.is_some() { "verified and added, link made" } else { "verified and added" }
+        } else if self.link.is_some() {
+            "verified, link made"
         } else {
             "verified"
         }
@@ -446,13 +570,50 @@ fn fields<'p>(pairs: &'p [(String, String)], names: &[&str]) -> Result<Vec<&'p s
     if missing { Err(Why::Missing) } else { Ok(found) }
 }
 
+/// A link for the account of `c` in `workspace`, vouched for by its passkey
+/// `vouched_by`, and its secret, drawn before the write that makes it. Every
+/// value is the ceremony's or the approval's, never the form's.
+fn new_link(c: &Ceremony, vouched_by: &str, workspace: &str) -> Result<(LinkSecret, NewLink), Error> {
+    let secret = auth::random_hex(32)?;
+    let id = auth::random_hex(16)?;
+    let now = Timestamp::now();
+    let link = NewLink {
+        id,
+        secret_hash: auth::hash(&secret),
+        issuer: c.issuer.clone(),
+        subject: c.subject.clone(),
+        provider: c.provider.clone(),
+        actor: c.actor.clone(),
+        vouched_by: vouched_by.to_string(),
+        workspace: workspace.to_string(),
+        created_at: now.millis(),
+        expires_at: now.plus(LINK_TTL).millis(),
+    };
+    Ok((LinkSecret(secret), link))
+}
+
 /// Check the WebAuthn fields of an approval's POST (`pairs`) against the
 /// ceremony its page asked for: a registration is stored, an assertion's
 /// counter moved on, a passkey added beside an assertion stored with that
 /// move in one write, and one registered under an allowance stored as that
-/// allowance is spent, in one write. Nothing else in the form is read.
-pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> Result<Verified, Failure> {
+/// allowance is spent, in one write. With `make_link` ticked, a link for
+/// `workspace`, the approval's own, is made with the assertion's move, in that
+/// same write. Nothing else in the form is read.
+pub(super) fn verify(
+    cx: &Ctx<'_>,
+    c: &Ceremony,
+    pairs: &[(String, String)],
+    workspace: &str,
+) -> Result<Verified, Failure> {
     let refused = |why: Why, credential: &str| Failure::Refused { why, credential: credential.to_string() };
+    // Before anything else is read: only a page that offered it may ask for a link.
+    let ticked = pairs.iter().any(|(k, _)| k == "make_link");
+    if ticked && !c.link {
+        return Err(refused(Why::LinkNotOffered, ""));
+    }
+    if ticked && form::single(pairs, "make_link") != Some("1") {
+        return Err(refused(Why::Malformed, ""));
+    }
     // Before anything is read: the path with no assertion is for pages opened under an allowance alone.
     let allowing = pairs.iter().any(|(k, _)| ALLOW_FIELDS.contains(&k.as_str()));
     let offer = match (allowing, &c.allowance) {
@@ -507,7 +668,7 @@ pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> 
         return match passkeys::insert_first(cx.root, &row).map_err(store)? {
             Inserted::Inserted => {
                 registered();
-                Ok(Verified { credential: prefix.clone(), registered: true, added: None, allowance: None })
+                Ok(Verified { credential: prefix.clone(), registered: true, added: None, allowance: None, link: None })
             }
             Inserted::AlreadyEnrolled => Err(refused(Why::AlreadyEnrolled)),
             Inserted::CredentialTaken => Err(refused(Why::CredentialTaken)),
@@ -539,10 +700,22 @@ pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> 
         Assertion { client_data: &client_data, authenticator_data: &authenticator_data, signature: &signature };
     let counter = webauthn::verify_assertion(&expect, &stored, &assertion).map_err(|r| refused(Why::Webauthn(r)))?;
     let Some((add, credential, client_data, authenticator_data, public_key, algorithm)) = new else {
-        if !passkeys::use_counter(cx.root, &encoded, passkey.counter, counter).map_err(store)? {
-            return Err(refused(Why::Raced));
+        let verified =
+            |link| Verified { credential: prefix.clone(), registered: false, added: None, allowance: None, link };
+        if !ticked {
+            if !passkeys::use_counter(cx.root, &encoded, passkey.counter, counter).map_err(store)? {
+                return Err(refused(Why::Raced));
+            }
+            return Ok(verified(None));
         }
-        return Ok(Verified { credential: prefix.clone(), registered: false, added: None, allowance: None });
+        let (secret, made) = new_link(c, &encoded, workspace).map_err(store)?;
+        return match passkeys::vouch_link(cx.root, &made, &encoded, passkey.counter, counter).map_err(store)? {
+            Vouched::Made { replaced } => {
+                link::made(replaced);
+                Ok(verified(Some(LinkMade { secret, expires_at: made.expires_at, full: false })))
+            }
+            Vouched::Raced => Err(refused(Why::Raced)),
+        };
     };
     // The added passkey's own ceremony, against the add challenge, once the assertion vouched for it.
     let expect = Expect { challenge: &add, origin: &c.origin, rp_id: &c.rp_id };
@@ -566,15 +739,24 @@ pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> 
         public_key: &new.public_key,
         counter: new.counter,
     };
-    match passkeys::add(cx.root, &row, &encoded, passkey.counter, counter).map_err(store)? {
+    let made = if ticked { Some(new_link(c, &encoded, workspace).map_err(store)?) } else { None };
+    let write = passkeys::add(cx.root, &row, &encoded, passkey.counter, counter, made.as_ref().map(|(_, link)| link));
+    let verified = |link| Verified {
+        credential: prefix.clone(),
+        registered: false,
+        added: Some(passkeys::prefix(&added).to_string()),
+        allowance: None,
+        link,
+    };
+    match write.map_err(store)? {
         Added::Added => {
             registered();
-            Ok(Verified {
-                credential: prefix.clone(),
-                registered: false,
-                added: Some(passkeys::prefix(&added).to_string()),
-                allowance: None,
-            })
+            Ok(verified(None))
+        }
+        Added::Linked { replaced, full } => {
+            registered();
+            link::made(replaced);
+            Ok(verified(made.map(|(secret, link)| LinkMade { secret, expires_at: link.expires_at, full })))
         }
         Added::LimitReached => Err(refused(Why::LimitReached)),
         Added::CredentialTaken => Err(refused(Why::CredentialTaken)),
@@ -646,6 +828,7 @@ fn register_allowed(
                 registered: true,
                 added: None,
                 allowance: Some(offer.id.clone()),
+                link: None,
             })
         }
         // One check in the store: the page's own expiry tells the log which it was.
@@ -655,6 +838,83 @@ fn register_allowed(
         AllowedAdd::CredentialTaken => Err(refused(AllowanceWhy::CredentialTaken)),
         AllowedAdd::NoAccount => Err(refused(AllowanceWhy::NoAccount)),
     }
+}
+
+/// Check a link page's POST (`pairs`) against the ceremony the page asked for
+/// and store the passkey through the link `link_id`, the one the page was
+/// opened for: what came of that, and the new credential's prefix. A POST
+/// naming anything of an approval is refused before any field is read.
+/// `Linked` other than `Inserted` stored nothing, and neither did a refusal,
+/// which leaves the link live.
+pub(super) fn verify_link(
+    cx: &Ctx<'_>,
+    c: &Ceremony,
+    link_id: &str,
+    pairs: &[(String, String)],
+) -> Result<(String, Linked), Failure> {
+    let refused = |why: Why, credential: &str| Failure::Refused { why, credential: credential.to_string() };
+    let of_an_approval = |name: &str| {
+        matches!(name, "signature" | "make_link") || NEW_FIELDS.contains(&name) || ALLOW_FIELDS.contains(&name)
+    };
+    if pairs.iter().any(|(name, _)| of_an_approval(name)) {
+        return Err(refused(Why::NotOffered, ""));
+    }
+    let values = fields(pairs, &LINK_FIELDS).map_err(|why| refused(why, ""))?;
+    let credential = decoded(values[0], webauthn::MAX_CREDENTIAL).map_err(|why| refused(why, ""))?;
+    let encoded = URL_SAFE_NO_PAD.encode(&credential);
+    let prefix = passkeys::prefix(&encoded).to_string();
+    let refused = |why: Why| refused(why, &prefix);
+    let client_data = decoded(values[1], webauthn::MAX_CLIENT_DATA).map_err(refused)?;
+    let authenticator_data = decoded(values[2], webauthn::MAX_AUTH_DATA).map_err(refused)?;
+    let public_key = decoded(values[3], webauthn::MAX_PUBLIC_KEY).map_err(refused)?;
+    let algorithm: i64 = values[4].parse().map_err(|_| refused(Why::Malformed))?;
+    let expect = Expect { challenge: &c.challenge, origin: &c.origin, rp_id: &c.rp_id };
+    let registration = Registration {
+        credential: &credential,
+        client_data: &client_data,
+        authenticator_data: &authenticator_data,
+        public_key: &public_key,
+        algorithm,
+    };
+    let new = webauthn::verify_registration(&expect, &registration).map_err(|r| refused(Why::New(r)))?;
+    let row = NewRow {
+        credential: &encoded,
+        issuer: &c.issuer,
+        subject: &c.subject,
+        provider: &c.provider,
+        actor: &c.actor,
+        alg: new.alg,
+        public_key: &new.public_key,
+        counter: new.counter,
+    };
+    let linked = passkeys::insert_linked(cx.root, link_id, &row)
+        .map_err(|error| Failure::Store { error, credential: prefix.clone() })?;
+    if matches!(linked, Linked::Inserted { .. }) {
+        registered();
+    }
+    Ok((prefix, linked))
+}
+
+/// `answer`, an approval's, with the link its ceremony made, if any: at the
+/// one point each flow's answer passes, so no way an approval ends can drop a
+/// link already committed. `approved` says whether the approval went through:
+/// otherwise the page says the link still works.
+pub(super) fn shown(answer: Answer, made: Option<&LinkMade>, issuer: &str, approved: bool) -> Answer {
+    let Some(made) = made else { return answer };
+    // A page keeps its status. No approval redirects today, and one that did would lose the link: it stays here.
+    let page = match answer {
+        Answer::Page(page) => page,
+        Answer::Redirect(_) => pages::notice(200, pages::PASSKEY_LINK_FIELD, ""),
+    };
+    let url = made.secret.url(issuer);
+    let until = minute(made.expires_at);
+    Answer::Page(pages::with_link(page, &pages::LinkShown { url: &url, until: &until, approved, full: made.full }))
+}
+
+/// The UTC minute of `millis`, as a page shows it: `2026-10-01 05:28`, at or
+/// before the moment itself.
+fn minute(millis: i64) -> String {
+    Timestamp::from_millis(millis).to_rfc3339().chars().take(16).map(|c| if c == 'T' { ' ' } else { c }).collect()
 }
 
 #[cfg(test)]
@@ -673,12 +933,19 @@ impl Ceremony {
             enroll,
             add: None,
             allowance: None,
+            link: false,
         }
     }
 
     /// The ceremony, offering to add a passkey with the challenge `add`.
     pub(super) fn with_add(mut self, add: [u8; 32]) -> Ceremony {
         self.add = Some(add);
+        self
+    }
+
+    /// The ceremony, offering to make a link for another device.
+    pub(super) fn with_link(mut self) -> Ceremony {
+        self.link = true;
         self
     }
 

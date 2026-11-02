@@ -184,7 +184,8 @@ bd serve token events --since 7d --root /srv/bd     # the audit trail
 `bd serve token events` lists the audit trail (kept 90 days): `signed_in`,
 `token_created`, `refreshed`, `revoked`, `forgotten`,
 `client_registered`, `linked`, `named`, `passkey_registered`,
-`passkey_removed`, `passkey_add_allowed` and `passkey_add_cancelled`
+`passkey_removed`, `passkey_add_allowed`, `passkey_add_cancelled`,
+`passkey_link_made` and `passkey_link_ended`
 ([Passkeys](sign-in.md#approving-human-gates-in-the-browser)),
 filtered by `--since`, `--actor` (alias `--by`), `--kind` and `-n`
 (default 100). The other subcommands, `accounts`, `link`, `name` and
@@ -195,7 +196,9 @@ accounts](sign-in.md#accounts-and-actors). `bd serve passkey list|remove
 approvals, on the server host, and `bd serve passkey allow-add --account
 <actor or login> [--for <duration>] [--cancel]` allows it, there too, to
 register one without an existing one, for a short time ([An admin's
-allowance](sign-in.md#approving-human-gates-in-the-browser)).
+allowance](sign-in.md#approving-human-gates-in-the-browser)). `bd serve
+passkey cancel-link --account <actor or login>` ends its live [link for
+another device](sign-in.md#approving-human-gates-in-the-browser), there too.
 
 The server's own actor, `bd-serve`, which runs the background jobs, is
 reserved: no token acts as it or its sub-actors.

@@ -5,6 +5,7 @@
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from './expect.mjs'
+import { HOSTILE, blocks, passed, runBlock } from './record-blocks.mjs'
 
 const source = readFileSync(fileURLToPath(new URL('../../.claude/workflows/score-issue.js', import.meta.url)), 'utf8').replace(
 	/^export const meta = /m,
@@ -56,7 +57,7 @@ describe('score-issue.js', () => {
 		const rec = calls.find((c) => c.label === 'record')
 		expect(rec.prompt).toContain(`bd -C /r update bd-1 --set-metadata 'score_judge={"rubric":3,"overall":5,`)
 		expect(rec.prompt).toContain(`--actor "Quang Le/claude-x"`)
-		expect(rec.prompt).toContain('bd -C /r comment add bd-1 <Text> --actor "Quang Le/claude-x"')
+		expect(rec.prompt).toContain(`bd -C /r comment add bd-1 --stdin --actor "Quang Le/claude-x" <<'BD_TEXT'\n`)
 		expect(rec.prompt).not.toContain('--session flag')
 		expect(calls.find((c) => c.label === 'trace').prompt).toContain('--write --actor "Quang Le/claude-x"')
 	})
@@ -147,5 +148,54 @@ describe('score-issue.js', () => {
 		expect(b.result.work).toBe('Work: partial\n(Not stored as work metadata: write refused)')
 		expect(labelsOf(b.calls, 'trace').map((c) => c.label)).toEqual(['trace'])
 		expect(escalated(b.calls)).toBe(false)
+	})
+})
+
+describe('score-issue.js record block', () => {
+	/** The record prompt of a run whose judge summary and trace summary are both text. */
+	const recordPrompt = async (text) => {
+		const { calls } = await run(
+			{ issue: 'bd-1', actor: 'Quang Le/claude-x' },
+			{ ...base, judge: { ...judgeReply(DIMS5, 5), summary: text }, trace: { ok: true, summary: text } },
+		)
+		return calls.find((c) => c.label === 'record').prompt
+	}
+
+	it.each(HOSTILE)('passes text with %s to bd unchanged and runs nothing else', async (_, text) => {
+		const found = blocks(await recordPrompt(text))
+		expect(found.length).toBe(1)
+		const [block] = found
+		expect(block.body).toContain(text)
+		const r = runBlock(block)
+		expect(r.status, r.stderr).toBe(0)
+		expect(r.canary).toBe(false)
+		expect(passed(r)).toBe(block.body.replace(/\n+$/, ''))
+	})
+
+	it('runs the comment with its arguments intact and the heredoc at top level', async () => {
+		const [block] = blocks(await recordPrompt('plain words'))
+		expect(block.first).toBe(`bd -C /r comment add bd-1 --stdin --actor "Quang Le/claude-x" <<'BD_TEXT'`)
+		expect(runBlock(block).argv).toEqual(['-C', '/r', 'comment', 'add', 'bd-1', '--stdin', '--actor', 'Quang Le/claude-x'])
+	})
+
+	it('picks a tag absent from the text', async () => {
+		expect(blocks(await recordPrompt('BD_TEXT')).map((b) => b.tag)).toEqual(['BD_TEXT_X'])
+	})
+
+	it('gives the same prompt for the same replies', async () => {
+		expect(await recordPrompt('plain words')).toBe(await recordPrompt('plain words'))
+	})
+
+	it("hands bd's exit status back", async () => {
+		const [block] = blocks(await recordPrompt('plain words'))
+		expect(runBlock(block, 7).status).toBe(7)
+	})
+
+	it('leaves nothing for the agent to compose', async () => {
+		const prompt = await recordPrompt('plain words')
+		expect(prompt).not.toContain('<Text>')
+		expect(prompt).not.toContain('Text:')
+		expect(prompt).not.toContain("<<'EOF'")
+		expect(prompt).not.toMatch(/\$\([^)]*<</)
 	})
 })

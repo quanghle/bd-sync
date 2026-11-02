@@ -871,11 +871,40 @@ mod tests {
             retained_from: Retained { seq: 1, ts: None },
             history_complete_from: 1,
             incomplete: false,
+            cut: 3,
         };
         let out = as_of(&d);
         assert_eq!(out[1], "  may or may not have existed (see below); no values shown");
         assert!(out.iter().any(|l| l.starts_with("! exists: ")), "{out:?}");
         d.unknown.clear();
         assert_eq!(as_of(&d)[1], "  did not exist");
+    }
+
+    /// A deletion stamped before a time but committed after its place in the
+    /// log has not happened yet at that point.
+    #[test]
+    fn as_of_a_time_counts_a_deletion_by_its_place_in_the_log() {
+        use bd_core::asof::{EventRef, PointView, Retained};
+        let created = EventRef { seq: 4, ts: Timestamp(1_000) };
+        let deleted = EventRef { seq: 5, ts: Timestamp(2_000) };
+        let mut d = IssueAsOf {
+            id: "t-1".into(),
+            point: PointView { seq: None, time: Some(Timestamp(3_000)) },
+            exists: false,
+            created: Some(created.clone()),
+            deleted: Some(deleted.clone()),
+            fields: Default::default(),
+            labels: vec![],
+            dependencies: vec![],
+            unknown: vec![],
+            last_event: None,
+            retained_from: Retained { seq: 1, ts: None },
+            history_complete_from: 1,
+            incomplete: false,
+            cut: 3,
+        };
+        assert_eq!(as_of(&d)[1], format!("  did not exist yet (created #4 at {})", created.ts));
+        d.cut = 5;
+        assert_eq!(as_of(&d)[1], format!("  deleted at #5 ({})", deleted.ts));
     }
 }

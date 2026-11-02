@@ -131,7 +131,7 @@ fn cmd_spec_changes(app: &mut App, a: &SpecChangesArgs) -> Result<()> {
         let since = history::parse_bound(&a.since, now)?;
         let until = match &a.until {
             Some(u) => history::parse_bound(u, now)?,
-            None => Point::Time(now),
+            None => Point::Now(now),
         };
         history::changes(r.conn(), a.target.as_deref(), since, until)
     })?;

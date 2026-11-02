@@ -1101,3 +1101,202 @@ fn as_of_before_compaction_shows_original() {
     assert_eq!(env.at(&id, Point::Time(ts)).fields["description"], "Did it.");
     let _ = asof::FIELDS;
 }
+
+// A clock that stepped back: seqs keep commit order, stamps do not.
+
+/// `n` seconds after `T0`.
+fn secs(n: i64) -> Timestamp {
+    Timestamp(T0 + n * 1000)
+}
+
+/// The time `t` answers exactly as the seq `seq` does, but for the point itself.
+fn assert_reads_as_seq(env: &Env, id: &str, t: Timestamp, seq: i64) {
+    let mut a = env.at(id, Point::Time(t));
+    let b = env.at(id, Point::Seq(seq));
+    a.point = b.point.clone();
+    assert_eq!(a, b, "{id} at {t:?} against #{seq}");
+}
+
+#[test]
+fn as_of_a_time_past_a_backward_step_is_a_state_the_log_held() {
+    let mut env = Env::new();
+    let id = env.create(NewIssue::titled("Old"));
+    let priority = env.issue(&id).priority;
+    env.clock.set(secs(200));
+    let before = env.head();
+    env.update(&id, IssuePatch { title: Some("New".into()), ..Default::default() }); // stamped 201
+    env.clock.set(secs(100));
+    env.update(&id, IssuePatch { priority: Some(priority + 1), ..Default::default() }); // stamped 101
+
+    // Between the stamps: not the new priority over the old title, which the log never held.
+    let a = env.at(&id, Point::Time(secs(150)));
+    assert_eq!(a.fields["title"], "Old", "{a:?}");
+    assert_eq!(a.fields["priority"], priority, "{a:?}");
+    assert!(a.unknown.is_empty(), "{a:?}");
+    assert_reads_as_seq(&env, &id, secs(150), before);
+    // Before both stamps, and after both.
+    assert_reads_as_seq(&env, &id, secs(50), before);
+    assert_reads_as_seq(&env, &id, secs(300), env.head());
+}
+
+#[test]
+fn as_of_a_time_past_a_backward_step_knows_a_key_changed_on_both_sides() {
+    let mut env = Env::new();
+    let id = env.create(NewIssue::titled("One"));
+    env.clock.set(secs(200));
+    let before = env.head();
+    env.update(&id, IssuePatch { title: Some("Two".into()), ..Default::default() }); // stamped 201
+    env.clock.set(secs(100));
+    env.update(&id, IssuePatch { title: Some("Three".into()), ..Default::default() }); // stamped 101
+
+    let a = env.at(&id, Point::Time(secs(150)));
+    assert_eq!(a.fields["title"], "One", "{a:?}");
+    assert!(a.unknown.is_empty(), "the passes agree: {a:?}");
+    assert_reads_as_seq(&env, &id, secs(150), before);
+    assert_reads_as_seq(&env, &id, secs(300), env.head());
+}
+
+#[test]
+fn as_of_a_time_counts_a_creation_and_a_deletion_by_their_place_in_the_log() {
+    let mut env = Env::new();
+    let anchor = env.create(NewIssue::titled("Anchor"));
+    env.clock.set(secs(200));
+    let before = env.head();
+    env.update(&anchor, IssuePatch { title: Some("Moved".into()), ..Default::default() }); // stamped 201
+    env.clock.set(secs(100));
+    // Stamped 101, 102 and 103, all committed after the event stamped 201.
+    let born = env.create(NewIssue::titled("Born"));
+    let gone = env.create(NewIssue::titled("Gone"));
+    let born_seq = env.history(&born)[0].seq;
+    let gone_seq = env.history(&gone)[0].seq;
+    env.w(|tx| tx.delete_issues(std::slice::from_ref(&gone), &DeleteOptions { force: true, ..Default::default() }));
+    let deleted = env.head();
+    assert!(env.history(&gone).last().is_some_and(|e| e.ts <= secs(150)));
+
+    // Stamped before 150, but after its place in the log: neither happened yet.
+    for (id, seq) in [(&born, born_seq), (&gone, gone_seq)] {
+        let a = env.at(id, Point::Time(secs(150)));
+        assert!(!a.exists, "{a:?}");
+        assert_eq!(a.created.as_ref().map(|c| c.seq), Some(seq), "{a:?}");
+        assert_eq!(a.last_event, None, "{a:?}");
+        assert!(!a.deleted_by_then(), "{a:?}");
+        assert_reads_as_seq(&env, id, secs(150), before);
+    }
+    assert_eq!(env.at(&gone, Point::Time(secs(150))).deleted.map(|d| d.seq), Some(deleted));
+
+    // After every stamp: both happened.
+    assert!(env.at(&born, Point::Time(secs(300))).exists);
+    let a = env.at(&gone, Point::Time(secs(300)));
+    assert!(!a.exists && a.deleted_by_then(), "{a:?}");
+    assert_reads_as_seq(&env, &born, secs(300), env.head());
+    assert_reads_as_seq(&env, &gone, secs(300), env.head());
+}
+
+#[test]
+fn as_of_a_time_inside_an_out_of_order_stretch_stops_at_the_first_later_stamp() {
+    let mut env = Env::new();
+    let id = env.create(NewIssue::titled("Start"));
+    let mut heads = vec![env.head()];
+    // Stamped 200, 100, 120 and 250, in that order.
+    for (stamp, title) in [(200, "A"), (100, "B"), (120, "C"), (250, "D")] {
+        env.clock.set(secs(stamp - 1));
+        env.update(&id, IssuePatch { title: Some(title.into()), ..Default::default() });
+        heads.push(env.head());
+    }
+
+    // Before the event stamped 200, though B and C are stamped before 150.
+    let a = env.at(&id, Point::Time(secs(150)));
+    assert_eq!(a.fields["title"], "Start", "{a:?}");
+    assert_reads_as_seq(&env, &id, secs(150), heads[0]);
+    // Before the event stamped 250: the first three are stamped before 220.
+    let a = env.at(&id, Point::Time(secs(220)));
+    assert_eq!(a.fields["title"], "C", "{a:?}");
+    assert_reads_as_seq(&env, &id, secs(220), heads[3]);
+    // A stamp itself is not after that stamp; a seq point stays exact.
+    assert_reads_as_seq(&env, &id, secs(200), heads[3]);
+    assert_reads_as_seq(&env, &id, secs(250), heads[4]);
+    assert_eq!(env.at(&id, Point::Seq(heads[2])).fields["title"], "B");
+}
+
+#[test]
+fn as_of_cuts_never_decrease_as_time_goes_on() {
+    let mut env = Env::new();
+    let id = env.create(NewIssue::titled("Start"));
+    for (n, stamp) in [200, 100, 120, 250, 90, 300, 299].into_iter().enumerate() {
+        env.clock.set(secs(stamp - 1));
+        env.update(&id, IssuePatch { title: Some(format!("Title {n}")), ..Default::default() });
+    }
+    let head = env.head();
+    let cuts: Vec<i64> = env
+        .store
+        .read(|r| {
+            let conn = r.conn();
+            let hist = asof::History::load(conn)?;
+            (0..=320).map(|n| Ok(hist.at(conn, Point::Time(secs(n)))?.cut())).collect()
+        })
+        .unwrap();
+    assert!(cuts.windows(2).all(|w| w[0] <= w[1]), "{cuts:?}");
+    assert_eq!(cuts.last(), Some(&head));
+}
+
+/// `t`'s place in the log.
+fn cut_of(env: &Env, t: Timestamp) -> i64 {
+    let at = |conn: &_| asof::History::load(conn)?.at(conn, Point::Time(t));
+    env.store.read(|r| at(r.conn())).unwrap().cut()
+}
+
+#[test]
+fn retention_keeps_its_meaning_on_a_pruned_log_whose_clock_stepped_back() {
+    let mut env = Env::new();
+    let old = env.create(NewIssue::titled("Old"));
+    env.clock.set(secs(500));
+    env.update(&old, IssuePatch { title: Some("Pruned".into()), ..Default::default() }); // stamped 501
+    env.clock.set(secs(200));
+    env.update(&old, IssuePatch { title: Some("Kept".into()), ..Default::default() }); // stamped 201
+    let floor = env.head();
+    env.clock.set(secs(100));
+    let young = env.create(NewIssue::titled("Young")); // stamped 101, committed after the one stamped 201
+    let created = env.history(&young)[0].seq;
+    env.clock.set(secs(300));
+    env.update(&old, IssuePatch { title: Some("Late".into()), ..Default::default() }); // stamped 301
+    let late = env.head();
+
+    // A stamp pruned away places no time: only the retained events do.
+    assert_eq!(cut_of(&env, secs(250)), floor - 2);
+    env.prune_before(floor); // stamped 302
+    assert_eq!(cut_of(&env, secs(250)), late - 1);
+    let head = env.head();
+
+    // Before the oldest retained event's stamp: before retained history, by
+    // the time asked. The event stamped 101 is retained, and the cut's own seq
+    // still answers, yet neither makes such a time a retained one.
+    assert_eq!(env.at(&old, Point::Seq(floor - 1)).fields["title"], "Pruned");
+    for t in [secs(50), secs(150), secs(200)] {
+        assert_eq!(cut_of(&env, t), floor - 1, "{t:?}");
+        let e = env.as_of(&old, Point::Time(t)).unwrap_err();
+        assert!(
+            matches!(e, Error::HistoryPruned { floor: f, floor_ts, .. } if f == floor && floor_ts == Some(secs(201))),
+            "{e}"
+        );
+        assert_eq!((e.code(), e.exit_code()), ("history_pruned", 6));
+        // Created in retention: the retained creation says it did not exist yet.
+        let a = env.at(&young, Point::Time(t));
+        assert!(!a.exists && a.unknown.is_empty(), "{a:?}");
+        assert_eq!(a.created.as_ref().map(|c| c.seq), Some(created), "{a:?}");
+    }
+
+    // From that stamp on, a time reads as its place among the retained events.
+    assert_eq!(env.at(&old, Point::Time(secs(250))).fields["title"], "Kept");
+    assert!(env.at(&young, Point::Time(secs(250))).exists);
+    for (t, seq) in [(secs(201), late - 1), (secs(250), late - 1), (secs(301), late), (secs(400), head)] {
+        assert_eq!(cut_of(&env, t), seq, "{t:?}");
+        assert_reads_as_seq(&env, &old, t, seq);
+        assert_reads_as_seq(&env, &young, t, seq);
+    }
+
+    // The reader's clock behind every stamp: still the head, never pruned.
+    let mut a = env.at(&old, Point::Now(secs(50)));
+    let b = env.at(&old, Point::Seq(head));
+    a.point = b.point.clone();
+    assert_eq!(a, b);
+}

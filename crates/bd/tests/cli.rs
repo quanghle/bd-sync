@@ -4613,6 +4613,78 @@ fn bd_time(t: &str, ms: i64) -> String {
     parsed.with_timezone(&chrono::Utc).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// A log stored out of order needs no migration: a time reads as a place in the
+/// log, and a time from now on as the head, however the last events are stamped.
+#[test]
+fn time_points_read_a_stored_log_that_steps_back_by_its_place_in_the_log() {
+    let without = |mut v: Value, key: &str| {
+        v.as_object_mut().unwrap().remove(key);
+        v
+    };
+    let ws = Ws::new();
+    let db = ws.dir.path().join(".bd").join("bd.db");
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let created = ws.json(&["create", "Old title", "-p", "2"]);
+    let spec = ws.id(&["create", "Checkout", "--pinned", "-l", "spec,area:checkout"]);
+    ws.id(&["create", "First rule", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let before = event_head(&ws);
+    ws.ok(&["update", "t-1", "--title", "New title"]);
+    let title = ws.seq_of("t-1", "updated");
+    assert_eq!(title, before + 1);
+    ws.ok(&["update", "t-1", "-p", "1"]);
+    let late = ws.id(&["create", "Late rule", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let head = event_head(&ws);
+
+    // Every stamp in the past, the title update's an hour after all the others.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE events SET ts = ts - 7200000", []).unwrap();
+        conn.execute("UPDATE events SET ts = ts + 3600000 WHERE seq = ?1", [title]).unwrap();
+    }
+    // Between that stamp and the rest: the priority update and the late
+    // requirement are stamped before it, but committed after the title update.
+    let t = bd_time(created["created_at"].as_str().unwrap(), -5_400_000);
+    let at_before = format!("#{before}");
+
+    let shown = ws.json(&["show", "t-1", "--as-of", &t]);
+    let fields = (shown["fields"]["title"].as_str(), shown["fields"]["priority"].as_i64());
+    assert_eq!(fields, (Some("Old title"), Some(2)), "{shown}");
+    let at_seq = ws.json(&["show", "t-1", "--as-of", &at_before]);
+    assert_eq!(without(shown, "point"), without(at_seq, "point"));
+
+    let window = |since: &str| ws.json(&["spec", "changes", "--since", since, "--until", &format!("#{head}")]);
+    let changes = window(&t);
+    let listed = changes["changes"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{changes}");
+    assert_eq!((listed[0]["kind"].as_str(), listed[0]["id"].as_str()), (Some("added"), Some(late.as_str())));
+    assert_eq!(without(changes, "since"), without(window(&at_before), "since"));
+
+    // Events stamped ahead of the clock.
+    let head = event_head(&ws);
+    let ahead = ws.id(&["create", "Ahead rule", "--pinned", "-l", "requirement", "--parent", &spec]);
+    ws.ok(&["update", "t-1", "--title", "Ahead title"]);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE events SET ts = ts + 3600000 WHERE seq > ?1", [head]).unwrap();
+    }
+
+    // An omitted --until is every event so far.
+    let changes = ws.json(&["spec", "changes", "--since", &format!("#{head}")]);
+    let listed = changes["changes"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{changes}");
+    assert_eq!(listed[0]["id"].as_str(), Some(ahead.as_str()), "{changes}");
+    assert!(changes["until"]["seq"].is_null() && changes["until"]["time"].is_string(), "{changes}");
+
+    let at_head = ws.json(&["show", "t-1", "--as-of", &format!("#{}", event_head(&ws))]);
+    assert_eq!(at_head["fields"]["title"], "Ahead title");
+    let at_head = without(at_head, "point");
+    for now in ["now", "-0s"] {
+        let shown = ws.json(&["show", "t-1", "--as-of", now]);
+        assert!(shown["point"]["seq"].is_null() && shown["point"]["time"].is_string(), "{shown}");
+        assert_eq!(without(shown, "point"), at_head, "{now}");
+    }
+}
+
 #[test]
 fn history_diff_prints_field_changes() {
     let ws = Ws::new();

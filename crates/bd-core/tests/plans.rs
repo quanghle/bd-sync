@@ -559,9 +559,9 @@ fn run_the_commands(ws: &mut Ws) {
     spec_history(ws, &spec);
 }
 
-/// `bd spec show --as-of` and `bd spec changes`: the events after a seq (a
-/// rowid range) and after a time (`idx_events_ts`), with the rebuilds they
-/// lead to, over a history an older bd wrote (left by
+/// `bd spec show --as-of` and `bd spec changes`: the events after a seq or a
+/// time (a rowid range for both, the time resolved through `idx_events_ts`),
+/// with the rebuilds they lead to, over a history an older bd wrote (left by
 /// [`history_and_compaction`]).
 fn spec_history(ws: &mut Ws, spec: &str) {
     // A time inside the retained history, then a requirement added and closed after it.
@@ -923,8 +923,8 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         "FROM dependencies INDEXED BY idx_deps_target WHERE depends_on_id = ?1",
         "SELECT metadata FROM issues WHERE id = ?1",
         "SELECT ts FROM events WHERE seq = ?1",
-        // Spec history: the events after a time through their index, after a seq by rowid.
-        "FROM events INDEXED BY idx_events_ts WHERE ts > ?1 AND ts <= ?2",
+        // Spec history: a time resolved to a seq through the index on times, the events after a seq by rowid.
+        "SELECT MIN(seq) FROM events INDEXED BY idx_events_ts WHERE ts > ?1",
         "FROM events WHERE seq > ?1 AND seq <= ?2 AND op IN",
         // Feature specs: closed and open work by status through the ready index, labels by label, edges by end.
         "i.status = 'closed' AND i.closed_at >= ?1",

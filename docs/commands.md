@@ -225,8 +225,10 @@ offset (`+2d`) or RFC 3339. Status values accept `wip`/`inprogress` for
 
 `show --as-of` takes an event seq (`120` or `#120`: the state just after
 that event), a time as above, or `-DURATION` for that long ago (`-2h`).
-It prints the fields it can rebuild from the issue's events and lists
-what it cannot (see [Reading an issue as of a past
+A time is read as a place in the log, the state just before the first
+retained event stamped after it, so a clock that stepped back cannot mix
+two states. It prints the fields it can rebuild from the issue's events
+and lists what it cannot (see [Reading an issue as of a past
 moment](concepts.md#reading-an-issue-as-of-a-past-moment)); a point
 before the retained history exits 6 (`history_pruned`), unless the issue
 had not been created yet then.
@@ -596,7 +598,7 @@ writes without the checks.
 - **Show as of.** `--as-of TIME` prints the specs as they were at TIME,
   rebuilt from the retained events as [`bd show --as-of`](#issues) does,
   in the same TIME forms (an event seq `120` or `#120`, a date or time,
-  `-7d` ago; a time in the future gives the current state) and with the
+  `-7d` ago; a time at or after now gives the current state) and with the
   same Markdown, plus an `As of #N` (or RFC 3339 time) line under the top
   heading; `--history` works with it. At TIME, an issue was a requirement,
   non-goal or sub-spec of a spec when it existed, its parent-child edge
@@ -621,14 +623,16 @@ writes without the checks.
   (`history_pruned`); a seq past the newest event exits 2.
 - **Changes.** Reports what changed in the specs between `--since`
   (required) and `--until` (default now): the events after `--since`, up to
-  and including `--until`, so two adjacent windows tile. Both take
-  `--as-of`'s TIME forms, plus a bare duration (`30d` is 30 days ago); bare
-  digits are an event seq (`--since 120`), as is `#120`, which a shell
-  needs quoted (`--since '#120'`: an unquoted `#` starts a comment).
-  `--since` not before `--until` exits 2. In a remote workspace relative
-  times are resolved by `bd serve`, on its clock. The scope is the named
-  spec, or the area's specs, at either end of the window, with their
-  sub-specs at either end; with no `AREA|ID`, every spec. Membership is
+  and including `--until`. Both take `--as-of`'s TIME forms, plus a bare
+  duration (`30d` is 30 days ago); bare digits are an event seq
+  (`--since 120`), as is `#120`, which a shell needs quoted
+  (`--since '#120'`: an unquoted `#` starts a comment). A time resolves as
+  `--as-of`'s does, to a place in the log, so two adjacent windows tile
+  even after a clock step back, and an omitted `--until` means every event
+  so far. `--since` not before `--until` exits 2. In a remote workspace
+  relative times are resolved by `bd serve`, on its clock. The scope is
+  the named spec, or the area's specs, at either end of the window, with
+  their sub-specs at either end; with no `AREA|ID`, every spec. Membership is
   `--as-of`'s rule, checked at `--since` and after each transaction that
   touched the item in the window, and each change is listed under the
   item's own parent spec, so inherited requirements are not repeated under

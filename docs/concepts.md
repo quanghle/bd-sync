@@ -260,6 +260,15 @@ listed as unknown, and the answer says history is incomplete
 (`incomplete: true`). Older bd binaries refuse a v4 workspace, so none can
 write such events after the marker.
 
+Events are numbered in commit order, while their times come from the
+writer's clock, which can step back (an NTP correction, a resumed VM). So
+a time is read as a place in the log: the state just before the first
+retained event stamped after it, which is always a state the log held.
+Inside a backward stretch, events stamped at or before the time but
+committed after a later-stamped one are left out; an event seq stays
+exact. A time at or after now means the newest state, however the last
+events are stamped.
+
 A point older than retention exits 6 (`history_pruned`), unless the
 issue's retained creation shows it did not exist yet. A seq just below the
 oldest retained event (`floor - 1`) still answers, as the state before

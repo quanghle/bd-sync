@@ -45,6 +45,9 @@ const WHOLE_TABLE: &[(&str, &str)] = &[
     ("WITH RECURSIVE direct(id) AS", "issues"),
     ("SELECT id, is_blocked FROM issues ORDER BY id", "issues"),
     ("SELECT issue_id, depends_on_id FROM dependencies WHERE dep_type IN", "dependencies"),
+    // issues blocked by their own ancestor (`doctor`, imports): the live blocking edges, then the hierarchy
+    ("WHERE d.dep_type IN ('blocks','conditional-blocks') AND i.status NOT IN", "dependencies"),
+    ("WHERE d.dep_type = 'parent-child' ORDER BY d.issue_id, d.depends_on_id", "dependencies"),
     // stats: issues by status, blocked, closable epics, label counts
     ("SELECT status, COUNT(*) FROM issues GROUP BY status", "issues"),
     ("SELECT COUNT(*) FROM issues WHERE is_blocked = 1 AND status NOT IN", "issues"),
@@ -264,6 +267,7 @@ fn walk_the_graph(ws: &mut Ws) {
                 playbook::runs(r.conn(), &Default::default(), r.now())?;
                 playbook::extract(r.conn(), &run, Some("plans"))?;
                 graph::full_blocked_set(r.conn())?;
+                graph::stuck_ancestor_edges(r.conn())?;
                 r.stats()?;
                 r.export_jsonl(&mut Vec::new(), &ExportOptions::default())?;
                 Ok(())
@@ -559,9 +563,9 @@ fn run_the_commands(ws: &mut Ws) {
     spec_history(ws, &spec);
 }
 
-/// `bd spec show --as-of` and `bd spec changes`: the events after a seq (a
-/// rowid range) and after a time (`idx_events_ts`), with the rebuilds they
-/// lead to, over a history an older bd wrote (left by
+/// `bd spec show --as-of` and `bd spec changes`: the events after a seq or a
+/// time (a rowid range for both, the time resolved through `idx_events_ts`),
+/// with the rebuilds they lead to, over a history an older bd wrote (left by
 /// [`history_and_compaction`]).
 fn spec_history(ws: &mut Ws, spec: &str) {
     // A time inside the retained history, then a requirement added and closed after it.
@@ -868,6 +872,15 @@ fn failures(name: &str, ws: &Ws, statements: &BTreeSet<String>) -> Vec<String> {
 fn graph_walks_plan_index_lookups_under_stale_statistics() {
     let mut statements = statements_of(walk_the_graph);
     assert!(statements.len() > 50, "{} statements", statements.len());
+    // The ancestor deadlock checks ran: the two scans behind `bd doctor` and imports, and a move's check.
+    let flat: Vec<String> = statements.iter().map(|s| s.split_whitespace().collect::<Vec<_>>().join(" ")).collect();
+    for needle in [
+        "WHERE d.dep_type IN ('blocks','conditional-blocks') AND i.status NOT IN",
+        "WHERE d.dep_type = 'parent-child' ORDER BY d.issue_id, d.depends_on_id",
+        "dep_type IN ('blocks','conditional-blocks') ORDER BY depends_on_id",
+    ] {
+        assert!(flat.iter().any(|s| s.contains(needle)), "no statement with {needle:?} ran");
+    }
     statements.extend(statements_of(approval_packets));
 
     let mut failures = Vec::new();
@@ -923,8 +936,8 @@ fn every_statement_plans_index_lookups_in_workspaces_as_bd_leaves_them() {
         "FROM dependencies INDEXED BY idx_deps_target WHERE depends_on_id = ?1",
         "SELECT metadata FROM issues WHERE id = ?1",
         "SELECT ts FROM events WHERE seq = ?1",
-        // Spec history: the events after a time through their index, after a seq by rowid.
-        "FROM events INDEXED BY idx_events_ts WHERE ts > ?1 AND ts <= ?2",
+        // Spec history: a time resolved to a seq through the index on times, the events after a seq by rowid.
+        "SELECT MIN(seq) FROM events INDEXED BY idx_events_ts WHERE ts > ?1",
         "FROM events WHERE seq > ?1 AND seq <= ?2 AND op IN",
         // Feature specs: closed and open work by status through the ready index, labels by label, edges by end.
         "i.status = 'closed' AND i.closed_at >= ?1",

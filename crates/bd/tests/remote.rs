@@ -358,6 +358,34 @@ fn remote_lifecycle_keeps_cli_output_and_exit_codes() {
 }
 
 #[test]
+fn remote_moves_that_would_block_an_issue_on_its_own_ancestor_are_refused() {
+    let server = Server::start();
+    let writer = server.client(&server.token("writer-laptop", "writer", &[]));
+    let id = |args: &[&str]| {
+        let mut a = vec!["-q"];
+        a.extend_from_slice(args);
+        writer.ok(&a).trim().to_string()
+    };
+    let p = id(&["create", "Parent"]);
+    let c = id(&["create", "Moved"]);
+    let d = id(&["create", "Child", "--parent", &c]);
+    writer.ok(&["dep", "add", &d, &p]);
+
+    assert_eq!(writer.code(&["update", &c, "--parent", &p]), 2);
+    let err = writer.run(&["--json", "update", &c, "--parent", &p]);
+    assert_eq!(err.status.code(), Some(2));
+    let err: Value = serde_json::from_slice(&err.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "refused", "{err}");
+    assert_eq!(
+        err["error"]["message"],
+        format!(
+            "{d} depends on {p} via blocks; moving {c} under {p} would make {p} an ancestor of {d} and deadlock; remove that edge first"
+        )
+    );
+    assert!(writer.json(&["show", &c])["parent"].is_null(), "the move left nothing behind");
+}
+
+#[test]
 fn remote_close_claims_the_next_issue() {
     let server = Server::start();
     let alice = server.client(&server.token("alice-laptop", "alice", &[]));
@@ -635,6 +663,41 @@ fn bench_remote_mode_verifies_invariants() {
     let keep = dir.path().join("not-a-workspace.db");
     let out = bd(dir.path()).args(["bench", "--mode", "remote", "--keep"]).arg(&keep).output().unwrap();
     assert_eq!(out.status.code(), Some(2), "--keep must name <root>/<name>/.bd/bd.db in remote mode");
+}
+
+#[test]
+fn bench_runs_every_mode_at_the_requested_durability() {
+    // Off, not normal: `config get` falls back to normal, which would pass without the write.
+    let mut levels = Vec::new();
+    for mode in ["threads", "processes", "cli", "remote"] {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = dir.path().join("w").join(".bd").join("bd.db");
+        let out = bd(dir.path())
+            .args([
+                "--json",
+                "bench",
+                "--mode",
+                mode,
+                "--durability",
+                "off",
+                "--workers",
+                "2",
+                "--issues",
+                "20",
+                "--keep",
+            ])
+            .arg(&keep)
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_str(&check(out, mode)).unwrap();
+        assert_eq!(report["mode"], mode);
+        assert_eq!(report["durability"], "off");
+        assert_eq!(report["verified"], true, "{report}");
+        let out = bd(dir.path()).arg("--db").arg(&keep).args(["config", "get", "durability"]).output().unwrap();
+        levels.push((mode, check(out, "config get durability").trim().to_string()));
+    }
+    let off = |mode| (mode, "off".to_string());
+    assert_eq!(levels, ["threads", "processes", "cli", "remote"].map(off));
 }
 
 #[test]

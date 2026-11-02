@@ -338,6 +338,9 @@ impl WriteCtx<'_> {
     /// Import a JSONL stream in this transaction (all or nothing).
     pub fn import_jsonl(&mut self, input: &mut dyn BufRead, opts: &ImportOptions) -> Result<ImportSummary> {
         let holds = self.human_holds()?;
+        // A workspace already stuck stays importable: only a new edge is refused.
+        let stuck_before: BTreeSet<(String, String)> =
+            graph::stuck_ancestor_edges(self.conn())?.into_iter().map(|e| (e.issue, e.target)).collect();
         let mut summary = ImportSummary::default();
         let mut issues_in: Vec<ImportedIssue> = Vec::new();
         let mut memories_in: Vec<InMemory> = Vec::new();
@@ -479,6 +482,20 @@ impl WriteCtx<'_> {
         let cycles = graph::find_cycles(self.conn())?;
         if let Some(c) = cycles.first() {
             return Err(Error::Cycle { path: c.clone() });
+        }
+        let new_stuck: Vec<graph::StuckEdge> = graph::stuck_ancestor_edges(self.conn())?
+            .into_iter()
+            .filter(|e| !stuck_before.contains(&(e.issue.clone(), e.target.clone())))
+            .collect();
+        if let Some(e) = new_stuck.first() {
+            let more = match new_stuck.len() - 1 {
+                0 => String::new(),
+                n => format!(" (+{n} more)"),
+            };
+            let (x, t, via) = (&e.issue, &e.target, &e.dep_type);
+            return Err(Error::Refused(format!(
+                "{x} depends on {t} via {via}, and {t} is an ancestor of {x}: importing this would deadlock; remove that edge{more}"
+            )));
         }
 
         for (issue, _, comments_in) in &issues_in {

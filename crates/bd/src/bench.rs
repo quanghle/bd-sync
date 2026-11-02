@@ -449,14 +449,11 @@ pub fn cmd_bench(app: &mut App, a: &BenchArgs) -> Result<()> {
     let seed_ms = seed_start.elapsed().as_secs_f64() * 1e3;
     let edges: i64 = store.connection().query_row("SELECT COUNT(*) FROM dependencies", [], |r| r.get(0))?;
 
-    // The server opens the database itself, so it reads durability from the workspace config.
+    // The server and the cli children open the database themselves, so they read durability
+    // from the workspace config.
+    store.write("bench.config", "bench", |tx| config::set(tx, "durability", &a.durability.to_ascii_lowercase()))?;
     let server = match a.mode {
-        BenchMode::Remote => {
-            store.write("bench.config", "bench", |tx| {
-                config::set(tx, "durability", &a.durability.to_ascii_lowercase())
-            })?;
-            Some(ScratchServer::start(&std::env::current_exe()?, &path)?)
-        }
+        BenchMode::Remote => Some(ScratchServer::start(&std::env::current_exe()?, &path)?),
         _ => None,
     };
     let target = match &server {

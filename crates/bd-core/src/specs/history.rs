@@ -24,6 +24,10 @@
 //! window; a transition with an unknown side is listed in `unknown`, never
 //! reported as a change.
 //!
+//! A time is resolved once per command to its place in the log
+//! ([`History::at`]), and everything here selects events by that place,
+//! never by their stamps, which a clock stepping back can put out of order.
+//!
 //! Everything here reads, inside the caller's one read transaction.
 
 use std::cell::{Cell, RefCell};
@@ -38,7 +42,7 @@ use super::{
     Brief, MAX_DEPTH, NON_GOAL, Node, REQUIREMENT, SPEC, Source, SpecView, clean, edges_in, labelled, spec_views,
     strip_removed,
 };
-use crate::asof::{History, IssueAsOf, Loaded, Point, PointView};
+use crate::asof::{At, History, IssueAsOf, Loaded, Point, PointView};
 use crate::error::{Error, Result};
 use crate::issues;
 use crate::model::{Event, Status};
@@ -82,7 +86,7 @@ pub fn parse_bound(input: &str, now: Timestamp) -> Result<Point> {
         return Point::parse(input, now);
     }
     match parse_duration(s) {
-        Ok(d) => Ok(Point::Time(now.minus(d))),
+        Ok(d) => Ok(Point::of_time(now.minus(d), now)),
         Err(_) => Point::parse(input, now),
     }
 }
@@ -97,29 +101,17 @@ macro_rules! history_ops {
     };
 }
 
-/// The events after a seq: a rowid range.
+/// The events between two seqs: a rowid range.
 const AFTER_SEQ: &str = concat!(
     "SELECT seq, tx, ts, actor, op, issue_id, data FROM events WHERE seq > ?1 AND seq <= ?2 AND op IN (",
     history_ops!(),
     ") ORDER BY seq"
 );
 
-/// The events after a time: a range of `idx_events_ts`.
-const AFTER_TS: &str = concat!(
-    "SELECT seq, tx, ts, actor, op, issue_id, data FROM events INDEXED BY idx_events_ts WHERE ts > ?1 AND ts <= ?2 \
-     AND op IN (",
-    history_ops!(),
-    ") ORDER BY seq"
-);
-
 /// The retained events of the history ops after `since` and, with `until`,
-/// at or before it, in seq order: one bounded read.
-pub(crate) fn events_after(
-    conn: &Connection,
-    hist: &History,
-    since: Point,
-    until: Option<Point>,
-) -> Result<Vec<Event>> {
+/// at or before it, in seq order: one bounded read, a rowid range between
+/// the two cuts.
+pub(crate) fn events_after(conn: &Connection, hist: &History, since: At, until: Option<At>) -> Result<Vec<Event>> {
     let row = |r: &rusqlite::Row<'_>| {
         let data: String = r.get(6)?;
         Ok(Event {
@@ -132,25 +124,10 @@ pub(crate) fn events_after(
             data: serde_json::from_str(&data).unwrap_or_else(|_| json!({})),
         })
     };
-    let events: Vec<Event> = match since {
-        Point::Seq(n) => {
-            let hi = match until {
-                Some(Point::Seq(u)) => u,
-                _ => hist.head(),
-            };
-            let mut stmt = conn.prepare_cached(AFTER_SEQ)?;
-            stmt.query_map(params![n, hi], row)?.collect::<rusqlite::Result<_>>()?
-        }
-        Point::Time(t) => {
-            let hi = match until {
-                Some(Point::Time(u)) => u,
-                _ => Timestamp(i64::MAX),
-            };
-            let mut stmt = conn.prepare_cached(AFTER_TS)?;
-            stmt.query_map(params![t, hi], row)?.collect::<rusqlite::Result<_>>()?
-        }
-    };
-    Ok(events.into_iter().filter(|e| !since.includes(e) && until.is_none_or(|u| u.includes(e))).collect())
+    let hi = until.map_or(hist.head(), |u| u.cut());
+    let mut stmt = conn.prepare_cached(AFTER_SEQ)?;
+    let events = stmt.query_map(params![since.cut(), hi], row)?.collect::<rusqlite::Result<_>>()?;
+    Ok(events)
 }
 
 /// What the events after a point say about the issues a spec can have held
@@ -180,7 +157,7 @@ pub(crate) struct After {
 
 impl After {
     /// From `events`, those after `point`.
-    pub(crate) fn of(events: &[Event], point: Point) -> After {
+    pub(crate) fn of(events: &[Event], point: At) -> After {
         let mut out = After::default();
         // Ids named only by a purge, a compaction or an import, and those with direct evidence.
         let mut named: BTreeSet<String> = BTreeSet::new();
@@ -384,24 +361,18 @@ impl Rebuilt {
     }
 }
 
-/// The seq of `d`'s retained creation, when it counts by `point`.
-fn created_by(d: &IssueAsOf, point: Point) -> Option<i64> {
-    d.created
-        .as_ref()
-        .filter(|c| match point {
-            Point::Seq(n) => c.seq <= n,
-            Point::Time(t) => c.ts <= t,
-        })
-        .map(|c| c.seq)
+/// The seq of `d`'s retained creation, when it counts by `at`.
+fn created_by(d: &IssueAsOf, at: At) -> Option<i64> {
+    d.created.as_ref().filter(|c| c.seq <= at.cut()).map(|c| c.seq)
 }
 
-/// When `d` was created, at `point`: its retained creation by then (the
+/// When `d` was created, at `at`: its retained creation by then (the
 /// `created_at` its snapshot recorded, which an import keeps from its
 /// input, else the event's time), else (none retained) the live row's;
 /// unknown when its creation by then is pruned.
-fn created_at(d: &IssueAsOf, loaded: &Loaded, point: Point) -> std::result::Result<Timestamp, String> {
+fn created_at(d: &IssueAsOf, loaded: &Loaded, at: At) -> std::result::Result<Timestamp, String> {
     match &d.created {
-        Some(c) if created_by(d, point).is_some() => Ok(loaded
+        Some(c) if created_by(d, at).is_some() => Ok(loaded
             .history
             .iter()
             .find(|e| e.seq == c.seq)
@@ -733,21 +704,26 @@ impl<'c> Rebuilder<'c> {
         Ok(p.spec_label)
     }
 
-    /// `id` at `point`; `None` when the workspace has never held it.
-    pub(crate) fn at(&self, id: &str, point: Point) -> Result<Option<Rebuilt>> {
+    /// `id` at `at`; `None` when the workspace has never held it.
+    pub(crate) fn at(&self, id: &str, at: At) -> Result<Option<Rebuilt>> {
         let Some(loaded) = self.load(id)? else { return Ok(None) };
         let replayed = self.replayed.get().saturating_add(loaded.history.len().max(1));
         if replayed > self.limits.replay {
             return Err(self.refusal.error(format!("more than {} events to replay", self.limits.replay)));
         }
         self.replayed.set(replayed);
-        let d = self.hist.rebuild(self.conn, &loaded, point)?;
+        let d = self.hist.rebuild(self.conn, &loaded, at)?;
         if d.incomplete {
             self.incomplete.set(true);
         }
-        let created_at = created_at(&d, &loaded, point);
-        let created_seq = created_by(&d, point);
+        let created_at = created_at(&d, &loaded, at);
+        let created_seq = created_by(&d, at);
         Ok(Some(Rebuilt { d, created_at, created_seq }))
+    }
+
+    /// `id` just after the event `seq`, which costs no read to resolve.
+    fn at_seq(&self, id: &str, seq: i64) -> Result<Option<Rebuilt>> {
+        self.at(id, self.hist.at(self.conn, Point::Seq(seq))?)
     }
 }
 
@@ -770,7 +746,7 @@ enum SpecAt {
 /// is collected by the spec it would be under.
 pub(crate) struct AsOfSource<'r, 'c> {
     rb: &'r Rebuilder<'c>,
-    point: Point,
+    point: At,
     after: &'r After,
     rebuilt: RefCell<HashMap<String, Option<Rc<Rebuilt>>>>,
     nodes: RefCell<HashMap<String, Option<Node>>>,
@@ -779,7 +755,7 @@ pub(crate) struct AsOfSource<'r, 'c> {
 }
 
 impl<'r, 'c> AsOfSource<'r, 'c> {
-    pub(crate) fn new(rb: &'r Rebuilder<'c>, point: Point, after: &'r After) -> AsOfSource<'r, 'c> {
+    pub(crate) fn new(rb: &'r Rebuilder<'c>, point: At, after: &'r After) -> AsOfSource<'r, 'c> {
         AsOfSource {
             rb,
             point,
@@ -1040,10 +1016,10 @@ pub fn show_as_of(conn: &Connection, arg: &str, point: Point) -> Result<Vec<Spec
 pub fn show_as_of_with_cap(conn: &Connection, arg: &str, point: Point, limits: Limits) -> Result<Vec<SpecView>> {
     let label = PointView::of(point).label();
     let rb = Rebuilder::new(conn, limits, Refusal::Show(label.clone()))?;
-    rb.hist().check(point)?;
-    let events = events_after(conn, rb.hist(), point, None)?;
-    let after = After::of(&events, point);
-    let src = AsOfSource::new(&rb, point, &after);
+    let at = rb.hist().at(conn, point)?;
+    let events = events_after(conn, rb.hist(), at, None)?;
+    let after = After::of(&events, at);
+    let src = AsOfSource::new(&rb, at, &after);
     let roots = resolve(&src, conn, arg.trim(), &label)?;
     for r in &roots {
         src.note_own(&r.id)?;
@@ -1120,18 +1096,21 @@ pub struct Changes {
     pub incomplete: bool,
 }
 
-/// Whether `since` is before `until`. Points of one kind compare directly;
-/// a seq and a time by the seq's event time, taken as before when that
-/// event is not retained (the window is then only possibly empty).
-fn ordered(conn: &Connection, since: Point, until: Point) -> Result<bool> {
-    let ts = |n: i64| -> Result<Option<Timestamp>> {
-        Ok(conn.prepare_cached("SELECT ts FROM events WHERE seq = ?1")?.query_row([n], |r| r.get(0)).optional()?)
+/// Whether `since` is before `until`. Two seqs compare directly, and so do
+/// two times, so a window of two times nothing falls in stays allowed. A
+/// retained seq compares against the time's place in the log ([`At::cut`]);
+/// a seq whose event is not retained is taken as before (the window is then
+/// only possibly empty).
+fn ordered(conn: &Connection, since: At, until: At) -> Result<bool> {
+    let retained = |n: i64| -> Result<bool> {
+        let ts = conn.prepare_cached("SELECT ts FROM events WHERE seq = ?1")?.query_row([n], |r| r.get::<_, i64>(0));
+        Ok(ts.optional()?.is_some())
     };
-    Ok(match (since, until) {
+    Ok(match (since.point(), until.point()) {
         (Point::Seq(a), Point::Seq(b)) => a < b,
-        (Point::Time(a), Point::Time(b)) => a < b,
-        (Point::Seq(n), Point::Time(t)) => ts(n)?.is_none_or(|x| x <= t),
-        (Point::Time(t), Point::Seq(n)) => ts(n)?.is_none_or(|x| x > t),
+        (Point::Time(a) | Point::Now(a), Point::Time(b) | Point::Now(b)) => a < b,
+        (Point::Seq(n), Point::Time(_) | Point::Now(_)) => !retained(n)? || n <= until.cut(),
+        (Point::Time(_) | Point::Now(_), Point::Seq(n)) => !retained(n)? || since.cut() < n,
     })
 }
 
@@ -1289,10 +1268,8 @@ fn transition(
             // Closed: superseded when it has a replacement then, else removed.
             match a.supersedes.first() {
                 Some(by) => {
-                    let title = rb
-                        .at(by, Point::Seq(point))?
-                        .and_then(|r| r.str_field("title").map(String::from))
-                        .unwrap_or_default();
+                    let title =
+                        rb.at_seq(by, point)?.and_then(|r| r.str_field("title").map(String::from)).unwrap_or_default();
                     sources_of(a, unknown);
                     out.push(Change {
                         by: Some(Brief { id: clean(by), title: clean(&title) }),
@@ -1354,12 +1331,13 @@ fn inert(e: &Event) -> bool {
 }
 
 /// What changed in the specs `target` names (or every spec) between `since`
-/// and `until`: the events `e` with `since < e <= until`. Attributed to each
-/// item's own parent spec among the specs in scope at either end and their
-/// sub-specs. A `since` before retained history is [`Error::HistoryPruned`]
-/// (exit 6); `since` not before `until` is refused (exit 2), and so are more
-/// than [`MAX_HISTORY_ISSUES`] issues to rebuild or [`MAX_HISTORY_REPLAY`]
-/// events to replay. Reads only.
+/// and `until`: the events in the log after `since`'s place and up to
+/// `until`'s ([`History::at`]), so adjacent windows tile however the events
+/// are stamped. Attributed to each item's own parent spec among the specs in
+/// scope at either end and their sub-specs. A `since` before retained history
+/// is [`Error::HistoryPruned`] (exit 6); `since` not before `until` is refused
+/// (exit 2), and so are more than [`MAX_HISTORY_ISSUES`] issues to rebuild or
+/// [`MAX_HISTORY_REPLAY`] events to replay. Reads only.
 pub fn changes(conn: &Connection, target: Option<&str>, since: Point, until: Point) -> Result<Changes> {
     changes_with_cap(conn, target, since, until, Limits::default())
 }
@@ -1375,29 +1353,28 @@ pub fn changes_with_cap(
     let target = target.map(str::trim);
     let rb = Rebuilder::new(conn, limits, Refusal::Changes)?;
     let hist = rb.hist();
-    hist.check(since)?;
-    hist.check(until)?;
+    let (at_s, at_u) = (hist.at(conn, since)?, hist.at(conn, until)?);
     // With seq 1 retained nothing was pruned: a time before the first event
     // (`--since 30d` in a younger workspace) is a window from the start.
-    if hist.floor() > 1 && hist.before_retention(since) {
+    if hist.floor() > 1 && hist.before_retention(at_s) {
         return Err(Error::HistoryPruned {
             id: clean(target.unwrap_or("the specs")),
             floor: hist.floor(),
             floor_ts: hist.floor_ts(),
         });
     }
-    if !ordered(conn, since, until)? {
+    if !ordered(conn, at_s, at_u)? {
         return Err(Error::invalid("--since must be before --until"));
     }
     let (since_label, until_label) = (PointView::of(since).label(), PointView::of(until).label());
 
     // One read of the events after since: the window, and what follows each end.
-    let events = events_after(conn, hist, since, None)?;
-    let window: Vec<&Event> = events.iter().filter(|e| until.includes(e)).collect();
-    let after_s = After::of(&events, since);
-    let after_u = After::of(&events, until);
-    let src_s = AsOfSource::new(&rb, since, &after_s);
-    let src_u = AsOfSource::new(&rb, until, &after_u);
+    let events = events_after(conn, hist, at_s, None)?;
+    let window: Vec<&Event> = events.iter().filter(|e| at_u.includes(e)).collect();
+    let after_s = After::of(&events, at_s);
+    let after_u = After::of(&events, at_u);
+    let src_s = AsOfSource::new(&rb, at_s, &after_s);
+    let src_u = AsOfSource::new(&rb, at_u, &after_u);
 
     let mut scope = BTreeSet::new();
     let mut why = Vec::new();
@@ -1479,7 +1456,7 @@ pub fn changes_with_cap(
             }
             let last = list.last().expect("a transaction has an event");
             let ops: Vec<&str> = list.iter().map(|e| e.op.as_str()).collect();
-            let next = State::of(rb.at(c, Point::Seq(last.seq))?.as_ref(), &scope);
+            let next = State::of(rb.at_seq(c, last.seq)?.as_ref(), &scope);
             if let Member::Unknown { key, reason } = &next.member {
                 note(c, *origin, key, reason);
             }

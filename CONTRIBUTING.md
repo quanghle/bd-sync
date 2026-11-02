@@ -62,6 +62,12 @@ clear the agent-session variables (`BD_SESSION`, `CLAUDE_CODE_SESSION_ID`,
 `COPILOT_AGENT_SESSION_ID`, `CODEX_THREAD_ID`, ...) per command, so the tests
 pass inside an agent session too.
 
+`.github/workflows/deny.yml` runs cargo-deny (advisories, bans, licenses and
+sources, with the policy in `deny.toml`) on pull requests and pushes to main
+that touch a `Cargo.toml`, `Cargo.lock`, `deny.toml` or the workflow itself,
+daily at 06:17 UTC so an advisory published after a merge is seen, and by hand
+from the Actions tab. See [Dependencies](#dependencies).
+
 ## Dependencies
 
 Add dependencies so that `Cargo.lock` stays compatible with the MSRV:
@@ -70,6 +76,57 @@ Add dependencies so that `Cargo.lock` stays compatible with the MSRV:
 CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS=fallback cargo add <crate>
 cargo +1.99 check --workspace --all-targets --locked
 ```
+
+The cargo-deny job runs the version and SHA-256 pinned in
+`.github/workflows/deny.yml`. The same check locally, with that version:
+
+```bash
+cargo deny --all-features --locked check
+```
+
+It covers the crate graph cargo-deny builds: every workspace member, target and
+feature, with dev-dependencies. That is 236 of the 253 packages in `Cargo.lock`
+at the time of writing; to recount,
+`cargo deny --all-features --locked list -f tsv` prints a header, then one row
+per crate. The others are optional dependencies of dependencies that no enabled
+feature turns on, so they are never compiled. An advisory on one does not fail
+the job, and a change that enables one brings it into the graph, and the
+manifest change starts the job.
+
+Advisories come from RustSec and match by crate name and version, not by
+whether bd reaches the code, and a crate with no advisory passes. Dependabot
+alerts read all of `Cargo.lock` from a different database, so they are a
+separate channel.
+
+A failed run goes red on main and repeats daily until fixed. It blocks nothing:
+main has no branch protection and `release.yml` does not depend on it. GitHub
+notifies the account that last changed the cron line, according to that
+account's notification settings, and nothing else happens by itself. The run
+and its log are public.
+
+Whoever sees a failure files a bd issue, then does one of two things:
+
+- Update the crate, keeping the lock MSRV-compatible as above, and remove any
+  `ignore` entry it had, because a stale entry fails.
+- Accept the finding: an `ignore` entry in `deny.toml` with its `id` and a
+  `reason` that says why it is acceptable and carries `review by YYYY-MM-DD`,
+  at most 90 days out, and a bd issue id, with that issue created with
+  `--defer <that date>` so it reaches `bd ready` on the date.
+
+`deny.toml` is public, so a reason holds no exploit detail beyond the advisory
+and no id of a private security finding. A vulnerability that may be reachable,
+or a finding that needs a code change, gets a bug issue and goes to the
+maintainer before it is accepted.
+
+An outage of GitHub, crates.io or the advisory database also fails the job;
+rerun it. A tool too old to read the database fails it too: change the version
+and hash together in one reviewed change, with the hash computed from the
+download and matched against the release's `.sha256` file. Dependabot does not
+bump them.
+
+GitHub disables schedules on public repositories after 60 days without
+activity, and that raises no failure. `gh workflow enable deny.yml` restores
+it.
 
 ## Conventions
 

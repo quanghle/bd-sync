@@ -150,6 +150,132 @@ fn reopen_refuses_an_open_child_under_a_closed_parent() {
     assert_eq!(ws.code_as("tester", &["doctor"]), 0, "a warning, not a failure");
 }
 
+/// The message of a `refused` error from `bd --json args`, which exits 2.
+fn refused_with(ws: &Ws, args: &[&str]) -> String {
+    let mut a = vec!["--json"];
+    a.extend_from_slice(args);
+    let (code, stderr) = refusal(ws, "tester", &a);
+    assert_eq!(code, 2, "bd {args:?}: {stderr}");
+    let err: Value = serde_json::from_str(&stderr).unwrap();
+    assert_eq!(err["error"]["code"], "refused", "{err}");
+    err["error"]["message"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn moves_that_would_block_an_issue_on_its_own_ancestor_are_refused() {
+    let ws = Ws::new();
+
+    // The subtree shape: a child of the moved issue blocks on the new parent.
+    let p = ws.id(&["create", "Parent"]);
+    let c = ws.id(&["create", "Moved"]);
+    let d = ws.id(&["create", "Child", "--parent", &c]);
+    ws.ok(&["dep", "add", &d, &p]);
+    let want = format!(
+        "{d} depends on {p} via blocks; moving {c} under {p} would make {p} an ancestor of {d} and deadlock; remove that edge first"
+    );
+    assert_eq!(refused_with(&ws, &["update", &c, "--parent", &p]), want);
+    assert_eq!(refused_with(&ws, &["dep", "add", &c, &p, "--type", "parent-child"]), want);
+    assert!(ws.json(&["show", &c])["parent"].is_null(), "the move left nothing behind");
+
+    // The ancestor shape: the moved issue blocks on the new parent's parent.
+    let g = ws.id(&["create", "Grandparent"]);
+    let p2 = ws.id(&["create", "Parent 2", "--parent", &g]);
+    let c2 = ws.id(&["create", "Moved 2"]);
+    ws.ok(&["dep", "add", &c2, &g]);
+    let want = format!(
+        "{c2} depends on {g} via blocks; moving {c2} under {p2} would make {g} an ancestor of {c2} and deadlock; remove that edge first"
+    );
+    assert_eq!(refused_with(&ws, &["update", &c2, "--parent", &p2]), want);
+    assert_eq!(refused_with(&ws, &["dep", "add", &c2, &p2, "--type", "parent-child"]), want);
+    assert!(ws.json(&["show", &c2])["parent"].is_null(), "the move left nothing behind");
+
+    // Doing what the message says lets both moves through.
+    ws.ok(&["dep", "rm", &d, &p]);
+    ws.ok(&["update", &c, "--parent", &p]);
+    assert_eq!(ws.json(&["show", &c])["parent"], p.as_str());
+    ws.ok(&["dep", "rm", &c2, &g]);
+    ws.ok(&["dep", "add", &c2, &p2, "--type", "parent-child"]);
+    assert_eq!(ws.json(&["show", &c2])["parent"], p2.as_str());
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn imports_that_would_block_an_issue_on_its_own_ancestor_are_refused() {
+    let ws = Ws::new();
+    let line = |id: &str, deps: Value| {
+        let issue = serde_json::json!({ "id": id, "title": id, "status": "open", "dependencies": deps });
+        format!("{issue}\n")
+    };
+    let top = line("t-1", serde_json::json!([]));
+    let middle = line("t-2", serde_json::json!([{ "depends_on_id": "t-1", "type": "parent-child" }]));
+    let stuck = line(
+        "t-3",
+        serde_json::json!([
+            { "depends_on_id": "t-2", "type": "parent-child" },
+            { "depends_on_id": "t-1", "type": "blocks" },
+        ]),
+    );
+    let file = ws.dir.path().join("stuck.jsonl");
+    std::fs::write(&file, format!("{top}{middle}{stuck}")).unwrap();
+    let file = file.to_str().unwrap();
+
+    let want =
+        "t-3 depends on t-1 via blocks, and t-1 is an ancestor of t-3: importing this would deadlock; remove that edge";
+    assert_eq!(refused_with(&ws, &["import", file]), want);
+    assert_eq!(refused_with(&ws, &["import", file, "--dry-run"]), want);
+    assert_eq!(refused_with(&ws, &["import", file, "--lenient"]), want);
+    assert_eq!(ws.json(&["list", "--all"]).as_array().unwrap().len(), 0, "all or nothing");
+
+    // The same file without that edge imports.
+    let fixed = line("t-3", serde_json::json!([{ "depends_on_id": "t-2", "type": "parent-child" }]));
+    let file = ws.dir.path().join("fixed.jsonl");
+    std::fs::write(&file, format!("{top}{middle}{fixed}")).unwrap();
+    assert_eq!(ws.json(&["import", file.to_str().unwrap()])["created"], 3);
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0);
+}
+
+#[test]
+fn doctor_warns_about_an_issue_blocked_by_its_own_ancestor_and_leaves_it() {
+    let ws = Ws::new();
+    let t = ws.id(&["create", "Top"]);
+    let m = ws.id(&["create", "Middle", "--parent", &t]);
+    let x = ws.id(&["create", "Held"]);
+    ws.ok(&["dep", "add", &x, &t]);
+    // Writers refuse the last link now, so seed it as an older bd would have left it.
+    let db = ws.dir.path().join(".bd").join("bd.db");
+    let mut store = bd_core::Store::open(&db, bd_core::OpenOptions::default()).unwrap();
+    store
+        .write("damage", "tester", |tx| {
+            tx.conn().execute(
+                "INSERT INTO dependencies (issue_id, depends_on_id, dep_type, created_at)
+                 VALUES (?1, ?2, 'parent-child', 1700000000000)",
+                (&x, &m),
+            )?;
+            tx.recompute_blocked()
+        })
+        .unwrap();
+    drop(store);
+
+    let check = |d: &Value| {
+        d["checks"].as_array().unwrap().iter().find(|k| k["name"] == "ancestor_deadlocks").cloned().unwrap()
+    };
+    let doctor = ws.json(&["doctor"]);
+    assert_eq!(doctor["ok"], true, "{doctor}");
+    let found = check(&doctor);
+    assert_eq!(found["severity"], "warn");
+    assert_eq!(
+        found["detail"],
+        format!("1 issue(s) blocked by their own ancestor (remove the edge with `bd dep rm`): {x} -> {t} (blocks)")
+    );
+    assert_eq!(ws.code_as("tester", &["doctor"]), 0, "a warning, not a failure");
+
+    assert_eq!(check(&ws.json(&["doctor", "--fix"])), found, "--fix leaves it alone");
+    assert_eq!(check(&ws.json(&["doctor"])), found, "the edge is still there");
+
+    ws.ok(&["dep", "rm", &x, &t]);
+    assert_eq!(check(&ws.json(&["doctor"]))["severity"], "ok");
+}
+
 #[test]
 fn stored_text_cannot_drive_the_terminal() {
     let ws = Ws::new();
@@ -4613,6 +4739,78 @@ fn bd_time(t: &str, ms: i64) -> String {
     parsed.with_timezone(&chrono::Utc).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// A log stored out of order needs no migration: a time reads as a place in the
+/// log, and a time from now on as the head, however the last events are stamped.
+#[test]
+fn time_points_read_a_stored_log_that_steps_back_by_its_place_in_the_log() {
+    let without = |mut v: Value, key: &str| {
+        v.as_object_mut().unwrap().remove(key);
+        v
+    };
+    let ws = Ws::new();
+    let db = ws.dir.path().join(".bd").join("bd.db");
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    let created = ws.json(&["create", "Old title", "-p", "2"]);
+    let spec = ws.id(&["create", "Checkout", "--pinned", "-l", "spec,area:checkout"]);
+    ws.id(&["create", "First rule", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let before = event_head(&ws);
+    ws.ok(&["update", "t-1", "--title", "New title"]);
+    let title = ws.seq_of("t-1", "updated");
+    assert_eq!(title, before + 1);
+    ws.ok(&["update", "t-1", "-p", "1"]);
+    let late = ws.id(&["create", "Late rule", "--pinned", "-l", "requirement", "--parent", &spec]);
+    let head = event_head(&ws);
+
+    // Every stamp in the past, the title update's an hour after all the others.
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE events SET ts = ts - 7200000", []).unwrap();
+        conn.execute("UPDATE events SET ts = ts + 3600000 WHERE seq = ?1", [title]).unwrap();
+    }
+    // Between that stamp and the rest: the priority update and the late
+    // requirement are stamped before it, but committed after the title update.
+    let t = bd_time(created["created_at"].as_str().unwrap(), -5_400_000);
+    let at_before = format!("#{before}");
+
+    let shown = ws.json(&["show", "t-1", "--as-of", &t]);
+    let fields = (shown["fields"]["title"].as_str(), shown["fields"]["priority"].as_i64());
+    assert_eq!(fields, (Some("Old title"), Some(2)), "{shown}");
+    let at_seq = ws.json(&["show", "t-1", "--as-of", &at_before]);
+    assert_eq!(without(shown, "point"), without(at_seq, "point"));
+
+    let window = |since: &str| ws.json(&["spec", "changes", "--since", since, "--until", &format!("#{head}")]);
+    let changes = window(&t);
+    let listed = changes["changes"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{changes}");
+    assert_eq!((listed[0]["kind"].as_str(), listed[0]["id"].as_str()), (Some("added"), Some(late.as_str())));
+    assert_eq!(without(changes, "since"), without(window(&at_before), "since"));
+
+    // Events stamped ahead of the clock.
+    let head = event_head(&ws);
+    let ahead = ws.id(&["create", "Ahead rule", "--pinned", "-l", "requirement", "--parent", &spec]);
+    ws.ok(&["update", "t-1", "--title", "Ahead title"]);
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE events SET ts = ts + 3600000 WHERE seq > ?1", [head]).unwrap();
+    }
+
+    // An omitted --until is every event so far.
+    let changes = ws.json(&["spec", "changes", "--since", &format!("#{head}")]);
+    let listed = changes["changes"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{changes}");
+    assert_eq!(listed[0]["id"].as_str(), Some(ahead.as_str()), "{changes}");
+    assert!(changes["until"]["seq"].is_null() && changes["until"]["time"].is_string(), "{changes}");
+
+    let at_head = ws.json(&["show", "t-1", "--as-of", &format!("#{}", event_head(&ws))]);
+    assert_eq!(at_head["fields"]["title"], "Ahead title");
+    let at_head = without(at_head, "point");
+    for now in ["now", "-0s"] {
+        let shown = ws.json(&["show", "t-1", "--as-of", now]);
+        assert!(shown["point"]["seq"].is_null() && shown["point"]["time"].is_string(), "{shown}");
+        assert_eq!(without(shown, "point"), at_head, "{now}");
+    }
+}
+
 #[test]
 fn history_diff_prints_field_changes() {
     let ws = Ws::new();
@@ -5399,7 +5597,12 @@ fn gh_issue(n: u64, title: &str, updated: &str, extra: Value) -> Value {
 
 #[cfg(unix)]
 fn gh_comment(id: i64, body: &str) -> Value {
-    serde_json::json!({"id": id, "user": {"login": "octo"}, "body": body, "created_at": "2026-10-01T10:00:00Z",
+    gh_comment_by(id, "octo", body)
+}
+
+#[cfg(unix)]
+fn gh_comment_by(id: i64, login: &str, body: &str) -> Value {
+    serde_json::json!({"id": id, "user": {"login": login}, "body": body, "created_at": "2026-10-01T10:00:00Z",
         "updated_at": "2026-10-01T10:00:00Z", "html_url": format!("https://github.com/acme/app/issues/1#issuecomment-{id}")})
 }
 
@@ -5610,7 +5813,7 @@ fn github_pull_links_marker_instead_of_duplicating() {
     );
     gh.list("open", None, &[vec![issue.clone()]]);
     gh.list("open", Some("sync"), &[vec![issue]]);
-    gh.comments(12, &[gh_comment(50, &format!("a note\n\n<!-- bd:{id}#c{cid} -->"))]);
+    gh.comments(12, &[gh_comment_by(50, "bd-bot", &format!("a note\n\n<!-- bd:{id}#c{cid} -->"))]);
     let r = gh.json(&ws, &["github", "pull", "--repo", "acme/app"]);
     assert_eq!(sync_actions(&r), [(12, "linked".to_string())], "{r}");
     assert_eq!(ws.json(&["list"]).as_array().unwrap().len(), 1, "nothing created");
@@ -5653,6 +5856,32 @@ fn github_comments_flow_both_ways() {
     assert_eq!(head_seq(&ws), head);
     let log = gh.log();
     assert!(gh.writes().is_empty() && !log.contains("/comments"), "{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn github_comment_marker_from_another_login_is_not_adopted() {
+    let ws = Ws::new();
+    let gh = FakeGitHub::new(&ws);
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-01T10:00:00Z", serde_json::json!({}))]]);
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app"]);
+    let id = ws.json(&["list"])[0]["id"].as_str().unwrap().to_string();
+
+    ws.ok(&["comment", "add", &id, "from bd"]);
+    let cid = ws.json(&["comments", &id])[0]["id"].as_i64().unwrap();
+    let marker = format!("<!-- bd:{id}#c{cid} -->");
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-01T11:00:00Z", serde_json::json!({"comments": 1}))]]);
+    gh.comments(7, &[gh_comment(11, &format!("hidden\n\n{marker}"))]);
+    let posted = gh_comment_by(12, "bd-bot", "x");
+    gh.serve("POST", "repos/acme/app/issues/7/comments", 201, &[], &posted.to_string());
+    gh.clear_log();
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app", "--comments"]);
+    let log = gh.log();
+    assert_eq!(gh.writes().len(), 1, "{log}");
+    // Only a POST's body reaches the log: GET answers do not.
+    assert!(log.contains(&marker), "{log}");
+    assert_eq!(ws.json(&["comments", &id]).as_array().unwrap().len(), 2);
+    assert_eq!(log.lines().filter(|l| l.ends_with(" user")).count(), 1, "{log}");
 }
 
 #[cfg(unix)]

@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from './expect.mjs'
+import { HOSTILE, blocks, passed, runBlock } from './record-blocks.mjs'
 
 const SDK_IMPORT = 'import { defineWorkflow, joinSession } from "@github/copilot-sdk/extension";'
 const STUB = `const defineWorkflow = (w) => { if (!w.meta?.name || !w.meta.description || !Array.isArray(w.meta.phases) || typeof w.run !== 'function') throw new Error('defineWorkflow needs meta { name, description, phases } and run'); return w; };
@@ -846,7 +847,7 @@ describe('plan-implement-review', () => {
 
 	describe('record', () => {
 		const SENTENCE =
-			'The single-quoted title after each `bd create` is final: pass it character for character, never rebuilt or reworded from the Text or the finding (bd rejects titles over 500 characters). '
+			'The single-quoted title after each `bd create` is final: pass it character for character, never rebuilt or reworded from the text under it or the finding (bd rejects titles over 500 characters). '
 		// A blocking finding whose triage fails (planner:triage:r0 answers null): the run files it on the step, then escalates.
 		const filing = (over) => script({ 'review:code:r0': { findings: [FOUND] }, 'validate:r0:F1': { valid: true, blocking: true, reasoning: 'real' }, ...over })
 		const run = async (over) => {
@@ -884,6 +885,81 @@ describe('plan-implement-review', () => {
 			const { ctx, got } = await run({ 'record:r0': { ok: true, filed: [{ id: 'F1', bdId: 'bd-9' }], followedUp: [] } })
 			expect((await got).status).toBe('escalated')
 			expect(ctx.calls.find((c) => c.label === 'record:r0').prompt).toContain(`${SENTENCE}Return ok=true`)
+		})
+
+		// Two rounds that reach all four sites with text in every block: F1's evidence in FILE, F2's in FOLLOW-UP, F3's rejected
+		// reasoning in r0's COMMENT, the drop reason in DROP and F4's rejected reasoning in r1's COMMENT. F4 is there because a
+		// dropped finding with a bdId is left out of the note, so r1's COMMENT would not hold the text without it.
+		const twoRounds = async (text) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx(
+				{ ...ARGS, reviewStep: 'bd-1.review' },
+				script({
+					'review:code:r0': { findings: [{ ...FOUND, evidence: text }, { ...FOUND, line: 5, evidence: text }, { ...FOUND, line: 6, evidence: text }] },
+					'validate:r0:F1': { valid: true, blocking: true, reasoning: 'real', fixInstruction: 'fix it' },
+					'validate:r0:F2': { valid: true, blocking: false, reasoning: 'minor' },
+					'validate:r0:F3': { valid: false, blocking: false, reasoning: text },
+					'planner:triage:r0': { items: [{ id: 'F1', action: 'fix', reason: 'r', instruction: 'i' }], converging: true },
+					'record:r0': { ok: true, filed: [{ id: 'F1', bdId: 'bd-1.review.1' }], followedUp: [{ id: 'F2', bdId: 'bd-2' }] },
+					'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }] },
+					'review:code:r1': { findings: [{ ...FOUND, line: 7 }], resolved: [{ id: 'F1', resolved: false, why: 'no' }] },
+					'validate:r1:F4': { valid: false, blocking: false, reasoning: text },
+					'planner:triage:r1': { items: [{ id: 'F1', action: 'drop', reason: text }], converging: true },
+				}),
+			)
+			const got = await wf.run(ctx)
+			const prompts = records(ctx).map((c) => c.prompt)
+			return { got, prompts, blocks: prompts.flatMap(blocks) }
+		}
+
+		it.each(HOSTILE)('passes text with %s to bd unchanged and runs nothing else', async (_, text) => {
+			const { got, blocks: found } = await twoRounds(text)
+			expect(got.status).toBe('done')
+			expect(found).toHaveLength(5)
+			for (const block of found) {
+				expect(block.body).toContain(text)
+				const r = runBlock(block)
+				expect(r.status).toBe(0)
+				expect(r.canary).toBe(false)
+				expect(passed(r)).toBe(block.body.replace(/\n+$/, ''))
+			}
+		})
+
+		it('writes each site\'s first line whole, with the heredoc at top level', async () => {
+			const { blocks: found } = await twoRounds('plain words')
+			const flags = '-C /r --actor "me/copilot-1"'
+			expect(found.map((b) => b.first)).toEqual([
+				`{ bd create 'Finding F1: Handles nothing' -t bug --parent bd-1.review -l severity:minor -d "$(cat)" --json ${flags}; } <<'BD_TEXT'`,
+				`{ bd create 'Handles nothing' -t task -p 3 --dep discovered-from:bd-1.review -l followup:bd-1.review/1be466fa -d "$(cat)" --json ${flags}; } <<'BD_TEXT'`,
+				`bd comment add bd-1.review --stdin ${flags} <<'BD_TEXT'`,
+				`bd comment add bd-1.review.1 --stdin ${flags} <<'BD_TEXT'`,
+				`bd comment add bd-1.review --stdin ${flags} <<'BD_TEXT'`,
+			])
+		})
+
+		it('leaves no text for the agent to compose', async () => {
+			const { prompts } = await twoRounds('plain words')
+			expect(prompts).toHaveLength(2)
+			for (const prompt of prompts) {
+				expect(prompt).not.toContain('<Text>')
+				expect(prompt).not.toContain('Text:')
+				expect(prompt).not.toContain("<<'EOF'")
+				expect(prompt).not.toMatch(/\$\([^)]*<</)
+			}
+		})
+
+		it('picks a tag per block, from that block\'s text', async () => {
+			const { ctx, got } = await run({ 'review:code:r0': { findings: [{ ...FOUND, evidence: 'BD_TEXT' }] }, 'record:r0': { ok: true, filed: [{ id: 'F1', bdId: 'bd-9' }], followedUp: [] } })
+			await got
+			expect(blocks(ctx.calls.find((c) => c.label === 'record:r0').prompt).map((b) => b.tag)).toEqual(['BD_TEXT_X', 'BD_TEXT'])
+		})
+
+		it('hands bd\'s exit status to the agent from both forms', async () => {
+			const { blocks: found } = await twoRounds('plain words')
+			const create = found.find((b) => b.first.startsWith('{ bd create'))
+			const comment = found.find((b) => b.first.startsWith('bd comment add'))
+			expect(runBlock(create, 7).status).toBe(7)
+			expect(runBlock(comment, 7).status).toBe(7)
 		})
 	})
 
@@ -953,6 +1029,145 @@ describe('plan-implement-review', () => {
 			expect(ctx.logs).toContain(`${UNMATCHED}bd-nx85b`)
 		})
 	})
+
+	// The guard reads one triage answer as a whole before anything applies, so a refused amendment escalates the run with
+	// the ledger as it was. Its reason text does not reach the result (bd-vojld): a refusal shows as the status, the
+	// `planner escalated <F>` reason and the ledger. A refusal of the wrong finding shows in that reason's list of ids.
+	describe('amendment guards', () => {
+		const SEEDED = { ...PLAN, decisions: [{ decision: 'one', rationale: 'x' }, { decision: 'two', rationale: 'y' }] }
+		const SEEDED3 = { ...SEEDED, decisions: [...SEEDED.decisions, { decision: 'three', rationale: 'z' }] }
+		const FOUND2 = { ...FOUND, line: 9, claim: 'Handles too much' }
+		const OK = { valid: true, blocking: true, reasoning: 'real', fixInstruction: 'fix it' }
+		const amend = (id, supersedes) => ({ id, action: 'amend', reason: 'r', instruction: 'i', newDecision: 'n', supersedes })
+		const triaged = (...items) => ({ 'planner:triage:r0': { items, converging: true } })
+		const run = async (over, extra) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx(
+				{ ...ARGS, plan: SEEDED, ...extra },
+				script({
+					'review:code:r0': { findings: [FOUND, FOUND2] },
+					'validate:r0:F1': OK,
+					'validate:r0:F2': OK,
+					'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }, { id: 'F2', change: 'c' }] },
+					...over,
+				}),
+			)
+			return { ctx, got: await wf.run(ctx) }
+		}
+		const entry = (got, id) => got.ledger.find((e) => e.id === id)
+		const fixCalled = (ctx) => ctx.calls.some((c) => c.label === 'coder:fix:r1')
+		const untouched = (got) => {
+			expect(got.amended).toEqual([])
+			expect(got.ledger.filter((e) => e.source === 'amend')).toEqual([])
+			expect(got.ledger.filter((e) => e.supersededBy)).toEqual([])
+		}
+
+		it('refuses an unknown id among known ones', async () => {
+			const fix = { id: 'F2', action: 'fix', reason: 'r', instruction: 'i' }
+			for (const sup of [['D1', 'D99'], ['D99']]) {
+				const { ctx, got } = await run(triaged(amend('F1', sup), fix))
+				expect(got.status).toBe('escalated')
+				expect(got.reason).toBe('planner escalated F1')
+				untouched(got)
+				expect(fixCalled(ctx)).toBe(false)
+			}
+		})
+
+		it('applies nothing beside a refused amendment', async () => {
+			const amended = await run(triaged(amend('F1', ['D1']), amend('F2', ['D99'])))
+			expect(amended.got.status).toBe('escalated')
+			expect(amended.got.reason).toBe('planner escalated F2')
+			untouched(amended.got)
+
+			const dropped = await run(triaged({ id: 'F1', action: 'drop', reason: 'r' }, amend('F2', ['D99'])))
+			expect(dropped.got.status).toBe('escalated')
+			expect(dropped.got.dropped).toEqual([])
+		})
+
+		it('refuses the amendment that crosses the budget', async () => {
+			const { got } = await run(triaged(amend('F1', ['D1']), amend('F2', ['D2'])), { maxAmendments: 1 })
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toBe('planner escalated F2')
+			untouched(got)
+		})
+
+		it('applies an answer landing exactly on the budget', async () => {
+			const { ctx, got } = await run(triaged(amend('F1', ['D1']), amend('F2', ['D2'])))
+			expect(got.status).toBe('done')
+			expect(got.amended).toHaveLength(2)
+			expect(entry(got, 'D1').supersededBy).toBe('D3')
+			expect(entry(got, 'D2').supersededBy).toBe('D4')
+			expect(fixCalled(ctx)).toBe(true)
+		})
+
+		it('counts an amendment of two entries as one', async () => {
+			const { got } = await run(triaged(amend('F1', ['D1', 'D2']), amend('F2', ['D3'])), { plan: SEEDED3 })
+			expect(got.status).toBe('done')
+			expect(got.amended).toHaveLength(2)
+			expect(entry(got, 'D2').supersededBy).toBe('D4')
+			expect(entry(got, 'D3').supersededBy).toBe('D5')
+		})
+
+		it('refuses a second amendment of one entry', async () => {
+			const { got } = await run(triaged(amend('F1', ['D1']), amend('F2', ['D1'])))
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toBe('planner escalated F2')
+			untouched(got)
+		})
+
+		it('a refused amendment neither marks entries nor takes budget', async () => {
+			// A marked entry would refuse F2 too, giving `planner escalated F1, F2`.
+			const marks = await run(triaged(amend('F1', ['D1', 'D99']), amend('F2', ['D1'])))
+			expect(marks.got.reason).toBe('planner escalated F1')
+			untouched(marks.got)
+
+			const budget = await run(triaged(amend('F1', ['D99']), amend('F2', ['D1'])), { maxAmendments: 1 })
+			expect(budget.got.reason).toBe('planner escalated F1')
+			untouched(budget.got)
+		})
+
+		it('applies a valid amendment as before', async () => {
+			const { got } = await run({
+				'review:code:r0': { findings: [FOUND] },
+				...triaged(amend('F1', ['D1'])),
+				'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }] },
+			})
+			expect(got.status).toBe('done')
+			expect(got.amended).toEqual([{ finding: 'F1', supersedes: ['D1'], by: 'D3' }])
+			expect(entry(got, 'D1').supersededBy).toBe('D3')
+		})
+
+		// r0 amends D1 (the amendment is D3, its fix D4), so r1 can name an entry superseded or an amendment from a round before.
+		const laterRound = (sup, extra) =>
+			run(
+				{
+					'review:code:r0': { findings: [FOUND] },
+					...triaged(amend('F1', ['D1'])),
+					'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }] },
+					'review:code:r1': { findings: [FOUND2] },
+					'validate:r1:F2': OK,
+					'planner:triage:r1': { items: [amend('F2', sup)], converging: true },
+				},
+				extra,
+			)
+
+		for (const [name, sup, extra] of [
+			['an entry superseded in an earlier round', ['D1']],
+			['an earlier amendment', ['D3']],
+			['a budget spent in an earlier round', ['D2'], { maxAmendments: 1 }],
+			['an empty supersedes', []],
+		]) {
+			it(`refuses ${name}`, async () => {
+				const { got } = await laterRound(sup, extra)
+				expect(got.status).toBe('escalated')
+				expect(got.reason).toBe('planner escalated F2')
+				expect(got.amended).toEqual([{ finding: 'F1', supersedes: ['D1'], by: 'D3' }])
+				expect(got.ledger.filter((e) => e.source === 'amend')).toHaveLength(1)
+				expect(entry(got, 'D2').supersededBy).toBeUndefined()
+				expect(entry(got, 'D3').supersededBy).toBeUndefined()
+			})
+		}
+	})
 })
 
 describe('score-issue', () => {
@@ -1004,6 +1219,45 @@ describe('score-issue', () => {
 		expect(record).toContain('Complexity: 4/5 (estimated 3, gap +1). big')
 		expect(record).toContain('Work: 3 agents, 1.2 credits')
 		expect(record).toContain('--actor "me/copilot-1"')
+		expect(record).toContain(`bd -C /r comment add bd-1 --stdin --actor "me/copilot-1" <<'BD_TEXT'\n`)
+	})
+
+	describe('record block', () => {
+		/** The record prompt of a run whose judge summary and trace summary are both text. */
+		const recordPrompt = async (text) => {
+			const wf = await load('score-issue', undefined)
+			const ctx = fakeCtx({ issue: 'bd-1', actor: 'me/copilot-1' }, script({ judge: judgement({ top: { summary: text } }), trace: { ok: true, summary: text } }))
+			expect(await wf.run(ctx)).toMatchObject({ status: 'scored', recorded: true })
+			return ctx.calls.find((c) => c.label === 'record').prompt
+		}
+
+		it.each(HOSTILE)('passes text with %s to bd unchanged and runs nothing else', async (_, text) => {
+			const found = blocks(await recordPrompt(text))
+			expect(found.length).toBe(1)
+			const [block] = found
+			expect(block.body).toContain(text)
+			const r = runBlock(block)
+			expect(r.status, r.stderr).toBe(0)
+			expect(r.canary).toBe(false)
+			expect(passed(r)).toBe(block.body.replace(/\n+$/, ''))
+		})
+
+		it('leaves nothing for the agent to compose', async () => {
+			const prompt = await recordPrompt('plain words')
+			expect(prompt).not.toContain('<Text>')
+			expect(prompt).not.toContain('Text:')
+			expect(prompt).not.toContain("<<'EOF'")
+			expect(prompt).not.toMatch(/\$\([^)]*<</)
+		})
+
+		it('picks a tag absent from the text', async () => {
+			expect(blocks(await recordPrompt('BD_TEXT')).map((b) => b.tag)).toEqual(['BD_TEXT_X'])
+		})
+
+		it("hands bd's exit status back", async () => {
+			const [block] = blocks(await recordPrompt('plain words'))
+			expect(runBlock(block, 7).status).toBe(7)
+		})
 	})
 
 	it('escalates a mechanical agent that fails its schema once, to general-purpose at medium, with an @escalated label', async () => {

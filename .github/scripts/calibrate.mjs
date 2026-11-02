@@ -14,6 +14,8 @@
 // before the run's last steps and its score gate close. The complexity tables (estimate vs judged, score, score by coder,
 // and cost and time by complexity) are per rubric version (.bd/rubric.md's Version, recorded with each estimate and score):
 // a run counts under its judged score's version, and an estimate/judged pair of different versions is counted apart as mixed.
+// The Judge vs person section reports a person's confirmed score minus the judge's draft per rubric version, over the runs a
+// person confirmed, with a run of two versions counted apart as mixed.
 // The Controller sessions section reads each session a run's trace names over its whole main thread from this machine's
 // logs (the Claude Code main transcript or Copilot's main requests, through trace-run's readers, found by the directory
 // listing only), reports its cost, mean tokens read per request by quarter and the runs traced and finished in it, and is
@@ -176,6 +178,13 @@ export function joinRuns(issues, { followUpsOf, traceOf }) {
         overall: confirmed?.overall ?? md.score_judge?.overall ?? null,
         // 'accepted': the judge's draft taken as the score with no person confirming it (by: judge).
         overallFrom: confirmed ? (confirmed.by === 'judge' ? 'accepted' : 'person') : md.score_judge ? 'judge' : null,
+        // The judge's draft and the confirmed score side by side, with no fallback between them (unlike `overall`).
+        // Dims stay as stored: a null in them is the rubric's n/a.
+        judgeOverall: numberOf(md.score_judge?.overall),
+        judgeDims: md.score_judge?.dims ?? null,
+        judgeRubric: versionOf(md.score_judge?.rubric),
+        confirmedOverall: numberOf(confirmed?.overall),
+        confirmedDims: confirmed?.dims ?? null,
         findings: {
           serious: findings.filter((f) => ['blocker', 'serious'].includes(severityOf(f))).length,
           minor: findings.filter((f) => !['blocker', 'serious'].includes(severityOf(f))).length,
@@ -204,6 +213,8 @@ const agentsOf = (r) => (r.work?.steps ?? []).flatMap((s) => s.agents)
 const meanOf = (xs) => mean(xs.filter((x) => x != null))
 // A rubric version is an integer; anything else in the free-form metadata is unknown (null).
 const versionOf = (x) => (Number.isInteger(x) ? x : null)
+// A number in the free-form metadata; anything else there is absent (null).
+const numberOf = (x) => (Number.isFinite(x) ? x : null)
 const rubricOf = (r) => r.rubric ?? null
 // Numeric versions ascending, unknown (null) last.
 const byVersion = (a, b) => (a === b ? 0 : a == null ? 1 : b == null ? -1 : a - b)
@@ -218,6 +229,8 @@ const byBand = (rs) => {
   }
   return [...groups.values()].toSorted((a, b) => byVersion(a.rubric, b.rubric) || a.complexity - b.complexity)
 }
+// Each distinct gap with its count, ascending.
+const distributionOf = (gaps) => [...new Set(gaps)].toSorted((a, b) => a - b).map((g) => [g, gaps.filter((x) => x === g).length])
 // The estimate gap (judged minus estimate) over runs that have both.
 const gapOf = (rs) => {
   const gaps = rs.map((r) => complexityOf(r) - r.estimate)
@@ -231,8 +244,26 @@ const gapOf = (rs) => {
   return {
     runs: gaps.length,
     mean: mean(gaps),
-    distribution: [...new Set(gaps)].toSorted((a, b) => a - b).map((g) => [g, gaps.filter((x) => x === g).length]),
+    distribution: distributionOf(gaps),
     byTier: gapBy((r) => r.tier),
+  }
+}
+// The judge's gap (person minus judge, so positive means the judge scored lower) over runs that have both overalls.
+// A dimension counts only where both sides are numbers: a null is the rubric's n/a, and anything else is not a score.
+const judgeGapOf = (rs) => {
+  const gaps = rs.map((r) => r.confirmedOverall - r.judgeOverall)
+  const dims = new Map()
+  for (const r of rs)
+    for (const d of new Set([...Object.keys(r.confirmedDims ?? {}), ...Object.keys(r.judgeDims ?? {})])) {
+      const [person, judge] = [r.confirmedDims?.[d], r.judgeDims?.[d]]
+      if (Number.isFinite(person) && Number.isFinite(judge)) dims.set(d, [...(dims.get(d) ?? []), person - judge])
+    }
+  return {
+    runs: gaps.length,
+    mean: mean(gaps),
+    meanAbsolute: mean(gaps.map(Math.abs)),
+    distribution: distributionOf(gaps),
+    byDimension: Object.fromEntries([...dims].toSorted(([a], [b]) => a.localeCompare(b)).map(([d, g]) => [d, { runs: g.length, mean: mean(g) }])),
   }
 }
 
@@ -285,6 +316,17 @@ export function aggregate(runs, prices = PRICES) {
     byRubric: [...new Set(sameVersion.map(rubricOf))]
       .toSorted(byVersion)
       .map((v) => Object.assign({ rubric: v }, gapOf(sameVersion.filter((r) => rubricOf(r) === v)))),
+  }
+  // The judge's gap reads confirmedOverall, not `overall`: that falls back to the judge's, which would read as a false 0.
+  const withJudgeGap = runs.filter((r) => r.overallFrom === 'person' && Number.isFinite(r.confirmedOverall) && Number.isFinite(r.judgeOverall))
+  // As with the estimate gap: one rubric version only, and two unknowns agree (as unknown).
+  const isJudgeMixed = (r) => (r.judgeRubric ?? null) !== rubricOf(r)
+  const sameJudgeVersion = withJudgeGap.filter((r) => !isJudgeMixed(r))
+  const judgeGap = {
+    mixed: withJudgeGap.filter(isJudgeMixed).length,
+    byRubric: [...new Set(sameJudgeVersion.map(rubricOf))]
+      .toSorted(byVersion)
+      .map((v) => Object.assign({ rubric: v }, judgeGapOf(sameJudgeVersion.filter((r) => rubricOf(r) === v)))),
   }
   // A mixed run still counts here, under its judged score's version.
   const scored = runs.filter((x) => complexityOf(x) != null && x.overall != null)
@@ -405,6 +447,7 @@ export function aggregate(runs, prices = PRICES) {
     scored: runs.filter((r) => r.overall != null).length,
     traced: runs.filter((r) => r.work).length,
     gap,
+    judgeGap,
     bands,
     coders: [...coders.values()]
       .map((x) => Object.assign(x, { overall: mean(x.overall) }))
@@ -577,6 +620,7 @@ const rubricCell = (r) =>
       ? ver(r.rubric)
       : `${ver(r.rubric)} (estimate ${ver(r.estimateRubric)})`
 const table = (head, rows) => [`| ${head.join(' | ')} |`, `|${head.map(() => '---').join('|')}|`, ...rows.map((r) => `| ${r.join(' | ')} |`)].join('\n')
+const distributionCell = (d) => d.map(([g, c]) => `${g > 0 ? '+' : ''}${g}: ${c}`).join(', ')
 
 /** The report as markdown. */
 export function render(runs, agg, prices = PRICES) {
@@ -627,7 +671,7 @@ export function render(runs, agg, prices = PRICES) {
                     ver(x.rubric),
                     x.runs,
                     n(x.mean, 2),
-                    x.distribution.map(([g, c]) => `${g > 0 ? '+' : ''}${g}: ${c}`).join(', '),
+                    distributionCell(x.distribution),
                     Object.entries(x.byTier)
                       .map(([t, y]) => `${t} ${n(y.mean, 2)} over ${y.runs}`)
                       .join('; '),
@@ -639,6 +683,34 @@ export function render(runs, agg, prices = PRICES) {
           `Mixed versions: ${agg.gap.mixed} ${agg.gap.mixed === 1 ? 'run' : 'runs'} whose estimate and judged complexity used different rubric versions, counted in neither.`,
         ].join('\n')
       : 'No run has both an estimate and a judged complexity yet.',
+    ``,
+    `## Judge vs person`,
+    ``,
+    agg.judgeGap.byRubric.length || agg.judgeGap.mixed
+      ? [
+          `Gap is the person's score minus the judge's draft; positive = the judge scored lower. One row per rubric version, over the runs a person confirmed; a by-dimension figure covers the runs where both scored that dimension. An accepted draft has no gap.`,
+          ``,
+          ...(agg.judgeGap.byRubric.length
+            ? [
+                table(
+                  ['rubric', 'runs', 'mean gap', 'mean absolute gap', 'distribution', 'by dimension'],
+                  agg.judgeGap.byRubric.map((x) => [
+                    ver(x.rubric),
+                    x.runs,
+                    n(x.mean, 2),
+                    n(x.meanAbsolute, 2),
+                    distributionCell(x.distribution),
+                    Object.entries(x.byDimension)
+                      .map(([d, y]) => `${d} ${n(y.mean, 2)} over ${y.runs}`)
+                      .join('; ') || '–',
+                  ]),
+                ),
+                ``,
+              ]
+            : []),
+          `Mixed versions: ${agg.judgeGap.mixed} ${agg.judgeGap.mixed === 1 ? 'run' : 'runs'} whose judge and person used different rubric versions, counted in neither.`,
+        ].join('\n')
+      : `No run has a person's score beside a judge's draft yet.`,
     ``,
     `## Score by complexity`,
     ``,

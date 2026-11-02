@@ -8570,3 +8570,96 @@ fn serve_passkey_allow_add_keeps_its_audit_trail() {
     assert_eq!(ws.events("passkey_add_cancelled").len(), 1);
     assert!(details.iter().all(|d| !d.contains("credential")), "{details:?}");
 }
+
+#[test]
+fn serve_passkey_remove_takes_a_leading_hyphen_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let root_s = root.to_str().unwrap();
+    let run = |args: &[&str]| Ws::cmd_in(dir.path(), "tester", args).output().unwrap();
+    let json = |args: &[&str]| -> Value {
+        let out = run(&[&["--json"], args].concat());
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let list = ["serve", "passkey", "list", "--account", "corp:alice", "--root", root_s];
+    assert!(run(&["serve", "token", "create", "seed", "--as", "seed", "--root", root_s]).status.success());
+    let conn = rusqlite::Connection::open(root.join("server.db")).unwrap();
+    let account = serde_json::json!({
+        "provider": "corp", "issuer": "https://idp.example", "subject": "s1", "actor": "corp:alice",
+        "login": "alice", "first_seen": 1, "last_seen": 1,
+    });
+    conn.execute(
+        "INSERT INTO accounts (issuer, subject, actor_key, login_key, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params!["https://idp.example", "s1", "corp:alice", "alice", account.to_string()],
+    )
+    .unwrap();
+    for credential in ["-HHHHHHHHHHHh", "-JJJJJJJJJJJk", "AAAAAAAAAAAAk"] {
+        conn.execute(
+            "INSERT INTO passkeys (credential, issuer, subject, actor_key, algorithm, public_key, counter, created_at, \
+             last_used_at) VALUES (?1, 'https://idp.example', 's1', 'corp:alice', -7, x'3059', 0, ?2, NULL)",
+            rusqlite::params![credential, 1_700_000_000_000i64],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let prefixes = || -> Vec<String> {
+        let rows = json(&list);
+        rows.as_array().unwrap().iter().map(|r| r["credential_prefix"].as_str().unwrap().to_string()).collect()
+    };
+    let every = ["-HHHHHHHHHHH", "-JJJJJJJJJJJ", "AAAAAAAAAAAA"];
+    assert_eq!(prefixes(), every, "the list prints the leading hyphen");
+    let remove = |extra: &[&str]| {
+        let mut a = vec!["serve", "passkey", "remove", "--account", "corp:alice", "--root", root_s];
+        a.extend_from_slice(extra);
+        run(&a)
+    };
+
+    // No value at all, or a flag whose own value is then left over: clap refuses, and nothing is removed. Omitting
+    // --credential is what removes every passkey, so none of these may parse as that. --root comes first in all of
+    // these, so they do not depend on BD_SERVE_ROOT.
+    for extra in
+        [&["--credential"][..], &["--credential", "--account", "corp:alice"], &["--credential", "--root", root_s]]
+    {
+        let out = remove(extra);
+        assert_eq!(out.status.code(), Some(2), "{extra:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(prefixes(), every, "{extra:?} removed something");
+    }
+
+    // A flag with no separate value is read as the prefix, which names nothing: the lookup refuses it.
+    let root_flag = format!("--root={root_s}");
+    for flag in ["--json", "-q", "--help", &root_flag] {
+        let out = remove(&["--credential", flag]);
+        assert_eq!(out.status.code(), Some(3), "{flag}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(prefixes(), every, "{flag} removed something");
+    }
+
+    // A prefix of several, as with any other prefix.
+    let out = remove(&["--credential", "-"]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("give a longer prefix"));
+    assert_eq!(prefixes(), every, "nothing removed");
+
+    // The prefix `passkey list` prints names its one passkey, space-separated, in the order `serve_command` passes.
+    let out = run(&[
+        "serve",
+        "passkey",
+        "remove",
+        "--account",
+        "corp:alice",
+        "--credential",
+        "-HHHHHHHHHHH",
+        "--root",
+        root_s,
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(prefixes(), ["-JJJJJJJJJJJ", "AAAAAAAAAAAA"]);
+
+    let events = json(&["serve", "token", "events", "--kind", "passkey_removed", "--root", root_s]);
+    let events = events.as_array().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    let detail = events[0]["detail"].as_str().unwrap();
+    assert!(detail.contains("credential -HHHHHHHHHHH"), "{detail}");
+}

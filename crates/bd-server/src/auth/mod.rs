@@ -1211,20 +1211,74 @@ mod tests {
         passkey("github:forgettable-login", "41", "forgettable-credential");
         passkey("github:keeper", "42", "keeper-credential");
         let passkeys = |subject: &str| crate::passkeys::for_account(dir.path(), GITHUB, subject).unwrap().len();
-        assert!(has(&files(), "forgettable-login"));
+        let allowed = |login: &str| {
+            let account = account_named(dir.path(), login).unwrap();
+            crate::passkeys::grant(dir.path(), &account, crate::passkeys::ALLOWANCE_DEFAULT).unwrap().id
+        };
+        let live = |subject: &str| crate::passkeys::account_state(dir.path(), GITHUB, subject).unwrap().1.is_some();
+        let (forgettable_allowance, keeper_allowance) = (allowed("forgettable-login"), allowed("keeper"));
+        assert!(has(&files(), "forgettable-login") && has(&files(), &forgettable_allowance));
 
         let done = revoke_account(dir.path(), "forgettable-login", false).unwrap();
         assert_eq!((done.revoked.len(), done.erased), (2, None));
         assert_eq!(read(dir.path()).unwrap().tokens.len(), 3, "revoked, still listed");
         assert_eq!(passkeys("41"), 1, "revoking alone keeps the passkey");
+        assert!(live("41"), "and the allowance");
         let done = revoke_account(dir.path(), "github:forgettable-login", true).unwrap();
         assert_eq!(done.erased, Some(true));
         let file = read(dir.path()).unwrap();
         assert_eq!((file.tokens.len(), file.accounts.len()), (1, 1), "only keeper's");
         assert_eq!((passkeys("41"), passkeys("42")), (0, 1), "its passkey erased with it");
+        assert_eq!((live("41"), live("42")), (false, true), "and its allowance");
         let bytes = files();
         assert!(!has(&bytes, "forgettable-login") && has(&bytes, "keeper"), "erased from the files themselves");
         assert!(!has(&bytes, "forgettable-credential") && has(&bytes, "keeper-credential"));
+        assert!(!has(&bytes, &forgettable_allowance) && has(&bytes, &keeper_allowance));
+    }
+
+    /// An allowance of `subject` at GitHub, as a row.
+    fn allowance(root: &Path, subject: &str, id: &str, expires_at: i64) {
+        let conn = server_db::open(root).unwrap();
+        conn.execute(
+            "INSERT INTO passkey_allowances (issuer, subject, id, created_at, expires_at) VALUES (?1, ?2, ?3, 0, ?4)",
+            rusqlite::params![GITHUB, subject, id, expires_at],
+        )
+        .unwrap();
+    }
+
+    /// The ids of the allowances, in order.
+    fn allowances(root: &Path) -> Vec<String> {
+        let conn = server_db::open(root).unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM passkey_allowances ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn a_sign_in_prunes_the_allowances_that_ran_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let later = Timestamp::now().plus(Duration::from_secs(60)).millis();
+        allowance(dir.path(), "1", "ran-out", 1);
+        allowance(dir.path(), "2", "live", later);
+        github_token(dir.path(), &gh("alice", 3), grant, Duration::from_secs(3600), true).unwrap();
+        assert_eq!(allowances(dir.path()), ["live"]);
+        let events = server_db::events(dir.path(), 0, None, &[], 100).unwrap();
+        assert_eq!(events.iter().map(|e| e.event.kind).collect::<Vec<_>>(), ["signed_in"], "and records nothing of it");
+    }
+
+    #[test]
+    fn only_forgetting_an_account_erases_its_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let hour = Duration::from_secs(3600);
+        github_token(dir.path(), &gh("alice", 1), grant.clone(), hour, true).unwrap();
+        github_token(dir.path(), &gh("bob", 2), grant, hour, true).unwrap();
+        allowance(dir.path(), "1", "alice's", i64::MAX);
+        allowance(dir.path(), "2", "bob's", i64::MAX);
+        revoke_account(dir.path(), "alice", false).unwrap();
+        assert_eq!(allowances(dir.path()), ["alice's", "bob's"], "revoking alone keeps it");
+        revoke_account(dir.path(), "alice", true).unwrap();
+        assert_eq!(allowances(dir.path()), ["bob's"]);
     }
 
     #[test]

@@ -21,9 +21,21 @@
 //! where the page did not offer adding, else the assertion is verified,
 //! then the registration against the add challenge, and only then is the
 //! new passkey stored with the counter's compare-and-set in one write
-//! ([`passkeys::add`]); any refusal stores nothing. What the log may show
-//! of a credential is its first [`passkeys::PREFIX`] characters, once it
-//! decoded.
+//! ([`passkeys::add`]); any refusal stores nothing.
+//!
+//! While an admin's allowance is live, the page of an account with 1 to
+//! [`passkeys::MAX_PER_ACCOUNT`] - 1 passkeys asks instead to register a
+//! passkey on this device with no existing one, against a third single-use
+//! challenge (`Ceremony.allowance`, [`Offer`]), and keeps the assertion as a
+//! secondary path. Only the names of the [`ALLOW_FIELDS`] in a POST select the
+//! registration: refused outright where the page was not opened under an
+//! allowance, else checked as a first registration is, then spending that very
+//! allowance and storing the passkey in one write
+//! ([`passkeys::insert_allowed`]), before the approval runs. A POST without
+//! them goes down the assertion's path, which leaves the allowance live.
+//!
+//! What the log may show of a credential is its first
+//! [`passkeys::PREFIX`] characters, once it decoded.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -32,8 +44,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use sha2::{Digest, Sha256};
 
 use super::super::{form, pages};
-use super::{Ceremony, Ctx, origin};
-use crate::passkeys::{self, Added, Inserted, NewRow};
+use super::{Ceremony, Ctx, Offer, now_millis, origin};
+use crate::passkeys::{self, Added, AllowedAdd, Inserted, NewRow};
 use crate::webauthn::{self, Alg, Assertion, Expect, Refusal, Registration, Stored};
 use crate::{auth, metrics};
 
@@ -48,14 +60,18 @@ pub(super) enum Prepared {
 
 /// The ceremony for `user` (bound to `actor`) at this server: unavailable
 /// where the issuer cannot be a relying party, else with a fresh challenge,
-/// registering when the account has no passkey yet.
+/// registering when the account has no passkey yet. A live allowance is
+/// offered (with a challenge of its own, in place of adding a passkey beside
+/// an assertion) only to an account with 1 to
+/// [`passkeys::MAX_PER_ACCOUNT`] - 1 passkeys: with none it enrolls as ever,
+/// and at the limit it gets the ordinary page, the allowance unspent.
 pub(super) fn prepare(cx: &Ctx<'_>, user: &auth::Identity, actor: &str) -> Result<Prepared, Error> {
     let rp_id = match webauthn::rp_id(cx.issuer) {
         Ok(rp_id) => rp_id,
         Err(why) => return Ok(Prepared::Unavailable(why)),
     };
-    let credentials: Vec<String> =
-        passkeys::for_account(cx.root, &user.issuer, &user.subject)?.into_iter().map(|p| p.credential).collect();
+    let (held, live) = passkeys::account_state(cx.root, &user.issuer, &user.subject)?;
+    let credentials: Vec<String> = held.into_iter().map(|p| p.credential).collect();
     let random = || {
         let mut bytes = [0u8; 32];
         SystemRandom::new()
@@ -64,7 +80,12 @@ pub(super) fn prepare(cx: &Ctx<'_>, user: &auth::Identity, actor: &str) -> Resul
         Ok::<_, Error>(bytes)
     };
     let challenge = random()?;
-    let add = if (1..passkeys::MAX_PER_ACCOUNT).contains(&credentials.len()) { Some(random()?) } else { None };
+    let room = (1..passkeys::MAX_PER_ACCOUNT).contains(&credentials.len());
+    let allowance = match live {
+        Some(live) if room => Some(Offer { challenge: random()?, id: live.id, until: live.expires_at }),
+        _ => None,
+    };
+    let add = if room && allowance.is_none() { Some(random()?) } else { None };
     let ceremony = Ceremony {
         challenge,
         rp_id,
@@ -75,6 +96,7 @@ pub(super) fn prepare(cx: &Ctx<'_>, user: &auth::Identity, actor: &str) -> Resul
         actor: actor.to_string(),
         enroll: credentials.is_empty(),
         add,
+        allowance,
     };
     Ok(Prepared::Ask { ceremony: Box::new(ceremony), credentials })
 }
@@ -90,6 +112,18 @@ pub(super) fn user_handle(issuer: &str, subject: &str) -> String {
 /// What the page asks the browser for in `ceremony`.
 pub(super) fn ask<'a>(ceremony: &'a Ceremony, credentials: &'a [String]) -> pages::PasskeyAsk<'a> {
     let challenge = URL_SAFE_NO_PAD.encode(ceremony.challenge);
+    if let Some(offer) = &ceremony.allowance {
+        return pages::PasskeyAsk::Allow {
+            challenge,
+            rp_id: &ceremony.rp_id,
+            credentials,
+            register: pages::PasskeyAdd {
+                challenge: URL_SAFE_NO_PAD.encode(offer.challenge),
+                user: user_handle(&ceremony.issuer, &ceremony.subject),
+                name: &ceremony.actor,
+            },
+        };
+    }
     if ceremony.enroll {
         pages::PasskeyAsk::Enroll {
             challenge,
@@ -115,6 +149,13 @@ pub(super) fn ask<'a>(ceremony: &'a Ceremony, credentials: &'a [String]) -> page
 /// a POST means it adds a passkey, even with an empty value.
 const NEW_FIELDS: [&str; 5] =
     ["new_credential", "new_client_data", "new_authenticator_data", "new_public_key", "new_algorithm"];
+
+/// The fields of a registration under an allowance, which no assertion
+/// vouches for. Any of them in a POST means it registers one, even with an
+/// empty value: nothing else selects that path, and the page has to have been
+/// opened under an allowance.
+pub(super) const ALLOW_FIELDS: [&str; 5] =
+    ["allow_credential", "allow_client_data", "allow_authenticator_data", "allow_public_key", "allow_algorithm"];
 
 /// Why a ceremony's POST was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,10 +185,36 @@ pub(super) enum Why {
     LimitReached,
     /// The ceremony registering the added passkey.
     New(Refusal),
+    /// A registration under an allowance.
+    Allowance(AllowanceWhy),
 }
 
-/// The fixed phrases of a refused added passkey's ceremony: its label and
-/// its detail, each `new passkey: ` and the refusal's label.
+/// Why a registration under an allowance was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum AllowanceWhy {
+    /// Its fields, where the page was not opened under an allowance.
+    NotOffered,
+    /// One of its fields is not there (or empty).
+    MissingFields,
+    /// One occurs more than once, is too long or does not decode, or the POST
+    /// carries an assertion's fields too: one POST is one ceremony.
+    MalformedFields,
+    /// The allowance ran out after the page was shown.
+    Expired,
+    /// It was spent, cancelled or replaced after the page was shown.
+    Ended,
+    /// The account had [`passkeys::MAX_PER_ACCOUNT`] passkeys by then.
+    LimitReached,
+    /// A passkey has this credential id already.
+    CredentialTaken,
+    /// The account was forgotten since the page was shown.
+    NoAccount,
+    /// The registration's ceremony.
+    Webauthn(Refusal),
+}
+
+/// The fixed phrases of a refused registration beside the assertion or under
+/// an allowance: each's label and detail, its prefix and the refusal's label.
 macro_rules! new_passkey_phrases {
     ($($variant:ident => $label:literal,)*) => {
         fn new_label(r: Refusal) -> &'static str {
@@ -159,6 +226,18 @@ macro_rules! new_passkey_phrases {
         fn new_detail(r: Refusal) -> &'static str {
             match r {
                 $(Refusal::$variant => concat!("passkey refused: new passkey: ", $label),)*
+            }
+        }
+
+        fn allowance_label(r: Refusal) -> &'static str {
+            match r {
+                $(Refusal::$variant => concat!("allowance: ", $label),)*
+            }
+        }
+
+        fn allowance_detail(r: Refusal) -> &'static str {
+            match r {
+                $(Refusal::$variant => concat!("passkey refused: allowance: ", $label),)*
             }
         }
     };
@@ -185,7 +264,19 @@ new_passkey_phrases! {
 }
 
 impl Why {
-    /// A short fixed description, for the gate approval log's `passkey`.
+    /// Whether it is a registration under an allowance that was refused: what
+    /// an operation's log line reports in `passkey`.
+    pub(super) fn is_allowance(self) -> bool {
+        matches!(self, Why::Allowance(_))
+    }
+
+    /// Whether the allowance itself is over, so the page says so: the person
+    /// has to ask the admin again, or use an existing passkey.
+    pub(super) fn ended(self) -> bool {
+        matches!(self, Why::Allowance(AllowanceWhy::Expired | AllowanceWhy::Ended))
+    }
+
+    /// A short fixed description, for the approval logs' `passkey`.
     pub(super) fn label(self) -> &'static str {
         match self {
             Why::Missing => "missing fields",
@@ -200,6 +291,17 @@ impl Why {
             Why::NotOffered => "adding not offered",
             Why::LimitReached => "limit reached",
             Why::New(r) => new_label(r),
+            Why::Allowance(why) => match why {
+                AllowanceWhy::NotOffered => "allowance: not offered",
+                AllowanceWhy::MissingFields => "allowance: missing fields",
+                AllowanceWhy::MalformedFields => "allowance: malformed fields",
+                AllowanceWhy::Expired => "allowance: expired",
+                AllowanceWhy::Ended => "allowance: ended",
+                AllowanceWhy::LimitReached => "allowance: limit reached",
+                AllowanceWhy::CredentialTaken => "allowance: credential taken",
+                AllowanceWhy::NoAccount => "allowance: no account",
+                AllowanceWhy::Webauthn(r) => allowance_label(r),
+            },
         }
     }
 
@@ -237,24 +339,40 @@ impl Why {
             Why::NotOffered => "passkey refused: adding not offered",
             Why::LimitReached => "passkey refused: limit reached",
             Why::New(r) => new_detail(r),
+            Why::Allowance(why) => match why {
+                AllowanceWhy::NotOffered => "passkey refused: allowance: not offered",
+                AllowanceWhy::MissingFields => "passkey refused: allowance: missing fields",
+                AllowanceWhy::MalformedFields => "passkey refused: allowance: malformed fields",
+                AllowanceWhy::Expired => "passkey refused: allowance: expired",
+                AllowanceWhy::Ended => "passkey refused: allowance: ended",
+                AllowanceWhy::LimitReached => "passkey refused: allowance: limit reached",
+                AllowanceWhy::CredentialTaken => "passkey refused: allowance: credential taken",
+                AllowanceWhy::NoAccount => "passkey refused: allowance: no account",
+                AllowanceWhy::Webauthn(r) => allowance_detail(r),
+            },
         }
     }
 }
 
 /// A ceremony that passed: the credential's prefix, whether it registered
-/// a passkey (else it used one), and the prefix of the passkey it added
-/// beside the one it used, if any.
+/// a passkey (else it used one), the prefix of the passkey it added beside
+/// the one it used, if any, and the id of the allowance it registered under,
+/// if any.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Verified {
     pub(super) credential: String,
     pub(super) registered: bool,
     pub(super) added: Option<String>,
+    pub(super) allowance: Option<String>,
 }
 
 impl Verified {
-    /// What the gate approval log's `passkey` says of it.
+    /// What the approval logs' `passkey` says of it: an operation's line says
+    /// it only of a registration under an allowance.
     pub(super) fn label(&self) -> &'static str {
-        if self.registered {
+        if self.allowance.is_some() {
+            "registered under allowance"
+        } else if self.registered {
             "registered"
         } else if self.added.is_some() {
             "verified and added"
@@ -330,16 +448,27 @@ fn fields<'p>(pairs: &'p [(String, String)], names: &[&str]) -> Result<Vec<&'p s
 
 /// Check the WebAuthn fields of an approval's POST (`pairs`) against the
 /// ceremony its page asked for: a registration is stored, an assertion's
-/// counter moved on, and a passkey added beside an assertion stored with
-/// that move in one write. Nothing else in the form is read.
+/// counter moved on, a passkey added beside an assertion stored with that
+/// move in one write, and one registered under an allowance stored as that
+/// allowance is spent, in one write. Nothing else in the form is read.
 pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> Result<Verified, Failure> {
     let refused = |why: Why, credential: &str| Failure::Refused { why, credential: credential.to_string() };
+    // Before anything is read: the path with no assertion is for pages opened under an allowance alone.
+    let allowing = pairs.iter().any(|(k, _)| ALLOW_FIELDS.contains(&k.as_str()));
+    let offer = match (allowing, &c.allowance) {
+        (false, _) => None,
+        (true, Some(offer)) => Some(offer),
+        (true, None) => return Err(refused(Why::Allowance(AllowanceWhy::NotOffered), "")),
+    };
     let adding = pairs.iter().any(|(k, _)| NEW_FIELDS.contains(&k.as_str()));
     let add = match (adding, c.enroll, c.add) {
         (false, _, _) => None,
         (true, false, Some(add)) => Some(add),
         (true, _, _) => return Err(refused(Why::NotOffered, "")),
     };
+    if let Some(offer) = offer {
+        return register_allowed(cx, c, offer, pairs);
+    }
     let names: &[&str] = if c.enroll {
         &["credential", "client_data", "authenticator_data", "public_key", "algorithm"]
     } else {
@@ -378,7 +507,7 @@ pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> 
         return match passkeys::insert_first(cx.root, &row).map_err(store)? {
             Inserted::Inserted => {
                 registered();
-                Ok(Verified { credential: prefix.clone(), registered: true, added: None })
+                Ok(Verified { credential: prefix.clone(), registered: true, added: None, allowance: None })
             }
             Inserted::AlreadyEnrolled => Err(refused(Why::AlreadyEnrolled)),
             Inserted::CredentialTaken => Err(refused(Why::CredentialTaken)),
@@ -413,7 +542,7 @@ pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> 
         if !passkeys::use_counter(cx.root, &encoded, passkey.counter, counter).map_err(store)? {
             return Err(refused(Why::Raced));
         }
-        return Ok(Verified { credential: prefix.clone(), registered: false, added: None });
+        return Ok(Verified { credential: prefix.clone(), registered: false, added: None, allowance: None });
     };
     // The added passkey's own ceremony, against the add challenge, once the assertion vouched for it.
     let expect = Expect { challenge: &add, origin: &c.origin, rp_id: &c.rp_id };
@@ -444,12 +573,87 @@ pub(super) fn verify(cx: &Ctx<'_>, c: &Ceremony, pairs: &[(String, String)]) -> 
                 credential: prefix.clone(),
                 registered: false,
                 added: Some(passkeys::prefix(&added).to_string()),
+                allowance: None,
             })
         }
         Added::LimitReached => Err(refused(Why::LimitReached)),
         Added::CredentialTaken => Err(refused(Why::CredentialTaken)),
         Added::NoAccount => Err(refused(Why::NoAccount)),
         Added::Raced => Err(refused(Why::Raced)),
+    }
+}
+
+/// The registration of a POST on a page opened under the allowance `offer`,
+/// checked as a first registration is, against the offer's challenge alone.
+/// The account is the one the sign-in proved and the allowance the one the
+/// page was opened under, both kept with the approval: never what the form
+/// names. Any refusal stores nothing and leaves the allowance as it was.
+fn register_allowed(
+    cx: &Ctx<'_>,
+    c: &Ceremony,
+    offer: &Offer,
+    pairs: &[(String, String)],
+) -> Result<Verified, Failure> {
+    let refused = |why: AllowanceWhy, credential: &str| Failure::Refused {
+        why: Why::Allowance(why),
+        credential: credential.to_string(),
+    };
+    let unread = |why: Why| match why {
+        Why::Missing => AllowanceWhy::MissingFields,
+        _ => AllowanceWhy::MalformedFields,
+    };
+    // One POST is one ceremony. A browser sends the assertion's fields empty.
+    let assertion = ["credential", "client_data", "authenticator_data", "signature"];
+    if pairs.iter().any(|(k, v)| assertion.contains(&k.as_str()) && !v.is_empty()) {
+        return Err(refused(AllowanceWhy::MalformedFields, ""));
+    }
+    let values = fields(pairs, &ALLOW_FIELDS).map_err(|why| refused(unread(why), ""))?;
+    let credential = decoded(values[0], webauthn::MAX_CREDENTIAL).map_err(|why| refused(unread(why), ""))?;
+    let encoded = URL_SAFE_NO_PAD.encode(&credential);
+    let prefix = passkeys::prefix(&encoded).to_string();
+    let refused = |why: AllowanceWhy| refused(why, &prefix);
+    let malformed = |_| refused(AllowanceWhy::MalformedFields);
+    let client_data = decoded(values[1], webauthn::MAX_CLIENT_DATA).map_err(malformed)?;
+    let authenticator_data = decoded(values[2], webauthn::MAX_AUTH_DATA).map_err(malformed)?;
+    let public_key = decoded(values[3], webauthn::MAX_PUBLIC_KEY).map_err(malformed)?;
+    let algorithm: i64 = values[4].parse().map_err(|_| refused(AllowanceWhy::MalformedFields))?;
+    let expect = Expect { challenge: &offer.challenge, origin: &c.origin, rp_id: &c.rp_id };
+    let registration = Registration {
+        credential: &credential,
+        client_data: &client_data,
+        authenticator_data: &authenticator_data,
+        public_key: &public_key,
+        algorithm,
+    };
+    let new = webauthn::verify_registration(&expect, &registration).map_err(|r| refused(AllowanceWhy::Webauthn(r)))?;
+    let row = NewRow {
+        credential: &encoded,
+        issuer: &c.issuer,
+        subject: &c.subject,
+        provider: &c.provider,
+        actor: &c.actor,
+        alg: new.alg,
+        public_key: &new.public_key,
+        counter: new.counter,
+    };
+    let added = passkeys::insert_allowed(cx.root, &row, &offer.id)
+        .map_err(|error| Failure::Store { error, credential: prefix.clone() })?;
+    match added {
+        AllowedAdd::Added => {
+            registered();
+            Ok(Verified {
+                credential: prefix.clone(),
+                registered: true,
+                added: None,
+                allowance: Some(offer.id.clone()),
+            })
+        }
+        // One check in the store: the page's own expiry tells the log which it was.
+        AllowedAdd::Ended if now_millis() >= offer.until => Err(refused(AllowanceWhy::Expired)),
+        AllowedAdd::Ended => Err(refused(AllowanceWhy::Ended)),
+        AllowedAdd::LimitReached => Err(refused(AllowanceWhy::LimitReached)),
+        AllowedAdd::CredentialTaken => Err(refused(AllowanceWhy::CredentialTaken)),
+        AllowedAdd::NoAccount => Err(refused(AllowanceWhy::NoAccount)),
     }
 }
 
@@ -468,12 +672,22 @@ impl Ceremony {
             actor: "acme:alice".into(),
             enroll,
             add: None,
+            allowance: None,
         }
     }
 
     /// The ceremony, offering to add a passkey with the challenge `add`.
     pub(super) fn with_add(mut self, add: [u8; 32]) -> Ceremony {
         self.add = Some(add);
+        self
+    }
+
+    /// The ceremony, as of a page opened under the allowance `id`, due to end
+    /// at `until`, with a fresh challenge.
+    pub(super) fn with_allowance(mut self, id: &str, until: i64) -> Ceremony {
+        let mut challenge = [0u8; 32];
+        SystemRandom::new().fill(&mut challenge).expect("the system's random number generator");
+        self.allowance = Some(Offer { challenge, id: id.to_string(), until });
         self
     }
 
@@ -487,5 +701,12 @@ impl Ceremony {
     pub(super) fn expect_add(&self) -> Expect<'_> {
         let add = self.add.as_ref().expect("a ceremony offering to add a passkey");
         Expect { challenge: add, origin: &self.origin, rp_id: &self.rp_id }
+    }
+
+    /// What a software authenticator registering under its allowance expects
+    /// of it: the allowance's challenge, which it must offer.
+    pub(super) fn expect_allow(&self) -> Expect<'_> {
+        let offer = self.allowance.as_ref().expect("a ceremony offering an allowance");
+        Expect { challenge: &offer.challenge, origin: &self.origin, rp_id: &self.rp_id }
     }
 }

@@ -20,12 +20,14 @@
 //!    operation gets past, and is shown only to a person who may open every
 //!    one, with a cookie of its own (`bd_op_<suffix>`) and a one-time id.
 //!    The page asks for a passkey (`super::passkey`), registering the
-//!    account's first; where the issuer cannot be a relying party, a notice
+//!    account's first, or one with no existing one at hand while an admin's
+//!    allowance is live; where the issuer cannot be a relying party, a notice
 //!    and no form, recorded as a passkey refusal.
 //! 3. `POST` to the same path ([`approve`]): taken once, from that browser,
-//!    its passkey ceremony checked, the sealed request is performed exactly
-//!    ([`Operations::perform`]) as the approver, never anything the form
-//!    names but the approval id and the passkey's fields.
+//!    its passkey ceremony checked (a passkey registered with it is stored
+//!    first, and stays if the workspace then refuses), the sealed request is
+//!    performed exactly ([`Operations::perform`]) as the approver, never
+//!    anything the form names but the approval id and the passkey's fields.
 //!
 //! Every way an operation's approval ends, once its flow is known to be
 //! one, is counted and logged once, by [`record`] alone.
@@ -171,7 +173,9 @@ impl Outcome {
 /// started with, then, once the provider identified the account, its login,
 /// subject and actor (never an email), the first characters of the
 /// passkey credential its POST sent, once it decoded, and those of a passkey
-/// it added. Empty where unknown.
+/// it added. Empty where unknown. `passkey` is what came of a registration
+/// under an allowance, a fixed phrase, and None when no allowance was involved:
+/// the line then has no such field.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Who<'a> {
     pub provider: &'a str,
@@ -180,6 +184,7 @@ pub struct Who<'a> {
     pub actor: &'a str,
     pub credential: &'a str,
     pub added: &'a str,
+    pub passkey: Option<&'static str>,
 }
 
 impl<'a> Who<'a> {
@@ -207,6 +212,7 @@ pub fn record(outcome: Outcome, who: &Who<'_>, workspace: &str, op: &str, issue:
         detail,
         credential = %who.credential,
         added = %who.added,
+        passkey = who.passkey,
         "operation approval"
     );
     #[cfg(test)]
@@ -215,6 +221,7 @@ pub fn record(outcome: Outcome, who: &Who<'_>, workspace: &str, op: &str, issue:
             (outcome, workspace.into(), op.into(), issue.into(), detail),
             who.credential.into(),
             who.added.into(),
+            who.passkey,
         ))
     });
 }
@@ -224,10 +231,14 @@ pub fn record(outcome: Outcome, who: &Who<'_>, workspace: &str, op: &str, issue:
 #[cfg(test)]
 pub(crate) type Recorded = (Outcome, String, String, String, &'static str);
 
+/// [`Recorded`] with the credential prefix logged, that of the passkey added
+/// and the `passkey` value.
+#[cfg(test)]
+pub(crate) type RecordedWhole = (Recorded, String, String, Option<&'static str>);
+
 #[cfg(test)]
 thread_local! {
-    static RECORDED: std::cell::RefCell<Vec<(Recorded, String, String)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static RECORDED: std::cell::RefCell<Vec<RecordedWhole>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// What [`record`] recorded on this thread since the last call.
@@ -246,6 +257,12 @@ pub(crate) fn take_recorded_with_credential() -> Vec<(Recorded, String)> {
 /// the passkey it added (else empty).
 #[cfg(test)]
 pub(crate) fn take_recorded_with_passkeys() -> Vec<(Recorded, String, String)> {
+    take_recorded_with_passkey_field().into_iter().map(|(r, credential, added, _)| (r, credential, added)).collect()
+}
+
+/// [`take_recorded_with_passkeys`], each with the `passkey` it logged, if any.
+#[cfg(test)]
+pub(crate) fn take_recorded_with_passkey_field() -> Vec<RecordedWhole> {
     RECORDED.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
@@ -431,6 +448,7 @@ struct Seen {
     actor: String,
     credential: String,
     added: String,
+    passkey: Option<&'static str>,
 }
 
 impl Seen {
@@ -442,6 +460,7 @@ impl Seen {
             actor: &self.actor,
             credential: &self.credential,
             added: &self.added,
+            passkey: self.passkey,
         }
     }
 }
@@ -893,6 +912,7 @@ fn approve_inner(
             actor: a.actor.clone(),
             credential: String::new(),
             added: String::new(),
+            passkey: None,
         };
         match flows.operations.get_mut(&key).map(|a| (bound(a), here(a), seen(a))) {
             None => return ended(Outcome::Refused, &nobody, "unknown or expired", refusal(400, EXPIRED)),
@@ -919,6 +939,7 @@ fn approve_inner(
         actor: approval.actor.clone(),
         credential: String::new(),
         added: String::new(),
+        passkey: None,
     };
     let cleared = vec![set_op_cookie(cx.issuer, workspace, op.as_str(), issue, &approval.cookie, "", Duration::ZERO)];
     let ended_as = |outcome, who: &Seen, detail, answer| (Step::ended(outcome, who, detail, answer), cleared.clone());
@@ -935,13 +956,16 @@ fn approve_inner(
     // The passkey ceremony the page asked for, checked once the approval is taken: nothing is performed without it.
     match passkey::verify(cx, &approval.passkey, &pairs) {
         Ok(verified) => {
+            // Only an allowance's outcomes show in `passkey`: with none involved the line reads as ever.
+            who.passkey = verified.allowance.is_some().then(|| verified.label());
             who.credential = verified.credential;
             who.added = verified.added.unwrap_or_default();
         }
         Err(Failure::Refused { why, credential }) => {
             who.credential = credential;
-            let answer = refusal(403, pages::PASSKEY_FAILED_OP);
-            return ended_as(Outcome::PasskeyRefused, &who, why.detail(), answer);
+            who.passkey = why.is_allowance().then(|| why.label());
+            let copy = if why.ended() { pages::PASSKEY_ALLOW_ENDED } else { pages::PASSKEY_FAILED_OP };
+            return ended_as(Outcome::PasskeyRefused, &who, why.detail(), refusal(403, copy));
         }
         Err(Failure::Store { error: Error::Busy(_) | Error::Locked(_), credential }) => {
             who.credential = credential;

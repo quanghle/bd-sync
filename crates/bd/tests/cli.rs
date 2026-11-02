@@ -7641,3 +7641,438 @@ fn serve_passkey_list_and_remove() {
         assert!(!detail.contains("AAAAAAAAAAAAx1") && !detail.contains("AAAAAAAAAAAAy"), "{detail}");
     }
 }
+
+// pinned-goldens:begin bd-h6q45.1 S1: never edit; a failure here means production output changed
+#[test]
+fn serve_passkey_list_json_is_pinned() {
+    const PINNED: &[u8] = br#"[
+  {
+    "algorithm": "ES256",
+    "counter": 0,
+    "created_at": "2023-11-14T22:13:20.000Z",
+    "credential_prefix": "AAAAAAAAAAAA",
+    "last_used_at": null
+  },
+  {
+    "algorithm": "ES256",
+    "counter": 1,
+    "created_at": "2023-11-14T22:13:20.000Z",
+    "credential_prefix": "BBBBBBBBBBBB",
+    "last_used_at": "2023-11-14T22:15:00.000Z"
+  }
+]
+"#;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let root_s = root.to_str().unwrap();
+    let run = |args: &[&str]| Ws::cmd_in(dir.path(), "tester", args).output().unwrap();
+    let out = run(&["serve", "token", "create", "seed", "--as", "seed", "--root", root_s]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let conn = rusqlite::Connection::open(root.join("server.db")).unwrap();
+    let account = serde_json::json!({
+        "provider": "corp", "issuer": "https://idp.example", "subject": "s1", "actor": "corp:alice",
+        "login": "alice", "first_seen": 1, "last_seen": 1,
+    });
+    conn.execute(
+        "INSERT INTO accounts (issuer, subject, actor_key, login_key, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params!["https://idp.example", "s1", "corp:alice", "alice", account.to_string()],
+    )
+    .unwrap();
+    for (n, credential) in ["AAAAAAAAAAAAx1", "BBBBBBBBBBBBy2"].into_iter().enumerate() {
+        conn.execute(
+            "INSERT INTO passkeys (credential, issuer, subject, actor_key, algorithm, public_key, counter, created_at, \
+             last_used_at) VALUES (?1, 'https://idp.example', 's1', 'corp:alice', -7, x'3059', ?2, ?3, ?4)",
+            rusqlite::params![credential, n as i64, 1_700_000_000_000i64, (n == 1).then_some(1_700_000_100_000i64)],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let out = run(&["--json", "serve", "passkey", "list", "--account", "corp:alice", "--root", root_s]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.stdout, PINNED, "{}", String::from_utf8_lossy(&out.stdout));
+}
+// pinned-goldens:end
+
+/// A server root for `bd serve passkey allow-add`: account corp:alice (login
+/// alice), with `passkeys` passkeys, in a new `server.db`.
+struct AllowanceRoot {
+    dir: TempDir,
+    root: std::path::PathBuf,
+}
+
+impl AllowanceRoot {
+    const ISSUER: &str = "https://idp.example";
+
+    fn new(passkeys: usize) -> AllowanceRoot {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let this = AllowanceRoot { dir, root };
+        let out = this.bd(&["serve", "token", "create", "seed", "--as", "seed"]);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        this.account("corp", "s1", "alice");
+        let conn = this.db();
+        for n in 0..passkeys {
+            conn.execute(
+                "INSERT INTO passkeys (credential, issuer, subject, actor_key, algorithm, public_key, counter, \
+                 created_at) VALUES (?1, ?2, 's1', 'corp:alice', -7, x'3059', 0, 1700000000000)",
+                rusqlite::params![format!("credential{n:04}"), Self::ISSUER],
+            )
+            .unwrap();
+        }
+        this
+    }
+
+    /// Bind account `<provider>:<login>`.
+    fn account(&self, provider: &str, subject: &str, login: &str) {
+        let actor = format!("{provider}:{login}");
+        let account = serde_json::json!({
+            "provider": provider, "issuer": Self::ISSUER, "subject": subject, "actor": actor, "login": login,
+            "first_seen": 1, "last_seen": 1,
+        });
+        self.db()
+            .execute(
+                "INSERT INTO accounts (issuer, subject, actor_key, login_key, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![Self::ISSUER, subject, actor, login, account.to_string()],
+            )
+            .unwrap();
+    }
+
+    fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(self.root.join("server.db")).unwrap()
+    }
+
+    /// `bd <args> --root <root>`.
+    fn bd(&self, args: &[&str]) -> Output {
+        let mut args = args.to_vec();
+        args.extend(["--root", self.root.to_str().unwrap()]);
+        Ws::cmd_in(self.dir.path(), "tester", &args).output().unwrap()
+    }
+
+    /// `bd <args> --root <root>`, which must succeed: its stdout.
+    fn ok(&self, args: &[&str]) -> String {
+        let out = self.bd(args);
+        assert!(out.status.success(), "bd {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    /// `bd --json <args> --root <root>`, which must succeed.
+    fn json(&self, args: &[&str]) -> Value {
+        let mut all = vec!["--json"];
+        all.extend_from_slice(args);
+        serde_json::from_str(&self.ok(&all)).unwrap()
+    }
+
+    /// `bd serve passkey allow-add --account corp:alice <extra>`.
+    fn allow(&self, extra: &[&str]) -> Output {
+        let mut args = vec!["serve", "passkey", "allow-add", "--account", "corp:alice"];
+        args.extend_from_slice(extra);
+        self.bd(&args)
+    }
+
+    /// As [`Self::allow`], which must succeed, with `--json`.
+    fn allow_json(&self, extra: &[&str]) -> Value {
+        let mut args = vec!["serve", "passkey", "allow-add", "--account", "corp:alice"];
+        args.extend_from_slice(extra);
+        self.json(&args)
+    }
+
+    /// The one allowance row: its id, `created_at` and `expires_at`.
+    fn allowance(&self) -> Option<(String, i64, i64)> {
+        let conn = self.db();
+        let mut rows: Vec<(String, i64, i64)> = conn
+            .prepare("SELECT id, created_at, expires_at FROM passkey_allowances")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(rows.len() <= 1, "one allowance per account: {rows:?}");
+        rows.pop()
+    }
+
+    /// Put the allowance's expiry in the past, as time would.
+    fn expire(&self) {
+        let changed = self.db().execute("UPDATE passkey_allowances SET expires_at = 1", []).unwrap();
+        assert_eq!(changed, 1);
+    }
+
+    /// Every row of every table of `server.db`, to compare before and after.
+    fn snapshot(&self) -> Vec<String> {
+        let conn = self.db();
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let mut all = vec![format!("version {version}")];
+        for table in tables {
+            let mut select = conn.prepare(&format!("SELECT * FROM \"{table}\"")).unwrap();
+            let columns = select.column_count();
+            let mut rows = select.query([]).unwrap();
+            while let Some(row) = rows.next().unwrap() {
+                let cells: Vec<_> = (0..columns).map(|c| format!("{:?}", row.get_ref(c).unwrap())).collect();
+                all.push(format!("{table}: {}", cells.join(" | ")));
+            }
+        }
+        all
+    }
+
+    /// The `details` of this root's events of these kinds, oldest first.
+    fn events(&self, kinds: &str) -> Vec<String> {
+        let events = self.json(&["serve", "token", "events", "--kind", kinds]);
+        let events = events.as_array().unwrap();
+        events
+            .iter()
+            .inspect(|e| assert_eq!(e["actor"], "corp:alice", "{e}"))
+            .map(|e| e["detail"].as_str().unwrap().to_string())
+            .collect()
+    }
+}
+
+const ALLOWED_KINDS: &str = "passkey_add_allowed,passkey_add_cancelled";
+
+/// What a command printed to stderr, for an assertion's message.
+fn stderr(out: &Output) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(&out.stderr)
+}
+
+#[test]
+fn serve_passkey_allow_add_opens_a_window_of_the_length_asked() {
+    let ws = AllowanceRoot::new(1);
+    // The default, in text, then as asked, each replacing the one before.
+    let out = ws.allow(&[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (id, created, expires) = ws.allowance().expect("granted");
+    assert_eq!(expires - created, 15 * 60 * 1000, "15 minutes by default");
+    let until = bd_core::Timestamp(expires).to_rfc3339();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("✓ corp:alice may register one passkey without an existing one until {until}\n")
+    );
+    assert_eq!(id.len(), 16, "{id}");
+
+    for (asked, millis) in [("1h", 3_600_000), ("90s", 90_000), ("60m", 3_600_000)] {
+        let granted = ws.allow_json(&["--for", asked]);
+        let (_, created, expires) = ws.allowance().expect("granted");
+        assert_eq!(expires - created, millis, "--for {asked}");
+        let until = bd_core::Timestamp(expires).to_rfc3339();
+        let want = serde_json::json!({ "account": "corp:alice", "expires_at": until, "replaced": true });
+        assert_eq!(granted, want, "--for {asked}");
+    }
+
+    // A login names the account too.
+    let by_login = ws.json(&["serve", "passkey", "allow-add", "--account", "alice"]);
+    assert_eq!(by_login["account"], "corp:alice");
+}
+
+#[test]
+fn serve_passkey_allow_add_refuses_a_bad_length_changing_nothing() {
+    let ws = AllowanceRoot::new(1);
+    let before = ws.snapshot();
+    for bad in ["1h1s", "61m", "2d", "0", "0s", "0ms", "abc", ""] {
+        for args in [["--for".to_string(), bad.to_string()].as_slice(), &[format!("--for={bad}")]] {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let out = ws.allow(&args);
+            assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+            assert!(!stderr(&out).is_empty(), "{args:?}");
+            assert_eq!(ws.snapshot(), before, "{args:?}");
+        }
+    }
+    for args in [&["--for", "-5m"][..], &["--for=-5m"], &["--for", "5m", "--cancel"]] {
+        let out = ws.allow(args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert_eq!(ws.snapshot(), before, "{args:?}");
+    }
+
+    // Bad input is told before the account is looked for.
+    let out = ws.bd(&["serve", "passkey", "allow-add", "--account", "nobody", "--for", "2h"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("at most 1h"), "{}", stderr(&out));
+}
+
+#[test]
+fn serve_passkey_allow_add_refuses_an_account_it_cannot_serve() {
+    // Unknown, and ambiguous: the login of accounts at two providers.
+    let ws = AllowanceRoot::new(1);
+    ws.account("corp", "s2", "bob");
+    ws.account("other", "s3", "bob");
+    let before = ws.snapshot();
+    for (name, code) in [("nobody", 3), ("bob", 2)] {
+        for extra in [&[][..], &["--cancel"]] {
+            let mut args = vec!["serve", "passkey", "allow-add", "--account", name];
+            args.extend_from_slice(extra);
+            let out = ws.bd(&args);
+            assert_eq!(out.status.code(), Some(code), "{name} {extra:?}: {}", stderr(&out));
+            assert_eq!(ws.snapshot(), before, "{name} {extra:?}");
+        }
+    }
+
+    // No passkeys: its next approval registers one anyway.
+    let ws = AllowanceRoot::new(0);
+    let before = ws.snapshot();
+    let out = ws.allow(&[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("registers one anyway"), "{}", stderr(&out));
+    assert_eq!(ws.snapshot(), before);
+
+    // At the limit, and one below it.
+    let ws = AllowanceRoot::new(99);
+    let before = ws.snapshot();
+    let out = ws.allow(&[]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("99 passkeys"), "{}", stderr(&out));
+    assert_eq!(ws.snapshot(), before);
+    let ws = AllowanceRoot::new(98);
+    assert!(ws.allow(&[]).status.success());
+}
+
+#[test]
+fn serve_passkey_allow_add_leaves_a_mistaken_root_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("mistaken");
+    std::fs::create_dir(&root).unwrap();
+    let root_s = root.to_str().unwrap();
+    for extra in [&[][..], &["--cancel"]] {
+        let mut args = vec!["serve", "passkey", "allow-add", "--account", "corp:alice", "--root", root_s];
+        args.extend_from_slice(extra);
+        let out = Ws::cmd_in(dir.path(), "tester", &args).output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{extra:?}: {}", stderr(&out));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0, "{extra:?}: nothing made in the root");
+    }
+}
+
+#[test]
+fn serve_passkey_allow_add_replaces_the_live_one() {
+    let ws = AllowanceRoot::new(1);
+    assert_eq!(ws.allow_json(&["--for", "5m"])["replaced"], false);
+    let (first, _, first_until) = ws.allowance().unwrap();
+
+    let out = ws.allow(&["--for", "30m"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (second, _, second_until) = ws.allowance().unwrap();
+    assert_ne!(first, second, "a new id");
+    assert!(second_until > first_until, "a new expiry");
+    let until = bd_core::Timestamp(second_until).to_rfc3339();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "✓ corp:alice may register one passkey without an existing one until {until}, replacing the one before\n"
+        )
+    );
+    let details = ws.events("passkey_add_allowed");
+    assert_eq!(
+        details[1],
+        format!("allowance {second}, until {until}, by an admin, replacing allowance {first}"),
+        "{details:?}"
+    );
+
+    // One past its expiry is not a replacement.
+    ws.expire();
+    let granted = ws.allow_json(&[]);
+    assert_eq!(granted["replaced"], false, "{granted}");
+    let (third, _, third_until) = ws.allowance().unwrap();
+    let details = ws.events("passkey_add_allowed");
+    assert_eq!(
+        details[2],
+        format!("allowance {third}, until {}, by an admin", bd_core::Timestamp(third_until).to_rfc3339()),
+        "{details:?}"
+    );
+}
+
+#[test]
+fn serve_passkey_allow_add_cancel_ends_the_live_one() {
+    let ws = AllowanceRoot::new(1);
+    ws.allow_json(&[]);
+    let (id, _, expires) = ws.allowance().unwrap();
+    let until = bd_core::Timestamp(expires).to_rfc3339();
+
+    let out = ws.allow(&["--cancel"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "✓ Cancelled the allowance of corp:alice\n");
+    assert_eq!(ws.allowance(), None);
+    assert_eq!(ws.events("passkey_add_cancelled"), [format!("allowance {id}, until {until}, cancelled by an admin")]);
+
+    // Nothing live, and then only an expired row: not an error, says so, writes nothing.
+    let none = |ws: &AllowanceRoot| {
+        let before = ws.snapshot();
+        let out = ws.allow(&["--cancel"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "corp:alice has no allowance to cancel\n");
+        assert_eq!(ws.snapshot(), before);
+        assert_eq!(ws.allow_json(&["--cancel"]), serde_json::json!({ "account": "corp:alice", "cancelled": false }));
+        assert_eq!(ws.snapshot(), before);
+    };
+    none(&ws);
+    ws.allow_json(&[]);
+    ws.expire();
+    none(&ws);
+    assert!(ws.allowance().is_some(), "an expired row waits for the next prune");
+
+    let ws = AllowanceRoot::new(1);
+    ws.allow_json(&[]);
+    assert_eq!(ws.allow_json(&["--cancel"]), serde_json::json!({ "account": "corp:alice", "cancelled": true }));
+}
+
+#[test]
+fn serve_passkey_list_shows_a_live_allowance() {
+    let ws = AllowanceRoot::new(2);
+    let list = ["serve", "passkey", "list", "--account", "corp:alice"];
+    let json_list = ["--json", "serve", "passkey", "list", "--account", "corp:alice"];
+    let (text, json) = (ws.ok(&list), ws.ok(&json_list));
+    assert!(!text.contains("Add allowed") && !json.contains("add_allowed_until"), "{text}{json}");
+
+    ws.allow_json(&[]);
+    let (_, _, expires) = ws.allowance().unwrap();
+    let until = bd_core::Timestamp(expires).to_rfc3339();
+    let shown = ws.ok(&list);
+    let last = shown.lines().last().unwrap();
+    assert_eq!(last, format!("Add allowed: one passkey may be registered without an existing one until {until}"));
+    assert_eq!(shown.lines().count(), text.lines().count() + 1, "{shown}");
+    let rows: Value = serde_json::from_str(&ws.ok(&json_list)).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|r| r["add_allowed_until"] == until.as_str()), "{rows:?}");
+
+    // Expired, then gone as a spent one is: the same bytes as before any.
+    ws.expire();
+    assert_eq!((ws.ok(&list), ws.ok(&json_list)), (text.clone(), json.clone()));
+    ws.db().execute("DELETE FROM passkey_allowances", []).unwrap();
+    assert_eq!((ws.ok(&list), ws.ok(&json_list)), (text, json));
+}
+
+#[test]
+fn serve_passkey_allow_add_keeps_its_audit_trail() {
+    let ws = AllowanceRoot::new(1);
+    ws.allow_json(&["--for", "5m"]);
+    let (first, _, first_until) = ws.allowance().unwrap();
+    ws.allow_json(&["--cancel"]);
+    ws.allow_json(&[]);
+    ws.expire();
+    ws.allow_json(&["--cancel"]);
+    let (second, _, _) = ws.allowance().unwrap();
+
+    // What was done: not the expiry, nor the cancel that found nothing.
+    let events = ws.json(&["serve", "token", "events", "--kind", ALLOWED_KINDS]);
+    let events = events.as_array().unwrap();
+    assert_eq!(events.len(), 3, "{events:?}");
+    for e in events {
+        assert_eq!((e["provider"].as_str(), e["subject"].as_str()), (Some("corp"), Some("s1")), "{e}");
+    }
+    let details = ws.events(ALLOWED_KINDS);
+    let first_until = bd_core::Timestamp(first_until).to_rfc3339();
+    assert_eq!(details[0], format!("allowance {first}, until {first_until}, by an admin"));
+    assert_eq!(details[1], format!("allowance {first}, until {first_until}, cancelled by an admin"));
+    assert!(details[2].starts_with(&format!("allowance {second}, until ")), "{details:?}");
+
+    // Each kind apart, and no key material in any.
+    assert_eq!(ws.events("passkey_add_allowed").len(), 2);
+    assert_eq!(ws.events("passkey_add_cancelled").len(), 1);
+    assert!(details.iter().all(|d| !d.contains("credential")), "{details:?}");
+}

@@ -852,6 +852,28 @@ fn add_body(asserting: &SoftKey, new: &SoftKey, c: &Ceremony, counter: u32, ta: 
     format!("{}&{}", assertion(asserting, c, counter, ta), new_fields(&new.register(&c.expect_add(), tr)))
 }
 
+/// `f` as the `allow_*` fields of a registration under an allowance.
+fn allow_pairs(f: &Fields) -> Vec<(&'static str, String)> {
+    let b64 = |bytes: &[u8]| URL_SAFE_NO_PAD.encode(bytes);
+    vec![
+        ("allow_credential", b64(&f.credential)),
+        ("allow_client_data", b64(&f.client_data)),
+        ("allow_authenticator_data", b64(&f.authenticator_data)),
+        ("allow_public_key", b64(&f.public_key)),
+        ("allow_algorithm", f.algorithm.to_string()),
+    ]
+}
+
+/// What a browser posts of an assertion on a page that registers: the fields
+/// rendered on every page, empty.
+const EMPTY_HIDDEN: &str = "credential=&client_data=&authenticator_data=&signature=&public_key=&algorithm=";
+
+/// `new`'s registration against `c`'s allowance (changed by `t`), as the page
+/// posts it.
+fn allow_body(new: &SoftKey, c: &Ceremony, t: &Tamper) -> String {
+    format!("{EMPTY_HIDDEN}&{}", encoded(&allow_pairs(&new.register(&c.expect_allow(), t))))
+}
+
 /// Register `key` as the acme account's first passkey, by an enrollment
 /// POST, and check that it alone was counted: whatever is counted after is
 /// the caller's.
@@ -906,6 +928,7 @@ fn the_add_option_is_offered_for_one_to_ninety_eight_passkeys() {
                 }
                 pages::PasskeyAsk::Assert { add: None, .. } => assert!(!offered && n > 0, "{n}"),
                 pages::PasskeyAsk::Enroll { .. } => assert_eq!(n, 0),
+                pages::PasskeyAsk::Allow { .. } => panic!("{n}: no allowance"),
                 pages::PasskeyAsk::Unavailable { .. } => panic!("{n}: unavailable"),
             }
         }
@@ -1400,6 +1423,715 @@ fn an_added_passkeys_refusals_are_named_after_the_ceremony() {
     assert_eq!(passkey::Why::LimitReached.detail(), "passkey refused: limit reached");
 }
 
+/// The ceremony and credentials of the page the acme account is shown now.
+fn opened(cx: &Ctx<'_>) -> (Ceremony, Vec<String>) {
+    let passkey::Prepared::Ask { ceremony, credentials } = passkey::prepare(cx, &acme(), "acme:alice").unwrap() else {
+        panic!("a ceremony at an https issuer");
+    };
+    (*ceremony, credentials)
+}
+
+/// An admin's allowance for the acme account, of the default length.
+fn granted(root: &std::path::Path) -> passkeys::Granted {
+    let account = auth::account_named(root, "acme:alice").unwrap();
+    passkeys::grant(root, &account, passkeys::ALLOWANCE_DEFAULT).unwrap()
+}
+
+/// Every allowance kept, whether live or not, in `server.db`.
+fn allowances(root: &std::path::Path) -> Vec<(String, String, String, i64)> {
+    let conn = crate::server_db::open(root).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT issuer, subject, id, expires_at FROM passkey_allowances ORDER BY issuer, subject, id")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+/// Put an allowance `id` for the account `subject` at the acme issuer, ending
+/// at `expires_at`, as `grant` keeps it but without its checks or its event.
+fn put_allowance(root: &std::path::Path, subject: &str, id: &str, expires_at: i64) {
+    let conn = crate::server_db::open(root).unwrap();
+    let params = rusqlite::params![ACME_ISSUER, subject, id, 1, expires_at];
+    conn.execute(passkeys::ALLOWANCE_PUT, params).unwrap();
+}
+
+/// Move every allowance kept to the past.
+fn run_out(root: &std::path::Path) {
+    let conn = crate::server_db::open(root).unwrap();
+    conn.execute("UPDATE passkey_allowances SET expires_at = 1", []).unwrap();
+}
+
+/// What a refusal must leave as it was: [`snapshot`]'s, and every allowance.
+type KeptAll = ((Vec<(String, u32, Option<i64>)>, usize), Vec<(String, String, String, i64)>);
+
+fn kept_all(root: &std::path::Path) -> KeptAll {
+    (snapshot(root), allowances(root))
+}
+
+/// In the future, for a ceremony's `until` that plays no part.
+fn later() -> i64 {
+    now_millis() + 600_000
+}
+
+/// Post `body` for a fresh approval asking for `c`, and check it refused and
+/// logged as `why`, its label and the credential prefix, with nothing
+/// approved, counted or written.
+fn refused_as(cx: &Ctx<'_>, flows: &Mutex<Flows>, gates: &FakeGates, c: &Ceremony, body: &str, why: (&str, &str)) {
+    static POSTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let (label, credential) = why;
+    let (before, calls) = (kept_all(cx.root), gates.calls());
+    let refused_before = crate::metrics::APPROVALS_PASSKEY_REFUSED.get();
+    let _ = gate::take_logged();
+    assert_eq!(settled(), 0, "{label}");
+    let id = format!("refused{}", POSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let (answer, _) = post_gate(cx, flows, &id, c, body);
+    assert_eq!(page(&answer).status, 403, "{label}: {}", page(&answer).html);
+    assert_eq!(passkey::take_registered(), 0, "{label}");
+    assert_eq!(gates.calls(), calls, "{label}");
+    assert_eq!(kept_all(cx.root), before, "{label}");
+    assert!(crate::metrics::APPROVALS_PASSKEY_REFUSED.get() > refused_before, "{label}");
+    let logged = gate::take_logged();
+    assert_eq!(logged.len(), 1, "{label}");
+    assert_eq!(
+        (logged[0].outcome, logged[0].passkey, logged[0].credential.as_str(), logged[0].added.as_str()),
+        ("passkey refused", label, credential, ""),
+    );
+}
+
+#[test]
+fn an_allowance_is_offered_for_one_to_ninety_eight_passkeys() {
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let until = later();
+    put_allowance(root.path(), ACME_SUBJECT, "feedc0de", until);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        for (n, offered) in [(0, false), (1, true), (98, true), (99, false)] {
+            fill_to(root.path(), n);
+            let (ceremony, credentials) = opened(cx);
+            assert_eq!(credentials.len(), n);
+            assert_eq!(ceremony.enroll, n == 0, "{n}");
+            assert_eq!(ceremony.allowance.is_some(), offered, "{n}");
+            match passkey::ask(&ceremony, &credentials) {
+                pages::PasskeyAsk::Allow { challenge, rp_id, credentials: shown, register } => {
+                    assert!(offered, "{n}");
+                    // Never beside adding, and with a challenge of its own; the assertion's stays for the fallback.
+                    assert!(ceremony.add.is_none(), "{n}");
+                    let offer = ceremony.allowance.as_ref().unwrap();
+                    assert_ne!(offer.challenge, ceremony.challenge, "{n}");
+                    assert_eq!((offer.id.as_str(), offer.until), ("feedc0de", until), "{n}");
+                    assert_eq!(challenge, URL_SAFE_NO_PAD.encode(ceremony.challenge));
+                    assert_eq!(register.challenge, URL_SAFE_NO_PAD.encode(offer.challenge));
+                    assert_eq!(register.user, passkey::user_handle(ACME_ISSUER, ACME_SUBJECT));
+                    assert_eq!((register.name, rp_id), ("acme:alice", ceremony.rp_id.as_str()));
+                    assert_eq!(shown, credentials.as_slice());
+                }
+                pages::PasskeyAsk::Assert { add, .. } => {
+                    assert!(!offered && n == 99 && add.is_none(), "{n}: the ordinary page");
+                }
+                pages::PasskeyAsk::Enroll { .. } => assert_eq!(n, 0),
+                pages::PasskeyAsk::Unavailable { .. } => panic!("{n}: unavailable"),
+            }
+        }
+        assert_eq!(allowances(root.path()).len(), 1, "opening a page spends nothing");
+    });
+
+    // One that ran out, and another account's, are not offered: the page is the ordinary one, adding included.
+    let root = gate_root(false);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        fill_to(root.path(), 1);
+        put_allowance(root.path(), ACME_SUBJECT, "feedc0de", now_millis() - 1);
+        let (ceremony, _) = opened(cx);
+        assert!(ceremony.allowance.is_none() && ceremony.add.is_some() && !ceremony.enroll);
+        put_allowance(root.path(), "00u8", "feedc0de", later());
+        let (ceremony, _) = opened(cx);
+        assert!(ceremony.allowance.is_none() && ceremony.add.is_some() && !ceremony.enroll);
+    });
+
+    // Where the issuer cannot be a relying party nothing is offered.
+    let root = gate_root(false);
+    let ops = FakeOperations::new(OpFound::NoIssue, Performed::Closed);
+    fill_to(root.path(), 1);
+    put_allowance(root.path(), ACME_SUBJECT, "feedc0de", later());
+    with_ops_at("https://192.0.2.1", root.path(), &flows, &ops, |cx| {
+        let prepared = passkey::prepare(cx, &acme(), "acme:alice").unwrap();
+        assert!(matches!(prepared, passkey::Prepared::Unavailable(_)));
+    });
+}
+
+#[test]
+fn the_page_names_neither_the_allowance_nor_when_it_ends() {
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    fill_to(root.path(), 1);
+    let grant = granted(root.path());
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let (ceremony, credentials) = opened(cx);
+        let page = pages::approve_gate(&pages::ApproveGate {
+            workspace: "proj",
+            gate: "bd-1",
+            title: "Ship it",
+            holds: &[],
+            part_of: None,
+            approvers: None,
+            provider: "Acme",
+            actor: "acme:alice",
+            id: "c0ffee",
+            action: "https://bd.example.com/w/proj/gates/bd-1",
+            packet: None,
+            passkey: passkey::ask(&ceremony, &credentials),
+        });
+        assert!(page.html.contains("data-passkey=\"allow\""), "{}", page.html);
+        assert!(!page.html.contains(&grant.id), "{}", page.html);
+        assert!(!page.html.contains(&grant.expires_at.to_string()), "{}", page.html);
+        // Every field the path reads is one the page renders, and renders disabled.
+        for name in passkey::ALLOW_FIELDS {
+            assert!(page.html.contains(&format!("name=\"{name}\" value=\"\" disabled")), "{name}: {}", page.html);
+        }
+    });
+}
+
+#[test]
+fn an_allowance_registers_a_passkey_with_no_existing_one() {
+    use operation::{Outcome, take_recorded_with_passkeys};
+    let _ = gate::take_logged();
+    let _ = take_recorded_with_passkeys();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let (lost, new) = (SoftKey::es256(), SoftKey::rs256());
+    let ((lost_id, _), (new_id, new_prefix)) = (credential_of(&lost), credential_of(&new));
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &lost);
+        let _ = gate::take_logged();
+        let grant = granted(root.path());
+        let (c, _) = opened(cx);
+        let (registered_before, calls) = (crate::metrics::PASSKEYS_REGISTERED.get(), gates.calls());
+        // A second page, as a second tab: under the same allowance, spent by then.
+        let (other, _) = opened(cx);
+        assert_eq!(settled(), 0);
+        let (answer, _) = post_gate(cx, &flows, "allowed", &c, &allow_body(&new, &c, &Tamper::default()));
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert_eq!(passkey::take_registered(), 1);
+        assert!(crate::metrics::PASSKEYS_REGISTERED.get() > registered_before);
+        assert_eq!(gates.calls(), calls + 1);
+        assert!(allowances(root.path()).is_empty(), "spent");
+        let kept = kept_passkeys(root.path());
+        let ids: Vec<&str> = kept.iter().map(|p| p.credential.as_str()).collect();
+        assert_eq!(ids, [lost_id.as_str(), new_id.as_str()]);
+        assert_eq!((kept[0].counter, kept[0].last_used_at), (0, None), "no assertion in it");
+        assert_eq!((kept[1].alg_name(), kept[1].counter, kept[1].last_used_at), ("RS256", 0, None));
+        let events = events_of(root.path(), "passkey_registered");
+        let detail = events.iter().filter_map(|e| e.detail.clone()).find(|d| d.contains("allowance"));
+        assert_eq!(
+            detail.unwrap(),
+            format!("credential {new_prefix} (RS256), registered at a browser approval under allowance {}", grant.id)
+        );
+        let logged = gate::take_logged();
+        assert_eq!(logged.len(), 1);
+        assert_eq!(
+            (logged[0].outcome, logged[0].credential.as_str(), logged[0].added.as_str(), logged[0].passkey),
+            ("approved", new_prefix.as_str(), "", "registered under allowance")
+        );
+        let line = format!("{:?}", logged[0]);
+        assert!(!line.contains(&new_id), "{line}");
+
+        // The other tab's registration, of another key.
+        let another = SoftKey::es256();
+        let (_, prefix) = credential_of(&another);
+        let body = allow_body(&another, &other, &Tamper::default());
+        refused_as(cx, &flows, &gates, &other, &body, ("allowance: ended", &prefix));
+
+        // The next page is the ordinary one, adding included, and the new passkey approves on it.
+        let (c, _) = opened(cx);
+        assert!(c.allowance.is_none() && c.add.is_some());
+        assert_eq!(settled(), 0);
+        let fields = assertion(&new, &c, 1, &Tamper::default());
+        assert_eq!(page(&post_gate(cx, &flows, "after", &c, &fields).0).status, 200);
+        assert_eq!(passkey::take_registered(), 0);
+        assert_eq!(gate::take_logged()[0].passkey, "verified");
+    });
+
+    // An operation's page spends it the same way.
+    let root = gate_root(false);
+    let ops = FakeOperations::new(OpFound::NoIssue, Performed::Closed);
+    let value = "c".repeat(64);
+    with_ctx(root.path(), &flows, &gates, |cx| enrolled(cx, &flows, &lost));
+    granted(root.path());
+    with_ops(root.path(), &flows, &ops, |cx| {
+        let (c, _) = opened(cx);
+        let approval =
+            OperationApproval { passkey: c.clone(), ..op_approval("ab12", &value, close_request("proj", "bd-1")) };
+        lock(&flows).operations.put(auth::hash("o"), approval);
+        let body = format!("approval=o&{}", allow_body(&new, &c, &Tamper::default()));
+        let cookies = format!("__Secure-bd_op_ab12={value}");
+        assert_eq!(settled(), 0);
+        let (answer, _) = operation::approve(cx, "proj", "close", "bd-1", &body, &cookies);
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert_eq!(ops.performs().len(), 1);
+        assert_eq!(passkey::take_registered(), 1);
+        assert!(allowances(root.path()).is_empty(), "spent");
+        assert_eq!(kept_passkeys(root.path()).len(), 2);
+        let recorded = take_recorded_with_passkeys();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            (recorded[0].0.0, recorded[0].1.as_str(), recorded[0].2.as_str()),
+            (Outcome::Approved, new_prefix.as_str(), "")
+        );
+    });
+}
+
+#[test]
+fn an_allowance_refused_by_the_store_changes_nothing() {
+    let _ = gate::take_logged();
+    let a = SoftKey::es256();
+    let bob_key = SoftKey::es256();
+    let (bob_id, _) = credential_of(&bob_key);
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let bob = auth::Identity { subject: "00u8".into(), login: "bob".into(), ..acme() };
+    auth::bind_account(root.path(), &bob, true, "test").unwrap();
+    put_passkey(root.path(), &bob_id, "00u8", "acme:bob", &bob_key);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        let grant = granted(root.path());
+        put_allowance(root.path(), "00u8", "b0bb0b0b", later());
+        let (open, _) = opened(cx);
+        assert_eq!(open.allowance.as_ref().unwrap().id, grant.id);
+
+        // Another account's allowance, and an id nobody has, by a page that claims them.
+        let new = SoftKey::es256();
+        let (_, prefix) = credential_of(&new);
+        for id in ["b0bb0b0b", "0000000000000000"] {
+            let c = ceremony(false).with_allowance(id, later());
+            let body = allow_body(&new, &c, &Tamper::default());
+            refused_as(cx, &flows, &gates, &c, &body, ("allowance: ended", &prefix));
+        }
+        // A credential id taken, by the account's own passkey and by another account's.
+        for credential in [a.credential.clone(), bob_key.credential.clone()] {
+            let mut taken = SoftKey::es256();
+            taken.credential = credential;
+            let (_, prefix) = credential_of(&taken);
+            let c = ceremony(false).with_allowance(&grant.id, grant.expires_at);
+            let body = allow_body(&taken, &c, &Tamper::default());
+            refused_as(cx, &flows, &gates, &c, &body, ("allowance: credential taken", &prefix));
+        }
+        // The limit reached after the page was shown.
+        fill_to(root.path(), passkeys::MAX_PER_ACCOUNT);
+        let body = allow_body(&new, &open, &Tamper::default());
+        refused_as(cx, &flows, &gates, &open, &body, ("allowance: limit reached", &prefix));
+    });
+}
+
+#[test]
+fn a_forgotten_account_registers_nothing_under_an_open_page() {
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let a = SoftKey::es256();
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        granted(root.path());
+        let (c, _) = opened(cx);
+        assert!(c.allowance.is_some());
+        assert!(auth::forget_account(root.path(), ACME_ISSUER, ACME_SUBJECT).unwrap());
+        assert!(allowances(root.path()).is_empty(), "erased with the account");
+        let new = SoftKey::es256();
+        let (_, prefix) = credential_of(&new);
+        let body = allow_body(&new, &c, &Tamper::default());
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: no account", &prefix));
+        assert!(kept_passkeys(root.path()).is_empty());
+    });
+}
+
+#[test]
+fn removing_the_last_passkey_ends_an_open_pages_allowance() {
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let a = SoftKey::es256();
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        granted(root.path());
+        let (c, _) = opened(cx);
+        let account = auth::account_named(root.path(), "acme:alice").unwrap();
+        passkeys::remove(root.path(), &account, None).unwrap();
+        assert!(allowances(root.path()).is_empty());
+        let new = SoftKey::es256();
+        let (_, prefix) = credential_of(&new);
+        let body = allow_body(&new, &c, &Tamper::default());
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: ended", &prefix));
+        assert!(kept_passkeys(root.path()).is_empty());
+        // And the next page enrolls, as for an account with none.
+        let (c, _) = opened(cx);
+        assert!(c.enroll && c.allowance.is_none());
+    });
+}
+
+#[test]
+fn an_allowance_is_checked_as_a_first_registration_is() {
+    use crate::webauthn::Alg;
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let a = SoftKey::es256();
+    let ok = Tamper::default;
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        let grant = granted(root.path());
+        let (c, _) = opened(cx);
+        let new = SoftKey::es256();
+        let (_, prefix) = credential_of(&new);
+        for (tamper, label) in [
+            (Tamper { kind: Some("webauthn.get"), ..ok() }, "allowance: wrong ceremony type"),
+            (Tamper { challenge: Some(vec![1; 32]), ..ok() }, "allowance: wrong challenge"),
+            (Tamper { origin: Some("https://evil.example".into()), ..ok() }, "allowance: wrong origin"),
+            (Tamper { cross_origin: Some(true), ..ok() }, "allowance: cross-origin"),
+            (Tamper { top_origin: Some("\"https://evil.example\""), ..ok() }, "allowance: top origin present"),
+            (Tamper { duplicate: true, ..ok() }, "allowance: client data unreadable"),
+            (Tamper { rp_id: Some("example.com".into()), ..ok() }, "allowance: wrong relying party"),
+            (Tamper { flags: Some(0x44), ..ok() }, "allowance: user not present"),
+            (Tamper { flags: Some(0x41), ..ok() }, "allowance: user not verified"),
+            (Tamper { flags: Some(0x05), ..ok() }, "allowance: no credential data"),
+            (Tamper { mismatch: true, ..ok() }, "allowance: credential mismatch"),
+        ] {
+            let body = allow_body(&new, &c, &tamper);
+            refused_as(cx, &flows, &gates, &c, &body, (label, &prefix));
+        }
+
+        // What the form says of the key and the data, each changed alone.
+        let valid = || allow_pairs(&new.register(&c.expect_allow(), &ok()));
+        let change = |i: usize, value: String| {
+            let mut pairs = valid();
+            pairs[i].1 = value;
+            format!("{EMPTY_HIDDEN}&{}", encoded(&pairs))
+        };
+        let wrong_key = URL_SAFE_NO_PAD.encode(SoftKey::rs256().spki());
+        for (i, value, label) in [
+            (4, "-8".to_string(), "allowance: unsupported algorithm"),
+            (4, Alg::Rs256.cose().to_string(), "allowance: bad public key"),
+            (3, wrong_key, "allowance: bad public key"),
+            (1, URL_SAFE_NO_PAD.encode([0xff, 0xfe]), "allowance: client data unreadable"),
+            (2, URL_SAFE_NO_PAD.encode([0u8; 8]), "allowance: authenticator data malformed"),
+        ] {
+            refused_as(cx, &flows, &gates, &c, &change(i, value), (label, &prefix));
+        }
+
+        // Each ceremony's challenge is its own. A registration for the assertion's challenge:
+        let body = format!("{EMPTY_HIDDEN}&{}", encoded(&allow_pairs(&new.register(&c.expect(), &ok()))));
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: wrong challenge", &prefix));
+        // for another page's allowance, the same allowance:
+        let (other, _) = opened(cx);
+        let body = format!("{EMPTY_HIDDEN}&{}", encoded(&allow_pairs(&new.register(&other.expect_allow(), &ok()))));
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: wrong challenge", &prefix));
+        // and an assertion for the allowance's challenge.
+        let (_, a_prefix) = credential_of(&a);
+        let body = webauthn_body(&a.assert(&c.expect_allow(), 1, &ok()), false);
+        refused_as(cx, &flows, &gates, &c, &body, ("wrong challenge", &a_prefix));
+        assert_eq!(allowances(root.path())[0].2, grant.id, "still live, after all that");
+    });
+}
+
+#[test]
+fn an_allowances_refusals_are_named_after_it() {
+    use crate::webauthn::Refusal;
+    use passkey::{AllowanceWhy, Why};
+    for r in [
+        Refusal::ClientDataTooLong,
+        Refusal::ClientDataUnreadable,
+        Refusal::WrongType,
+        Refusal::WrongChallenge,
+        Refusal::WrongOrigin,
+        Refusal::CrossOrigin,
+        Refusal::TopOrigin,
+        Refusal::AuthDataMalformed,
+        Refusal::WrongRpId,
+        Refusal::UserNotPresent,
+        Refusal::UserNotVerified,
+        Refusal::NoCredentialData,
+        Refusal::CredentialMismatch,
+        Refusal::UnsupportedAlgorithm,
+        Refusal::BadPublicKey,
+        Refusal::BadSignature,
+        Refusal::CounterRegression,
+    ] {
+        let why = Why::Allowance(AllowanceWhy::Webauthn(r));
+        assert_eq!(why.label(), format!("allowance: {}", r.label()));
+        assert_eq!(why.detail(), format!("passkey refused: allowance: {}", r.label()));
+    }
+    for (why, phrase) in [
+        (AllowanceWhy::NotOffered, "not offered"),
+        (AllowanceWhy::MissingFields, "missing fields"),
+        (AllowanceWhy::MalformedFields, "malformed fields"),
+        (AllowanceWhy::Expired, "expired"),
+        (AllowanceWhy::Ended, "ended"),
+        (AllowanceWhy::LimitReached, "limit reached"),
+        (AllowanceWhy::CredentialTaken, "credential taken"),
+        (AllowanceWhy::NoAccount, "no account"),
+    ] {
+        assert_eq!(Why::Allowance(why).label(), format!("allowance: {phrase}"));
+        assert_eq!(Why::Allowance(why).detail(), format!("passkey refused: allowance: {phrase}"));
+    }
+}
+
+#[test]
+fn an_allowances_fields_are_read_once_and_capped() {
+    use crate::webauthn::{MAX_AUTH_DATA, MAX_CLIENT_DATA, MAX_CREDENTIAL, MAX_PUBLIC_KEY, encoded_len};
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let a = SoftKey::es256();
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        granted(root.path());
+        let (c, _) = opened(cx);
+        let new = SoftKey::es256();
+        let (_, prefix) = credential_of(&new);
+        let valid = || allow_pairs(&new.register(&c.expect_allow(), &Tamper::default()));
+        let body = |pairs: &[(&'static str, String)]| format!("{EMPTY_HIDDEN}&{}", encoded(pairs));
+        for i in 0..5 {
+            // Not there, or empty.
+            let mut pairs = valid();
+            pairs.remove(i);
+            refused_as(cx, &flows, &gates, &c, &body(&pairs), ("allowance: missing fields", ""));
+            let mut pairs = valid();
+            pairs[i].1.clear();
+            refused_as(cx, &flows, &gates, &c, &body(&pairs), ("allowance: missing fields", ""));
+            // Twice, with the same value or another.
+            let mut pairs = valid();
+            let again = pairs[i].clone();
+            pairs.push(again);
+            refused_as(cx, &flows, &gates, &c, &body(&pairs), ("allowance: malformed fields", ""));
+            let mut pairs = valid();
+            let again = (pairs[i].0, format!("{}A", pairs[i].1));
+            pairs.push(again);
+            refused_as(cx, &flows, &gates, &c, &body(&pairs), ("allowance: malformed fields", ""));
+        }
+        // A duplicate goes before a missing field, as it does for the other fields.
+        let mut pairs = valid();
+        pairs[1].1.clear();
+        let again = pairs[0].clone();
+        pairs.push(again);
+        refused_as(cx, &flows, &gates, &c, &body(&pairs), ("allowance: malformed fields", ""));
+        // Longer than its cap, by one character, whatever it decodes to.
+        for (i, cap, credential) in [
+            (0, MAX_CREDENTIAL, ""),
+            (1, MAX_CLIENT_DATA, prefix.as_str()),
+            (2, MAX_AUTH_DATA, prefix.as_str()),
+            (3, MAX_PUBLIC_KEY, prefix.as_str()),
+        ] {
+            let mut pairs = valid();
+            pairs[i].1 = "A".repeat(encoded_len(cap) + 1);
+            refused_as(cx, &flows, &gates, &c, &body(&pairs), ("allowance: malformed fields", credential));
+            let mut pairs = valid();
+            pairs[i].1 = "!".repeat(8);
+            refused_as(cx, &flows, &gates, &c, &body(&pairs), ("allowance: malformed fields", credential));
+        }
+        let mut pairs = valid();
+        pairs[4].1 = "ES256".into();
+        refused_as(cx, &flows, &gates, &c, &body(&pairs), ("allowance: malformed fields", &prefix));
+    });
+}
+
+#[test]
+fn a_page_spends_the_allowance_it_was_opened_under_or_none() {
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let a = SoftKey::es256();
+    let new = SoftKey::es256();
+    let (_, prefix) = credential_of(&new);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        let account = auth::account_named(root.path(), "acme:alice").unwrap();
+
+        // The row ran out, but the page says it had time: ended, as anything else ending it would be.
+        granted(root.path());
+        let (mut c, _) = opened(cx);
+        run_out(root.path());
+        let body = allow_body(&new, &c, &Tamper::default());
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: ended", &prefix));
+        // Ran out while the page was open: the page's own expiry tells the log.
+        c.allowance.as_mut().unwrap().until = now_millis() - 1;
+        let body = allow_body(&new, &c, &Tamper::default());
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: expired", &prefix));
+
+        // Cancelled.
+        granted(root.path());
+        let (c, _) = opened(cx);
+        assert!(passkeys::cancel(root.path(), &account).unwrap());
+        let body = allow_body(&new, &c, &Tamper::default());
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: ended", &prefix));
+
+        // Cancelled, then granted again: the new one is not this page's.
+        granted(root.path());
+        let (c, _) = opened(cx);
+        assert!(passkeys::cancel(root.path(), &account).unwrap());
+        let regranted = granted(root.path());
+        let body = allow_body(&new, &c, &Tamper::default());
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: ended", &prefix));
+        assert_eq!(allowances(root.path())[0].2, regranted.id, "unspent");
+
+        // Replaced: neither is the replacing one.
+        let (c, _) = opened(cx);
+        assert_eq!(c.allowance.as_ref().unwrap().id, regranted.id);
+        let replaced = granted(root.path());
+        assert_eq!(replaced.replaced.as_deref(), Some(regranted.id.as_str()));
+        let body = allow_body(&new, &c, &Tamper::default());
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: ended", &prefix));
+        assert_eq!(allowances(root.path())[0].2, replaced.id, "unspent");
+
+        // A page opened after it spends it.
+        let (c, _) = opened(cx);
+        let (answer, _) = post_gate(cx, &flows, "after", &c, &allow_body(&new, &c, &Tamper::default()));
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert!(allowances(root.path()).is_empty());
+        let _ = (settled(), gate::take_logged());
+    });
+}
+
+#[test]
+fn allowance_fields_are_refused_where_no_allowance_was_offered() {
+    let _ = gate::take_logged();
+    let a = SoftKey::es256();
+    let new = SoftKey::es256();
+    let ok = Tamper::default;
+    // Valid fields, signed for the page's own challenge, or just the name of one.
+    let signed = |c: &Ceremony| encoded(&allow_pairs(&new.register(&c.expect(), &ok())));
+    let named = "allow_credential=";
+    let unreadable = "allow_credential=%21&allow_algorithm=x&allow_algorithm=y";
+
+    // An account's first page: nothing else on it matters, and nothing is registered.
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let (c, _) = opened(cx);
+        assert!(c.enroll);
+        for body in [signed(&c), named.to_string(), unreadable.to_string()] {
+            refused_as(cx, &flows, &gates, &c, &body, ("allowance: not offered", ""));
+        }
+        let body = format!("{}&{}", registration(&a, &c, &ok()), signed(&c));
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: not offered", ""));
+        assert!(kept_passkeys(root.path()).is_empty());
+    });
+
+    // The pages of an account with a passkey, opened with and without an allowance anywhere near them.
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        let (before_grant, _) = opened(cx);
+        assert!(before_grant.add.is_some() && before_grant.allowance.is_none());
+        let grant = granted(root.path());
+        let shown = [("an assertion's", ceremony(false)), ("an add's", adding()), ("before the grant", before_grant)];
+        for (what, c) in shown {
+            for body in [signed(&c), named.to_string(), unreadable.to_string()] {
+                refused_as(cx, &flows, &gates, &c, &body, ("allowance: not offered", ""));
+            }
+            // Beside the page's own ceremony, which would pass, and which is not read.
+            let body = format!("{}&{}", assertion(&a, &c, 9, &ok()), signed(&c));
+            refused_as(cx, &flows, &gates, &c, &body, ("allowance: not offered", ""));
+            assert_eq!(allowances(root.path())[0].2, grant.id, "{what}");
+        }
+        // And before the fields of adding are looked at.
+        let c = adding();
+        let body = format!("{}&{}", add_body(&a, &new, &c, 9, &ok(), &ok()), signed(&c));
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: not offered", ""));
+        assert_eq!(kept_passkeys(root.path())[0].counter, 0);
+    });
+}
+
+#[test]
+fn one_post_is_one_ceremony_on_an_allowance_page() {
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let a = SoftKey::es256();
+    let new = SoftKey::es256();
+    let ok = Tamper::default;
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        granted(root.path());
+        let (c, _) = opened(cx);
+        let registering = encoded(&allow_pairs(&new.register(&c.expect_allow(), &ok())));
+        // A full assertion beside it, and each of its fields alone.
+        let body = format!("{}&{registering}", assertion(&a, &c, 1, &ok()));
+        refused_as(cx, &flows, &gates, &c, &body, ("allowance: malformed fields", ""));
+        for field in ["credential", "client_data", "authenticator_data", "signature"] {
+            let body = format!("{field}=AAAA&{registering}");
+            refused_as(cx, &flows, &gates, &c, &body, ("allowance: malformed fields", ""));
+        }
+        // A registration added beside an assertion is not this page's either.
+        let beside = new_fields(&SoftKey::es256().register(&c.expect(), &ok()));
+        refused_as(cx, &flows, &gates, &c, &format!("{registering}&{beside}"), ("adding not offered", ""));
+        refused_as(cx, &flows, &gates, &c, &beside, ("adding not offered", ""));
+
+        // Without the assertion's fields, or with them empty as a browser sends them, it registers.
+        let (answer, _) = post_gate(cx, &flows, "bare", &c, &registering);
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert!(allowances(root.path()).is_empty());
+        granted(root.path());
+        let (c, _) = opened(cx);
+        let (answer, _) = post_gate(cx, &flows, "empty", &c, &allow_body(&SoftKey::es256(), &c, &ok()));
+        assert_eq!(page(&answer).status, 200, "{}", page(&answer).html);
+        assert_eq!(kept_passkeys(root.path()).len(), 3);
+        let _ = (settled(), gate::take_logged());
+    });
+}
+
+#[test]
+fn an_existing_passkey_keeps_approving_while_an_allowance_is_live() {
+    let _ = gate::take_logged();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let a = SoftKey::es256();
+    let (_, prefix) = credential_of(&a);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        let _ = gate::take_logged();
+        let (before_grant, _) = opened(cx);
+        let grant = granted(root.path());
+        let (allow_page, _) = opened(cx);
+        assert!(allow_page.allowance.is_some() && allow_page.add.is_none());
+        // On a page opened before the grant, and on the allowance page's secondary path.
+        for (n, (c, what)) in [(before_grant, "ordinary"), (allow_page, "allowance")].iter().enumerate() {
+            let counter = n as u32 + 1;
+            let calls = gates.calls();
+            let events = events_of(root.path(), "passkey_registered").len();
+            assert_eq!(settled(), 0, "{what}");
+            // As a browser posts it: the two fields it does not fill empty, the allowance's disabled.
+            let body = format!("{}&public_key=&algorithm=", assertion(&a, c, counter, &Tamper::default()));
+            let (answer, _) = post_gate(cx, &flows, what, c, &body);
+            assert_eq!(page(&answer).status, 200, "{what}: {}", page(&answer).html);
+            assert_eq!(passkey::take_registered(), 0, "{what}");
+            assert_eq!(gates.calls(), calls + 1, "{what}");
+            let kept = kept_passkeys(root.path());
+            assert_eq!(kept.len(), 1, "{what}");
+            assert_eq!((kept[0].counter, kept[0].last_used_at.is_some()), (counter, true), "{what}");
+            assert_eq!(events_of(root.path(), "passkey_registered").len(), events, "{what}");
+            assert_eq!(allowances(root.path())[0].2, grant.id, "{what}: nothing spent");
+            let logged = gate::take_logged();
+            assert_eq!(
+                (logged[0].outcome, logged[0].passkey, logged[0].credential.as_str(), logged[0].added.as_str()),
+                ("approved", "verified", prefix.as_str(), ""),
+                "{what}"
+            );
+        }
+    });
+}
+
 #[test]
 fn webauthn_fields_are_capped_before_they_are_decoded() {
     let _ = gate::take_logged();
@@ -1461,11 +2193,11 @@ fn store_failures_after_decoding_keep_the_credential_prefix() {
         assert_eq!(page(&answer).status, 200);
     });
     let _ = gate::take_logged();
-    // The table gone at version 4: every lookup fails, and server.db is not migrated again.
+    // The table gone at version 5: every lookup fails, and server.db is not migrated again.
     let conn = rusqlite::Connection::open(crate::server_db::path(root.path())).unwrap();
     conn.execute_batch("DROP TABLE passkeys").unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     drop(conn);
     with_ctx(root.path(), &flows, &gates, |cx| {
         let c = ceremony(false);
@@ -1688,6 +2420,7 @@ fn each_outcome_is_recorded_once_per_call() {
         actor: "github:alice",
         credential: "AAAAAAAAAAAA",
         added: "",
+        passkey: None,
     };
     record(Outcome::Approved, &who, "proj", "close", "bd-1", "performed");
     assert_eq!(
@@ -1717,7 +2450,7 @@ fn each_outcome_is_recorded_once_per_call() {
     assert_eq!(labels, ["approved", "refused", "not_ready", "gone", "busy", "failed", "passkey_refused"]);
     assert_eq!(
         Who::provider_only("acme"),
-        Who { provider: "acme", login: "", subject: "", actor: "", credential: "", added: "" }
+        Who { provider: "acme", login: "", subject: "", actor: "", credential: "", added: "", passkey: None }
     );
 }
 
@@ -2373,4 +3106,654 @@ fn operation_approvals_are_posted_once_from_their_own_browser_and_recorded_once(
         assert_eq!(page(&answer).status, 404);
         assert_eq!(take_recorded(), one(Outcome::Failed, "sign-in settings unavailable"));
     });
+}
+
+/// The two flows an approval page belongs to, for what both must do alike.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Approving {
+    Gate,
+    Operation,
+}
+
+const BOTH: [Approving; 2] = [Approving::Gate, Approving::Operation];
+
+/// One approval's log line, as either flow logs it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Line {
+    outcome: String,
+    /// An operation's `detail`: a gate's line has none.
+    detail: String,
+    credential: String,
+    added: String,
+    /// A gate's line always has it, an operation's only for an allowance.
+    passkey: Option<&'static str>,
+}
+
+impl Approving {
+    /// Keep an approval (`id`) asking for `c`, as its page was shown.
+    fn put(self, flows: &Mutex<Flows>, id: &str, c: &Ceremony) {
+        let value = "c".repeat(64);
+        match self {
+            Approving::Gate => {
+                lock(flows).approvals.put(auth::hash(id), approval_with("ab12", &value, c.clone()));
+            }
+            Approving::Operation => {
+                let request = close_request("proj", "bd-1");
+                let approval = OperationApproval { passkey: c.clone(), ..op_approval("ab12", &value, request) };
+                lock(flows).operations.put(auth::hash(id), approval);
+            }
+        }
+    }
+
+    /// Whether the approval `id` still waits for its POST.
+    fn waiting(self, flows: &Mutex<Flows>, id: &str) -> bool {
+        let key = auth::hash(id);
+        match self {
+            Approving::Gate => lock(flows).approvals.get_mut(&key).is_some(),
+            Approving::Operation => lock(flows).operations.get_mut(&key).is_some(),
+        }
+    }
+
+    /// The approval cookie, of value `value`.
+    fn cookie(self, value: &str) -> String {
+        match self {
+            Approving::Gate => format!("__Secure-bd_gate_ab12={value}"),
+            Approving::Operation => format!("__Secure-bd_op_ab12={value}"),
+        }
+    }
+
+    /// The cookies of the browser the approvals [`Approving::put`] keeps are bound to.
+    fn cookies(self) -> String {
+        self.cookie(&"c".repeat(64))
+    }
+
+    fn send(self, cx: &Ctx<'_>, body: &str, cookies: &str) -> (Answer, Vec<String>) {
+        match self {
+            Approving::Gate => gate::approve(cx, "proj", "bd-1", body, cookies),
+            Approving::Operation => operation::approve(cx, "proj", "close", "bd-1", body, cookies),
+        }
+    }
+
+    /// Post `fields` for a fresh approval (`id`) asking for `c`, from its own browser.
+    fn post(self, cx: &Ctx<'_>, flows: &Mutex<Flows>, id: &str, c: &Ceremony, fields: &str) -> (Answer, Vec<String>) {
+        self.put(flows, id, c);
+        self.send(cx, &format!("approval={id}&{fields}"), &self.cookies())
+    }
+
+    /// The page copy of a passkey check that failed.
+    fn failed_copy(self) -> &'static str {
+        match self {
+            Approving::Gate => pages::PASSKEY_FAILED_GATE,
+            Approving::Operation => pages::PASSKEY_FAILED_OP,
+        }
+    }
+
+    /// The lines logged on this thread since the last call.
+    fn lines(self) -> Vec<Line> {
+        match self {
+            Approving::Gate => gate::take_logged()
+                .into_iter()
+                .map(|l| Line {
+                    outcome: l.outcome.to_string(),
+                    detail: String::new(),
+                    credential: l.credential,
+                    added: l.added,
+                    passkey: Some(l.passkey),
+                })
+                .collect(),
+            Approving::Operation => operation::take_recorded_with_passkey_field()
+                .into_iter()
+                .map(|(r, credential, added, passkey)| Line {
+                    outcome: r.0.label().to_string(),
+                    detail: r.4.to_string(),
+                    credential,
+                    added,
+                    passkey,
+                })
+                .collect(),
+        }
+    }
+
+    /// The one line logged on this thread since the last call.
+    fn line(self) -> Line {
+        let mut lines = self.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        lines.remove(0)
+    }
+
+    /// The line of an approval carried out, its passkey ceremony `passkey`.
+    fn approved(self, credential: &str, passkey: &'static str) -> Line {
+        let (detail, passkey) = match self {
+            Approving::Gate => ("", Some(passkey)),
+            Approving::Operation => ("performed", passkey.contains("allowance").then_some(passkey)),
+        };
+        Line {
+            outcome: "approved".into(),
+            detail: detail.into(),
+            credential: credential.into(),
+            added: String::new(),
+            passkey,
+        }
+    }
+
+    /// The line of a passkey ceremony refused as `label`.
+    fn refused(self, label: &'static str, credential: &str) -> Line {
+        let (outcome, detail, passkey) = match self {
+            Approving::Gate => ("passkey refused", String::new(), Some(label)),
+            Approving::Operation => (
+                "passkey_refused",
+                format!("passkey refused: {label}"),
+                label.starts_with("allowance: ").then_some(label),
+            ),
+        };
+        Line { outcome: outcome.into(), detail, credential: credential.into(), added: String::new(), passkey }
+    }
+}
+
+/// Forget what this thread logged and counted so far.
+fn drained() {
+    let _ = gate::take_logged();
+    let _ = operation::take_recorded_with_passkey_field();
+    settled();
+}
+
+/// What the workspace answers an approval: a gate's or an operation's.
+enum Answering {
+    Gate(Result<Approved, bd_core::Error>),
+    Operation(Result<Performed, bd_core::Error>),
+}
+
+/// Gates and operations answering as told, else carrying the approval out.
+/// When called they read `server.db` over a connection of their own, so they
+/// see what had been committed by then.
+struct Watching {
+    root: std::path::PathBuf,
+    gates: Mutex<std::collections::VecDeque<Result<Approved, bd_core::Error>>>,
+    operations: Mutex<std::collections::VecDeque<Result<Performed, bd_core::Error>>>,
+    seen: Mutex<Vec<KeptAll>>,
+}
+
+impl Watching {
+    fn new(root: &std::path::Path) -> Watching {
+        Watching {
+            root: root.to_path_buf(),
+            gates: Default::default(),
+            operations: Default::default(),
+            seen: Default::default(),
+        }
+    }
+
+    /// The next call answers `answer`.
+    fn answer(&self, answer: Answering) {
+        match answer {
+            Answering::Gate(answer) => self.gates.lock().unwrap().push_back(answer),
+            Answering::Operation(answer) => self.operations.lock().unwrap().push_back(answer),
+        }
+    }
+
+    /// What each call since the last one saw kept.
+    fn seen(&self) -> Vec<KeptAll> {
+        std::mem::take(&mut *self.seen.lock().unwrap())
+    }
+}
+
+impl Gates for Watching {
+    fn find(&self, _: &str, _: &str, _: &Approver<'_>) -> Result<Found, bd_core::Error> {
+        Ok(Found::NoIssue)
+    }
+
+    fn approve(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<Approved, bd_core::Error> {
+        self.seen.lock().unwrap().push(kept_all(&self.root));
+        let next = self.gates.lock().unwrap().pop_front();
+        next.unwrap_or(Ok(Approved::Opened { unblocked: vec![], completed: vec![] }))
+    }
+}
+
+impl Operations for Watching {
+    fn find(&self, _: &OperationRequest, _: &Approver<'_>) -> Result<OpFound, bd_core::Error> {
+        Ok(OpFound::NoIssue)
+    }
+
+    fn perform(&self, _: &OperationRequest, _: &str, _: Option<&str>) -> Result<Performed, bd_core::Error> {
+        self.seen.lock().unwrap().push(kept_all(&self.root));
+        self.operations.lock().unwrap().pop_front().unwrap_or(Ok(Performed::Closed))
+    }
+}
+
+fn with_watching<T>(watching: &Watching, flows: &Mutex<Flows>, f: impl FnOnce(&Ctx<'_>) -> T) -> T {
+    let documents = super::super::cimd::Documents::new();
+    let exists = |_: &str| true;
+    f(&Ctx {
+        root: &watching.root,
+        issuer: ISSUER,
+        documents: &documents,
+        flows,
+        workspace_exists: &exists,
+        gates: watching,
+        links: None,
+        operations: watching,
+    })
+}
+
+/// The acme account enrolled with `key` and an allowance granted, nothing
+/// logged or counted since: the ceremony of the page it is shown now.
+fn allowed_page(cx: &Ctx<'_>, flows: &Mutex<Flows>, key: &SoftKey) -> Ceremony {
+    enrolled(cx, flows, key);
+    granted(cx.root);
+    drained();
+    let (c, _) = opened(cx);
+    assert!(c.allowance.is_some());
+    c
+}
+
+/// Post `body` in `flow` for a fresh approval asking for `c`, and check it
+/// refused as `why`, its label and the credential prefix: the page's copy,
+/// the line and the counter, nothing approved and nothing written.
+fn refused_in(
+    flow: Approving,
+    cx: &Ctx<'_>,
+    flows: &Mutex<Flows>,
+    watching: &Watching,
+    c: &Ceremony,
+    body: &str,
+    why: (&'static str, &str),
+) {
+    static POSTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    use crate::metrics::{APPROVALS_PASSKEY_REFUSED, OPERATIONS_PASSKEY_REFUSED};
+    let (label, credential) = why;
+    drained();
+    let _ = watching.seen();
+    let before = kept_all(cx.root);
+    let counter = match flow {
+        Approving::Gate => &APPROVALS_PASSKEY_REFUSED,
+        Approving::Operation => &OPERATIONS_PASSKEY_REFUSED,
+    };
+    let refused_before = counter.get();
+    let id = format!("in{}", POSTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let (answer, _) = flow.post(cx, flows, &id, c, body);
+    assert_eq!(page(&answer).status, 403, "{flow:?} {label}: {}", page(&answer).html);
+    let ended = ["allowance: expired", "allowance: ended"].contains(&label);
+    let copy = if ended { pages::PASSKEY_ALLOW_ENDED } else { flow.failed_copy() };
+    assert!(page(&answer).html.contains(&pages::escape(copy)), "{flow:?} {label}: {}", page(&answer).html);
+    assert_eq!(passkey::take_registered(), 0, "{flow:?} {label}");
+    assert_eq!(watching.seen(), vec![], "{flow:?} {label}: nothing approved");
+    assert_eq!(kept_all(cx.root), before, "{flow:?} {label}: nothing written");
+    assert!(counter.get() > refused_before, "{flow:?} {label}");
+    assert_eq!(flow.line(), flow.refused(label, credential), "{flow:?} {label}");
+}
+
+#[test]
+fn what_an_allowance_refusal_says() {
+    use crate::webauthn::Refusal;
+    use passkey::{AllowanceWhy as A, Why};
+    for why in [A::Expired, A::Ended] {
+        assert!(Why::Allowance(why).is_allowance() && Why::Allowance(why).ended(), "{why:?}");
+    }
+    for why in [
+        A::NotOffered,
+        A::MissingFields,
+        A::MalformedFields,
+        A::LimitReached,
+        A::CredentialTaken,
+        A::NoAccount,
+        A::Webauthn(Refusal::WrongChallenge),
+    ] {
+        assert!(Why::Allowance(why).is_allowance() && !Why::Allowance(why).ended(), "{why:?}");
+    }
+    for why in [
+        Why::Missing,
+        Why::Malformed,
+        Why::Webauthn(Refusal::WrongChallenge),
+        Why::UnknownCredential,
+        Why::ForeignCredential,
+        Why::AlreadyEnrolled,
+        Why::CredentialTaken,
+        Why::NoAccount,
+        Why::Raced,
+        Why::NotOffered,
+        Why::LimitReached,
+        Why::New(Refusal::WrongChallenge),
+    ] {
+        assert!(!why.is_allowance() && !why.ended(), "{why:?}");
+    }
+}
+
+#[test]
+fn an_allowances_passkey_is_committed_before_the_approval_runs() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let new = SoftKey::es256();
+        let (new_id, _) = credential_of(&new);
+        with_watching(&watching, &flows, |cx| {
+            let c = allowed_page(cx, &flows, &SoftKey::es256());
+            let _ = watching.seen();
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &allow_body(&new, &c, &Tamper::default()));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            let seen = watching.seen();
+            assert_eq!(seen.len(), 1, "{flow:?}");
+            let ((kept, _), rows) = &seen[0];
+            assert!(rows.is_empty(), "{flow:?}: spent by the time the approval ran");
+            assert!(kept.iter().any(|(id, _, _)| *id == new_id), "{flow:?}: stored by then");
+            assert_eq!(seen[0], kept_all(root.path()), "{flow:?}: and nothing after it");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn a_workspace_refusal_keeps_the_passkey_and_spends_the_allowance() {
+    use Answering::{Gate, Operation};
+    let io = || bd_core::Error::Io(std::io::Error::other("disk full"));
+    let busy = || bd_core::Error::Busy("locked".into());
+    let locked = || bd_core::Error::Locked("locked".into());
+    let cases: Vec<(Answering, u16, &str, &str)> = vec![
+        (Gate(Ok(Approved::Resolved)), 409, "already resolved", ""),
+        (Gate(Ok(Approved::NotArmed)), 409, "not ready", ""),
+        (Gate(Ok(Approved::Gone(Found::NoIssue))), 404, "gone", ""),
+        (Gate(Ok(Approved::Refused("not an approver".into()))), 403, "refused", ""),
+        (Gate(Err(busy())), 503, "busy", ""),
+        (Gate(Err(locked())), 503, "busy", ""),
+        (Gate(Err(io())), 500, "failed", ""),
+        (Operation(Ok(Performed::Done)), 409, "gone", "already closed"),
+        (Operation(Ok(Performed::Gone(OpFound::NoIssue))), 404, "gone", "no such issue"),
+        (Operation(Ok(Performed::NotHeld)), 409, "not_ready", "no longer held"),
+        (Operation(Ok(Performed::Changed("bd-1 is pinned now.".into()))), 409, "not_ready", "target changed"),
+        (Operation(Ok(Performed::Refused("claimed".into()))), 403, "refused", "refused by the workspace"),
+        (Operation(Err(busy())), 503, "busy", "workspace busy"),
+        (Operation(Err(locked())), 503, "busy", "workspace busy"),
+        (Operation(Err(io())), 500, "failed", "internal error"),
+    ];
+    for (answering, status, outcome, detail) in cases {
+        let flow = match answering {
+            Gate(_) => Approving::Gate,
+            Operation(_) => Approving::Operation,
+        };
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (lost, new) = (SoftKey::es256(), SoftKey::es256());
+        let (new_id, prefix) = credential_of(&new);
+        with_watching(&watching, &flows, |cx| {
+            let c = allowed_page(cx, &flows, &lost);
+            watching.answer(answering);
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &allow_body(&new, &c, &Tamper::default()));
+            assert_eq!(page(&answer).status, status, "{outcome}: {}", page(&answer).html);
+            assert_eq!(passkey::take_registered(), 1, "{outcome}");
+            assert!(allowances(root.path()).is_empty(), "{outcome}: spent");
+            assert_eq!(kept_passkeys(root.path())[1].credential, new_id, "{outcome}: kept");
+            let line = Line {
+                outcome: outcome.into(),
+                detail: detail.into(),
+                credential: prefix.clone(),
+                added: String::new(),
+                passkey: Some("registered under allowance"),
+            };
+            assert_eq!(flow.line(), line);
+            // The person approves again, on the ordinary page, with the passkey the refusal kept.
+            let (c, _) = opened(cx);
+            assert!(c.allowance.is_none() && c.add.is_some(), "{outcome}");
+            let (answer, _) = flow.post(cx, &flows, "q", &c, &assertion(&new, &c, 1, &Tamper::default()));
+            assert_eq!(page(&answer).status, 200, "{outcome}: {}", page(&answer).html);
+            assert_eq!(flow.line(), flow.approved(&prefix, "verified"), "{outcome}");
+            assert_eq!(kept_passkeys(root.path())[1].counter, 1, "{outcome}");
+            assert_eq!(passkey::take_registered(), 0, "{outcome}");
+        });
+    }
+}
+
+#[test]
+fn an_allowances_success_is_logged_and_counted_in_both_flows() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let new = SoftKey::es256();
+        let (new_id, prefix) = credential_of(&new);
+        with_watching(&watching, &flows, |cx| {
+            let c = allowed_page(cx, &flows, &SoftKey::es256());
+            let registered_before = crate::metrics::PASSKEYS_REGISTERED.get();
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &allow_body(&new, &c, &Tamper::default()));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(passkey::take_registered(), 1, "{flow:?}");
+            assert!(crate::metrics::PASSKEYS_REGISTERED.get() > registered_before, "{flow:?}");
+            let line = flow.line();
+            assert_eq!(line, flow.approved(&prefix, "registered under allowance"), "{flow:?}");
+            assert_ne!(line.credential, new_id, "{flow:?}: its prefix alone");
+        });
+    }
+}
+
+#[test]
+fn an_allowances_refusals_are_logged_and_counted_in_both_flows() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let a = SoftKey::es256();
+        let new = SoftKey::es256();
+        let (_, prefix) = credential_of(&new);
+        with_watching(&watching, &flows, |cx| {
+            let open = allowed_page(cx, &flows, &a);
+            let id = open.allowance.as_ref().unwrap().id.clone();
+            let refused = |c: &Ceremony, body: &str, label, credential: &str| {
+                refused_in(flow, cx, &flows, &watching, c, body, (label, credential));
+            };
+
+            // The ceremony.
+            let unverified = Tamper { flags: Some(0x41), ..Tamper::default() };
+            refused(&open, &allow_body(&new, &open, &unverified), "allowance: user not verified", &prefix);
+            let (other, _) = opened(cx);
+            let elsewhere = allow_body(&new, &other, &Tamper::default());
+            refused(&open, &elsewhere, "allowance: wrong challenge", &prefix);
+            // The fields: nothing decoded, so no prefix to show.
+            refused(&open, &format!("{EMPTY_HIDDEN}&allow_credential="), "allowance: missing fields", "");
+            let twice = format!("{}&allow_credential=AAAA", allow_body(&new, &open, &Tamper::default()));
+            refused(&open, &twice, "allowance: malformed fields", "");
+            let ordinary = ceremony(false);
+            let body = allow_body(&new, &open, &Tamper::default());
+            refused(&ordinary, &body, "allowance: not offered", "");
+            // The store's.
+            let mut taken = SoftKey::es256();
+            taken.credential = a.credential.clone();
+            let (_, taken_prefix) = credential_of(&taken);
+            let body = allow_body(&taken, &open, &Tamper::default());
+            refused(&open, &body, "allowance: credential taken", &taken_prefix);
+            // Replaced since the page was shown, and the new one run out by the time another is posted.
+            granted(root.path());
+            let body = allow_body(&new, &open, &Tamper::default());
+            refused(&open, &body, "allowance: ended", &prefix);
+            run_out(root.path());
+            let past = ceremony(false).with_allowance(&allowances(root.path())[0].2, now_millis() - 1);
+            let body = allow_body(&new, &past, &Tamper::default());
+            refused(&past, &body, "allowance: expired", &prefix);
+            assert_ne!(allowances(root.path())[0].2, id, "{flow:?}");
+            granted(root.path());
+            let (full, _) = opened(cx);
+            fill_to(root.path(), passkeys::MAX_PER_ACCOUNT);
+            let body = allow_body(&new, &full, &Tamper::default());
+            refused(&full, &body, "allowance: limit reached", &prefix);
+            assert!(auth::forget_account(root.path(), ACME_ISSUER, ACME_SUBJECT).unwrap());
+            refused(&full, &body, "allowance: no account", &prefix);
+        });
+    }
+}
+
+#[test]
+fn only_an_allowances_outcomes_show_on_an_operations_line() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (a, new) = (SoftKey::es256(), SoftKey::es256());
+        let (_, prefix) = credential_of(&a);
+        with_watching(&watching, &flows, |cx| {
+            let c = allowed_page(cx, &flows, &a);
+            let live = allowances(root.path());
+            // On an allowance's page, the paths that are not its own.
+            let (stale, _) = opened(cx);
+            let body = assertion(&a, &c, 1, &Tamper::default());
+            refused_in(flow, cx, &flows, &watching, &stale, &body, ("wrong challenge", &prefix));
+            let body = format!("{}&{}", body, new_fields(&new.register(&c.expect(), &Tamper::default())));
+            refused_in(flow, cx, &flows, &watching, &c, &body, ("adding not offered", ""));
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &assertion(&a, &c, 1, &Tamper::default()));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(flow.line(), flow.approved(&prefix, "verified"), "{flow:?}");
+            assert_eq!(allowances(root.path()), live, "{flow:?}: unspent");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn a_store_failure_says_nothing_of_the_allowance() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let new = SoftKey::es256();
+        let (_, prefix) = credential_of(&new);
+        with_watching(&watching, &flows, |cx| {
+            let c = allowed_page(cx, &flows, &SoftKey::es256());
+            let body = allow_body(&new, &c, &Tamper::default());
+            let live = allowances(root.path());
+            // The table gone: the store's checks fail, and the transaction with them.
+            let conn = rusqlite::Connection::open(crate::server_db::path(root.path())).unwrap();
+            conn.execute_batch("DROP TABLE passkeys").unwrap();
+            drop(conn);
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &body);
+            assert_eq!(page(&answer).status, 500, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(passkey::take_registered(), 0, "{flow:?}");
+            assert_eq!(allowances(root.path()), live, "{flow:?}: unspent");
+            let (outcome, detail, passkey) = match flow {
+                Approving::Gate => ("failed", "", Some("store failed")),
+                Approving::Operation => ("failed", "internal error", None),
+            };
+            let line = Line {
+                outcome: outcome.into(),
+                detail: detail.into(),
+                credential: prefix.clone(),
+                added: String::new(),
+                passkey,
+            };
+            assert_eq!(flow.line(), line, "{flow:?}");
+        });
+    }
+}
+
+#[test]
+fn two_tabs_under_one_allowance_register_one_passkey() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (first_key, second_key) = (SoftKey::es256(), SoftKey::es256());
+        let (_, second_prefix) = credential_of(&second_key);
+        with_watching(&watching, &flows, |cx| {
+            let first = allowed_page(cx, &flows, &SoftKey::es256());
+            let (second, _) = opened(cx);
+            let (answer, _) = flow.post(cx, &flows, "p", &first, &allow_body(&first_key, &first, &Tamper::default()));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            let body = allow_body(&second_key, &second, &Tamper::default());
+            refused_in(flow, cx, &flows, &watching, &second, &body, ("allowance: ended", &second_prefix));
+            assert_eq!(kept_passkeys(root.path()).len(), 2, "{flow:?}: the first tab's alone");
+        });
+    }
+}
+
+#[test]
+fn an_allowances_post_is_taken_once_and_its_registration_is_no_good_on_another_page() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let new = SoftKey::es256();
+        let (_, prefix) = credential_of(&new);
+        with_watching(&watching, &flows, |cx| {
+            let c = allowed_page(cx, &flows, &SoftKey::es256());
+            let body = allow_body(&new, &c, &Tamper::default());
+            let (answer, _) = flow.post(cx, &flows, "once", &c, &body);
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            let _ = (flow.lines(), watching.seen());
+            // The same POST again.
+            let before = kept_all(root.path());
+            let (answer, _) = flow.send(cx, &format!("approval=once&{body}"), &flow.cookies());
+            assert_eq!(page(&answer).status, 400, "{flow:?}");
+            assert!(page(&answer).html.contains("already used"), "{flow:?}: {}", page(&answer).html);
+            assert_eq!(kept_all(root.path()), before, "{flow:?}");
+            assert_eq!(watching.seen(), vec![], "{flow:?}");
+            let lines = flow.lines();
+            let details: Vec<&str> = lines.iter().map(|l| l.detail.as_str()).collect();
+            assert_eq!(details, if flow == Approving::Gate { vec![] } else { vec!["already used"] });
+            assert!(lines.iter().all(|l| l.passkey.is_none()), "{flow:?}");
+            // The registration captured, on a page of a new allowance, which stays unspent.
+            granted(root.path());
+            let (next, _) = opened(cx);
+            refused_in(flow, cx, &flows, &watching, &next, &body, ("allowance: wrong challenge", &prefix));
+            assert_eq!(allowances(root.path()).len(), 1, "{flow:?}");
+        });
+    }
+}
+
+#[test]
+fn a_post_refused_before_the_passkey_leaves_the_allowance_alone() {
+    for flow in BOTH {
+        drained();
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let new = SoftKey::es256();
+        with_watching(&watching, &flows, |cx| {
+            let c = allowed_page(cx, &flows, &SoftKey::es256());
+            let _ = watching.seen();
+            let before = kept_all(root.path());
+            let fields = allow_body(&new, &c, &Tamper::default());
+            flow.put(&flows, "id", &c);
+
+            // The approval's id twice, either way: incomplete, nothing taken.
+            for twice in ["approval=id&approval=id", "approval=id&approval=nope"] {
+                let (answer, _) = flow.send(cx, &format!("{twice}&{fields}"), &flow.cookies());
+                assert_eq!(page(&answer).status, 400, "{flow:?} {twice}");
+                assert!(page(&answer).html.contains("arrived incomplete"), "{}", page(&answer).html);
+            }
+            // No cookie, and another browser's.
+            for other in [String::new(), flow.cookie(&"d".repeat(64))] {
+                let (answer, _) = flow.send(cx, &format!("approval=id&{fields}"), &other);
+                assert_eq!(page(&answer).status, 403, "{flow:?} {other:?}");
+                assert!(page(&answer).html.contains("different browser"), "{}", page(&answer).html);
+            }
+            assert!(flow.waiting(&flows, "id"), "{flow:?}: nothing taken");
+
+            // The sign-in settings gone since the page was shown: taken, then refused before the ceremony.
+            let (settings, aside) = (root.path().join("auth.toml"), root.path().join("auth.toml.aside"));
+            std::fs::rename(&settings, &aside).unwrap();
+            let (answer, _) = flow.send(cx, &format!("approval=id&{fields}"), &flow.cookies());
+            assert_eq!(page(&answer).status, 404, "{flow:?}");
+            assert!(!flow.waiting(&flows, "id"), "{flow:?}");
+            std::fs::rename(&aside, &settings).unwrap();
+
+            assert_eq!(kept_all(root.path()), before, "{flow:?}");
+            assert_eq!(watching.seen(), vec![], "{flow:?}: nothing approved");
+            assert_eq!(passkey::take_registered(), 0, "{flow:?}");
+            let lines = flow.lines();
+            let details: Vec<&str> = lines.iter().map(|l| l.detail.as_str()).collect();
+            let expected = [
+                "form incomplete",
+                "form incomplete",
+                "different browser",
+                "different browser",
+                "sign-in settings unavailable",
+            ];
+            assert_eq!(details, if flow == Approving::Gate { &[][..] } else { &expected[..] }, "{flow:?}");
+            assert!(lines.iter().all(|l| l.passkey.is_none() && l.credential.is_empty()), "{flow:?}");
+
+            // The row is live: a page opened now spends it.
+            let (next, _) = opened(cx);
+            let (answer, _) = flow.post(cx, &flows, "next", &next, &allow_body(&new, &next, &Tamper::default()));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert!(allowances(root.path()).is_empty(), "{flow:?}");
+        });
+        drained();
+    }
 }

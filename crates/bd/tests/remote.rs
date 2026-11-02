@@ -10937,14 +10937,17 @@ fn page_attribute(page: &str, name: &str) -> Option<String> {
 
 /// The WebAuthn fields a browser posts with the approval `page` shows, as form fields: a new passkey's registration
 /// where the page asks to create one, else an assertion by the first of its credentials this authenticator holds.
+/// Under an allowance, what its Approve posts: a new passkey's registration, against the allowance's own challenge,
+/// in the `allow_*` fields, and the ordinary fields empty.
 fn passkey_fields(page: &str) -> String {
     use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair};
     use sha2::{Digest, Sha256};
     let rng = ring::rand::SystemRandom::new();
     let mode = page_attribute(page, "data-passkey").unwrap_or_else(|| panic!("no passkey ceremony: {page}"));
-    let challenge = page_attribute(page, "data-challenge").unwrap();
+    let allow = mode == "allow";
+    let challenge = page_attribute(page, if allow { "data-allow-challenge" } else { "data-challenge" }).unwrap();
     let rp = page_attribute(page, "data-rp").unwrap();
-    let create = mode == "create";
+    let create = mode == "create" || allow;
     let kind = if create { "webauthn.create" } else { "webauthn.get" };
     let client_data = json!({"type": kind, "challenge": challenge, "origin": PUBLIC, "crossOrigin": false}).to_string();
     let mut auth = Sha256::digest(rp.as_bytes()).to_vec();
@@ -10968,6 +10971,20 @@ fn passkey_fields(page: &str) -> String {
         ];
         spki.extend_from_slice(pair.public_key().as_ref());
         keys.insert(b64url(&id), (pkcs8.as_ref().to_vec(), 0));
+        if allow {
+            // What the page gives `create()` beside the challenge, which this authenticator has no use for.
+            for name in ["data-user", "data-name"] {
+                assert!(page_attribute(page, name).is_some_and(|v| !v.is_empty()), "no {name}: {page}");
+            }
+            return format!(
+                "allow_credential={}&allow_client_data={}&allow_authenticator_data={}&allow_public_key={}&\
+                 allow_algorithm=-7&credential=&client_data=&authenticator_data=&signature=&public_key=&algorithm=",
+                b64url(&id),
+                b64url(client_data.as_bytes()),
+                b64url(&auth),
+                b64url(&spki)
+            );
+        }
         format!(
             "credential={}&client_data={}&authenticator_data={}&public_key={}&algorithm=-7",
             b64url(&id),
@@ -13060,5 +13077,796 @@ fn operation_links_need_a_public_url() {
     for path in [format!("/w/proj/close/{}", op.run), "/bd/w/proj/close/x".to_string(), "/w/proj/discard/x".into()] {
         let (status, _, page) = browse(&format!("{}{path}?request=abc", server.base), None, None);
         assert_eq!(status, 404, "{path}: {page}");
+    }
+}
+
+// An admin's allowance to register a passkey with no existing one at hand (`bd serve passkey allow-add`).
+
+/// A row of `passkey_allowances`: issuer, subject, id, created_at and expires_at.
+type AllowanceRow = (String, String, String, i64, i64);
+
+/// A row of `passkeys`, as far as an approval may move it: credential, counter and last use.
+type PasskeyRow = (String, i64, Option<i64>);
+
+/// Every allowance and every passkey of a server.
+type AllowanceState = (Vec<AllowanceRow>, Vec<PasskeyRow>);
+
+/// [`AllowanceState`] in `<root>/server.db`. A sign-in writes accounts and events, so this is what a refusal must
+/// leave as it was, rather than the whole database.
+fn allowance_state(root: &Path) -> AllowanceState {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let conn = rusqlite::Connection::open_with_flags(root.join("server.db"), flags).unwrap();
+    let allowances = conn
+        .prepare("SELECT issuer, subject, id, created_at, expires_at FROM passkey_allowances ORDER BY issuer, subject")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let passkeys = conn
+        .prepare("SELECT credential, counter, last_used_at FROM passkeys ORDER BY seq")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    (allowances, passkeys)
+}
+
+/// `bd serve <args> --root <root>` on the server's host, as an admin runs it.
+fn serve_command(server: &Server, args: &[&str]) -> String {
+    let root = server.root.path();
+    check(bd(root).arg("--json").arg("serve").args(args).arg("--root").arg(root).output().unwrap(), "bd serve")
+}
+
+/// Replace `from` in `auth.toml`, which the running server reads again.
+fn edit_auth_toml(server: &Server, from: &str, to: &str) {
+    let path = server.root.path().join("auth.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains(from), "{from}: {text}");
+    std::fs::write(&path, text.replacen(from, to, 1)).unwrap();
+}
+
+/// The fields of an allowance's page second button: an assertion, its two registration fields empty and the
+/// `allow_*` fields left out, as a browser leaves them while they are disabled.
+fn existing_passkey_fields(page: &str) -> String {
+    let asserting = page.replacen("data-passkey=\"allow\"", "data-passkey=\"get\"", 1);
+    format!("{}&public_key=&algorithm=", passkey_fields(&asserting))
+}
+
+/// [`passkey_fields`] of an ordinary `page`, by the credential `id` alone among those it lists.
+fn asserting_with(page: &str, id: &str) -> String {
+    let listed = page_attribute(page, "data-credentials").unwrap();
+    assert!(listed.split(' ').any(|c| c == id), "{id} not in {listed}");
+    passkey_fields(&page.replacen(&listed, id, 1))
+}
+
+/// What an approval page approves: a gate, or the close of `id` an operation's `link` asks for.
+struct Way {
+    id: String,
+    link: Option<String>,
+}
+
+/// One account's approvals in one flow, for what the two flows do alike.
+struct Flow<'a> {
+    t: &'a Allowing,
+    login: &'static str,
+    /// The message of the flow's log lines.
+    line: &'static str,
+    /// The account's passkey from before.
+    credential: &'a str,
+    ways: [Way; 2],
+}
+
+impl Flow<'_> {
+    fn account(&self) -> String {
+        format!("github:{}", self.login)
+    }
+
+    fn is_gate(&self) -> bool {
+        self.line == "gate approval"
+    }
+
+    /// Open `ways[n]` in a fresh browser and sign in: its approval page.
+    fn open(&self, n: usize) -> Signed {
+        let way = &self.ways[n];
+        let t = self.t;
+        let signed = match &way.link {
+            None => approve_flow(&t.server, &t.github, self.login, "proj", &way.id),
+            Some(url) => approve_op_flow(&t.server, &t.github, self.login, url),
+        };
+        assert_eq!(signed.status, 200, "{}", signed.page);
+        signed
+    }
+
+    fn url(&self, n: usize) -> String {
+        let way = &self.ways[n];
+        match way.link {
+            None => gate_url(&self.t.server, "proj", &way.id),
+            Some(_) => format!("{}{}", self.t.server.base, op_path("close", &way.id)),
+        }
+    }
+
+    /// POST `fields` with the approval `signed` shows of `ways[n]`, from its browser.
+    fn post(&self, n: usize, signed: &Signed, fields: &str) -> Answered {
+        let body = format!("approval={}&{fields}", signed.approval());
+        post_gate(&self.url(n), Some(PUBLIC), None, &signed.cookie(), &body)
+    }
+
+    /// Whether `ways[n]` was approved.
+    fn closed(&self, n: usize) -> bool {
+        shown_on_host(&self.t.server, &self.ways[n].id)["status"] == "closed"
+    }
+
+    /// The account's log lines of this flow, in order.
+    fn lines(&self) -> Vec<String> {
+        let (text, account) = (std::fs::read_to_string(&self.t.log).unwrap(), self.account());
+        text.lines()
+            .filter(|l| l.contains(self.line) && field(l, "actor") == Some(&account))
+            .map(String::from)
+            .collect()
+    }
+
+    /// The log line after the first `seen`.
+    fn line_after(&self, seen: usize) -> String {
+        eventually("the approval's log line", || self.lines().len() > seen);
+        self.lines().remove(seen)
+    }
+
+    /// The `outcome` of a refused passkey on this flow's log lines.
+    fn refused_outcome(&self) -> &'static str {
+        if self.is_gate() { "passkey refused" } else { "passkey_refused" }
+    }
+
+    /// What the page says of a refused passkey that did not end an allowance.
+    fn says_failed(&self, page: &str) {
+        assert!(page.contains("The passkey check failed"), "{page}");
+        assert!(!page.contains("allowance"), "{page}");
+    }
+}
+
+/// A logging server over [`op_root`]'s workspace, where github:alice and github:dave each registered a passkey by
+/// approving a spare gate. [`Flow`]s are left [`GateIds::spares`]' other two, and two closes.
+struct Allowing {
+    github: FakeGithub,
+    server: Server,
+    log: std::path::PathBuf,
+    ids: GateIds,
+    op: OpIds,
+    /// An admin token, for `/metrics`.
+    admin: String,
+    /// A person with an admin token, who gets past what the approvals here are held back by.
+    ops: Client,
+    agent: Client,
+    alice: String,
+    dave: String,
+}
+
+impl Allowing {
+    fn new() -> Allowing {
+        let github = FakeGithub::start();
+        let (root, ids, op) = op_root(&github);
+        let (server, log) = logged_server(root, PUBLIC_URL);
+        let admin = server.token("metrics", "metrics", &["--role", "admin"]);
+        let ops = server.client(&server.token("ops", "ops", &["--role", "admin", "--kind", "human"]));
+        let agent = server.client(&server.token("agent", AGENT, &[]));
+        let enrol = |login: &str, gate: &str| {
+            let signed = approve_flow(&server, &github, login, "proj", gate);
+            assert_eq!(signed.status, 200, "{}", signed.page);
+            assert!(signed.page.contains("data-passkey=\"create\""), "{}", signed.page);
+            let fields = passkey_fields(&signed.page);
+            let body = format!("approval={}&{fields}", signed.approval());
+            let (status, _, page) =
+                post_gate(&gate_url(&server, "proj", gate), Some(PUBLIC), None, &signed.cookie(), &body);
+            assert_eq!(status, 200, "{page}");
+            form_value(&fields, "credential").to_string()
+        };
+        let (alice, dave) = (enrol("alice", &ids.spares[0]), enrol("dave", &ids.spares[1]));
+        Allowing { github, server, log, ids, op, admin, ops, agent, alice, dave }
+    }
+
+    fn root(&self) -> &Path {
+        self.server.root.path()
+    }
+
+    fn state(&self) -> AllowanceState {
+        allowance_state(self.root())
+    }
+
+    /// `bd serve passkey allow-add` for `account`: the allowance it left.
+    fn allow(&self, account: &str, extra: &[&str]) -> AllowanceRow {
+        let before = self.state().0;
+        let args = [&["passkey", "allow-add", "--account", account], extra].concat();
+        serve_command(&self.server, &args);
+        self.state()
+            .0
+            .into_iter()
+            .find(|a| !before.contains(a))
+            .unwrap_or_else(|| panic!("no new allowance: {extra:?}"))
+    }
+
+    fn cancel(&self, account: &str) {
+        let out = serve_command(&self.server, &["passkey", "allow-add", "--account", account, "--cancel"]);
+        let out: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(out["cancelled"], true, "{out}");
+    }
+
+    /// `bd serve passkey list` for `account`.
+    fn listed(&self, account: &str) -> Vec<Value> {
+        let out = serve_command(&self.server, &["passkey", "list", "--account", account]);
+        serde_json::from_str::<Value>(&out).unwrap().as_array().unwrap().clone()
+    }
+
+    /// The operation's link for the close of `id`, as an agent refused at a human gate is given it.
+    fn close_link(&self, id: &str) -> String {
+        let out = self.agent.run(&["close", id, "--force", "-r", "no longer needed"]);
+        assert_eq!(out.status.code(), Some(7), "{}", stderr_of(&out));
+        op_link(&stderr_of(&out))
+    }
+
+    fn way(&self, id: &str) -> Way {
+        Way { id: id.to_string(), link: Some(self.close_link(id)) }
+    }
+
+    /// github:alice on two gates, and github:dave on two closes.
+    fn flows(&self) -> [Flow<'_>; 2] {
+        let (gates, spare) = (&self.ids.spares[2..], |id: &String| Way { id: id.clone(), link: None });
+        [
+            Flow {
+                t: self,
+                login: "alice",
+                line: "gate approval",
+                credential: &self.alice,
+                ways: [spare(&gates[0]), spare(&gates[1])],
+            },
+            Flow {
+                t: self,
+                login: "dave",
+                line: "operation approval",
+                credential: &self.dave,
+                ways: [self.way(&self.ids.task), self.way(&self.ids.big_task)],
+            },
+        ]
+    }
+
+    /// The events of `kind` for `account`.
+    fn events(&self, kind: &str, account: &str) -> Vec<Value> {
+        auth_events(&self.server, kind).into_iter().filter(|e| e["actor"] == account).collect()
+    }
+
+    /// `signed` is a refusal before the passkey step: `status`, saying `says`, with no form, no approval cookie and
+    /// `before` left as it was.
+    fn shows_no_form(&self, before: &AllowanceState, what: &str, signed: &Signed, status: u16, says: &str) {
+        assert_eq!(signed.status, status, "{what}: {}", signed.page);
+        assert!(signed.page.contains(says), "{what}: {}", signed.page);
+        assert!(!signed.has_form() && !signed.page.contains("allow_"), "{what}: {}", signed.page);
+        for cookie in ["__Secure-bd_gate_", "__Secure-bd_op_"] {
+            assert!(cookie_line(&signed.headers, cookie).is_none(), "{what}: {:?}", signed.headers);
+        }
+        assert_eq!(&self.state(), before, "{what}");
+    }
+}
+
+/// Foreign posts of a complete allowance body at `url`, on the page `signed`: each is refused before the passkey
+/// step and leaves `root`'s allowances, passkeys and the approval itself alone.
+fn foreign_posts_take_nothing(root: &Path, url: &str, signed: &Signed, fields: &str) {
+    let before = allowance_state(root);
+    let (approval, cookie) = (signed.approval(), signed.cookie());
+    let body = format!("approval={approval}&{fields}");
+    for (origin, site) in [
+        (Some("https://evil.example"), None),
+        (Some("https://evil.example"), Some("same-origin")),
+        (Some(PUBLIC), Some("cross-site")),
+        (None, Some("cross-site")),
+        (None, None),
+    ] {
+        let (status, _, page) = post_gate(url, origin, site, &cookie, &body);
+        assert_eq!(status, 403, "{origin:?} {site:?}: {page}");
+        assert!(page.contains("another site"), "{page}");
+        assert_eq!(allowance_state(root), before, "{origin:?} {site:?}");
+    }
+    let (name, _) = cookie.split_once('=').unwrap();
+    for other in [String::new(), format!("{name}={}", "0".repeat(64))] {
+        let (status, _, page) = post_gate(url, Some(PUBLIC), None, &other, &body);
+        assert_eq!(status, 403, "{other}: {page}");
+        assert!(page.contains("different browser"), "{page}");
+        assert_eq!(allowance_state(root), before, "{other}");
+    }
+    let doubled = format!("approval={approval}&{body}");
+    let (status, _, page) = post_gate(url, Some(PUBLIC), None, &cookie, &doubled);
+    assert_eq!(status, 400, "{page}");
+    assert!(page.contains("arrived incomplete"), "{page}");
+    assert_eq!(allowance_state(root), before, "a duplicated approval");
+}
+
+/// Take github:dave out of the rule for people, as an admin editing `auth.toml` would. An account has to be refused
+/// after it registered a passkey: one refused at sign-in never gets that far.
+fn dave_not_admitted(server: &Server) {
+    edit_auth_toml(server, "\"carol\", \"dave\", \"mallory\"", "\"carol\", \"mallory\"");
+}
+
+/// Let github:dave in again, by the rule that gives kind agent: only after [`dave_not_admitted`].
+fn dave_an_agent(server: &Server) {
+    edit_auth_toml(server, "users = [\"bob\"]", "users = [\"bob\", \"dave\"]");
+}
+
+#[test]
+fn an_allowance_is_refused_through_tokens_and_missing_from_mcp() {
+    let t = Allowing::new();
+    let human = t.server.token("human-admin", "root", &["--role", "admin", "--kind", "human"]);
+    let root = t.root().to_str().unwrap();
+    let before = t.state();
+    for secret in [&human, &t.admin] {
+        for extra in [&["--for", "5m"][..], &["--cancel"]] {
+            let argv =
+                [&["serve", "passkey", "allow-add", "--account", "github:alice", "--root", root], extra].concat();
+            let (status, r) = post(&t.server.url(), secret, &json!({ "argv": argv }));
+            assert_eq!((status, r["exit_code"].as_i64()), (200, Some(2)), "{argv:?}: {r}");
+            assert!(r["stderr"].as_str().unwrap().contains("not available through bd serve"), "{r}");
+            assert_eq!(t.state(), before, "{argv:?}");
+        }
+    }
+    assert!(auth_events(&t.server, "passkey_add_allowed").is_empty());
+
+    let (status, _, list) = mcp_post(&t.server, Some(&human), "", &[], &mcp_modern(1, "tools/list", json!({})));
+    assert_eq!(status, 200, "{list}");
+    let tools = list["result"]["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|t| t["name"] == "claim"), "{list}");
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap();
+        assert!(!name.contains("allow") && !name.contains("passkey"), "{name}");
+    }
+    assert!(!list.to_string().contains("allow-add"), "{list}");
+}
+
+#[test]
+fn a_live_allowance_changes_nothing_before_a_gates_passkey_step() {
+    let t = Allowing::new();
+    let (root, gate) = (t.root(), &t.ids.spares[2]);
+    t.allow("github:alice", &[]);
+    t.allow("github:dave", &[]);
+    let before = t.state();
+    let shows_no_form = |what: &str, signed: &Signed, status: u16, says: &str| {
+        t.shows_no_form(&before, what, signed, status, says);
+    };
+
+    dave_not_admitted(&t.server);
+    let signed = approve_flow(&t.server, &t.github, "dave", "proj", gate);
+    shows_no_form("not admitted", &signed, 403, "may not approve");
+    dave_an_agent(&t.server);
+    let signed = approve_flow(&t.server, &t.github, "dave", "proj", gate);
+    shows_no_form("kind agent", &signed, 403, "may not approve");
+    let signed = approve_flow(&t.server, &t.github, "alice", "proj", &t.ids.carol);
+    shows_no_form("not an approver", &signed, 403, "Only github:carol can approve it");
+    let signed = approve_flow(&t.server, &t.github, "alice", "proj", &t.ids.unarmed);
+    shows_no_form("not armed", &signed, 409, "not ready to approve");
+
+    let signed = approve_flow(&t.server, &t.github, "alice", "proj", gate);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("data-passkey=\"allow\""), "{}", signed.page);
+    let fields = passkey_fields(&signed.page);
+    let url = gate_url(&t.server, "proj", gate);
+    foreign_posts_take_nothing(root, &url, &signed, &fields);
+
+    // The allowance was live and the approval not taken: its own browser's POST goes through.
+    let body = format!("approval={}&{fields}", signed.approval());
+    let (status, _, page) = post_gate(&url, Some(PUBLIC), None, &signed.cookie(), &body);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(shown_on_host(&t.server, gate)["status"], "closed");
+    let (allowances, passkeys) = t.state();
+    assert_eq!(allowances.len(), 1, "github:dave's is left: {allowances:?}");
+    assert_eq!(passkeys.len(), before.1.len() + 1, "{passkeys:?}");
+}
+
+#[test]
+fn a_live_allowance_changes_nothing_before_an_operations_passkey_step() {
+    let t = Allowing::new();
+    let root = t.root();
+    let link = t.close_link(&t.ids.task);
+    t.allow("github:alice", &[]);
+    t.allow("github:dave", &[]);
+    let before = t.state();
+    let shows_no_form = |what: &str, signed: &Signed, status: u16, says: &str| {
+        t.shows_no_form(&before, what, signed, status, says);
+    };
+
+    dave_not_admitted(&t.server);
+    let signed = approve_op_flow(&t.server, &t.github, "dave", &link);
+    shows_no_form("not admitted", &signed, 403, "may not approve");
+    dave_an_agent(&t.server);
+    let signed = approve_op_flow(&t.server, &t.github, "dave", &link);
+    shows_no_form("kind agent", &signed, 403, "may not approve");
+    let carol = t.close_link(&t.op.carol_run);
+    let signed = approve_op_flow(&t.server, &t.github, "alice", &carol);
+    shows_no_form("not an approver", &signed, 403, "github:carol");
+
+    // Operations have no armed step: the matching refusal is a target closed after its link was given.
+    let closes = t.close_link(&t.ids.big_task);
+    t.ops.ok(&["close", &t.ids.big_task, "--force", "-r", "done elsewhere"]);
+    let signed = approve_op_flow(&t.server, &t.github, "alice", &closes);
+    shows_no_form("closed already", &signed, 409, "closed already");
+
+    let signed = approve_op_flow(&t.server, &t.github, "alice", &link);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("data-passkey=\"allow\""), "{}", signed.page);
+    let fields = passkey_fields(&signed.page);
+    let url = format!("{}{}", t.server.base, op_path("close", &t.ids.task));
+    foreign_posts_take_nothing(root, &url, &signed, &fields);
+
+    let body = format!("approval={}&{fields}", signed.approval());
+    let (status, _, page) = post_gate(&url, Some(PUBLIC), None, &signed.cookie(), &body);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(shown_on_host(&t.server, &t.ids.task)["status"], "closed");
+    let (allowances, passkeys) = t.state();
+    assert_eq!(allowances.len(), 1, "github:dave's is left: {allowances:?}");
+    assert_eq!(passkeys.len(), before.1.len() + 1, "{passkeys:?}");
+}
+
+#[test]
+fn an_allowance_registers_a_passkey_with_the_approval_and_the_next_one_uses_it() {
+    let t = Allowing::new();
+    let registered = "bd_serve_passkeys_registered_total";
+    let mut sent = Vec::new();
+    for flow in &t.flows() {
+        let account = flow.account();
+        let counted = metric(&t.server, &t.admin, registered);
+        let granted = t.allow(&account, &[]);
+        let id = granted.2.as_str();
+        let before = t.state();
+        assert_eq!(before.0, std::slice::from_ref(&granted), "the one allowance");
+        assert!(t.listed(&account).iter().all(|r| r["add_allowed_until"].is_string()), "{account}");
+
+        // The page offers it and names neither the allowance nor when it ends.
+        let signed = flow.open(0);
+        assert!(signed.page.contains("data-passkey=\"allow\""), "{}", signed.page);
+        assert!(signed.page.contains("name=\"allow_credential\" value=\"\" disabled"), "{}", signed.page);
+        assert!(signed.page.contains("Use an existing passkey instead"), "{}", signed.page);
+        assert!(!signed.page.contains(id) && !signed.page.contains(&granted.4.to_string()), "{}", signed.page);
+        assert_eq!(t.state(), before, "opening the page spends nothing");
+
+        let fields = passkey_fields(&signed.page);
+        let seen = flow.lines().len();
+        let (status, _, page) = flow.post(0, &signed, &fields);
+        assert_eq!(status, 200, "{page}");
+        assert!(flow.closed(0), "approved");
+
+        // One passkey more, the others as they were, and the allowance spent.
+        let credential = form_value(&fields, "allow_credential");
+        let (allowances, passkeys) = t.state();
+        assert_eq!(allowances, [], "spent");
+        assert_eq!(passkeys.len(), before.1.len() + 1, "{passkeys:?}");
+        assert!(before.1.iter().all(|p| passkeys.contains(p)), "{passkeys:?}");
+        assert_eq!(passkeys.last().unwrap().0, credential, "{passkeys:?}");
+        let listed = t.listed(&account);
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed.iter().all(|r| r.get("add_allowed_until").is_none()), "spent: {listed:?}");
+
+        // T11.1: the trail names the allowance; the kinds read together, as the review after a grant does.
+        let allowed = t.events("passkey_add_allowed", &account);
+        assert_eq!(allowed.len(), 1, "{allowed:?}");
+        let detail = allowed[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.starts_with(&format!("allowance {id}, until ")) && detail.ends_with(", by an admin"),
+            "{detail}"
+        );
+        let kinds = "passkey_add_allowed,passkey_add_cancelled,passkey_registered";
+        let events = t.events(kinds, &account);
+        assert_eq!(events.len(), 3, "first passkey, grant, this one: {events:?}");
+        let detail =
+            format!("credential {} (ES256), registered at a browser approval under allowance {id}", &credential[..12]);
+        let under = t.events("passkey_registered", &account);
+        assert!(under.iter().any(|e| e["detail"] == detail.as_str()), "{detail}: {under:?}");
+
+        // T11.2: the new passkey's prefix, and nothing added.
+        let line = flow.line_after(seen);
+        assert_eq!(field(&line, "outcome"), Some("approved"), "{line}");
+        assert_eq!(field(&line, "passkey"), Some("registered under allowance"), "{line}");
+        assert_eq!(field(&line, "credential"), Some(&credential[..12]), "{line}");
+        assert_eq!(field(&line, "added"), Some(""), "{line}");
+        assert_eq!(metric(&t.server, &t.admin, registered), counted + 1);
+
+        // The next page is the ordinary one, with both passkeys, and the new one approves.
+        let next = flow.open(1);
+        assert!(next.page.contains("data-passkey=\"get\"") && !next.page.contains("allow_"), "{}", next.page);
+        let listed = page_attribute(&next.page, "data-credentials").unwrap();
+        assert!(listed.contains(flow.credential) && listed.contains(credential), "{listed}");
+        let seen = flow.lines().len();
+        let (status, _, page) = flow.post(1, &next, &asserting_with(&next.page, credential));
+        assert_eq!(status, 200, "{page}");
+        assert!(flow.closed(1), "approved");
+        assert_eq!(field(&flow.line_after(seen), "credential"), Some(&credential[..12]));
+        sent.push(fields);
+    }
+
+    // T11.4: neither key material nor an email in the logs or the trail.
+    let logged = std::fs::read_to_string(&t.log).unwrap();
+    let trail = serde_json::to_string(&auth_events(&t.server, "passkey_registered")).unwrap();
+    for fields in &sent {
+        for name in ["allow_credential", "allow_client_data", "allow_authenticator_data", "allow_public_key"] {
+            let value = form_value(fields, name);
+            assert!(!logged.contains(value), "{name} logged: {logged}");
+            assert!(!trail.contains(value), "{name} in the trail: {trail}");
+        }
+    }
+    let lines = logged.lines().filter(|l| l.contains("gate approval") || l.contains("operation approval"));
+    assert!(lines.clone().count() >= 4, "{logged}");
+    assert!(!lines.into_iter().any(|l| l.contains('@')), "{logged}");
+    assert!(!trail.contains('@'), "{trail}");
+}
+
+#[test]
+fn two_tabs_under_one_allowance_register_one_passkey() {
+    let t = Allowing::new();
+    for flow in &t.flows() {
+        t.allow(&flow.account(), &[]);
+        let (first, second) = (flow.open(0), flow.open(1));
+        for tab in [&first, &second] {
+            assert!(tab.page.contains("data-passkey=\"allow\""), "{}", tab.page);
+        }
+        let fields = passkey_fields(&second.page);
+        let (status, _, page) = flow.post(0, &first, &passkey_fields(&first.page));
+        assert_eq!(status, 200, "{page}");
+        let spent = t.state();
+        assert_eq!(spent.0, []);
+
+        let seen = flow.lines().len();
+        let (status, _, page) = flow.post(1, &second, &fields);
+        assert_eq!(status, 403, "{page}");
+        assert!(page.contains("allowance has ended"), "{page}");
+        assert_eq!(t.state(), spent, "the second registers nothing");
+        assert!(!flow.closed(1), "nor approves");
+        let line = flow.line_after(seen);
+        assert_eq!(field(&line, "outcome"), Some(flow.refused_outcome()), "{line}");
+        assert_eq!(field(&line, "passkey"), Some("allowance: ended"), "{line}");
+        let credential = form_value(&fields, "allow_credential");
+        assert_eq!(field(&line, "credential"), Some(&credential[..12]), "{line}");
+        assert_eq!(field(&line, "added"), Some(""), "{line}");
+    }
+}
+
+#[test]
+fn an_allowance_that_ended_after_its_page_opened_is_refused() {
+    let t = Allowing::new();
+    for flow in &t.flows() {
+        let account = flow.account();
+        let ended = |signed: &Signed| {
+            let (before, seen) = (t.state(), flow.lines().len());
+            let (status, _, page) = flow.post(0, signed, &passkey_fields(&signed.page));
+            assert_eq!(status, 403, "{page}");
+            assert!(page.contains("allowance has ended"), "{page}");
+            assert_eq!(t.state(), before, "nothing spent or registered");
+            assert_eq!(field(&flow.line_after(seen), "passkey"), Some("allowance: ended"));
+            assert!(!flow.closed(0), "nothing approved");
+        };
+
+        // Cancelled.
+        t.allow(&account, &[]);
+        let signed = flow.open(0);
+        t.cancel(&account);
+        ended(&signed);
+
+        // Cancelled and granted again: the new allowance is another one, and stays unspent.
+        t.allow(&account, &[]);
+        let signed = flow.open(0);
+        t.cancel(&account);
+        let again = t.allow(&account, &[]);
+        ended(&signed);
+        assert!(t.state().0.contains(&again), "{again:?}");
+
+        // Replaced.
+        let signed = flow.open(0);
+        let replacing = t.allow(&account, &["--for", "30m"]);
+        assert_ne!(replacing.2, again.2);
+        ended(&signed);
+        assert!(t.state().0.contains(&replacing), "{replacing:?}");
+
+        // Its account's last passkey removed: the allowance ends with it.
+        let signed = flow.open(0);
+        let args = ["passkey", "remove", "--account", account.as_str()];
+        let out = serve_command(&t.server, &args);
+        assert_eq!(t.events("passkey_removed", &account).len(), 1, "{out}");
+        assert!(!t.state().0.contains(&replacing), "{replacing:?}");
+        let cancelled = t.events("passkey_add_cancelled", &account);
+        assert_eq!(cancelled.len(), 3, "two cancels, then the removal: {cancelled:?}");
+        let last = cancelled.iter().map(|e| e["detail"].as_str().unwrap()).filter(|d| d.contains("last passkey"));
+        assert_eq!(last.count(), 1, "{cancelled:?}");
+        ended(&signed);
+    }
+}
+
+#[test]
+fn a_workspace_refusal_after_an_allowance_keeps_the_passkey_and_spends_the_allowance() {
+    let t = Allowing::new();
+    let [gates, mut operations] = t.flows();
+    let spent = |flow: &Flow<'_>, before: &AllowanceState, fields: &str, seen: usize| {
+        let credential = form_value(fields, "allow_credential").to_string();
+        let (allowances, passkeys) = t.state();
+        assert_eq!(allowances, [], "spent");
+        assert_eq!(passkeys.len(), before.1.len() + 1, "{passkeys:?}");
+        assert_eq!(passkeys.last().unwrap().0, credential, "stored: {passkeys:?}");
+        let line = flow.line_after(seen);
+        assert_eq!(field(&line, "passkey"), Some("registered under allowance"), "{line}");
+        assert_eq!(field(&line, "credential"), Some(&credential[..12]), "{line}");
+        (credential, line)
+    };
+
+    // Deferred between the page and the approval: not ready, with the passkey stored.
+    let gate = &gates.ways[0].id;
+    t.allow("github:alice", &[]);
+    let before = t.state();
+    let signed = gates.open(0);
+    t.ops.ok(&["update", gate, "--status", "deferred"]);
+    let fields = passkey_fields(&signed.page);
+    let seen = gates.lines().len();
+    let (status, _, page) = gates.post(0, &signed, &fields);
+    assert_eq!(status, 409, "{page}");
+    assert!(page.contains("not ready to approve"), "{page}");
+    let (credential, line) = spent(&gates, &before, &fields, seen);
+    assert_eq!(field(&line, "outcome"), Some("not ready"), "{line}");
+    assert!(!gates.closed(0));
+    t.ops.ok(&["update", gate, "--status", "open"]);
+    let signed = gates.open(0);
+    assert!(signed.page.contains("data-passkey=\"get\"") && !signed.page.contains("allow_"), "{}", signed.page);
+    let (status, _, page) = gates.post(0, &signed, &asserting_with(&signed.page, &credential));
+    assert_eq!(status, 200, "{page}");
+    assert!(gates.closed(0));
+
+    // Work the requester claimed: the approval does not take it over, and the passkey stays.
+    operations.ways[0] = t.way(&t.op.claimed);
+    t.allow("github:dave", &[]);
+    let before = t.state();
+    let signed = operations.open(0);
+    let fields = passkey_fields(&signed.page);
+    let seen = operations.lines().len();
+    let (status, _, page) = operations.post(0, &signed, &fields);
+    assert_eq!(status, 403, "{page}");
+    assert!(page.contains("released first") && page.contains("Nothing was changed"), "{page}");
+    let (credential, line) = spent(&operations, &before, &fields, seen);
+    assert_eq!(field(&line, "outcome"), Some("refused"), "{line}");
+    assert!(!operations.closed(0));
+    t.agent.ok(&["release", &t.op.claimed]);
+    let signed = operations.open(0);
+    assert!(signed.page.contains("data-passkey=\"get\"") && !signed.page.contains("allow_"), "{}", signed.page);
+    let (status, _, page) = operations.post(0, &signed, &asserting_with(&signed.page, &credential));
+    assert_eq!(status, 200, "{page}");
+    assert!(operations.closed(0));
+}
+
+#[test]
+fn an_existing_passkey_keeps_approving_while_an_allowance_is_live() {
+    let t = Allowing::new();
+
+    // T9.6: with no allowance about, an operation's line has no `passkey` at all.
+    let link = t.close_link(&t.op.run);
+    let signed = approve_op_flow(&t.server, &t.github, "dave", &link);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = post_op(&t.server, &op_path("close", &t.op.run), &signed);
+    assert_eq!(status, 200, "{page}");
+    let flows = t.flows();
+    let line = flows[1].line_after(0);
+    assert_eq!(field(&line, "outcome"), Some("approved"), "{line}");
+    assert_eq!(field(&line, "passkey"), None, "{line}");
+
+    for flow in &flows {
+        let verified = flow.is_gate().then_some("verified");
+        let used = |before: &[PasskeyRow], line: &str| {
+            let (_, after) = t.state();
+            assert_eq!(after.len(), before.len(), "registers nothing: {after:?}");
+            let row = |rows: &[PasskeyRow]| rows.iter().find(|p| p.0 == flow.credential).unwrap().clone();
+            let (was, now) = (row(before), row(&after));
+            assert!(now.1 > was.1 && now.2.is_some(), "the counter moved: {was:?} {now:?}");
+            assert_eq!(field(line, "outcome"), Some("approved"), "{line}");
+            assert_eq!(field(line, "passkey"), verified, "{line}");
+            assert_eq!(field(line, "credential"), Some(&flow.credential[..12]), "{line}");
+            assert_eq!(field(line, "added"), Some(""), "{line}");
+        };
+
+        // T9.5: a page opened before the grant stays what it was.
+        let ordinary = flow.open(0);
+        assert!(ordinary.page.contains("data-passkey=\"get\""), "{}", ordinary.page);
+        let granted = t.allow(&flow.account(), &[]);
+        let (before, seen) = (t.state().1, flow.lines().len());
+        let (status, _, page) = flow.post(0, &ordinary, &passkey_fields(&ordinary.page));
+        assert_eq!(status, 200, "{page}");
+        assert!(flow.closed(0), "approved");
+        used(&before, &flow.line_after(seen));
+        assert!(t.state().0.contains(&granted), "the allowance stays live");
+
+        // T10.1: the second button of an allowance's page runs the ordinary assertion.
+        let allowed = flow.open(1);
+        assert!(allowed.page.contains("data-passkey=\"allow\""), "{}", allowed.page);
+        let (before, seen) = (t.state().1, flow.lines().len());
+        let (status, _, page) = flow.post(1, &allowed, &existing_passkey_fields(&allowed.page));
+        assert_eq!(status, 200, "{page}");
+        assert!(flow.closed(1), "approved");
+        used(&before, &flow.line_after(seen));
+        assert!(t.state().0.contains(&granted), "the allowance stays live");
+    }
+}
+
+#[test]
+fn an_allowances_refusals_are_logged_and_counted_in_both_flows() {
+    let t = Allowing::new();
+    let series = ["bd_serve_approvals_total", "bd_serve_operation_approvals_total"]
+        .map(|name| format!("{name}{{outcome=\"passkey_refused\"}}"));
+    for (flow, series) in t.flows().iter().zip(&series) {
+        let before_grant = flow.open(0);
+        t.allow(&flow.account(), &[]);
+        let before = t.state();
+        let refused = |signed: &Signed, fields: &str, label: &str, prefix: &str| {
+            let (counted, seen) = (metric(&t.server, &t.admin, series), flow.lines().len());
+            let (status, _, page) = flow.post(0, signed, fields);
+            assert_eq!(status, 403, "{label}: {page}");
+            flow.says_failed(&page);
+            assert_eq!(t.state(), before, "{label}");
+            assert!(!flow.closed(0), "{label}");
+            let line = flow.line_after(seen);
+            assert_eq!(field(&line, "outcome"), Some(flow.refused_outcome()), "{line}");
+            assert_eq!(field(&line, "passkey"), Some(label), "{line}");
+            assert_eq!(field(&line, "credential"), Some(prefix), "{line}");
+            assert_eq!(field(&line, "added"), Some(""), "{line}");
+            if !flow.is_gate() {
+                assert_eq!(field(&line, "detail"), Some(format!("passkey refused: {label}").as_str()), "{line}");
+            }
+            assert_eq!(metric(&t.server, &t.admin, series), counted + 1, "{label}");
+        };
+        let allowed = || {
+            let signed = flow.open(0);
+            assert!(signed.page.contains("data-passkey=\"allow\""), "{}", signed.page);
+            signed
+        };
+
+        // A registration where none was offered: a page opened before the grant, nothing read.
+        let signed = allowed();
+        refused(&before_grant, &passkey_fields(&signed.page), "allowance: not offered", "");
+
+        // An Approve whose fields never got filled in.
+        let empty = "allow_credential=&allow_client_data=&allow_authenticator_data=&allow_public_key=&allow_algorithm=";
+        refused(&signed, empty, "allowance: missing fields", "");
+
+        // A field sent twice, and a POST that is both ceremonies.
+        let signed = allowed();
+        let fields = passkey_fields(&signed.page);
+        refused(&signed, &format!("{fields}&allow_algorithm=-7"), "allowance: malformed fields", "");
+        let signed = allowed();
+        let both = passkey_fields(&signed.page).replacen("&credential=&", "&credential=AAAA&", 1);
+        refused(&signed, &both, "allowance: malformed fields", "");
+
+        // The assertion's challenge used for the registration.
+        let signed = allowed();
+        let swapped = signed.page.replacen(" data-allow-challenge=\"", " data-other=\"", 1).replacen(
+            " data-challenge=\"",
+            " data-allow-challenge=\"",
+            1,
+        );
+        let fields = passkey_fields(&swapped);
+        let prefix = &form_value(&fields, "allow_credential")[..12];
+        refused(&signed, &fields, "allowance: wrong challenge", prefix);
+    }
+}
+
+#[test]
+fn forgetting_an_account_leaves_an_open_page_nothing_to_spend() {
+    let t = Allowing::new();
+    for flow in &t.flows() {
+        let account = flow.account();
+        let granted = t.allow(&account, &[]);
+        let signed = flow.open(0);
+        serve_command(&t.server, &["token", "revoke", "--account", &account, "--forget"]);
+        let before = t.state();
+        assert!(!before.0.contains(&granted), "erased with the account: {before:?}");
+        assert!(before.1.iter().all(|p| p.0 != flow.credential), "{before:?}");
+
+        let fields = passkey_fields(&signed.page);
+        let seen = flow.lines().len();
+        let (status, _, page) = flow.post(0, &signed, &fields);
+        assert_eq!(status, 403, "{page}");
+        flow.says_failed(&page);
+        assert_eq!(t.state(), before);
+        assert!(!flow.closed(0));
+        let line = flow.line_after(seen);
+        assert_eq!(field(&line, "passkey"), Some("allowance: no account"), "{line}");
+        let credential = form_value(&fields, "allow_credential");
+        assert_eq!(field(&line, "credential"), Some(&credential[..12]), "{line}");
     }
 }

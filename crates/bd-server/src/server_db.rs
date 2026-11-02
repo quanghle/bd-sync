@@ -14,7 +14,10 @@
 //!
 //! The passkeys of the accounts that approve in the browser (schema 4,
 //! [`PASSKEYS`]) are plain columns, read and written by `crate::passkeys`,
-//! and erased with their account ([`erase_passkeys`]).
+//! and erased with their account ([`erase_passkeys`]). So are the windows an
+//! admin opens for an account to add one without an existing one (schema 5,
+//! [`ALLOWANCES`]): at most one each, erased with it ([`erase_allowance`])
+//! and pruned once they ran out ([`prune_allowances`]).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -34,7 +37,7 @@ fn busy_wait() -> Duration {
 }
 
 /// The schema this bd writes (`PRAGMA user_version`).
-const VERSION: i64 = 4;
+const VERSION: i64 = 5;
 
 /// The schema of version 3, which version 4 adds [`PASSKEYS`] to.
 const SCHEMA_V3: &str = "
@@ -107,10 +110,34 @@ CREATE TABLE passkeys (
 CREATE INDEX passkeys_account ON passkeys (issuer, subject);
 ";
 
+/// Version 5: the allowances an admin grants, an account (its primary key)
+/// allowed to register one passkey without an existing one until `expires_at`
+/// (milliseconds). `id` tells one grant from the next one on the same account.
+/// Never `IF NOT EXISTS`: a table left behind by a rollback that skipped its
+/// `DROP` fails the migration rather than bring its rows back.
+const ALLOWANCES: &str = "
+CREATE TABLE passkey_allowances (
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY (issuer, subject)
+);
+CREATE INDEX passkey_allowances_expires ON passkey_allowances (expires_at);
+";
+
 /// What takes a database of version 4 back to version 3, for a rollback to
-/// an older bd (docs/security.md quotes it): its passkeys are lost.
+/// an older bd (docs/security.md quotes it): its passkeys are lost. A
+/// database of version 5 takes [`ROLLBACK_V5`] first.
 #[cfg(test)]
 pub(crate) const ROLLBACK: &str = "DROP TABLE passkeys; PRAGMA user_version = 3;";
+
+/// What takes a database of version 5 back to version 4, for a rollback to
+/// an older bd (docs/security.md quotes it): its allowances are lost, the
+/// passkeys registered under them stay.
+#[cfg(test)]
+pub(crate) const ROLLBACK_V5: &str = "DROP TABLE passkey_allowances; PRAGMA user_version = 4;";
 
 pub fn path(root: &Path) -> PathBuf {
     root.join("server.db")
@@ -179,8 +206,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     // Another process may have created it meanwhile.
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let done = match version {
-        0 => conn.execute_batch(&format!("{SCHEMA_V3}{PASSKEYS}PRAGMA user_version = {VERSION};")),
-        3 => conn.execute_batch(&format!("{PASSKEYS}PRAGMA user_version = {VERSION};")),
+        0 => conn.execute_batch(&format!("{SCHEMA_V3}{PASSKEYS}{ALLOWANCES}PRAGMA user_version = {VERSION};")),
+        3 => conn.execute_batch(&format!("{PASSKEYS}{ALLOWANCES}PRAGMA user_version = {VERSION};")),
+        4 => conn.execute_batch(&format!("{ALLOWANCES}PRAGMA user_version = {VERSION};")),
         VERSION => Ok(()),
         other => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -328,7 +356,7 @@ pub const EVENTS_KEPT: Duration = Duration::from_secs(90 * 24 * 3600);
 pub struct AuthEvent {
     /// `signed_in`, `token_created`, `refreshed`, `revoked`, `forgotten`,
     /// `client_registered`, `linked`, `named`, `passkey_registered`,
-    /// `passkey_removed`.
+    /// `passkey_removed`, `passkey_add_allowed`, `passkey_add_cancelled`.
     pub kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<String>,
@@ -383,6 +411,17 @@ pub fn prune_events(tx: &rusqlite::Transaction) -> Result<()> {
 /// The most rows of a kind one write prunes.
 pub const PRUNE_BATCH: i64 = 500;
 
+pub(crate) const PRUNE_ALLOWANCES: &str = "DELETE FROM passkey_allowances WHERE rowid IN \
+     (SELECT rowid FROM passkey_allowances WHERE expires_at <= ?1 ORDER BY expires_at LIMIT ?2)";
+
+/// Delete the allowances that ran out, at most [`PRUNE_BATCH`]. No reader
+/// takes one past its expiry, so this only keeps the table small, and
+/// records nothing: an allowance running out is not an event.
+pub fn prune_allowances(tx: &rusqlite::Transaction) -> Result<()> {
+    tx.execute(PRUNE_ALLOWANCES, rusqlite::params![Timestamp::now().millis(), PRUNE_BATCH])?;
+    Ok(())
+}
+
 /// The registrations of OAuth clients the audit trail keeps, the latest:
 /// anyone may register, so their events are bounded by count as well as age.
 const KEPT_REGISTRATIONS: i64 = 5000;
@@ -409,6 +448,15 @@ pub fn erase_events(tx: &rusqlite::Transaction, issuer: &str, subject: &str) -> 
 /// being forgotten).
 pub fn erase_passkeys(tx: &rusqlite::Transaction, issuer: &str, subject: &str) -> Result<()> {
     tx.execute("DELETE FROM passkeys WHERE issuer = ?1 AND subject = ?2", [issuer, subject])?;
+    Ok(())
+}
+
+pub(crate) const ERASE_ALLOWANCE: &str = "DELETE FROM passkey_allowances WHERE issuer = ?1 AND subject = ?2";
+
+/// Delete the allowance of the account with this issuer and subject (it is
+/// being forgotten).
+pub fn erase_allowance(tx: &rusqlite::Transaction, issuer: &str, subject: &str) -> Result<()> {
+    tx.execute(ERASE_ALLOWANCE, [issuer, subject])?;
     Ok(())
 }
 
@@ -476,6 +524,8 @@ pub const KINDS: &[&str] = &[
     "named",
     "passkey_registered",
     "passkey_removed",
+    "passkey_add_allowed",
+    "passkey_add_cancelled",
 ];
 
 /// How actors and logins are compared: regardless of case.
@@ -652,6 +702,12 @@ mod tests {
             crate::passkeys::COUNT_BY_ACCOUNT,
             crate::passkeys::OWNED,
             crate::passkeys::USE_COUNTER_OWNED,
+            crate::passkeys::ALLOWANCE_LIVE,
+            crate::passkeys::ALLOWANCE_ROW,
+            crate::passkeys::ALLOWANCE_MATCH,
+            crate::passkeys::ALLOWANCE_DELETE,
+            ERASE_ALLOWANCE,
+            PRUNE_ALLOWANCES,
         ];
         let dir = tempfile::tempdir().unwrap();
         let conn = open(dir.path()).unwrap();
@@ -705,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn a_v3_database_migrates_to_v4_keeping_its_rows() {
+    fn a_v3_database_migrates_to_v5_keeping_its_rows() {
         let dir = tempfile::tempdir().unwrap();
         let rows = [
             "SELECT issuer, subject, actor_key, login_key, data FROM accounts",
@@ -741,28 +797,167 @@ mod tests {
         drop(v3);
 
         let conn = open(dir.path()).unwrap();
-        assert_eq!(user_version(&conn), 4);
+        assert_eq!(user_version(&conn), 5);
         assert_eq!(dump(&conn), before, "every row as it was");
         let passkeys: i64 = conn.query_row("SELECT count(*) FROM passkeys", [], |r| r.get(0)).unwrap();
         assert_eq!(passkeys, 0);
         let fresh = Connection::open_in_memory().unwrap();
-        fresh.execute_batch(&format!("{SCHEMA_V3}{PASSKEYS}")).unwrap();
-        assert_eq!(schema_of(&conn), schema_of(&fresh), "as a database created at version 4");
+        fresh.execute_batch(&format!("{SCHEMA_V3}{PASSKEYS}{ALLOWANCES}")).unwrap();
+        assert_eq!(schema_of(&conn), schema_of(&fresh), "as a database created at version 5");
+    }
+
+    #[test]
+    fn a_v4_database_migrates_to_v5_keeping_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let v4 = Connection::open(path(dir.path())).unwrap();
+        v4.execute_batch(&format!(
+            "{SCHEMA_V3}{PASSKEYS}PRAGMA user_version = 4; \
+             INSERT INTO accounts (issuer, subject, actor_key, login_key, data) VALUES ('https://idp', 's1', 'corp:alice', 'alice', '{{}}'); \
+             INSERT INTO tokens (id, sha256, actor_key, name, data) VALUES ('t1', 'h1', 'corp:alice', 'n1', '{{}}'); \
+             INSERT INTO oauth_clients (client_id, data) VALUES ('c1', '{{}}'); \
+             INSERT INTO auth_events (at, kind, actor, detail) VALUES (1, 'passkey_registered', 'corp:alice', 'why'); \
+             INSERT INTO passkeys (credential, issuer, subject, actor_key, algorithm, public_key, counter, created_at, last_used_at) \
+             VALUES ('c', 'https://idp', 's1', 'corp:alice', -7, x'0102', 3, 4, 5);"
+        ))
+        .unwrap();
+        let dump = |conn: &Connection| -> Vec<String> {
+            [
+                "SELECT issuer || subject || actor_key || login_key || data FROM accounts",
+                "SELECT id || sha256 || actor_key || name || data FROM tokens",
+                "SELECT client_id || data FROM oauth_clients",
+                "SELECT at || kind || actor || detail FROM auth_events",
+                "SELECT credential || issuer || subject || actor_key || algorithm || hex(public_key) || counter \
+                 || created_at || last_used_at FROM passkeys",
+            ]
+            .iter()
+            .map(|sql| conn.query_row(sql, [], |r| r.get(0)).unwrap())
+            .collect()
+        };
+        let before = dump(&v4);
+        drop(v4);
+
+        let conn = open(dir.path()).unwrap();
+        assert_eq!(user_version(&conn), 5);
+        assert_eq!(dump(&conn), before, "every row as it was");
+        let allowances: i64 = conn.query_row("SELECT count(*) FROM passkey_allowances", [], |r| r.get(0)).unwrap();
+        assert_eq!(allowances, 0);
+        let fresh = Connection::open_in_memory().unwrap();
+        fresh.execute_batch(&format!("{SCHEMA_V3}{PASSKEYS}{ALLOWANCES}")).unwrap();
+        assert_eq!(schema_of(&conn), schema_of(&fresh), "as a database created at version 5");
+    }
+
+    #[test]
+    fn a_fresh_database_has_the_schema_of_a_migrated_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path()).unwrap();
+        assert_eq!(user_version(&conn), VERSION);
+        let v3 = tempfile::tempdir().unwrap();
+        let old = Connection::open(path(v3.path())).unwrap();
+        old.execute_batch(&format!("{SCHEMA_V3}PRAGMA user_version = 3;")).unwrap();
+        drop(old);
+        assert_eq!(schema_of(&conn), schema_of(&open(v3.path()).unwrap()));
     }
 
     #[test]
     fn the_rollback_leaves_exactly_the_v3_schema() {
         let dir = tempfile::tempdir().unwrap();
         let conn = open(dir.path()).unwrap();
-        assert_eq!(user_version(&conn), 4);
+        assert_eq!(user_version(&conn), VERSION);
+        conn.execute_batch(ROLLBACK_V5).unwrap();
         conn.execute_batch(ROLLBACK).unwrap();
         let v3 = Connection::open_in_memory().unwrap();
         v3.execute_batch(SCHEMA_V3).unwrap();
         assert_eq!(schema_of(&conn), schema_of(&v3));
         assert_eq!(user_version(&conn), 3);
         drop(conn);
-        // And the next open brings it back to version 4.
-        assert_eq!(user_version(&open(dir.path()).unwrap()), 4);
+        // And the next open brings it back to this version.
+        assert_eq!(user_version(&open(dir.path()).unwrap()), VERSION);
+    }
+
+    #[test]
+    fn the_rollback_leaves_exactly_the_v4_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path()).unwrap();
+        assert_eq!(user_version(&conn), 5);
+        allow(&conn, "s1", "a1", i64::MAX);
+        conn.execute_batch(ROLLBACK_V5).unwrap();
+        let v4 = Connection::open_in_memory().unwrap();
+        v4.execute_batch(&format!("{SCHEMA_V3}{PASSKEYS}")).unwrap();
+        assert_eq!(schema_of(&conn), schema_of(&v4), "the table and its index gone");
+        assert_eq!(user_version(&conn), 4);
+        drop(conn);
+        // And the next open brings it back to version 5, with no allowance.
+        let conn = open(dir.path()).unwrap();
+        assert_eq!(user_version(&conn), 5);
+        assert!(allowances(&conn).is_empty());
+    }
+
+    #[test]
+    fn a_table_left_by_a_partial_rollback_fails_the_open_and_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = open(dir.path()).unwrap();
+        allow(&conn, "s1", "stale", i64::MAX);
+        // Only the version set back, at each version that adds the table.
+        for (version, sql) in [(4, "PRAGMA user_version = 4"), (3, "DROP TABLE passkeys; PRAGMA user_version = 3")] {
+            conn.execute_batch(sql).unwrap();
+            let schema = schema_of(&conn);
+            let e = open(dir.path()).unwrap_err().to_string();
+            assert!(e.contains("passkey_allowances") && e.contains("server.db"), "{e}");
+            assert_eq!(user_version(&conn), version, "not moved");
+            assert_eq!(schema_of(&conn), schema, "nothing half-done");
+            assert_eq!(allowances(&conn), ["stale"], "its row neither adopted nor dropped");
+        }
+    }
+
+    /// An allowance of `subject`, as a row.
+    fn allow(conn: &Connection, subject: &str, id: &str, expires_at: i64) {
+        conn.execute(
+            "INSERT INTO passkey_allowances (issuer, subject, id, created_at, expires_at) \
+             VALUES ('https://idp', ?1, ?2, 0, ?3)",
+            rusqlite::params![subject, id, expires_at],
+        )
+        .unwrap();
+    }
+
+    /// The ids of the allowances, in order.
+    fn allowances(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn.prepare("SELECT id FROM passkey_allowances ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn allowances_that_ran_out_are_pruned_in_batches_with_no_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open(dir.path()).unwrap();
+        let later = Timestamp::now().plus(Duration::from_secs(60)).millis();
+        for i in 0..PRUNE_BATCH + 3 {
+            // The oldest first, whatever order they were added in.
+            allow(&conn, &format!("old-{i}"), &format!("old-{i:04}"), PRUNE_BATCH + 3 - i);
+        }
+        allow(&conn, "just-now", "just-now", Timestamp::now().millis());
+        allow(&conn, "live", "live", later);
+        write(dir.path(), &mut conn, prune_allowances).unwrap();
+        assert_eq!(
+            allowances(&conn),
+            ["just-now", "live", "old-0000", "old-0001", "old-0002"],
+            "a batch a write, the oldest first"
+        );
+        write(dir.path(), &mut conn, prune_allowances).unwrap();
+        assert_eq!(allowances(&conn), ["live"]);
+        let events: i64 = conn.query_row("SELECT count(*) FROM auth_events", [], |r| r.get(0)).unwrap();
+        assert_eq!(events, 0, "running out records nothing");
+    }
+
+    #[test]
+    fn erasing_an_allowance_leaves_the_other_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = open(dir.path()).unwrap();
+        allow(&conn, "s1", "a1", i64::MAX);
+        allow(&conn, "s2", "a2", i64::MAX);
+        write(dir.path(), &mut conn, |tx| erase_allowance(tx, "https://idp", "s1")).unwrap();
+        assert_eq!(allowances(&conn), ["a2"]);
+        write(dir.path(), &mut conn, |tx| erase_allowance(tx, "https://other", "s2")).unwrap();
+        assert_eq!(allowances(&conn), ["a2"], "another issuer's subject");
     }
 
     #[test]

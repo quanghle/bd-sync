@@ -288,6 +288,9 @@ mod tests {
                 "/srv/bd",
             ],
             &["bd", "serve", "passkey", "remove", "--account", "corp:alice", "--root", "/srv/bd"],
+            &["bd", "serve", "passkey", "allow-add", "--account", "corp:alice", "--root", "/srv/bd"],
+            &["bd", "serve", "passkey", "allow-add", "--account", "corp:alice", "--for", "5m", "--root", "/srv/bd"],
+            &["bd", "serve", "passkey", "allow-add", "--account", "corp:alice", "--cancel", "--root", "/srv/bd"],
         ] {
             let cmd = Cli::try_parse_from(args).unwrap().command;
             assert_eq!(access(&cmd), Access::Local, "{args:?}");
@@ -300,6 +303,21 @@ mod tests {
             panic!("not serve passkey remove")
         };
         assert_eq!((a.account.as_str(), a.credential), ("a", None));
+        let parsed = |extra: &[&'static str]| {
+            let args = ["bd", "serve", "passkey", "allow-add", "--account", "a", "--root", "r"];
+            let cmd = Cli::try_parse_from(args.iter().chain(extra)).unwrap();
+            let Command::Serve(ServeArgs { action: Some(ServeAction::Passkey(PasskeyCommand::AllowAdd(a))), .. }) =
+                cmd.command
+            else {
+                panic!("not serve passkey allow-add")
+            };
+            (a.for_, a.cancel)
+        };
+        assert_eq!(parsed(&[]), (None, false));
+        assert_eq!(parsed(&["--for", "5m"]), (Some("5m".to_string()), false));
+        assert_eq!(parsed(&["--cancel"]), (None, true));
+        let both = ["bd", "serve", "passkey", "allow-add", "--account", "a", "--root", "r", "--for", "5m", "--cancel"];
+        assert!(Cli::try_parse_from(both).is_err(), "--for and --cancel exclude each other");
     }
 
     #[test]

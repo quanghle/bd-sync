@@ -326,9 +326,10 @@ consent page and more.
   which, or insist on a biometric. No attestation is asked for or checked:
   bd does not know which authenticator holds a passkey, and does not
   restrict authenticators.
-- **Adding a passkey needs one of the account's.** An account with 1 to
-  98 passkeys may add one at an approval, in the same `POST` as a
-  verified assertion of one of its passkeys; new passkey fields on a page
+- **Adding a passkey needs one of the account's, unless an admin allows
+  it (the next item).** An account with 1 to 98 passkeys may add one at an
+  approval, in the same `POST` as a verified assertion of one of its
+  passkeys; new passkey fields on a page
   that did not offer adding are refused. The new passkey's registration
   is checked as a first one is (the client data's type, its own challenge,
   a second 32 random bytes kept and spent with the approval, the origin,
@@ -345,6 +346,39 @@ consent page and more.
   a refusal) keeps the added passkey and approves nothing, as a
   first-use registration is kept: accepted, since the person can approve
   again with either passkey.
+- **An admin's allowance stands in for that passkey, once.** `bd serve
+  passkey allow-add`, on the server host and never through a token,
+  `/v2/exec` or MCP, allows an account with 1 to 98 passkeys to register
+  one without an existing one, for 15 minutes unless told otherwise and
+  at most an hour. An account has one allowance at most, a row of
+  `server.db` that a second grant replaces and `--cancel` ends. Every check
+  above that comes before the passkey is unchanged. The page then asks for
+  a registration against a third challenge of its own, 32 random bytes kept
+  and spent with the approval. Only `allow_*` fields in the `POST` select
+  this path, and where the page was not opened under an allowance (an
+  ordinary page, a first registration, a page offering the add, one opened
+  before the grant) they are refused before anything else in the form is
+  read. A `POST` that carries an assertion's fields as well is refused.
+  The registration is checked as a first one is (the client data's type,
+  that challenge alone, the origin, no cross-origin frame, the relying
+  party id hash, the user-present and user-verified flags, ES256 or RS256).
+  Then one `server.db` transaction checks that the account still exists,
+  that the very allowance the page was opened under is still live (a
+  cancel and a new grant make another one), that the account holds fewer
+  than 99 passkeys and that the credential id is not registered, removes
+  the allowance, stores the passkey and records a `passkey_registered`
+  event naming the allowance. So two posts under one allowance register at
+  most one passkey. A refusal at any of these checks stores nothing and
+  approves nothing. The approval runs only after that commit, and a
+  workspace failure after it keeps the passkey, with the allowance spent,
+  and approves nothing: the person approves again with the new passkey.
+  The page's second button, `Use an existing passkey instead`, is the
+  ordinary assertion and leaves the allowance live. A live allowance
+  always has a passkey beside it: `allow-add` refuses an account with
+  none, and removing an account's last passkey ends its allowance in the
+  same transaction, so a first registration cannot be followed by a
+  second with no assertion. The allowance's id is no secret: it is never
+  accepted from a form and never shown on a page.
 - **Passkeys only at a host name over https.** The relying party id is the
   host of the public URL (`--public-url`, else `[oauth]`'s issuer).
   Browsers refuse passkeys at an IP address, so there, and for plain http
@@ -355,8 +389,10 @@ consent page and more.
   `credential`, the first 12 characters of the credential id once the
   posted one has been read (empty before), so an admin can tell which
   passkey approved or failed, and `added`, the first 12 characters of a
-  passkey added at that approval (empty otherwise); never the whole id,
-  the public key, the signature or the client data.
+  passkey added at that approval (empty otherwise). Under an allowance
+  `credential` is the new passkey's, `added` stays empty, and `passkey`
+  says `registered under allowance` or `allowance: <reason>`. Never the
+  whole id, the public key, the signature or the client data.
 - **Emails are never shown or logged.** The page shows the provider and
   actor; the logs name the provider, subject, login, actor, workspace and
   gate.
@@ -420,9 +456,11 @@ Residual risks, accepted:
   --account <actor or login> [--credential <prefix>]` (without
   `--credential`, every passkey of the account), on the server host; the
   account's next approval registers again. A lost device is recovered the
-  same way. Another passkey can be added only at an approval, backed by a
-  verified assertion of one of the account's passkeys in the same `POST`
-  (at most 99 an account). So someone holding the provider account who
+  same way.
+  Without an admin's allowance (below), another passkey can be added only at an
+  approval, backed by a verified assertion of one of the account's passkeys in
+  the same `POST` (at most 99 an account). So someone holding the provider
+  account who
   gets the person to complete the existing passkey's prompt for them (the
   cross-device prompt on the person's phone, say) can add a passkey of
   their own; a phishing page cannot ask for that assertion, as it is bound
@@ -430,20 +468,82 @@ Residual risks, accepted:
   events whose detail names a vouching credential (`added at a browser
   approval with credential <prefix>`) on an add no one expected, and
   remove the passkey as above.
+- **An allowance is a window on the provider account.** Whoever holds the
+  provider account while an allowance is live gets a lasting passkey and
+  one approval, with no existing passkey. This is the feature, and the
+  main risk: it rests on the admin's grant, and is bounded by 15 minutes
+  by default, an hour at most, one registration, the audit trail and
+  removal. While one is live, an approval needs no existing passkey, so
+  what a passkey adds to a sensitive gate is weaker for that window:
+  approvers of such gates should treat a grant as an exception. After each
+  one, review `passkey_registered` events
+  ([Server logs](observability.md#server-logs)), and remove a passkey no
+  one recognizes with `bd serve passkey remove --account <actor or login>
+  --credential <prefix>`.
+- **An admin can be talked into granting.** Confirm the request with the
+  person some other way than through the account, and grant only when the
+  person is ready.
+- **A window can be left open** after the person gave up, or chose an
+  existing passkey, which spends nothing. It runs out by itself, `--cancel`
+  ends it, and `bd serve passkey list` shows it.
+- **The page shows that a window is live** to whoever signed in as the
+  account. The owner has to be told, and it tells an attacker who already
+  signed in little.
+- **The admin who granted is not named** in the events, as for
+  `passkey_removed`: `bd serve passkey` runs on the host, as no actor, so
+  the host's own logs are the record.
+- **A window needs something to approve.** A passkey is registered only
+  at an approval, so an account with no gate or operation waiting for it
+  cannot use one, and an admin may have to make one.
+- **The wrong authenticator can spend it.** On a device with several
+  authenticators a person may register the wrong one: that passkey still
+  works, or the admin removes it, and can grant again. An authenticator
+  may also keep a credential the server refused, which is inert: the
+  server holds nothing of it.
+- **An allowance survives `bd serve token revoke --account` without
+  `--forget`.** Revoking ends tokens, and using an allowance takes a new
+  sign-in at the provider. An admin who suspects an account should also run
+  `bd serve passkey allow-add --account <actor or login> --cancel`.
 - **A rollback** to a `bd serve` that predates passkeys approves with the
   click alone again. A rollback to one that predates adding passkeys keeps
   every stored passkey usable (any of an account's passkeys approves) and
-  only stops offering the add.
+  only stops offering the add. A rollback to one that predates allowances
+  keeps every stored passkey usable, those registered under an allowance
+  included, and ends the live allowances.
 
-**Rolling back passkeys.** `bd serve` moves `server.db` from schema 3 to 4
-at its first start, adding a `passkeys` table. An older `bd serve`
-refuses schema 4, so to go back:
+**Upgrading to allowances.** `bd serve` moves `server.db` from schema 4 to
+5 at its first start, adding a `passkey_allowances` table (from schema 3
+it adds both tables at once). Any `bd serve token` or `bd serve passkey`
+command migrates a root as well, and an older `bd serve` refuses schema 5
+at its next open of `server.db`. So stop `bd serve`, replace the binary and
+start it, in that order, and do not run `bd serve passkey` from a new
+binary against a root an older server is still serving.
+
+**Rolling back allowances.** To go back to a bd without them:
 
 1. Stop `bd serve` and back up `server.db`.
-2. Run `sqlite3 server.db 'DROP TABLE passkeys; PRAGMA user_version = 3;'`
+2. Run `sqlite3 server.db 'DROP TABLE passkey_allowances; PRAGMA user_version = 4;'`
    in the root.
 3. Start the older bd.
 
+Accounts, tokens, OAuth clients, passkeys and the audit trail survive.
+Passkeys registered under an allowance are ordinary passkeys and stay
+valid; live allowances are gone; events of the new kinds read as `other`;
+open approval pages fail and are opened again. Setting the version alone,
+without the `DROP`, leaves a stale table: the next upgrade fails at start
+naming the table, changing nothing, until it is dropped.
+
+**Rolling back passkeys.** `bd serve` moved `server.db` from schema 3 to 4
+at its first start, adding a `passkeys` table. An older `bd serve`
+refuses schema 4, so to go back from schema 5 to a bd that predates
+passkeys, both tables go:
+
+1. Stop `bd serve` and back up `server.db`.
+2. Run `sqlite3 server.db 'DROP TABLE passkey_allowances; DROP TABLE passkeys; PRAGMA user_version = 3;'`
+   in the root.
+3. Start the older bd.
+
+From schema 4, the same with no `DROP TABLE passkey_allowances`.
 Accounts, tokens, OAuth clients and the audit trail survive; the
 passkeys are gone, and each account registers a new one at its first
 approval after upgrading again.
@@ -492,9 +592,11 @@ human-gate override without a token, so it gets the protections of
   `human` only, no token issued), and the page has the same Content
   Security Policy, framing refusal, focus arming, same-origin `POST` and
   shared sign-in slots.
-- **The same passkeys.** Every Approve needs one of the account's
-  passkeys, those its gate approvals use, verified as for [gate
-  approval](#approving-gates-in-the-browser) (origin, relying party id
+- **The same passkeys.**
+  Without an admin's allowance, every Approve needs one of the account's passkeys,
+  those its gate approvals use,
+  verified as for [gate approval](#approving-gates-in-the-browser) (origin,
+  relying party id
   hash, user verification, a per-approval challenge, the signature, the
   counter by compare-and-set, each form field exactly once) after the
   checks of this section, the request's expiry included, and before the
@@ -507,11 +609,16 @@ human-gate override without a token, so it gets the protections of
   to add one, with the gate page's checks and the same all-or-nothing
   store ([gate approval](#approving-gates-in-the-browser)); a workspace
   failure after the store keeps the added passkey and performs nothing.
-  First-use registration and adding are the residual risks
+  A live allowance works as at a gate, with the same checks and the same
+  one transaction spending it and storing the passkey before the operation
+  is performed; a workspace failure after it keeps the passkey, with the
+  allowance spent, and performs nothing.
+  First-use registration, adding and allowances are the residual risks
   described for gate approval. `operation approval` lines carry
   `credential`, the credential id's first 12 characters once it has been
-  read (empty before), and `added`, an added passkey's first 12
-  characters (empty otherwise), never the whole id, the public key, the
+  read (empty before), `added`, an added passkey's first 12
+  characters (empty otherwise), and, only on an allowance's outcome,
+  `passkey`, never the whole id, the public key, the
   signature or the client data.
 - **Every gate in the way.** The person must be able to open every open
   human gate the operation gets past: one of its approvers when it names
@@ -567,6 +674,12 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   account (`bd serve token revoke --account <login> --forget`, or a
   provider's `account-deleted` notification) erases its passkeys in the
   same transaction.
+- **Passkey allowances.** For an account an admin allowed to register a
+  passkey (`bd serve passkey allow-add`), `server.db` keeps its issuer and
+  subject, a random id, and when the allowance was granted and when it
+  ends, at most an hour later. It goes when it is spent, cancelled or
+  replaced; one that ran out is pruned at the next write; and forgetting
+  the account erases it in the same transaction.
 - **Logins are never emails.** An account's login is the provider's
   `preferred_username` unless that is an email (or otherwise unsuitable),
   else a pseudonym (`u-` and 12 hex digits of a hash of its issuer and
@@ -580,7 +693,7 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
   its login and dates are all it holds. A registered OAuth client never
   used within a day, or unused for 90 days, is deleted.
 - **Erasure.** `bd serve token revoke --account <login> --forget` deletes
-  the account and every token and passkey of it. Deleted rows are
+  the account and every token, passkey and allowance of it. Deleted rows are
   overwritten (`secure_delete`) and the write-ahead log is emptied, so
   nothing of them stays in the database's files (if `bd serve` is reading
   at that moment, its next checkpoint does it, and the command says so). A
@@ -590,7 +703,8 @@ minimization, as in GDPR Art. 5(1)(c) and OIDC Core §17.1).
 - **Audit trail.** `server.db` records each sign-in (one to approve a gate
   in a browser too, as a `signed_in` event without a token), token
   created, refresh, revocation (and why), account forgotten, linked or
-  named, passkey registered or removed, and client registered, in the same
+  named, passkey registered or removed, passkey allowance granted or
+  cancelled, and client registered, in the same
   transaction as the change, for 90 days (client registrations, which
   anyone may make: the latest 5000). `bd serve token events` shows it. An
   event names the actor, provider, subject, token and client, never a

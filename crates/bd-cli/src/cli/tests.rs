@@ -253,6 +253,7 @@ fn duration_and_time_flags_name_their_value() {
         ("bd serve", "backup-every"),
         ("bd serve", "max-wait"),
         ("bd serve token events", "since"),
+        ("bd serve passkey allow-add", "for"),
         ("bd list", "stale"),
         ("bd ready", "stale"),
     ];
@@ -407,6 +408,7 @@ fn commands_that_are_not_obvious_have_long_help_and_examples() {
         "bd serve token name",
         "bd serve passkey list",
         "bd serve passkey remove",
+        "bd serve passkey allow-add",
         "bd remote set",
         "bd remote login",
         "bd remote logout",

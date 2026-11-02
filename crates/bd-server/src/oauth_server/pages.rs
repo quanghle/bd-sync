@@ -224,6 +224,88 @@ form.submit();\
 }\
 })();";
 
+/// The approval pages' script under a live allowance, used only for
+/// [`PasskeyAsk::Allow`], so that [`APPROVE`] and every other page stay as
+/// they are: [`ARMING`]'s focus rule on both buttons, what the server gave it
+/// read only from the form's and the status line's escaped `data-` attributes,
+/// and messages written with `textContent` alone. Both buttons are rendered
+/// disabled.
+///
+/// Approve runs `create()` with the allowance's challenge, the account's user
+/// handle and name, and its passkeys as `excludeCredentials`, then enables and
+/// fills the five `allow_*` fields (rendered disabled, so that nothing else
+/// sends them) and posts them. The second button runs `get()` with the
+/// assertion's challenge and posts the assertion, the `allow_*` fields left
+/// disabled, so nothing is spent. Where the browser cannot register a passkey
+/// (no `getPublicKey`) the second button is hidden, the page says so, and
+/// Approve runs that `get()`. A `create()` that failed disables the `allow_*`
+/// fields again and posts nothing, so the same page can try again; one
+/// refused because this device holds a passkey of the account
+/// (`InvalidStateError`) points at the second button, and never starts `get()`
+/// by itself: a new prompt needs its own click.
+pub(crate) const APPROVE_ALLOWANCE: &str = "(function(){\
+var since=document.hasFocus()?Date.now():0;\
+addEventListener('focus',function(){since=Date.now();});\
+addEventListener('blur',function(){since=0;});\
+document.addEventListener('visibilitychange',function(){\
+since=!document.hidden&&document.hasFocus()?Date.now():0;});\
+var form=document.querySelector('form.actions');\
+var status=document.querySelector('p[role=status]');\
+if(!form||!status)return;\
+var buttons=form.querySelectorAll('button'),button=buttons[0],other=buttons[1];\
+var d=form.dataset,m=status.dataset;\
+var allows=['allow_credential','allow_client_data','allow_authenticator_data','allow_public_key','allow_algorithm'];\
+function say(t){status.textContent=t||'';}\
+function bytes(s){s=(s||'').replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';\
+var b=atob(s),u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;}\
+function text(buf){var u=new Uint8Array(buf),s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);\
+return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}\
+function put(name,value){form.elements[name].value=value;}\
+function known(){return(d.credentials||'').split(' ').filter(Boolean).map(function(c){return{type:'public-key',id:bytes(c)};});}\
+function quiet(){for(var i=0;i<allows.length;i++)form.elements[allows[i]].disabled=true;}\
+function asking(){busy=true;button.disabled=true;other.disabled=true;say(m.waiting);}\
+function done(){busy=false;button.disabled=false;if(!other.hidden)other.disabled=false;}\
+function existing(){\
+navigator.credentials.get({publicKey:{rpId:d.rp,challenge:bytes(d.challenge),\
+allowCredentials:known(),userVerification:'required',timeout:300000}}).then(function(c){\
+var r=c.response;\
+put('credential',text(c.rawId));\
+put('client_data',text(r.clientDataJSON));\
+put('authenticator_data',text(r.authenticatorData));\
+put('signature',text(r.signature));\
+form.submit();\
+}).catch(function(){done();say(m.cancelled);});\
+}\
+var registers=window.AuthenticatorAttestationResponse&&\
+typeof AuthenticatorAttestationResponse.prototype.getPublicKey==='function';\
+if(!window.PublicKeyCredential||!navigator.credentials){other.hidden=true;say(m.unsupported);return;}\
+var busy=false;\
+button.disabled=false;\
+if(registers)other.disabled=false;\
+else{other.hidden=true;say(m.noRegister);}\
+form.addEventListener('submit',function(e){\
+e.preventDefault();\
+if(busy||!since||Date.now()-since<600)return;\
+asking();\
+if(!registers){existing();return;}\
+navigator.credentials.create({publicKey:{rp:{id:d.rp,name:'bd'},\
+user:{id:bytes(d.user),name:d.name,displayName:d.name},challenge:bytes(d.allowChallenge),\
+pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],excludeCredentials:known(),\
+authenticatorSelection:{userVerification:'required',residentKey:'preferred'},\
+attestation:'none',timeout:300000}}).then(function(c){\
+var r=c.response,k=r.getPublicKey();if(!k)throw new Error('no public key');\
+var v=[text(c.rawId),text(r.clientDataJSON),text(r.getAuthenticatorData()),text(k),String(r.getPublicKeyAlgorithm())];\
+for(var i=0;i<allows.length;i++){var f=form.elements[allows[i]];f.disabled=false;f.value=v[i];}\
+form.submit();\
+}).catch(function(e){quiet();done();say(e&&e.name==='InvalidStateError'?m.held:m.cancelled);});\
+});\
+other.addEventListener('click',function(){\
+if(busy||!since||Date.now()-since<600)return;\
+asking();\
+existing();\
+});\
+})();";
+
 /// What the approval pages say about the passkey every approval needs. No
 /// copy here names a person (`a_passkeys_copy_names_no_one`).
 pub const PASSKEY_ENROLL: &str = "Approving first registers a passkey for this account: the browser asks for a \
@@ -251,6 +333,16 @@ pub const PASSKEY_ADD_OPTION: &str = "Also add a passkey on this device";
 pub const PASSKEY_ADD_NEXT: &str = "The passkey was checked. Press Add the passkey and approve to register a passkey \
 on this device and approve.";
 pub const PASSKEY_ADD_BUTTON: &str = "Add the passkey and approve";
+pub const PASSKEY_ALLOW: &str = "An admin allowed this account to add a passkey: approving registers a new passkey on \
+this device, and the browser asks for a fingerprint, face or device PIN. Anyone who did not ask for this should use \
+an existing passkey instead, and tell the admin.";
+pub const PASSKEY_ALLOW_EXISTING: &str = "Use an existing passkey instead";
+pub const PASSKEY_ALLOW_NO_REGISTER: &str = "This browser can't register a passkey, so the admin's allowance can't be \
+used from it. Approving asks for a passkey this account already has.";
+pub const PASSKEY_ALLOW_HELD: &str = "This device already has a passkey for this account, so a new one can't be \
+registered on it. Press Use an existing passkey instead.";
+pub const PASSKEY_ALLOW_ENDED: &str = "The admin's allowance has ended, so no passkey was registered and nothing was \
+approved. Ask the admin again, or open the link again to use an existing passkey.";
 
 /// The passkey ceremony an approval page asks for.
 #[derive(Clone, Debug)]
@@ -267,13 +359,19 @@ pub enum PasskeyAsk<'a> {
     /// Use one of the account's passkeys (`get()`), by credential id
     /// (base64url); with `add`, also offer to add a passkey on this device.
     Assert { challenge: String, rp_id: &'a str, credentials: &'a [String], add: Option<PasskeyAdd<'a>> },
+    /// A live allowance: register a passkey on this device with no existing
+    /// one (`create()` with `excludeCredentials`), `register` holding its
+    /// challenge, or, the secondary path, use one of the account's passkeys
+    /// (`get()`) as [`PasskeyAsk::Assert`] does. Nothing here names the
+    /// allowance.
+    Allow { challenge: String, rp_id: &'a str, credentials: &'a [String], register: PasskeyAdd<'a> },
     /// The server's address cannot be a relying party: no form, a notice.
     Unavailable { why: crate::webauthn::NoRp },
 }
 
-/// What an approval page offers for adding a passkey on this device after
-/// one of the account's passkeys was used (`create()` with
-/// `excludeCredentials`).
+/// What an approval page offers for adding a passkey on this device
+/// (`create()` with `excludeCredentials`): after one of the account's
+/// passkeys was used, or under an allowance.
 #[derive(Clone, Debug)]
 pub struct PasskeyAdd<'a> {
     /// Its own challenge and the account's user handle, base64url.
@@ -319,6 +417,21 @@ fn approval_form(action: &str, id: &str, ask: &PasskeyAsk<'_>) -> (String, Strin
             }
             ("get", data, PASSKEY_ASSERT, add.as_ref())
         }
+        PasskeyAsk::Allow { challenge, rp_id, credentials, register } => (
+            "allow",
+            format!(
+                " data-challenge=\"{}\" data-rp=\"{}\" data-credentials=\"{}\" data-allow-challenge=\"{}\" \
+data-user=\"{}\" data-name=\"{}\"",
+                escape(challenge),
+                escape(rp_id),
+                escape(&credentials.join(" ")),
+                escape(&register.challenge),
+                escape(&register.user),
+                escape(register.name)
+            ),
+            PASSKEY_ALLOW,
+            None,
+        ),
         PasskeyAsk::Unavailable { why } => {
             let why = match why {
                 crate::webauthn::NoRp::IpLiteral => PASSKEY_UNAVAILABLE_HOST,
@@ -348,6 +461,24 @@ fn approval_form(action: &str, id: &str, ask: &PasskeyAsk<'_>) -> (String, Strin
         );
         added = format!(" data-added=\"{}\"", escape(PASSKEY_ADD_NEXT));
     }
+    // Under an allowance: its fields rendered disabled, so that only the
+    // script's registration, enabling them, sends them, and the second
+    // button; the status line's two messages of its own.
+    let mut script = APPROVE;
+    if matches!(ask, PasskeyAsk::Allow { .. }) {
+        for name in
+            ["allow_credential", "allow_client_data", "allow_authenticator_data", "allow_public_key", "allow_algorithm"]
+        {
+            fields.push_str(&format!("<input type=\"hidden\" name=\"{name}\" value=\"\" disabled>\n"));
+        }
+        adding = format!("<button type=\"button\" disabled>{}</button>\n", escape(PASSKEY_ALLOW_EXISTING));
+        added = format!(
+            " data-held=\"{}\" data-no-register=\"{}\"",
+            escape(PASSKEY_ALLOW_HELD),
+            escape(PASSKEY_ALLOW_NO_REGISTER)
+        );
+        script = APPROVE_ALLOWANCE;
+    }
     let actions = format!(
         "<form method=\"post\" action=\"{action}\" class=\"actions\" data-passkey=\"{mode}\"{data}>\n\
 {fields}<button type=\"submit\" class=\"primary\" disabled>Approve</button>\n\
@@ -364,7 +495,7 @@ data-cancelled=\"{}\"{added}></p>\n",
         escape(PASSKEY_WAITING),
         escape(PASSKEY_CANCELLED),
     );
-    (actions, body, Some(APPROVE))
+    (actions, body, Some(script))
 }
 
 /// What vouches for a client being who it says.
@@ -1240,6 +1371,12 @@ mod tests {
         PasskeyAsk::Assert { challenge: "Y2hhbGxlbmdl".into(), rp_id: "bd.example.com", credentials, add: Some(add) }
     }
 
+    /// The ceremony under a live allowance, with the account's `credentials`,
+    /// registering with `register`.
+    fn allow_with<'a>(credentials: &'a [String], register: PasskeyAdd<'a>) -> PasskeyAsk<'a> {
+        PasskeyAsk::Allow { challenge: "Y2hhbGxlbmdl".into(), rp_id: "bd.example.com", credentials, register }
+    }
+
     #[test]
     fn pages_escape_what_they_show() {
         assert_eq!(escape(r#"<a href="x">'&'</a>"#), "&lt;a href=&quot;x&quot;&gt;&#39;&amp;&#39;&lt;/a&gt;");
@@ -1529,6 +1666,31 @@ mod tests {
                         &credentials,
                         PasskeyAdd {
                             challenge: "YWRkLWNoYWxsZW5nZQ".into(),
+                            user: "dXNlcg".into(),
+                            name: "github:octocat",
+                        },
+                    ),
+                }),
+            ),
+            (
+                "approve-gate-allowance",
+                "Approving a human gate under an admin's allowance to register a passkey",
+                approve_gate(&ApproveGate {
+                    workspace: "proj",
+                    gate: "proj-a1b2",
+                    title: "Release sign-off",
+                    holds: &[("proj-c3d4".to_string(), "Deploy to production".to_string(), "open".to_string())],
+                    part_of: None,
+                    approvers: Some(&["github:octocat".to_string()]),
+                    provider: "GitHub",
+                    actor: "github:octocat",
+                    id: "c0ffee",
+                    action: "https://bd.example.com/w/proj/gates/proj-a1b2",
+                    packet: None,
+                    passkey: allow_with(
+                        &credentials,
+                        PasskeyAdd {
+                            challenge: "YWxsb3ctY2hhbGxlbmdl".into(),
                             user: "dXNlcg".into(),
                             name: "github:octocat",
                         },
@@ -1963,6 +2125,160 @@ data-user=\"dXNlcg\" data-name=\"github:octocat\">\n<input type=\"hidden\" name=
     }
 
     #[test]
+    fn the_allowance_page_registers_with_its_own_script_and_keeps_the_assertion() {
+        let script = STANDARD.encode(Sha256::digest(APPROVE_ALLOWANCE.as_bytes()));
+        let evil = "\"><script>alert(1)</script>";
+        let shown = "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;";
+        let credentials = [evil.to_string(), "AAAAAAAAAAAAx1zQ".to_string()];
+        let register = || PasskeyAdd { challenge: evil.into(), user: evil.into(), name: evil };
+        let hostile = || PasskeyAsk::Allow {
+            challenge: evil.into(),
+            rp_id: evil,
+            credentials: &credentials,
+            register: register(),
+        };
+        for page in [gate_asking(hostile()), operation_asking(hostile())] {
+            let html = &page.html;
+            assert_eq!(page.status, 200);
+            assert!(html.contains("data-passkey=\"allow\""), "{html}");
+            for attribute in ["data-challenge", "data-rp", "data-allow-challenge", "data-user", "data-name"] {
+                assert!(html.contains(&format!("{attribute}=\"{shown}\"")), "{attribute}: {html}");
+            }
+            assert!(html.contains(&format!("data-credentials=\"{shown} AAAAAAAAAAAAx1zQ\"")), "{html}");
+            assert!(!html.contains("<script>alert"), "{html}");
+            // Its own script, under its own hash: not APPROVE's.
+            assert_eq!(html.matches("<script").count(), 1, "{html}");
+            assert_eq!(script_of(&page), APPROVE_ALLOWANCE);
+            assert!(page.csp.contains(&format!("; script-src 'sha256-{script}';")), "{}", page.csp);
+            assert_eq!(page.csp.matches("sha256-").count(), 2, "the style and this script: {}", page.csp);
+            // Both buttons rendered disabled; the second no primary action, and it posts nothing by itself.
+            assert_eq!(html.matches("<button").count(), 2, "{html}");
+            assert!(html.contains("<button type=\"submit\" class=\"primary\" disabled>Approve</button>"), "{html}");
+            let second = format!("<button type=\"button\" disabled>{}</button>", escape(PASSKEY_ALLOW_EXISTING));
+            assert!(html.contains(&second), "{html}");
+            // The six hidden fields as ever, the five of its own disabled, nothing of adding.
+            for name in ["credential", "client_data", "authenticator_data", "signature", "public_key", "algorithm"] {
+                assert!(html.contains(&format!("<input type=\"hidden\" name=\"{name}\" value=\"\">")), "{name}");
+            }
+            for name in [
+                "allow_credential",
+                "allow_client_data",
+                "allow_authenticator_data",
+                "allow_public_key",
+                "allow_algorithm",
+            ] {
+                assert!(
+                    html.contains(&format!("<input type=\"hidden\" name=\"{name}\" value=\"\" disabled>")),
+                    "{name}"
+                );
+            }
+            assert_eq!(html.matches("name=\"allow_").count(), 5, "{html}");
+            for absent in ["name=\"new_", "data-add-challenge", "data-added", "type=\"checkbox\""] {
+                assert!(!html.contains(absent), "{absent}: {html}");
+            }
+            // Its copy, and the status line's two messages of its own.
+            assert!(html.contains(&format!("<p class=\"note\">{}</p>", escape(PASSKEY_ALLOW))), "{html}");
+            assert!(html.contains(&format!("data-held=\"{}\"", escape(PASSKEY_ALLOW_HELD))), "{html}");
+            assert!(html.contains(&format!("data-no-register=\"{}\"", escape(PASSKEY_ALLOW_NO_REGISTER))), "{html}");
+            assert!(
+                html.contains(&format!("<noscript><p class=\"lead\">{}</p></noscript>", escape(PASSKEY_NO_SCRIPT))),
+                "{html}"
+            );
+            assert!(html.contains("role=\"status\" aria-live=\"polite\""), "{html}");
+            // No handlers: attribute names only, as the copy in values says "on this device".
+            for tag in tags(html) {
+                let names = tag.split('"').step_by(2).collect::<Vec<_>>().join(" ");
+                assert!(!names.split_whitespace().skip(1).any(|a| a.to_ascii_lowercase().starts_with("on")), "{tag}");
+            }
+        }
+
+        // Every other page has nothing of it, and keeps APPROVE.
+        let adding = PasskeyAdd { challenge: "YWRk".into(), user: "dXNlcg".into(), name: "github:octocat" };
+        for page in [
+            gate_asking(enroll()),
+            gate_asking(assert_with(&credentials)),
+            gate_asking(assert_adding(&credentials, adding.clone())),
+            operation_asking(assert_adding(&credentials, adding)),
+        ] {
+            assert_eq!(script_of(&page), APPROVE);
+            for absent in ["allow_", "data-allow-challenge", "data-held", "data-no-register", "data-passkey=\"allow\""]
+            {
+                assert!(!page.html.contains(absent), "{absent}: {}", page.html);
+            }
+            assert!(!page.html.contains(&escape(PASSKEY_ALLOW_EXISTING)), "{}", page.html);
+        }
+    }
+
+    /// The part of `script` from `from` up to the `end` after it.
+    fn between<'a>(script: &'a str, from: &str, end: &str) -> &'a str {
+        let start = script.find(from).unwrap_or_else(|| panic!("{from} in {script}"));
+        let rest = &script[start..];
+        &rest[..rest.find(end).unwrap_or_else(|| panic!("{end} after {from} in {script}"))]
+    }
+
+    #[test]
+    fn the_allowance_script_runs_what_it_may_and_nothing_else() {
+        let script = APPROVE_ALLOWANCE;
+        // As APPROVE's: messages as text, nothing it is given run, no handlers in the page.
+        for banned in ["innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "Function(", "document.write"] {
+            assert!(!script.contains(banned), "{banned}");
+        }
+        assert!(script.contains("status.textContent=t||''"));
+        assert!(script.contains("alg:-7") && script.contains("alg:-257") && script.contains("timeout:300000"));
+        assert!(script.contains("attestation:'none'") && script.contains("residentKey:'preferred'"));
+        // One create(), one get(), each requiring user verification.
+        assert_eq!(script.matches("navigator.credentials.create(").count(), 1);
+        assert_eq!(script.matches("navigator.credentials.get(").count(), 1);
+        assert_eq!(script.matches("userVerification:'required'").count(), 2);
+        // The registration: the allowance's challenge alone, the account's passkeys excluded.
+        let create = between(script, "navigator.credentials.create(", ".then(");
+        assert!(create.contains("challenge:bytes(d.allowChallenge)") && create.contains("excludeCredentials:known()"));
+        assert!(!create.contains("d.challenge") && !create.contains("allowCredentials"));
+        assert!(script.contains("user:{id:bytes(d.user),name:d.name,displayName:d.name}"));
+        // The assertion: the page's challenge alone, and it never touches the allowance's fields.
+        let get = between(script, "function existing(){", "var registers=");
+        assert!(get.contains("challenge:bytes(d.challenge)") && get.contains("allowCredentials:known()"));
+        assert!(!get.contains("allowChallenge") && !get.contains("allows"), "{get}");
+        // The allowance's fields are enabled in one place, right before they are posted, and disabled on any failure.
+        assert_eq!(script.matches("f.disabled=false").count(), 1);
+        let filled = between(script, "for(var i=0;i<allows.length;i++){var f=", "}).catch(");
+        assert!(filled.contains("f.value=v[i];") && filled.contains("form.submit();"));
+        assert!(
+            script
+                .contains("function quiet(){for(var i=0;i<allows.length;i++)form.elements[allows[i]].disabled=true;}")
+        );
+        // A device that holds a passkey is told so, and a new prompt takes its own click.
+        let caught = between(script, ".catch(function(e){", "other.addEventListener");
+        assert!(caught.contains("quiet();") && caught.contains("e.name==='InvalidStateError'?m.held:m.cancelled"));
+        assert!(!caught.contains("existing("), "{caught}");
+        // The focus rule on both buttons, and neither starts a ceremony while another runs.
+        assert_eq!(script.matches("if(busy||!since||Date.now()-since<600)return;").count(), 2);
+        let click = between(script, "other.addEventListener('click',", "})();");
+        assert!(click.contains("if(busy||!since||Date.now()-since<600)return;") && click.contains("existing();"));
+        assert!(!click.contains("navigator.credentials.create"), "{click}");
+    }
+
+    #[test]
+    fn a_browser_that_cannot_register_is_told_so_and_can_still_assert() {
+        let script = APPROVE_ALLOWANCE;
+        assert!(script.contains(
+            "var registers=window.AuthenticatorAttestationResponse&&\
+typeof AuthenticatorAttestationResponse.prototype.getPublicKey==='function';"
+        ));
+        // No passkeys at all: the second button hidden, the unsupported message, Approve left disabled.
+        let unusable = "if(!window.PublicKeyCredential||!navigator.credentials){other.hidden=true;say(m.unsupported);\
+return;}";
+        assert!(script.contains(unusable));
+        assert!(script.find(unusable).unwrap() < script.find("var busy=false;button.disabled=false;").unwrap());
+        // Passkeys but no registering: the second button hidden, the notice said, Approve running get() alone.
+        assert!(script.contains("if(registers)other.disabled=false;else{other.hidden=true;say(m.noRegister);}"));
+        let submit = between(script, "form.addEventListener('submit',", "navigator.credentials.create(");
+        assert!(submit.contains("if(!registers){existing();return;}"), "{submit}");
+        // Disabled only until the page's own failure gives both back, a hidden button staying out of it.
+        assert!(script.contains("if(!other.hidden)other.disabled=false;"));
+    }
+
+    #[test]
     fn a_passkeys_copy_names_no_one() {
         const PRONOUNS: [&str; 10] = ["i", "me", "my", "we", "our", "us", "you", "your", "yours", "you're"];
         for copy in [
@@ -1979,6 +2295,11 @@ data-user=\"dXNlcg\" data-name=\"github:octocat\">\n<input type=\"hidden\" name=
             PASSKEY_ADD_OPTION,
             PASSKEY_ADD_NEXT,
             PASSKEY_ADD_BUTTON,
+            PASSKEY_ALLOW,
+            PASSKEY_ALLOW_EXISTING,
+            PASSKEY_ALLOW_NO_REGISTER,
+            PASSKEY_ALLOW_HELD,
+            PASSKEY_ALLOW_ENDED,
         ] {
             for word in copy.split(|c: char| !c.is_alphanumeric() && c != '\'').filter(|w| !w.is_empty()) {
                 let word = word.to_lowercase().replace('\u{2019}', "'");
@@ -2135,6 +2456,78 @@ class=\"actions\" data-passkey=\"create\"";
         let html = operation_page("proj", None, &[], Some((&one, 1))).html;
         assert!(html.contains("Deletes 1 issue, with no undo") && !html.contains("more</span>"), "{html}");
     }
+
+    // pinned-goldens:begin bd-h6q45.1 S1: never edit; a failure here means production output changed
+    /// An operation approval page with fixed values, asking for `passkey`.
+    fn operation_asking(passkey: PasskeyAsk<'_>) -> Page {
+        approve_operation(&ApproveOperation {
+            workspace: "proj",
+            op_label: "close",
+            issue: "t-1",
+            title: "Ship it",
+            status: "open",
+            part_of: None,
+            reason: Some("Blocked past its gate, on purpose"),
+            requester: "github:hubot",
+            at: 0,
+            failed: false,
+            force: true,
+            gates: &[],
+            deletes: None,
+            provider: "GitHub",
+            actor: "github:octocat",
+            id: "c0ffee",
+            action: "https://bd.example.com/w/proj/close/t-1",
+            passkey,
+        })
+    }
+
+    #[test]
+    fn the_pages_without_an_allowance_are_pinned() {
+        const APPROVE_SCRIPT: &str = "FthMszPRPfefvNe8/2nrVx7xAc3V330zjaEmTszzZ1Q=";
+        const GATE_ENROLL_HTML: &str = "Wd7s2mCcgrdvdn6iURTGseXRa55XLX3a6VurQzAuDBM=";
+        const GATE_ENROLL_CSP: &str = "k2Xtfe+SqoPZy7TXCh+6nOascBm01lrJndgtfTYfIfc=";
+        const GATE_ASSERT_HTML: &str = "gtYqKkkBPz2XC3VKttZxXAjNsA2rc/HpQQkCLBlR94o=";
+        const GATE_ASSERT_CSP: &str = "k2Xtfe+SqoPZy7TXCh+6nOascBm01lrJndgtfTYfIfc=";
+        const GATE_ADD_HTML: &str = "JWYNr7VhF5OhfpDEx8EPrqSKP1oBuWF8OVPmjgamoYs=";
+        const GATE_ADD_CSP: &str = "k2Xtfe+SqoPZy7TXCh+6nOascBm01lrJndgtfTYfIfc=";
+        const OPERATION_ENROLL_HTML: &str = "1LNZYrIY9DK9jXoG0siwX/RhR7L2UeHdCqOtuHjnnbY=";
+        const OPERATION_ENROLL_CSP: &str = "k2Xtfe+SqoPZy7TXCh+6nOascBm01lrJndgtfTYfIfc=";
+        const OPERATION_ASSERT_HTML: &str = "BLmrOa+t25+lpzoOjbEdIhxdM7zY1Bj9L4RRYkC/bns=";
+        const OPERATION_ASSERT_CSP: &str = "k2Xtfe+SqoPZy7TXCh+6nOascBm01lrJndgtfTYfIfc=";
+        const OPERATION_ADD_HTML: &str = "M5TKM+Jk/WRbNCrELKPcHbscJXkWSbGhy1SZiTh/YRk=";
+        const OPERATION_ADD_CSP: &str = "k2Xtfe+SqoPZy7TXCh+6nOascBm01lrJndgtfTYfIfc=";
+
+        let hash = |text: &str| STANDARD.encode(Sha256::digest(text.as_bytes()));
+        let credentials = ["AAAAAAAAAAAAx1zQ".to_string(), "AAAAAAAAAAAAy2zQ".to_string()];
+        let adding =
+            || PasskeyAdd { challenge: "YWRkLWNoYWxsZW5nZQ".into(), user: "dXNlcg".into(), name: "github:octocat" };
+        assert_eq!(hash(APPROVE), APPROVE_SCRIPT, "APPROVE");
+        let pages = [
+            ("gate enroll", gate_asking(enroll()), GATE_ENROLL_HTML, GATE_ENROLL_CSP),
+            ("gate assert", gate_asking(assert_with(&credentials)), GATE_ASSERT_HTML, GATE_ASSERT_CSP),
+            ("gate add", gate_asking(assert_adding(&credentials, adding())), GATE_ADD_HTML, GATE_ADD_CSP),
+            ("operation enroll", operation_asking(enroll()), OPERATION_ENROLL_HTML, OPERATION_ENROLL_CSP),
+            (
+                "operation assert",
+                operation_asking(assert_with(&credentials)),
+                OPERATION_ASSERT_HTML,
+                OPERATION_ASSERT_CSP,
+            ),
+            (
+                "operation add",
+                operation_asking(assert_adding(&credentials, adding())),
+                OPERATION_ADD_HTML,
+                OPERATION_ADD_CSP,
+            ),
+        ];
+        for (what, page, html, csp) in &pages {
+            assert_eq!(page.status, 200, "{what}");
+            assert_eq!(hash(&page.html), *html, "{what}: html: {}", page.html);
+            assert_eq!(hash(&page.csp), *csp, "{what}: csp: {}", page.csp);
+        }
+    }
+    // pinned-goldens:end
 
     use bd_core::gates::packet::{Field, FieldKind, MAX_HELD, PacketComment};
     use bd_core::model::Status;

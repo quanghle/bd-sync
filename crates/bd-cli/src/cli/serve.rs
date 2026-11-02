@@ -248,7 +248,8 @@ pub struct TokenEventsArgs {
     #[arg(long, visible_alias = "by", value_name = "ACTOR")]
     pub actor: Option<String>,
     /// Only these kinds: signed_in, token_created, refreshed, revoked, forgotten, client_registered, linked,
-    /// named, passkey_registered or passkey_removed (repeatable or comma separated)
+    /// named, passkey_registered, passkey_removed, passkey_add_allowed or passkey_add_cancelled (repeatable or
+    /// comma separated)
     #[arg(long = "kind", value_name = "KIND", value_delimiter = ',')]
     pub kinds: Vec<String>,
     /// Show at most this many, the latest
@@ -266,6 +267,9 @@ pub enum PasskeyCommand {
     /// Remove an account's passkeys: its next browser approval registers a new one
     #[command(long_about = PASSKEY_REMOVE_LONG_ABOUT)]
     Remove(PasskeyRemoveArgs),
+    /// Allow an account to register one passkey without an existing one
+    #[command(name = "allow-add", long_about = PASSKEY_ALLOW_ADD_LONG_ABOUT)]
+    AllowAdd(PasskeyAllowAddArgs),
 }
 
 const PASSKEY_LIST_LONG_ABOUT: &str = "\
@@ -276,7 +280,8 @@ closes and discards) needs a passkey with user verification: an account's
 first approval registers one, and later approvals ask for it. This lists the
 passkeys of one account, by the first 12 characters of each credential id,
 with its algorithm, when it was registered and last used, and its signature
-counter.";
+counter, and says until when a live allowance (`bd serve passkey allow-add`)
+lets the account register one without an existing one.";
 
 const PASSKEY_REMOVE_LONG_ABOUT: &str = "\
 Remove an account's passkeys: its next browser approval registers a new one
@@ -287,7 +292,28 @@ is removed; with it, only the one whose credential id starts with that prefix
 (as `bd serve passkey list` shows it), refused when the prefix names none or
 several. Each removal is recorded in the audit trail as a passkey_removed
 event. The account's next browser approval registers a new passkey, so check
-who signs in next.";
+who signs in next. Removing the account's last passkey also ends its live
+allowance (`bd serve passkey allow-add`), recorded as a passkey_add_cancelled
+event.";
+
+const PASSKEY_ALLOW_ADD_LONG_ABOUT: &str = "\
+Allow an account to register one passkey without an existing one
+
+Use it when a person has no passkey at hand, on a new device say, and needs to
+approve something: adding a passkey otherwise takes an approval with an
+existing one. While the allowance is live, the account's browser approval
+pages ask to register a new passkey on the device in use, with a second button
+to use an existing passkey instead. The person still signs in with the
+provider and must still be allowed to approve. The first registration spends
+the allowance, whether or not the approval then goes through.
+
+Anyone signed in as the account can use it while it is live, so confirm the
+request with the person some other way first, and grant it only when the
+person is ready. It lasts 15 minutes unless --for says otherwise, at most 1
+hour. A second allow-add replaces the first, and --cancel ends it; expiry needs
+nothing done. Refused for an account with no passkeys, whose next approval
+registers one anyway, and for one holding the limit of 99. Recorded in the
+audit trail as passkey_add_allowed and passkey_add_cancelled events.";
 
 #[derive(Args, Debug, Clone)]
 #[command(after_long_help = "\
@@ -315,6 +341,26 @@ pub struct PasskeyRemoveArgs {
     /// account)
     #[arg(long, value_name = "PREFIX")]
     pub credential: Option<String>,
+    #[command(flatten)]
+    pub root: TokenRootArgs,
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(after_long_help = "\
+Examples:
+  bd serve passkey allow-add --account corp:alice --root /srv/bd
+  bd serve passkey allow-add --account corp:alice --for 30m --root /srv/bd
+  bd serve passkey allow-add --account corp:alice --cancel --root /srv/bd")]
+pub struct PasskeyAllowAddArgs {
+    /// Account: its actor, or its login
+    #[arg(long, value_name = "ACCOUNT")]
+    pub account: String,
+    /// How long the allowance lasts, e.g. 30m: at most 1h (default: 15m)
+    #[arg(long = "for", value_name = "DURATION", conflicts_with = "cancel")]
+    pub for_: Option<String>,
+    /// End the account's live allowance instead
+    #[arg(long)]
+    pub cancel: bool,
     #[command(flatten)]
     pub root: TokenRootArgs,
 }

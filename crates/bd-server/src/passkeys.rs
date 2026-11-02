@@ -2,19 +2,29 @@
 //! `<root>/server.db`'s `passkeys` table: several per account, at most
 //! [`MAX_PER_ACCOUNT`]. The first is registered at the account's first
 //! approval (`insert_first`); more are added at an approval vouched for by a
-//! verified assertion of one the account has (`add`). Each approval moves
-//! its passkey's counter on (`use_counter`, or `add` for the vouching one);
-//! an admin removes them (`remove`), and they are erased with a forgotten
-//! account (`server_db::erase_passkeys`). Registrations and removals are
-//! recorded in the audit trail by the credential id's first [`PREFIX`]
-//! characters and the algorithm, never the key. `bd serve passkey
-//! list|remove` is the admin's command over them (`cmd_passkey`).
+//! verified assertion of one the account has (`add`), or, for someone without
+//! one at hand, under an allowance (`insert_allowed`): a window of at most
+//! [`ALLOWANCE_MAX`] an admin opens on the server host (`grant`, ended early
+//! by `cancel`), one per account, in the `passkey_allowances` table, spent by
+//! the one registration it lets in. Each approval moves its passkey's counter
+//! on (`use_counter`, or `add` for the vouching one); an admin removes them
+//! (`remove`, which ends the allowance of an account it leaves with none, so
+//! a live allowance always means a passkey), and they are erased with a
+//! forgotten account (`server_db::erase_passkeys`,
+//! `server_db::erase_allowance`). Registrations, removals and what happens to
+//! allowances are recorded in the audit trail, by the credential id's first
+//! [`PREFIX`] characters, the algorithm and an allowance's id, never the key.
+//! `bd serve passkey list|remove|allow-add` is the admin's command over them
+//! (`cmd_passkey`).
 
 use std::path::Path;
+use std::time::Duration;
 
 use bd_cli::app::{App, Out};
 use bd_cli::cli::PasskeyCommand;
+use bd_cli::io;
 use bd_core::{Error, Result, Timestamp};
+use rusqlite::OptionalExtension;
 use serde_json::json;
 
 use crate::auth::{self, Account};
@@ -24,6 +34,12 @@ use crate::webauthn::Alg;
 /// The most passkeys an account may hold: an approval offers to add one only
 /// below it, and [`add`] refuses past it.
 pub const MAX_PER_ACCOUNT: usize = 99;
+
+/// The longest an allowance lasts.
+pub const ALLOWANCE_MAX: Duration = Duration::from_secs(3600);
+
+/// How long an allowance lasts unless the admin says.
+pub const ALLOWANCE_DEFAULT: Duration = Duration::from_secs(15 * 60);
 
 /// How many characters of a credential id (base64url) logs, events and
 /// listings show.
@@ -65,6 +81,18 @@ impl Passkey {
     }
 }
 
+/// An allowance as kept: its account's one window to register a passkey with
+/// no existing one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Allowance {
+    /// 8 random bytes in hex, not a secret: what tells this allowance from
+    /// one that replaced it, for a page opened under it and in the events.
+    pub id: String,
+    /// Milliseconds.
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
 pub(crate) const BY_ACCOUNT: &str = "SELECT credential, issuer, subject, algorithm, public_key, counter, created_at, \
                                      last_used_at FROM passkeys WHERE issuer = ?1 AND subject = ?2 ORDER BY seq";
 pub(crate) const BY_CREDENTIAL: &str = "SELECT credential, issuer, subject, algorithm, public_key, counter, \
@@ -81,6 +109,18 @@ pub(crate) const COUNT_BY_ACCOUNT: &str = "SELECT COUNT(*) FROM passkeys WHERE i
 pub(crate) const OWNED: &str = "SELECT 1 FROM passkeys WHERE credential = ?1 AND issuer = ?2 AND subject = ?3";
 pub(crate) const USE_COUNTER_OWNED: &str = "UPDATE passkeys SET counter = ?1, last_used_at = ?2 WHERE credential = ?3 \
                                             AND issuer = ?4 AND subject = ?5 AND counter = ?6";
+pub(crate) const ALLOWANCE_LIVE: &str = "SELECT id, created_at, expires_at FROM passkey_allowances WHERE issuer = ?1 \
+                                         AND subject = ?2 AND expires_at > ?3";
+pub(crate) const ALLOWANCE_ROW: &str =
+    "SELECT id, created_at, expires_at FROM passkey_allowances WHERE issuer = ?1 AND subject = ?2";
+pub(crate) const ALLOWANCE_MATCH: &str =
+    "SELECT 1 FROM passkey_allowances WHERE issuer = ?1 AND subject = ?2 AND id = ?3 AND expires_at > ?4";
+pub(crate) const ALLOWANCE_DELETE: &str =
+    "DELETE FROM passkey_allowances WHERE issuer = ?1 AND subject = ?2 AND id = ?3";
+pub(crate) const ALLOWANCE_PUT: &str = "INSERT INTO passkey_allowances (issuer, subject, id, created_at, expires_at) \
+                                        VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (issuer, subject) DO UPDATE SET \
+                                        id = excluded.id, created_at = excluded.created_at, \
+                                        expires_at = excluded.expires_at";
 
 fn select(tx: &rusqlite::Transaction, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Passkey>> {
     let mut stmt = tx.prepare_cached(sql)?;
@@ -99,11 +139,48 @@ fn select(tx: &rusqlite::Transaction, sql: &str, args: &[&dyn rusqlite::ToSql]) 
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+fn allowance(tx: &rusqlite::Transaction, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Option<Allowance>> {
+    let found = tx
+        .prepare_cached(sql)?
+        .query_row(args, |r| Ok(Allowance { id: r.get(0)?, created_at: r.get(1)?, expires_at: r.get(2)? }));
+    Ok(found.optional()?)
+}
+
+fn count(tx: &rusqlite::Transaction, issuer: &str, subject: &str) -> Result<usize> {
+    let count: i64 = tx.prepare_cached(COUNT_BY_ACCOUNT)?.query_row([issuer, subject], |r| r.get(0))?;
+    Ok(usize::try_from(count).unwrap_or(0))
+}
+
+/// `kind`, of `account`, for the audit trail.
+fn event_of(kind: &'static str, account: &Account, detail: String) -> AuthEvent {
+    AuthEvent {
+        kind,
+        actor: Some(account.actor.clone()),
+        provider: Some(account.provider.clone()),
+        issuer: Some(account.issuer.clone()),
+        subject: Some(account.subject.clone()),
+        detail: Some(detail),
+        ..AuthEvent::default()
+    }
+}
+
 /// The passkeys of the account with this issuer and subject, oldest first
 /// (none if there is no `server.db`).
 pub fn for_account(root: &Path, issuer: &str, subject: &str) -> Result<Vec<Passkey>> {
     let Some(mut conn) = server_db::open_existing(root)? else { return Ok(Vec::new()) };
     server_db::read(root, &mut conn, |tx| select(tx, BY_ACCOUNT, &[&issuer, &subject]))
+}
+
+/// The passkeys of the account with this issuer and subject, oldest first,
+/// and its live allowance if it has one, as of one moment (nothing if there
+/// is no `server.db`).
+pub fn account_state(root: &Path, issuer: &str, subject: &str) -> Result<(Vec<Passkey>, Option<Allowance>)> {
+    let Some(mut conn) = server_db::open_existing(root)? else { return Ok((Vec::new(), None)) };
+    server_db::read(root, &mut conn, |tx| {
+        let passkeys = select(tx, BY_ACCOUNT, &[&issuer, &subject])?;
+        let live = allowance(tx, ALLOWANCE_LIVE, &[&issuer, &subject, &Timestamp::now().millis()])?;
+        Ok((passkeys, live))
+    })
 }
 
 /// The passkey with this credential id (base64url), if any.
@@ -184,6 +261,7 @@ pub fn insert_first(root: &Path, row: &NewRow) -> Result<Inserted> {
             },
         )?;
         server_db::prune_events(tx)?;
+        server_db::prune_allowances(tx)?;
         Ok(Inserted::Inserted)
     })
 }
@@ -269,7 +347,168 @@ pub fn add(root: &Path, row: &NewRow, asserted: &str, read: u32, new: u32) -> Re
             },
         )?;
         server_db::prune_events(tx)?;
+        server_db::prune_allowances(tx)?;
         Ok(Added::Added)
+    })
+}
+
+/// What [`grant`] opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Granted {
+    /// The allowance's id.
+    pub id: String,
+    /// Milliseconds.
+    pub expires_at: i64,
+    /// The live allowance it took the place of, if any.
+    pub replaced: Option<String>,
+}
+
+/// Allow `account` to register one passkey with no existing one for
+/// `length` from now, in place of any allowance it had, with a
+/// `passkey_add_allowed` event, in one transaction: only if the account is
+/// there and has a passkey, and fewer than [`MAX_PER_ACCOUNT`]. Refused, with
+/// nothing changed, otherwise: without a `server.db` too, which is never
+/// created, so that a mistaken `--root` is not left with one.
+pub fn grant(root: &Path, account: &Account, length: Duration) -> Result<Granted> {
+    let none = || Error::not_found("account", account.actor.as_str());
+    let Some(mut conn) = server_db::open_existing(root)? else { return Err(none()) };
+    server_db::write(root, &mut conn, |tx| {
+        if !tx.prepare_cached(ACCOUNT_EXISTS)?.exists([&account.issuer, &account.subject])? {
+            return Err(none());
+        }
+        let passkeys = count(tx, &account.issuer, &account.subject)?;
+        if passkeys == 0 {
+            return Err(Error::invalid(format!(
+                "{} has no passkeys: its next browser approval registers one anyway",
+                account.actor
+            )));
+        }
+        if passkeys >= MAX_PER_ACCOUNT {
+            return Err(Error::invalid(format!(
+                "{} has {passkeys} passkeys, the most an account may have: remove one first",
+                account.actor
+            )));
+        }
+        let now = Timestamp::now();
+        let earlier = allowance(tx, ALLOWANCE_ROW, &[&account.issuer, &account.subject])?;
+        let replaced = earlier.filter(|a| a.expires_at > now.millis()).map(|a| a.id);
+        let id = auth::random_hex(8)?;
+        let expires_at = now.plus(length).millis();
+        tx.prepare_cached(ALLOWANCE_PUT)?.execute(rusqlite::params![
+            account.issuer,
+            account.subject,
+            id,
+            now.millis(),
+            expires_at
+        ])?;
+        let mut detail = format!("allowance {id}, until {}, by an admin", time(expires_at).to_rfc3339());
+        if let Some(replaced) = &replaced {
+            detail.push_str(&format!(", replacing allowance {replaced}"));
+        }
+        server_db::record(tx, &event_of("passkey_add_allowed", account, detail))?;
+        server_db::prune_events(tx)?;
+        server_db::prune_allowances(tx)?;
+        Ok(Granted { id, expires_at, replaced })
+    })
+}
+
+/// End `live`, `account`'s allowance, with a `passkey_add_cancelled` event
+/// saying `how`.
+fn end_allowance(tx: &rusqlite::Transaction, account: &Account, live: &Allowance, how: &str) -> Result<()> {
+    tx.prepare_cached(ALLOWANCE_DELETE)?.execute([&account.issuer, &account.subject, &live.id])?;
+    let detail = format!("allowance {}, until {}, {how}", live.id, time(live.expires_at).to_rfc3339());
+    server_db::record(tx, &event_of("passkey_add_cancelled", account, detail))
+}
+
+/// End `account`'s live allowance, for an admin: whether it had one. With
+/// none, nothing is written, an allowance that ran out left as it is.
+pub fn cancel(root: &Path, account: &Account) -> Result<bool> {
+    let Some(mut conn) = server_db::open_existing(root)? else { return Ok(false) };
+    server_db::write(root, &mut conn, |tx| {
+        let now = Timestamp::now().millis();
+        let Some(live) = allowance(tx, ALLOWANCE_LIVE, &[&account.issuer, &account.subject, &now])? else {
+            return Ok(false);
+        };
+        end_allowance(tx, account, &live, "cancelled by an admin")?;
+        server_db::prune_events(tx)?;
+        server_db::prune_allowances(tx)?;
+        Ok(true)
+    })
+}
+
+/// What [`insert_allowed`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllowedAdd {
+    Added,
+    /// The account is not there (any more).
+    NoAccount,
+    /// The allowance is not live any more: spent, cancelled, replaced, or
+    /// past its expiry.
+    Ended,
+    /// The account has [`MAX_PER_ACCOUNT`] passkeys already.
+    LimitReached,
+    /// Another passkey has the new credential id.
+    CredentialTaken,
+}
+
+/// Register `row` under its account's allowance `allowance_id`, the very one
+/// its page was opened under, in one transaction: only if the account is
+/// there, that allowance is live and the account's, it has fewer than
+/// [`MAX_PER_ACCOUNT`] passkeys and no passkey has the new credential id.
+/// Every check runs before the first change, so a refusal changes nothing;
+/// otherwise the allowance goes, the row goes in, and a `passkey_registered`
+/// event names the allowance. Writers run one at a time, so of several
+/// registrations under one allowance one gets in and the rest find it ended.
+pub fn insert_allowed(root: &Path, row: &NewRow, allowance_id: &str) -> Result<AllowedAdd> {
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| {
+        let exists =
+            |sql: &str, args: &[&dyn rusqlite::ToSql]| -> Result<bool> { Ok(tx.prepare_cached(sql)?.exists(args)?) };
+        if !exists(ACCOUNT_EXISTS, &[&row.issuer, &row.subject])? {
+            return Ok(AllowedAdd::NoAccount);
+        }
+        let now = Timestamp::now().millis();
+        if !exists(ALLOWANCE_MATCH, &[&row.issuer, &row.subject, &allowance_id, &now])? {
+            return Ok(AllowedAdd::Ended);
+        }
+        if count(tx, row.issuer, row.subject)? >= MAX_PER_ACCOUNT {
+            return Ok(AllowedAdd::LimitReached);
+        }
+        if exists(TAKEN, &[&row.credential])? {
+            return Ok(AllowedAdd::CredentialTaken);
+        }
+        if tx.prepare_cached(ALLOWANCE_DELETE)?.execute([row.issuer, row.subject, allowance_id])? != 1 {
+            return Ok(AllowedAdd::Ended);
+        }
+        tx.prepare_cached(INSERT)?.execute(rusqlite::params![
+            row.credential,
+            row.issuer,
+            row.subject,
+            server_db::key(row.actor),
+            row.alg.cose(),
+            row.public_key,
+            row.counter,
+            now,
+        ])?;
+        server_db::record(
+            tx,
+            &AuthEvent {
+                kind: "passkey_registered",
+                actor: Some(row.actor.to_string()),
+                provider: Some(row.provider.to_string()),
+                issuer: Some(row.issuer.to_string()),
+                subject: Some(row.subject.to_string()),
+                detail: Some(format!(
+                    "credential {} ({}), registered at a browser approval under allowance {allowance_id}",
+                    prefix(row.credential),
+                    row.alg.name()
+                )),
+                ..AuthEvent::default()
+            },
+        )?;
+        server_db::prune_events(tx)?;
+        server_db::prune_allowances(tx)?;
+        Ok(AllowedAdd::Added)
     })
 }
 
@@ -291,8 +530,10 @@ pub fn use_counter(root: &Path, credential: &str, read: u32, new: u32) -> Result
 
 /// Remove `account`'s passkeys, for an admin: the one whose credential id
 /// starts with `prefix`, or, without one, every one of them; each removal
-/// recorded as a `passkey_removed` event. The passkeys removed. Refused,
-/// with nothing removed, when there is none, or when `prefix` names several.
+/// recorded as a `passkey_removed` event. Leaving it with none ends its live
+/// allowance too, in the same transaction, so that no allowance outlives the
+/// account's last passkey. The passkeys removed. Refused, with nothing
+/// removed, when there is none, or when `prefix` names several.
 pub fn remove(root: &Path, account: &Account, prefix: Option<&str>) -> Result<Vec<Passkey>> {
     let none = || Error::not_found("passkey", prefix.unwrap_or(&account.actor));
     let Some(mut conn) = server_db::open_existing(root)? else { return Err(none()) };
@@ -329,19 +570,49 @@ pub fn remove(root: &Path, account: &Account, prefix: Option<&str>) -> Result<Ve
                 },
             )?;
         }
+        if count(tx, &account.issuer, &account.subject)? == 0 {
+            let now = Timestamp::now().millis();
+            if let Some(live) = allowance(tx, ALLOWANCE_LIVE, &[&account.issuer, &account.subject, &now])? {
+                end_allowance(tx, account, &live, "ended: the account's last passkey was removed")?;
+            }
+        }
         server_db::prune_events(tx)?;
+        server_db::prune_allowances(tx)?;
         Ok(chosen)
     })
 }
 
-/// `bd serve passkey list|remove`: an admin's commands, on this machine.
+/// How long the allowance `--for` asks for lasts: refused, before anything
+/// else is looked at, unless it is more than nothing and at most
+/// [`ALLOWANCE_MAX`].
+fn allowance_length(asked: Option<&str>) -> Result<Duration> {
+    let Some(asked) = asked else { return Ok(ALLOWANCE_DEFAULT) };
+    let length = bd_core::time::parse_duration(asked)?;
+    if length.is_zero() || length > ALLOWANCE_MAX {
+        return Err(Error::invalid("--for must be more than zero and at most 1h"));
+    }
+    Ok(length)
+}
+
+/// `bd serve passkey list|remove|allow-add`: an admin's commands, on this
+/// machine.
 pub fn cmd_passkey(app: &mut App, cmd: &PasskeyCommand) -> Result<()> {
     match cmd {
         PasskeyCommand::List(a) => {
             let root = auth::root_dir(&a.root)?;
             let account = auth::account_named(&root, a.account.trim())?;
-            let passkeys = for_account(&root, &account.issuer, &account.subject)?;
-            let views: Vec<_> = passkeys.iter().map(view).collect();
+            let (passkeys, allowance) = account_state(&root, &account.issuer, &account.subject)?;
+            let until = allowance.map(|a| time(a.expires_at).to_rfc3339());
+            let views: Vec<_> = passkeys
+                .iter()
+                .map(|p| {
+                    let mut row = view(p);
+                    if let Some(until) = &until {
+                        row["add_allowed_until"] = json!(until);
+                    }
+                    row
+                })
+                .collect();
             let mut out = Out::new(json!(views));
             if passkeys.is_empty() {
                 out = out.line(format!("No passkeys for {}: its next browser approval registers one.", account.actor));
@@ -358,6 +629,10 @@ pub fn cmd_passkey(app: &mut App, cmd: &PasskeyCommand) -> Result<()> {
                     ))
                     .id(p.prefix().to_string());
             }
+            if let Some(until) = until {
+                out = out
+                    .line(format!("Add allowed: one passkey may be registered without an existing one until {until}"));
+            }
             app.print(out);
         }
         PasskeyCommand::Remove(a) => {
@@ -372,6 +647,33 @@ pub fn cmd_passkey(app: &mut App, cmd: &PasskeyCommand) -> Result<()> {
                 account.actor
             ));
             app.print(prefixes.iter().fold(out, |out, p| out.id(p.to_string())));
+        }
+        PasskeyCommand::AllowAdd(a) => {
+            let length = if a.cancel { None } else { Some(allowance_length(a.for_.as_deref())?) };
+            let root = auth::root_dir(&a.root)?;
+            let account = auth::account_named(&root, a.account.trim())?;
+            let who = io::printable(&account.actor);
+            app.print(match length {
+                Some(length) => {
+                    let granted = grant(&root, &account, length)?;
+                    let until = time(granted.expires_at).to_rfc3339();
+                    let replacing = if granted.replaced.is_some() { ", replacing the one before" } else { "" };
+                    Out::new(json!({
+                        "account": account.actor,
+                        "expires_at": until,
+                        "replaced": granted.replaced.is_some(),
+                    }))
+                    .line(format!("✓ {who} may register one passkey without an existing one until {until}{replacing}"))
+                }
+                None => {
+                    let cancelled = cancel(&root, &account)?;
+                    Out::new(json!({ "account": account.actor, "cancelled": cancelled })).line(if cancelled {
+                        format!("✓ Cancelled the allowance of {who}")
+                    } else {
+                        format!("{who} has no allowance to cancel")
+                    })
+                }
+            });
         }
     }
     Ok(())
@@ -708,5 +1010,511 @@ mod tests {
         assert_eq!(for_account(root, &alice.issuer, &alice.subject).unwrap().len(), MAX_PER_ACCOUNT);
         refused(&row(&alice, "FFFFFFFFFFFFx2", &key, Alg::Es256), asserted, 5, Added::LimitReached);
         refused(&row(&alice, asserted, &key, Alg::Es256), asserted, 5, Added::LimitReached);
+    }
+
+    /// An allowance, every column.
+    type AllowanceRow = (String, String, String, i64, i64);
+
+    /// Every allowance of the root, those past their expiry too.
+    fn allowance_rows(root: &Path) -> Vec<AllowanceRow> {
+        let conn = server_db::open(root).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT issuer, subject, id, created_at, expires_at FROM passkey_allowances ORDER BY issuer, subject",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// [`snapshot`] and every allowance: what a refused grant or registration
+    /// must leave as it was.
+    type Everything = ((Vec<Vec<Kept>>, usize), Vec<AllowanceRow>);
+
+    fn everything(root: &Path, accounts: &[&Account]) -> Everything {
+        (snapshot(root, accounts), allowance_rows(root))
+    }
+
+    /// `user`'s account with a passkey of this credential id.
+    fn enrolled(root: &Path, user: &Identity, credential: &str) -> Account {
+        let account = account(root, user);
+        put(root, &account, credential, Alg::Es256, b"spki");
+        account
+    }
+
+    /// Put an allowance in as it is kept, without grant's checks and event.
+    fn put_allowance(root: &Path, account: &Account, id: &str, expires_at: i64) {
+        let conn = server_db::open(root).unwrap();
+        let args = rusqlite::params![account.issuer, account.subject, id, 0, expires_at];
+        conn.execute(ALLOWANCE_PUT, args).unwrap();
+    }
+
+    /// Run `account`'s allowance out, as time would.
+    fn expire(root: &Path, account: &Account) {
+        let conn = server_db::open(root).unwrap();
+        let args = rusqlite::params![account.issuer, account.subject];
+        let sql = "UPDATE passkey_allowances SET expires_at = 1 WHERE issuer = ?1 AND subject = ?2";
+        assert_eq!(conn.execute(sql, args).unwrap(), 1);
+    }
+
+    fn live(root: &Path, account: &Account) -> Option<Allowance> {
+        account_state(root, &account.issuer, &account.subject).unwrap().1
+    }
+
+    fn details(root: &Path, kind: &str) -> Vec<String> {
+        kept(root, kind).into_iter().map(|e| e.detail.unwrap()).collect()
+    }
+
+    fn until(expires_at: i64) -> String {
+        time(expires_at).to_rfc3339()
+    }
+
+    #[test]
+    fn the_durations_are_as_documented() {
+        assert_eq!(ALLOWANCE_DEFAULT, Duration::from_secs(15 * 60));
+        assert_eq!(ALLOWANCE_MAX, Duration::from_secs(60 * 60));
+    }
+
+    #[test]
+    fn a_grant_opens_one_window_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        assert_eq!(live(root, &alice), None);
+
+        let before = Timestamp::now();
+        let granted = grant(root, &alice, Duration::from_secs(90)).unwrap();
+        let after = Timestamp::now();
+
+        assert_eq!(granted.replaced, None);
+        assert_eq!(granted.id.len(), 16, "8 bytes in hex: {}", granted.id);
+        assert!(granted.id.bytes().all(|b| b.is_ascii_hexdigit()), "{}", granted.id);
+        assert!(
+            (before.plus(Duration::from_secs(90)).millis()..=after.plus(Duration::from_secs(90)).millis())
+                .contains(&granted.expires_at)
+        );
+        let (passkeys, state) = account_state(root, &alice.issuer, &alice.subject).unwrap();
+        assert_eq!(passkeys.len(), 1);
+        let state = state.unwrap();
+        assert_eq!((&state.id, state.expires_at), (&granted.id, granted.expires_at));
+        assert!((before.millis()..=after.millis()).contains(&state.created_at));
+
+        let events = kept(root, "passkey_add_allowed");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "passkey_add_allowed", "a kind the trail reads back as itself");
+        assert_eq!(events[0].actor.as_deref(), Some(alice.actor.as_str()));
+        assert_eq!(
+            (events[0].provider.as_deref(), events[0].issuer.as_deref(), events[0].subject.as_deref()),
+            (Some("corp"), Some("https://idp.example"), Some("s1"))
+        );
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some(format!("allowance {}, until {}, by an admin", granted.id, until(granted.expires_at)).as_str())
+        );
+
+        expire(root, &alice);
+        assert_eq!(live(root, &alice), None, "past its expiry it is not read");
+        assert_eq!(allowance_rows(root).len(), 1, "though nothing removed it yet");
+        assert_eq!(kept(root, "passkey_add_cancelled").len(), 0, "and running out records nothing");
+    }
+
+    #[test]
+    fn a_grant_refused_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = account(root, &user("alice", "s1"));
+        let refused = |who: &Account| -> Error {
+            let before = everything(root, &[&alice]);
+            let e = grant(root, who, ALLOWANCE_DEFAULT).unwrap_err();
+            assert_eq!(everything(root, &[&alice]), before, "{e}");
+            e
+        };
+
+        let e = refused(&Account { subject: "s9".into(), ..alice.clone() });
+        assert!(matches!(e, Error::NotFound { .. }), "{e}");
+        assert_eq!(e.exit_code(), 3);
+
+        let e = refused(&alice);
+        assert!(matches!(e, Error::Invalid(_)), "{e}");
+        assert_eq!(e.exit_code(), 2);
+        assert_eq!(
+            e.to_string(),
+            format!("{} has no passkeys: its next browser approval registers one anyway", alice.actor)
+        );
+
+        for n in 0..MAX_PER_ACCOUNT - 1 {
+            put(root, &alice, &format!("EEEEEEEEEEEE{n:02}"), Alg::Es256, b"spki");
+        }
+        assert_eq!(grant(root, &alice, ALLOWANCE_DEFAULT).unwrap().replaced, None, "98 is under the limit");
+        assert!(cancel(root, &alice).unwrap());
+        put(root, &alice, "EEEEEEEEEEEE98", Alg::Es256, b"spki");
+        let e = refused(&alice);
+        assert!(matches!(e, Error::Invalid(_)) && e.to_string().contains("99 passkeys"), "{e}");
+        assert_eq!(e.exit_code(), 2);
+    }
+
+    #[test]
+    fn a_mistaken_root_is_not_left_with_a_database() {
+        let (dir, mistaken) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let alice = enrolled(dir.path(), &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let root = mistaken.path();
+        let e = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap_err();
+        assert!(matches!(e, Error::NotFound { .. }) && e.to_string().contains(&alice.actor), "{e}");
+        assert!(!cancel(root, &alice).unwrap());
+        assert_eq!(account_state(root, &alice.issuer, &alice.subject).unwrap(), (Vec::new(), None));
+        assert!(!server_db::path(root).exists());
+    }
+
+    #[test]
+    fn a_second_grant_replaces_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        let bobs = grant(root, &bob, ALLOWANCE_DEFAULT).unwrap();
+        let first = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        assert_eq!(first.replaced, None, "bob's is another account's");
+
+        let second = grant(root, &alice, ALLOWANCE_MAX).unwrap();
+        assert_ne!(second.id, first.id);
+        assert_eq!(second.replaced.as_deref(), Some(first.id.as_str()));
+        assert!(second.expires_at > first.expires_at);
+        let rows = allowance_rows(root);
+        let ids: Vec<&str> = rows.iter().map(|r| r.2.as_str()).collect();
+        assert_eq!(ids, [second.id.as_str(), bobs.id.as_str()], "one each");
+        assert_eq!(live(root, &alice).unwrap().expires_at, second.expires_at);
+        assert_eq!(details(root, "passkey_add_allowed").len(), 3);
+        assert_eq!(
+            details(root, "passkey_add_allowed")[2],
+            format!(
+                "allowance {}, until {}, by an admin, replacing allowance {}",
+                second.id,
+                until(second.expires_at),
+                first.id
+            )
+        );
+        assert!(details(root, "passkey_add_cancelled").is_empty(), "a replace is the one event");
+
+        expire(root, &alice);
+        let third = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        assert_eq!(third.replaced, None, "one past its expiry is overwritten, not replaced");
+        assert_eq!(live(root, &alice).unwrap().id, third.id);
+        assert_eq!(allowance_rows(root).len(), 2);
+        assert_eq!(
+            details(root, "passkey_add_allowed")[3],
+            format!("allowance {}, until {}, by an admin", third.id, until(third.expires_at))
+        );
+    }
+
+    #[test]
+    fn cancelling_ends_a_live_allowance_and_writes_nothing_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        let bobs = grant(root, &bob, ALLOWANCE_DEFAULT).unwrap();
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+
+        assert!(cancel(root, &alice).unwrap());
+        assert_eq!(live(root, &alice), None);
+        assert_eq!(live(root, &bob).unwrap().id, bobs.id, "another account's stays");
+        let events = kept(root, "passkey_add_cancelled");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "passkey_add_cancelled", "a kind the trail reads back as itself");
+        assert_eq!(events[0].actor.as_deref(), Some(alice.actor.as_str()));
+        assert_eq!(
+            (events[0].provider.as_deref(), events[0].issuer.as_deref(), events[0].subject.as_deref()),
+            (Some("corp"), Some("https://idp.example"), Some("s1"))
+        );
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some(
+                format!("allowance {}, until {}, cancelled by an admin", granted.id, until(granted.expires_at))
+                    .as_str()
+            )
+        );
+
+        let before = everything(root, &[&alice, &bob]);
+        assert!(!cancel(root, &alice).unwrap(), "none to cancel");
+        assert_eq!(everything(root, &[&alice, &bob]), before);
+
+        grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        expire(root, &alice);
+        let before = everything(root, &[&alice, &bob]);
+        assert!(!cancel(root, &alice).unwrap(), "one past its expiry is none");
+        assert_eq!(everything(root, &[&alice, &bob]), before, "and is not even pruned: nothing is written");
+    }
+
+    #[test]
+    fn a_registration_spends_the_allowance_and_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let key = SoftKey::rs256();
+        let (credential, spki) = (URL_SAFE_NO_PAD.encode(&key.credential), key.spki());
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+
+        let new = NewRow { counter: 3, ..row(&alice, &credential, &spki, key.alg()) };
+        assert_eq!(insert_allowed(root, &new, &granted.id).unwrap(), AllowedAdd::Added);
+
+        assert!(allowance_rows(root).is_empty(), "spent");
+        let now = for_account(root, &alice.issuer, &alice.subject).unwrap();
+        let credentials: Vec<&str> = now.iter().map(|p| p.credential.as_str()).collect();
+        assert_eq!(credentials, ["AAAAAAAAAAAAx1", credential.as_str()]);
+        assert_eq!((now[0].counter, now[0].last_used_at), (0, None), "no existing passkey was asserted");
+        assert_eq!((now[1].counter, now[1].last_used_at, now[1].alg_name()), (3, None, "RS256"));
+        assert_eq!(now[1].public_key, spki);
+
+        let events = kept(root, "passkey_registered");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor.as_deref(), Some(alice.actor.as_str()));
+        assert_eq!(
+            (events[0].provider.as_deref(), events[0].issuer.as_deref(), events[0].subject.as_deref()),
+            (Some("corp"), Some("https://idp.example"), Some("s1"))
+        );
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some(
+                format!(
+                    "credential {} (RS256), registered at a browser approval under allowance {}",
+                    prefix(&credential),
+                    granted.id
+                )
+                .as_str()
+            )
+        );
+
+        let before = everything(root, &[&alice]);
+        let again = row(&alice, "CCCCCCCCCCCCx1", &spki, key.alg());
+        assert_eq!(insert_allowed(root, &again, &granted.id).unwrap(), AllowedAdd::Ended, "single use");
+        assert_eq!(everything(root, &[&alice]), before);
+    }
+
+    #[test]
+    fn a_registration_refused_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        let key = SoftKey::es256().spki();
+        let new = row(&alice, "CCCCCCCCCCCCx1", &key, Alg::Es256);
+        let refused = |new: &NewRow, id: &str, expected: AllowedAdd| {
+            let before = everything(root, &[&alice, &bob]);
+            assert_eq!(insert_allowed(root, new, id).unwrap(), expected, "{}", new.credential);
+            assert_eq!(everything(root, &[&alice, &bob]), before, "{expected:?} changed something");
+        };
+        let bobs = grant(root, &bob, ALLOWANCE_DEFAULT).unwrap();
+
+        refused(&new, &bobs.id, AllowedAdd::Ended);
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        refused(&new, &bobs.id, AllowedAdd::Ended);
+        refused(&new, "0123456789abcdef", AllowedAdd::Ended);
+        refused(&new, "", AllowedAdd::Ended);
+        refused(&row(&alice, "AAAAAAAAAAAAx1", &key, Alg::Es256), &granted.id, AllowedAdd::CredentialTaken);
+        refused(&row(&alice, "BBBBBBBBBBBBx1", &key, Alg::Es256), &granted.id, AllowedAdd::CredentialTaken);
+        refused(&row(&alice, "BBBBBBBBBBBBx1", &key, Alg::Es256), "0123456789abcdef", AllowedAdd::Ended);
+
+        let gone = Account { subject: "s9".into(), ..alice.clone() };
+        put_allowance(root, &gone, "gone's", i64::MAX);
+        refused(&row(&gone, "CCCCCCCCCCCCx1", &key, Alg::Es256), "gone's", AllowedAdd::NoAccount);
+
+        expire(root, &alice);
+        refused(&new, &granted.id, AllowedAdd::Ended);
+
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        for n in 1..MAX_PER_ACCOUNT {
+            put(root, &alice, &format!("EEEEEEEEEEEE{n:02}"), Alg::Es256, &key);
+        }
+        refused(&new, &granted.id, AllowedAdd::LimitReached);
+        refused(&row(&alice, "AAAAAAAAAAAAx1", &key, Alg::Es256), &granted.id, AllowedAdd::LimitReached);
+    }
+
+    #[test]
+    fn concurrent_registrations_under_one_allowance_register_one() {
+        const THREADS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        let barrier = std::sync::Barrier::new(THREADS);
+        let outcomes: Vec<AllowedAdd> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..THREADS)
+                .map(|n| {
+                    let (alice, granted, barrier) = (&alice, &granted, &barrier);
+                    s.spawn(move || {
+                        let credential = format!("CCCCCCCCCCCC{n:02}");
+                        barrier.wait();
+                        insert_allowed(root, &row(alice, &credential, b"spki", Alg::Es256), &granted.id).unwrap()
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        assert_eq!(outcomes.iter().filter(|o| **o == AllowedAdd::Added).count(), 1, "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|o| **o == AllowedAdd::Ended).count(), THREADS - 1, "{outcomes:?}");
+        assert_eq!(for_account(root, &alice.issuer, &alice.subject).unwrap().len(), 2);
+        assert!(allowance_rows(root).is_empty());
+        assert_eq!(kept(root, "passkey_registered").len(), 1);
+    }
+
+    #[test]
+    fn removing_the_last_passkey_ends_the_allowance() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        put(root, &alice, "AAAAAAAAAAAAy2", Alg::Es256, b"spki");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        put(root, &bob, "BBBBBBBBBBBBy2", Alg::Es256, b"spki");
+        let carol = enrolled(root, &user("carol", "s3"), "CCCCCCCCCCCCx1");
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        grant(root, &bob, ALLOWANCE_DEFAULT).unwrap();
+        grant(root, &carol, ALLOWANCE_DEFAULT).unwrap();
+
+        let removed = remove(root, &alice, Some("AAAAAAAAAAAAx")).unwrap();
+        assert_eq!(removed.iter().map(Passkey::prefix).collect::<Vec<_>>(), ["AAAAAAAAAAAA"]);
+        assert_eq!(live(root, &alice).unwrap().id, granted.id, "one passkey is left");
+        assert!(details(root, "passkey_add_cancelled").is_empty());
+
+        let removed = remove(root, &alice, Some("AAAAAAAAAAAAy")).unwrap();
+        assert_eq!(removed.iter().map(Passkey::prefix).collect::<Vec<_>>(), ["AAAAAAAAAAAA"], "as without one");
+        assert_eq!(live(root, &alice), None);
+        assert_eq!(
+            details(root, "passkey_add_cancelled"),
+            [format!(
+                "allowance {}, until {}, ended: the account's last passkey was removed",
+                granted.id,
+                until(granted.expires_at)
+            )]
+        );
+        assert_eq!(
+            kept(root, "passkey_add_cancelled")[0].actor.as_deref(),
+            Some(alice.actor.as_str()),
+            "the account's, erased with it"
+        );
+        assert_eq!(details(root, "passkey_removed").len(), 2, "beside each removal");
+        let page = row(&alice, "DDDDDDDDDDDDx1", b"spki", Alg::Es256);
+        assert_eq!(insert_allowed(root, &page, &granted.id).unwrap(), AllowedAdd::Ended, "a page opened before");
+
+        assert_eq!(remove(root, &bob, None).unwrap().len(), 2, "every one at once");
+        assert_eq!(live(root, &bob), None);
+        assert_eq!(details(root, "passkey_add_cancelled").len(), 2);
+        assert!(live(root, &carol).is_some(), "another account's stays");
+
+        expire(root, &carol);
+        remove(root, &carol, None).unwrap();
+        assert_eq!(details(root, "passkey_add_cancelled").len(), 2, "one past its expiry ended by itself");
+        assert!(allowance_rows(root).is_empty(), "and is pruned with the write");
+    }
+
+    #[test]
+    fn allowance_events_carry_no_key_or_email() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let key = SoftKey::es256();
+        let (credential, spki) = (URL_SAFE_NO_PAD.encode(&key.credential), key.spki());
+        grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        cancel(root, &alice).unwrap();
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        insert_allowed(root, &row(&alice, &credential, &spki, key.alg()), &granted.id).unwrap();
+        grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        remove(root, &alice, None).unwrap();
+
+        let details: Vec<String> = server_db::events(root, 0, None, &[], 100)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.event.kind.starts_with("passkey_"))
+            .map(|e| e.event.detail.unwrap())
+            .collect();
+        assert_eq!(details.len(), 9, "{details:?}");
+        for detail in &details {
+            assert!(!detail.contains(&credential) && !detail.contains('@'), "{detail}");
+            for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+                let encoded = engine.encode(&spki);
+                let tail = &encoded[encoded.len() - 16..];
+                assert!(!detail.contains(&encoded) && !detail.contains(tail), "{detail}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_passkey_registered_under_an_allowance_reads_after_a_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        let spki = SoftKey::es256().spki();
+        let new = row(&alice, "CCCCCCCCCCCCx1", &spki, Alg::Es256);
+        assert_eq!(insert_allowed(root, &new, &granted.id).unwrap(), AllowedAdd::Added);
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        grant(root, &bob, ALLOWANCE_DEFAULT).unwrap();
+
+        // Read as a bd of version 4 reads it: nothing here brings it back to 5.
+        let path = server_db::path(root);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(server_db::ROLLBACK_V5).unwrap();
+        assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
+        let mut stmt = conn.prepare(BY_ACCOUNT).unwrap();
+        let args = rusqlite::params![alice.issuer, alice.subject];
+        let rows: Vec<(String, Vec<u8>)> =
+            stmt.query_map(args, |r| Ok((r.get(0)?, r.get(4)?))).unwrap().map(Result::unwrap).collect();
+        assert_eq!(rows[1], ("CCCCCCCCCCCCx1".to_string(), spki.clone()));
+        drop(stmt);
+        drop(conn);
+
+        // The next open brings the table back with no allowance, and the passkey stays usable.
+        assert_eq!(live(root, &bob), None);
+        assert!(use_counter(root, "CCCCCCCCCCCCx1", 0, 1).unwrap());
+    }
+
+    #[test]
+    fn every_write_prunes_the_allowances_that_ran_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = account(root, &user("bob", "s2"));
+        let carol = account(root, &user("carol", "s3"));
+        let ran_out = || {
+            put_allowance(root, &carol, "ran-out", 1);
+            assert_eq!(allowance_rows(root).iter().filter(|r| r.2 == "ran-out").count(), 1);
+        };
+        let pruned = |after: &str| {
+            assert_eq!(allowance_rows(root).iter().filter(|r| r.2 == "ran-out").count(), 0, "{after}");
+        };
+        let (spki, other) = (SoftKey::es256().spki(), SoftKey::es256().spki());
+
+        ran_out();
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        pruned("grant");
+        ran_out();
+        assert!(cancel(root, &alice).unwrap());
+        pruned("cancel");
+        let granted_again = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        assert_ne!(granted.id, granted_again.id);
+        ran_out();
+        let spend = row(&alice, "CCCCCCCCCCCCx1", &spki, Alg::Es256);
+        assert_eq!(insert_allowed(root, &spend, &granted_again.id).unwrap(), AllowedAdd::Added);
+        pruned("spend");
+        ran_out();
+        assert_eq!(insert_first(root, &row(&bob, "BBBBBBBBBBBBx1", &other, Alg::Es256)).unwrap(), Inserted::Inserted);
+        pruned("insert_first");
+        ran_out();
+        let added = row(&bob, "BBBBBBBBBBBBx2", &other, Alg::Es256);
+        assert_eq!(add(root, &added, "BBBBBBBBBBBBx1", 0, 1).unwrap(), Added::Added);
+        pruned("add");
+        ran_out();
+        remove(root, &bob, Some("BBBBBBBBBBBBx2")).unwrap();
+        pruned("remove");
+
+        ran_out();
+        assert!(!cancel(root, &alice).unwrap());
+        assert_eq!(allowance_rows(root).len(), 1, "a cancel that finds none writes nothing");
+        let refused = row(&alice, "DDDDDDDDDDDDx1", &spki, Alg::Es256);
+        assert_eq!(insert_allowed(root, &refused, "0123456789abcdef").unwrap(), AllowedAdd::Ended);
+        assert_eq!(allowance_rows(root).len(), 1, "nor does a refusal");
+        assert_eq!(kept(root, "passkey_add_cancelled").len(), 1, "only the cancel above: pruning records nothing");
     }
 }

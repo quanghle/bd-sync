@@ -20,11 +20,14 @@
 //!    account's reference, computed from the identity the provider proved.
 //!    The page asks for a passkey (`super::passkey`): the account's first
 //!    is registered with the approval, later approvals use one of its
-//!    passkeys and may add another on this device; where the issuer cannot
-//!    be a relying party, a notice and no form ([`unavailable`]).
+//!    passkeys and may add another on this device, or, while an admin's
+//!    allowance is live, register one with no existing one at hand; where
+//!    the issuer cannot be a relying party, a notice and no form
+//!    ([`unavailable`]).
 //! 3. `POST` to the same path ([`approve`]): the approval, bound to that
 //!    cookie and posted once, then its passkey ceremony checked (a passkey
-//!    added with it is stored before the gate is resolved), resolves
+//!    added with it or registered under an allowance is stored before the
+//!    gate is resolved, and stays if the gate then refuses), resolves
 //!    the gate as the account's actor with the reference kept at step 2,
 //!    never one the form names ([`Gates::approve`]), its state, arming and
 //!    approvers checked again in the transaction. Each POST taken is logged
@@ -604,7 +607,8 @@ pub fn approve(cx: &Ctx<'_>, workspace: &str, gate: &str, body: &str, cookies: &
         Err(Failure::Refused { why, credential }) => {
             metrics::APPROVALS_PASSKEY_REFUSED.add();
             log_approval(logged("passkey refused", &credential, "", why.label()));
-            return (refusal(403, pages::PASSKEY_FAILED_GATE), cleared);
+            let why = if why.ended() { pages::PASSKEY_ALLOW_ENDED } else { pages::PASSKEY_FAILED_GATE };
+            return (refusal(403, why), cleared);
         }
         Err(Failure::Store { error: Error::Busy(_) | Error::Locked(_), credential }) => {
             log_approval(logged("busy", &credential, "", "store busy"));

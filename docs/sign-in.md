@@ -681,7 +681,8 @@ verification: the browser asks for a fingerprint, a face or the device's
 PIN (bd asks for verification, and the browser and authenticator choose
 how: bd cannot insist on a biometric). An account's first approval
 registers its passkey with the same click, and later approvals ask for
-one of the account's passkeys. The page needs scripts and WebAuthn with `getPublicKey`
+one of the account's passkeys (or, under an admin's allowance, below, offer to
+register a new one). The page needs scripts and WebAuthn with `getPublicKey`
 (Chrome and Edge 85+, Safari 16+, Firefox 119+); without them its Approve
 button stays disabled and the page says why, and nothing can be approved
 from it. Passkeys work only at an https address with a host name, or at
@@ -716,8 +717,77 @@ gone, refused, the workspace busy or failing): nothing is approved, and
 the approval can be tried again from the gate's link with either
 passkey. Without the box checked, or where the browser cannot register
 passkeys (no `getPublicKey`), the page approves with the existing
-passkey alone, as before. A passkey can be added only this way, at an
-approval; one is never removed from the browser.
+passkey alone, as before.
+Without an admin's allowance (below), a passkey can be added only this way, at
+an approval; one is never removed from the browser.
+
+**An admin's allowance.** A person with none of the account's passkeys at
+hand (on a new device, the old one left at home or lost) cannot add one
+at an approval, and removing the account's passkeys would take away those
+that still work. An admin can instead allow the account to register one
+passkey without an existing one, on the server host:
+
+```bash
+bd serve passkey allow-add --account <actor or login> [--for <duration>]
+bd serve passkey allow-add --account <actor or login> --cancel
+```
+
+Like `list` and `remove`, the command runs only on the server host, never
+through a token, `/v2/exec` or MCP. An allowance lasts 15 minutes unless
+`--for` says otherwise (`--for 30m`), at most 1 hour, and covers one
+registration. An account has at most one: a second `allow-add` replaces
+the first, with a new expiry, `--cancel` ends it (cancelling none is no
+error, and says so), expiry needs nothing done, and `bd serve passkey
+list` shows until when one is live. `allow-add` refuses an unknown
+account, one holding the limit of 99 passkeys, and one with no passkeys,
+whose next approval registers one anyway.
+
+Confirm the request with the person some other way than through the
+account (a call, say), and grant it only when the person is ready: while
+it is live, anyone who signs in to the provider as the account can use it,
+and gets a lasting passkey and one approval. A passkey is registered only
+at an approval, so the account needs a gate or an operation waiting for
+it, and an admin may have to make one.
+
+Everything before the passkey is as on any approval: the sign-in, the
+admission with a human grant, whether the account may open the gate (or
+every gate in the way) and whether the gate is ready. For an account with
+1 to 98 passkeys, the page then says that an admin allowed this and
+has two buttons, in place of the `Also add a passkey on this device` box:
+
+- **Approve** registers a new passkey on this device, with user
+  verification. The browser refuses an authenticator that already holds
+  one of the account's passkeys, and the page then points at the second
+  button.
+- **`Use an existing passkey instead`** checks one of the account's
+  passkeys as on any other page. The allowance stays live.
+
+Where the browser cannot register passkeys (no `getPublicKey`), the page
+says the allowance cannot be used from it, the second button goes, and
+Approve asks for an existing passkey: nothing is spent. A person who did
+not ask for this should use an existing passkey, as the page says, and
+tell the admin, who ends the allowance with `--cancel` and removes any
+passkey no one recognizes by its prefix.
+
+The new passkey is checked as a first one is (its own challenge, the
+origin, the relying party, user verification). One transaction then checks
+that the allowance is still live and the account's, that the account holds
+fewer than 99 passkeys and that the credential id is not registered, spends
+the allowance and stores the passkey, before the approval runs. A refusal
+at those checks stores nothing, approves nothing and leaves the allowance
+as it was, and the approval is used up: open the link again. A page opened
+under an allowance that has since run out, been spent (in a second tab,
+say), been cancelled or been replaced says so: ask the admin again, or
+open the link again to use an existing passkey. Once the new passkey is
+stored it stays, with the allowance spent, even when the workspace's answer
+does not approve (the gate no longer armed, gone, refused, the workspace
+busy or failing): nothing is approved, and the approval can be tried again
+from the gate's link with the new passkey.
+
+Removing the account's last passkey ends a live allowance, and forgetting
+the account erases it. `bd serve token revoke --account` without
+`--forget` leaves it: an admin who suspects the account also runs
+`--cancel`.
 
 An admin lists an account's
 passkeys with `bd serve passkey list --account <actor or login>` on the
@@ -729,7 +799,10 @@ next approval registers a new one ([commands](commands.md)). Registrations
 token events --kind passkey_registered`, `passkey_removed`), each naming
 the credential's first 12 characters and its algorithm; an added
 passkey's event also names the passkey that vouched for it (`added at a
-browser approval with credential <prefix>`).
+browser approval with credential <prefix>`), and one registered under an
+allowance names the allowance (`registered at a browser approval under
+allowance <id>`). Allowances granted and ended are `passkey_add_allowed`
+and `passkey_add_cancelled` events; one that runs out records nothing.
 
 **Refusals** end on a page of this server, never a redirect elsewhere, and
 write nothing to the workspace. Once the provider has admitted an account
@@ -748,6 +821,7 @@ when the page then refuses or shows a notice:
 | a post from another site, or with neither `Origin` nor `Sec-Fetch-Site` | 403 |
 | a post without the approval's cookie (another browser) | 403; the approval stays usable from its own browser |
 | a post without the passkey's fields, or whose passkey check fails, or a refused add (a new passkey's fields where adding was not offered, incomplete, or failing their check; the limit reached; a credential id already registered) | 403; the approval is used up, nothing is stored |
+| a refused registration under an allowance (its fields where none was offered, incomplete, sent with an existing passkey's fields, or failing their check; the allowance run out, spent, cancelled or replaced since the page was opened; the limit reached; a credential id already registered; the account forgotten) | 403; the approval is used up, nothing is stored |
 | an address passkeys cannot be used at (an IP address, or http on a host other than `localhost`) | 403, a notice with no Approve button |
 | no such workspace, issue or gate, not a gate, not a human gate (after admission) | 404 |
 | already resolved | 409 |
@@ -758,23 +832,29 @@ Approval sign-ins share the 8 sign-in slots: the provider's callback and
 the approval's `POST` each take one. The approval's `POST` is at most
 16 KiB (room for an existing passkey's check and a new passkey's
 registration). The server logs each approval (`gate approval`, with its
-`outcome`, `passkey refused` for a failed or missing passkey check or a
-refused add) and refusal (`gate approval refused`) with the provider,
+`outcome`, `passkey refused` for a failed or missing passkey check, a
+refused add or a refused registration under an allowance) and refusal
+(`gate approval refused`) with the provider,
 subject, login, actor, workspace and gate, never an email; `gate
 approval` lines also carry `credential`, the first 12 characters of the
 passkey's credential id once the posted one could be read (empty
 otherwise), `added`, the first 12 characters of the passkey added at
 this approval (empty otherwise, a refused add included), and `passkey`,
 what became of the check (`registered`, `verified`, `verified and
-added`, a refusal's reason such as `missing fields`, `store busy`, `store
-failed`, `adding not offered`, `limit reached`, `new passkey: <reason>`
-for a new passkey's failed check (`new passkey: wrong challenge`, say),
-or `unavailable` where the address cannot use passkeys). They never
-carry the public key, the signature, the client data or the whole
-credential id. The approvals are counted in `/metrics`
+added`, `registered under allowance`, a refusal's reason such as `missing
+fields`, `store busy`, `store failed`, `adding not offered`, `limit
+reached`, `new passkey: <reason>` for a new passkey's failed check (`new
+passkey: wrong challenge`, say), `allowance: <reason>` for a refused
+registration under an allowance (`not offered`, `missing fields`,
+`malformed fields`, `expired`, `ended`, `limit reached`, `credential
+taken`, `no account`, or a failed check's reason, as in `allowance: wrong
+challenge`), or `unavailable` where the address cannot use passkeys).
+Under an allowance `credential` is the new passkey's, and `added` stays
+empty. They never carry the public key, the signature, the client data or
+the whole credential id. The approvals are counted in `/metrics`
 ([`bd_serve_approvals_total`](observability.md#server-metrics), and
-`bd_serve_passkeys_registered_total`, which counts first registrations
-and passkeys added at an approval).
+`bd_serve_passkeys_registered_total`, which counts first registrations,
+passkeys added at an approval and passkeys registered under an allowance).
 
 ### Approving a close or discard
 
@@ -887,9 +967,10 @@ included, refuses the approval (403, nothing changed): release it first,
 then ask again.
 
 **Passkeys.** As for a gate ([Passkeys](#approving-human-gates-in-the-browser)
-above), every Approve needs one of the account's passkeys with user verification
-(a fingerprint, a face or the device's PIN; the browser cannot be made to
-insist on a biometric). The first approval of an account, whether of a
+above), every Approve needs one of the account's passkeys (an allowance aside, below)
+with user verification (a fingerprint, a face or the device's PIN; the
+browser cannot be made to insist on a biometric). The first approval of an
+account, whether of a
 gate or of an operation, registers its passkey with the same click, and
 later ones ask for one of its passkeys. Scripts and WebAuthn with `getPublicKey` are needed
 (Chrome and Edge 85+, Safari 16+, Firefox 119+). The address must be https
@@ -907,12 +988,27 @@ no passkey, moves no counter and performs nothing; once the new passkey
 is stored, a workspace answer that does not perform the operation (no
 longer held back, gone, refused, busy or failed) leaves it registered,
 with nothing performed, and the operation can be approved again from its
-link with either passkey. An admin recovers a lost passkey with
+link with either passkey.
+
+While an [admin's allowance](#approving-human-gates-in-the-browser) is
+live, an account with 1 to 98 passkeys gets the same two buttons as on a
+gate's page: Approve registers a new passkey on this device, and `Use an
+existing passkey instead` checks one of its passkeys and leaves the
+allowance live. One transaction spends the allowance and stores the
+passkey before the operation is performed. A refusal at those checks stores
+nothing and performs nothing, and uses the approval up; once the passkey
+is stored, a workspace answer that does not perform the operation leaves
+it registered and the allowance spent, with nothing performed, and the
+operation can be approved again from its link with the new passkey.
+
+An admin recovers a lost passkey with
 `bd serve passkey list|remove --account <actor or login>`; `remove`
 without `--credential` removes every passkey of the account, and its next
-approval registers a new one. First registrations and added passkeys are
-in the audit trail (`passkey_registered`), an added one naming the
-passkey that vouched for it.
+approval registers a new one. `bd serve passkey allow-add` keeps the
+account's other passkeys instead. First registrations, added passkeys and
+those registered under an allowance are in the audit trail
+(`passkey_registered`), an added one naming the passkey that vouched for
+it and one under an allowance naming the allowance.
 
 **What is recorded.** The `closed` event (a close) or each `deleted`
 event (a discard) has the approver's actor, `"via": "browser"`,
@@ -925,8 +1021,12 @@ byte (none when it was empty or only whitespace).
 bad signature`, say, or `passkey refused: new passkey: wrong challenge`
 for an added passkey's failed check), `credential` (the first 12
 characters of the passkey's credential id once the posted one could be
-read, else empty) and `added` (the first 12 characters of the passkey
-added at this approval, else empty),
+read, else empty), `added` (the first 12 characters of the passkey
+added at this approval, else empty) and, only on an allowance's outcome,
+`passkey` (`registered under allowance` or `allowance: <reason>`, as on
+`gate approval` lines, with `credential` the new passkey's and `added`
+empty; `detail` reads `passkey refused: allowance: ended`, say, on a
+refusal, and no other line has the key),
 never the reason, a title, an email, or the passkey's public key,
 signature, client data or whole credential id, and counted in
 [`bd_serve_operation_approvals_total{outcome}`](observability.md#server-metrics),

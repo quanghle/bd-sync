@@ -212,6 +212,26 @@ pub(super) struct Ceremony {
     /// account has 1 to [`crate::passkeys::MAX_PER_ACCOUNT`] - 1 passkeys,
     /// kept and spent with the approval.
     pub(super) add: Option<[u8; 32]>,
+    /// The live allowance the page was opened under, offering to register a
+    /// passkey with no existing one: only for an account with 1 to
+    /// [`crate::passkeys::MAX_PER_ACCOUNT`] - 1 passkeys, and then never with
+    /// `add`.
+    pub(super) allowance: Option<Offer>,
+}
+
+/// What an approval page opened under a live allowance keeps of it. None of
+/// it but the challenge reaches the page, and the form names none of it.
+#[derive(Clone, Debug)]
+pub(super) struct Offer {
+    /// The third single-use challenge, minted apart from the others, kept
+    /// and spent with the approval.
+    pub(super) challenge: [u8; 32],
+    /// The allowance's id: a POST spends this one or none
+    /// ([`crate::passkeys::insert_allowed`]).
+    pub(super) id: String,
+    /// When it was due to end (milliseconds): what tells an expired allowance
+    /// from one ended otherwise, in the log.
+    pub(super) until: i64,
 }
 
 /// A human gate's approval page, shown to a person the rules let in:

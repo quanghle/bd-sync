@@ -137,7 +137,7 @@ crates/bd-server/src/ serve/ (bd serve: listen, routes, exec, sign-in endpoints,
                       · stream (streamed answers) · mcp_http (MCP over HTTP) · jobs (background jobs:
                       reclaim, gate checks, agent sets, backups) · follow (long polls) · server_db (server.db)
                       · webauthn (passkey registrations and assertions verified on ring) · passkeys
-                      (passkeys in server.db, bd serve passkey)
+                      (passkeys and add allowances in server.db, bd serve passkey)
                       · auth/ (access tokens, accounts and their actors) · oauth/ (sign-in: one rule engine
                       for every provider, GitHub, admission, refresh) · oidc/ · authorizer · secrets
                       (secrets fetched by the admin's command) · helper (running such commands) · oauth_server/

@@ -108,7 +108,8 @@ pub(super) fn change_scoped<T>(
 }
 
 /// Delete the tokens that ended [`PRUNE_AFTER`] ago: revoked, or a
-/// sign-in's that expired and could no longer be refreshed (`ended_at`).
+/// sign-in's that expired and could no longer be refreshed (`ended_at`);
+/// the audit trail's old events and the allowances that ran out too.
 /// At most [`server_db::PRUNE_BATCH`] each write, so that one write never
 /// pays for a long backlog while others wait; the next writes go on.
 pub(super) fn prune(tx: &rusqlite::Transaction) -> Result<()> {
@@ -116,7 +117,8 @@ pub(super) fn prune(tx: &rusqlite::Transaction) -> Result<()> {
         "DELETE FROM tokens WHERE id IN (SELECT id FROM tokens WHERE ended_at <= ?1 LIMIT ?2)",
         rusqlite::params![Timestamp::now().minus(PRUNE_AFTER).millis(), server_db::PRUNE_BATCH],
     )?;
-    server_db::prune_events(tx)
+    server_db::prune_events(tx)?;
+    server_db::prune_allowances(tx)
 }
 
 /// Which rows a change or a read looks at.
@@ -223,6 +225,7 @@ pub(super) fn save(tx: &rusqlite::Transaction, before: &TokenFile, after: &Token
     for (issuer, subject) in &after.erased {
         server_db::erase_events(tx, issuer, subject)?;
         server_db::erase_passkeys(tx, issuer, subject)?;
+        server_db::erase_allowance(tx, issuer, subject)?;
     }
     server_db::sync_rows(
         &before.tokens,

@@ -1323,6 +1323,37 @@ async function run(ctx) {
         const done = new Set(matched.map((m) => m.f.id));
         return { matched, unmatched, skipped: work.filter((x) => !done.has(x.f.id)) };
     };
+    // One pass over the whole triage answer before anything applies, so a refusal (rewritten to escalate) leaves the ledger
+    // and the counts untouched. count and taken carry this answer's earlier amendments; a refused amendment takes no budget
+    // and marks no entries.
+    const guardAmendments = (decided, ledger, used, max) => {
+        let count = used;
+        const taken = new Set();
+        for (const x of decided.filter((x) => x.d.action === "amend")) {
+            const ids = x.d.supersedes || [];
+            const targets = ids.map((id) => ledger.find((e) => e.id === id)).filter(Boolean);
+            const unknown = ids.filter((id) => !targets.some((e) => e.id === id));
+            const superseded = targets.filter((e) => e.supersededBy || taken.has(e.id)).map((e) => e.id);
+            const amends = targets.filter((e) => e.source === "amend").map((e) => e.id);
+            const why = !ids.length
+                ? "amend names no ledger entry"
+                : unknown.length
+                  ? `${unknown.join(", ")} not in the ledger`
+                  : superseded.length
+                    ? `${superseded.join(", ")} already superseded`
+                    : amends.length
+                      ? `would overturn an amendment (${amends.join(", ")}): flip-flop`
+                      : count >= max
+                        ? `amendment budget (${max}) spent`
+                        : null;
+            if (why) {
+                x.d = { ...x.d, action: "escalate", reason: `${x.d.reason} [guard: ${why}]` };
+                continue;
+            }
+            count++;
+            for (const id of ids) taken.add(id);
+        }
+    };
 
     for (let round = 0; round <= MAX_ROUNDS; round++) {
         const pass = await reviewPass(round);
@@ -1363,21 +1394,7 @@ async function run(ctx) {
         const decided = open.map((f) => ({ f, d: byId.get(f.id) || { action: "fix", reason: "not triaged", instruction: f.fixInstruction } }));
 
         // Cycle guards the planner cannot talk its way past.
-        for (const x of decided.filter((x) => x.d.action === "amend")) {
-            const targets = (x.d.supersedes || []).map((id) => ledger.find((e) => e.id === id)).filter(Boolean);
-            const superseded = targets.filter((e) => e.supersededBy).map((e) => e.id);
-            const amends = targets.filter((e) => e.source === "amend").map((e) => e.id);
-            const why = !targets.length
-                ? "amend names no ledger entry"
-                : superseded.length
-                  ? `${superseded.join(", ")} already superseded`
-                  : amends.length
-                    ? `would overturn an amendment (${amends.join(", ")}): flip-flop`
-                    : amendments >= MAX_AMENDMENTS
-                      ? `amendment budget (${MAX_AMENDMENTS}) spent`
-                      : null;
-            if (why) x.d = { ...x.d, action: "escalate", reason: `${x.d.reason} [guard: ${why}]` };
-        }
+        guardAmendments(decided, ledger, amendments, MAX_AMENDMENTS);
         const escalate = decided.filter((x) => x.d.action === "escalate");
         if (escalate.length || t.converging === false) {
             await recordRound({ file: unfiled(open), escalated: open });

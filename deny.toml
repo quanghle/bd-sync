@@ -1,0 +1,36 @@
+# cargo-deny policy, checked by .github/workflows/deny.yml. CONTRIBUTING.md (Dependencies) says what a failure
+# means and how to update or accept a finding.
+
+[advisories]
+# Vulnerability and notice advisories always fail and take no setting; these make the others fail too.
+yanked = "deny"
+unsound = "all"
+unmaintained = "all"
+# A stale entry fails: remove it with the update that fixes the finding.
+unused-ignored-advisory = "deny"
+# Each entry's reason says why it is acceptable, with a review date at most 90 days out and the bd issue, deferred
+# to that date, that holds the review.
+ignore = [
+  { id = "RUSTSEC-2026-0370", reason = "zvariant merged into zbus 6: unmaintained, no defect reported, and no update until secret-service moves to zbus 6; review by 2027-01-30, bd-zarfh." },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names merged into zbus 6: unmaintained, no defect reported, and no update until secret-service moves to zbus 6; review by 2027-01-30, bd-zarfh." },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive merged into zbus 6: unmaintained, no defect reported, and no update until secret-service moves to zbus 6; review by 2027-01-30, bd-zarfh." },
+]
+
+[licenses]
+allow = ["MIT", "Apache-2.0", "ISC", "Zlib", "BSD-3-Clause", "Unicode-3.0", "CDLA-Permissive-2.0"]
+include-dev = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Applies to private crates only, which is why the workspace crates set publish = false.
+allow-wildcard-paths = true
+deny = [
+  { crate = "openssl", reason = "TLS stays on rustls" },
+  { crate = "openssl-sys", reason = "TLS stays on rustls" },
+  { crate = "native-tls", reason = "TLS stays on rustls" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

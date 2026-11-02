@@ -1,0 +1,73 @@
+# Checks the crate graph against RustSec advisories and the license, ban and source policy in deny.toml.
+# Separate from ci.yml, which has no path filter and whose test matrix a schedule would also run.
+# CONTRIBUTING.md (Dependencies) says what a failure means and how to update or accept a finding.
+name: cargo-deny
+
+on:
+  # push as well as pull_request: most merges to main are made locally.
+  push:
+    branches: [main]
+    paths:
+      - '**/Cargo.toml'
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/deny.yml
+  pull_request:
+    paths:
+      - '**/Cargo.toml'
+      - Cargo.lock
+      - deny.toml
+      - .github/workflows/deny.yml
+  # Daily, so an advisory published after a merge is seen.
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+
+# One run per workflow+ref; superseded PR runs are cancelled, pushes to main always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUSTUP_MAX_RETRIES: 10
+  # Bump both in one reviewed change; Dependabot does not. A tool too old to read the database fails the job.
+  CARGO_DENY_VERSION: '0.20.2'
+  CARGO_DENY_SHA256: '9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f'
+
+defaults:
+  run:
+    shell: bash
+
+# Every trigger runs the same steps, so a dispatched run proves what a scheduled run does. Nothing carries over
+# between runs: each one reads the current advisory database.
+jobs:
+  cargo-deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      # The hash is checked before anything is unpacked, against the value above, not the release's .sha256 file,
+      # which comes from the same place as the archive.
+      - name: Install cargo-deny
+        run: |
+          set -euo pipefail
+          archive="cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO_DENY_VERSION/$archive"
+          printf '%s  %s\n' "$CARGO_DENY_SHA256" "$RUNNER_TEMP/$archive" | sha256sum --check --strict
+          mkdir "$RUNNER_TEMP/cargo-deny"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/cargo-deny" --strip-components=1
+          echo "$RUNNER_TEMP/cargo-deny" >> "$GITHUB_PATH"
+      - run: cargo deny --all-features --locked check

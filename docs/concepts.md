@@ -69,6 +69,15 @@ written, with the cycle's path in the error; `bd dep cycles` checks a whole
 workspace. `bd dep list` and `bd dep tree` show edges (`--direction`,
 `--max-depth`), and `bd blocked` lists blocked issues with their blockers.
 
+An issue cannot wait on its own ancestor: a parent can't close before its
+children, and a blocked parent blocks its whole subtree, so neither could
+finish. A `blocks` or `conditional-blocks` edge between an issue and its
+ancestor or descendant is refused, and so is a move (`bd update --parent`,
+`bd dep add -t parent-child`) that would make one, naming the edge to
+remove. These checks ignore statuses. `bd import` refuses a file that would
+leave a new edge of this kind live, and `bd doctor` warns about any already
+in a workspace ([Health](observability.md#health)).
+
 `duplicates` and `supersedes` edges point from the closed issue to the one
 that replaces it, as in beads: `X duplicates Y` means X is a duplicate of Y,
 and `X supersedes Y` means X is superseded by Y. `bd duplicate X --of Y` and
@@ -259,6 +268,15 @@ could have changed, where the evidence spans that older history, are
 listed as unknown, and the answer says history is incomplete
 (`incomplete: true`). Older bd binaries refuse a v4 workspace, so none can
 write such events after the marker.
+
+Events are numbered in commit order, while their times come from the
+writer's clock, which can step back (an NTP correction, a resumed VM). So
+a time is read as a place in the log: the state just before the first
+retained event stamped after it, which is always a state the log held.
+Inside a backward stretch, events stamped at or before the time but
+committed after a later-stamped one are left out; an event seq stays
+exact. A time at or after now means the newest state, however the last
+events are stamped.
 
 A point older than retention exits 6 (`history_pruned`), unless the
 issue's retained creation shows it did not exist yet. A seq just below the

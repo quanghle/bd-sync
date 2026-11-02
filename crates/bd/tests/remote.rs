@@ -359,6 +359,34 @@ fn remote_lifecycle_keeps_cli_output_and_exit_codes() {
 }
 
 #[test]
+fn remote_moves_that_would_block_an_issue_on_its_own_ancestor_are_refused() {
+    let server = Server::start();
+    let writer = server.client(&server.token("writer-laptop", "writer", &[]));
+    let id = |args: &[&str]| {
+        let mut a = vec!["-q"];
+        a.extend_from_slice(args);
+        writer.ok(&a).trim().to_string()
+    };
+    let p = id(&["create", "Parent"]);
+    let c = id(&["create", "Moved"]);
+    let d = id(&["create", "Child", "--parent", &c]);
+    writer.ok(&["dep", "add", &d, &p]);
+
+    assert_eq!(writer.code(&["update", &c, "--parent", &p]), 2);
+    let err = writer.run(&["--json", "update", &c, "--parent", &p]);
+    assert_eq!(err.status.code(), Some(2));
+    let err: Value = serde_json::from_slice(&err.stderr).unwrap();
+    assert_eq!(err["error"]["code"], "refused", "{err}");
+    assert_eq!(
+        err["error"]["message"],
+        format!(
+            "{d} depends on {p} via blocks; moving {c} under {p} would make {p} an ancestor of {d} and deadlock; remove that edge first"
+        )
+    );
+    assert!(writer.json(&["show", &c])["parent"].is_null(), "the move left nothing behind");
+}
+
+#[test]
 fn remote_close_claims_the_next_issue() {
     let server = Server::start();
     let alice = server.client(&server.token("alice-laptop", "alice", &[]));

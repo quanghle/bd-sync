@@ -63,6 +63,11 @@ impl Ws {
         self.store.read(|r| crate::events::head(r.conn())).unwrap()
     }
 
+    /// `point`'s place in the log.
+    fn cut(&self, point: Point) -> i64 {
+        self.store.read(|r| History::load(r.conn())?.at(r.conn(), point).map(|at| at.cut())).unwrap()
+    }
+
     /// The point just after the last write: as a seq, and as a time.
     fn now(&self) -> (Point, Point) {
         (Point::Seq(self.head()), Point::Time(self.clock.now()))
@@ -437,10 +442,11 @@ fn bounds_parse_as_points_or_durations_ago() {
     assert_eq!(parse_bound("-1h", now).unwrap(), ago(3_600));
     assert_eq!(parse_bound("12", now).unwrap(), Point::Seq(12));
     assert_eq!(parse_bound("#12", now).unwrap(), Point::Seq(12));
-    assert_eq!(parse_bound("+1d", now).unwrap(), Point::Time(now.plus(Duration::from_secs(86_400))));
-    assert_eq!(parse_bound("now", now).unwrap(), Point::Time(now));
+    assert_eq!(parse_bound("+1d", now).unwrap(), Point::Now(now.plus(Duration::from_secs(86_400))));
+    assert_eq!(parse_bound("now", now).unwrap(), Point::Now(now));
+    assert_eq!(parse_bound("0s", now).unwrap(), Point::Now(now));
     let t = Timestamp::parse_rfc3339("2026-01-15T09:00:00Z").unwrap();
-    assert_eq!(parse_bound("2026-01-15T09:00:00Z", now).unwrap(), Point::Time(t));
+    assert_eq!(parse_bound("2026-01-15T09:00:00Z", now).unwrap(), Point::Now(t));
     for bad in ["garbage", "#x", "", "-x"] {
         assert_eq!(parse_bound(bad, now).unwrap_err().exit_code(), 2, "{bad:?}");
     }
@@ -470,11 +476,12 @@ fn events_after_a_point_are_read_in_one_window() {
         .read(|c| {
             let conn = c.conn();
             let hist = History::load(conn)?;
-            let all = events_after(conn, &hist, t, None)?;
-            assert!(all.iter().all(|e| !t.includes(e)));
+            let (at_t, at_u) = (hist.at(conn, t)?, hist.at(conn, u)?);
+            let all = events_after(conn, &hist, at_t, None)?;
+            assert!(all.iter().all(|e| !at_t.includes(e)));
             assert!(all.iter().any(|e| e.op == "closed"));
-            for (since, until) in [(t, Some(u)), (time, Some(until)), (t, Some(until)), (time, Some(u))] {
-                let window = events_after(conn, &hist, since, until)?;
+            for (since, until) in [(t, u), (time, until), (t, until), (time, u)] {
+                let window = events_after(conn, &hist, hist.at(conn, since)?, Some(hist.at(conn, until)?))?;
                 assert!(!window.is_empty(), "{since:?}..{until:?}");
                 let ops: Vec<(&str, Option<&str>)> =
                     window.iter().map(|e| (e.op.as_str(), e.issue_id.as_deref())).collect();
@@ -485,12 +492,19 @@ fn events_after_a_point_are_read_in_one_window() {
                 );
             }
             // A child created later is tied to its spec by its parent edge's event.
-            let after = After::of(&all, t);
+            let after = After::of(&all, at_t);
             assert_eq!(after.kids.get(&spec), Some(&BTreeSet::from([r.clone()])));
-            assert!(After::of(&all, u).kids.is_empty(), "nothing after u adds an edge");
+            assert!(After::of(&all, at_u).kids.is_empty(), "nothing after u adds an edge");
             Ok(())
         })
         .unwrap();
+}
+
+/// What the events after `point` say.
+fn after_of(conn: &Connection, point: Point) -> Result<After> {
+    let hist = History::load(conn)?;
+    let at = hist.at(conn, point)?;
+    Ok(After::of(&events_after(conn, &hist, at, None)?, at))
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +661,7 @@ fn a_member_gone_with_a_purge_is_removed_as_purged() {
         .read(|c| {
             let rb = Rebuilder::new(c.conn(), Limits::issues(10), Refusal::Changes)?;
             let scope = BTreeSet::from([spec.clone()]);
-            let before = State::of(rb.at(&r, t)?.as_ref(), &scope);
+            let before = State::of(rb.at(&r, rb.hist().at(c.conn(), t)?)?.as_ref(), &scope);
             assert!(before.open().is_some());
             let gone = State { member: Member::Out, gone: true, parent: None };
             let ev = Event {
@@ -791,6 +805,193 @@ fn the_window_holds_events_after_since_up_to_until_and_windows_tile() {
 }
 
 #[test]
+fn windows_tile_in_log_order_when_the_clock_steps_back() {
+    let secs = Duration::from_secs;
+    let mut ws = Ws::new();
+    let spec = ws.create(pinned("Checkout", &["spec"], None));
+    let first = ws.create(pinned("First", &["requirement"], Some(&spec)));
+    let start = ws.clock.now();
+    let at = |s: u64| Point::Time(start.plus(secs(s)));
+    // Stamped +3660 s and +3720 s.
+    ws.clock.set(start.plus(secs(3600)));
+    let late = ws.create(pinned("Late", &["requirement"], Some(&spec)));
+    ws.close(&first, "dropped");
+    // Back: stamped +1860 s and +1920 s, committed after the two above.
+    ws.clock.set(start.plus(secs(1800)));
+    let early = ws.create(pinned("Early", &["requirement"], Some(&spec)));
+    ws.close(&late, "dropped");
+    // Forward again: stamped +7260 s and +7320 s.
+    ws.clock.set(start.plus(secs(7200)));
+    let last = ws.create(pinned("Last", &["requirement"], Some(&spec)));
+    ws.close(&early, "dropped");
+
+    let key = |c: &Changes| -> Vec<(i64, &'static str, String)> {
+        c.changes.iter().map(|x| (x.seq, x.kind, x.id.clone())).collect()
+    };
+    let bounds = [at(0), at(2400), at(3690), at(5000), at(9000)];
+    let cuts = bounds.map(|t| ws.cut(t));
+    assert_eq!(cuts[0], cuts[1], "nothing is committed before the first event stamped after +2400 s");
+    assert!(cuts[1] < cuts[2] && cuts[2] < cuts[3] && cuts[3] < cuts[4], "{cuts:?}");
+    assert_eq!(cuts[4], ws.head());
+
+    let mut parts = Vec::new();
+    for (i, pair) in bounds.windows(2).enumerate() {
+        let window = ws.ch(Some(&spec), pair[0], pair[1]);
+        parts.extend(key(&window));
+        if cuts[i] == cuts[i + 1] {
+            assert!(window.changes.is_empty(), "{pair:?}: {:?}", window.changes);
+            continue;
+        }
+        // The same answer as the seqs of its place in the log, labels apart.
+        let seqs = ws.ch(Some(&spec), Point::Seq(cuts[i]), Point::Seq(cuts[i + 1]));
+        assert_eq!(Changes { since: seqs.since.clone(), until: seqs.until.clone(), ..window }, seqs, "{pair:?}");
+    }
+    assert_eq!(parts, key(&ws.ch(Some(&spec), Point::Seq(cuts[0]), Point::Seq(cuts[4]))));
+    let listed: Vec<(&str, &str)> = parts.iter().map(|(_, kind, id)| (*kind, id.as_str())).collect();
+    assert_eq!(
+        listed,
+        [
+            ("added", late.as_str()),
+            ("removed", first.as_str()),
+            ("added", early.as_str()),
+            ("removed", late.as_str()),
+            ("added", last.as_str()),
+            ("removed", early.as_str()),
+        ]
+    );
+    // Stamped before this since, committed after it: in this window and no other.
+    let window = ws.ch(Some(&spec), at(3690), at(5000));
+    assert_eq!(window.changes.iter().filter(|x| x.id == early && x.kind == "added").count(), 1);
+    assert!(!ws.ch(Some(&spec), at(0), at(3690)).changes.iter().any(|x| x.id == early));
+
+    // A time reads as its place in the log, on either side of the step.
+    let bare = |mut views: Vec<SpecView>| {
+        views.iter_mut().for_each(|v| v.as_of = None);
+        views
+    };
+    for t in [at(0), at(1890), at(2400), at(3690), at(5000), at(9000)] {
+        let view = ws.at(&spec, t);
+        assert_eq!(view[0].as_of, Some(PointView::of(t)));
+        assert_eq!(bare(view), bare(ws.at(&spec, Point::Seq(ws.cut(t)))), "{t:?}");
+    }
+    assert_eq!(reqs(&ws.at(&spec, at(2400))[0]), [first.as_str()], "neither side of the step yet");
+}
+
+#[test]
+fn a_seq_and_a_time_compare_by_the_times_place_in_the_log() {
+    let secs = Duration::from_secs;
+    let mut ws = Ws::new();
+    let spec = ws.create(pinned("Checkout", &["spec"], None));
+    let start = ws.clock.now();
+    let (before, _) = ws.now();
+    ws.clock.set(start.plus(secs(3600)));
+    let late = ws.create(pinned("Late", &["requirement"], Some(&spec)));
+    ws.clock.set(start.plus(secs(1800)));
+    let early = ws.create(pinned("Early", &["requirement"], Some(&spec)));
+    let (past_the_cut, _) = ws.now();
+    let Point::Seq(n) = past_the_cut else { unreachable!() };
+    let (t, t2) = (Point::Time(start.plus(secs(2400))), Point::Time(start.plus(secs(3000))));
+    assert_eq!(Point::Seq(ws.cut(t)), before, "the first event stamped after t is `late`'s");
+    let stamp: Timestamp =
+        ws.store.read(|r| Ok(r.conn().query_row("SELECT ts FROM events WHERE seq = ?1", [n], |x| x.get(0))?)).unwrap();
+    assert!(stamp <= start.plus(secs(2400)), "stamped at or before t, committed past its cut");
+
+    let refused = |s: Point, u: Point| {
+        let e = ws.changes(Some(&spec), s, u).unwrap_err();
+        assert_eq!(e.exit_code(), 2, "{s:?}..{u:?}: {e}");
+        assert!(e.to_string().contains("--since must be before --until"), "{s:?}..{u:?}: {e}");
+    };
+    // A seq past the cut is after the time, whatever its stamp.
+    let c = ws.ch(Some(&spec), t, past_the_cut);
+    assert_eq!(kinds(&c), [("added", spec.as_str(), late.as_str()), ("added", spec.as_str(), early.as_str())]);
+    refused(past_the_cut, t);
+    // The cut itself is not after the time, and is a window up to it.
+    refused(t, before);
+    assert!(ws.ch(Some(&spec), before, t).changes.is_empty());
+    // Two times compare as times, even with one place in the log.
+    assert_eq!(ws.cut(t), ws.cut(t2));
+    assert!(ws.ch(Some(&spec), t, t2).changes.is_empty());
+    refused(t, t);
+    refused(t2, t);
+    // Two seqs compare as seqs.
+    assert_eq!(ws.ch(Some(&spec), before, past_the_cut).changes.len(), 2);
+    refused(past_the_cut, past_the_cut);
+    refused(past_the_cut, before);
+}
+
+#[test]
+fn a_seq_no_longer_retained_is_taken_as_before_a_time() {
+    let mut ws = Ws::new();
+    let spec = ws.create(pinned("Checkout", &["spec"], None));
+    for i in 0..4 {
+        ws.update(&spec, IssuePatch { description: Some(format!("v{i}")), ..Default::default() });
+    }
+    let head = ws.head();
+    ws.write(|tx| tx.prune_events(&PruneOptions { before: Some(head - 1), ..Default::default() }));
+    let floor = ws.store.read(|r| Ok(History::load(r.conn())?.floor())).unwrap();
+    let (gone, t) = (Point::Seq(floor - 1), ws.now().1);
+    assert!(ws.cut(gone) < ws.cut(t), "the cut alone would refuse t..{gone:?}");
+    for (s, u) in [(gone, t), (t, gone)] {
+        let c = ws.changes(Some(&spec), s, u).unwrap_or_else(|e| panic!("{s:?}..{u:?}: {e}"));
+        assert!(c.changes.is_empty(), "{s:?}..{u:?}: {:?}", c.changes);
+    }
+}
+
+#[test]
+fn a_time_from_the_clock_on_reads_the_head_of_a_log_stamped_ahead_of_it() {
+    let mut ws = Ws::new();
+    let spec = ws.create(pinned("Checkout", &["spec"], None));
+    let (since, _) = ws.now();
+    let clock = ws.clock.now();
+    ws.clock.set(clock.plus(Duration::from_secs(3600)));
+    let ahead = ws.create(pinned("Ahead", &["requirement"], Some(&spec)));
+    ws.clock.set(clock);
+    let head = ws.head();
+    let now = Point::Now(clock);
+    assert_eq!(ws.cut(now), head);
+
+    let points = [
+        Point::parse("now", clock).unwrap(),
+        Point::parse("-0s", clock).unwrap(),
+        parse_bound("now", clock).unwrap(),
+        parse_bound("+1d", clock).unwrap(),
+    ];
+    let tomorrow = clock.plus(Duration::from_secs(86_400));
+    assert_eq!(points, [now, now, now, Point::Now(tomorrow)]);
+    for point in points {
+        let view = PointView::of(point);
+        assert_eq!((view.seq, view.time.is_some()), (None, true), "{point:?}");
+        let mut got = ws.store.read(|r| crate::asof::issue_as_of(r.conn(), &ahead, point)).unwrap();
+        assert_eq!(got.point, view, "{point:?}");
+        got.point = PointView::of(Point::Seq(head));
+        assert_eq!(got, ws.store.read(|r| crate::asof::issue_as_of(r.conn(), &ahead, Point::Seq(head))).unwrap());
+
+        // A window up to it lists the change stamped ahead of the clock, and
+        // answers as the head does, labels apart.
+        let c = ws.ch(Some(&spec), since, point);
+        assert_eq!(kinds(&c), [("added", spec.as_str(), ahead.as_str())], "{point:?}");
+        assert_eq!(c.until, view);
+        assert_eq!(reqs(&ws.at(&spec, point)[0]), [ahead.as_str()], "{point:?}");
+    }
+    // The same stamp as a plain time stops before it.
+    assert!(ws.ch(Some(&spec), since, Point::Time(clock)).changes.is_empty());
+
+    // The head is a seq's end too, and nothing is after it.
+    let refused = |s: Point, u: Point| {
+        let e = ws.changes(Some(&spec), s, u).unwrap_err();
+        assert!(e.to_string().contains("--since must be before --until"), "{s:?}..{u:?}: {e}");
+    };
+    assert!(ws.ch(Some(&spec), Point::Seq(head), now).changes.is_empty());
+    refused(now, Point::Seq(head));
+    // Now compares with a time as the time it reads as.
+    refused(now, now);
+    refused(Point::Time(clock), now);
+    refused(Point::Now(tomorrow), now);
+    assert!(ws.ch(Some(&spec), now, Point::Now(tomorrow)).changes.is_empty());
+    assert_eq!(ws.ch(Some(&spec), Point::Time(clock), Point::Now(tomorrow)).changes.len(), 1);
+}
+
+#[test]
 fn an_empty_or_reversed_window_and_a_pruned_since_are_refused() {
     let mut ws = Ws::new();
     let first = ws.clock.now();
@@ -829,6 +1030,34 @@ fn a_since_before_the_first_event_of_an_unpruned_history_is_the_start() {
     let r = ws.create(pinned("Rule", &["requirement"], Some(&spec)));
     assert_eq!(kinds(&ws.since("checkout", before)), [("added", spec.as_str(), r.as_str())]);
     assert_eq!(ws.changes(None, before, ws.now().1).unwrap().changes.len(), 1);
+}
+
+#[test]
+fn a_since_before_the_first_stamp_of_a_stepped_log_is_the_start_unless_it_was_pruned() {
+    let mut ws = Ws::new();
+    let first = ws.clock.now();
+    let spec = ws.create(pinned("Checkout", &["spec", "area:checkout"], None));
+    let kept = ws.head() + 1;
+    let one = ws.create(pinned("One", &["requirement"], Some(&spec)));
+    let floor_of = |ws: &Ws| ws.store.read(|r| Ok(History::load(r.conn())?.floor())).unwrap();
+    // Stamped before every event so far, committed after them.
+    ws.clock.set(first.minus(Duration::from_secs(3600)));
+    let two = ws.create(pinned("Two", &["requirement"], Some(&spec)));
+
+    // Before every stamp, and before the first one but after the step's.
+    let times = [first.minus(Duration::from_secs(7200)), first.minus(Duration::from_secs(1))];
+    assert_eq!(floor_of(&ws), 1);
+    let added = [("added", spec.as_str(), one.as_str()), ("added", spec.as_str(), two.as_str())];
+    for since in times {
+        assert_eq!(kinds(&ws.since("checkout", Point::Time(since))), added, "{since:?}");
+    }
+
+    ws.write(|tx| tx.prune_events(&PruneOptions { before: Some(kept), ..Default::default() }));
+    assert_eq!(floor_of(&ws), kept);
+    for since in times {
+        let e = ws.changes(Some(&spec), Point::Time(since), ws.now().0).unwrap_err();
+        assert_eq!((e.exit_code(), e.code()), (6, "history_pruned"), "{since:?}: {e}");
+    }
 }
 
 #[test]
@@ -909,8 +1138,7 @@ fn a_create_import_after_the_point_adds_no_candidates() {
     assert_eq!(reqs(&v[0]), [r.as_str()]);
     let c = ws.store.read(|c| changes_with_cap(c.conn(), Some(&spec), t, now, limits)).unwrap();
     assert!(c.changes.is_empty() && c.unknown.is_empty(), "{c:?}");
-    let after =
-        ws.store.read(|c| Ok(After::of(&events_after(c.conn(), &History::load(c.conn())?, t, None)?, t))).unwrap();
+    let after = ws.store.read(|c| after_of(c.conn(), t)).unwrap();
     assert!(!after.kids.contains_key(&spec), "{after:?}");
     assert!(after.maybe.is_empty() && after.specs.is_empty() && after.hidden.is_empty(), "{after:?}");
 }
@@ -935,14 +1163,13 @@ fn a_point_inside_a_create_import_still_counts_its_edges() {
         .read(|c| {
             let conn = c.conn();
             let hist = History::load(conn)?;
-            let all = events_after(conn, &hist, t, None)?;
+            let all = events_after(conn, &hist, hist.at(conn, t)?, None)?;
             let seq = all
                 .iter()
                 .find(|e| e.op == "imported" && e.issue_id.as_deref() == Some("t-100"))
                 .map(|e| e.seq)
                 .expect("t-100 imported");
-            let point = Point::Seq(seq);
-            Ok(After::of(&events_after(conn, &hist, point, None)?, point))
+            after_of(conn, Point::Seq(seq))
         })
         .unwrap();
     // t-100's imported event is at the point, so nothing after it shows the
@@ -969,8 +1196,7 @@ fn an_update_import_with_previous_adds_no_candidates_for_its_new_edges() {
     assert_eq!(reqs(&v[0]), [r.as_str()]);
     let c = ws.store.read(|c| changes_with_cap(c.conn(), Some(&spec), t, now, limits)).unwrap();
     assert!(c.changes.is_empty() && c.unknown.is_empty(), "{c:?}");
-    let after =
-        ws.store.read(|c| Ok(After::of(&events_after(c.conn(), &History::load(c.conn())?, t, None)?, t))).unwrap();
+    let after = ws.store.read(|c| after_of(c.conn(), t)).unwrap();
     assert!(!after.kids.contains_key(&spec), "{after:?}");
 }
 
@@ -989,8 +1215,7 @@ fn an_update_import_after_the_point_ties_the_child_by_its_snapshots() {
     assert_eq!(reqs(v), [r.as_str()]);
     assert_eq!(v.requirements[0].title, "Rule");
     assert!(reqs(&ws.at(&spec, ws.now().0)[0]).is_empty());
-    let after =
-        ws.store.read(|c| Ok(After::of(&events_after(c.conn(), &History::load(c.conn())?, t, None)?, t))).unwrap();
+    let after = ws.store.read(|c| after_of(c.conn(), t)).unwrap();
     assert_eq!(after.kids.get(&spec), Some(&BTreeSet::from([r.clone()])));
     assert!(after.maybe.is_empty() && after.hidden.is_empty(), "{after:?}");
     let c = ws.since(&spec, t);
@@ -1095,8 +1320,7 @@ fn ids_purged_later_under_an_epic_do_not_count() {
     let outcome = ws.write(|tx| tx.purge_ephemeral(None, false));
     assert!(outcome.deleted.contains(&epic) && steps.iter().all(|x| outcome.deleted.contains(x)));
     let now = ws.now().0;
-    let after =
-        ws.store.read(|c| Ok(After::of(&events_after(c.conn(), &History::load(c.conn())?, t, None)?, t))).unwrap();
+    let after = ws.store.read(|c| after_of(c.conn(), t)).unwrap();
     assert!(steps.iter().all(|x| after.hidden.contains(x)), "{after:?}");
     let v = ws.store.read(|c| show_as_of_with_cap(c.conn(), &spec, t, limits)).unwrap();
     assert_eq!(reqs(&v[0]), [r.as_str()]);
@@ -1153,7 +1377,14 @@ fn retyped_line(ws: &Ws, r: &str, spec: &str) -> String {
 
 /// The ops of the events of `id` after `t`.
 fn ops_after(ws: &Ws, id: &str, t: Point) -> Vec<String> {
-    let events = ws.store.read(|c| events_after(c.conn(), &History::load(c.conn())?, t, None)).unwrap();
+    let events = ws
+        .store
+        .read(|c| {
+            let conn = c.conn();
+            let hist = History::load(conn)?;
+            events_after(conn, &hist, hist.at(conn, t)?, None)
+        })
+        .unwrap();
     events.into_iter().filter(|e| e.issue_id.as_deref() == Some(id)).map(|e| e.op).collect()
 }
 

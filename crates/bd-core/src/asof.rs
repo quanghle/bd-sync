@@ -19,6 +19,13 @@
 //! deletion dropped from surviving issues. A value whose evidence spans such
 //! retained events is reported unknown where one of those writes could have
 //! changed it, and the answer says its history is incomplete.
+//!
+//! Seqs follow commit order, while an event's time is the writer's clock,
+//! which can step back. So a [`Point::Time`] is first resolved to a place in
+//! the log, [`At`]: the state just after `cut(t)`, one less than the lowest
+//! retained seq stamped after `t`, or the head when none is. Every reader
+//! selects events by that cut, never by their own stamps, so a time always
+//! reads a state the log held.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,13 +46,26 @@ use crate::time::{Timestamp, parse_duration, parse_when};
 pub enum Point {
     /// The state just after the event with this seq.
     Seq(i64),
-    /// The state after every event recorded at or before this time.
+    /// The state just before the first retained event stamped after this
+    /// time (see [`History::at`]). Inside a stretch of out-of-order stamps,
+    /// events stamped at or before it but committed after that event are left
+    /// out; a [`Point::Seq`] stays exact.
     Time(Timestamp),
+    /// A time at or after the reader's clock, which reads as a time and means
+    /// the head: every committed event counts, however it is stamped.
+    Now(Timestamp),
 }
 
 impl Point {
+    /// The point for time `t`, read at `now`: [`Point::Now`] from `now` on,
+    /// else [`Point::Time`].
+    pub fn of_time(t: Timestamp, now: Timestamp) -> Point {
+        if t >= now { Point::Now(t) } else { Point::Time(t) }
+    }
+
     /// `N` or `#N`: an event seq; `-DURATION`: that long before `now`;
-    /// anything else a time as [`parse_when`] reads it.
+    /// anything else a time as [`parse_when`] reads it. A time goes through
+    /// [`Point::of_time`].
     pub fn parse(input: &str, now: Timestamp) -> Result<Point> {
         let s = input.trim();
         if let Some(n) = s.strip_prefix('#') {
@@ -60,17 +80,34 @@ impl Point {
             return s.parse().map(Point::Seq).map_err(|_| Error::invalid(format!("invalid event seq {input:?}")));
         }
         if let Some(ago) = s.strip_prefix('-') {
-            return Ok(Point::Time(now.minus(parse_duration(ago)?)));
+            return Ok(Point::of_time(now.minus(parse_duration(ago)?), now));
         }
-        parse_when(s, now).map(Point::Time)
+        parse_when(s, now).map(|t| Point::of_time(t, now))
+    }
+}
+
+/// A [`Point`] resolved to its place in the log by [`History::at`], the only
+/// way to build one: what a reader selects events by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct At {
+    point: Point,
+    cut: i64,
+}
+
+impl At {
+    /// The point as asked.
+    pub fn point(&self) -> Point {
+        self.point
     }
 
-    /// Whether `e` happened at or before this point.
+    /// The last seq the point includes.
+    pub fn cut(&self) -> i64 {
+        self.cut
+    }
+
+    /// Whether `e` is at or before this point.
     pub fn includes(&self, e: &Event) -> bool {
-        match *self {
-            Point::Seq(n) => e.seq <= n,
-            Point::Time(t) => e.ts <= t,
-        }
+        e.seq <= self.cut
     }
 }
 
@@ -145,6 +182,9 @@ pub struct IssueAsOf {
     /// Whether the answer relies on history written by an older bd, which
     /// did not record every change: values it could not confirm are unknown.
     pub incomplete: bool,
+    /// The last seq the point includes ([`At::cut`]).
+    #[serde(skip)]
+    pub cut: i64,
 }
 
 impl IssueAsOf {
@@ -155,11 +195,7 @@ impl IssueAsOf {
 
     /// Whether the deletion is at or before the point.
     pub fn deleted_by_then(&self) -> bool {
-        self.deleted.as_ref().is_some_and(|d| match (self.point.seq, self.point.time) {
-            (Some(n), _) => d.seq <= n,
-            (None, Some(t)) => d.ts <= t,
-            (None, None) => false,
-        })
+        self.deleted.as_ref().is_some_and(|d| d.seq <= self.cut)
     }
 }
 
@@ -662,7 +698,8 @@ impl Legacy<'_> {
 /// the issue's retained creation shows it did not exist yet.
 ///
 /// To rebuild many issues, or one issue at many points, load a [`History`]
-/// once and use [`History::issue`] or [`History::rebuild`].
+/// once and use [`History::issue`], or [`History::rebuild`] at what
+/// [`History::at`] resolves.
 pub fn issue_as_of(conn: &Connection, id: &str, point: Point) -> Result<IssueAsOf> {
     History::load(conn)?.issue(conn, id, point)
 }
@@ -672,7 +709,7 @@ impl PointView {
     pub fn of(point: Point) -> PointView {
         match point {
             Point::Seq(n) => PointView { seq: Some(n), time: None },
-            Point::Time(t) => PointView { seq: None, time: Some(t) },
+            Point::Time(t) | Point::Now(t) => PointView { seq: None, time: Some(t) },
         }
     }
 
@@ -775,11 +812,30 @@ impl History {
         Ok(())
     }
 
-    /// Whether `point` is before retained history.
-    pub fn before_retention(&self, point: Point) -> bool {
-        match point {
+    /// `point`'s place in the log, refusing a seq [`History::check`] refuses:
+    /// a seq is its own, [`Point::Now`] the head, a time `cut(t)` over the
+    /// retained events (see the [module](self) docs). A [`Point::Time`] costs
+    /// one read of `idx_events_ts`, so a command resolves each point once.
+    pub fn at(&self, conn: &Connection, point: Point) -> Result<At> {
+        self.check(point)?;
+        let cut = match point {
+            Point::Seq(n) => n,
+            Point::Now(_) => self.head,
+            Point::Time(t) => conn
+                .prepare_cached("SELECT MIN(seq) FROM events INDEXED BY idx_events_ts WHERE ts > ?1")?
+                .query_row([t], |r| r.get::<_, Option<i64>>(0))?
+                .map_or(self.head, |s| s - 1),
+        };
+        Ok(At { point, cut })
+    }
+
+    /// Whether `at` is before retained history: a time by the time asked,
+    /// against the oldest retained event's. The head never is.
+    pub fn before_retention(&self, at: At) -> bool {
+        match at.point {
             Point::Seq(n) => n < self.floor - 1,
             Point::Time(t) => self.floor_ts.is_some_and(|f| t < f),
+            Point::Now(_) => false,
         }
     }
 
@@ -815,33 +871,32 @@ impl History {
 
     /// [`issue_as_of`] over this context.
     pub fn issue(&self, conn: &Connection, id: &str, point: Point) -> Result<IssueAsOf> {
-        self.check(point)?;
+        let at = self.at(conn, point)?;
         let loaded = self.load_issue(conn, id)?;
-        self.rebuild(conn, &loaded, point)
+        self.rebuild(conn, &loaded, at)
     }
 
-    /// The state of `loaded` at `point` (see [`issue_as_of`]). The point is
-    /// checked first, as [`History::check`] does.
-    pub fn rebuild(&self, conn: &Connection, loaded: &Loaded, point: Point) -> Result<IssueAsOf> {
-        self.check(point)?;
-        rebuild(conn, self, loaded, point)
+    /// The state of `loaded` at `at`, resolved by [`History::at`] (see
+    /// [`issue_as_of`]).
+    pub fn rebuild(&self, conn: &Connection, loaded: &Loaded, at: At) -> Result<IssueAsOf> {
+        rebuild(conn, self, loaded, at)
     }
 }
 
-fn rebuild(conn: &Connection, hist: &History, loaded: &Loaded, point: Point) -> Result<IssueAsOf> {
+fn rebuild(conn: &Connection, hist: &History, loaded: &Loaded, at: At) -> Result<IssueAsOf> {
     let (head, floor, floor_ts, marker) = (hist.head, hist.floor, hist.floor_ts, hist.marker);
     let id = loaded.id.as_str();
     let history = &loaded.history;
     let row = &loaded.row;
     let retained_from = hist.retained();
-    let view = PointView::of(point);
+    let view = PointView::of(at.point);
     let is_creation = |e: &Event| e.op == "created" || (e.op == "imported" && e.data["mode"] != json!("update"));
     let is_deletion = |e: &Event| {
         e.op == "deleted"
             || (matches!(e.op.as_str(), "purged" | "run_compacted")
                 && e.data["ids"].as_array().is_some_and(|ids| ids.iter().any(|x| x == id)))
     };
-    let created_by_point = history.iter().rfind(|e| is_creation(e) && point.includes(e));
+    let created_by_point = history.iter().rfind(|e| is_creation(e) && at.includes(e));
     let created = created_by_point.or_else(|| history.iter().find(|e| is_creation(e))).map(EventRef::of);
     // The life the point is in: after its creation, the first deletion that
     // ends it; when that creation is not by then (pruned, so the reuse's
@@ -850,10 +905,10 @@ fn rebuild(conn: &Connection, hist: &History, loaded: &Loaded, point: Point) -> 
     let deleted = if created.is_none() || created_by_point.is_some() {
         first_after()
     } else {
-        history.iter().rfind(|e| is_deletion(e) && point.includes(e)).or_else(first_after)
+        history.iter().rfind(|e| is_deletion(e) && at.includes(e)).or_else(first_after)
     }
     .map(EventRef::of);
-    let last_event = history.iter().rfind(|e| point.includes(e)).map(|e| e.seq);
+    let last_event = history.iter().rfind(|e| at.includes(e)).map(|e| e.seq);
     let mut out = IssueAsOf {
         id: id.to_string(),
         point: view,
@@ -868,10 +923,11 @@ fn rebuild(conn: &Connection, hist: &History, loaded: &Loaded, point: Point) -> 
         retained_from,
         history_complete_from: marker,
         incomplete: false,
+        cut: at.cut,
     };
 
     // Before retained history: only a retained creation tells.
-    if hist.before_retention(point) {
+    if hist.before_retention(at) {
         if history.first().is_some_and(is_creation) {
             out.created = history.first().map(EventRef::of);
             out.deleted = None;
@@ -880,12 +936,12 @@ fn rebuild(conn: &Connection, hist: &History, loaded: &Loaded, point: Point) -> 
         return Err(Error::HistoryPruned { id: id.to_string(), floor, floor_ts });
     }
 
-    let included: Vec<&Event> = history.iter().filter(|e| point.includes(e)).collect();
-    let excluded: Vec<&Event> = history.iter().filter(|e| !point.includes(e)).collect();
+    let included: Vec<&Event> = history.iter().filter(|e| at.includes(e)).collect();
+    let excluded: Vec<&Event> = history.iter().filter(|e| !at.includes(e)).collect();
     // The bounds of the point's windows, as seqs (see `taint`).
-    let (fwd_hi, bwd_lo) = match point {
+    let (fwd_hi, bwd_lo) = match at.point {
         Point::Seq(n) => (n, n),
-        Point::Time(_) => (marker - 1, included.last().map_or(floor - 1, |e| e.seq)),
+        Point::Time(_) | Point::Now(_) => (marker - 1, included.last().map_or(floor - 1, |e| e.seq)),
     };
     let legacy_from = floor.max(1);
     let has_legacy = floor < marker;
@@ -1103,8 +1159,21 @@ mod tests {
         assert!(Point::parse("#x", now).is_err());
         assert_eq!(Point::parse("-1h", now).unwrap(), Point::Time(Timestamp(10_000_000 - 3_600_000)));
         let t = Point::parse("2026-01-15T09:00:00Z", now).unwrap();
-        assert_eq!(t, Point::Time(Timestamp::parse_rfc3339("2026-01-15T09:00:00Z").unwrap()));
+        assert_eq!(t, Point::Now(Timestamp::parse_rfc3339("2026-01-15T09:00:00Z").unwrap()));
         assert!(Point::parse("whenever", now).is_err());
+    }
+
+    /// A time at or after the reader's clock is [`Point::Now`], whichever way
+    /// it was written; one before it stays a time.
+    #[test]
+    fn times_from_the_clock_on_parse_as_now() {
+        let now = Timestamp(10_000_000);
+        assert_eq!(Point::parse("now", now).unwrap(), Point::Now(now));
+        assert_eq!(Point::parse("-0s", now).unwrap(), Point::Now(now));
+        assert_eq!(Point::parse("+1h", now).unwrap(), Point::Now(Timestamp(10_000_000 + 3_600_000)));
+        let past = Timestamp(now.0 - 1);
+        assert_eq!(Point::of_time(past, now), Point::Time(past));
+        assert_eq!(Point::of_time(now, now), Point::Now(now));
     }
 
     #[test]
@@ -1124,6 +1193,62 @@ mod tests {
         let t = Timestamp::parse_rfc3339("2026-01-15T09:00:00Z").unwrap();
         assert_eq!(PointView::of(Point::Time(t)), PointView { seq: None, time: Some(t) });
         assert_eq!(PointView::of(Point::Time(t)).label(), t.to_rfc3339());
+        assert_eq!(PointView::of(Point::Now(t)), PointView { seq: None, time: Some(t) });
+        assert_eq!(PointView::of(Point::Now(t)).label(), t.to_rfc3339());
+    }
+
+    /// On a log stamped ahead of the reader's clock, a time before every stamp
+    /// is before retained history while [`Point::Now`] reads the head: only the
+    /// point differs from the head's seq. It runs no query (the empty
+    /// connection has no `events`).
+    #[test]
+    fn now_is_the_head_on_a_log_stamped_ahead_of_the_clock() {
+        use std::sync::Arc;
+
+        use crate::model::{IssuePatch, NewIssue};
+        use crate::store::{InitOptions, OpenOptions, Store};
+        use crate::time::ManualClock;
+        use crate::{Guard, IdMode};
+
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ManualClock::new(Timestamp(1_700_000_200_000)));
+        let opts = OpenOptions { clock: clock.clone(), ..Default::default() };
+        let mut store =
+            Store::init(&dir.path().join("bd.db"), InitOptions { prefix: "t".into(), id_mode: IdMode::Counter }, opts)
+                .unwrap();
+        let id = store.write("test", "alice", |tx| Ok(tx.create_issue(NewIssue::titled("first"))?.id)).unwrap();
+        let patch = IssuePatch { title: Some("second".into()), ..Default::default() };
+        store.write("test", "alice", |tx| tx.update_issue(&id, &patch, &Guard::default(), false).map(|_| ())).unwrap();
+        let reader = Timestamp(1_700_000_100_000);
+        clock.set(reader);
+
+        store
+            .read(|r| {
+                let conn = r.conn();
+                let hist = History::load(conn)?;
+                let head = hist.head();
+                assert!(hist.floor_ts().is_some_and(|f| reader < f));
+                let empty = Connection::open_in_memory().unwrap();
+                for input in ["now", "-0s"] {
+                    let point = Point::parse(input, reader)?;
+                    assert_eq!(point, Point::Now(reader), "{input}");
+                    let at = hist.at(&empty, point)?;
+                    assert_eq!(at.cut(), head, "{input}");
+                    assert!(!hist.before_retention(at), "{input}");
+
+                    let mut got = issue_as_of(conn, &id, point)?;
+                    assert_eq!(got.point, PointView { seq: None, time: Some(reader) }, "{input}");
+                    assert_eq!(got.fields["title"], json!("second"), "{input}");
+                    got.point = PointView::of(Point::Seq(head));
+                    assert_eq!(got, issue_as_of(conn, &id, Point::Seq(head))?, "{input}");
+                }
+                // The same time as a plain time resolves over the stamps, and
+                // is before the log.
+                let time = hist.at(conn, Point::Time(reader))?;
+                assert!(hist.before_retention(time));
+                Ok(())
+            })
+            .unwrap();
     }
 
     /// One shared context answers as `issue_as_of` does, and one loaded
@@ -1182,7 +1307,7 @@ mod tests {
                 for point in points {
                     let fresh = issue_as_of(conn, &id, point);
                     let shared = hist.issue(conn, &id, point);
-                    let replayed = hist.rebuild(conn, &loaded, point);
+                    let replayed = hist.at(conn, point).and_then(|at| hist.rebuild(conn, &loaded, at));
                     match (&fresh, &shared, &replayed) {
                         (Ok(a), Ok(b), Ok(c)) => {
                             assert_eq!(a, b, "{point:?}");
@@ -1206,10 +1331,10 @@ mod tests {
                     issue_as_of(conn, "t-nope", Point::Seq(head + 1)).unwrap_err().to_string()
                 );
                 assert!(past.to_string().contains("past the newest event"), "{past}");
-                assert!(hist.rebuild(conn, &loaded, Point::Seq(-1)).is_err());
+                assert!(hist.at(conn, Point::Seq(-1)).is_err());
                 assert_eq!(hist.issue(conn, "t-nope", Point::Seq(head)).unwrap_err().exit_code(), 3);
                 assert_eq!(hist.retained(), Retained { seq: hist.floor(), ts: hist.floor_ts() });
-                assert!(!hist.before_retention(Point::Seq(0)));
+                assert!(!hist.before_retention(hist.at(conn, Point::Seq(0))?));
                 Ok(())
             })
             .unwrap();

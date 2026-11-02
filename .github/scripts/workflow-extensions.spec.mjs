@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { afterEach, beforeEach, describe, expect, it } from './expect.mjs'
+import { HOSTILE, blocks, passed, runBlock } from './record-blocks.mjs'
 
 const SDK_IMPORT = 'import { defineWorkflow, joinSession } from "@github/copilot-sdk/extension";'
 const STUB = `const defineWorkflow = (w) => { if (!w.meta?.name || !w.meta.description || !Array.isArray(w.meta.phases) || typeof w.run !== 'function') throw new Error('defineWorkflow needs meta { name, description, phases } and run'); return w; };
@@ -846,7 +847,7 @@ describe('plan-implement-review', () => {
 
 	describe('record', () => {
 		const SENTENCE =
-			'The single-quoted title after each `bd create` is final: pass it character for character, never rebuilt or reworded from the Text or the finding (bd rejects titles over 500 characters). '
+			'The single-quoted title after each `bd create` is final: pass it character for character, never rebuilt or reworded from the text under it or the finding (bd rejects titles over 500 characters). '
 		// A blocking finding whose triage fails (planner:triage:r0 answers null): the run files it on the step, then escalates.
 		const filing = (over) => script({ 'review:code:r0': { findings: [FOUND] }, 'validate:r0:F1': { valid: true, blocking: true, reasoning: 'real' }, ...over })
 		const run = async (over) => {
@@ -884,6 +885,81 @@ describe('plan-implement-review', () => {
 			const { ctx, got } = await run({ 'record:r0': { ok: true, filed: [{ id: 'F1', bdId: 'bd-9' }], followedUp: [] } })
 			expect((await got).status).toBe('escalated')
 			expect(ctx.calls.find((c) => c.label === 'record:r0').prompt).toContain(`${SENTENCE}Return ok=true`)
+		})
+
+		// Two rounds that reach all four sites with text in every block: F1's evidence in FILE, F2's in FOLLOW-UP, F3's rejected
+		// reasoning in r0's COMMENT, the drop reason in DROP and F4's rejected reasoning in r1's COMMENT. F4 is there because a
+		// dropped finding with a bdId is left out of the note, so r1's COMMENT would not hold the text without it.
+		const twoRounds = async (text) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx(
+				{ ...ARGS, reviewStep: 'bd-1.review' },
+				script({
+					'review:code:r0': { findings: [{ ...FOUND, evidence: text }, { ...FOUND, line: 5, evidence: text }, { ...FOUND, line: 6, evidence: text }] },
+					'validate:r0:F1': { valid: true, blocking: true, reasoning: 'real', fixInstruction: 'fix it' },
+					'validate:r0:F2': { valid: true, blocking: false, reasoning: 'minor' },
+					'validate:r0:F3': { valid: false, blocking: false, reasoning: text },
+					'planner:triage:r0': { items: [{ id: 'F1', action: 'fix', reason: 'r', instruction: 'i' }], converging: true },
+					'record:r0': { ok: true, filed: [{ id: 'F1', bdId: 'bd-1.review.1' }], followedUp: [{ id: 'F2', bdId: 'bd-2' }] },
+					'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }] },
+					'review:code:r1': { findings: [{ ...FOUND, line: 7 }], resolved: [{ id: 'F1', resolved: false, why: 'no' }] },
+					'validate:r1:F4': { valid: false, blocking: false, reasoning: text },
+					'planner:triage:r1': { items: [{ id: 'F1', action: 'drop', reason: text }], converging: true },
+				}),
+			)
+			const got = await wf.run(ctx)
+			const prompts = records(ctx).map((c) => c.prompt)
+			return { got, prompts, blocks: prompts.flatMap(blocks) }
+		}
+
+		it.each(HOSTILE)('passes text with %s to bd unchanged and runs nothing else', async (_, text) => {
+			const { got, blocks: found } = await twoRounds(text)
+			expect(got.status).toBe('done')
+			expect(found).toHaveLength(5)
+			for (const block of found) {
+				expect(block.body).toContain(text)
+				const r = runBlock(block)
+				expect(r.status).toBe(0)
+				expect(r.canary).toBe(false)
+				expect(passed(r)).toBe(block.body.replace(/\n+$/, ''))
+			}
+		})
+
+		it('writes each site\'s first line whole, with the heredoc at top level', async () => {
+			const { blocks: found } = await twoRounds('plain words')
+			const flags = '-C /r --actor "me/copilot-1"'
+			expect(found.map((b) => b.first)).toEqual([
+				`{ bd create 'Finding F1: Handles nothing' -t bug --parent bd-1.review -l severity:minor -d "$(cat)" --json ${flags}; } <<'BD_TEXT'`,
+				`{ bd create 'Handles nothing' -t task -p 3 --dep discovered-from:bd-1.review -l followup:bd-1.review/1be466fa -d "$(cat)" --json ${flags}; } <<'BD_TEXT'`,
+				`bd comment add bd-1.review --stdin ${flags} <<'BD_TEXT'`,
+				`bd comment add bd-1.review.1 --stdin ${flags} <<'BD_TEXT'`,
+				`bd comment add bd-1.review --stdin ${flags} <<'BD_TEXT'`,
+			])
+		})
+
+		it('leaves no text for the agent to compose', async () => {
+			const { prompts } = await twoRounds('plain words')
+			expect(prompts).toHaveLength(2)
+			for (const prompt of prompts) {
+				expect(prompt).not.toContain('<Text>')
+				expect(prompt).not.toContain('Text:')
+				expect(prompt).not.toContain("<<'EOF'")
+				expect(prompt).not.toMatch(/\$\([^)]*<</)
+			}
+		})
+
+		it('picks a tag per block, from that block\'s text', async () => {
+			const { ctx, got } = await run({ 'review:code:r0': { findings: [{ ...FOUND, evidence: 'BD_TEXT' }] }, 'record:r0': { ok: true, filed: [{ id: 'F1', bdId: 'bd-9' }], followedUp: [] } })
+			await got
+			expect(blocks(ctx.calls.find((c) => c.label === 'record:r0').prompt).map((b) => b.tag)).toEqual(['BD_TEXT_X', 'BD_TEXT'])
+		})
+
+		it('hands bd\'s exit status to the agent from both forms', async () => {
+			const { blocks: found } = await twoRounds('plain words')
+			const create = found.find((b) => b.first.startsWith('{ bd create'))
+			const comment = found.find((b) => b.first.startsWith('bd comment add'))
+			expect(runBlock(create, 7).status).toBe(7)
+			expect(runBlock(comment, 7).status).toBe(7)
 		})
 	})
 
@@ -1143,6 +1219,45 @@ describe('score-issue', () => {
 		expect(record).toContain('Complexity: 4/5 (estimated 3, gap +1). big')
 		expect(record).toContain('Work: 3 agents, 1.2 credits')
 		expect(record).toContain('--actor "me/copilot-1"')
+		expect(record).toContain(`bd -C /r comment add bd-1 --stdin --actor "me/copilot-1" <<'BD_TEXT'\n`)
+	})
+
+	describe('record block', () => {
+		/** The record prompt of a run whose judge summary and trace summary are both text. */
+		const recordPrompt = async (text) => {
+			const wf = await load('score-issue', undefined)
+			const ctx = fakeCtx({ issue: 'bd-1', actor: 'me/copilot-1' }, script({ judge: judgement({ top: { summary: text } }), trace: { ok: true, summary: text } }))
+			expect(await wf.run(ctx)).toMatchObject({ status: 'scored', recorded: true })
+			return ctx.calls.find((c) => c.label === 'record').prompt
+		}
+
+		it.each(HOSTILE)('passes text with %s to bd unchanged and runs nothing else', async (_, text) => {
+			const found = blocks(await recordPrompt(text))
+			expect(found.length).toBe(1)
+			const [block] = found
+			expect(block.body).toContain(text)
+			const r = runBlock(block)
+			expect(r.status, r.stderr).toBe(0)
+			expect(r.canary).toBe(false)
+			expect(passed(r)).toBe(block.body.replace(/\n+$/, ''))
+		})
+
+		it('leaves nothing for the agent to compose', async () => {
+			const prompt = await recordPrompt('plain words')
+			expect(prompt).not.toContain('<Text>')
+			expect(prompt).not.toContain('Text:')
+			expect(prompt).not.toContain("<<'EOF'")
+			expect(prompt).not.toMatch(/\$\([^)]*<</)
+		})
+
+		it('picks a tag absent from the text', async () => {
+			expect(blocks(await recordPrompt('BD_TEXT')).map((b) => b.tag)).toEqual(['BD_TEXT_X'])
+		})
+
+		it("hands bd's exit status back", async () => {
+			const [block] = blocks(await recordPrompt('plain words'))
+			expect(runBlock(block, 7).status).toBe(7)
+		})
 	})
 
 	it('escalates a mechanical agent that fails its schema once, to general-purpose at medium, with an @escalated label', async () => {

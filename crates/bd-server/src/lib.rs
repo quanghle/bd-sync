@@ -1,5 +1,6 @@
-//! `bd serve`: remote workspaces over HTTPS (`serve`), their background jobs
-//! (`jobs`) and long polls (`follow`), access tokens and accounts in
+//! `bd serve`: remote workspaces over HTTPS (`serve`), with the memory their
+//! requests may hold (`budget`), their background jobs (`jobs`) and long
+//! polls (`follow`), access tokens and accounts in
 //! `server.db` (`auth`, `server_db`), sign-in with GitHub or OpenID Connect
 //! providers (`oauth`, `oidc`, `authorizer`, with the admin's commands in
 //! `helper` and secrets fetched by one in `secrets`), and the MCP endpoint
@@ -11,6 +12,7 @@
 
 pub mod auth;
 pub mod authorizer;
+pub mod budget;
 pub mod follow;
 pub mod helper;
 pub mod jobs;

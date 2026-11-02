@@ -32,6 +32,8 @@ ureq = { version = "3", default-features = false, features = ["rustls"] }
 [dev-dependencies]
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
 tempfile = "3.27.0"
+# The paused clock of budget.rs' and read_within's tests: same crate and version, test builds only.
+tokio = { version = "1", default-features = false, features = ["test-util", "macros", "rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
 # The admin's helper commands (helper.rs): kill(2) of their process group, and poll(2)/fcntl(2) to read their output;

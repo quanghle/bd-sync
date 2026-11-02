@@ -62,7 +62,10 @@ malformed spec parts) do not.
   an expired one, and `token`, `workspace` and `why` for what a token may
   not do (a read token writing, another actor, another workspace). A
   request with no token is not logged, since MCP clients send one to learn
-  where to sign in.
+  where to sign in. A body arriving too slowly and a caller over its share
+  of memory log the same line, with `peer`, `token`, `workspace` and `why`;
+  a request refused because memory is full for everyone is counted only in
+  `bd_serve_busy_total`.
 - **Startup**: the address it listens on (also printed on stdout), its
   background job settings, which sign-in methods are on, and warnings about
   a root or secret file open to other users.
@@ -145,7 +148,7 @@ Prometheus text:
 |---|---|
 | `bd_serve_responses_total{class}` | responses by status class (`1xx`…`5xx`) |
 | `bd_serve_busy_total` | 503s, which clients retry |
-| `bd_serve_refused_total{reason}` | requests refused for their token: `unknown_token`, `expired_token`, `forbidden` |
+| `bd_serve_refused_total{reason}` | requests refused for their token (`unknown_token`, `expired_token`, `forbidden`), a body under the minimum rate (`slow_body`), or a caller over its share of memory (`caller_budget`) |
 | `bd_serve_connections_total` | connections accepted |
 | `bd_serve_connections_refused_total{limit}` | connections refused: `peer`, `total` |
 | `bd_serve_connections_open` | connections open now |

@@ -32,6 +32,7 @@ use hyper::body::{Body, Bytes, Frame as BodyFrame, SizeHint};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
+use crate::budget;
 use bd_cli::io::Sink;
 
 use bd_cli::protocol::{ExecResponse, Exit, Frame};
@@ -188,7 +189,7 @@ impl Pipe {
 pub struct ResponseBody {
     kind: Kind,
     /// The answer's share of the server's memory budget, given back when hyper drops the body.
-    _budget: Option<OwnedSemaphorePermit>,
+    _budget: Option<budget::Held>,
 }
 
 enum Kind {
@@ -202,7 +203,7 @@ impl ResponseBody {
     }
 
     /// A whole answer holding `budget` until it is sent or dropped.
-    pub fn whole_within(bytes: impl Into<Bytes>, budget: Option<OwnedSemaphorePermit>) -> ResponseBody {
+    pub fn whole_within(bytes: impl Into<Bytes>, budget: Option<budget::Held>) -> ResponseBody {
         ResponseBody { kind: Kind::Whole(Some(bytes.into())), _budget: budget }
     }
 }
@@ -315,7 +316,8 @@ pub struct FrameWriter {
     limits: Limits,
     /// Where the answer's body goes once it is known; taken when sent.
     answer: Option<oneshot::Sender<ResponseBody>>,
-    budget: Option<OwnedSemaphorePermit>,
+    /// The answer's share of the server's memory budget, handed to its body.
+    budget: Option<budget::Held>,
     /// The server's lane of streamed answers, and this answer's place in it.
     lane: Option<Arc<Semaphore>>,
     in_lane: Option<OwnedSemaphorePermit>,
@@ -404,7 +406,7 @@ impl FrameWriter {
     pub fn new(
         answer: oneshot::Sender<ResponseBody>,
         limits: Limits,
-        budget: Option<OwnedSemaphorePermit>,
+        budget: Option<budget::Held>,
         lane: Option<Arc<Semaphore>>,
     ) -> FrameWriter {
         FrameWriter {

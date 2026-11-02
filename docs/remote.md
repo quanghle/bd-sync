@@ -74,12 +74,27 @@ answered `503`, which clients retry.
   machine's: a local proxy's connections are everyone's); a connection over
   either limit is closed as it is accepted. Request headers,
   and an idle keep-alive connection's next request, must arrive within 75
-  seconds; a request body within 120 seconds; a TLS handshake within 15
-  seconds. A connection closes after 15 minutes, once the answer under way
+  seconds; a request body within 120 seconds and at no less than 16 KiB/s,
+  measured over each 30 seconds, or it gets `408` and the connection
+  closes; a TLS handshake within 15 seconds. A proxy that buffers request
+  bodies hides a client's rate from the server, so behind one the rate is
+  not seen. A connection closes after 15 minutes, once the answer under way
   is sent (cut 2 minutes later).
-- **Commands**: at most 32 run at once. Requests in progress share a
-  memory budget of 256 MiB (more if one maximum-size request needs it). A
-  request waits up to 15 seconds for a slot or budget before its 503.
+- **Commands**: at most 32 run at once. A request waits up to 15 seconds
+  for a slot before its 503.
+- **Memory**: requests in progress share 256 MiB (at `--max-body-mib` 112
+  or more, what one maximum-size request needs, twice its body and 1.25
+  MiB, plus 32 MiB). A request holds about what it has sent, twice its
+  bytes received plus 128 KiB, whatever size it declares, and its answer's
+  share only once its body has arrived. One caller, a token's actor with
+  all its tokens and linked accounts, may hold half of the total, or what
+  one maximum-size request needs if more: 129.25 MiB by default, across
+  workspaces. Declared sizes count against this limit though they hold
+  nothing: past it a request gets its 503 at once, and a declared body
+  that cannot fit is refused before it is read. The last 32 MiB is kept
+  for requests of at most 1 MiB. A request's waits for memory total at
+  most 15 seconds and do not count against its body's time, so a large
+  upload can be refused part way through, and its client retries.
 - **Streaming**: past 64 KiB, a read's output streams to the client as it
   is written, through under 1 MiB of buffers, so a large `bd export` costs
   no more memory than a claim. A write's output is held, up to 1 MiB, so a
@@ -413,6 +428,12 @@ and stores its answer (up to 1 MiB of output), so a retry of a write whose
 answer was lost gets the stored answer instead of running again: writes
 apply once.
 
+An upload the server refused or cut did not run: a `503` before or part
+way through its body, or a `408` for a body that came too late or too
+slowly (exit 8). A client still sending as the server closes may not read
+that answer: it sees a lost connection and retries, and a write whose
+retries give up can then exit 9, though nothing ran.
+
 A write's answer is printed once it has arrived whole; a read prints a long
 output as it arrives, so a read cut off after that fails rather than
 retrying. Exit codes are the same as locally, plus:
@@ -632,8 +653,9 @@ Blank lines are keep-alives; an answer without the exit frame was cut off.
 
 Failures before the command runs (an unknown, expired or wrongly bound
 token: 401; another workspace: 403; an unknown workspace: 404; a body too
-large: 413; a bad body: 400; busy: 503) return that status with the
-`--json` error shape. Failures decided once the request is read (a bad
-command line, a read token writing, an actor the token may not use) are a
-200 answer with an exit frame. Every answer carries `bd-protocol: 2` and
-`bd-version` headers, which tell bd's own answers apart from a proxy's.
+large: 413; a body too late or too slow: 408; a bad body: 400; busy: 503)
+return that status with the `--json` error shape. Failures decided once
+the request is read (a bad command line, a read token writing, an actor
+the token may not use) are a 200 answer with an exit frame. Every answer
+carries `bd-protocol: 2` and `bd-version` headers, which tell bd's own
+answers apart from a proxy's.

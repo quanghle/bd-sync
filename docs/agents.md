@@ -599,10 +599,12 @@ Two commands run at the start of each agent session:
   harness's set with pull semantics (removals and restores applied, new or
   changed assets only reported), and tells the session what changed.
 - `bd prime --hook <harness>` prints the [prime](concepts.md#comments-and-memory)
-  context: the actor, the core loop, its claims, ready work, gates,
-  playbooks and memories. The core loop is kept to a dozen lines, as it is
-  injected into every session and again after compaction; besides claim,
-  heartbeat and close it names the commands that keep context small:
+  context: the actor, the workspace's status, its claims, ready work and
+  gates, then the core loop, feature specs, playbooks and memories, so what
+  the session holds and can do next comes first. The core loop is kept to a
+  dozen lines, as it is injected into every session and again after
+  compaction; besides claim, heartbeat and close it names the commands that
+  keep context small:
   `--brief` on `bd ready`/`list`/`show`, `bd ready --explain` and
   `bd show <id> --why` for work that is not ready, `bd query` for searches,
   `bd q` for quick capture, and `bd duplicate`/`bd supersede`.
@@ -640,6 +642,42 @@ checkout's mutex and the rest (at least 1 second) for the server, all its
 requests and retries against one deadline. Files are written only once the
 server's answers are in and checked, so running out of time leaves nothing
 half written.
+
+**Size budget.** `bd prime --hook <harness>` prints at most 9,500 bytes of
+context, for every harness, so that all of it reaches the model. Each
+harness limits what a hook adds (checked with these versions):
+
+| harness | limit | over the limit |
+|---|---|---|
+| Claude Code 2.1.316 | 10,000 characters per hook | the text goes to a file; the model gets its path and the first 2,000 characters |
+| Codex 0.155.1 | 2,500 tokens per hook, estimated as bytes/4, so 10,000 bytes, unless the hook sets `additionalContextLimit` | the text goes to a file; the model gets its path and a preview of the head and tail |
+| Copilot CLI 1.0.105 | a byte limit on the contexts of all hooks together; 20,000 bytes arrived whole, the exact limit is not known | the whole context is ignored |
+
+A context that fits is the text `bd prime` prints. One over the budget is
+shortened, under `--hook` only:
+
+1. Each memory becomes one line, `- <key>: <text>`, sharing the room the
+   rest of the context leaves. A note names `bd memory get <key>`, which
+   prints one whole.
+2. If that is not enough, the list taking the most bytes (held claims, ready
+   work, gates, playbooks or memories) loses its last line, repeatedly. The
+   session's own claims, which carry its lease tokens, go only when those
+   lists are empty.
+3. If fixed text alone still passes the budget (a very long list of playbooks
+   waiting for approval, say), it is cut at a line end, and the last line
+   says `bd prime` prints all of it.
+
+A shortened list says how many lines it left out and which command prints
+them, as in ``- … 3 more: `bd prime` `` (`bd prime` for claims and gates,
+with their lease tokens and approval links; `bd playbook list` for playbooks;
+`bd memories` for memories). Its heading counts what it shows,
+`(showing 2 of 5)`, or `(top 2 of 5)` for ready work, which has no such line.
+
+Plain `bd prime` and `bd prime --json` are never shortened, and
+`--max-memories`, `--ready` and `--max-playbooks` apply before the budget. In
+a remote workspace the server renders the context, so the server applies the
+budget and the client needs no change; an older server keeps printing as
+before until it is upgraded.
 
 `bd remote set` and `bd remote login` mention when the workspace serves
 sets, so you can run `bd agents pull --harness <h>` before the first
@@ -744,11 +782,12 @@ the session. A command printing anything but one JSON object adds nothing.
 
 Codex loads project hooks only when the project's `.codex/` layer is
 trusted, and each hook must be trusted in `/hooks` (an edited hook needs
-trust again). A subagent's thread runs no `SessionStart` hooks. Codex
-shows the model a limited amount of hook output by default: a long
-`bd prime` may need `"additionalContextLimit"` raised. Keep `compact` in
-the matcher, so the hooks run again after compaction; `bd setup codex`
-writes this file.
+trust again). A subagent's thread runs no `SessionStart` hooks. A hook's
+context over 2,500 estimated tokens (10,000 bytes) spills to a file unless
+the hook sets `"additionalContextLimit"`; `bd prime --hook codex` stays
+under it ([Size budget](#session-start-hooks)), and `bd prime` prints
+everything. Keep `compact` in the matcher, so the hooks run again after
+compaction; `bd setup codex` writes this file.
 
 ### Reloading
 

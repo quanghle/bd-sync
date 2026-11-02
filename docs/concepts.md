@@ -339,7 +339,10 @@ bd recall <key>; bd forget <key>               # also: bd memory add|get|list|rm
 Memories are durable project insights, with authorship and revisions.
 `bd prime` prints them with your claims, ready work, gates waiting on a
 person and the [playbooks](playbooks.md) available. Outside a workspace it
-prints nothing, so it is safe in session hooks.
+prints nothing, so it is safe in session hooks. In a
+[session hook](agents.md#session-start-hooks) the context stays within 9,500
+bytes, so memories may be shortened to a line each; `bd memory get <key>`
+prints one whole.
 
 ## Feature specs
 

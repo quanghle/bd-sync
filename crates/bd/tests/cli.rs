@@ -3841,6 +3841,183 @@ fn prime_prints_one_json_object_for_copilot_hooks() {
 }
 
 #[test]
+fn prime_prints_state_before_reference() {
+    let ws = Ws::new();
+    for title in ["Mine", "Another session's", "Up next", "Behind a gate"] {
+        ws.ok(&["create", title]);
+    }
+    assert!(as_user(&ws, None, &["claim", "t-1"]).status.success());
+    assert!(as_user(&ws, Some(SESSION_A), &["claim", "t-2"]).status.success());
+    ws.ok(&["gate", "create", "-t", "human", "--blocks", "t-4"]);
+    ws.ok(&["config", "set", "experimental.features", "specs"]);
+    ws.playbook("ship", "description = \"Short\"\n[[steps]]\nid = \"a\"\n");
+    ws.ok(&["remember", "--key", "habit", "Prefer small changes"]);
+    for args in [&["prime"][..], &["prime", "--hook", "claude"]] {
+        let text = String::from_utf8(as_user(&ws, None, args).stdout).unwrap();
+        let mut last = 0;
+        for heading in [
+            "⚠",
+            "## Status",
+            "## Your claims",
+            "## Held by other",
+            "## Ready work",
+            "## Gates needing",
+            "## Core loop",
+            "## Experimental",
+            "## Feature specs",
+            "## Playbooks",
+            "## Persistent memories",
+        ] {
+            let at = text.find(heading).unwrap_or_else(|| panic!("{heading} missing from {text}"));
+            assert!(at > last, "{heading} comes too early in {args:?}: {text}");
+            last = at;
+        }
+    }
+}
+
+#[test]
+fn prime_counts_the_memories_max_memories_leaves_out() {
+    let ws = Ws::new();
+    for key in ["a", "b", "c"] {
+        ws.ok(&["remember", "--key", key, "Some note"]);
+    }
+    let capped = ws.ok(&["prime", "--max-memories", "1"]);
+    assert!(capped.contains("## Persistent memories (showing 1 of 3)"), "{capped}");
+    assert!(capped.contains("- … 2 more: `bd memories`"), "{capped}");
+    assert!(capped.contains("### a\nSome note") && !capped.contains("### b"), "{capped}");
+    let all = ws.ok(&["prime"]);
+    assert!(all.contains("## Persistent memories (3)") && !all.contains("more: `bd memories`"), "{all}");
+}
+
+/// What `bd prime --hook` may hand a harness, whichever it is.
+const HOOK_CONTEXT_BYTES: usize = 9_500;
+
+/// Memory `n` of [`crowded_ws`]: about 500 bytes, told apart by its number.
+fn crowded_memory(n: usize) -> String {
+    format!("Note {n:02}: {}", "keep this habit in mind when the work touches it, ".repeat(10).trim_end())
+}
+
+/// A workspace whose whole `bd prime` is well past a hook's budget: 30 memories
+/// and 12 issues with long titles, two of them claimed by `tester` and two
+/// behind a human gate, plus three playbooks. Returns it with the gates' ids.
+fn crowded_ws() -> (Ws, Vec<String>) {
+    let ws = Ws::new();
+    for n in 1..=30 {
+        ws.ok(&["remember", "--key", &format!("note-{n:02}"), &crowded_memory(n)]);
+    }
+    let issues: Vec<String> =
+        (1..=12).map(|n| ws.id(&["create", &format!("Task {n:02} {}", "x".repeat(292))])).collect();
+    for issue in &issues[..2] {
+        ws.ok(&["claim", issue]);
+    }
+    let gates = issues[2..4].iter().map(|i| ws.id(&["gate", "create", "-t", "human", "--blocks", i])).collect();
+    for name in ["p1", "p2", "p3"] {
+        ws.playbook(name, "description = \"Short\"\n[[steps]]\nid = \"a\"\n");
+    }
+    let whole = ws.ok(&["prime"]).len();
+    assert!(whole > HOOK_CONTEXT_BYTES, "not crowded: {whole} bytes");
+    (ws, gates)
+}
+
+#[test]
+fn prime_hook_context_stays_within_the_budget() {
+    let (ws, _) = crowded_ws();
+    // Each harness on its own: claim lines count their lease down to the
+    // second, so two `bd` processes may not print the same text.
+    for harness in ["claude", "codex", "copilot"] {
+        let stdout = ws.ok(&["prime", "--hook", harness]);
+        let text = if harness == "copilot" { copilot_context(&stdout).unwrap() } else { stdout.trim_end().into() };
+        assert!(text.len() <= HOOK_CONTEXT_BYTES, "{harness}: {} bytes: {text}", text.len());
+        assert!(text.contains("## Your claims (2)") && text.contains("(token "), "{harness}: {text}");
+        assert!(text.contains("`bd memory get <key>`"), "{harness}: {text}");
+    }
+}
+
+/// What `bd prime --hook <harness>` hands that harness, once it has read it.
+fn hook_text(ws: &Ws, harness: &str) -> String {
+    let stdout = ws.ok(&["prime", "--hook", harness]);
+    if harness == "copilot" { copilot_context(&stdout).unwrap() } else { stdout.trim_end().into() }
+}
+
+#[test]
+fn prime_hook_budget_counts_a_memory_as_printed() {
+    let ws = Ws::new();
+    // Under the budget as stored, six times over it as printed: `\u001b` each.
+    ws.ok(&["remember", "--key", "esc", &format!("{}tail", "\u{1b}".repeat(3000))]);
+    assert!(ws.ok(&["prime"]).len() > HOOK_CONTEXT_BYTES);
+    for harness in ["claude", "codex", "copilot"] {
+        let text = hook_text(&ws, harness);
+        assert!(text.len() <= HOOK_CONTEXT_BYTES, "{harness}: {} bytes: {text}", text.len());
+        assert!(text.contains("`bd memory get <key>`"), "{harness}: {text}");
+    }
+}
+
+#[test]
+fn prime_hook_budget_counts_titles_as_printed() {
+    let ws = Ws::new();
+    for n in 0..10 {
+        let hidden = if n % 2 == 0 { "\u{1b}" } else { "\u{202e}" };
+        ws.ok(&["create", &format!("Task {n} {}", hidden.repeat(400))]);
+    }
+    assert!(ws.ok(&["prime"]).len() > HOOK_CONTEXT_BYTES);
+    for harness in ["claude", "codex", "copilot"] {
+        let text = hook_text(&ws, harness);
+        assert!(text.len() <= HOOK_CONTEXT_BYTES, "{harness}: {} bytes: {text}", text.len());
+        assert!(text.contains("## Ready work (top ") && !text.contains("(top 10 of 10)"), "{harness}: {text}");
+    }
+}
+
+#[test]
+fn prime_hook_text_that_fits_as_printed_is_the_plain_text() {
+    let ws = Ws::new();
+    ws.ok(&["create", "Hidden \u{1b}[31m and \u{202e} marks"]);
+    ws.ok(&["remember", "--key", "crlf", "one\r\ntwo \u{1b}[2K three"]);
+    let plain = ws.ok(&["prime"]);
+    for printed in ["Hidden \\u001b[31m and \\u202e marks", "one\r\ntwo \\u001b[2K three"] {
+        assert!(plain.contains(printed), "{printed:?} in {plain}");
+    }
+    assert_eq!(ws.ok(&["prime", "--hook", "claude"]), plain);
+    assert_eq!(ws.ok(&["prime", "--hook", "codex"]), plain);
+    let context = copilot_context(&ws.ok(&["prime", "--hook", "copilot"])).unwrap();
+    assert_eq!(format!("{context}\n"), plain);
+}
+
+#[test]
+fn prime_complete_forms_are_not_shortened() {
+    let (ws, gates) = crowded_ws();
+    let plain = ws.ok(&["prime"]);
+    for n in 1..=30 {
+        assert!(plain.contains(&crowded_memory(n)), "memory {n} is not whole: {plain}");
+    }
+    for gate in &gates {
+        assert!(plain.contains(&format!("- {gate} ")), "{gate} is missing: {plain}");
+    }
+    assert!(!plain.contains("- … "), "{plain}");
+    let json = ws.json(&["prime"]);
+    assert_eq!(json["memories"].as_array().unwrap().len(), 30, "{json}");
+    assert_eq!(json["gates_needing_attention"].as_array().unwrap().len(), 2, "{json}");
+}
+
+#[test]
+fn prime_caps_apply_before_the_budget() {
+    let (ws, _) = crowded_ws();
+    let text = ws.ok(&["prime", "--hook", "claude", "--ready", "1", "--max-memories", "2", "--max-playbooks", "1"]);
+    for line in [
+        "## Ready work (top 1 of",
+        "## Persistent memories (showing 2 of 30)",
+        "- … 28 more: `bd memories`",
+        "## Playbooks (showing 1 of 3)",
+        "- … 2 more: `bd playbook list`",
+    ] {
+        assert!(text.contains(line), "{line} is missing: {text}");
+    }
+    // The caps acted and the budget did not: what they left fits as it is.
+    assert!(text.contains(&crowded_memory(1)) && text.contains(&crowded_memory(2)), "{text}");
+    assert!(!text.contains(&crowded_memory(3)), "{text}");
+    assert!(!text.contains("`bd memory get <key>`"), "{text}");
+}
+
+#[test]
 fn prime_lists_the_playbooks_a_name_would_load() {
     let ws = Ws::new();
     let plain = ws.ok(&["prime"]);

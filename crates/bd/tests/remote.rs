@@ -1051,6 +1051,30 @@ fn prime_in_session_hooks_never_fails() {
 }
 
 #[test]
+fn prime_hook_context_stays_within_the_budget_through_a_server() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let memory = |n: usize| {
+        format!("Note {n:02}: {}", "keep this habit in mind when the work touches it, ".repeat(10).trim_end())
+    };
+    for n in 1..=30 {
+        alice.ok(&["remember", "--key", &format!("note-{n:02}"), &memory(n)]);
+    }
+    // The server shortens it, so a client needs no flag and no new field.
+    for harness in ["claude", "copilot"] {
+        let stdout = alice.ok(&["prime", "--hook", harness]);
+        let text = if harness == "copilot" { copilot_context(&stdout).unwrap() } else { stdout.trim_end().into() };
+        assert!(text.len() <= 9_500, "{harness}: {} bytes: {text}", text.len());
+        assert!(text.contains("`bd memory get <key>`"), "{harness}: {text}");
+    }
+    let plain = alice.ok(&["prime"]);
+    assert!(plain.len() > 9_500, "{} bytes: {plain}", plain.len());
+    for n in 1..=30 {
+        assert!(plain.contains(&memory(n)), "memory {n} is not whole: {plain}");
+    }
+}
+
+#[test]
 fn prime_lists_the_checkouts_the_approved_and_the_users_playbooks() {
     let server = Server::start();
     let alice = server.client(&server.token("alice-laptop", "alice", &[]));

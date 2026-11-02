@@ -138,13 +138,18 @@ pub struct HistoryArgs {
 }
 
 pub const PRIME_LONG_ABOUT: &str = "\
-Print agent context: workflow, actor, claims, ready work, memories
+Print agent context: actor, claims, ready work, workflow, memories
 
-Prints what an agent session needs to start: the bd workflow, the actor it
-acts as, its claims and those of the user's other sessions, the head of the
-ready queue, gates waiting on a person, playbooks and the workspace's
+Prints what an agent session needs to start: the actor it acts as, its
+claims and those of the user's other sessions, the head of the ready queue,
+gates waiting on a person, the bd workflow, playbooks and the workspace's
 memories. Session-start hooks run it (with --hook); run it again after the
-session's context was cleared or compacted.";
+session's context was cleared or compacted.
+
+With --hook the text stays within 9,500 bytes, to fit the agent harnesses'
+limits. Over that, memories become one line each and the longest lists lose
+lines, each saying what it left out and which command prints it. Plain
+`bd prime` and --json are complete.";
 
 const PRIME_EXAMPLES: &str = "\
 Examples:
@@ -165,8 +170,8 @@ pub struct PrimeArgs {
     pub max_playbooks: usize,
     /// Run as a session hook of this agent harness: work in the session's directory (the cwd of the hook's JSON
     /// input on stdin), and print the context as the harness reads it: copilot gets one JSON object
-    /// {"additionalContext": "..."}, as Copilot CLI drops plain text; claude and codex read plain text. Takes
-    /// precedence over --json
+    /// {"additionalContext": "..."}, as Copilot CLI drops plain text; claude and codex read plain text. Keeps the
+    /// context within 9,500 bytes, shortening memories and long lists when it is over. Takes precedence over --json
     #[arg(long, value_name = "HARNESS", value_parser = harness_parser())]
     pub hook: Option<Harness>,
 }

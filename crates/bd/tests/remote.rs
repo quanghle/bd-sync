@@ -13563,6 +13563,21 @@ fn post_link(server: &Server, oauth: &str, secret: &str) -> Answered {
     browse(&link_address(server), Some(oauth), Some((PUBLIC, &format!("link={secret}"))))
 }
 
+/// A link's landing form posts to an address of its own, so a new link opened in the tab of a dead link's notice,
+/// as that notice tells the person to, differs from it by more than a fragment and loads.
+#[test]
+fn a_new_link_loads_over_a_dead_links_notice() {
+    let t = Allowing::new();
+    let server = &t.server;
+    let (_, _, page) = browse(&link_address(server), None, None);
+    assert!(page.contains(&format!("action=\"{PUBLIC}/bd/oauth/passkey-link?open\"")), "{page}");
+    let action = format!("{}?open", link_address(server));
+    let oauth = landed(server);
+    let (status, _, page) = browse(&action, Some(&oauth), Some((PUBLIC, &format!("link={}", "0".repeat(64)))));
+    let (dead_status, _, dead) = dead_link(server);
+    assert_eq!((status, page.as_str()), (dead_status, dead.as_str()), "the query changes no answer");
+}
+
 /// Open the link `url` in a fresh browser: the browser's cookie, and what its secret's POST answers.
 fn open_link(server: &Server, url: &str) -> (String, Answered) {
     let oauth = landed(server);

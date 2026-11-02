@@ -312,11 +312,16 @@ existing();\
 /// the link's secret from the URL's fragment, which no server is sent, into
 /// the form's field, and takes it out of the address bar. It sends nothing:
 /// only the person's press of the button does, so a scanner running scripts
-/// starts no sign-in.
+/// starts no sign-in. A second link opened over this page differs from it only
+/// in the fragment, so no page loads: it is taken from `hashchange`.
 const OPEN_LINK: &str = "(function(){\
 var form=document.querySelector('form.actions');\
-if(form)form.elements.link.value=location.hash.slice(1);\
+function take(){\
+if(form&&location.hash.length>1)form.elements.link.value=location.hash.slice(1);\
 history.replaceState(null,'',location.pathname);\
+}\
+take();\
+addEventListener('hashchange',take);\
 })();";
 
 /// The script of the page registering a passkey through a link
@@ -1425,10 +1430,13 @@ Nothing happening? <a href=\"{url}\">Open the application</a>.</p>\n"
 /// The page a passkey link opens: the same bytes for every link, live or
 /// dead, as the secret is in the URL's fragment, which only [`OPEN_LINK`]
 /// sees. A press of its button posts the secret to `action`, the link's
-/// address with no fragment.
+/// address with no fragment, with a query the POST never reads: the notice
+/// answering a dead link sits at that URL, so a new link opened in its tab,
+/// as the notice tells the person to, loads rather than being taken for a
+/// move within the notice.
 pub fn landing_link(action: &str) -> Page {
     let actions = format!(
-        "<form method=\"post\" action=\"{}\" class=\"actions\">\n\
+        "<form method=\"post\" action=\"{}?open\" class=\"actions\">\n\
 <input type=\"hidden\" name=\"link\" value=\"\">\n\
 <button type=\"submit\" class=\"primary\">{}</button>\n</form>\n",
         escape(action),
@@ -3047,10 +3055,11 @@ class=\"actions\" data-passkey=\"create\"";
         assert_eq!(page.status, 200);
         assert_eq!(page, landing_link(LINK_ACTION), "the same bytes every time");
         // The form posts to the address with no fragment: a redirect would keep one.
-        let action = format!("action=\"{LINK_ACTION}\"");
+        // Its query keeps the answer's URL apart from the link's: only a fragment between two equal URLs loads nothing.
+        let action = format!("action=\"{LINK_ACTION}?open\"");
         assert!(page.html.contains(&action), "{}", page.html);
         let form = tags(&page.html).into_iter().find(|t| t.starts_with("form ")).unwrap();
-        assert!(!form.contains('#') && !form.contains('?'), "{form}");
+        assert!(!form.contains('#'), "{form}");
         assert!(page.html.contains("<input type=\"hidden\" name=\"link\" value=\"\">"), "{}", page.html);
         assert!(
             page.html.contains(&format!("<button type=\"submit\" class=\"primary\">{PASSKEY_LINK_CONTINUE}</button>"))
@@ -3062,6 +3071,7 @@ class=\"actions\" data-passkey=\"create\"";
         );
         // The script moves the fragment and clears it, and leaves sending it to the person's press.
         assert!(OPEN_LINK.contains("form.elements.link.value=location.hash.slice(1);"));
+        assert!(OPEN_LINK.contains("addEventListener('hashchange',take);"), "a second link: {OPEN_LINK}");
         assert!(OPEN_LINK.contains("history.replaceState(null,'',location.pathname);"));
         assert!(!OPEN_LINK.contains("submit") && !OPEN_LINK.contains("click"), "{OPEN_LINK}");
         for read in ["search", "href", "fetch", "XMLHttpRequest", "cookie", "Storage"] {
@@ -3291,11 +3301,11 @@ your sign-in can add a passkey to your account."
 
     #[test]
     fn the_link_pages_are_pinned() {
-        const OPEN_LINK_SCRIPT: &str = "DPh9tyyLbbOZnRs+puH3NdswX2dUuwi9wzReVh81OcU=";
+        const OPEN_LINK_SCRIPT: &str = "C2RUVNYngwNjr60N8ek+YGAj3QnkqKWeBSP5km839Yk=";
         const REGISTER_LINK_SCRIPT: &str = "qiWLnlXtnw/o/4NyeH5DKn+wFHTOLrxEoo52vovFQ9g=";
         const COPY_LINK_SCRIPT: &str = "ilTopjb6cxwOIxr7CZ6XhvBHZ0XWP2jLQRhGQDqvfCg=";
-        const LANDING_HTML: &str = "ZRHqiIicQV9xMBF3izEVKI15GFUSEH5GGvZv+AVETL8=";
-        const LANDING_CSP: &str = "pJmUbrVJOAFOijV8nPzVsdF6sG0VppR6bD22zoFU99s=";
+        const LANDING_HTML: &str = "BKFgoGuo16Om/Sm+SrXxDdmN+clGY1MPKyc7wAX1wis=";
+        const LANDING_CSP: &str = "zqHfpP1cslkEGi8FSWuDU0xq/0MLE9GB8t+DytERosc=";
         const REGISTER_HTML: &str = "Ajs+v+0qj+MT71iieUj5ccKBPFFgUr4iwtu7mqO497g=";
         const REGISTER_CSP: &str = "0Ujx/gDRHROs6bhXb+18bcG711K285XFxbhyzU7Qixo=";
         const SHOWN_HTML: &str = "CX77W5EhTTeZuZAM2t9D7c1SE6kNn/VDBpGo7Cv4Wi8=";

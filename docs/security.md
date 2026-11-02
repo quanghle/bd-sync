@@ -406,7 +406,9 @@ consent page and more.
     request line and no `Referer`, so a proxy's access log and a link
     preview's fetch do not see it. `GET` answers one constant page whatever
     the URL holds, without reading its query, and its script moves the
-    fragment into a form and clears it from the address bar. A person
+    fragment into a form and clears it from the address bar. The form
+    posts to that address with a fixed `?open` query, which nothing reads,
+    so a new link opened in the tab of a dead link's notice loads. A person
     presses the button, so a scanner that runs scripts starts nothing. The
     `POST`, whose body is the only request that carries the secret, is
     checked in this order, each before any lookup: approvals offered at all

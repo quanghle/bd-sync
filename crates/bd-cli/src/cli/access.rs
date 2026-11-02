@@ -291,6 +291,7 @@ mod tests {
             &["bd", "serve", "passkey", "allow-add", "--account", "corp:alice", "--root", "/srv/bd"],
             &["bd", "serve", "passkey", "allow-add", "--account", "corp:alice", "--for", "5m", "--root", "/srv/bd"],
             &["bd", "serve", "passkey", "allow-add", "--account", "corp:alice", "--cancel", "--root", "/srv/bd"],
+            &["bd", "serve", "passkey", "cancel-link", "--account", "corp:alice", "--root", "/srv/bd"],
         ] {
             let cmd = Cli::try_parse_from(args).unwrap().command;
             assert_eq!(access(&cmd), Access::Local, "{args:?}");

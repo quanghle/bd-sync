@@ -13415,6 +13415,727 @@ fn dave_an_agent(server: &Server) {
 }
 
 #[test]
+fn cancelling_a_link_is_refused_through_tokens() {
+    let t = Allowing::new();
+    let human = t.server.token("human-admin", "root", &["--role", "admin", "--kind", "human"]);
+    let root = t.root().to_str().unwrap();
+    let before = t.state();
+    for secret in [&human, &t.admin] {
+        let argv = ["serve", "passkey", "cancel-link", "--account", "github:alice", "--root", root];
+        let (status, r) = post(&t.server.url(), secret, &json!({ "argv": argv }));
+        assert_eq!((status, r["exit_code"].as_i64()), (200, Some(2)), "{argv:?}: {r}");
+        assert!(r["stderr"].as_str().unwrap().contains("not available through bd serve"), "{r}");
+        assert_eq!(t.state(), before, "{argv:?}");
+    }
+}
+
+// A one-time link adding a passkey on another device, made at an approval (its `make_link` box).
+
+/// A row of `passkey_links`: issuer, subject, id, secret hash, vouching credential, workspace, created_at and
+/// expires_at.
+type LinkRow = (String, String, String, String, String, String, i64, i64);
+
+/// Every link and every passkey of a server.
+type LinkState = (Vec<LinkRow>, Vec<PasskeyRow>);
+
+/// [`LinkState`] in `<root>/server.db`: what a refused sign-in must leave as it was, as [`allowance_state`] is.
+fn link_state(root: &Path) -> LinkState {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+    let conn = rusqlite::Connection::open_with_flags(root.join("server.db"), flags).unwrap();
+    let links = conn
+        .prepare(
+            "SELECT issuer, subject, id, secret_hash, vouched_by, workspace, created_at, expires_at \
+             FROM passkey_links ORDER BY issuer, subject",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    (links, allowance_state(root).1)
+}
+
+/// The address a link opens, and its page's form posts to, as the test browser reaches it.
+fn link_address(server: &Server) -> String {
+    format!("{}/bd/oauth/passkey-link", server.base)
+}
+
+/// `fields` with the box for a link ticked.
+fn ticked(fields: &str) -> String {
+    format!("{fields}&make_link=1")
+}
+
+/// The link an answer `page` shows, as its field holds it.
+fn link_url(page: &str) -> String {
+    let at =
+        page.find(&format!("value=\"{PUBLIC}/bd/oauth/passkey-link#")).unwrap_or_else(|| panic!("no link: {page}"))
+            + "value=\"".len();
+    page[at..at + page[at..].find('"').unwrap()].to_string()
+}
+
+/// The secret of the link `url`: its fragment.
+fn link_secret(url: &str) -> &str {
+    let (address, secret) = url.split_once('#').unwrap_or_else(|| panic!("no fragment: {url}"));
+    assert_eq!(address, format!("{PUBLIC}/bd/oauth/passkey-link"));
+    assert!(secret.len() == 64 && secret.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')), "{url}");
+    secret
+}
+
+/// Where the page answering a live link's POST goes on to, on the public URL.
+fn onward_url(page: &str) -> String {
+    let marker = "content=\"0; url=";
+    let at = page.find(marker).unwrap_or_else(|| panic!("no refresh: {page}")) + marker.len();
+    page[at..at + page[at..].find('"').unwrap()].replace("&amp;", "&")
+}
+
+/// GET the landing page in a fresh browser: the `bd_oauth` cookie it gives.
+fn landed(server: &Server) -> String {
+    let (status, headers, page) = browse(&link_address(server), None, None);
+    assert_eq!(status, 200, "{page}");
+    bd_oauth(&headers)
+}
+
+/// The landing page's POST of `secret`, from the browser with the cookie `oauth`.
+fn post_link(server: &Server, oauth: &str, secret: &str) -> Answered {
+    browse(&link_address(server), Some(oauth), Some((PUBLIC, &format!("link={secret}"))))
+}
+
+/// Open the link `url` in a fresh browser: the browser's cookie, and what its secret's POST answers.
+fn open_link(server: &Server, url: &str) -> (String, Answered) {
+    let oauth = landed(server);
+    let answered = post_link(server, &oauth, link_secret(url));
+    (oauth, answered)
+}
+
+/// A link no server gave: what every link that can't be used is answered.
+fn dead_link(server: &Server) -> Answered {
+    let (status, headers, page) = open_link(server, &format!("{PUBLIC}/bd/oauth/passkey-link#{}", "0".repeat(64))).1;
+    assert_eq!(status, 404, "{page}");
+    (status, headers, page)
+}
+
+/// Open the live link `url` in a fresh browser and go on to sign in: a 302 to the provider where there is one, a
+/// chooser where there are several.
+fn link_choose(server: &Server, url: &str) -> Answered {
+    let (oauth, (status, _, page)) = open_link(server, url);
+    assert_eq!(status, 200, "{page}");
+    browse(&local_url(server, &onward_url(&page)), Some(&oauth), None)
+}
+
+/// Open the link `url` in a fresh browser and sign in at GitHub as `login`.
+fn link_flow(server: &Server, github: &FakeGithub, login: &str, url: &str) -> Signed {
+    github.next(login, 0);
+    signed_in_at_github(server, github, &link_choose(server, url))
+}
+
+impl Signed {
+    /// The one-time id a link's registration page posts.
+    fn link_id(&self) -> String {
+        let field = "name=\"id\" value=\"";
+        let at = self.page.find(field).unwrap_or_else(|| panic!("no registration form: {}", self.page)) + field.len();
+        self.page[at..at + self.page[at..].find('"').unwrap()].to_string()
+    }
+
+    /// `name=value` of a registration page's own cookie, as the browser sends it back.
+    fn link_cookie(&self) -> String {
+        let line = cookie_line(&self.headers, "__Secure-bd_passkey_");
+        line.unwrap_or_else(|| panic!("no page cookie: {:?}", self.headers)).split(';').next().unwrap().to_string()
+    }
+}
+
+/// The address a link's registration page posts to, as the test browser reaches it.
+fn register_address(server: &Server) -> String {
+    format!("{}/register", link_address(server))
+}
+
+/// Register a new passkey on the page `signed` shows, from its browser, as the page posts it.
+fn register_at_link(server: &Server, signed: &Signed) -> Answered {
+    let body = format!("id={}&{}", signed.link_id(), passkey_fields(&signed.page));
+    post_gate(&register_address(server), Some(PUBLIC), None, &signed.link_cookie(), &body)
+}
+
+/// `signed` is byte for byte what a link no server gave is answered, with no page to go on to.
+fn told_nothing(server: &Server, what: &str, signed: &Signed) {
+    let (status, _, page) = dead_link(server);
+    assert_eq!((signed.status, signed.page.as_str()), (status, page.as_str()), "{what}");
+    assert!(cookie_line(&signed.headers, "__Secure-bd_passkey_").is_none(), "{what}: {:?}", signed.headers);
+}
+
+/// The headers every page of a link's answers with.
+fn hardened(headers: &ureq::http::HeaderMap) {
+    assert_eq!(headers.get("x-frame-options").unwrap(), "DENY", "{headers:?}");
+    assert_eq!(headers.get("referrer-policy").unwrap(), "same-origin", "{headers:?}");
+    let csp = headers.get("content-security-policy").expect("a policy").to_str().unwrap();
+    assert!(!csp.contains("unsafe-inline"), "{csp}");
+}
+
+/// The `form-action` of the policy `headers` carry.
+fn form_action(headers: &ureq::http::HeaderMap) -> String {
+    let csp = headers.get("content-security-policy").expect("a policy").to_str().unwrap();
+    csp.split("; ").find(|d| d.starts_with("form-action ")).unwrap_or_else(|| panic!("{csp}")).to_string()
+}
+
+/// The `passkey link` lines of `log` with this `outcome`.
+fn link_lines(log: &Path, outcome: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(log).unwrap();
+    text.lines()
+        .filter(|l| l.contains(" passkey link ") && field(l, "outcome") == Some(outcome))
+        .map(String::from)
+        .collect()
+}
+
+/// Follow a chooser's `Continue with <label>` link, in the browser it set a cookie for.
+#[cfg(unix)]
+fn chosen(server: &Server, choose: &Answered, label: &str) -> Answered {
+    let (status, headers, page) = choose;
+    assert_eq!(*status, 200, "{page}");
+    let at = page.find(&format!(">Continue with {label}<")).unwrap_or_else(|| panic!("no {label}: {page}"));
+    let start = page[..at].rfind("href=\"").unwrap() + "href=\"".len();
+    browse(&local_url(server, &page[start..at - 1].replace("&amp;", "&")), Some(&bd_oauth(headers)), None)
+}
+
+/// Open the link `url` in a fresh browser, choose Acme SSO and sign in there as `subject` with `claims`.
+#[cfg(unix)]
+fn link_flow_at_acme(server: &Server, idp: &FakeOidc, url: &str, subject: &str, claims: Value) -> Signed {
+    let (status, headers, body) = chosen(server, &link_choose(server, url), "Acme SSO");
+    assert_eq!(status, 302, "{body}");
+    let oauth = bd_oauth(&headers);
+    let to_idp = location(&headers);
+    assert!(to_idp.starts_with(&format!("{}/authorize?", idp.url)), "{to_idp}");
+    idp.next(subject, claims);
+    let (_, headers, _) = browse(&to_idp, None, None);
+    let back = location(&headers);
+    assert!(back.starts_with(&format!("{PUBLIC}/bd/oauth/acme/callback?")), "{back}");
+    let (status, headers, page) = browse(&local_url(server, &back), Some(&oauth), None);
+    Signed { status, headers, page }
+}
+
+impl Flow<'_> {
+    /// Approve `ways[n]` with the box for a link ticked: the link its answer shows.
+    fn made_link(&self, n: usize) -> String {
+        let signed = self.open(n);
+        let (status, _, page) = self.post(n, &signed, &ticked(&passkey_fields(&signed.page)));
+        assert_eq!(status, 200, "{page}");
+        assert!(self.closed(n), "approved");
+        link_url(&page)
+    }
+}
+
+impl Allowing {
+    /// `bd_serve_passkey_links_total` of `outcome`.
+    fn links_counted(&self, outcome: &str) -> u64 {
+        metric(&self.server, &self.admin, &format!("bd_serve_passkey_links_total{{outcome=\"{outcome}\"}}"))
+    }
+}
+
+#[test]
+fn a_link_adds_a_passkey_on_another_device() {
+    let t = Allowing::new();
+    let root = t.root();
+    for flow in &t.flows() {
+        let account = flow.account();
+        let vouching = &flow.credential[..12];
+        let (made, started, registered) =
+            (t.links_counted("made"), t.links_counted("started"), t.links_counted("registered"));
+
+        // The box is offered; ticked, the approval goes through and its answer shows the link.
+        let signed = flow.open(0);
+        assert!(signed.page.contains("name=\"make_link\""), "{}", signed.page);
+        let seen = flow.lines().len();
+        let (status, headers, page) = flow.post(0, &signed, &ticked(&passkey_fields(&signed.page)));
+        assert_eq!(status, 200, "{page}");
+        assert!(flow.closed(0), "approved");
+        hardened(&headers);
+        assert_eq!(form_action(&headers), "form-action 'none'");
+        assert!(page.contains("Open this on your own new device."), "{page}");
+        assert!(!page.contains("The link still works."), "{page}");
+        let line = flow.line_after(seen);
+        assert_eq!(field(&line, "passkey"), Some("verified, link made"), "{line}");
+        assert_eq!(t.links_counted("made"), made + 1);
+
+        let url = link_url(&page);
+        let before = link_state(root);
+        let [(_, _, id, _, vouched_by, workspace, created_at, expires_at)] = before.0.as_slice() else {
+            panic!("one link: {before:?}");
+        };
+        assert_eq!((vouched_by.as_str(), workspace.as_str()), (flow.credential, "proj"));
+        assert_eq!(expires_at - created_at, 15 * 60 * 1000);
+        let listed = t.listed(&account);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0]["link_vouched_by"], vouching, "{listed:?}");
+        assert!(listed[0]["link_until"].is_string(), "{listed:?}");
+        let events = t.events("passkey_link_made", &account);
+        assert_eq!(events.len(), 1, "{events:?}");
+        let prefix = format!("link {} vouched by {vouching}, until ", &id[..12]);
+        assert!(events[0]["detail"].as_str().unwrap().starts_with(&prefix), "{events:?}");
+
+        // On the other device, the usual sign-in, as the very account, ends on a page that spends nothing yet.
+        let signed = link_flow(&t.server, &t.github, flow.login, &url);
+        assert_eq!(signed.status, 200, "{}", signed.page);
+        hardened(&signed.headers);
+        assert_eq!(form_action(&signed.headers), "form-action 'self'");
+        let said = format!("Add a passkey on this device for {account}. This approves nothing.");
+        assert!(signed.page.contains(&said), "{}", signed.page);
+        assert_eq!(page_attribute(&signed.page, "data-credentials").as_deref(), Some(flow.credential));
+        let set = cookie_line(&signed.headers, "__Secure-bd_passkey_").unwrap();
+        assert!(set.contains("; Path=/bd/oauth/passkey-link/register;"), "{set}");
+        assert_eq!(link_state(root), before, "opening it spends nothing");
+        assert_eq!(t.links_counted("started"), started + 1);
+        let bound = t.events("signed_in", &account);
+        let detail = "to add a passkey through a link; no token issued";
+        assert!(bound.iter().any(|e| e["detail"] == detail), "{bound:?}");
+
+        // One passkey more, the link spent, and nothing else moved.
+        let (status, headers, page) = register_at_link(&t.server, &signed);
+        assert_eq!(status, 200, "{page}");
+        assert!(page.contains("Adding it approved nothing"), "{page}");
+        assert!(cookies_from(&headers).contains("Max-Age=0"), "its cookie is cleared: {headers:?}");
+        let (links, passkeys) = link_state(root);
+        assert_eq!(links, [], "spent");
+        assert_eq!(passkeys.len(), before.1.len() + 1, "{passkeys:?}");
+        assert!(before.1.iter().all(|p| passkeys.contains(p)), "{passkeys:?}");
+        let new = passkeys.last().unwrap().0.clone();
+        assert_eq!(t.links_counted("registered"), registered + 1);
+
+        // The trail names the new passkey as the list does, and the link and the passkey that vouched for it.
+        let listed = t.listed(&account);
+        assert_eq!(listed.len(), 2, "{listed:?}");
+        assert!(listed.iter().all(|r| r.get("link_until").is_none()), "spent: {listed:?}");
+        assert!(listed.iter().all(|r| r.get("link_vouched_by").is_none()), "spent: {listed:?}");
+        let events = t.events("passkey_registered", &account);
+        let details: Vec<&str> = events.iter().map(|e| e["detail"].as_str().unwrap()).collect();
+        let through = details.iter().find(|d| d.contains("through link")).unwrap_or_else(|| panic!("{details:?}"));
+        let named = through.strip_prefix("credential ").unwrap().split(' ').next().unwrap();
+        assert_eq!(named, &new[..12], "{through}");
+        assert!(listed.iter().any(|r| r["credential_prefix"] == named), "{listed:?}");
+        let id = &id[..12];
+        assert_eq!(*through, format!("credential {named} (ES256), through link {id} vouched by {vouching}"));
+        let lines = || link_lines(&t.log, "registered");
+        eventually("the registered line", || lines().iter().any(|l| field(l, "credential") == Some(named)));
+        let line = lines().pop().unwrap();
+        assert_eq!(field(&line, "vouched_by"), Some(vouching), "{line}");
+
+        // Spent: the link says what any other says, and the new passkey approves as the old one did.
+        let (status, _, page) = open_link(&t.server, &url).1;
+        let dead = dead_link(&t.server);
+        assert_eq!((status, page.as_str()), (dead.0, dead.2.as_str()), "spent");
+        let next = flow.open(1);
+        let listed = page_attribute(&next.page, "data-credentials").unwrap();
+        assert!(listed.contains(flow.credential) && listed.contains(&new), "{listed}");
+        let (status, _, page) = flow.post(1, &next, &ticked(&asserting_with(&next.page, &new)));
+        assert_eq!(status, 200, "{page}");
+        assert!(flow.closed(1), "approved");
+
+        // The host ends the link that one made, and what's left of the incident is the new passkey, by the prefix
+        // the trail gave.
+        let second = link_url(&page);
+        assert_ne!(second, url);
+        assert_eq!(t.listed(&account)[0]["link_vouched_by"], &new[..12]);
+        let args = ["passkey", "cancel-link", "--account", account.as_str()];
+        let out: Value = serde_json::from_str(&serve_command(&t.server, &args)).unwrap();
+        assert_eq!(out["cancelled"], true, "{out}");
+        let (status, _, page) = open_link(&t.server, &second).1;
+        assert_eq!((status, page.as_str()), (dead.0, dead.2.as_str()), "cancelled");
+        let ended = t.events("passkey_link_ended", &account);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert!(ended[0]["detail"].as_str().unwrap().ends_with(": cancelled"), "{ended:?}");
+        serve_command(&t.server, &["passkey", "remove", "--account", &account, "--credential", named]);
+        let listed = t.listed(&account);
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0]["credential_prefix"], vouching, "{listed:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_works_through_an_oidc_provider_alone() {
+    let github = FakeGithub::start();
+    let idp = FakeOidc::start();
+    let (root, ids) = gate_root(&github, GATE_RULES);
+    with_acme(
+        root.path(),
+        &idp,
+        "emails = [\"alice@acme.example\"]\nrole = \"write\"\nkind = \"human\"\nworkspaces = [\"proj\"]\n",
+    );
+    let server = Server::launch(root, "127.0.0.1:0", PUBLIC_URL);
+    let root = server.root.path();
+    let subject = "248289761001";
+    let alice = || json!({ "preferred_username": "alice", "email": "alice@acme.example", "email_verified": true });
+
+    // acme:alice registers a passkey at one gate's approval, and makes a link at another's, which resolves it.
+    let (enrolled, minted) = (&ids.spares[0], &ids.spares[1]);
+    let signed = approve_flow_at_acme(&server, &idp, enrolled, subject, alice());
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = post_approval(&server, enrolled, &signed);
+    assert_eq!(status, 200, "{page}");
+    let signed = approve_flow_at_acme(&server, &idp, minted, subject, alice());
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("name=\"make_link\""), "{}", signed.page);
+    let body = format!("approval={}&{}", signed.approval(), ticked(&passkey_fields(&signed.page)));
+    let (status, _, page) = post_gate(&gate_url(&server, "proj", minted), Some(PUBLIC), None, &signed.cookie(), &body);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(shown_on_host(&server, minted)["status"], "closed");
+    let url = link_url(&page);
+    let before = link_state(root);
+
+    // The chooser names nothing, and the same login at another issuer is another account.
+    let choose = link_choose(&server, &url);
+    assert!(choose.2.contains("<h1>Sign in to add a passkey</h1>"), "{}", choose.2);
+    assert!(
+        choose.2.contains(">Continue with GitHub<") && choose.2.contains(">Continue with Acme SSO<"),
+        "{}",
+        choose.2
+    );
+    github.next("alice", 0);
+    let signed = signed_in_at_github(&server, &github, &chosen(&server, &choose, "GitHub"));
+    told_nothing(&server, "the same login at another issuer", &signed);
+    assert_eq!(link_state(root), before);
+    assert!(auth_events(&server, "signed_in").iter().all(|e| e["actor"] != "github:alice"), "never bound");
+
+    // The very subject gets the page, which names no gate and no workspace, and registers.
+    let signed = link_flow_at_acme(&server, &idp, &url, subject, alice());
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert!(signed.page.contains("Add a passkey on this device for acme:alice."), "{}", signed.page);
+    for named in [enrolled.as_str(), minted, "proj", "Workspace", "alice@acme.example"] {
+        assert!(!signed.page.contains(named), "{named}: {}", signed.page);
+    }
+    let (status, _, page) = register_at_link(&server, &signed);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(link_state(root).0, [], "spent");
+    let listed: Value =
+        serde_json::from_str(&serve_command(&server, &["passkey", "list", "--account", "acme:alice"])).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 2, "{listed}");
+    let events = auth_events(&server, "passkey_registered");
+    let through =
+        events.iter().filter(|e| e["actor"] == "acme:alice" && e["detail"].to_string().contains("through link"));
+    assert_eq!(through.count(), 1, "{events:?}");
+}
+
+#[test]
+fn a_workspace_refusal_keeps_the_link() {
+    let t = Allowing::new();
+    let root = t.root();
+    let flows = t.flows();
+    let gates = &flows[0];
+    let gate = &gates.ways[0].id;
+
+    // No longer armed between the page and the approval: the link was made first, and is shown with the refusal.
+    let signed = gates.open(0);
+    t.ops.ok(&["update", gate, "--status", "deferred"]);
+    let (status, headers, page) = gates.post(0, &signed, &ticked(&passkey_fields(&signed.page)));
+    assert_eq!(status, 409, "{page}");
+    assert!(page.contains("not ready to approve"), "{page}");
+    assert!(page.contains("The link still works."), "{page}");
+    hardened(&headers);
+    assert!(!gates.closed(0));
+    let url = link_url(&page);
+    let before = link_state(root);
+    assert_eq!(before.0.len(), 1, "{before:?}");
+
+    let signed = link_flow(&t.server, &t.github, gates.login, &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = register_at_link(&t.server, &signed);
+    assert_eq!(status, 200, "{page}");
+    let (links, passkeys) = link_state(root);
+    assert_eq!(links, [], "spent");
+    assert_eq!(passkeys.len(), before.1.len() + 1, "{passkeys:?}");
+    assert!(!gates.closed(0), "it approved nothing");
+}
+
+#[test]
+fn only_the_very_account_reaches_a_links_page() {
+    let t = Allowing::new();
+    let root = t.root();
+    let flows = t.flows();
+    let url = flows[0].made_link(0);
+    let before = link_state(root);
+    let wrong = t.links_counted("wrong_account");
+
+    // An account that never signed in here: no binding, no event, and the link left live.
+    let signed = link_flow(&t.server, &t.github, "carol", &url);
+    told_nothing(&t.server, "another account", &signed);
+    assert_eq!(link_state(root), before);
+    assert_eq!(t.events("signed_in", "github:carol"), Vec::<Value>::new());
+    assert_eq!(t.links_counted("wrong_account"), wrong + 1);
+    let lines = || link_lines(&t.log, "wrong account");
+    eventually("the wrong account's line", || lines().len() == 1);
+    assert_eq!(field(&lines()[0], "login"), Some("carol"), "{:?}", lines());
+
+    // Joined to the link's account by an admin: one principal, and still not the account that made the link.
+    let signed = approve_flow(&t.server, &t.github, "carol", "proj", &t.ids.carol);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    assert_eq!(t.events("signed_in", "github:carol").len(), 1, "bound now");
+    serve_command(&t.server, &["token", "link", "github:carol", "--to", "github:alice"]);
+    let signed = link_flow(&t.server, &t.github, "carol", &url);
+    told_nothing(&t.server, "a linked account", &signed);
+    assert_eq!(link_state(root), before);
+    eventually("the linked account's line", || lines().len() == 2);
+
+    // All that left the link as it was: its owner can still use it.
+    let signed = link_flow(&t.server, &t.github, "alice", &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = register_at_link(&t.server, &signed);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(link_state(root).1.len(), before.1.len() + 1);
+}
+
+#[test]
+fn a_links_account_must_still_be_let_in_as_a_person() {
+    let t = Allowing::new();
+    let root = t.root();
+    let flows = t.flows();
+    let url = flows[1].made_link(0);
+    let before = link_state(root);
+    let refused = t.links_counted("refused");
+    let last_line = |outcome: &str, count: usize| {
+        eventually(outcome, || link_lines(&t.log, outcome).len() == count);
+        link_lines(&t.log, outcome).pop().unwrap()
+    };
+
+    dave_not_admitted(&t.server);
+    let signed = link_flow(&t.server, &t.github, "dave", &url);
+    told_nothing(&t.server, "not admitted", &signed);
+    assert_eq!(link_state(root), before);
+    assert_eq!(field(&last_line("not admitted", 1), "login"), Some("dave"));
+
+    dave_an_agent(&t.server);
+    let signed = link_flow(&t.server, &t.github, "dave", &url);
+    told_nothing(&t.server, "kind agent", &signed);
+    assert_eq!(link_state(root), before);
+    assert_eq!(field(&last_line("not human", 1), "login"), Some("dave"));
+
+    // Denied, whatever rule lets it in: `deny` lists the account's subject, which the link's row holds.
+    let subject = &before.0[0].1;
+    edit_auth_toml(&t.server, "deny = [\"4242\"]", &format!("deny = [\"4242\", \"{subject}\"]"));
+    let signed = link_flow(&t.server, &t.github, "dave", &url);
+    told_nothing(&t.server, "denied", &signed);
+    assert_eq!(link_state(root), before);
+    last_line("not admitted", 2);
+
+    assert_eq!(t.links_counted("refused"), refused + 3);
+}
+
+#[test]
+fn a_link_is_judged_for_its_workspace_alone() {
+    let t = Allowing::new();
+    let root = t.root();
+    let flows = t.flows();
+    let url = flows[0].made_link(0);
+    let judged_for = |workspace: &str| {
+        let conn = rusqlite::Connection::open(root.join("server.db")).unwrap();
+        conn.execute("UPDATE passkey_links SET workspace = ?1", [workspace]).unwrap();
+    };
+
+    // A rule scoped elsewhere: the account is let in nowhere the link was made.
+    judged_for("elsewhere");
+    let before = link_state(root);
+    let signed = link_flow(&t.server, &t.github, "alice", &url);
+    told_nothing(&t.server, "a workspace no rule names", &signed);
+    assert_eq!(link_state(root), before);
+    eventually("the refusal's line", || link_lines(&t.log, "not admitted").len() == 1);
+
+    // Granted and never created: only the rules are asked, and nothing looks for it.
+    judged_for("nosuch");
+    let signed = link_flow(&t.server, &t.github, "alice", &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = register_at_link(&t.server, &signed);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(link_state(root).0, [], "spent");
+    assert!(!root.join("nosuch").exists(), "no workspace was made");
+}
+
+#[test]
+fn foreign_posts_take_no_link_and_no_page() {
+    const FOREIGN: [(Option<&str>, Option<&str>); 5] = [
+        (Some("https://evil.example"), None),
+        (Some("https://evil.example"), Some("same-origin")),
+        (Some(PUBLIC), Some("cross-site")),
+        (None, Some("cross-site")),
+        (None, None),
+    ];
+    let t = Allowing::new();
+    let root = t.root();
+    let flows = t.flows();
+    let url = flows[0].made_link(0);
+    let before = link_state(root);
+    let started = t.links_counted("started");
+
+    // The landing POST: the one answer whether the link lives or not, and no lookup to tell them apart.
+    let (landing, cookie) = (link_address(&t.server), format!("__Secure-bd_oauth={}", landed(&t.server)));
+    let live = format!("link={}", link_secret(&url));
+    let dead = format!("link={}", "0".repeat(64));
+    let refused = |origin, site, cookie: &str, what: &str| {
+        let first = post_gate(&landing, origin, site, cookie, &live);
+        let second = post_gate(&landing, origin, site, cookie, &dead);
+        assert_eq!(first.0, 403, "{what}: {}", first.2);
+        assert!(first.2.contains("own page"), "{what}: {}", first.2);
+        assert_eq!((first.0, &first.2), (second.0, &second.2), "{what}");
+        assert_eq!(link_state(root), before, "{what}");
+    };
+    for (origin, site) in FOREIGN {
+        refused(origin, site, &cookie, &format!("{origin:?} {site:?}"));
+    }
+    refused(Some(PUBLIC), None, "", "no cookie");
+    assert_eq!(t.links_counted("started"), started, "none of them went on");
+
+    // The registration page's POST: taken by none of these.
+    let signed = link_flow(&t.server, &t.github, "alice", &url);
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let register = register_address(&t.server);
+    let (id, cookie) = (signed.link_id(), signed.link_cookie());
+    let fields = passkey_fields(&signed.page);
+    let body = format!("id={id}&{fields}");
+    for (origin, site) in FOREIGN {
+        let (status, _, page) = post_gate(&register, origin, site, &cookie, &body);
+        assert_eq!(status, 403, "{origin:?} {site:?}: {page}");
+        assert!(page.contains("another site"), "{page}");
+        assert_eq!(link_state(root), before, "{origin:?} {site:?}");
+    }
+    let (name, _) = cookie.split_once('=').unwrap();
+    for other in [String::new(), format!("{name}={}", "0".repeat(64))] {
+        let (status, _, page) = post_gate(&register, Some(PUBLIC), None, &other, &body);
+        assert_eq!(status, 403, "{other}: {page}");
+        assert!(page.contains("different browser"), "{page}");
+        assert_eq!(link_state(root), before, "{other}");
+    }
+    let (status, _, page) = post_gate(&register, Some(PUBLIC), None, &cookie, &format!("id={id}&{body}"));
+    assert_eq!(status, 400, "{page}");
+    assert!(page.contains("arrived incomplete"), "{page}");
+    assert_eq!(link_state(root), before, "a duplicated id");
+
+    // Neither the link nor the page was taken: its own browser's POST goes through.
+    let (status, _, page) = post_gate(&register, Some(PUBLIC), None, &cookie, &body);
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(link_state(root).1.len(), before.1.len() + 1);
+}
+
+/// The URL a live link goes on to is a request line a proxy logs: it does nothing without the browser that posted
+/// the secret.
+#[test]
+fn a_links_onward_url_does_nothing_in_another_browser() {
+    let t = Allowing::new();
+    let url = t.flows()[0].made_link(0);
+    let (oauth, (status, _, page)) = open_link(&t.server, &url);
+    assert_eq!(status, 200, "{page}");
+    let onward = local_url(&t.server, &onward_url(&page));
+    let at_github = t.github.log();
+
+    for (what, cookie) in [("no cookie", None), ("another browser", Some(landed(&t.server)))] {
+        let (status, headers, page) = browse(&onward, cookie.as_deref(), None);
+        assert_eq!(status, 400, "{what}: {page}");
+        assert!(page.contains("different browser"), "{what}: {page}");
+        assert_eq!(cookies_from(&headers), "", "{what}: no cookie set");
+        assert!(headers.get("location").is_none(), "{what}: {headers:?}");
+        assert_eq!(t.github.log(), at_github, "{what}: no sign-in");
+    }
+
+    // The browser that posted it still goes on, to the end.
+    t.github.next("alice", 0);
+    let signed = signed_in_at_github(&t.server, &t.github, &browse(&onward, Some(&oauth), None));
+    assert_eq!(signed.status, 200, "{}", signed.page);
+    let (status, _, page) = register_at_link(&t.server, &signed);
+    assert_eq!(status, 200, "{page}");
+}
+
+#[test]
+fn no_link_secret_is_left_behind() {
+    use sha2::Digest;
+    let t = Allowing::new();
+    let root = t.root();
+    let mut secrets = Vec::new();
+    let mut answers: Vec<ureq::http::HeaderMap> = Vec::new();
+    for flow in &t.flows() {
+        let signed = flow.open(0);
+        let (status, headers, page) = flow.post(0, &signed, &ticked(&passkey_fields(&signed.page)));
+        assert_eq!(status, 200, "{page}");
+        answers.push(headers);
+        let url = link_url(&page);
+        let secret = link_secret(&url).to_string();
+        let hash: String = sha2::Sha256::digest(secret.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let (links, _) = link_state(root);
+        assert_eq!(links.iter().filter(|l| l.3 == hash).count(), 1, "the hash looked for is the one kept: {links:?}");
+
+        // Every way it can go that a log or a header sees: another account, and then the whole flow, hop by hop.
+        let wrong = link_flow(&t.server, &t.github, "carol", &url);
+        told_nothing(&t.server, "another account", &wrong);
+        answers.push(wrong.headers);
+        let address = link_address(&t.server);
+        let (status, headers, page) = browse(&address, None, None);
+        assert_eq!(status, 200, "{page}");
+        let oauth = bd_oauth(&headers);
+        answers.push(headers);
+        let (status, headers, page) = post_link(&t.server, &oauth, &secret);
+        assert_eq!(status, 200, "{page}");
+        answers.push(headers);
+        t.github.next(flow.login, 0);
+        let choose = browse(&local_url(&t.server, &onward_url(&page)), Some(&oauth), None);
+        let signed = signed_in_at_github(&t.server, &t.github, &choose);
+        assert_eq!(signed.status, 200, "{}", signed.page);
+        answers.push(choose.1);
+        let (status, headers, page) = register_at_link(&t.server, &signed);
+        assert_eq!(status, 200, "{page}");
+        answers.push(signed.headers);
+        answers.push(headers);
+        secrets.push((secret, hash));
+    }
+
+    let log = std::fs::read_to_string(&t.log).unwrap();
+    assert!(log.contains(" passkey link "), "{log}");
+    let trail = serve_command(&t.server, &["token", "events"]);
+    assert!(trail.contains("through link"), "{trail}");
+    let provider = t.github.log().join("\n");
+    assert!(provider.contains("/login/oauth"), "{provider}");
+    let db = std::fs::read(root.join("server.db")).unwrap();
+    assert!(!db.is_empty());
+    let wal = std::fs::read(root.join("server.db-wal")).unwrap_or_default();
+    let holds = |bytes: &[u8], text: &str| bytes.windows(text.len()).any(|w| w == text.as_bytes());
+    for (secret, hash) in &secrets {
+        for text in [secret, hash] {
+            assert!(!log.contains(text.as_str()), "logged: {text}");
+            assert!(!trail.contains(text.as_str()), "in the trail: {text}");
+            assert!(!provider.contains(text.as_str()), "sent to the provider: {text}");
+            for headers in &answers {
+                for name in ["set-cookie", "location"] {
+                    for value in headers.get_all(name).iter().filter_map(|v| v.to_str().ok()) {
+                        assert!(!value.contains(text.as_str()), "{name}: {value}");
+                    }
+                }
+            }
+        }
+        assert!(!holds(&db, secret) && !holds(&wal, secret), "the secret in server.db");
+    }
+}
+
+#[test]
+fn a_flood_of_dead_links_keeps_nothing_and_is_counted() {
+    let t = Allowing::new();
+    let root = t.root();
+    let flows = t.flows();
+    let url = flows[0].made_link(0);
+    let before = link_state(root);
+    let unusable = t.links_counted("unusable");
+    let oauth = landed(&t.server);
+    let flood = 64;
+    let dead = dead_link(&t.server);
+    for n in 0..flood {
+        let (status, headers, page) = post_link(&t.server, &oauth, &format!("{n:064x}"));
+        assert_eq!((status, &page), (dead.0, &dead.2), "{n}");
+        assert_eq!(cookies_from(&headers), "", "{n}");
+    }
+    // The one from `dead_link`, and each of the flood's.
+    assert_eq!(t.links_counted("unusable"), unusable + 1 + flood);
+    assert_eq!(link_state(root), before);
+    eventually("the first line", || !link_lines(&t.log, "unusable").is_empty());
+    let lines = link_lines(&t.log, "unusable");
+    assert!(lines.len() <= 2, "throttled: {lines:?}");
+
+    // The live link is none the worse.
+    t.github.next("alice", 0);
+    let signed = signed_in_at_github(&t.server, &t.github, &link_choose(&t.server, &url));
+    assert_eq!(signed.status, 200, "{}", signed.page);
+}
+
+#[test]
 fn an_allowance_is_refused_through_tokens_and_missing_from_mcp() {
     let t = Allowing::new();
     let human = t.server.token("human-admin", "root", &["--role", "admin", "--kind", "human"]);

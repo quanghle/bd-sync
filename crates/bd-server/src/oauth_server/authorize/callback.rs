@@ -1,5 +1,6 @@
 //! Back from the provider: `/oauth/<provider>/callback` (relayed first when posted), then the consent page (or, for
-//! a human gate's approval, its approval page: `gate::signed_in`; for an operation's, `operation::signed_in`).
+//! a human gate's approval, its approval page: `gate::signed_in`; for an operation's, `operation::signed_in`; for a
+//! passkey link's, its registration page: `link::signed_in`).
 
 use std::time::Duration;
 
@@ -47,8 +48,9 @@ pub fn relay(cx: &Ctx<'_>, provider: &str, body: &str) -> Answer {
 /// browser back. Find out who signed in and what the rules or the
 /// authorizer let the account do in the workspace, and ask whether the
 /// client may; or, signed in to approve a human gate or an operation,
-/// whether to approve it. A callback whose flow is an operation's is
-/// recorded once, whichever way it ends (`operation::record`).
+/// whether to approve it. A callback whose flow is an operation's or a
+/// passkey link's is recorded once, whichever way it ends (`operation::record`,
+/// `link::record`).
 pub fn callback(
     cx: &Ctx<'_>,
     provider: &str,
@@ -57,15 +59,24 @@ pub fn callback(
     cookies: &str,
 ) -> (Answer, Vec<String>) {
     let mut fresh = None;
-    // The flow, opened first whether or not it has expired: an operation's is recorded however it ends.
+    // The flow, opened first whether or not it has expired: an operation's or a link's is recorded however it ends.
     let opened = operation::opened_flow(cx, query, cookies);
     let op_flow = opened.as_ref().and_then(|p| Some((p.then.operation()?, p.at.as_ref()?.provider.clone())));
+    let link_flow = opened.as_ref().and_then(|p| Some((p.then.link()?.to_string(), p.at.as_ref()?.provider.clone())));
     let answer = match common(cx, provider, query, browser, opened) {
         Ok(common) => signed_in(cx, provider, common, cookies, &mut fresh),
         Err(early) => {
             if let Some((flow, started_with)) = &op_flow {
                 let who = operation::Who::provider_only(started_with);
                 operation::record(early.outcome, &who, &flow.workspace, &flow.op, &flow.issue, early.detail);
+            }
+            if let Some((id, started_with)) = &link_flow {
+                let seen = link::Seen {
+                    provider: started_with.clone(),
+                    link: crate::passkeys::prefix(id).to_string(),
+                    ..link::Seen::default()
+                };
+                link::record(link::Outcome::Failed, &seen, early.detail);
             }
             early.answer
         }
@@ -171,6 +182,11 @@ fn signed_in(cx: &Ctx<'_>, provider: &str, common: Common, cookies: &str, fresh:
                 gate::Returned { provider, error: get("error"), code: get("code"), verifier: &verifier, nonce: &nonce };
             let Some(flow) = then.operation() else { return refused(400, MALFORMED) };
             return operation::signed_in(cx, &sign_in, &back, &flow, cookies, fresh);
+        }
+        Then::Link { id } => {
+            let back =
+                gate::Returned { provider, error: get("error"), code: get("code"), verifier: &verifier, nonce: &nonce };
+            return link::signed_in(cx, &sign_in, &back, &id, fresh);
         }
     };
     let request = match request_of(cx, &oauth_config, &requested) {

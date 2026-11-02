@@ -1281,6 +1281,53 @@ mod tests {
         assert_eq!(allowances(dir.path()), ["bob's"]);
     }
 
+    /// A link of `subject` at GitHub, as a row.
+    fn link_row(root: &Path, subject: &str, id: &str, expires_at: i64) {
+        let conn = server_db::open(root).unwrap();
+        conn.execute(
+            "INSERT INTO passkey_links \
+             (issuer, subject, id, secret_hash, vouched_by, workspace, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?3, 'c', 'w', 0, ?4)",
+            rusqlite::params![GITHUB, subject, id, expires_at],
+        )
+        .unwrap();
+    }
+
+    /// The ids of the links, in order.
+    fn links(root: &Path) -> Vec<String> {
+        let conn = server_db::open(root).unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM passkey_links ORDER BY id").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    }
+
+    #[test]
+    fn a_sign_in_prunes_the_links_that_ran_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let later = Timestamp::now().plus(Duration::from_secs(60)).millis();
+        link_row(dir.path(), "1", "ran-out", 1);
+        link_row(dir.path(), "2", "live", later);
+        github_token(dir.path(), &gh("alice", 3), grant, Duration::from_secs(3600), true).unwrap();
+        assert_eq!(links(dir.path()), ["live"]);
+        let events = server_db::events(dir.path(), 0, None, &[], 100).unwrap();
+        assert_eq!(events.iter().map(|e| e.event.kind).collect::<Vec<_>>(), ["signed_in"], "and records nothing of it");
+    }
+
+    #[test]
+    fn only_forgetting_an_account_erases_its_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let grant = Grant { role: Role::Write, kind: Kind::Agent, workspaces: vec![], max_claims: None };
+        let hour = Duration::from_secs(3600);
+        github_token(dir.path(), &gh("alice", 1), grant.clone(), hour, true).unwrap();
+        github_token(dir.path(), &gh("bob", 2), grant, hour, true).unwrap();
+        link_row(dir.path(), "1", "alice's", i64::MAX);
+        link_row(dir.path(), "2", "bob's", i64::MAX);
+        revoke_account(dir.path(), "alice", false).unwrap();
+        assert_eq!(links(dir.path()), ["alice's", "bob's"], "revoking alone keeps it");
+        revoke_account(dir.path(), "alice", true).unwrap();
+        assert_eq!(links(dir.path()), ["bob's"]);
+    }
+
     #[test]
     fn the_audit_trail_records_each_change_and_forgets_with_the_account() {
         let dir = tempfile::tempdir().unwrap();

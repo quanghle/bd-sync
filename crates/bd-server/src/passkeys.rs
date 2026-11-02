@@ -6,15 +6,23 @@
 //! one at hand, under an allowance (`insert_allowed`): a window of at most
 //! [`ALLOWANCE_MAX`] an admin opens on the server host (`grant`, ended early
 //! by `cancel`), one per account, in the `passkey_allowances` table, spent by
-//! the one registration it lets in. Each approval moves its passkey's counter
-//! on (`use_counter`, or `add` for the vouching one); an admin removes them
-//! (`remove`, which ends the allowance of an account it leaves with none, so
-//! a live allowance always means a passkey), and they are erased with a
-//! forgotten account (`server_db::erase_passkeys`,
-//! `server_db::erase_allowance`). Registrations, removals and what happens to
-//! allowances are recorded in the audit trail, by the credential id's first
-//! [`PREFIX`] characters, the algorithm and an allowance's id, never the key.
-//! `bd serve passkey list|remove|allow-add` is the admin's command over them
+//! the one registration it lets in; or through a link: a verified assertion
+//! at an approval vouches for a secret shown once (`vouch_link`), which lets
+//! the very account register one passkey on another device for [`LINK_TTL`]
+//! (`insert_linked`, ended early by `cancel_link`), one per account, in the
+//! `passkey_links` table, only the secret's hash kept. Each approval moves
+//! its passkey's counter on (`use_counter`, or `add` or `vouch_link` for the
+//! vouching one); an admin removes them (`remove`, which ends the allowance
+//! of an account it leaves with none, so a live allowance always means a
+//! passkey, and the link it leaves with none or without the passkey that
+//! vouched for it, so a live link always means that passkey), and they are
+//! erased with a forgotten account (`server_db::erase_passkeys`,
+//! `server_db::erase_allowance`, `server_db::erase_link`). Registrations,
+//! removals and what happens to allowances and links are recorded in the
+//! audit trail, by the credential id's first [`PREFIX`] characters, the
+//! algorithm and an allowance's id or a link's first [`PREFIX`], never the
+//! key, a link's secret or its hash. `bd serve passkey
+//! list|remove|allow-add|cancel-link` is the admin's command over them
 //! (`cmd_passkey`).
 
 use std::path::Path;
@@ -40,6 +48,9 @@ pub const ALLOWANCE_MAX: Duration = Duration::from_secs(3600);
 
 /// How long an allowance lasts unless the admin says.
 pub const ALLOWANCE_DEFAULT: Duration = Duration::from_secs(15 * 60);
+
+/// How long a link lasts: always this, whoever makes it.
+pub const LINK_TTL: Duration = Duration::from_secs(15 * 60);
 
 /// How many characters of a credential id (base64url) logs, events and
 /// listings show.
@@ -93,6 +104,62 @@ pub struct Allowance {
     pub expires_at: i64,
 }
 
+/// A link as kept, its secret's hash left out: what an account may register a
+/// passkey through while it is live, strictly before `expires_at`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    /// 16 random bytes in hex, not a secret: what names this link in sealed
+    /// flows, and, cut to [`PREFIX`], in logs and events.
+    pub id: String,
+    /// The account's, as in [`crate::auth::Identity`].
+    pub issuer: String,
+    pub subject: String,
+    /// The whole credential id of the passkey that vouched for it.
+    pub vouched_by: String,
+    /// The approval's workspace: only ever an input to `oauth::judge`.
+    pub workspace: String,
+    /// Milliseconds.
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// A link to make, with its account's fields for the events.
+#[derive(Clone)]
+pub struct NewLink {
+    /// 16 random bytes in hex.
+    pub id: String,
+    /// `auth::hash` of the secret.
+    pub secret_hash: String,
+    pub issuer: String,
+    pub subject: String,
+    pub provider: String,
+    /// The account's actor.
+    pub actor: String,
+    /// The whole credential id of the passkey that vouches for it.
+    pub vouched_by: String,
+    pub workspace: String,
+    /// Milliseconds.
+    pub created_at: i64,
+    pub expires_at: i64,
+}
+
+/// By hand, so that `secret_hash` is printed nowhere.
+impl std::fmt::Debug for NewLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewLink")
+            .field("id", &self.id)
+            .field("issuer", &self.issuer)
+            .field("subject", &self.subject)
+            .field("provider", &self.provider)
+            .field("actor", &self.actor)
+            .field("vouched_by", &self.vouched_by)
+            .field("workspace", &self.workspace)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
 pub(crate) const BY_ACCOUNT: &str = "SELECT credential, issuer, subject, algorithm, public_key, counter, created_at, \
                                      last_used_at FROM passkeys WHERE issuer = ?1 AND subject = ?2 ORDER BY seq";
 pub(crate) const BY_CREDENTIAL: &str = "SELECT credential, issuer, subject, algorithm, public_key, counter, \
@@ -121,6 +188,21 @@ pub(crate) const ALLOWANCE_PUT: &str = "INSERT INTO passkey_allowances (issuer, 
                                         VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (issuer, subject) DO UPDATE SET \
                                         id = excluded.id, created_at = excluded.created_at, \
                                         expires_at = excluded.expires_at";
+pub(crate) const LINK_BY_ACCOUNT: &str = "SELECT id, issuer, subject, vouched_by, workspace, created_at, expires_at \
+                                          FROM passkey_links WHERE issuer = ?1 AND subject = ?2 AND expires_at > ?3";
+pub(crate) const LINK_BY_ID: &str = "SELECT id, issuer, subject, vouched_by, workspace, created_at, expires_at FROM \
+                                     passkey_links WHERE id = ?1 AND expires_at > ?2";
+pub(crate) const LINK_BY_SECRET: &str = "SELECT id, issuer, subject, vouched_by, workspace, created_at, expires_at \
+                                         FROM passkey_links WHERE secret_hash = ?1 AND expires_at > ?2";
+pub(crate) const LINK_ROW: &str = "SELECT id, issuer, subject, vouched_by, workspace, created_at, expires_at FROM \
+                                   passkey_links WHERE issuer = ?1 AND subject = ?2";
+pub(crate) const LINK_DELETE: &str = "DELETE FROM passkey_links WHERE issuer = ?1 AND subject = ?2 AND id = ?3";
+pub(crate) const LINK_PUT: &str = "INSERT INTO passkey_links (issuer, subject, id, secret_hash, vouched_by, \
+                                   workspace, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) ON \
+                                   CONFLICT (issuer, subject) DO UPDATE SET id = excluded.id, secret_hash = \
+                                   excluded.secret_hash, vouched_by = excluded.vouched_by, workspace = \
+                                   excluded.workspace, created_at = excluded.created_at, expires_at = \
+                                   excluded.expires_at";
 
 fn select(tx: &rusqlite::Transaction, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<Passkey>> {
     let mut stmt = tx.prepare_cached(sql)?;
@@ -143,6 +225,21 @@ fn allowance(tx: &rusqlite::Transaction, sql: &str, args: &[&dyn rusqlite::ToSql
     let found = tx
         .prepare_cached(sql)?
         .query_row(args, |r| Ok(Allowance { id: r.get(0)?, created_at: r.get(1)?, expires_at: r.get(2)? }));
+    Ok(found.optional()?)
+}
+
+fn one_link(tx: &rusqlite::Transaction, sql: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Option<Link>> {
+    let found = tx.prepare_cached(sql)?.query_row(args, |r| {
+        Ok(Link {
+            id: r.get(0)?,
+            issuer: r.get(1)?,
+            subject: r.get(2)?,
+            vouched_by: r.get(3)?,
+            workspace: r.get(4)?,
+            created_at: r.get(5)?,
+            expires_at: r.get(6)?,
+        })
+    });
     Ok(found.optional()?)
 }
 
@@ -262,6 +359,7 @@ pub fn insert_first(root: &Path, row: &NewRow) -> Result<Inserted> {
         )?;
         server_db::prune_events(tx)?;
         server_db::prune_allowances(tx)?;
+        server_db::prune_links(tx)?;
         Ok(Inserted::Inserted)
     })
 }
@@ -270,6 +368,14 @@ pub fn insert_first(root: &Path, row: &NewRow) -> Result<Inserted> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Added {
     Added,
+    /// Added, with the link it was asked to make: only ever with a link.
+    Linked {
+        /// The link took the place of a live one.
+        replaced: bool,
+        /// The new passkey brought the account to [`MAX_PER_ACCOUNT`], so the
+        /// link can add nothing until one is removed.
+        full: bool,
+    },
     /// The account is not there (any more).
     NoAccount,
     /// The account has [`MAX_PER_ACCOUNT`] passkeys already.
@@ -288,8 +394,10 @@ pub enum Added {
 /// passkey has the new credential id, and `asserted`'s counter is still at
 /// `read`. Every check runs before the first change, so a refusal changes
 /// nothing; otherwise the counter moves, the row goes in, and a
-/// `passkey_registered` event names both credentials' prefixes.
-pub fn add(root: &Path, row: &NewRow, asserted: &str, read: u32, new: u32) -> Result<Added> {
+/// `passkey_registered` event names both credentials' prefixes. With `link`,
+/// the same transaction makes it ([`put_link`]), so the counter, the passkey
+/// and the link commit together or not at all.
+pub fn add(root: &Path, row: &NewRow, asserted: &str, read: u32, new: u32, link: Option<&NewLink>) -> Result<Added> {
     let mut conn = server_db::open(root)?;
     server_db::write(root, &mut conn, |tx| {
         let exists =
@@ -346,9 +454,14 @@ pub fn add(root: &Path, row: &NewRow, asserted: &str, read: u32, new: u32) -> Re
                 ..AuthEvent::default()
             },
         )?;
+        let replaced = link.map(|link| put_link(tx, link)).transpose()?;
         server_db::prune_events(tx)?;
         server_db::prune_allowances(tx)?;
-        Ok(Added::Added)
+        server_db::prune_links(tx)?;
+        Ok(match replaced {
+            None => Added::Added,
+            Some(replaced) => Added::Linked { replaced, full: count + 1 >= MAX_PER_ACCOUNT as i64 },
+        })
     })
 }
 
@@ -408,6 +521,7 @@ pub fn grant(root: &Path, account: &Account, length: Duration) -> Result<Granted
         server_db::record(tx, &event_of("passkey_add_allowed", account, detail))?;
         server_db::prune_events(tx)?;
         server_db::prune_allowances(tx)?;
+        server_db::prune_links(tx)?;
         Ok(Granted { id, expires_at, replaced })
     })
 }
@@ -432,7 +546,229 @@ pub fn cancel(root: &Path, account: &Account) -> Result<bool> {
         end_allowance(tx, account, &live, "cancelled by an admin")?;
         server_db::prune_events(tx)?;
         server_db::prune_allowances(tx)?;
+        server_db::prune_links(tx)?;
         Ok(true)
+    })
+}
+
+/// How the audit trail names a link: by prefixes, of its id and of the
+/// passkey that vouched for it.
+fn link_named(id: &str, vouched_by: &str) -> String {
+    format!("link {} vouched by {}", prefix(id), prefix(vouched_by))
+}
+
+/// `kind`, of `link`'s account, for the audit trail.
+fn link_event(kind: &'static str, link: &NewLink, detail: String) -> AuthEvent {
+    AuthEvent {
+        kind,
+        actor: Some(link.actor.clone()),
+        provider: Some(link.provider.clone()),
+        issuer: Some(link.issuer.clone()),
+        subject: Some(link.subject.clone()),
+        detail: Some(detail),
+        ..AuthEvent::default()
+    }
+}
+
+/// The account's link in place of any it had, with a `passkey_link_made`
+/// event, after a `passkey_link_ended` one if a live link was replaced:
+/// whether one was. One past its expiry is overwritten with no event, as
+/// running out records none.
+fn put_link(tx: &rusqlite::Transaction, link: &NewLink) -> Result<bool> {
+    let now = Timestamp::now().millis();
+    let earlier = one_link(tx, LINK_ROW, &[&link.issuer, &link.subject])?.filter(|l| l.expires_at > now);
+    if let Some(earlier) = &earlier {
+        let detail = format!("{}: replaced", link_named(&earlier.id, &earlier.vouched_by));
+        server_db::record(tx, &link_event("passkey_link_ended", link, detail))?;
+    }
+    tx.prepare_cached(LINK_PUT)?.execute(rusqlite::params![
+        link.issuer,
+        link.subject,
+        link.id,
+        link.secret_hash,
+        link.vouched_by,
+        link.workspace,
+        link.created_at,
+        link.expires_at
+    ])?;
+    let detail = format!("{}, until {}", link_named(&link.id, &link.vouched_by), time(link.expires_at).to_rfc3339());
+    server_db::record(tx, &link_event("passkey_link_made", link, detail))?;
+    Ok(earlier.is_some())
+}
+
+/// [`put_link`] alone, for tests that need a live link and no approval.
+#[cfg(test)]
+pub(crate) fn test_put_link(root: &Path, link: &NewLink) -> Result<bool> {
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| put_link(tx, link))
+}
+
+/// What [`vouch_link`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Vouched {
+    Made {
+        /// It took the place of a live link.
+        replaced: bool,
+    },
+    /// The vouching passkey is no longer the account's, or its counter moved
+    /// since it was read: another approval or an admin changed it meanwhile.
+    Raced,
+}
+
+/// Make `link` at an approval vouched for by the account's passkey
+/// `asserted`, whose counter was `read` and moves to `new`, in one
+/// transaction: the counter and the link commit together or not at all. If
+/// the counter did not move, nothing is written.
+pub fn vouch_link(root: &Path, link: &NewLink, asserted: &str, read: u32, new: u32) -> Result<Vouched> {
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| {
+        let moved = tx.prepare_cached(USE_COUNTER_OWNED)?.execute(rusqlite::params![
+            new,
+            Timestamp::now().millis(),
+            asserted,
+            link.issuer,
+            link.subject,
+            read
+        ])?;
+        if moved != 1 {
+            return Ok(Vouched::Raced);
+        }
+        let replaced = put_link(tx, link)?;
+        server_db::prune_events(tx)?;
+        server_db::prune_allowances(tx)?;
+        server_db::prune_links(tx)?;
+        Ok(Vouched::Made { replaced })
+    })
+}
+
+/// The live link of the account with this issuer and subject, if any (none if
+/// there is no `server.db`).
+pub fn live_link(root: &Path, issuer: &str, subject: &str) -> Result<Option<Link>> {
+    let Some(mut conn) = server_db::open_existing(root)? else { return Ok(None) };
+    server_db::read(root, &mut conn, |tx| {
+        one_link(tx, LINK_BY_ACCOUNT, &[&issuer, &subject, &Timestamp::now().millis()])
+    })
+}
+
+/// The live link with this id, if any.
+pub fn link_by_id(root: &Path, id: &str) -> Result<Option<Link>> {
+    let Some(mut conn) = server_db::open_existing(root)? else { return Ok(None) };
+    server_db::read(root, &mut conn, |tx| one_link(tx, LINK_BY_ID, &[&id, &Timestamp::now().millis()]))
+}
+
+/// The live link whose secret has this `auth::hash`, if any.
+pub fn link_by_secret(root: &Path, hash: &str) -> Result<Option<Link>> {
+    let Some(mut conn) = server_db::open_existing(root)? else { return Ok(None) };
+    server_db::read(root, &mut conn, |tx| one_link(tx, LINK_BY_SECRET, &[&hash, &Timestamp::now().millis()]))
+}
+
+/// End `live`, `account`'s link, with a `passkey_link_ended` event saying
+/// `how`.
+fn end_link(tx: &rusqlite::Transaction, account: &Account, live: &Link, how: &str) -> Result<()> {
+    tx.prepare_cached(LINK_DELETE)?.execute([&account.issuer, &account.subject, &live.id])?;
+    let detail = format!("{}: {how}", link_named(&live.id, &live.vouched_by));
+    server_db::record(tx, &event_of("passkey_link_ended", account, detail))
+}
+
+/// End `account`'s live link, for an admin: whether it had one. With none,
+/// nothing is written, a link that ran out left as it is.
+pub fn cancel_link(root: &Path, account: &Account) -> Result<bool> {
+    let Some(mut conn) = server_db::open_existing(root)? else { return Ok(false) };
+    server_db::write(root, &mut conn, |tx| {
+        let now = Timestamp::now().millis();
+        let Some(live) = one_link(tx, LINK_BY_ACCOUNT, &[&account.issuer, &account.subject, &now])? else {
+            return Ok(false);
+        };
+        end_link(tx, account, &live, "cancelled")?;
+        server_db::prune_events(tx)?;
+        server_db::prune_allowances(tx)?;
+        server_db::prune_links(tx)?;
+        Ok(true)
+    })
+}
+
+/// What [`insert_linked`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Linked {
+    Inserted {
+        /// The whole credential id of the passkey that vouched for the link.
+        vouched_by: String,
+    },
+    /// The link is not live any more or not the account's (spent, cancelled,
+    /// replaced, or past its expiry), or the account is not there.
+    LinkGone,
+    /// The passkey that vouched for the link is no longer the account's.
+    VouchGone,
+    /// The account has [`MAX_PER_ACCOUNT`] passkeys already.
+    LimitReached,
+    /// Another passkey has the new credential id.
+    CredentialTaken,
+}
+
+/// Register `row` through the link `link_id`, the very one its page was
+/// opened under, in one transaction: only if that link is live and the
+/// account's, the account is there, still holds the passkey that vouched for
+/// the link and fewer than [`MAX_PER_ACCOUNT`] passkeys, and no passkey has
+/// the new credential id. Every check runs before the first change, so a
+/// refusal changes nothing; otherwise the link goes, the row goes in, and a
+/// `passkey_registered` event names the new passkey, the link and the one
+/// that vouched for it. Writers run one at a time, so of several
+/// registrations through one link one gets in and the rest find it gone.
+pub fn insert_linked(root: &Path, link_id: &str, row: &NewRow) -> Result<Linked> {
+    let mut conn = server_db::open(root)?;
+    server_db::write(root, &mut conn, |tx| {
+        let exists =
+            |sql: &str, args: &[&dyn rusqlite::ToSql]| -> Result<bool> { Ok(tx.prepare_cached(sql)?.exists(args)?) };
+        let now = Timestamp::now().millis();
+        let Some(link) =
+            one_link(tx, LINK_BY_ID, &[&link_id, &now])?.filter(|l| l.issuer == row.issuer && l.subject == row.subject)
+        else {
+            return Ok(Linked::LinkGone);
+        };
+        if !exists(ACCOUNT_EXISTS, &[&row.issuer, &row.subject])? {
+            return Ok(Linked::LinkGone);
+        }
+        if !exists(OWNED, &[&link.vouched_by, &row.issuer, &row.subject])? {
+            return Ok(Linked::VouchGone);
+        }
+        if count(tx, row.issuer, row.subject)? >= MAX_PER_ACCOUNT {
+            return Ok(Linked::LimitReached);
+        }
+        if exists(TAKEN, &[&row.credential])? {
+            return Ok(Linked::CredentialTaken);
+        }
+        tx.prepare_cached(LINK_DELETE)?.execute([row.issuer, row.subject, link_id])?;
+        tx.prepare_cached(INSERT)?.execute(rusqlite::params![
+            row.credential,
+            row.issuer,
+            row.subject,
+            server_db::key(row.actor),
+            row.alg.cose(),
+            row.public_key,
+            row.counter,
+            now,
+        ])?;
+        server_db::record(
+            tx,
+            &AuthEvent {
+                kind: "passkey_registered",
+                actor: Some(row.actor.to_string()),
+                provider: Some(row.provider.to_string()),
+                issuer: Some(row.issuer.to_string()),
+                subject: Some(row.subject.to_string()),
+                detail: Some(format!(
+                    "credential {} ({}), through {}",
+                    prefix(row.credential),
+                    row.alg.name(),
+                    link_named(&link.id, &link.vouched_by)
+                )),
+                ..AuthEvent::default()
+            },
+        )?;
+        server_db::prune_events(tx)?;
+        server_db::prune_allowances(tx)?;
+        server_db::prune_links(tx)?;
+        Ok(Linked::Inserted { vouched_by: link.vouched_by })
     })
 }
 
@@ -508,6 +844,7 @@ pub fn insert_allowed(root: &Path, row: &NewRow, allowance_id: &str) -> Result<A
         )?;
         server_db::prune_events(tx)?;
         server_db::prune_allowances(tx)?;
+        server_db::prune_links(tx)?;
         Ok(AllowedAdd::Added)
     })
 }
@@ -532,8 +869,10 @@ pub fn use_counter(root: &Path, credential: &str, read: u32, new: u32) -> Result
 /// starts with `prefix`, or, without one, every one of them; each removal
 /// recorded as a `passkey_removed` event. Leaving it with none ends its live
 /// allowance too, in the same transaction, so that no allowance outlives the
-/// account's last passkey. The passkeys removed. Refused, with nothing
-/// removed, when there is none, or when `prefix` names several.
+/// account's last passkey, and so does its live link, as does removing the
+/// passkey that vouched for that link, so that no link outlives its voucher.
+/// The passkeys removed. Refused, with nothing removed, when there is none,
+/// or when `prefix` names several.
 pub fn remove(root: &Path, account: &Account, prefix: Option<&str>) -> Result<Vec<Passkey>> {
     let none = || Error::not_found("passkey", prefix.unwrap_or(&account.actor));
     let Some(mut conn) = server_db::open_existing(root)? else { return Err(none()) };
@@ -570,14 +909,21 @@ pub fn remove(root: &Path, account: &Account, prefix: Option<&str>) -> Result<Ve
                 },
             )?;
         }
-        if count(tx, &account.issuer, &account.subject)? == 0 {
-            let now = Timestamp::now().millis();
-            if let Some(live) = allowance(tx, ALLOWANCE_LIVE, &[&account.issuer, &account.subject, &now])? {
-                end_allowance(tx, account, &live, "ended: the account's last passkey was removed")?;
+        let now = Timestamp::now().millis();
+        let none_left = count(tx, &account.issuer, &account.subject)? == 0;
+        if none_left && let Some(live) = allowance(tx, ALLOWANCE_LIVE, &[&account.issuer, &account.subject, &now])? {
+            end_allowance(tx, account, &live, "ended: the account's last passkey was removed")?;
+        }
+        if let Some(live) = one_link(tx, LINK_BY_ACCOUNT, &[&account.issuer, &account.subject, &now])? {
+            if none_left {
+                end_link(tx, account, &live, "last passkey removed")?;
+            } else if !tx.prepare_cached(OWNED)?.exists([&live.vouched_by, &account.issuer, &account.subject])? {
+                end_link(tx, account, &live, "vouching passkey removed")?;
             }
         }
         server_db::prune_events(tx)?;
         server_db::prune_allowances(tx)?;
+        server_db::prune_links(tx)?;
         Ok(chosen)
     })
 }
@@ -594,21 +940,28 @@ fn allowance_length(asked: Option<&str>) -> Result<Duration> {
     Ok(length)
 }
 
-/// `bd serve passkey list|remove|allow-add`: an admin's commands, on this
-/// machine.
+/// `bd serve passkey list|remove|allow-add|cancel-link`: an admin's commands,
+/// on this machine. What `list` says of a link is its end and the prefix of
+/// the passkey that vouched for it, nothing that could open it.
 pub fn cmd_passkey(app: &mut App, cmd: &PasskeyCommand) -> Result<()> {
     match cmd {
         PasskeyCommand::List(a) => {
             let root = auth::root_dir(&a.root)?;
             let account = auth::account_named(&root, a.account.trim())?;
             let (passkeys, allowance) = account_state(&root, &account.issuer, &account.subject)?;
+            let link = live_link(&root, &account.issuer, &account.subject)?;
             let until = allowance.map(|a| time(a.expires_at).to_rfc3339());
+            let link = link.map(|l| (time(l.expires_at).to_rfc3339(), prefix(&l.vouched_by).to_string()));
             let views: Vec<_> = passkeys
                 .iter()
                 .map(|p| {
                     let mut row = view(p);
                     if let Some(until) = &until {
                         row["add_allowed_until"] = json!(until);
+                    }
+                    if let Some((until, vouched_by)) = &link {
+                        row["link_until"] = json!(until);
+                        row["link_vouched_by"] = json!(vouched_by);
                     }
                     row
                 })
@@ -632,6 +985,9 @@ pub fn cmd_passkey(app: &mut App, cmd: &PasskeyCommand) -> Result<()> {
             if let Some(until) = until {
                 out = out
                     .line(format!("Add allowed: one passkey may be registered without an existing one until {until}"));
+            }
+            if let Some((until, vouched_by)) = link {
+                out = out.line(format!("link until {until} (vouched by {vouched_by})"));
             }
             app.print(out);
         }
@@ -674,6 +1030,17 @@ pub fn cmd_passkey(app: &mut App, cmd: &PasskeyCommand) -> Result<()> {
                     })
                 }
             });
+        }
+        PasskeyCommand::CancelLink(a) => {
+            let root = auth::root_dir(&a.root)?;
+            let account = auth::account_named(&root, a.account.trim())?;
+            let who = io::printable(&account.actor);
+            let cancelled = cancel_link(&root, &account)?;
+            app.print(Out::new(json!({ "account": account.actor, "cancelled": cancelled })).line(if cancelled {
+                format!("✓ Cancelled the link of {who}")
+            } else {
+                format!("{who} has no link to cancel")
+            }));
         }
     }
     Ok(())
@@ -911,7 +1278,7 @@ mod tests {
         let before = kept(root, "passkey_registered").len();
 
         let new = NewRow { counter: 3, ..row(&alice, &added, &second_key, second.alg()) };
-        assert_eq!(add(root, &new, &asserted, 0, 5).unwrap(), Added::Added);
+        assert_eq!(add(root, &new, &asserted, 0, 5, None).unwrap(), Added::Added);
 
         let now = for_account(root, &alice.issuer, &alice.subject).unwrap();
         let credentials: Vec<&str> = now.iter().map(|p| p.credential.as_str()).collect();
@@ -983,7 +1350,7 @@ mod tests {
         insert_first(root, &row(&bob, "BBBBBBBBBBBBx1", &key, Alg::Es256)).unwrap();
         let refused = |new: &NewRow, asserted: &str, read: u32, expected: Added| {
             let before = snapshot(root, &[&alice, &bob]);
-            assert_eq!(add(root, new, asserted, read, read + 1).unwrap(), expected, "{}", new.credential);
+            assert_eq!(add(root, new, asserted, read, read + 1, None).unwrap(), expected, "{}", new.credential);
             assert_eq!(snapshot(root, &[&alice, &bob]), before, "{expected:?} changed something");
         };
 
@@ -1003,7 +1370,7 @@ mod tests {
         }
         assert_eq!(for_account(root, &alice.issuer, &alice.subject).unwrap().len(), MAX_PER_ACCOUNT - 1);
         assert_eq!(
-            add(root, &row(&alice, "FFFFFFFFFFFFx1", &key, Alg::Es256), asserted, 4, 5).unwrap(),
+            add(root, &row(&alice, "FFFFFFFFFFFFx1", &key, Alg::Es256), asserted, 4, 5, None).unwrap(),
             Added::Added,
             "the 99th"
         );
@@ -1452,9 +1819,10 @@ mod tests {
         let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
         grant(root, &bob, ALLOWANCE_DEFAULT).unwrap();
 
-        // Read as a bd of version 4 reads it: nothing here brings it back to 5.
+        // Read as a bd of version 4 reads it: nothing here migrates it again.
         let path = server_db::path(root);
         let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(server_db::ROLLBACK_V6).unwrap();
         conn.execute_batch(server_db::ROLLBACK_V5).unwrap();
         assert_eq!(conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(), 4);
         let mut stmt = conn.prepare(BY_ACCOUNT).unwrap();
@@ -1503,7 +1871,7 @@ mod tests {
         pruned("insert_first");
         ran_out();
         let added = row(&bob, "BBBBBBBBBBBBx2", &other, Alg::Es256);
-        assert_eq!(add(root, &added, "BBBBBBBBBBBBx1", 0, 1).unwrap(), Added::Added);
+        assert_eq!(add(root, &added, "BBBBBBBBBBBBx1", 0, 1, None).unwrap(), Added::Added);
         pruned("add");
         ran_out();
         remove(root, &bob, Some("BBBBBBBBBBBBx2")).unwrap();
@@ -1516,5 +1884,920 @@ mod tests {
         assert_eq!(insert_allowed(root, &refused, "0123456789abcdef").unwrap(), AllowedAdd::Ended);
         assert_eq!(allowance_rows(root).len(), 1, "nor does a refusal");
         assert_eq!(kept(root, "passkey_add_cancelled").len(), 1, "only the cancel above: pruning records nothing");
+    }
+
+    /// Whether the link `every_write_prunes_the_links_that_ran_out` put in is there.
+    fn ran_out_link(root: &Path) -> bool {
+        let conn = server_db::open(root).unwrap();
+        conn.query_row("SELECT count(*) FROM passkey_links WHERE id = 'ran-out'", [], |r| r.get::<_, i64>(0)).unwrap()
+            == 1
+    }
+
+    #[test]
+    fn every_write_prunes_the_links_that_ran_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = account(root, &user("bob", "s2"));
+        let ran_out = || {
+            let conn = server_db::open(root).unwrap();
+            conn.execute(
+                "INSERT INTO passkey_links \
+                 (issuer, subject, id, secret_hash, vouched_by, workspace, created_at, expires_at) \
+                 VALUES ('https://carol', 's3', 'ran-out', 'h', 'c', 'w', 0, 1)",
+                [],
+            )
+            .unwrap();
+            assert!(ran_out_link(root));
+        };
+        let pruned = |after: &str| assert!(!ran_out_link(root), "{after}");
+        let (spki, other) = (SoftKey::es256().spki(), SoftKey::es256().spki());
+
+        ran_out();
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        pruned("grant");
+        ran_out();
+        assert!(cancel(root, &alice).unwrap());
+        pruned("cancel");
+        let granted_again = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        assert_ne!(granted.id, granted_again.id);
+        ran_out();
+        let spend = row(&alice, "CCCCCCCCCCCCx1", &spki, Alg::Es256);
+        assert_eq!(insert_allowed(root, &spend, &granted_again.id).unwrap(), AllowedAdd::Added);
+        pruned("spend");
+        ran_out();
+        assert_eq!(insert_first(root, &row(&bob, "BBBBBBBBBBBBx1", &other, Alg::Es256)).unwrap(), Inserted::Inserted);
+        pruned("insert_first");
+        ran_out();
+        let added = row(&bob, "BBBBBBBBBBBBx2", &other, Alg::Es256);
+        assert_eq!(add(root, &added, "BBBBBBBBBBBBx1", 0, 1, None).unwrap(), Added::Added);
+        pruned("add");
+        ran_out();
+        remove(root, &bob, Some("BBBBBBBBBBBBx2")).unwrap();
+        pruned("remove");
+        assert!(kept(root, "passkey_link_ended").is_empty(), "pruning records nothing");
+    }
+
+    /// Every row of `table` of the root, as kept, in the order of its rowids.
+    fn rows_of(root: &Path, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+        let conn = server_db::open(root).unwrap();
+        let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY rowid")).unwrap();
+        let columns = stmt.column_count();
+        stmt.query_map([], |r| (0..columns).map(|n| r.get(n)).collect()).unwrap().map(Result::unwrap).collect()
+    }
+
+    /// The three tables a link's writes touch, whole: what a refusal must
+    /// leave as it was.
+    fn tables(root: &Path) -> [Vec<Vec<rusqlite::types::Value>>; 3] {
+        ["passkeys", "passkey_links", "auth_events"].map(|table| rows_of(root, table))
+    }
+
+    /// The events of the root, their kinds and details, oldest first.
+    fn trail(root: &Path) -> Vec<(String, String)> {
+        server_db::events(root, 0, None, &[], 10_000)
+            .unwrap()
+            .into_iter()
+            .map(|e| (e.event.kind.to_string(), e.event.detail.unwrap_or_default()))
+            .collect()
+    }
+
+    const LINK_ID: &str = "aaaaaaaaaaaa11112222333344445555";
+    const OTHER_LINK_ID: &str = "bbbbbbbbbbbb11112222333344445555";
+
+    /// A link of `account` vouched for by `vouched_by`, as an approval makes it.
+    fn new_link(account: &Account, id: &str, vouched_by: &str) -> NewLink {
+        let now = Timestamp::now();
+        NewLink {
+            id: id.into(),
+            secret_hash: auth::hash(&format!("the secret of {id}")),
+            issuer: account.issuer.clone(),
+            subject: account.subject.clone(),
+            provider: account.provider.clone(),
+            actor: account.actor.clone(),
+            vouched_by: vouched_by.into(),
+            workspace: "ws".into(),
+            created_at: now.millis(),
+            expires_at: now.plus(LINK_TTL).millis(),
+        }
+    }
+
+    /// Run `account`'s link out, as time would.
+    fn expire_link(root: &Path, account: &Account) {
+        let conn = server_db::open(root).unwrap();
+        let args = rusqlite::params![account.issuer, account.subject];
+        let sql = "UPDATE passkey_links SET expires_at = 1 WHERE issuer = ?1 AND subject = ?2";
+        assert_eq!(conn.execute(sql, args).unwrap(), 1);
+    }
+
+    fn live_of(root: &Path, account: &Account) -> Option<Link> {
+        live_link(root, &account.issuer, &account.subject).unwrap()
+    }
+
+    #[test]
+    fn a_link_lasts_fifteen_minutes_and_ends_at_its_expiry() {
+        assert_eq!(LINK_TTL, Duration::from_secs(15 * 60));
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let new = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        assert_eq!(vouch_link(root, &new, "AAAAAAAAAAAAx1", 0, 1).unwrap(), Vouched::Made { replaced: false });
+        let link = live_of(root, &alice).unwrap();
+        assert_eq!(link.expires_at - link.created_at, 15 * 60 * 1000);
+
+        let conn = server_db::open(root).unwrap();
+        let expires_at = link.expires_at;
+        let reads = |now: i64| -> [bool; 3] {
+            [
+                conn.prepare(LINK_BY_ACCOUNT)
+                    .unwrap()
+                    .exists(rusqlite::params![alice.issuer, alice.subject, now])
+                    .unwrap(),
+                conn.prepare(LINK_BY_ID).unwrap().exists(rusqlite::params![link.id, now]).unwrap(),
+                conn.prepare(LINK_BY_SECRET).unwrap().exists(rusqlite::params![new.secret_hash, now]).unwrap(),
+            ]
+        };
+        assert_eq!(reads(expires_at - 1), [true; 3], "live strictly before its expiry");
+        assert_eq!(reads(expires_at), [false; 3], "not at it");
+        assert_eq!(reads(expires_at + 1), [false; 3], "nor past it");
+        drop(conn);
+
+        expire_link(root, &alice);
+        assert_eq!(live_of(root, &alice), None);
+        assert_eq!(link_by_id(root, LINK_ID).unwrap(), None);
+        assert_eq!(link_by_secret(root, &new.secret_hash).unwrap(), None);
+        assert_eq!(rows_of(root, "passkey_links").len(), 1, "though nothing removed it yet");
+        assert!(kept(root, "passkey_link_ended").is_empty(), "and running out records nothing");
+    }
+
+    #[test]
+    fn a_link_is_read_by_account_id_and_hash_of_its_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(live_link(root, "i", "s").unwrap(), None);
+        assert_eq!(link_by_id(root, LINK_ID).unwrap(), None);
+        assert_eq!(link_by_secret(root, "h").unwrap(), None);
+        assert!(!server_db::path(root).exists(), "reads create nothing");
+
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        let new = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        assert!(!test_put_link(root, &new).unwrap());
+        let expected = Link {
+            id: new.id.clone(),
+            issuer: alice.issuer.clone(),
+            subject: alice.subject.clone(),
+            vouched_by: "AAAAAAAAAAAAx1".into(),
+            workspace: "ws".into(),
+            created_at: new.created_at,
+            expires_at: new.expires_at,
+        };
+        assert_eq!(live_of(root, &alice).as_ref(), Some(&expected));
+        assert_eq!(link_by_id(root, LINK_ID).unwrap().as_ref(), Some(&expected));
+        assert_eq!(link_by_secret(root, &new.secret_hash).unwrap().as_ref(), Some(&expected));
+        assert_eq!(live_of(root, &bob), None, "another account's is not read");
+        assert_eq!(link_by_id(root, OTHER_LINK_ID).unwrap(), None);
+        assert_eq!(link_by_secret(root, &auth::hash("another secret")).unwrap(), None);
+    }
+
+    #[test]
+    fn a_links_debug_prints_no_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let new = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        let printed = format!("{new:?}");
+        assert!(!printed.contains(&new.secret_hash) && !printed.contains("secret_hash"), "{printed}");
+        assert!(printed.contains(LINK_ID) && printed.contains("workspace"), "{printed}");
+        test_put_link(root, &new).unwrap();
+        let printed = format!("{:?}", live_of(root, &alice).unwrap());
+        assert!(!printed.contains(&new.secret_hash), "{printed}");
+    }
+
+    #[test]
+    fn a_verified_passkey_makes_a_link_with_its_counter_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let new = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+
+        assert_eq!(vouch_link(root, &new, "AAAAAAAAAAAAx1", 0, 7).unwrap(), Vouched::Made { replaced: false });
+
+        let passkey = by_credential(root, "AAAAAAAAAAAAx1").unwrap().unwrap();
+        assert_eq!(passkey.counter, 7);
+        assert!(passkey.last_used_at.is_some());
+        assert_eq!(live_of(root, &alice).unwrap().id, LINK_ID);
+        let events = kept(root, "passkey_link_made");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "passkey_link_made", "a kind the trail reads back as itself");
+        assert_eq!(events[0].actor.as_deref(), Some(alice.actor.as_str()));
+        assert_eq!(
+            (events[0].provider.as_deref(), events[0].issuer.as_deref(), events[0].subject.as_deref()),
+            (Some("corp"), Some("https://idp.example"), Some("s1"))
+        );
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some(format!("link aaaaaaaaaaaa vouched by AAAAAAAAAAAA, until {}", until(new.expires_at)).as_str())
+        );
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_written_leaves_the_counter_unmoved() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let new = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        let conn = server_db::open(root).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_links BEFORE INSERT ON passkey_links BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .unwrap();
+        drop(conn);
+        let before = tables(root);
+
+        vouch_link(root, &new, "AAAAAAAAAAAAx1", 0, 1).unwrap_err();
+
+        assert_eq!(tables(root), before, "the counter's move went with it");
+        let passkey = by_credential(root, "AAAAAAAAAAAAx1").unwrap().unwrap();
+        assert_eq!((passkey.counter, passkey.last_used_at), (0, None));
+    }
+
+    #[test]
+    fn a_link_that_cannot_be_written_adds_no_passkey() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let link = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        let conn = server_db::open(root).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER refuse_links BEFORE INSERT ON passkey_links BEGIN SELECT RAISE(ABORT, 'refused'); END",
+        )
+        .unwrap();
+        drop(conn);
+        let before = tables(root);
+
+        add(root, &row(&alice, "AAAAAAAAAAAAy2", b"spki", Alg::Es256), "AAAAAAAAAAAAx1", 0, 1, Some(&link))
+            .unwrap_err();
+
+        assert_eq!(tables(root), before, "the counter's move and the new passkey went with it");
+        assert_eq!(by_credential(root, "AAAAAAAAAAAAy2").unwrap(), None);
+        let passkey = by_credential(root, "AAAAAAAAAAAAx1").unwrap().unwrap();
+        assert_eq!((passkey.counter, passkey.last_used_at), (0, None));
+    }
+
+    #[test]
+    fn a_passkey_added_with_a_link_is_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let first = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        let new = row(&alice, "AAAAAAAAAAAAy2", b"spki", Alg::Es256);
+
+        let added = add(root, &new, "AAAAAAAAAAAAx1", 0, 3, Some(&first)).unwrap();
+
+        assert_eq!(added, Added::Linked { replaced: false, full: false });
+        let passkey = by_credential(root, "AAAAAAAAAAAAx1").unwrap().unwrap();
+        assert_eq!(passkey.counter, 3);
+        assert!(by_credential(root, "AAAAAAAAAAAAy2").unwrap().is_some());
+        assert_eq!(live_of(root, &alice).unwrap().id, LINK_ID);
+        assert_eq!(kept(root, "passkey_link_made").len(), 1);
+        assert!(kept(root, "passkey_link_ended").is_empty());
+        let kinds: Vec<String> = trail(root).into_iter().map(|(kind, _)| kind).collect();
+        assert_eq!(kinds.iter().filter(|k| *k == "passkey_registered").count(), 1, "{kinds:?}");
+
+        // Over a live link, the next takes its place.
+        let second = new_link(&alice, OTHER_LINK_ID, "AAAAAAAAAAAAx1");
+        let new = row(&alice, "AAAAAAAAAAAAz3", b"spki", Alg::Es256);
+        let added = add(root, &new, "AAAAAAAAAAAAx1", 3, 4, Some(&second)).unwrap();
+        assert_eq!(added, Added::Linked { replaced: true, full: false });
+        assert_eq!(live_of(root, &alice).unwrap().id, OTHER_LINK_ID);
+        assert_eq!(kept(root, "passkey_link_ended").len(), 1);
+
+        // Asked for none, it says so and touches none.
+        let links = rows_of(root, "passkey_links");
+        let new = row(&alice, "AAAAAAAAAAAAw4", b"spki", Alg::Es256);
+        assert_eq!(add(root, &new, "AAAAAAAAAAAAx1", 4, 5, None).unwrap(), Added::Added);
+        assert_eq!(rows_of(root, "passkey_links"), links);
+    }
+
+    #[test]
+    fn a_refused_add_makes_no_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        put(root, &alice, "AAAAAAAAAAAAy2", Alg::Es256, b"spki");
+        let link = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        let before = tables(root);
+
+        let new = row(&alice, "AAAAAAAAAAAAz3", b"spki", Alg::Es256);
+        assert_eq!(add(root, &new, "AAAAAAAAAAAAx1", 9, 10, Some(&link)).unwrap(), Added::Raced);
+        let taken = row(&alice, "AAAAAAAAAAAAy2", b"spki", Alg::Es256);
+        assert_eq!(add(root, &taken, "AAAAAAAAAAAAx1", 0, 1, Some(&link)).unwrap(), Added::CredentialTaken);
+        assert_eq!(tables(root), before);
+
+        for i in 2..MAX_PER_ACCOUNT {
+            put(root, &alice, &format!("AAAAAAAAAAAA{i:04}"), Alg::Es256, b"spki");
+        }
+        let before = tables(root);
+        assert_eq!(add(root, &new, "AAAAAAAAAAAAx1", 0, 1, Some(&link)).unwrap(), Added::LimitReached);
+        assert_eq!(tables(root), before);
+    }
+
+    #[test]
+    fn a_passkey_filling_the_account_says_its_link_has_no_room() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        for i in 1..MAX_PER_ACCOUNT - 2 {
+            put(root, &alice, &format!("AAAAAAAAAAAA{i:04}"), Alg::Es256, b"spki");
+        }
+        assert_eq!(for_account(root, &alice.issuer, &alice.subject).unwrap().len(), MAX_PER_ACCOUNT - 2);
+
+        let (first, second) =
+            (new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1"), new_link(&alice, OTHER_LINK_ID, "AAAAAAAAAAAAx1"));
+        let new = row(&alice, "AAAAAAAAAAAAy2", b"spki", Alg::Es256);
+        let added = add(root, &new, "AAAAAAAAAAAAx1", 0, 1, Some(&first)).unwrap();
+        assert_eq!(added, Added::Linked { replaced: false, full: false }, "room for one more");
+        let new = row(&alice, "AAAAAAAAAAAAz3", b"spki", Alg::Es256);
+        let added = add(root, &new, "AAAAAAAAAAAAx1", 1, 2, Some(&second)).unwrap();
+        assert_eq!(added, Added::Linked { replaced: true, full: true }, "none left");
+        assert_eq!(for_account(root, &alice.issuer, &alice.subject).unwrap().len(), MAX_PER_ACCOUNT);
+    }
+
+    #[test]
+    fn a_counter_that_moved_makes_no_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        let new = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        assert!(use_counter(root, "AAAAAAAAAAAAx1", 0, 4).unwrap());
+        let before = tables(root);
+
+        assert_eq!(vouch_link(root, &new, "AAAAAAAAAAAAx1", 0, 5).unwrap(), Vouched::Raced, "read before the move");
+        assert_eq!(vouch_link(root, &new, "BBBBBBBBBBBBx1", 0, 5).unwrap(), Vouched::Raced, "bob's is not alice's");
+        assert_eq!(vouch_link(root, &new, "CCCCCCCCCCCCx1", 0, 5).unwrap(), Vouched::Raced, "no such passkey");
+
+        assert_eq!(tables(root), before);
+        assert_eq!(live_of(root, &alice), None);
+        assert_eq!(live_of(root, &bob), None);
+    }
+
+    #[test]
+    fn another_link_replaces_the_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        put(root, &alice, "AAAAAAAAAAAAy2", Alg::Es256, b"spki");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        let bobs = new_link(&bob, "cccccccccccc11112222333344445555", "BBBBBBBBBBBBx1");
+        assert_eq!(vouch_link(root, &bobs, "BBBBBBBBBBBBx1", 0, 1).unwrap(), Vouched::Made { replaced: false });
+        let first = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        let made = vouch_link(root, &first, "AAAAAAAAAAAAx1", 0, 1).unwrap();
+        assert_eq!(made, Vouched::Made { replaced: false }, "bob's is another account's");
+
+        let second = new_link(&alice, OTHER_LINK_ID, "AAAAAAAAAAAAy2");
+        assert_eq!(vouch_link(root, &second, "AAAAAAAAAAAAy2", 0, 1).unwrap(), Vouched::Made { replaced: true });
+
+        let live = live_of(root, &alice).unwrap();
+        assert_eq!((live.id.as_str(), live.vouched_by.as_str()), (OTHER_LINK_ID, "AAAAAAAAAAAAy2"));
+        assert_eq!(rows_of(root, "passkey_links").len(), 2, "one each");
+        assert_eq!(live_of(root, &bob).unwrap().id, bobs.id, "another account's stays");
+        assert_eq!(link_by_id(root, LINK_ID).unwrap(), None);
+        assert_eq!(link_by_secret(root, &first.secret_hash).unwrap(), None);
+        assert_eq!(link_by_secret(root, &second.secret_hash).unwrap().unwrap().id, OTHER_LINK_ID);
+        assert_eq!(details(root, "passkey_link_ended"), ["link aaaaaaaaaaaa vouched by AAAAAAAAAAAA: replaced"]);
+        assert_eq!(
+            details(root, "passkey_link_made")[2],
+            format!("link bbbbbbbbbbbb vouched by AAAAAAAAAAAA, until {}", until(second.expires_at))
+        );
+
+        expire_link(root, &alice);
+        let third = new_link(&alice, "dddddddddddd11112222333344445555", "AAAAAAAAAAAAx1");
+        let made = vouch_link(root, &third, "AAAAAAAAAAAAx1", 1, 2).unwrap();
+        assert_eq!(made, Vouched::Made { replaced: false }, "one past its expiry is overwritten, not replaced");
+        assert_eq!(details(root, "passkey_link_ended").len(), 1);
+        assert_eq!(live_of(root, &alice).unwrap().id, third.id);
+        assert_eq!(rows_of(root, "passkey_links").len(), 2);
+    }
+
+    #[test]
+    fn a_registration_through_a_link_spends_it_and_names_all_three() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let key = SoftKey::rs256();
+        let (credential, spki) = (URL_SAFE_NO_PAD.encode(&key.credential), key.spki());
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+
+        let new = NewRow { counter: 3, ..row(&alice, &credential, &spki, key.alg()) };
+        let linked = insert_linked(root, LINK_ID, &new).unwrap();
+        assert_eq!(linked, Linked::Inserted { vouched_by: "AAAAAAAAAAAAx1".to_string() });
+
+        assert!(rows_of(root, "passkey_links").is_empty(), "spent");
+        let now = for_account(root, &alice.issuer, &alice.subject).unwrap();
+        let credentials: Vec<&str> = now.iter().map(|p| p.credential.as_str()).collect();
+        assert_eq!(credentials, ["AAAAAAAAAAAAx1", credential.as_str()]);
+        assert_eq!((now[0].counter, now[0].last_used_at), (0, None), "the vouching one asserted nothing here");
+        assert_eq!((now[1].counter, now[1].last_used_at, now[1].alg_name()), (3, None, "RS256"));
+        assert_eq!(now[1].public_key, spki);
+
+        let events = kept(root, "passkey_registered");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor.as_deref(), Some(alice.actor.as_str()));
+        assert_eq!(
+            (events[0].provider.as_deref(), events[0].issuer.as_deref(), events[0].subject.as_deref()),
+            (Some("corp"), Some("https://idp.example"), Some("s1"))
+        );
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some(
+                format!(
+                    "credential {} (RS256), through link aaaaaaaaaaaa vouched by AAAAAAAAAAAA",
+                    prefix(&credential)
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(prefix(&credential).len(), PREFIX);
+        assert!(kept(root, "passkey_link_ended").is_empty(), "spent is no ending: the registration says it");
+
+        let before = tables(root);
+        let again = row(&alice, "CCCCCCCCCCCCx1", &spki, key.alg());
+        assert_eq!(insert_linked(root, LINK_ID, &again).unwrap(), Linked::LinkGone, "it works once");
+        assert_eq!(tables(root), before);
+    }
+
+    #[test]
+    fn a_registration_through_a_link_refused_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        let key = SoftKey::es256().spki();
+        let new = row(&alice, "CCCCCCCCCCCCx1", &key, Alg::Es256);
+        let refused = |new: &NewRow, id: &str, expected: Linked| {
+            let before = tables(root);
+            assert_eq!(insert_linked(root, id, new).unwrap(), expected, "{}", new.credential);
+            assert_eq!(tables(root), before, "{expected:?} changed something");
+        };
+
+        refused(&new, LINK_ID, Linked::LinkGone);
+
+        let bobs = new_link(&bob, OTHER_LINK_ID, "BBBBBBBBBBBBx1");
+        test_put_link(root, &bobs).unwrap();
+        refused(&new, OTHER_LINK_ID, Linked::LinkGone);
+
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        refused(&new, "", Linked::LinkGone);
+        refused(&new, OTHER_LINK_ID, Linked::LinkGone);
+        refused(&row(&alice, "AAAAAAAAAAAAx1", &key, Alg::Es256), LINK_ID, Linked::CredentialTaken);
+        refused(&row(&alice, "BBBBBBBBBBBBx1", &key, Alg::Es256), LINK_ID, Linked::CredentialTaken);
+        refused(&row(&bob, "CCCCCCCCCCCCx1", &key, Alg::Es256), LINK_ID, Linked::LinkGone);
+
+        let replacing = new_link(&alice, "dddddddddddd11112222333344445555", "AAAAAAAAAAAAx1");
+        assert!(test_put_link(root, &replacing).unwrap());
+        refused(&new, LINK_ID, Linked::LinkGone);
+
+        assert!(cancel_link(root, &alice).unwrap());
+        refused(&new, &replacing.id, Linked::LinkGone);
+
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        expire_link(root, &alice);
+        refused(&new, LINK_ID, Linked::LinkGone);
+
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        for n in 1..MAX_PER_ACCOUNT {
+            put(root, &alice, &format!("EEEEEEEEEEEE{n:02}"), Alg::Es256, &key);
+        }
+        refused(&new, LINK_ID, Linked::LimitReached);
+        refused(&row(&alice, "AAAAAAAAAAAAx1", &key, Alg::Es256), LINK_ID, Linked::LimitReached);
+
+        let gone = Account { subject: "s9".into(), ..alice.clone() };
+        test_put_link(root, &new_link(&gone, "eeeeeeeeeeee11112222333344445555", "AAAAAAAAAAAAx1")).unwrap();
+        refused(&row(&gone, "CCCCCCCCCCCCx1", &key, Alg::Es256), "eeeeeeeeeeee11112222333344445555", Linked::LinkGone);
+
+        let carol = enrolled(root, &user("carol", "s3"), "DDDDDDDDDDDDx1");
+        put(root, &carol, "DDDDDDDDDDDDy2", Alg::Es256, &key);
+        let carols = new_link(&carol, "ffffffffffff11112222333344445555", "DDDDDDDDDDDDx1");
+        test_put_link(root, &carols).unwrap();
+        // Not through `remove`, which ends the link: the check holds if that one failed to.
+        server_db::open(root).unwrap().execute(DELETE, ["DDDDDDDDDDDDx1"]).unwrap();
+        refused(&row(&carol, "CCCCCCCCCCCCx1", &key, Alg::Es256), &carols.id, Linked::VouchGone);
+    }
+
+    #[test]
+    fn a_refused_registration_through_a_link_leaves_it_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        let key = SoftKey::es256().spki();
+        let taken = row(&alice, "AAAAAAAAAAAAx1", &key, Alg::Es256);
+        assert_eq!(insert_linked(root, LINK_ID, &taken).unwrap(), Linked::CredentialTaken);
+        let new = row(&alice, "CCCCCCCCCCCCx1", &key, Alg::Es256);
+        assert!(matches!(insert_linked(root, LINK_ID, &new).unwrap(), Linked::Inserted { .. }));
+    }
+
+    #[test]
+    fn concurrent_registrations_through_one_link_register_one() {
+        const THREADS: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        let barrier = std::sync::Barrier::new(THREADS);
+        let outcomes: Vec<Linked> = std::thread::scope(|s| {
+            let racers: Vec<_> = (0..THREADS)
+                .map(|n| {
+                    let (alice, barrier) = (&alice, &barrier);
+                    s.spawn(move || {
+                        let credential = format!("CCCCCCCCCCCC{n:02}");
+                        barrier.wait();
+                        insert_linked(root, LINK_ID, &row(alice, &credential, b"spki", Alg::Es256)).unwrap()
+                    })
+                })
+                .collect();
+            racers.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let registered = outcomes.iter().filter(|o| matches!(o, Linked::Inserted { .. })).count();
+        assert_eq!(registered, 1, "{outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|o| **o == Linked::LinkGone).count(), THREADS - 1, "{outcomes:?}");
+        assert_eq!(for_account(root, &alice.issuer, &alice.subject).unwrap().len(), 2);
+        assert!(rows_of(root, "passkey_links").is_empty());
+        assert_eq!(kept(root, "passkey_registered").len(), 1);
+    }
+
+    #[test]
+    fn cancelling_ends_a_live_link_and_writes_nothing_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        let bobs = new_link(&bob, OTHER_LINK_ID, "BBBBBBBBBBBBx1");
+        test_put_link(root, &bobs).unwrap();
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+
+        assert!(cancel_link(root, &alice).unwrap());
+
+        assert_eq!(live_of(root, &alice), None);
+        assert_eq!(live_of(root, &bob).unwrap().id, bobs.id, "another account's stays");
+        let events = kept(root, "passkey_link_ended");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "passkey_link_ended", "a kind the trail reads back as itself");
+        assert_eq!(events[0].actor.as_deref(), Some(alice.actor.as_str()));
+        assert_eq!(
+            (events[0].provider.as_deref(), events[0].issuer.as_deref(), events[0].subject.as_deref()),
+            (Some("corp"), Some("https://idp.example"), Some("s1"))
+        );
+        assert_eq!(events[0].detail.as_deref(), Some("link aaaaaaaaaaaa vouched by AAAAAAAAAAAA: cancelled"));
+
+        let before = tables(root);
+        assert!(!cancel_link(root, &alice).unwrap(), "none to cancel");
+        assert_eq!(tables(root), before);
+
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        expire_link(root, &alice);
+        let before = tables(root);
+        assert!(!cancel_link(root, &alice).unwrap(), "one past its expiry is none");
+        assert_eq!(tables(root), before, "and is not even pruned: nothing is written");
+
+        let mistaken = tempfile::tempdir().unwrap();
+        assert!(!cancel_link(mistaken.path(), &alice).unwrap());
+        assert!(!server_db::path(mistaken.path()).exists());
+    }
+
+    #[test]
+    fn removing_the_vouching_or_the_last_passkey_ends_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        put(root, &alice, "AAAAAAAAAAABy2", Alg::Es256, b"spki");
+        put(root, &alice, "AAAAAAAAAAACz3", Alg::Es256, b"spki");
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+
+        remove(root, &alice, Some("AAAAAAAAAAAB")).unwrap();
+        assert_eq!(live_of(root, &alice).unwrap().id, LINK_ID, "removing another passkey leaves it");
+        assert!(details(root, "passkey_link_ended").is_empty());
+
+        remove(root, &alice, Some("AAAAAAAAAAAA")).unwrap();
+        assert_eq!(live_of(root, &alice), None);
+        assert_eq!(
+            details(root, "passkey_link_ended"),
+            ["link aaaaaaaaaaaa vouched by AAAAAAAAAAAA: vouching passkey removed"]
+        );
+        let page = row(&alice, "DDDDDDDDDDDDx1", b"spki", Alg::Es256);
+        assert_eq!(insert_linked(root, LINK_ID, &page).unwrap(), Linked::LinkGone, "a page opened before");
+
+        // The last one, the very one that vouched: the broader cause is the one said.
+        test_put_link(root, &new_link(&alice, OTHER_LINK_ID, "AAAAAAAAAAACz3")).unwrap();
+        remove(root, &alice, Some("AAAAAAAAAAAC")).unwrap();
+        assert_eq!(live_of(root, &alice), None);
+        assert_eq!(
+            details(root, "passkey_link_ended")[1],
+            "link bbbbbbbbbbbb vouched by AAAAAAAAAAAC: last passkey removed"
+        );
+
+        // All of them at once, the last passkey too.
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        put(root, &bob, "BBBBBBBBBBBBy2", Alg::Es256, b"spki");
+        test_put_link(root, &new_link(&bob, "cccccccccccc11112222333344445555", "BBBBBBBBBBBBy2")).unwrap();
+        assert_eq!(remove(root, &bob, None).unwrap().len(), 2);
+        assert_eq!(live_of(root, &bob), None);
+        assert_eq!(
+            details(root, "passkey_link_ended")[2],
+            "link cccccccccccc vouched by BBBBBBBBBBBB: last passkey removed"
+        );
+
+        // One past its expiry is no live link: nothing to end, whatever goes.
+        let carol = enrolled(root, &user("carol", "s3"), "CCCCCCCCCCCCx1");
+        test_put_link(root, &new_link(&carol, "dddddddddddd11112222333344445555", "CCCCCCCCCCCCx1")).unwrap();
+        expire_link(root, &carol);
+        remove(root, &carol, None).unwrap();
+        assert_eq!(details(root, "passkey_link_ended").len(), 3, "one past its expiry ended by itself");
+        assert!(rows_of(root, "passkey_links").is_empty(), "and is pruned with the write");
+
+        for event in kept(root, "passkey_link_ended") {
+            assert!(event.actor.is_some() && event.provider.is_some() && event.issuer.is_some(), "{event:?}");
+        }
+        assert_eq!(kept(root, "passkey_link_ended")[0].actor.as_deref(), Some(alice.actor.as_str()));
+    }
+
+    #[test]
+    fn forgetting_an_account_erases_its_link_and_the_events_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = enrolled(root, &user("bob", "s2"), "BBBBBBBBBBBBx1");
+        let alices = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        assert_eq!(vouch_link(root, &alices, "AAAAAAAAAAAAx1", 0, 1).unwrap(), Vouched::Made { replaced: false });
+        let bobs = new_link(&bob, OTHER_LINK_ID, "BBBBBBBBBBBBx1");
+        assert_eq!(vouch_link(root, &bobs, "BBBBBBBBBBBBx1", 0, 1).unwrap(), Vouched::Made { replaced: false });
+
+        assert!(auth::forget_account(root, &alice.issuer, &alice.subject).unwrap());
+
+        assert_eq!(live_of(root, &alice), None);
+        assert_eq!(link_by_secret(root, &alices.secret_hash).unwrap(), None);
+        assert_eq!(rows_of(root, "passkey_links").len(), 1, "alice's row went, bob's stayed");
+        assert_eq!(live_of(root, &bob).unwrap().id, bobs.id);
+        let made = kept(root, "passkey_link_made");
+        assert_eq!(made.len(), 1, "alice's events went with her: {made:?}");
+        assert_eq!(made[0].subject.as_deref(), Some("s2"));
+        assert!(kept(root, "passkey_link_ended").is_empty(), "an erasure is no ending");
+    }
+
+    #[test]
+    fn an_allowance_and_a_link_leave_each_other_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let key = SoftKey::es256().spki();
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        assert_eq!(live(root, &alice).unwrap().id, granted.id, "a link leaves an allowance");
+
+        assert!(cancel(root, &alice).unwrap());
+        assert_eq!(live_of(root, &alice).unwrap().id, LINK_ID, "cancelling an allowance leaves a link");
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+        assert_eq!(live_of(root, &alice).unwrap().id, LINK_ID, "and so does a grant");
+        assert!(cancel_link(root, &alice).unwrap());
+        assert_eq!(live(root, &alice).unwrap().id, granted.id, "cancelling a link leaves an allowance");
+
+        test_put_link(root, &new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        let through = row(&alice, "CCCCCCCCCCCCx1", &key, Alg::Es256);
+        assert!(matches!(insert_linked(root, LINK_ID, &through).unwrap(), Linked::Inserted { .. }));
+        assert_eq!(live(root, &alice).unwrap().id, granted.id, "spending a link leaves an allowance");
+
+        test_put_link(root, &new_link(&alice, OTHER_LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        let under = row(&alice, "DDDDDDDDDDDDx1", &key, Alg::Es256);
+        assert_eq!(insert_allowed(root, &under, &granted.id).unwrap(), AllowedAdd::Added);
+        assert_eq!(live_of(root, &alice).unwrap().id, OTHER_LINK_ID, "spending an allowance leaves a link");
+    }
+
+    #[test]
+    fn link_writes_prune_what_ran_out_and_refusals_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let bob = account(root, &user("bob", "s2"));
+        let ran_out = || {
+            let conn = server_db::open(root).unwrap();
+            conn.execute(
+                "INSERT INTO passkey_links \
+                 (issuer, subject, id, secret_hash, vouched_by, workspace, created_at, expires_at) \
+                 VALUES ('https://carol', 's3', 'ran-out', 'h', 'c', 'w', 0, 1)",
+                [],
+            )
+            .unwrap();
+            put_allowance(root, &bob, "ran-out", 1);
+            assert!(ran_out_link(root));
+        };
+        let pruned = |after: &str| {
+            assert!(!ran_out_link(root), "{after}");
+            assert_eq!(allowance_rows(root).iter().filter(|r| r.2 == "ran-out").count(), 0, "{after}");
+        };
+
+        ran_out();
+        let new = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        assert_eq!(vouch_link(root, &new, "AAAAAAAAAAAAx1", 0, 1).unwrap(), Vouched::Made { replaced: false });
+        pruned("vouch_link");
+        ran_out();
+        let spent = row(&alice, "CCCCCCCCCCCCx1", b"spki", Alg::Es256);
+        assert!(matches!(insert_linked(root, LINK_ID, &spent).unwrap(), Linked::Inserted { .. }));
+        pruned("insert_linked");
+        ran_out();
+        test_put_link(root, &new_link(&alice, OTHER_LINK_ID, "AAAAAAAAAAAAx1")).unwrap();
+        assert!(cancel_link(root, &alice).unwrap());
+        pruned("cancel_link");
+
+        ran_out();
+        assert!(!cancel_link(root, &alice).unwrap());
+        assert!(ran_out_link(root), "a cancel that finds none writes nothing");
+        let refused = row(&alice, "DDDDDDDDDDDDx1", b"spki", Alg::Es256);
+        assert_eq!(insert_linked(root, OTHER_LINK_ID, &refused).unwrap(), Linked::LinkGone);
+        assert!(ran_out_link(root), "nor does a refusal");
+        assert_eq!(vouch_link(root, &new, "AAAAAAAAAAAAx1", 0, 2).unwrap(), Vouched::Raced);
+        assert!(ran_out_link(root), "nor does a race");
+    }
+
+    /// What `bd <args> --root <root>` printed, run through [`cmd_passkey`] as
+    /// a command line would run it.
+    fn passkey_command(root: &Path, args: &[&str]) -> String {
+        let line = [&["bd"], args, &["--root", root.to_str().unwrap()]].concat();
+        let cli = <bd_cli::cli::Cli as clap::Parser>::try_parse_from(line).unwrap();
+        let bd_cli::cli::Command::Serve(serve) = &cli.command else { panic!("{args:?} is not bd serve") };
+        let Some(bd_cli::cli::ServeAction::Passkey(command)) = &serve.action else { panic!("{args:?} is no passkey") };
+        let mut app = App::new(cli.global.clone()).unwrap();
+        let (out, capture) = io::Capture::buffered(1 << 20);
+        let (done, _) = io::capture(capture, || cmd_passkey(&mut app, command));
+        done.unwrap();
+        let printed = out.borrow().output().unwrap().to_vec();
+        String::from_utf8(printed).unwrap()
+    }
+
+    /// `bd serve passkey list` of corp:alice, as text and as JSON.
+    fn listed(root: &Path) -> (String, String) {
+        let list = ["serve", "passkey", "list", "--account", "corp:alice"];
+        (passkey_command(root, &list), passkey_command(root, &[&["--json"], &list[..]].concat()))
+    }
+
+    #[test]
+    fn the_list_shows_a_live_link_and_nothing_else_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        put(root, &alice, "BBBBBBBBBBBBx2", Alg::Es256, b"spki");
+        let (text, json) = listed(root);
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(!text.contains("link until") && !json.contains("link_"), "{text}{json}");
+
+        let link = new_link(&alice, LINK_ID, "BBBBBBBBBBBBx2");
+        test_put_link(root, &link).unwrap();
+        let until = time(link.expires_at).to_rfc3339();
+        let (shown, shown_json) = listed(root);
+        assert_eq!(shown, format!("{text}link until {until} (vouched by BBBBBBBBBBBB)\n"));
+        let rows: serde_json::Value = serde_json::from_str(&shown_json).unwrap();
+        let rows = rows.as_array().unwrap();
+        assert_eq!(rows.len(), 2, "{shown_json}");
+        for row in rows {
+            assert_eq!(row["link_until"], until.as_str(), "{row}");
+            assert_eq!(row["link_vouched_by"], "BBBBBBBBBBBB", "{row}");
+        }
+        for leaked in [link.secret_hash.as_str(), "the secret of", link.id.as_str(), "BBBBBBBBBBBBx2", "/oauth/"] {
+            assert!(!shown.contains(leaked) && !shown_json.contains(leaked), "{leaked}: {shown}{shown_json}");
+        }
+
+        // A row of the JSON holds what `view` always held, and these two.
+        let passkeys = for_account(root, &alice.issuer, &alice.subject).unwrap();
+        for (row, passkey) in rows.iter().zip(&passkeys) {
+            let mut bare = row.as_object().unwrap().clone();
+            assert!(bare.remove("link_until").is_some() && bare.remove("link_vouched_by").is_some(), "{row}");
+            assert_eq!(serde_json::Value::Object(bare), view(passkey));
+        }
+        assert_eq!(
+            view(&passkeys[0]).as_object().unwrap().keys().map(String::as_str).collect::<Vec<_>>(),
+            ["algorithm", "counter", "created_at", "credential_prefix", "last_used_at"]
+        );
+
+        // Ran out, then gone as a spent one is: the same bytes as before any.
+        expire_link(root, &alice);
+        assert_eq!(listed(root), (text.clone(), json.clone()), "a link that ran out is not shown");
+        rows_cleared(root);
+        assert_eq!(listed(root), (text, json));
+    }
+
+    /// Drop every link, as a spent one goes.
+    fn rows_cleared(root: &Path) {
+        server_db::open(root).unwrap().execute("DELETE FROM passkey_links", []).unwrap();
+    }
+
+    #[test]
+    fn the_list_shows_a_link_beside_an_allowance_each_on_its_own_terms() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let link = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        test_put_link(root, &link).unwrap();
+        let granted = grant(root, &alice, ALLOWANCE_DEFAULT).unwrap();
+
+        let (text, json) = listed(root);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(lines[1].starts_with("Add allowed: "), "{text}");
+        assert_eq!(lines[2], format!("link until {} (vouched by AAAAAAAAAAAA)", until(link.expires_at)));
+        let rows: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(rows[0]["add_allowed_until"], until(granted.expires_at).as_str(), "{json}");
+        assert_eq!(rows[0]["link_until"], until(link.expires_at).as_str(), "{json}");
+    }
+
+    #[test]
+    fn cancel_link_says_what_it_did_and_prints_nothing_of_the_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        let link = new_link(&alice, LINK_ID, "AAAAAAAAAAAAx1");
+        let cancel = ["serve", "passkey", "cancel-link", "--account", "corp:alice"];
+        let as_json = [&["--json"], &cancel[..]].concat();
+
+        test_put_link(root, &link).unwrap();
+        assert_eq!(passkey_command(root, &cancel), "✓ Cancelled the link of corp:alice\n");
+        assert_eq!(live_of(root, &alice), None);
+        assert_eq!(details(root, "passkey_link_ended"), ["link aaaaaaaaaaaa vouched by AAAAAAAAAAAA: cancelled"]);
+        assert_eq!(passkey_command(root, &cancel), "corp:alice has no link to cancel\n");
+
+        test_put_link(root, &link).unwrap();
+        let json = passkey_command(root, &as_json);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            json!({ "account": "corp:alice", "cancelled": true })
+        );
+        assert!(!json.contains(&link.secret_hash) && !json.contains(&link.id), "{json}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&passkey_command(root, &as_json)).unwrap(),
+            json!({ "account": "corp:alice", "cancelled": false })
+        );
+    }
+
+    #[test]
+    fn link_events_name_prefixes_never_a_secret_a_hash_or_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let alice = enrolled(root, &user("alice", "s1"), "AAAAAAAAAAAAx1");
+        put(root, &alice, "AAAAAAAAAAABy2", Alg::Es256, b"spki");
+        let key = SoftKey::es256();
+        let (credential, spki) = (URL_SAFE_NO_PAD.encode(&key.credential), key.spki());
+        let links = ["11", "22", "33", "44", "55"].map(|n| {
+            let mut link = new_link(&alice, &format!("{n}{}", &LINK_ID[2..]), "AAAAAAAAAAAAx1");
+            link.secret_hash = auth::hash(&format!("the secret {n}"));
+            link
+        });
+        let mut counter = 0;
+        let mut vouch = |link: &NewLink| {
+            vouch_link(root, link, "AAAAAAAAAAAAx1", counter, counter + 1).unwrap();
+            counter += 1;
+        };
+
+        vouch(&links[0]);
+        vouch(&links[1]);
+        insert_linked(root, &links[1].id, &row(&alice, &credential, &spki, key.alg())).unwrap();
+        vouch(&links[2]);
+        cancel_link(root, &alice).unwrap();
+        vouch(&links[3]);
+        remove(root, &alice, Some("AAAAAAAAAAAA")).unwrap();
+        vouch_link(root, &NewLink { vouched_by: "AAAAAAAAAAABy2".into(), ..links[4].clone() }, "AAAAAAAAAAABy2", 0, 1)
+            .unwrap();
+        remove(root, &alice, None).unwrap();
+
+        let trail: Vec<(String, String)> = trail(root).into_iter().filter(|(k, _)| k.starts_with("passkey_")).collect();
+        let kinds: Vec<&str> = trail.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "passkey_link_made",
+                "passkey_link_ended",
+                "passkey_link_made",
+                "passkey_registered",
+                "passkey_link_made",
+                "passkey_link_ended",
+                "passkey_link_made",
+                "passkey_removed",
+                "passkey_link_ended",
+                "passkey_link_made",
+                "passkey_removed",
+                "passkey_removed",
+                "passkey_link_ended",
+            ]
+        );
+        for (kind, detail) in &trail {
+            assert!(!detail.contains(&credential) && !detail.contains("AAAAAAAAAAAAx1"), "{kind}: {detail}");
+            for link in &links {
+                assert!(!detail.contains(&link.id), "{kind}: {detail}");
+                assert!(!detail.contains(&link.secret_hash[..16]), "{kind}: {detail}");
+            }
+            for engine in [&STANDARD, &STANDARD_NO_PAD, &URL_SAFE, &URL_SAFE_NO_PAD] {
+                let encoded = engine.encode(&spki);
+                let tail = &encoded[encoded.len() - 16..];
+                assert!(!detail.contains(&encoded) && !detail.contains(tail), "{kind}: {detail}");
+            }
+        }
     }
 }

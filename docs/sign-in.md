@@ -718,8 +718,9 @@ the approval can be tried again from the gate's link with either
 passkey. Without the box checked, or where the browser cannot register
 passkeys (no `getPublicKey`), the page approves with the existing
 passkey alone, as before.
-Without an admin's allowance (below), a passkey can be added only this way, at
-an approval; one is never removed from the browser.
+Without an admin's allowance or a link from another device (both below), a
+passkey can be added only this way, at an approval; one is never removed from
+the browser.
 
 **An admin's allowance.** A person with none of the account's passkeys at
 hand (on a new device, the old one left at home or lost) cannot add one
@@ -789,6 +790,100 @@ the account erases it. `bd serve token revoke --account` without
 `--forget` leaves it: an admin who suspects the account also runs
 `--cancel`.
 
+**Adding a passkey from another device.** A person with a device that holds
+a passkey at hand, whose passkey cannot be used from the new device (it stays
+on that device alone, say), needs no admin: an approval on the old device can
+make a one-time link that registers a passkey on the new one.
+
+1. On the old device, on a gate's or an operation's approval page that asks
+   for an existing passkey, for an account with 1 to 98 passkeys, check the
+   unchecked box `Also make a link to add a passkey on another device` and
+   approve as usual. The verified passkey vouches for the link: a failed
+   check makes none. The box may be checked with `Also add a passkey on this
+   device`. It is not on a first registration's page, on a page at 99
+   passkeys, or on a page under an admin's allowance.
+2. The page that answers the approval shows the link,
+   `<public url>/oauth/passkey-link#<secret>`, with a copy button, until when
+   it works and a warning: `Open this on your own new device. Don't send it
+   to anyone else, whoever asks: anyone with this link and your sign-in can
+   add a passkey to your account. It works once, until <time> UTC.` It is
+   shown on that page alone. Posted again, in a second tab say, the approval
+   says it was already used and makes no link, no command prints one, and
+   the server keeps only a hash of the secret.
+3. On the new device, open the link and press `Continue to sign in` (the page
+   needs scripts). Sign in to the provider as the very account that made the
+   link: the same issuer and subject. The same login at another provider is
+   another account, and so is an account joined to it with `bd serve token
+   link`.
+4. The next page registers a passkey on this device, with user verification.
+   The browser refuses an authenticator that already holds one of the
+   account's passkeys. A prompt cancelled in the browser posts nothing, so
+   the button can be pressed again. The passkey is checked as a first one is
+   (its own challenge, the origin, the relying party, user verification), and
+   then one transaction checks that the link is still live and the account's,
+   that the passkey that vouched for it is still the account's, that the
+   account holds fewer than 99 passkeys and that the credential id is not
+   registered, removes the link and stores the passkey.
+
+No gate needs to be waiting: the page registers a passkey and approves
+nothing. The new passkey then works at approvals like any other, and the link
+gives no access to any workspace, makes no token and counts as no passkey at
+an approval.
+
+The sign-in is judged as a gate's approval is, for the workspace the link was
+made in: `deny` first, then the [authorizer](#deciding-with-an-authorizer),
+which sees a `sign_in` for that workspace with `"client": null`, as for a
+gate's approval, or the [rules](#rules). The grant must be of kind `human`.
+Only that answer counts: nothing looks at whether the workspace still exists.
+The very account is bound as at an approval, with a tokenless `signed_in`
+event; any other account is not.
+
+A link lasts 15 minutes, always, and works once. An account has at most one:
+making another replaces the first, and a registration page opened from the
+first is then refused. A link that ran out, was used, replaced or cancelled,
+one this server never gave, and a sign-in as any other account, or as the
+very account when it is denied, let in by no rule or not of kind `human`, all
+get one notice, with status 404, that says nothing of which: `This link can't
+be used. Links work once, for a short time. Make a new one at an approval on
+a device that holds a passkey.` A dead link starts no sign-in.
+
+The account's limit is told apart, as only someone signed in as it can see
+it: an account already holding 99 passkeys gets a page saying so after the
+sign-in (409), and the link stays live, so an admin can remove a passkey and
+the link be opened again. Checking both boxes at 98 passkeys fills the
+account: the link is still made, and the page says it can add nothing until
+one is removed.
+
+A refused registration (a failed check of the new passkey, or the credential
+id registered meanwhile) stores nothing and leaves the link live, but the
+page's form is used up: open the link again. Where the address cannot use
+passkeys, the page says so and the link stays live.
+
+The link is made in one transaction with the passkey's counter, before the
+approval runs. So an approval the workspace does not go through with (the
+gate no longer armed, gone, refused, the workspace busy or failing) still
+shows the link, says `The link still works. You can try the approval again.`,
+and the approval can be tried again from its own link. A link that cannot be
+written stops the approval: nothing is approved.
+
+An admin sees a live link's end and the passkey that vouched for it in `bd
+serve passkey list` (`link until <time> (vouched by <prefix>)`, or
+`link_until` and `link_vouched_by` with `--json`) and ends it on the server
+host:
+
+```bash
+bd serve passkey cancel-link --account <actor or login>
+```
+
+Like the other `bd serve passkey` commands it runs only on the server host,
+never through a token, `/v2/exec` or MCP; cancelling none is no error, and
+says so. The person cannot end a link from the browser, only replace it at
+another approval or let it run out. Removing the passkey that vouched for a
+link, or the account's last passkey, ends it, and forgetting the account
+erases it. `bd serve token revoke --account` without `--forget` leaves it, as
+it leaves an allowance: an admin who suspects the account also runs
+`cancel-link`. A live link and an allowance do not affect each other.
+
 An admin lists an account's
 passkeys with `bd serve passkey list --account <actor or login>` on the
 server host and removes them with `bd serve passkey remove --account
@@ -799,10 +894,18 @@ next approval registers a new one ([commands](commands.md)). Registrations
 token events --kind passkey_registered`, `passkey_removed`), each naming
 the credential's first 12 characters and its algorithm; an added
 passkey's event also names the passkey that vouched for it (`added at a
-browser approval with credential <prefix>`), and one registered under an
+browser approval with credential <prefix>`), one registered under an
 allowance names the allowance (`registered at a browser approval under
-allowance <id>`). Allowances granted and ended are `passkey_add_allowed`
-and `passkey_add_cancelled` events; one that runs out records nothing.
+allowance <id>`), and one registered through a link names the link and the
+passkey that vouched for it (`credential <prefix> (<algorithm>), through link
+<id prefix> vouched by <credential prefix>`, the prefixes 12 characters each).
+Allowances granted and ended are `passkey_add_allowed` and
+`passkey_add_cancelled` events; one that runs out records nothing. Links made
+are `passkey_link_made` events, naming the link, the passkey that vouched for
+it and its end, and links ended `passkey_link_ended` events, saying how
+(`replaced`, `cancelled`, `vouching passkey removed` or `last passkey
+removed`); that `passkey_registered` event is a link's use, and one that runs
+out records nothing. No event holds a link's secret or its hash.
 
 **Refusals** end on a page of this server, never a redirect elsewhere, and
 write nothing to the workspace. Once the provider has admitted an account
@@ -822,6 +925,7 @@ when the page then refuses or shows a notice:
 | a post without the approval's cookie (another browser) | 403; the approval stays usable from its own browser |
 | a post without the passkey's fields, or whose passkey check fails, or a refused add (a new passkey's fields where adding was not offered, incomplete, or failing their check; the limit reached; a credential id already registered) | 403; the approval is used up, nothing is stored |
 | a refused registration under an allowance (its fields where none was offered, incomplete, sent with an existing passkey's fields, or failing their check; the allowance run out, spent, cancelled or replaced since the page was opened; the limit reached; a credential id already registered; the account forgotten) | 403; the approval is used up, nothing is stored |
+| a link asked for (`make_link`) where the page offered none, or sent twice or with another value | 403; the approval is used up, nothing is stored |
 | an address passkeys cannot be used at (an IP address, or http on a host other than `localhost`) | 403, a notice with no Approve button |
 | no such workspace, issue or gate, not a gate, not a human gate (after admission) | 404 |
 | already resolved | 409 |
@@ -841,10 +945,12 @@ passkey's credential id once the posted one could be read (empty
 otherwise), `added`, the first 12 characters of the passkey added at
 this approval (empty otherwise, a refused add included), and `passkey`,
 what became of the check (`registered`, `verified`, `verified and
-added`, `registered under allowance`, a refusal's reason such as `missing
-fields`, `store busy`, `store failed`, `adding not offered`, `limit
-reached`, `new passkey: <reason>` for a new passkey's failed check (`new
-passkey: wrong challenge`, say), `allowance: <reason>` for a refused
+added`, `verified, link made`, `verified and added, link made`,
+`registered under allowance`, a refusal's reason such as `missing
+fields`, `store busy`, `store failed`, `adding not offered`, `link not
+offered`, `limit reached`, `new passkey: <reason>` for a new passkey's
+failed check (`new passkey: wrong challenge`, say), `allowance: <reason>`
+for a refused
 registration under an allowance (`not offered`, `missing fields`,
 `malformed fields`, `expired`, `ended`, `limit reached`, `credential
 taken`, `no account`, or a failed check's reason, as in `allowance: wrong
@@ -854,7 +960,10 @@ empty. They never carry the public key, the signature, the client data or
 the whole credential id. The approvals are counted in `/metrics`
 ([`bd_serve_approvals_total`](observability.md#server-metrics), and
 `bd_serve_passkeys_registered_total`, which counts first registrations,
-passkeys added at an approval and passkeys registered under an allowance).
+passkeys added at an approval and passkeys registered under an allowance or
+through a link). Each step of a link logs its own `passkey link` line and
+counts in `bd_serve_passkey_links_total`
+([Server logs](observability.md#server-logs)).
 
 ### Approving a close or discard
 
@@ -988,7 +1097,10 @@ no passkey, moves no counter and performs nothing; once the new passkey
 is stored, a workspace answer that does not perform the operation (no
 longer held back, gone, refused, busy or failed) leaves it registered,
 with nothing performed, and the operation can be approved again from its
-link with either passkey.
+link with either passkey. The page also has the box [making a link for
+another device](#approving-human-gates-in-the-browser): the link is made
+with the passkey's counter before the operation is performed, and an
+operation that is not performed still shows it and says it still works.
 
 While an [admin's allowance](#approving-human-gates-in-the-browser) is
 live, an account with 1 to 98 passkeys gets the same two buttons as on a
@@ -1001,14 +1113,18 @@ is stored, a workspace answer that does not perform the operation leaves
 it registered and the allowance spent, with nothing performed, and the
 operation can be approved again from its link with the new passkey.
 
-An admin recovers a lost passkey with
+A person with a device that holds a passkey at hand needs no admin: a [link
+for another device](#approving-human-gates-in-the-browser), made at an
+approval, adds a passkey on the new one. Otherwise an admin recovers a lost
+passkey with
 `bd serve passkey list|remove --account <actor or login>`; `remove`
 without `--credential` removes every passkey of the account, and its next
 approval registers a new one. `bd serve passkey allow-add` keeps the
 account's other passkeys instead. First registrations, added passkeys and
-those registered under an allowance are in the audit trail
+those registered under an allowance or through a link are in the audit trail
 (`passkey_registered`), an added one naming the passkey that vouched for
-it and one under an allowance naming the allowance.
+it, one under an allowance naming the allowance, and one through a link
+naming the link and the passkey that vouched for it.
 
 **What is recorded.** The `closed` event (a close) or each `deleted`
 event (a discard) has the approver's actor, `"via": "browser"`,
@@ -1022,11 +1138,12 @@ bad signature`, say, or `passkey refused: new passkey: wrong challenge`
 for an added passkey's failed check), `credential` (the first 12
 characters of the passkey's credential id once the posted one could be
 read, else empty), `added` (the first 12 characters of the passkey
-added at this approval, else empty) and, only on an allowance's outcome,
-`passkey` (`registered under allowance` or `allowance: <reason>`, as on
-`gate approval` lines, with `credential` the new passkey's and `added`
-empty; `detail` reads `passkey refused: allowance: ended`, say, on a
-refusal, and no other line has the key),
+added at this approval, else empty) and, only on an allowance's outcome
+or a link's, `passkey` (`registered under allowance` or `allowance:
+<reason>`, as on `gate approval` lines, with `credential` the new passkey's
+and `added` empty; `verified, link made`, `verified and added, link made`
+or `link not offered`; `detail` reads `passkey refused: allowance: ended`,
+say, on a refusal, and no other line has the key),
 never the reason, a title, an email, or the passkey's public key,
 signature, client data or whole credential id, and counted in
 [`bd_serve_operation_approvals_total{outcome}`](observability.md#server-metrics),

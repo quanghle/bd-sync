@@ -56,6 +56,11 @@ pub fn events_provider(path: &str) -> Option<&str> {
 /// Where the consent page posts its decision.
 pub const CONSENT: &str = "/oauth/consent";
 
+/// Where a one-time passkey link opens, its secret in the fragment.
+pub const PASSKEY_LINK: &str = "/oauth/passkey-link";
+/// Where the page a link leads to posts the passkey it registers.
+pub const PASSKEY_LINK_REGISTER: &str = "/oauth/passkey-link/register";
+
 /// The issuer of a server whose public URL is `public_url` (normalized by
 /// `mcp_http::public_url`): https, or http to this machine.
 pub fn issuer(public_url: Option<&str>) -> Result<String, String> {

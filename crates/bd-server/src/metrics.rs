@@ -1,11 +1,11 @@
 //! `bd serve`'s counters since it started, served at `GET /metrics` in the
 //! Prometheus text format to admin tokens: answers by status class and the
 //! busy ones, requests refused for their access token, connections refused
-//! over the limits, panics, commands, MCP tool calls, publishes and browser
-//! approvals of gates and of refused closes and discards. Counts only: no
-//! actor, token, workspace or address is a label, so nothing here names
-//! anyone. And [`Throttle`], which keeps a warning repeated under load from
-//! flooding the log.
+//! over the limits, panics, commands, MCP tool calls, publishes, browser
+//! approvals of gates and of refused closes and discards, and one-time passkey
+//! links. Counts only: no actor, token, workspace or address is a label, so
+//! nothing here names anyone. And [`Throttle`], which keeps a warning repeated
+//! under load from flooding the log.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -64,6 +64,17 @@ pub static OPERATIONS_FAILED: Counter = Counter::new();
 pub static OPERATIONS_PASSKEY_REFUSED: Counter = Counter::new();
 /// Passkeys registered at a browser approval.
 pub static PASSKEYS_REGISTERED: Counter = Counter::new();
+/// One-time passkey links, by outcome (`oauth_server::authorize::link::record`,
+/// the only place that counts them). `ended` counts the replacements this
+/// server saw, and `refused` every way a link's step was refused that is not
+/// counted apart.
+pub static PASSKEY_LINKS_MADE: Counter = Counter::new();
+pub static PASSKEY_LINKS_STARTED: Counter = Counter::new();
+pub static PASSKEY_LINKS_UNUSABLE: Counter = Counter::new();
+pub static PASSKEY_LINKS_WRONG_ACCOUNT: Counter = Counter::new();
+pub static PASSKEY_LINKS_REFUSED: Counter = Counter::new();
+pub static PASSKEY_LINKS_REGISTERED: Counter = Counter::new();
+pub static PASSKEY_LINKS_ENDED: Counter = Counter::new();
 /// Connections open now.
 pub static OPEN: AtomicI64 = AtomicI64::new(0);
 
@@ -166,6 +177,19 @@ pub fn render() -> String {
         "Passkeys registered at a browser approval.",
         &[("", PASSKEYS_REGISTERED.get())],
     );
+    counter(
+        "passkey_links_total",
+        "One-time passkey links, by outcome.",
+        &[
+            ("{outcome=\"made\"}", PASSKEY_LINKS_MADE.get()),
+            ("{outcome=\"started\"}", PASSKEY_LINKS_STARTED.get()),
+            ("{outcome=\"unusable\"}", PASSKEY_LINKS_UNUSABLE.get()),
+            ("{outcome=\"wrong_account\"}", PASSKEY_LINKS_WRONG_ACCOUNT.get()),
+            ("{outcome=\"refused\"}", PASSKEY_LINKS_REFUSED.get()),
+            ("{outcome=\"registered\"}", PASSKEY_LINKS_REGISTERED.get()),
+            ("{outcome=\"ended\"}", PASSKEY_LINKS_ENDED.get()),
+        ],
+    );
     let _ = writeln!(
         out,
         "# HELP bd_serve_connections_open Connections open now.\n# TYPE bd_serve_connections_open gauge\n\
@@ -245,6 +269,8 @@ mod tests {
         APPROVALS_REFUSED.add();
         APPROVALS_PASSKEY_REFUSED.add();
         PASSKEYS_REGISTERED.add();
+        PASSKEY_LINKS_MADE.add();
+        PASSKEY_LINKS_ENDED.add();
         let text = render();
         assert!(text.contains("# TYPE bd_serve_approvals_total counter"), "{text}");
         assert!(text.contains("# TYPE bd_serve_passkeys_registered_total counter"), "{text}");
@@ -260,6 +286,14 @@ mod tests {
             let n: u64 = line.and_then(|l| l.rsplit(' ').next()).and_then(|n| n.parse().ok()).unwrap_or(0);
             assert!(n >= 1, "{outcome}: {text}");
         }
+        assert!(text.contains("# TYPE bd_serve_passkey_links_total counter"), "{text}");
+        for outcome in ["made", "started", "unusable", "wrong_account", "refused", "registered", "ended"] {
+            let series = format!("bd_serve_passkey_links_total{{outcome=\"{outcome}\"}} ");
+            assert_eq!(text.lines().filter(|l| l.starts_with(&series)).count(), 1, "{outcome}: {text}");
+        }
+        assert_eq!(text.lines().filter(|l| l.starts_with("bd_serve_passkey_links_total")).count(), 7, "{text}");
+        assert!(n("bd_serve_passkey_links_total{outcome=\"made\"}") >= 1, "{text}");
+        assert!(n("bd_serve_passkey_links_total{outcome=\"ended\"}") >= 1, "{text}");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! The pages people see during an authorization (`authorize/`): the
 //! consent page, refusals, and the page sending the browser on; and those
 //! of a human gate's approval in the browser: the approval page and its
-//! notices. Every value shown is escaped, and each page comes with the
-//! Content-Security-Policy it needs: its inline style, and forms posting
-//! only where the consent or the approval goes. The pages fetch nothing:
+//! notices; and those of a one-time passkey link: the answer showing it, the
+//! page it opens, its registration and the one notice a dead link gets. Every
+//! value shown is escaped, and each page comes with the Content-Security-Policy
+//! it needs: its inline style, and forms posting only where the consent or the
+//! approval goes. The pages fetch nothing:
 //! icons are inline SVG drawn with presentation attributes, which the
 //! policy's `style-src` does not cover, and a client's logo comes inside
 //! the page, as a `data:` URL.
@@ -306,6 +308,88 @@ existing();\
 });\
 })();";
 
+/// The script of the page a passkey link opens ([`landing_link`]): it moves
+/// the link's secret from the URL's fragment, which no server is sent, into
+/// the form's field, and takes it out of the address bar. It sends nothing:
+/// only the person's press of the button does, so a scanner running scripts
+/// starts no sign-in.
+const OPEN_LINK: &str = "(function(){\
+var form=document.querySelector('form.actions');\
+if(form)form.elements.link.value=location.hash.slice(1);\
+history.replaceState(null,'',location.pathname);\
+})();";
+
+/// The script of the page registering a passkey through a link
+/// ([`register_link`]): [`ARMING`]'s focus rule and a `create()` with the
+/// page's challenge, the account's user handle and name, and its passkeys as
+/// `excludeCredentials`. As in [`APPROVE`], what the server gave it is read
+/// only from the form's and the status line's escaped `data-` attributes,
+/// messages are written with `textContent` alone, and the button, rendered
+/// disabled, is enabled only where the browser can register a passkey
+/// (`getPublicKey`). It has no `get()`, and nothing of an approval: a
+/// cancelled or failed `create()` posts nothing, so the same page can try
+/// again, and one refused because this device holds a passkey of the account
+/// (`InvalidStateError`) says so.
+const REGISTER_LINK: &str = "(function(){\
+var since=document.hasFocus()?Date.now():0;\
+addEventListener('focus',function(){since=Date.now();});\
+addEventListener('blur',function(){since=0;});\
+document.addEventListener('visibilitychange',function(){\
+since=!document.hidden&&document.hasFocus()?Date.now():0;});\
+var form=document.querySelector('form.actions');\
+var status=document.querySelector('p[role=status]');\
+if(!form||!status)return;\
+var button=form.querySelector('button');\
+var d=form.dataset,m=status.dataset;\
+function say(t){status.textContent=t||'';}\
+function bytes(s){s=(s||'').replace(/-/g,'+').replace(/_/g,'/');while(s.length%4)s+='=';\
+var b=atob(s),u=new Uint8Array(b.length);for(var i=0;i<b.length;i++)u[i]=b.charCodeAt(i);return u;}\
+function text(buf){var u=new Uint8Array(buf),s='';for(var i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);\
+return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');}\
+function put(name,value){form.elements[name].value=value;}\
+function known(){return(d.credentials||'').split(' ').filter(Boolean).map(function(c){return{type:'public-key',id:bytes(c)};});}\
+var able=window.PublicKeyCredential&&navigator.credentials&&window.AuthenticatorAttestationResponse&&\
+typeof AuthenticatorAttestationResponse.prototype.getPublicKey==='function';\
+if(!able){say(m.unsupported);return;}\
+button.disabled=false;\
+var busy=false;\
+form.addEventListener('submit',function(e){\
+e.preventDefault();\
+if(busy||!since||Date.now()-since<600)return;\
+busy=true;button.disabled=true;say(m.waiting);\
+navigator.credentials.create({publicKey:{rp:{id:d.rp,name:'bd'},\
+user:{id:bytes(d.user),name:d.name,displayName:d.name},challenge:bytes(d.challenge),\
+pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],excludeCredentials:known(),\
+authenticatorSelection:{userVerification:'required',residentKey:'preferred'},\
+attestation:'none',timeout:300000}}).then(function(c){\
+var r=c.response,k=r.getPublicKey();if(!k)throw new Error('no public key');\
+put('credential',text(c.rawId));\
+put('client_data',text(r.clientDataJSON));\
+put('authenticator_data',text(r.getAuthenticatorData()));\
+put('public_key',text(k));\
+put('algorithm',String(r.getPublicKeyAlgorithm()));\
+form.submit();\
+}).catch(function(e){busy=false;button.disabled=false;say(e&&e.name==='InvalidStateError'?m.held:m.cancelled);});\
+});\
+})();";
+
+/// The script of an answer page showing a link ([`with_link`]): its button
+/// copies the field's value, and where the browser will not, selects it to
+/// copy by hand. Messages come from the status line's escaped `data-`
+/// attributes, written with `textContent` alone. Without scripts the link
+/// stays in its field, to select by hand.
+const COPY_LINK: &str = "(function(){\
+var field=document.querySelector('input[readonly]');\
+var button=document.querySelector('button[type=button]');\
+var status=document.querySelector('p[role=status]');\
+if(!field||!button||!status)return;\
+function pick(){field.focus();field.select();status.textContent=status.dataset.select;}\
+button.addEventListener('click',function(){\
+if(!navigator.clipboard||!navigator.clipboard.writeText){pick();return;}\
+navigator.clipboard.writeText(field.value).then(function(){status.textContent=status.dataset.copied;},pick);\
+});\
+})();";
+
 /// What the approval pages say about the passkey every approval needs. No
 /// copy here names a person (`a_passkeys_copy_names_no_one`).
 pub const PASSKEY_ENROLL: &str = "Approving first registers a passkey for this account: the browser asks for a \
@@ -344,6 +428,55 @@ registered on it. Press Use an existing passkey instead.";
 pub const PASSKEY_ALLOW_ENDED: &str = "The admin's allowance has ended, so no passkey was registered and nothing was \
 approved. Ask the admin again, or open the link again to use an existing passkey.";
 
+/// The box on an approval page that makes a link for another device: named,
+/// so that the browser's own submit sends it, and after the add box, which
+/// [`APPROVE`] takes as the first checkbox.
+const LINK_BOX: &str = "<label class=\"note\"><input type=\"checkbox\" name=\"make_link\" value=\"1\"> Also make a link to add a passkey \
+on another device</label>";
+
+/// What the answer page showing a link says, word for word as agreed: the
+/// one copy that speaks to the person, as a warning has to
+/// (`the_links_warning_is_the_agreed_text_and_is_filled_with_no_name`). The
+/// warning ends with its expiry, which [`with_link`] adds.
+pub const PASSKEY_LINK_SHOWN: &str = "You also have a link for another device:";
+pub const PASSKEY_LINK_WARNING: &str = "Open this on your own new device. Don't send it to anyone else, whoever asks: \
+anyone with this link and your sign-in can add a passkey to your account.";
+pub const PASSKEY_LINK_STILL_WORKS: &str = "The link still works. You can try the approval again.";
+
+/// The rest of what the link's pages say. No copy here names a person
+/// (`a_passkeys_copy_names_no_one`).
+pub const PASSKEY_LINK_FULL: &str =
+    "This account now holds the most passkeys it can, so this link can't add another until one is removed.";
+pub const PASSKEY_LINK_FIELD: &str = "Link for another device";
+pub const PASSKEY_LINK_COPY: &str = "Copy the link";
+pub const PASSKEY_LINK_COPIED: &str = "Copied.";
+pub const PASSKEY_LINK_SELECT: &str = "The browser didn't copy it. The link is selected: copy it from the field.";
+pub const PASSKEY_LINK_TITLE: &str = "Add a passkey";
+pub const PASSKEY_LINK_LANDING: &str =
+    "This link adds a passkey on this device, after a sign-in with the account that made it. It approves nothing.";
+pub const PASSKEY_LINK_CONTINUE: &str = "Continue to sign in";
+pub const PASSKEY_LINK_ONWARD: &str = "Going to sign in now.";
+pub const PASSKEY_LINK_NO_SCRIPT: &str =
+    "Adding a passkey needs scripts: turn them on in this browser, then open the link again.";
+pub const PASSKEY_LINK_UNUSABLE_TITLE: &str = "Link not usable";
+pub const PASSKEY_LINK_UNUSABLE: &str = "This link can't be used. Links work once, for a short time. Make a new one \
+at an approval on a device that holds a passkey.";
+pub const PASSKEY_LINK_LIMIT_TITLE: &str = "No room for a passkey";
+pub const PASSKEY_LINK_LIMIT: &str = "This account holds the most passkeys it can, so this link can't add another. \
+Ask the server's admin to remove one, then open the link again.";
+pub const PASSKEY_LINK_FAILED_TITLE: &str = "Passkey not added";
+pub const PASSKEY_LINK_FAILED: &str = "The passkey couldn't be added. Open the link again to try again.";
+pub const PASSKEY_LINK_ADDED_TITLE: &str = "Passkey added";
+pub const PASSKEY_LINK_ADDED: &str = "This device now holds a passkey for this account. Adding it approved nothing: \
+an approval still asks for a passkey on its own page.";
+pub const PASSKEY_LINK_ADD: &str = "Add the passkey";
+pub const PASSKEY_LINK_UNSUPPORTED: &str = "This browser can't register a passkey, so none can be added from it. Open \
+the link in a current browser.";
+pub const PASSKEY_LINK_CANCELLED: &str =
+    "The passkey check was cancelled or didn't complete, so no passkey was added. Press Add the passkey to try again.";
+pub const PASSKEY_LINK_HELD: &str = "This device already has a passkey for this account, so a new one can't be \
+registered on it.";
+
 /// The passkey ceremony an approval page asks for.
 #[derive(Clone, Debug)]
 pub enum PasskeyAsk<'a> {
@@ -357,8 +490,10 @@ pub enum PasskeyAsk<'a> {
         name: &'a str,
     },
     /// Use one of the account's passkeys (`get()`), by credential id
-    /// (base64url); with `add`, also offer to add a passkey on this device.
-    Assert { challenge: String, rp_id: &'a str, credentials: &'a [String], add: Option<PasskeyAdd<'a>> },
+    /// (base64url); with `add`, also offer to add a passkey on this device,
+    /// and with `link` too, to make a link for another device ([`LINK_BOX`]).
+    /// The two go together: [`APPROVE`] would take a box alone for the add box.
+    Assert { challenge: String, rp_id: &'a str, credentials: &'a [String], add: Option<PasskeyAdd<'a>>, link: bool },
     /// A live allowance: register a passkey on this device with no existing
     /// one (`create()` with `excludeCredentials`), `register` holding its
     /// challenge, or, the secondary path, use one of the account's passkeys
@@ -400,7 +535,7 @@ fn approval_form(action: &str, id: &str, ask: &PasskeyAsk<'_>) -> (String, Strin
             PASSKEY_ENROLL,
             None,
         ),
-        PasskeyAsk::Assert { challenge, rp_id, credentials, add } => {
+        PasskeyAsk::Assert { challenge, rp_id, credentials, add, .. } => {
             let mut data = format!(
                 " data-challenge=\"{}\" data-rp=\"{}\" data-credentials=\"{}\"",
                 escape(challenge),
@@ -459,6 +594,10 @@ data-user=\"{}\" data-name=\"{}\"",
             escape(PASSKEY_ADD_OPTION),
             escape(PASSKEY_ADD_BUTTON)
         );
+        if matches!(ask, PasskeyAsk::Assert { link: true, .. }) {
+            adding.push_str(LINK_BOX);
+            adding.push('\n');
+        }
         added = format!(" data-added=\"{}\"", escape(PASSKEY_ADD_NEXT));
     }
     // Under an allowance: its fields rendered disabled, so that only the
@@ -1283,6 +1422,186 @@ Nothing happening? <a href=\"{url}\">Open the application</a>.</p>\n"
     page(200, "Back to the application", &body, Parts { head: &refresh, ..Parts::default() })
 }
 
+/// The page a passkey link opens: the same bytes for every link, live or
+/// dead, as the secret is in the URL's fragment, which only [`OPEN_LINK`]
+/// sees. A press of its button posts the secret to `action`, the link's
+/// address with no fragment.
+pub fn landing_link(action: &str) -> Page {
+    let actions = format!(
+        "<form method=\"post\" action=\"{}\" class=\"actions\">\n\
+<input type=\"hidden\" name=\"link\" value=\"\">\n\
+<button type=\"submit\" class=\"primary\">{}</button>\n</form>\n",
+        escape(action),
+        escape(PASSKEY_LINK_CONTINUE)
+    );
+    let body = format!(
+        "<div class=\"link\" aria-hidden=\"true\"><div class=\"avatar\">{MARK}</div></div>\n\
+<h1>{}</h1>\n<p class=\"lead\">{}</p>\n<noscript><p class=\"lead\">{}</p></noscript>\n",
+        escape(PASSKEY_LINK_TITLE),
+        escape(PASSKEY_LINK_LANDING),
+        escape(PASSKEY_LINK_NO_SCRIPT)
+    );
+    let parts = Parts { actions: &actions, form_action: "'self'", script: Some(OPEN_LINK), ..Parts::default() };
+    page(200, PASSKEY_LINK_TITLE, &body, parts)
+}
+
+/// A page sending the browser on to sign in at `url` after a live link's
+/// POST. It is no redirect, for [`onward`]'s reason: the way to the provider
+/// follows, and a redirect after a form would be under that form's
+/// `form-action`.
+pub fn sign_in_onward(url: &str) -> Page {
+    let url = escape(url);
+    let body = format!(
+        "<h1>{continuing}</h1>\n<p class=\"lead\">{}\
+ Nothing happening? <a href=\"{url}\">{continuing}</a>.</p>\n",
+        escape(PASSKEY_LINK_ONWARD),
+        continuing = escape(PASSKEY_LINK_CONTINUE),
+    );
+    let refresh = format!("<meta http-equiv=\"refresh\" content=\"0; url={url}\">\n");
+    page(200, PASSKEY_LINK_CONTINUE, &body, Parts { head: &refresh, ..Parts::default() })
+}
+
+/// The one notice of a link that cannot be used, for whatever reason: it
+/// takes no parameter, so that it can say none.
+pub fn link_unusable() -> Page {
+    notice(404, PASSKEY_LINK_UNUSABLE_TITLE, PASSKEY_LINK_UNUSABLE)
+}
+
+/// The notice of a link opened for an account with no room for a passkey.
+/// Only the account's owner, signed in, sees it, and nothing was spent.
+pub fn link_limit() -> Page {
+    notice(409, PASSKEY_LINK_LIMIT_TITLE, PASSKEY_LINK_LIMIT)
+}
+
+/// The notice of a registration refused while its link lives on.
+pub fn link_failed() -> Page {
+    notice(403, PASSKEY_LINK_FAILED_TITLE, PASSKEY_LINK_FAILED)
+}
+
+/// The notice of a passkey added through a link, which approved nothing.
+pub fn link_added() -> Page {
+    notice(200, PASSKEY_LINK_ADDED_TITLE, PASSKEY_LINK_ADDED)
+}
+
+/// The notice of a link opened at an address passkeys can't be used at: it
+/// says so as an approval's page does, and offers no form.
+pub fn link_unavailable(why: crate::webauthn::NoRp) -> Page {
+    let why = match why {
+        crate::webauthn::NoRp::IpLiteral => PASSKEY_UNAVAILABLE_HOST,
+        crate::webauthn::NoRp::NotSecure => PASSKEY_UNAVAILABLE_HTTPS,
+    };
+    notice(409, PASSKEY_LINK_FAILED_TITLE, why)
+}
+
+/// The passkey ceremony of a link's registration page: `create()` with the
+/// account's passkeys excluded.
+#[derive(Clone, Debug)]
+pub struct LinkAsk<'a> {
+    /// The challenge and the user handle, base64url.
+    pub challenge: String,
+    pub rp_id: &'a str,
+    pub user_handle: String,
+    /// The account's actor, as the passkey is named.
+    pub user_name: &'a str,
+    /// The account's passkeys, by credential id (base64url).
+    pub excluded: &'a [String],
+}
+
+/// The page registering a passkey on this device for `actor`, after a link
+/// and its sign-in. Its form posts `id`, the page's one-time id, to `action`
+/// with the registration's five fields, which [`REGISTER_LINK`] fills in. It
+/// shares no field that means anything at an approval's POST, and says that
+/// it approves nothing.
+pub fn register_link(action: &str, id: &str, actor: &str, ask: &LinkAsk<'_>) -> Page {
+    let mut fields = format!("<input type=\"hidden\" name=\"id\" value=\"{}\">\n", escape(id));
+    for name in ["credential", "client_data", "authenticator_data", "public_key", "algorithm"] {
+        fields.push_str(&format!("<input type=\"hidden\" name=\"{name}\" value=\"\">\n"));
+    }
+    let actions = format!(
+        "<form method=\"post\" action=\"{}\" class=\"actions\" data-passkey=\"create\" data-challenge=\"{}\" \
+data-rp=\"{}\" data-user=\"{}\" data-name=\"{}\" data-credentials=\"{}\">\n\
+{fields}<button type=\"submit\" class=\"primary\" disabled>{}</button>\n</form>\n",
+        escape(action),
+        escape(&ask.challenge),
+        escape(ask.rp_id),
+        escape(&ask.user_handle),
+        escape(ask.user_name),
+        escape(&ask.excluded.join(" ")),
+        escape(PASSKEY_LINK_ADD)
+    );
+    let body = format!(
+        "<div class=\"link\" aria-hidden=\"true\"><div class=\"avatar\">{MARK}</div></div>\n\
+<h1>{}</h1>\n<p class=\"lead\">Add a passkey on this device for {}. This approves nothing.</p>\n\
+<noscript><p class=\"lead\">{}</p></noscript>\n\
+<p class=\"lead\" role=\"status\" aria-live=\"polite\" data-unsupported=\"{}\" data-waiting=\"{}\" \
+data-cancelled=\"{}\" data-held=\"{}\"></p>\n",
+        escape(PASSKEY_LINK_TITLE),
+        shown(actor, MAX_TITLE),
+        escape(PASSKEY_LINK_NO_SCRIPT),
+        escape(PASSKEY_LINK_UNSUPPORTED),
+        escape(PASSKEY_WAITING),
+        escape(PASSKEY_LINK_CANCELLED),
+        escape(PASSKEY_LINK_HELD),
+    );
+    let parts = Parts { actions: &actions, form_action: "'self'", script: Some(REGISTER_LINK), ..Parts::default() };
+    page(200, PASSKEY_LINK_TITLE, &body, parts)
+}
+
+/// A link just made, as its answer page shows it. It holds the link's secret,
+/// so it derives nothing: not even `Debug` can print it.
+pub struct LinkShown<'a> {
+    /// The link, the one place a person is ever given it.
+    pub url: &'a str,
+    /// When it ends, as words followed by `UTC`.
+    pub until: &'a str,
+    /// Whether the approval it came with went through.
+    pub approved: bool,
+    /// Whether the approval left the account with no room for the link's
+    /// passkey.
+    pub full: bool,
+}
+
+/// `page`, an approval's answer of any status, with the link just made shown
+/// under the outcome's own text: the link in a field to copy, the warning,
+/// and whether it outlives an approval that did not go through. The page
+/// keeps its status. Answer pages run no script, so [`COPY_LINK`] is the only
+/// one its policy allows.
+pub fn with_link(page: Page, link: &LinkShown<'_>) -> Page {
+    let Page { status, html, csp } = page;
+    debug_assert!(!csp.contains("script-src"), "an answer page runs no script: {csp}");
+    let mut block = format!(
+        "<p class=\"lead\">{}</p>\n\
+<div class=\"actions\"><input type=\"text\" readonly size=\"32\" aria-label=\"{}\" value=\"{}\">\
+<button type=\"button\" class=\"primary\">{}</button></div>\n\
+<p class=\"note\" role=\"status\" aria-live=\"polite\" data-copied=\"{}\" data-select=\"{}\"></p>\n\
+<p class=\"callout\">{SHIELD}<span>{} It works once, until {} UTC.</span></p>\n",
+        escape(PASSKEY_LINK_SHOWN),
+        escape(PASSKEY_LINK_FIELD),
+        escape(link.url),
+        escape(PASSKEY_LINK_COPY),
+        escape(PASSKEY_LINK_COPIED),
+        escape(PASSKEY_LINK_SELECT),
+        escape(PASSKEY_LINK_WARNING),
+        escape(link.until),
+    );
+    if !link.approved {
+        block.push_str(&format!("<p class=\"lead\">{}</p>\n", escape(PASSKEY_LINK_STILL_WORKS)));
+    }
+    if link.full {
+        block.push_str(&format!("<p class=\"lead\">{}</p>\n", escape(PASSKEY_LINK_FULL)));
+    }
+    // Every value on a page is escaped, so neither tag can come from one.
+    let bar = "<div class=\"bar\">";
+    let html = html.replacen(bar, &format!("{block}{bar}"), 1).replacen(
+        "</body>",
+        &format!("<script>{COPY_LINK}</script>\n</body>"),
+        1,
+    );
+    let hash = STANDARD.encode(Sha256::digest(COPY_LINK.as_bytes()));
+    let csp = csp.replacen("form-action ", &format!("script-src 'sha256-{hash}'; form-action "), 1);
+    Page { status, html, csp }
+}
+
 /// What a page has besides its title and body.
 struct Parts<'a> {
     /// Added to the document's head.
@@ -1362,13 +1681,37 @@ mod tests {
 
     /// The ceremony of a later approval, with the account's `credentials`.
     fn assert_with(credentials: &[String]) -> PasskeyAsk<'_> {
-        PasskeyAsk::Assert { challenge: "Y2hhbGxlbmdl".into(), rp_id: "bd.example.com", credentials, add: None }
+        PasskeyAsk::Assert {
+            challenge: "Y2hhbGxlbmdl".into(),
+            rp_id: "bd.example.com",
+            credentials,
+            add: None,
+            link: false,
+        }
     }
 
     /// The ceremony of a later approval, with the account's `credentials`,
     /// offering to add a passkey with `add`.
     fn assert_adding<'a>(credentials: &'a [String], add: PasskeyAdd<'a>) -> PasskeyAsk<'a> {
-        PasskeyAsk::Assert { challenge: "Y2hhbGxlbmdl".into(), rp_id: "bd.example.com", credentials, add: Some(add) }
+        PasskeyAsk::Assert {
+            challenge: "Y2hhbGxlbmdl".into(),
+            rp_id: "bd.example.com",
+            credentials,
+            add: Some(add),
+            link: false,
+        }
+    }
+
+    /// As [`assert_adding`], offering a link for another device too: the
+    /// page of an account with 1 to 98 passkeys.
+    fn assert_linking<'a>(credentials: &'a [String], add: PasskeyAdd<'a>) -> PasskeyAsk<'a> {
+        PasskeyAsk::Assert {
+            challenge: "Y2hhbGxlbmdl".into(),
+            rp_id: "bd.example.com",
+            credentials,
+            add: Some(add),
+            link: true,
+        }
     }
 
     /// The ceremony under a live allowance, with the account's `credentials`,
@@ -1779,6 +2122,55 @@ mod tests {
                 "A gate already resolved",
                 notice(200, "Already resolved", "This gate was resolved already: there is nothing to approve."),
             ),
+            ("link-box", "An approval page offering a link for another device", {
+                let adding = PasskeyAdd { challenge: "YWRk".into(), user: "dXNlcg".into(), name: "github:octocat" };
+                gate_asking(assert_linking(&credentials, adding))
+            }),
+            (
+                "link-shown",
+                "The answer to an approval that made a link",
+                with_link(
+                    notice(
+                        200,
+                        "Approved",
+                        "Gate proj-a1b2 in proj is resolved, recorded as approved by github:octocat.",
+                    ),
+                    &preview_link(true, false),
+                ),
+            ),
+            (
+                "link-shown-refused",
+                "An approval refused after it made a link, with the account now full",
+                with_link(
+                    refusal(403, "Not approved", "The gate's approvers do not include this account.", None),
+                    &preview_link(false, true),
+                ),
+            ),
+            ("link-landing", "The page a link opens", landing_link("https://bd.example.com/oauth/passkey-link")),
+            (
+                "link-onward",
+                "On to sign in, from a live link",
+                sign_in_onward("https://bd.example.com/oauth/choose?flow=sealed"),
+            ),
+            ("link-unusable", "A link that cannot be used", link_unusable()),
+            ("link-limit", "A link for an account with no room for a passkey", link_limit()),
+            ("link-failed", "A link's registration refused", link_failed()),
+            ("link-added", "A passkey added through a link", link_added()),
+            (
+                "link-unavailable",
+                "A link opened where passkeys cannot be used",
+                link_unavailable(crate::webauthn::NoRp::NotSecure),
+            ),
+            (
+                "link-register",
+                "Registering a passkey through a link",
+                register_link(
+                    "https://bd.example.com/oauth/passkey-link/register",
+                    "c0ffee",
+                    "github:octocat",
+                    &link_ask(&credentials),
+                ),
+            ),
         ];
         let mut index = String::from("<h1>bd authorization pages</h1>\n<ul>\n");
         let write = |name: &str, page: &Page| {
@@ -1933,6 +2325,12 @@ data-user=\"dXNlcg\" data-name=\"github:octocat\">\n<input type=\"hidden\" name=
             onward("https://app.example/cb"),
             notice(404, "t", "w"),
             choose("Sign in to approve gate g in proj", &options),
+            sign_in_onward("https://bd.example.com/oauth/choose?flow=f"),
+            link_unusable(),
+            link_limit(),
+            link_failed(),
+            link_added(),
+            link_unavailable(crate::webauthn::NoRp::IpLiteral),
         ] {
             assert!(!other.html.contains("<script") && !other.csp.contains("script-src"), "{}", other.csp);
         }
@@ -2300,6 +2698,29 @@ return;}";
             PASSKEY_ALLOW_NO_REGISTER,
             PASSKEY_ALLOW_HELD,
             PASSKEY_ALLOW_ENDED,
+            LINK_BOX,
+            PASSKEY_LINK_FULL,
+            PASSKEY_LINK_FIELD,
+            PASSKEY_LINK_COPY,
+            PASSKEY_LINK_COPIED,
+            PASSKEY_LINK_SELECT,
+            PASSKEY_LINK_TITLE,
+            PASSKEY_LINK_LANDING,
+            PASSKEY_LINK_CONTINUE,
+            PASSKEY_LINK_ONWARD,
+            PASSKEY_LINK_NO_SCRIPT,
+            PASSKEY_LINK_UNUSABLE_TITLE,
+            PASSKEY_LINK_UNUSABLE,
+            PASSKEY_LINK_LIMIT_TITLE,
+            PASSKEY_LINK_LIMIT,
+            PASSKEY_LINK_FAILED_TITLE,
+            PASSKEY_LINK_FAILED,
+            PASSKEY_LINK_ADDED_TITLE,
+            PASSKEY_LINK_ADDED,
+            PASSKEY_LINK_ADD,
+            PASSKEY_LINK_UNSUPPORTED,
+            PASSKEY_LINK_CANCELLED,
+            PASSKEY_LINK_HELD,
         ] {
             for word in copy.split(|c: char| !c.is_alphanumeric() && c != '\'').filter(|w| !w.is_empty()) {
                 let word = word.to_lowercase().replace('\u{2019}', "'");
@@ -2455,6 +2876,445 @@ class=\"actions\" data-passkey=\"create\"";
         let one = [("r-1".to_string(), "t".to_string())];
         let html = operation_page("proj", None, &[], Some((&one, 1))).html;
         assert!(html.contains("Deletes 1 issue, with no undo") && !html.contains("more</span>"), "{html}");
+    }
+
+    /// A link's address, as a page shows it.
+    const LINK_ACTION: &str = "https://bd.example.com/oauth/passkey-link";
+
+    /// A link as [`preview_pages`] and the tests show it.
+    fn preview_link(approved: bool, full: bool) -> LinkShown<'static> {
+        LinkShown {
+            url: "https://bd.example.com/oauth/passkey-link#0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            until: "2026-11-02 01:45",
+            approved,
+            full,
+        }
+    }
+
+    /// A registration's ceremony, with the account's `credentials` excluded.
+    fn link_ask(credentials: &[String]) -> LinkAsk<'_> {
+        LinkAsk {
+            challenge: "Y2hhbGxlbmdl".into(),
+            rp_id: "bd.example.com",
+            user_handle: "dXNlcg".into(),
+            user_name: "github:octocat",
+            excluded: credentials,
+        }
+    }
+
+    /// The registration page of a link, as a test shows it.
+    fn register_page(credentials: &[String]) -> Page {
+        register_link(
+            "https://bd.example.com/oauth/passkey-link/register",
+            "c0ffee",
+            "github:octocat",
+            &link_ask(credentials),
+        )
+    }
+
+    #[test]
+    fn the_link_box_is_offered_only_with_the_add_part_and_unticked() {
+        let credentials = ["AAAAAAAAAAAAx1zQ".to_string()];
+        let adding = || PasskeyAdd { challenge: "YWRk".into(), user: "dXNlcg".into(), name: "github:octocat" };
+        for page in [
+            gate_asking(assert_linking(&credentials, adding())),
+            operation_asking(assert_linking(&credentials, adding())),
+        ] {
+            assert_eq!(page.html.matches(LINK_BOX).count(), 1, "{}", page.html);
+            let tag = tags(&page.html).into_iter().find(|t| t.contains("make_link")).unwrap();
+            assert_eq!(tag, "input type=\"checkbox\" name=\"make_link\" value=\"1\"");
+            // After the add box, which APPROVE takes as the first checkbox, and still inside the form.
+            let html = &page.html;
+            assert!(html.find("<input type=\"checkbox\">").unwrap() < html.find(LINK_BOX).unwrap(), "{html}");
+            assert!(html.find(LINK_BOX).unwrap() < html.find("</form>").unwrap(), "{html}");
+        }
+        // Everywhere else, none: a first passkey, a full account, an allowance, no passkeys here at all.
+        let unavailable = || PasskeyAsk::Unavailable { why: crate::webauthn::NoRp::IpLiteral };
+        for page in [
+            gate_asking(enroll()),
+            operation_asking(enroll()),
+            gate_asking(assert_with(&credentials)),
+            operation_asking(assert_with(&credentials)),
+            gate_asking(assert_adding(&credentials, adding())),
+            operation_asking(assert_adding(&credentials, adding())),
+            gate_asking(allow_with(&credentials, adding())),
+            operation_asking(allow_with(&credentials, adding())),
+            gate_asking(unavailable()),
+            operation_asking(unavailable()),
+        ] {
+            assert!(!page.html.contains("make_link"), "{}", page.html);
+        }
+        // Without the add part it would pass for the add box in APPROVE, so `link` alone adds nothing.
+        let alone = PasskeyAsk::Assert {
+            challenge: "Y2hhbGxlbmdl".into(),
+            rp_id: "bd.example.com",
+            credentials: &credentials,
+            add: None,
+            link: true,
+        };
+        let page = gate_asking(alone);
+        assert_eq!(page, gate_asking(assert_with(&credentials)));
+    }
+
+    #[test]
+    fn the_link_box_is_the_only_difference_from_the_pinned_pages() {
+        // The block below `the_pages_without_an_allowance_are_pinned` is never edited, so its values are repeated.
+        const APPROVE_SCRIPT: &str = "FthMszPRPfefvNe8/2nrVx7xAc3V330zjaEmTszzZ1Q=";
+        const GATE_ADD_HTML: &str = "JWYNr7VhF5OhfpDEx8EPrqSKP1oBuWF8OVPmjgamoYs=";
+        const OPERATION_ADD_HTML: &str = "M5TKM+Jk/WRbNCrELKPcHbscJXkWSbGhy1SZiTh/YRk=";
+        const ADD_CSP: &str = "k2Xtfe+SqoPZy7TXCh+6nOascBm01lrJndgtfTYfIfc=";
+        // The pages production renders for 1 to 98 passkeys.
+        const GATE_LINK_HTML: &str = "ILT3YwXuD8rSVPPGVFJBfgg34I5SvOaGHqFV4sGo/7A=";
+        const OPERATION_LINK_HTML: &str = "rYyC6Ge33Q3UwiNtrVtdgepRlsDG3WRCMG+xKsJIsjM=";
+
+        let hash = |text: &str| STANDARD.encode(Sha256::digest(text.as_bytes()));
+        let credentials = ["AAAAAAAAAAAAx1zQ".to_string(), "AAAAAAAAAAAAy2zQ".to_string()];
+        let adding =
+            || PasskeyAdd { challenge: "YWRkLWNoYWxsZW5nZQ".into(), user: "dXNlcg".into(), name: "github:octocat" };
+        assert_eq!(hash(APPROVE), APPROVE_SCRIPT, "APPROVE");
+        let box_line = format!("{LINK_BOX}\n");
+        for (what, page, pinned, golden) in [
+            ("gate", gate_asking(assert_linking(&credentials, adding())), GATE_ADD_HTML, GATE_LINK_HTML),
+            (
+                "operation",
+                operation_asking(assert_linking(&credentials, adding())),
+                OPERATION_ADD_HTML,
+                OPERATION_LINK_HTML,
+            ),
+        ] {
+            assert_eq!(page.status, 200, "{what}");
+            assert_eq!(page.html.matches(LINK_BOX).count(), 1, "{what}: {}", page.html);
+            assert_eq!(hash(&page.html.replacen(&box_line, "", 1)), pinned, "{what}: {}", page.html);
+            assert_eq!(hash(&page.csp), ADD_CSP, "{what}: {}", page.csp);
+            assert_eq!(script_of(&page), APPROVE, "{what}");
+            assert_eq!(hash(&page.html), golden, "{what}: {}", page.html);
+        }
+    }
+
+    /// `page` runs `script` alone, by its hash, and its forms post to
+    /// `form_action` alone.
+    fn runs_only(what: &str, page: &Page, script: &str, form_action: &str) {
+        let hash = STANDARD.encode(Sha256::digest(script.as_bytes()));
+        assert_eq!(page.html.matches("<script").count(), 1, "{what}: {}", page.html);
+        assert_eq!(script_of(page), script, "{what}");
+        assert_eq!(page.csp.matches("script-src").count(), 1, "{what}: {}", page.csp);
+        assert_eq!(page.csp.matches("sha256-").count(), 2, "{what}, the style and the script: {}", page.csp);
+        let allowed = format!("; script-src 'sha256-{hash}'; form-action {form_action}; frame-ancestors 'none';");
+        assert!(page.csp.contains(&allowed), "{what}: {}", page.csp);
+        assert!(page.csp.starts_with("default-src 'none'; style-src 'sha256-"), "{what}: {}", page.csp);
+        assert!(!page.csp.contains("unsafe-"), "{what}: {}", page.csp);
+        for tag in tags(&page.html) {
+            let names = tag.split('"').step_by(2).collect::<Vec<_>>().join(" ");
+            assert!(!names.split_whitespace().skip(1).any(|a| a.to_ascii_lowercase().starts_with("on")), "{tag}");
+        }
+    }
+
+    #[test]
+    fn the_link_pages_run_one_script_each_by_its_hash() {
+        let credentials = ["AAAAAAAAAAAAx1zQ".to_string()];
+        let back = "https://app.example/cb";
+        let answers = [
+            ("a notice", notice(200, "Approved", "It went through."), 200),
+            ("a refused notice", notice(409, "Not ready", "Not yet."), 409),
+            ("a refusal", refusal(403, "Not approved", "No.", None), 403),
+            ("a refusal with a way back", refusal(503, "Busy", "Later.", Some(back)), 503),
+        ];
+        runs_only("landing", &landing_link(LINK_ACTION), OPEN_LINK, "'self'");
+        runs_only("registration", &register_page(&credentials), REGISTER_LINK, "'self'");
+        for (what, answer, status) in answers {
+            for (approved, full) in [(true, false), (false, false), (true, true), (false, true)] {
+                let page = with_link(answer.clone(), &preview_link(approved, full));
+                assert_eq!(page.status, status, "{what}");
+                runs_only(what, &page, COPY_LINK, "'none'");
+            }
+        }
+        // Nothing here but the policy's script moves: the rest of an answer's policy stays as it was.
+        let answer = notice(200, "Approved", "It went through.");
+        let hash = STANDARD.encode(Sha256::digest(COPY_LINK.as_bytes()));
+        let linked = with_link(answer.clone(), &preview_link(true, false));
+        assert_eq!(linked.csp.replacen(&format!("script-src 'sha256-{hash}'; "), "", 1), answer.csp);
+        // Those three scripts keep off what no page may do.
+        for script in [OPEN_LINK, REGISTER_LINK, COPY_LINK] {
+            for banned in ["innerHTML", "outerHTML", "insertAdjacentHTML", "eval(", "Function(", "document.write"] {
+                assert!(!script.contains(banned), "{banned}: {script}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_landing_page_is_the_same_for_every_link_and_holds_none() {
+        let page = landing_link(LINK_ACTION);
+        assert_eq!(page.status, 200);
+        assert_eq!(page, landing_link(LINK_ACTION), "the same bytes every time");
+        // The form posts to the address with no fragment: a redirect would keep one.
+        let action = format!("action=\"{LINK_ACTION}\"");
+        assert!(page.html.contains(&action), "{}", page.html);
+        let form = tags(&page.html).into_iter().find(|t| t.starts_with("form ")).unwrap();
+        assert!(!form.contains('#') && !form.contains('?'), "{form}");
+        assert!(page.html.contains("<input type=\"hidden\" name=\"link\" value=\"\">"), "{}", page.html);
+        assert!(
+            page.html.contains(&format!("<button type=\"submit\" class=\"primary\">{PASSKEY_LINK_CONTINUE}</button>"))
+        );
+        assert!(!page.html.contains(" disabled"), "a press of the button is what sends it: {}", page.html);
+        assert!(
+            page.html
+                .contains(&format!("<noscript><p class=\"lead\">{}</p></noscript>", escape(PASSKEY_LINK_NO_SCRIPT)))
+        );
+        // The script moves the fragment and clears it, and leaves sending it to the person's press.
+        assert!(OPEN_LINK.contains("form.elements.link.value=location.hash.slice(1);"));
+        assert!(OPEN_LINK.contains("history.replaceState(null,'',location.pathname);"));
+        assert!(!OPEN_LINK.contains("submit") && !OPEN_LINK.contains("click"), "{OPEN_LINK}");
+        for read in ["search", "href", "fetch", "XMLHttpRequest", "cookie", "Storage"] {
+            assert!(!OPEN_LINK.contains(read), "{read}: {OPEN_LINK}");
+        }
+    }
+
+    #[test]
+    fn a_live_link_goes_on_to_sign_in_by_a_refresh_and_a_link() {
+        let page = sign_in_onward("https://bd.example.com/oauth/choose?flow=a\"b&c=d");
+        let url = "https://bd.example.com/oauth/choose?flow=a&quot;b&amp;c=d";
+        assert_eq!(page.status, 200);
+        let refresh = format!("<meta http-equiv=\"refresh\" content=\"0; url={url}\">");
+        assert!(page.html.contains(&refresh), "{}", page.html);
+        assert!(page.html.contains(&format!("<a href=\"{url}\">{PASSKEY_LINK_CONTINUE}</a>")), "{}", page.html);
+        assert!(!page.html.contains("<form") && !page.html.contains("<script"), "{}", page.html);
+        assert!(page.csp.contains("form-action 'none';") && !page.csp.contains("script-src"), "{}", page.csp);
+    }
+
+    #[test]
+    fn the_notices_of_a_link_tell_nothing_of_why() {
+        assert_eq!(link_unusable(), link_unusable());
+        let page = link_unusable();
+        assert_eq!(page.status, 404);
+        assert_eq!(
+            PASSKEY_LINK_UNUSABLE,
+            "This link can't be used. Links work once, for a short time. Make a new one at an approval on a device \
+that holds a passkey."
+        );
+        assert!(
+            page.html.contains(&format!("<p class=\"lead\">{}</p>", escape(PASSKEY_LINK_UNUSABLE))),
+            "{}",
+            page.html
+        );
+        assert!(!page.html.contains("<form") && !page.html.contains("<a "), "{}", page.html);
+        for reason in ["expired", "replaced", "cancelled", "unknown", "wrong", "account", "used up", "already"] {
+            for copy in [PASSKEY_LINK_UNUSABLE_TITLE, PASSKEY_LINK_UNUSABLE] {
+                assert!(!copy.to_lowercase().contains(reason), "{reason} in {copy}");
+            }
+        }
+        for (page, status, copy) in [(link_limit(), 409, PASSKEY_LINK_LIMIT), (link_failed(), 403, PASSKEY_LINK_FAILED)]
+        {
+            assert_eq!(page.status, status);
+            assert!(page.html.contains(&escape(copy)), "{}", page.html);
+            assert!(!page.html.contains("<form") && !page.csp.contains("script-src"), "{}", page.html);
+        }
+    }
+
+    #[test]
+    fn a_links_page_registers_a_passkey_and_approves_nothing() {
+        let credentials = ["AAAAAAAAAAAAx1zQ".to_string(), "AAAAAAAAAAAAy2zQ".to_string()];
+        let page = register_page(&credentials);
+        let html = &page.html;
+        assert_eq!(page.status, 200);
+        // The names the approval pages' create() uses, and every passkey the account holds.
+        let form = "<form method=\"post\" action=\"https://bd.example.com/oauth/passkey-link/register\" class=\"actions\" \
+data-passkey=\"create\" data-challenge=\"Y2hhbGxlbmdl\" data-rp=\"bd.example.com\" data-user=\"dXNlcg\" \
+data-name=\"github:octocat\" data-credentials=\"AAAAAAAAAAAAx1zQ AAAAAAAAAAAAy2zQ\">";
+        assert!(html.contains(form), "{html}");
+        // The page's id and a registration's five fields: none an approval's POST would take.
+        let names: Vec<&str> =
+            html.match_indices(" name=\"").map(|(at, _)| html[at + 7..].split('"').next().unwrap()).collect();
+        assert_eq!(
+            names,
+            ["viewport", "robots", "id", "credential", "client_data", "authenticator_data", "public_key", "algorithm"]
+        );
+        assert!(html.contains("<input type=\"hidden\" name=\"id\" value=\"c0ffee\">"), "{html}");
+        // Rendered disabled, as the script enables it only where a passkey can be registered.
+        assert_eq!(html.matches("<button").count(), 1, "{html}");
+        assert!(html.contains("<button type=\"submit\" class=\"primary\" disabled>Add the passkey</button>"), "{html}");
+        assert!(
+            html.contains(
+                "<p class=\"lead\">Add a passkey on this device for github:octocat. This approves nothing.</p>"
+            )
+        );
+        assert!(html.contains("role=\"status\" aria-live=\"polite\""), "{html}");
+        for (attribute, copy) in [
+            ("data-unsupported", PASSKEY_LINK_UNSUPPORTED),
+            ("data-waiting", PASSKEY_WAITING),
+            ("data-cancelled", PASSKEY_LINK_CANCELLED),
+            ("data-held", PASSKEY_LINK_HELD),
+        ] {
+            assert!(html.contains(&format!("{attribute}=\"{}\"", escape(copy))), "{attribute}: {html}");
+        }
+        assert!(
+            html.contains(&format!("<noscript><p class=\"lead\">{}</p></noscript>", escape(PASSKEY_LINK_NO_SCRIPT)))
+        );
+        // It speaks of an approval once, to say there is none.
+        assert_eq!(html.to_lowercase().matches("approv").count(), 1, "{html}");
+        assert!(html.contains("This approves nothing"), "{html}");
+
+        // Every value escaped.
+        let evil = "\"><script>alert(1)</script>\u{202E}";
+        let shown = "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;";
+        let excluded = [evil.to_string()];
+        let hostile = LinkAsk {
+            challenge: evil.into(),
+            rp_id: evil,
+            user_handle: evil.into(),
+            user_name: evil,
+            excluded: &excluded,
+        };
+        let page = register_link(evil, evil, evil, &hostile);
+        assert!(!page.html.contains("<script>alert"), "{}", page.html);
+        for attribute in ["action", "data-challenge", "data-rp", "data-user", "data-name", "data-credentials"] {
+            assert!(page.html.contains(&format!("{attribute}=\"{shown}")), "{attribute}: {}", page.html);
+        }
+        assert!(page.html.contains(&format!("name=\"id\" value=\"{shown}")), "{}", page.html);
+        assert!(page.html.contains(&format!("for {shown}\\u202e. This approves")), "{}", page.html);
+    }
+
+    #[test]
+    fn a_links_script_runs_a_registration_and_nothing_else() {
+        let script = REGISTER_LINK;
+        assert_eq!(script.matches("navigator.credentials.create(").count(), 1);
+        assert!(!script.contains("navigator.credentials.get("), "{script}");
+        assert_eq!(script.matches("userVerification:'required'").count(), 1);
+        assert_eq!(script.matches("attestation:'none'").count(), 1);
+        assert!(script.contains("alg:-7}") && script.contains("alg:-257}") && script.contains("timeout:300000"));
+        assert!(script.contains("excludeCredentials:known()") && script.contains("challenge:bytes(d.challenge)"));
+        assert!(script.contains("user:{id:bytes(d.user),name:d.name,displayName:d.name}"));
+        assert!(script.contains("status.textContent=t||''"));
+        // Fills the five fields the server reads, and no field of an assertion.
+        for name in ["credential", "client_data", "authenticator_data", "public_key", "algorithm"] {
+            assert_eq!(script.matches(&format!("put('{name}',")).count(), 1, "{name}");
+        }
+        assert!(!script.contains("signature") && !script.to_lowercase().contains("approv"), "{script}");
+        // ARMING's focus rule, and one ceremony at a time.
+        assert!(script.contains("if(busy||!since||Date.now()-since<600)return;"));
+        assert!(script.contains("addEventListener('blur',function(){since=0;});"));
+        // Only a browser that can register enables the button.
+        let able = between(script, "var able=", "button.disabled=false;");
+        assert!(able.contains("typeof AuthenticatorAttestationResponse.prototype.getPublicKey==='function'"), "{able}");
+        assert!(able.contains("if(!able){say(m.unsupported);return;}"), "{able}");
+        // A cancelled or failed create() posts nothing and can be tried again; a device holding a passkey is told so.
+        assert_eq!(script.matches("form.submit();").count(), 1);
+        let caught = between(script, ".catch(function(e){", "});");
+        assert!(caught.contains("busy=false;button.disabled=false;"), "{caught}");
+        assert!(caught.contains("e.name==='InvalidStateError'?m.held:m.cancelled"), "{caught}");
+        assert!(!caught.contains("form.submit"), "{caught}");
+    }
+
+    #[test]
+    fn an_answer_shows_the_link_under_the_outcome() {
+        let answer = notice(200, "Approved", "It went through.");
+        let page = with_link(answer.clone(), &preview_link(true, false));
+        let html = &page.html;
+        let url = preview_link(true, false).url;
+        assert_eq!(html.matches(url).count(), 1, "{html}");
+        assert!(
+            html.contains(&format!("readonly size=\"32\" aria-label=\"{PASSKEY_LINK_FIELD}\" value=\"{url}\">")),
+            "{html}"
+        );
+        assert!(
+            html.contains(&format!("<button type=\"button\" class=\"primary\">{PASSKEY_LINK_COPY}</button>")),
+            "{html}"
+        );
+        assert!(html.contains("until 2026-11-02 01:45 UTC."), "{html}");
+        // The outcome first, then the link, then the brand's row.
+        let outcome = html.find("It went through.").unwrap();
+        let shown = html.find(PASSKEY_LINK_SHOWN).unwrap();
+        let bar = html.find("<div class=\"bar\">").unwrap();
+        assert!(outcome < shown && shown < bar, "{html}");
+        assert_eq!(html.matches("<div class=\"bar\">").count(), 1, "{html}");
+        // No more than the block and its script over the page it was.
+        let script = format!("<script>{COPY_LINK}</script>\n");
+        let start = html.find("<p class=\"lead\">You also").unwrap();
+        let without = format!("{}{}", &html[..start], &html[bar..]).replacen(&script, "", 1);
+        assert_eq!(without, answer.html);
+        assert!(html.find(&script).unwrap() < html.find("</body>").unwrap(), "{html}");
+
+        // What is said changes with the outcome.
+        let still = escape(PASSKEY_LINK_STILL_WORKS);
+        let full = escape(PASSKEY_LINK_FULL);
+        for (approved, room, says_still, says_full) in [
+            (true, true, false, false),
+            (false, true, true, false),
+            (true, false, false, true),
+            (false, false, true, true),
+        ] {
+            let html = with_link(answer.clone(), &preview_link(approved, !room)).html;
+            assert_eq!(html.contains(&still), says_still, "{html}");
+            assert_eq!(html.contains(&full), says_full, "{html}");
+        }
+
+        // The values go in escaped, and a page's own text never comes into it.
+        let page = with_link(
+            answer.clone(),
+            &LinkShown { url: "https://x/\"><script>a</script>", until: "<b>", approved: true, full: false },
+        );
+        assert!(!page.html.contains("<script>a") && !page.html.contains("<b>"), "{}", page.html);
+        assert!(page.html.contains("value=\"https://x/&quot;&gt;&lt;script&gt;a&lt;/script&gt;\""), "{}", page.html);
+
+        // The script copies the field, or selects it where the browser will not, and says so as text.
+        assert!(COPY_LINK.contains("navigator.clipboard.writeText(field.value)"));
+        assert!(COPY_LINK.contains("field.select();") && COPY_LINK.contains(",pick);"));
+        assert!(COPY_LINK.contains("status.textContent=status.dataset.copied;"));
+        assert!(COPY_LINK.contains("status.textContent=status.dataset.select;"));
+        for (attribute, copy) in [("data-copied", PASSKEY_LINK_COPIED), ("data-select", PASSKEY_LINK_SELECT)] {
+            assert!(html.contains(&format!("{attribute}=\"{}\"", escape(copy))), "{attribute}: {html}");
+        }
+    }
+
+    #[test]
+    fn the_links_warning_is_the_agreed_text_and_is_filled_with_no_name() {
+        assert_eq!(PASSKEY_LINK_SHOWN, "You also have a link for another device:");
+        assert_eq!(
+            PASSKEY_LINK_WARNING,
+            "Open this on your own new device. Don't send it to anyone else, whoever asks: anyone with this link and \
+your sign-in can add a passkey to your account."
+        );
+        assert_eq!(PASSKEY_LINK_STILL_WORKS, "The link still works. You can try the approval again.");
+        assert_eq!(
+            PASSKEY_LINK_FULL,
+            "This account now holds the most passkeys it can, so this link can't add another until one is removed."
+        );
+
+        // Whatever the answer names, the link's block names no one: it takes the link and its end, no more.
+        let answer = notice(200, "Approved", "Gate g in proj is recorded as approved by github:octocat.");
+        let html = with_link(answer, &preview_link(false, true)).html;
+        let warning =
+            format!("<span>{} It works once, until 2026-11-02 01:45 UTC.</span>", escape(PASSKEY_LINK_WARNING));
+        assert!(html.contains(&warning), "{html}");
+        let block = between(&html, PASSKEY_LINK_SHOWN, "<div class=\"bar\">");
+        assert!(block.contains(&warning) && !block.contains("octocat") && !block.contains("proj"), "{block}");
+    }
+
+    #[test]
+    fn the_link_pages_are_pinned() {
+        const OPEN_LINK_SCRIPT: &str = "DPh9tyyLbbOZnRs+puH3NdswX2dUuwi9wzReVh81OcU=";
+        const REGISTER_LINK_SCRIPT: &str = "qiWLnlXtnw/o/4NyeH5DKn+wFHTOLrxEoo52vovFQ9g=";
+        const COPY_LINK_SCRIPT: &str = "ilTopjb6cxwOIxr7CZ6XhvBHZ0XWP2jLQRhGQDqvfCg=";
+        const LANDING_HTML: &str = "ZRHqiIicQV9xMBF3izEVKI15GFUSEH5GGvZv+AVETL8=";
+        const LANDING_CSP: &str = "pJmUbrVJOAFOijV8nPzVsdF6sG0VppR6bD22zoFU99s=";
+        const REGISTER_HTML: &str = "Ajs+v+0qj+MT71iieUj5ccKBPFFgUr4iwtu7mqO497g=";
+        const REGISTER_CSP: &str = "0Ujx/gDRHROs6bhXb+18bcG711K285XFxbhyzU7Qixo=";
+        const SHOWN_HTML: &str = "CX77W5EhTTeZuZAM2t9D7c1SE6kNn/VDBpGo7Cv4Wi8=";
+        const SHOWN_CSP: &str = "I9bSIleKkqHo1w9QdmWHEMvsHE/3O5N226Sg9Q66w3w=";
+
+        let hash = |text: &str| STANDARD.encode(Sha256::digest(text.as_bytes()));
+        assert_eq!(hash(OPEN_LINK), OPEN_LINK_SCRIPT, "OPEN_LINK");
+        assert_eq!(hash(REGISTER_LINK), REGISTER_LINK_SCRIPT, "REGISTER_LINK");
+        assert_eq!(hash(COPY_LINK), COPY_LINK_SCRIPT, "COPY_LINK");
+        let credentials = ["AAAAAAAAAAAAx1zQ".to_string(), "AAAAAAAAAAAAy2zQ".to_string()];
+        let answer = notice(409, "Not ready", "This gate isn't ready to approve yet.");
+        for (what, page, html, csp) in [
+            ("landing", landing_link(LINK_ACTION), LANDING_HTML, LANDING_CSP),
+            ("registration", register_page(&credentials), REGISTER_HTML, REGISTER_CSP),
+            ("shown", with_link(answer, &preview_link(false, true)), SHOWN_HTML, SHOWN_CSP),
+        ] {
+            assert_eq!(hash(&page.html), html, "{what}: html: {}", page.html);
+            assert_eq!(hash(&page.csp), csp, "{what}: csp: {}", page.csp);
+        }
     }
 
     // pinned-goldens:begin bd-h6q45.1 S1: never edit; a failure here means production output changed

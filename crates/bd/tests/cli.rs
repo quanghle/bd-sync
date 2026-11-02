@@ -8224,6 +8224,94 @@ fn serve_passkey_list_shows_a_live_allowance() {
     assert_eq!((ws.ok(&list), ws.ok(&json_list)), (text, json));
 }
 
+impl AllowanceRoot {
+    /// Put in a live link of corp:alice, as an approval leaves it, vouched
+    /// for by her first passkey: its expiry.
+    fn put_link(&self) -> i64 {
+        let expires = bd_core::Timestamp::now().millis() + 15 * 60 * 1000;
+        self.db()
+            .execute(
+                "INSERT INTO passkey_links (issuer, subject, id, secret_hash, vouched_by, workspace, created_at, \
+                 expires_at) VALUES (?1, 's1', 'aaaaaaaaaaaa11112222333344445555', 'the-hash', 'credential0000', \
+                 'proj', 1, ?2)",
+                rusqlite::params![Self::ISSUER, expires],
+            )
+            .unwrap();
+        expires
+    }
+
+    fn links(&self) -> i64 {
+        self.db().query_row("SELECT count(*) FROM passkey_links", [], |r| r.get(0)).unwrap()
+    }
+}
+
+const CANCEL_LINK: [&str; 5] = ["serve", "passkey", "cancel-link", "--account", "corp:alice"];
+
+#[test]
+fn serve_passkey_cancel_link_ends_the_live_one() {
+    let ws = AllowanceRoot::new(1);
+    ws.put_link();
+    let list = ["serve", "passkey", "list", "--account", "corp:alice"];
+    assert!(ws.ok(&list).contains("link until "), "{}", ws.ok(&list));
+
+    assert_eq!(ws.ok(&CANCEL_LINK), "✓ Cancelled the link of corp:alice\n");
+    assert_eq!(ws.links(), 0);
+    assert!(!ws.ok(&list).contains("link until "));
+    assert_eq!(ws.events("passkey_link_ended"), ["link aaaaaaaaaaaa vouched by credential00: cancelled"]);
+
+    // Nothing live: not an error, says so, writes nothing.
+    let before = ws.snapshot();
+    assert_eq!(ws.ok(&CANCEL_LINK), "corp:alice has no link to cancel\n");
+    assert_eq!(ws.json(&CANCEL_LINK), serde_json::json!({ "account": "corp:alice", "cancelled": false }));
+    assert_eq!(ws.snapshot(), before);
+
+    ws.put_link();
+    assert_eq!(ws.json(&CANCEL_LINK), serde_json::json!({ "account": "corp:alice", "cancelled": true }));
+    assert_eq!(ws.events("passkey_link_ended").len(), 2);
+
+    // By login too, and an account nobody knows is refused.
+    ws.put_link();
+    assert!(ws.ok(&["serve", "passkey", "cancel-link", "--account", "alice"]).contains("Cancelled"));
+    let out = ws.bd(&["serve", "passkey", "cancel-link", "--account", "nobody"]);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+}
+
+#[test]
+fn serve_passkey_cancel_link_never_goes_to_a_remote() {
+    // A client's workspace names a server, here unreachable: the command is never sent to it.
+    let ws = AllowanceRoot::new(1);
+    ws.put_link();
+    std::fs::create_dir_all(ws.dir.path().join(".bd")).unwrap();
+    std::fs::write(ws.dir.path().join(".bd/remote.toml"), "url = \"https://127.0.0.1:9/w/proj\"\n").unwrap();
+    let mut args = CANCEL_LINK.to_vec();
+    args.extend(["--remote", "https://127.0.0.1:9/w/proj"]);
+    assert_eq!(ws.ok(&args), "✓ Cancelled the link of corp:alice\n");
+    assert_eq!(ws.links(), 0, "it ran on the root named here");
+
+    // Off the server host there is no root to run on: refused, and nothing is made.
+    let dir = tempfile::tempdir().unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let mut args = CANCEL_LINK.to_vec();
+    args.extend(["--remote", "https://127.0.0.1:9/w/proj", "--root", elsewhere.to_str().unwrap()]);
+    let out = Ws::cmd_in(dir.path(), "tester", &args).output().unwrap();
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing made in the root");
+}
+
+#[test]
+fn serve_token_events_takes_the_link_kinds() {
+    let ws = AllowanceRoot::new(1);
+    ws.put_link();
+    ws.ok(&CANCEL_LINK);
+    assert_eq!(ws.events("passkey_link_ended").len(), 1);
+    assert!(ws.events("passkey_link_made").is_empty(), "this row was put in by hand");
+    assert_eq!(ws.events("passkey_link_made,passkey_link_ended").len(), 1);
+    let help = Ws::cmd_in(ws.dir.path(), "tester", &["serve", "token", "events", "--help"]).output().unwrap();
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("passkey_link_made") && help.contains("passkey_link_ended"), "{help}");
+}
+
 #[test]
 fn serve_passkey_allow_add_keeps_its_audit_trail() {
     let ws = AllowanceRoot::new(1);

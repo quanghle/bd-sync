@@ -199,6 +199,26 @@ fn a_flow_opens_only_as_the_kind_it_was_sealed_as() {
     assert_eq!(sealer.open(GATE_BEGIN, &begun), Some(gate_pending()));
     assert_eq!(sealer.open(CHOOSING, &begun), None);
     assert_eq!(sealer.open(AT_PROVIDER, &begun), None);
+    // A link's opens as a link's, for its own step only, and its hop goes on to the chooser only.
+    let linking = || Pending { then: Then::Link { id: "l1".into() }, browser: "b".into(), until: 1, at: None };
+    for step in [LINK_BEGIN, CHOOSING, AT_PROVIDER] {
+        let sealed = sealer.seal(step, &linking()).unwrap();
+        assert_eq!(sealer.open(step, &sealed), Some(linking()), "{step}");
+        for other in [LINK_BEGIN, CHOOSING, AT_PROVIDER, GATE_BEGIN, OP_BEGIN].into_iter().filter(|s| *s != step) {
+            assert_eq!(sealer.open(other, &sealed), None, "sealed for {step}, opened for {other}");
+        }
+    }
+    // Sealed under a link's AAD, nothing else is taken for a link's flow.
+    for kind in [authorize(), gate_pending()] {
+        let forged = sealer.seal("link:provider", &kind).unwrap();
+        assert_eq!(sealer.open(AT_PROVIDER, &forged), None);
+    }
+    // Each kind's AAD is its own.
+    let aads = [Kind::Authorize, Kind::Gate, Kind::Operation, Kind::Link].map(|kind| aad(AT_PROVIDER, kind));
+    assert_eq!(aads, ["provider", "gate:provider", "op:provider", "link:provider"]);
+    assert_eq!(linking().then.link(), Some("l1"));
+    assert_eq!((authorize().then.link(), gate_pending().then.link()), (None, None));
+    assert_eq!(linking().then.operation(), None);
 }
 
 #[test]
@@ -2193,11 +2213,11 @@ fn store_failures_after_decoding_keep_the_credential_prefix() {
         assert_eq!(page(&answer).status, 200);
     });
     let _ = gate::take_logged();
-    // The table gone at version 5: every lookup fails, and server.db is not migrated again.
+    // The table gone at version 6: every lookup fails, and server.db is not migrated again.
     let conn = rusqlite::Connection::open(crate::server_db::path(root.path())).unwrap();
     conn.execute_batch("DROP TABLE passkeys").unwrap();
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     drop(conn);
     with_ctx(root.path(), &flows, &gates, |cx| {
         let c = ceremony(false);
@@ -3125,7 +3145,8 @@ struct Line {
     detail: String,
     credential: String,
     added: String,
-    /// A gate's line always has it, an operation's only for an allowance.
+    /// A gate's line always has it, an operation's only for an allowance or
+    /// a link.
     passkey: Option<&'static str>,
 }
 
@@ -3225,7 +3246,9 @@ impl Approving {
     fn approved(self, credential: &str, passkey: &'static str) -> Line {
         let (detail, passkey) = match self {
             Approving::Gate => ("", Some(passkey)),
-            Approving::Operation => ("performed", passkey.contains("allowance").then_some(passkey)),
+            Approving::Operation => {
+                ("performed", (passkey.contains("allowance") || passkey.contains("link made")).then_some(passkey))
+            }
         };
         Line {
             outcome: "approved".into(),
@@ -3243,7 +3266,7 @@ impl Approving {
             Approving::Operation => (
                 "passkey_refused",
                 format!("passkey refused: {label}"),
-                label.starts_with("allowance: ").then_some(label),
+                (label.starts_with("allowance: ") || label == "link not offered").then_some(label),
             ),
         };
         Line { outcome: outcome.into(), detail, credential: credential.into(), added: String::new(), passkey }
@@ -3254,6 +3277,7 @@ impl Approving {
 fn drained() {
     let _ = gate::take_logged();
     let _ = operation::take_recorded_with_passkey_field();
+    let _ = link::take_recorded();
     settled();
 }
 
@@ -3271,6 +3295,7 @@ struct Watching {
     gates: Mutex<std::collections::VecDeque<Result<Approved, bd_core::Error>>>,
     operations: Mutex<std::collections::VecDeque<Result<Performed, bd_core::Error>>>,
     seen: Mutex<Vec<KeptAll>>,
+    links_seen: Mutex<Vec<Vec<LinkRow>>>,
 }
 
 impl Watching {
@@ -3280,6 +3305,7 @@ impl Watching {
             gates: Default::default(),
             operations: Default::default(),
             seen: Default::default(),
+            links_seen: Default::default(),
         }
     }
 
@@ -3295,6 +3321,17 @@ impl Watching {
     fn seen(&self) -> Vec<KeptAll> {
         std::mem::take(&mut *self.seen.lock().unwrap())
     }
+
+    /// The links kept when each call since the last one ran.
+    fn links_seen(&self) -> Vec<Vec<LinkRow>> {
+        std::mem::take(&mut *self.links_seen.lock().unwrap())
+    }
+
+    /// Note what a call found kept, as it ran.
+    fn saw(&self) {
+        self.seen.lock().unwrap().push(kept_all(&self.root));
+        self.links_seen.lock().unwrap().push(links(&self.root));
+    }
 }
 
 impl Gates for Watching {
@@ -3303,7 +3340,7 @@ impl Gates for Watching {
     }
 
     fn approve(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<Approved, bd_core::Error> {
-        self.seen.lock().unwrap().push(kept_all(&self.root));
+        self.saw();
         let next = self.gates.lock().unwrap().pop_front();
         next.unwrap_or(Ok(Approved::Opened { unblocked: vec![], completed: vec![] }))
     }
@@ -3315,7 +3352,7 @@ impl Operations for Watching {
     }
 
     fn perform(&self, _: &OperationRequest, _: &str, _: Option<&str>) -> Result<Performed, bd_core::Error> {
-        self.seen.lock().unwrap().push(kept_all(&self.root));
+        self.saw();
         self.operations.lock().unwrap().pop_front().unwrap_or(Ok(Performed::Closed))
     }
 }
@@ -3378,6 +3415,7 @@ fn refused_in(
     assert_eq!(passkey::take_registered(), 0, "{flow:?} {label}");
     assert_eq!(watching.seen(), vec![], "{flow:?} {label}: nothing approved");
     assert_eq!(kept_all(cx.root), before, "{flow:?} {label}: nothing written");
+    assert_eq!(link::take_recorded(), vec![], "{flow:?} {label}: no link made");
     assert!(counter.get() > refused_before, "{flow:?} {label}");
     assert_eq!(flow.line(), flow.refused(label, credential), "{flow:?} {label}");
 }
@@ -3414,8 +3452,12 @@ fn what_an_allowance_refusal_says() {
         Why::LimitReached,
         Why::New(Refusal::WrongChallenge),
     ] {
-        assert!(!why.is_allowance() && !why.ended(), "{why:?}");
+        assert!(!why.is_allowance() && !why.ended() && !why.is_link(), "{why:?}");
     }
+    assert!(!Why::Allowance(A::NotOffered).is_link());
+    let why = Why::LinkNotOffered;
+    assert!(why.is_link() && !why.is_allowance() && !why.ended());
+    assert_eq!((why.label(), why.detail()), ("link not offered", "passkey refused: link not offered"));
 }
 
 #[test]
@@ -3756,4 +3798,1813 @@ fn a_post_refused_before_the_passkey_leaves_the_allowance_alone() {
         });
         drained();
     }
+}
+
+/// A link as `server.db` keeps it: its id, the hash of its secret, the passkey
+/// that vouched for it, its workspace, and when it ends.
+type LinkRow = (String, String, String, String, i64);
+
+/// Every link kept, whether live or not.
+fn links(root: &std::path::Path) -> Vec<LinkRow> {
+    let conn = crate::server_db::open(root).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, secret_hash, vouched_by, workspace, expires_at FROM passkey_links ORDER BY id")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+}
+
+/// From here on no link can be written: a POST that tries answers 500.
+fn refuse_links(root: &std::path::Path) {
+    let conn = crate::server_db::open(root).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER refuse_links BEFORE INSERT ON passkey_links BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .unwrap();
+}
+
+/// `body`, with the page's box ticked.
+fn ticked(body: &str) -> String {
+    format!("{body}&make_link=1")
+}
+
+/// The secret in the link `html` shows.
+fn secret_on(html: &str) -> String {
+    let start = format!("value=\"{ISSUER}{}#", super::super::PASSKEY_LINK);
+    let at = html.find(&start).unwrap_or_else(|| panic!("no link on: {html}")) + start.len();
+    html[at..].chars().take_while(|c| *c != '"').collect()
+}
+
+fn is_a_secret(secret: &str) {
+    assert_eq!(secret.len(), 64, "{secret}");
+    assert!(secret.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)), "{secret}");
+}
+
+/// How many scripts `csp` allows, each by its hash.
+fn script_hashes(csp: &str) -> usize {
+    let script = csp.split(';').filter(|directive| directive.trim_start().starts_with("script-src"));
+    script.map(|directive| directive.matches("'sha256-").count()).sum()
+}
+
+/// The acme account enrolled with `key` and nothing logged, counted or seen
+/// since: the ceremony of the page it is shown now, offering a link.
+fn linkable(cx: &Ctx<'_>, flows: &Mutex<Flows>, watching: &Watching, key: &SoftKey) -> Ceremony {
+    enrolled(cx, flows, key);
+    drained();
+    let _ = (watching.seen(), watching.links_seen());
+    let (c, _) = opened(cx);
+    assert!(c.link);
+    c
+}
+
+#[test]
+fn a_link_is_offered_exactly_where_adding_a_passkey_is() {
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        for (n, offered) in [(0, false), (1, true), (2, true), (98, true), (99, false)] {
+            fill_to(root.path(), n);
+            let (c, credentials) = opened(cx);
+            assert_eq!(c.link, offered, "{n}");
+            assert_eq!(c.add.is_some(), offered, "{n}");
+            match passkey::ask(&c, &credentials) {
+                pages::PasskeyAsk::Assert { link, .. } => assert_eq!((link, n > 0), (offered, true), "{n}"),
+                pages::PasskeyAsk::Enroll { .. } => assert_eq!(n, 0),
+                _ => panic!("{n}: neither"),
+            }
+        }
+    });
+
+    // Under an allowance, at any count, the page has no box.
+    let root = gate_root(false);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        let c = allowed_page(cx, &flows, &SoftKey::es256());
+        assert!(c.allowance.is_some() && !c.link, "one passkey");
+        let (_, credentials) = opened(cx);
+        fill_to(root.path(), 98);
+        let (c, _) = opened(cx);
+        assert!(c.allowance.is_some() && !c.link, "98 passkeys");
+        assert!(matches!(passkey::ask(&c, &credentials), pages::PasskeyAsk::Allow { .. }));
+    });
+    drained();
+}
+
+#[test]
+fn a_box_ticked_where_the_page_did_not_offer_it_is_refused_first() {
+    let why = ("link not offered", "");
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (a, new) = (SoftKey::es256(), SoftKey::es256());
+        with_watching(&watching, &flows, |cx| {
+            // A first registration, before the account has a passkey: with a good one too.
+            let enroll = ceremony(true);
+            for body in [ticked(&registration(&a, &enroll, &Tamper::default())), "make_link=1".to_string()] {
+                refused_in(flow, cx, &flows, &watching, &enroll, &body, why);
+            }
+            assert!(kept_passkeys(root.path()).is_empty(), "{flow:?}");
+
+            let c = allowed_page(cx, &flows, &a);
+            let plain = ceremony(false);
+            let good = assertion(&a, &plain, 1, &Tamper::default());
+            let added = new_fields(&new.register(&adding().expect_add(), &Tamper::default()));
+            let bodies = [
+                "make_link=1".to_string(),
+                "make_link=".to_string(),
+                "make_link=0".to_string(),
+                "make_link=1&make_link=1".to_string(),
+                ticked(&good),
+                // A good ceremony's fields do not help it, nor do others' get read before it.
+                ticked(&format!("{good}&{added}")),
+                ticked(&allow_body(&new, &c, &Tamper::default())),
+                ticked("credential=%21%21%21&client_data=%21&signature=%21"),
+                ticked(&"credential=A&".repeat(4)),
+            ];
+            let live = allowances(root.path());
+            for body in &bodies {
+                refused_in(flow, cx, &flows, &watching, &plain, body, why);
+                // On a page opened under an allowance, which offers no link either.
+                refused_in(flow, cx, &flows, &watching, &c, body, why);
+            }
+            assert_eq!(allowances(root.path()), live, "{flow:?}: unspent");
+            assert_eq!(kept_passkeys(root.path())[0].counter, 0, "{flow:?}: unmoved");
+            assert_eq!(links(root.path()), vec![], "{flow:?}");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn a_link_takes_a_ceremony_that_passed_and_a_box_ticked_once() {
+    use crate::webauthn::Refusal;
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let a = SoftKey::es256();
+        let (_, prefix) = credential_of(&a);
+        with_watching(&watching, &flows, |cx| {
+            let c = linkable(cx, &flows, &watching, &a);
+            let refused = |body: &str, why: (&'static str, &str)| {
+                refused_in(flow, cx, &flows, &watching, &c, body, why);
+            };
+            let unverified = Tamper { flags: Some(0x01), ..Tamper::default() };
+            let bad = ticked(&assertion(&a, &c, 1, &unverified));
+            refused(&bad, (Refusal::UserNotVerified.label(), &prefix));
+            let (other, _) = opened(cx);
+            let elsewhere = ticked(&assertion(&a, &other, 1, &Tamper::default()));
+            refused(&elsewhere, (Refusal::WrongChallenge.label(), &prefix));
+            refused("make_link=1", ("missing fields", ""));
+
+            let good = assertion(&a, &c, 1, &Tamper::default());
+            for value in ["make_link=1&make_link=1", "make_link=0", "make_link=", "make_link=yes", "make_link=01"] {
+                refused(&format!("{good}&{value}"), ("malformed fields", ""));
+            }
+
+            assert_eq!(kept_passkeys(root.path())[0].counter, 0, "{flow:?}: unmoved");
+            assert_eq!(links(root.path()), vec![], "{flow:?}");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn a_ticked_box_shows_the_link_once_on_the_approvals_answer() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let a = SoftKey::es256();
+        let (a_id, prefix) = credential_of(&a);
+        with_watching(&watching, &flows, |cx| {
+            let c = linkable(cx, &flows, &watching, &a);
+            let body = ticked(&assertion(&a, &c, 1, &Tamper::default()));
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &body);
+            let shown = page(&answer);
+            assert_eq!(shown.status, 200, "{flow:?}: {}", shown.html);
+            let secret = secret_on(&shown.html);
+            is_a_secret(&secret);
+            let rows = links(root.path());
+            assert_eq!(rows.len(), 1, "{flow:?}");
+            let until = bd_core::Timestamp::from_millis(rows[0].4).to_rfc3339()[..16].replace('T', " ");
+            assert!(shown.html.contains(&format!("{until} UTC")), "{flow:?}: {}", shown.html);
+            assert!(shown.html.contains(pages::PASSKEY_LINK_COPY), "{flow:?}");
+            assert!(shown.html.contains(&pages::escape(pages::PASSKEY_LINK_WARNING)), "{flow:?}");
+            assert!(!shown.html.contains(&pages::escape(pages::PASSKEY_LINK_STILL_WORKS)), "{flow:?}");
+            assert!(!shown.html.contains(&pages::escape(pages::PASSKEY_LINK_FULL)), "{flow:?}");
+            assert_eq!(script_hashes(&shown.csp), 1, "{flow:?}: {}", shown.csp);
+            assert_eq!(kept_passkeys(root.path())[0].counter, 1, "{flow:?}");
+            let line = flow.line();
+            assert_eq!(line, flow.approved(&prefix, "verified, link made"), "{flow:?}");
+            let printed = format!("{line:?}");
+            assert!(!printed.contains(&secret) && !printed.contains(&a_id), "{printed}");
+            assert_eq!(passkey::take_registered(), 0, "{flow:?}");
+
+            // The same POST again, from a second tab or a reload: nothing new, and no link to show.
+            let (answer, _) = flow.send(cx, &format!("approval=p&{body}"), &flow.cookies());
+            assert_eq!(page(&answer).status, 400, "{flow:?}");
+            assert!(page(&answer).html.contains("already used"), "{flow:?}: {}", page(&answer).html);
+            assert!(!page(&answer).html.contains(&secret), "{flow:?}");
+            assert_eq!(links(root.path()), rows, "{flow:?}");
+            assert_eq!(watching.seen().len(), 1, "{flow:?}: approved once");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn a_links_secret_prints_nowhere_and_only_its_hash_is_kept() {
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let a = SoftKey::es256();
+    let (a_id, _) = credential_of(&a);
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        let (c, _) = opened(cx);
+        // Whatever the form says of the link is not read.
+        let others = "workspace=theirs&issuer=https%3A%2F%2Fevil.example&subject=mallory&actor=mallory\
+                      &vouched_by=theirs&expires_at=9999999999999&id=theirs&secret=theirs";
+        let body = format!("{}&{others}", ticked(&assertion(&a, &c, 1, &Tamper::default())));
+        let pairs = form::decode(&body).unwrap();
+        let before = now_millis();
+        let verified = passkey::verify(cx, &c, &pairs, "proj").unwrap();
+        let after = now_millis();
+
+        let made = verified.link.as_ref().expect("a link made");
+        let url = made.secret.url(ISSUER);
+        let (start, secret) = url.split_once('#').unwrap();
+        assert_eq!(start, format!("{ISSUER}{}", super::super::PASSKEY_LINK));
+        is_a_secret(secret);
+        assert!(!made.full);
+        let printed = format!("{verified:?}");
+        assert!(printed.contains("LinkSecret(..)") && !printed.contains(secret), "{printed}");
+
+        let rows = links(root.path());
+        assert_eq!(rows.len(), 1);
+        let (id, hash, vouched_by, workspace, expires_at) = &rows[0];
+        assert_eq!(hash, &auth::hash(secret), "its hash");
+        assert_ne!(hash, secret);
+        assert_eq!((id.len(), vouched_by, workspace.as_str()), (32, &a_id, "proj"));
+        assert_ne!(id, secret);
+        assert_eq!(*expires_at, made.expires_at);
+        let lasts = passkeys::LINK_TTL.as_millis() as i64;
+        assert!(((before + lasts)..=(after + lasts)).contains(expires_at), "{expires_at}");
+
+        let found = passkeys::link_by_secret(root.path(), &auth::hash(secret)).unwrap().expect("live");
+        assert_eq!((found.issuer.as_str(), found.subject.as_str()), (ACME_ISSUER, ACME_SUBJECT));
+        assert_eq!(found.workspace, "proj");
+        assert_eq!(passkeys::link_by_secret(root.path(), secret).unwrap(), None, "the secret alone finds nothing");
+        for event in events_of(root.path(), "passkey_link_made") {
+            let printed = format!("{event:?}");
+            assert!(!printed.contains(secret) && !printed.contains(hash.as_str()), "{printed}");
+        }
+    });
+    drained();
+}
+
+#[test]
+fn every_way_an_approval_ends_keeps_the_link_on_its_page() {
+    use Answering::{Gate, Operation};
+    let io = || bd_core::Error::Io(std::io::Error::other("disk full"));
+    let busy = || bd_core::Error::Busy("locked".into());
+    let locked = || bd_core::Error::Locked("locked".into());
+    let cases: Vec<(Answering, u16, bool)> = vec![
+        (Gate(Ok(Approved::Opened { unblocked: vec![], completed: vec![] })), 200, true),
+        (Gate(Ok(Approved::Resolved)), 409, false),
+        (Gate(Ok(Approved::NotArmed)), 409, false),
+        (Gate(Ok(Approved::Gone(Found::NoIssue))), 404, false),
+        (Gate(Ok(Approved::Refused("not an approver".into()))), 403, false),
+        (Gate(Err(busy())), 503, false),
+        (Gate(Err(locked())), 503, false),
+        (Gate(Err(io())), 500, false),
+        (Operation(Ok(Performed::Closed)), 200, true),
+        (Operation(Ok(Performed::Discarded { count: 1 })), 200, true),
+        (Operation(Ok(Performed::Done)), 409, false),
+        (Operation(Ok(Performed::Gone(OpFound::NoIssue))), 404, false),
+        (Operation(Ok(Performed::NotHeld)), 409, false),
+        (Operation(Ok(Performed::Changed("bd-1 is pinned now.".into()))), 409, false),
+        (Operation(Ok(Performed::Refused("claimed".into()))), 403, false),
+        (Operation(Err(busy())), 503, false),
+        (Operation(Err(locked())), 503, false),
+        (Operation(Err(io())), 500, false),
+    ];
+    for (answering, status, approved) in cases {
+        let flow = match answering {
+            Gate(_) => Approving::Gate,
+            Operation(_) => Approving::Operation,
+        };
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (a, new) = (SoftKey::es256(), SoftKey::es256());
+        with_watching(&watching, &flows, |cx| {
+            let c = linkable(cx, &flows, &watching, &a);
+            watching.answer(answering);
+            let body = ticked(&assertion(&a, &c, 1, &Tamper::default()));
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &body);
+            let shown = page(&answer);
+            let label = format!("{flow:?} {status} {approved}");
+            assert_eq!(shown.status, status, "{label}: {}", shown.html);
+            let secret = secret_on(&shown.html);
+            is_a_secret(&secret);
+            assert_eq!(shown.html.matches(&secret).count(), 1, "{label}");
+            assert_eq!(script_hashes(&shown.csp), 1, "{label}: {}", shown.csp);
+            assert_eq!(shown.html.matches("<script>").count(), 1, "{label}");
+            assert!(shown.html.contains(&pages::escape(pages::PASSKEY_LINK_WARNING)), "{label}");
+            let still = shown.html.contains(&pages::escape(pages::PASSKEY_LINK_STILL_WORKS));
+            assert_eq!(still, !approved, "{label}: {}", shown.html);
+
+            // Committed before the approval ran, whatever it answered.
+            let rows = links(root.path());
+            assert_eq!(rows.len(), 1, "{label}");
+            assert_eq!(watching.links_seen(), vec![rows.clone()], "{label}");
+            assert_eq!(rows[0].1, auth::hash(&secret), "{label}");
+
+            // And it works: the next device registers through it.
+            let spki = new.spki();
+            let (new_id, _) = credential_of(&new);
+            let row = passkeys::NewRow {
+                credential: &new_id,
+                issuer: ACME_ISSUER,
+                subject: ACME_SUBJECT,
+                provider: "acme",
+                actor: "acme:alice",
+                alg: new.alg(),
+                public_key: &spki,
+                counter: 0,
+            };
+            let linked = passkeys::insert_linked(root.path(), &rows[0].0, &row).unwrap();
+            assert_eq!(linked, passkeys::Linked::Inserted { vouched_by: rows[0].2.clone() }, "{label}");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn a_link_is_shown_over_any_answer_and_only_a_made_one() {
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let gates = FakeGates::answering(Approved::Opened { unblocked: vec![], completed: vec![] });
+    let a = SoftKey::es256();
+    with_ctx(root.path(), &flows, &gates, |cx| {
+        enrolled(cx, &flows, &a);
+        let (c, _) = opened(cx);
+        let pairs = form::decode(&ticked(&assertion(&a, &c, 1, &Tamper::default()))).unwrap();
+        let verified = passkey::verify(cx, &c, &pairs, "proj").unwrap();
+        // 2026-10-01T05:28:15.123Z: the minute it falls in.
+        let made = passkey::LinkMade { expires_at: 1790832495123, ..verified.link.unwrap() };
+        let secret = made.secret.url(ISSUER).split_once('#').unwrap().1.to_string();
+
+        // No link, no change: a page and a redirect alike.
+        let bare = pages::notice(409, "Gone", "It is gone.");
+        let untouched = passkey::shown(Answer::Page(bare.clone()), None, ISSUER, false);
+        assert_eq!(page(&untouched), &bare);
+        let there = passkey::shown(Answer::Redirect("https://app.example/".into()), None, ISSUER, true);
+        assert!(matches!(&there, Answer::Redirect(to) if to == "https://app.example/"), "{there:?}");
+
+        // A page keeps its status, and a redirect turns into a page rather than lose the link.
+        let on_page = passkey::shown(Answer::Page(bare.clone()), Some(&made), ISSUER, false);
+        assert_eq!(page(&on_page).status, 409);
+        assert_eq!(secret_on(&page(&on_page).html), secret);
+        assert!(page(&on_page).html.contains("until 2026-10-01 05:28 UTC"), "{}", page(&on_page).html);
+        let instead = passkey::shown(Answer::Redirect("https://app.example/".into()), Some(&made), ISSUER, true);
+        assert_eq!(page(&instead).status, 200);
+        assert_eq!(secret_on(&page(&instead).html), secret);
+        assert_eq!(script_hashes(&page(&instead).csp), 1, "{}", page(&instead).csp);
+        assert!(!page(&instead).html.contains("https://app.example/"), "{}", page(&instead).html);
+        let full = passkey::LinkMade { full: true, ..made };
+        let at_the_limit = passkey::shown(Answer::Page(bare), Some(&full), ISSUER, true);
+        assert!(page(&at_the_limit).html.contains(&pages::escape(pages::PASSKEY_LINK_FULL)));
+    });
+    drained();
+}
+
+#[test]
+fn both_boxes_add_the_passkey_and_make_the_link_in_one_write() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (a, b) = (SoftKey::es256(), SoftKey::rs256());
+        let ((a_id, a_prefix), (b_id, b_prefix)) = (credential_of(&a), credential_of(&b));
+        with_watching(&watching, &flows, |cx| {
+            linkable(cx, &flows, &watching, &a);
+            let c = adding().with_link();
+            let body = ticked(&add_body(&a, &b, &c, 3, &Tamper::default(), &Tamper::default()));
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &body);
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            let secret = secret_on(&page(&answer).html);
+            assert!(!page(&answer).html.contains(&pages::escape(pages::PASSKEY_LINK_FULL)), "{flow:?}");
+            assert_eq!(passkey::take_registered(), 1, "{flow:?}");
+            let kept = kept_passkeys(root.path());
+            assert_eq!(kept.len(), 2, "{flow:?}");
+            assert_eq!((kept[0].credential.as_str(), kept[0].counter), (a_id.as_str(), 3), "{flow:?}");
+            assert_eq!(kept[1].credential, b_id, "{flow:?}");
+            let rows = links(root.path());
+            assert_eq!(rows.len(), 1, "{flow:?}");
+            assert_eq!((rows[0].1.as_str(), rows[0].2.as_str()), (auth::hash(&secret).as_str(), a_id.as_str()));
+            assert_eq!(watching.links_seen(), vec![rows], "{flow:?}: committed before the approval ran");
+            let seen = watching.seen();
+            assert_eq!(seen.len(), 1, "{flow:?}");
+            assert_eq!(seen[0], kept_all(root.path()), "{flow:?}: and nothing after it");
+            let line = flow.line();
+            let expected =
+                Line { added: b_prefix.clone(), ..flow.approved(&a_prefix, "verified and added, link made") };
+            assert_eq!(line, expected, "{flow:?}");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn a_passkey_filling_the_account_says_the_link_has_no_room() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (a, b) = (SoftKey::es256(), SoftKey::es256());
+        with_watching(&watching, &flows, |cx| {
+            enrolled(cx, &flows, &a);
+            fill_to(root.path(), 98);
+            let (c, _) = opened(cx);
+            assert!(c.link && c.add.is_some(), "{flow:?}");
+            let body = ticked(&add_body(&a, &b, &c, 1, &Tamper::default(), &Tamper::default()));
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &body);
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert!(page(&answer).html.contains(&pages::escape(pages::PASSKEY_LINK_FULL)), "{flow:?}");
+            is_a_secret(&secret_on(&page(&answer).html));
+            assert_eq!(kept_passkeys(root.path()).len(), 99, "{flow:?}");
+            let rows = links(root.path());
+            assert!(passkeys::link_by_id(root.path(), &rows[0].0).unwrap().is_some(), "{flow:?}: live");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn a_box_left_unticked_changes_nothing() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (a, b) = (SoftKey::es256(), SoftKey::es256());
+        let ((_, a_prefix), (_, b_prefix)) = (credential_of(&a), credential_of(&b));
+        with_watching(&watching, &flows, |cx| {
+            let c = linkable(cx, &flows, &watching, &a);
+            refuse_links(root.path());
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &assertion(&a, &c, 1, &Tamper::default()));
+            let html = &page(&answer).html;
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {html}");
+            assert!(!html.contains(super::super::PASSKEY_LINK), "{flow:?}: {html}");
+            assert_eq!(script_hashes(&page(&answer).csp), 0, "{flow:?}");
+            assert_eq!(flow.line(), flow.approved(&a_prefix, "verified"), "{flow:?}");
+
+            let (c, _) = opened(cx);
+            let body = add_body(&a, &b, &c, 2, &Tamper::default(), &Tamper::default());
+            let (answer, _) = flow.post(cx, &flows, "q", &c, &body);
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            let line = Line { added: b_prefix.clone(), ..flow.approved(&a_prefix, "verified and added") };
+            assert_eq!(flow.line(), line, "{flow:?}");
+            assert_eq!(link::take_recorded(), vec![], "{flow:?}");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn a_link_that_cannot_be_written_stops_the_approval() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (a, b) = (SoftKey::es256(), SoftKey::es256());
+        with_watching(&watching, &flows, |cx| {
+            let c = linkable(cx, &flows, &watching, &a);
+            refuse_links(root.path());
+            let bodies = [
+                ticked(&assertion(&a, &c, 1, &Tamper::default())),
+                ticked(&add_body(&a, &b, &c, 1, &Tamper::default(), &Tamper::default())),
+            ];
+            let before = kept_all(root.path());
+            for (n, body) in bodies.iter().enumerate() {
+                let (answer, _) = flow.post(cx, &flows, &format!("p{n}"), &c, body);
+                assert_eq!(page(&answer).status, 500, "{flow:?} {n}: {}", page(&answer).html);
+                assert!(!page(&answer).html.contains(super::super::PASSKEY_LINK), "{flow:?} {n}");
+                assert_eq!(kept_all(root.path()), before, "{flow:?} {n}: nothing written");
+                assert_eq!(watching.seen(), vec![], "{flow:?} {n}: nothing approved");
+                assert_eq!(passkey::take_registered(), 0, "{flow:?} {n}");
+            }
+            assert_eq!(link::take_recorded(), vec![], "{flow:?}");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn no_other_path_makes_a_link() {
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (a, new) = (SoftKey::es256(), SoftKey::es256());
+        with_watching(&watching, &flows, |cx| {
+            // A first registration.
+            let enroll = ceremony(true);
+            let (answer, _) = flow.post(cx, &flows, "p", &enroll, &registration(&a, &enroll, &Tamper::default()));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(links(root.path()), vec![], "{flow:?}");
+            // A registration under an allowance.
+            granted(root.path());
+            let (c, _) = opened(cx);
+            let (answer, _) = flow.post(cx, &flows, "q", &c, &allow_body(&new, &c, &Tamper::default()));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(links(root.path()), vec![], "{flow:?}");
+            // An assertion with the box unticked.
+            let (c, _) = opened(cx);
+            let (answer, _) = flow.post(cx, &flows, "r", &c, &assertion(&a, &c, 1, &Tamper::default()));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(links(root.path()), vec![], "{flow:?}");
+            assert_eq!(link::take_recorded(), vec![], "{flow:?}");
+            assert!(events_of(root.path(), "passkey_link_made").is_empty(), "{flow:?}");
+        });
+        drained();
+    }
+}
+
+/// Every source file of this crate but the tests' own, without its test module,
+/// by the path it has under `src`.
+fn sources() -> Vec<(String, String)> {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    let mut folders = vec![src.clone()];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(&folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") && !path.ends_with("tests.rs") {
+                let text = std::fs::read_to_string(&path).unwrap().replace("\r\n", "\n");
+                let text = text.split("#[cfg(test)]\nmod tests").next().unwrap().to_string();
+                found.push((path.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/"), text));
+            }
+        }
+    }
+    assert!(found.len() > 10, "the crate's sources: {}", found.len());
+    found
+}
+
+#[test]
+fn an_approval_alone_vouches_for_a_link() {
+    let call = concat!("vouch_", "link(");
+    let callers: Vec<String> = sources()
+        .iter()
+        .flat_map(|(path, text)| {
+            text.lines()
+                .filter(|line| line.contains(call) && !line.contains("fn ") && !line.trim_start().starts_with("//"))
+                .map(|_| path.clone())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(callers, ["oauth_server/authorize/passkey.rs"]);
+}
+
+#[test]
+fn nothing_formats_a_links_secret() {
+    let secret = concat!("Link", "Secret");
+    let mut defined = 0;
+    for (path, text) in sources() {
+        for trait_name in ["Display", "Serialize", "ToString", "LowerHex", "UpperHex"] {
+            let implemented = format!("{trait_name} for {secret}");
+            assert!(!text.contains(&implemented), "{path}: {implemented}");
+        }
+        if let Some((before, _)) = text.split_once(&format!("struct {secret}")) {
+            defined += 1;
+            let derive = before.lines().rev().find(|line| line.starts_with("#[derive")).unwrap();
+            assert!(!derive.contains("Serialize") && !derive.contains("Debug"), "{derive}");
+        }
+    }
+    assert_eq!(defined, 1);
+}
+
+#[test]
+fn a_link_made_is_counted_and_logs_no_line_of_its_own() {
+    use crate::metrics::{PASSKEY_LINKS_ENDED, PASSKEY_LINKS_MADE};
+    use link::Outcome::{Ended, Made};
+    for flow in BOTH {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let watching = Watching::new(root.path());
+        let (a, b, d) = (SoftKey::es256(), SoftKey::es256(), SoftKey::es256());
+        with_watching(&watching, &flows, |cx| {
+            let c = linkable(cx, &flows, &watching, &a);
+            let (made, ended) = (PASSKEY_LINKS_MADE.get(), PASSKEY_LINKS_ENDED.get());
+
+            let (answer, _) = flow.post(cx, &flows, "p", &c, &ticked(&assertion(&a, &c, 1, &Tamper::default())));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(link::take_recorded(), [(Made, "", false)], "{flow:?}");
+            assert!(PASSKEY_LINKS_MADE.get() > made, "{flow:?}");
+
+            // Over the live link: it ends, on the assertion's path...
+            let (c, _) = opened(cx);
+            let (answer, _) = flow.post(cx, &flows, "q", &c, &ticked(&assertion(&a, &c, 2, &Tamper::default())));
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(link::take_recorded(), [(Made, "", false), (Ended, "", false)], "{flow:?}");
+            assert!(PASSKEY_LINKS_ENDED.get() > ended, "{flow:?}");
+            let ended = PASSKEY_LINKS_ENDED.get();
+
+            // ... and with both boxes.
+            let (c, _) = opened(cx);
+            let body = ticked(&add_body(&a, &b, &c, 3, &Tamper::default(), &Tamper::default()));
+            let (answer, _) = flow.post(cx, &flows, "r", &c, &body);
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(link::take_recorded(), [(Made, "", false), (Ended, "", false)], "{flow:?}");
+            assert!(PASSKEY_LINKS_ENDED.get() > ended, "{flow:?}");
+
+            // A link past its expiry ended by itself: nothing replaced, nothing to count.
+            let conn = crate::server_db::open(root.path()).unwrap();
+            conn.execute("UPDATE passkey_links SET expires_at = 1", []).unwrap();
+            drop(conn);
+            let (c, _) = opened(cx);
+            let body = ticked(&add_body(&a, &d, &c, 4, &Tamper::default(), &Tamper::default()));
+            let (answer, _) = flow.post(cx, &flows, "s", &c, &body);
+            assert_eq!(page(&answer).status, 200, "{flow:?}: {}", page(&answer).html);
+            assert_eq!(link::take_recorded(), [(Made, "", false)], "{flow:?}");
+        });
+        drained();
+    }
+}
+
+#[test]
+fn each_step_of_a_link_has_its_label_series_and_line() {
+    use crate::metrics as m;
+    use link::Outcome::{self, *};
+    let cases: [(Outcome, &str, Option<&crate::metrics::Counter>, bool); 11] = [
+        (Made, "made", Some(&m::PASSKEY_LINKS_MADE), false),
+        (Ended, "ended", Some(&m::PASSKEY_LINKS_ENDED), false),
+        (Started, "started", Some(&m::PASSKEY_LINKS_STARTED), true),
+        (WrongAccount, "wrong account", Some(&m::PASSKEY_LINKS_WRONG_ACCOUNT), true),
+        (NotAdmitted, "not admitted", Some(&m::PASSKEY_LINKS_REFUSED), true),
+        (NotHuman, "not human", Some(&m::PASSKEY_LINKS_REFUSED), true),
+        (PageShown, "page shown", None, true),
+        (Registered, "registered", Some(&m::PASSKEY_LINKS_REGISTERED), true),
+        (PasskeyRefused, "passkey refused", Some(&m::PASSKEY_LINKS_REFUSED), true),
+        (Busy, "busy", Some(&m::PASSKEY_LINKS_REFUSED), true),
+        (Failed, "failed", Some(&m::PASSKEY_LINKS_REFUSED), true),
+    ];
+    let _ = link::take_recorded();
+    for (outcome, label, series, logged) in cases {
+        assert_eq!(outcome.label(), label);
+        let before = series.map(|counter| counter.get());
+        link::record(outcome, &link::Seen::default(), "a phrase");
+        assert_eq!(link::take_recorded(), [(outcome, "a phrase", logged)]);
+        assert_eq!(outcome.counter().is_some(), series.is_some(), "{label}");
+        if let (Some(counter), Some(before)) = (series, before) {
+            assert!(std::ptr::eq(outcome.counter().unwrap(), counter), "{label}");
+            assert!(counter.get() > before, "{label}");
+        }
+    }
+
+    // Anyone may ask, so this one is always counted and at most once a minute logged.
+    assert_eq!(Unusable.label(), "unusable");
+    let before = m::PASSKEY_LINKS_UNUSABLE.get();
+    link::record(Unusable, &link::Seen::default(), "");
+    link::record(Unusable, &link::Seen::default(), "");
+    assert!(m::PASSKEY_LINKS_UNUSABLE.get() >= before + 2);
+    let recorded = link::take_recorded();
+    assert_eq!(recorded.len(), 2);
+    assert!(recorded.iter().filter(|(_, _, logged)| *logged).count() <= 1, "{recorded:?}");
+}
+
+/// Gates and operations nothing about a link may touch: every method panics.
+struct Untouched;
+
+impl Gates for Untouched {
+    fn find(&self, _: &str, _: &str, _: &Approver<'_>) -> Result<Found, bd_core::Error> {
+        panic!("a link looked up a gate");
+    }
+
+    fn approve(&self, _: &str, _: &str, _: &str, _: Option<&str>) -> Result<Approved, bd_core::Error> {
+        panic!("a link approved a gate");
+    }
+}
+
+impl Operations for Untouched {
+    fn find(&self, _: &OperationRequest, _: &Approver<'_>) -> Result<OpFound, bd_core::Error> {
+        panic!("a link looked up an operation");
+    }
+
+    fn perform(&self, _: &OperationRequest, _: &str, _: Option<&str>) -> Result<Performed, bd_core::Error> {
+        panic!("a link performed an operation");
+    }
+}
+
+/// A [`Ctx`] at `issuer` over [`Untouched`], whose `workspace_exists` panics too.
+fn with_link_ctx<T>(issuer: &str, root: &std::path::Path, flows: &Mutex<Flows>, f: impl FnOnce(&Ctx<'_>) -> T) -> T {
+    let documents = super::super::cimd::Documents::new();
+    let exists = |_: &str| -> bool { panic!("a link asked after a workspace") };
+    f(&Ctx {
+        root,
+        issuer,
+        documents: &documents,
+        flows,
+        workspace_exists: &exists,
+        gates: &Untouched,
+        links: None,
+        operations: &Untouched,
+    })
+}
+
+/// [`admitted_as`] for `identity`.
+fn admitted_for(identity: auth::Identity, kind: auth::Kind) -> crate::oauth::Admitted {
+    let mut admitted = admitted_as(kind);
+    admitted.user = identity;
+    admitted
+}
+
+/// A secret a link may carry.
+fn link_secret(fill: char) -> String {
+    fill.to_string().repeat(64)
+}
+
+/// A link of the acme account's `subject` with `secret`, vouched for by a
+/// passkey of its own, stored and ending at `expires_at`.
+fn put_link(root: &std::path::Path, secret: &str, subject: &str, workspace: &str, expires_at: i64) {
+    let hash = auth::hash(secret);
+    let vouched_by = format!("VOUCH{}", &hash[..16]);
+    put_passkey(root, &vouched_by, subject, "acme:alice", &SoftKey::es256());
+    let link = passkeys::NewLink {
+        id: hash[..32].to_string(),
+        secret_hash: hash,
+        issuer: ACME_ISSUER.into(),
+        subject: subject.into(),
+        provider: "acme".into(),
+        actor: "acme:alice".into(),
+        vouched_by,
+        workspace: workspace.into(),
+        created_at: now_millis(),
+        expires_at,
+    };
+    passkeys::test_put_link(root, &link).unwrap();
+}
+
+/// The acme account's live link with `secret`, for `workspace`.
+fn kept_link(root: &std::path::Path, secret: &str, workspace: &str) -> passkeys::Link {
+    put_link(root, secret, ACME_SUBJECT, workspace, now_millis() + 60_000);
+    passkeys::link_by_secret(root, &auth::hash(secret)).unwrap().expect("a live link")
+}
+
+/// `link::after_sign_in` at `issuer` as the provider `acme`: its answer and
+/// the cookie it set.
+fn link_signed_in(
+    issuer: &str,
+    root: &std::path::Path,
+    flows: &Mutex<Flows>,
+    admitted: Result<crate::oauth::Admitted, bd_core::Error>,
+    link: &passkeys::Link,
+) -> (Answer, Option<String>) {
+    let mut fresh = None;
+    let answer = with_link_ctx(issuer, root, flows, |cx| {
+        link::after_sign_in(cx, "Acme SSO", "acme", admitted, link, &mut fresh)
+    });
+    (answer, fresh)
+}
+
+/// The acme account, signed in as a person.
+fn the_account() -> Result<crate::oauth::Admitted, bd_core::Error> {
+    Ok(admitted_for(acme(), auth::Kind::Human))
+}
+
+/// The one notice of a link that can't be used, whyever, byte for byte.
+fn is_uniform(answer: &Answer) {
+    assert_eq!(page(answer), &pages::link_unusable());
+}
+
+/// `SELECT count(*)` of `table`.
+fn rows(root: &std::path::Path, table: &str) -> i64 {
+    let conn = crate::server_db::open(root).unwrap();
+    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn link_page_cookies_are_strict_to_their_endpoint() {
+    let c = "e".repeat(64);
+    assert_eq!(
+        set_link_page_cookie(ISSUER, "ab12", &c, STEP_TTL),
+        format!(
+            "__Secure-bd_passkey_ab12={c}; Path=/bd/oauth/passkey-link/register; Max-Age=600; HttpOnly; \
+             SameSite=Strict; Secure"
+        )
+    );
+    assert_eq!(
+        set_link_page_cookie("http://localhost:7420", "ab12", "", Duration::ZERO),
+        "bd_passkey_ab12=; Path=/oauth/passkey-link/register; Max-Age=0; HttpOnly; SameSite=Strict"
+    );
+    assert_eq!(link_page_cookie(ISSUER, &format!("x=1; __Secure-bd_passkey_ab12={c}"), "ab12"), Some(c.as_str()));
+    assert_eq!(link_page_cookie(ISSUER, &format!("bd_passkey_ab12={c}"), "ab12"), None, "unprefixed, on https");
+    assert_eq!(link_page_cookie(ISSUER, "__Secure-bd_passkey_ab12=abc", "ab12"), None);
+    assert_eq!(link_page_cookie(ISSUER, &format!("__Secure-bd_gate_ab12={c}"), "ab12"), None, "another flow's");
+}
+
+#[test]
+fn the_landing_page_gives_a_browser_with_no_cookie_one() {
+    let (answer, set) = link::landing(ISSUER, "x=1");
+    let p = page(&answer);
+    assert_eq!(p.status, 200);
+    assert_eq!(p, &pages::landing_link("https://bd.example.com/bd/oauth/passkey-link"));
+    assert_eq!(set.len(), 1, "{set:?}");
+    assert!(set[0].starts_with("__Secure-bd_oauth="), "{set:?}");
+    let value = "b".repeat(64);
+    let (answer, set) = link::landing(ISSUER, &format!("x=1; __Secure-bd_oauth={value}"));
+    assert_eq!(page(&answer).status, 200);
+    assert_eq!(set, Vec::<String>::new(), "its own cookie kept");
+}
+
+#[test]
+fn the_links_very_account_gets_the_registration_page() {
+    use link::{Outcome::PageShown, take_recorded, take_seen};
+    let _ = (take_recorded(), take_seen());
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let secret = link_secret('a');
+    let kept = kept_link(root.path(), &secret, "proj");
+    let (answer, fresh) = link_signed_in(ISSUER, root.path(), &flows, the_account(), &kept);
+    let p = page(&answer);
+    assert_eq!(p.status, 200);
+    assert!(p.html.contains("data-passkey=\"create\"") && p.html.contains("acme:alice"), "{}", p.html);
+    assert!(p.html.contains("action=\"https://bd.example.com/bd/oauth/passkey-link/register\""), "{}", p.html);
+    let fresh = fresh.expect("the page's cookie");
+    assert!(fresh.starts_with("__Secure-bd_passkey_"), "{fresh}");
+    assert!(fresh.contains("; Path=/bd/oauth/passkey-link/register;"), "{fresh}");
+    assert!(fresh.contains("HttpOnly; SameSite=Strict; Secure"), "{fresh}");
+    let kept_pages = &lock(&flows).link_pages.map;
+    assert_eq!(kept_pages.len(), 1);
+    let (_, shown) = kept_pages.values().next().unwrap();
+    assert_eq!(shown.link, kept.id);
+    let c = &shown.ceremony;
+    assert_eq!((c.issuer.as_str(), c.subject.as_str()), (ACME_ISSUER, ACME_SUBJECT));
+    assert_eq!((c.provider.as_str(), c.actor.as_str()), ("acme", "acme:alice"));
+    assert!(!c.enroll && c.add.is_none() && c.allowance.is_none() && !c.link, "nothing of an approval's: {c:?}");
+    // The account's passkeys are excluded, by their ids.
+    assert!(p.html.contains(&kept.vouched_by), "{}", p.html);
+    assert_eq!(take_recorded(), [(PageShown, "", true)]);
+    let seen = take_seen();
+    assert_eq!(
+        (seen[0].provider.as_str(), seen[0].login.as_str(), seen[0].subject.as_str(), seen[0].actor.as_str()),
+        ("acme", "alice", ACME_SUBJECT, "acme:alice")
+    );
+    assert_eq!(seen[0].link, passkeys::prefix(&kept.id));
+    assert_eq!(seen[0].vouched_by, passkeys::prefix(&kept.vouched_by));
+    assert_eq!((seen[0].link.len(), seen[0].vouched_by.len()), (12, 12));
+}
+
+#[test]
+fn only_the_links_very_account_and_a_person_get_past_the_sign_in() {
+    use auth::Kind::{Agent, Human};
+    use link::Outcome::{NotAdmitted, NotHuman, WrongAccount};
+    let elsewhere = "https://elsewhere.example";
+    let refused = || Err(bd_core::Error::Unauthorized("no rule lets this account in".into()));
+    type Case = (Result<crate::oauth::Admitted, bd_core::Error>, link::Outcome, &'static str);
+    let cases: Vec<Case> = vec![
+        // Another subject at the same issuer.
+        (Ok(admitted_for(auth::Identity { subject: "00u8".into(), ..acme() }, Human)), WrongAccount, "another account"),
+        // The same login and subject at another issuer.
+        (
+            Ok(admitted_for(auth::Identity { issuer: elsewhere.into(), ..acme() }, Human)),
+            WrongAccount,
+            "another account",
+        ),
+        (refused(), NotAdmitted, "not admitted"),
+        (Ok(admitted_for(acme(), Agent)), NotHuman, "not a person's access"),
+    ];
+    for (admitted, outcome, detail) in cases {
+        let _ = link::take_recorded();
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let kept = kept_link(root.path(), &link_secret('a'), "proj");
+        let (signed_in, accounts) = (events_of(root.path(), "signed_in").len(), rows(root.path(), "accounts"));
+        let (answer, fresh) = link_signed_in(ISSUER, root.path(), &flows, admitted, &kept);
+        is_uniform(&answer);
+        assert_eq!(fresh, None, "{detail}");
+        assert!(lock(&flows).link_pages.map.is_empty(), "{detail}");
+        assert_eq!(events_of(root.path(), "signed_in").len(), signed_in, "{detail}: not bound");
+        assert_eq!(rows(root.path(), "accounts"), accounts, "{detail}: no account");
+        assert_eq!(passkeys::link_by_id(root.path(), &kept.id).unwrap(), Some(kept), "{detail}: nothing spent");
+        assert_eq!(link::take_recorded(), [(outcome, detail, true)]);
+    }
+}
+
+#[test]
+fn an_account_that_cannot_be_bound_gets_the_one_notice() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    // The link's own account, but the actor it would take is another's.
+    put_link(root.path(), &link_secret('a'), "u2", "proj", now_millis() + 60_000);
+    let kept = passkeys::link_by_secret(root.path(), &auth::hash(&link_secret('a'))).unwrap().unwrap();
+    let user = auth::Identity { subject: "u2".into(), ..acme() };
+    let (answer, fresh) = link_signed_in(ISSUER, root.path(), &flows, Ok(admitted_for(user, auth::Kind::Human)), &kept);
+    is_uniform(&answer);
+    assert_eq!(fresh, None);
+    assert_eq!(link::take_recorded(), [(link::Outcome::NotAdmitted, "account not bound", true)]);
+}
+
+#[test]
+fn a_link_reaches_its_page_without_asking_after_its_workspace() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    // `with_link_ctx` panics at any question of a workspace, and no root has this one.
+    let kept = kept_link(root.path(), &link_secret('a'), "gone-for-good");
+    let (answer, fresh) = link_signed_in(ISSUER, root.path(), &flows, the_account(), &kept);
+    assert_eq!(page(&answer).status, 200);
+    assert!(fresh.is_some());
+    assert_eq!(link::take_recorded(), [(link::Outcome::PageShown, "", true)]);
+}
+
+#[test]
+fn a_link_ended_during_the_sign_in_gets_the_one_notice() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let account = auth::account_named(root.path(), "acme:alice").unwrap();
+    assert!(passkeys::cancel_link(root.path(), &account).unwrap());
+    let signed_in = events_of(root.path(), "signed_in").len();
+    let (answer, fresh) = link_signed_in(ISSUER, root.path(), &flows, the_account(), &kept);
+    is_uniform(&answer);
+    assert_eq!(fresh, None);
+    assert!(lock(&flows).link_pages.map.is_empty());
+    assert_eq!(events_of(root.path(), "signed_in").len(), signed_in + 1, "after the bind");
+    let recorded = link::take_recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!((recorded[0].0, recorded[0].1), (link::Outcome::Unusable, "no live link"));
+}
+
+#[test]
+fn a_full_account_is_told_so_and_spends_nothing() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    fill_to(root.path(), passkeys::MAX_PER_ACCOUNT);
+    let (answer, fresh) = link_signed_in(ISSUER, root.path(), &flows, the_account(), &kept);
+    assert_eq!(page(&answer), &pages::link_limit());
+    assert_eq!(fresh, None);
+    assert!(lock(&flows).link_pages.map.is_empty(), "no page kept");
+    assert_eq!(passkeys::link_by_id(root.path(), &kept.id).unwrap(), Some(kept));
+    assert_eq!(link::take_recorded(), [(link::Outcome::PasskeyRefused, "limit reached", true)]);
+}
+
+#[test]
+fn an_address_passkeys_cannot_work_at_gets_a_notice_and_no_form() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let (answer, fresh) = link_signed_in("http://127.0.0.1:7420", root.path(), &flows, the_account(), &kept);
+    let p = page(&answer);
+    assert!(p.html.contains(&pages::escape(pages::PASSKEY_UNAVAILABLE_HOST)), "{}", p.html);
+    assert!(!p.html.contains("<form") && !p.html.contains("<script"), "{}", p.html);
+    assert_eq!(fresh, None);
+    assert!(lock(&flows).link_pages.map.is_empty());
+    let recorded = link::take_recorded();
+    assert_eq!(recorded, [(link::Outcome::PasskeyRefused, "passkeys unavailable at this address", true)]);
+}
+
+#[test]
+fn what_went_wrong_at_a_sign_in_is_said_and_recorded_once() {
+    use bd_core::Error;
+    use link::Outcome::{Busy, Failed};
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let cases: Vec<(Error, u16, link::Outcome, &str, &str)> = vec![
+        (Error::Invalid("x".into()), 400, Failed, "sign-in did not complete", "Open the link again."),
+        (Error::Remote("x".into()), 502, Failed, "provider unreachable", "Acme SSO didn't respond"),
+        (Error::Busy("x".into()), 503, Busy, "access check unavailable", "couldn't check your access"),
+        (Error::Locked("x".into()), 503, Busy, "access check unavailable", "couldn't check your access"),
+        (Error::Io(std::io::Error::other("x")), 500, Failed, "internal error", "Something went wrong"),
+    ];
+    for (error, status, outcome, detail, says) in cases {
+        let (answer, fresh) = link_signed_in(ISSUER, root.path(), &flows, Err(error), &kept);
+        let p = page(&answer);
+        assert_eq!(p.status, status, "{detail}");
+        assert!(p.html.contains(&pages::escape(says)), "{detail}: {}", p.html);
+        assert_ne!(p, &pages::link_unusable(), "{detail}");
+        assert_eq!(fresh, None, "{detail}");
+        assert_eq!(link::take_recorded(), [(outcome, detail, true)]);
+    }
+    assert!(lock(&flows).link_pages.map.is_empty());
+    assert!(passkeys::link_by_id(root.path(), &kept.id).unwrap().is_some());
+}
+
+/// A callback at `at` for a flow of the link `id` that went to `started`: what
+/// it answered.
+fn link_callback(
+    root: &std::path::Path,
+    (started, at): (&str, &str),
+    id: &str,
+    browser: &str,
+    until: i64,
+    extra: &[(&str, &str)],
+    code: bool,
+) -> (Answer, Vec<String>) {
+    let flows = Mutex::new(Flows::default());
+    let sent_from = "b".repeat(64);
+    let (query, cookie) = at_provider(&flows, Then::Link { id: id.into() }, started, &sent_from, until, extra);
+    let query = if code { query } else { query.replace("&code=c0de", "") };
+    with_link_ctx(ISSUER, root, &flows, |cx| callback(cx, at, &query, Some(browser), &cookie))
+}
+
+#[test]
+fn every_early_end_of_a_links_callback_is_recorded_once() {
+    use link::{Outcome::Failed, take_recorded, take_seen};
+    let _ = (take_recorded(), take_seen());
+    let (browser, other) = ("b".repeat(64), "c".repeat(64));
+    let later = now_millis() + 60_000;
+    let (github, both) = (gate_root(false), gate_root(true));
+    let (g, b) = (github.path(), both.path());
+    // No row has this id, so that a link read would have answered the one notice instead of any of these.
+    let id = "absent-link-id-0123456789";
+    let denied: &[(&str, &str)] = &[("error", "access_denied")];
+    let apple: &[(&str, &str)] = &[("error", "user_cancelled_authorize")];
+    let broke: &[(&str, &str)] = &[("error", "server_error")];
+    type Case<'a> = (&'a std::path::Path, &'a str, &'a str, &'a str, i64, &'a [(&'a str, &'a str)], bool, u16, &'a str);
+    let cases: Vec<Case<'_>> = vec![
+        (g, "github", "github", &browser, later, denied, true, 403, "cancelled at the provider"),
+        (g, "github", "github", &browser, later, apple, true, 403, "cancelled at the provider"),
+        (g, "github", "github", &browser, later, broke, true, 502, "provider error"),
+        (g, "github", "github", &browser, later, &[], false, 400, "no sign-in code"),
+        (g, "github", "github", &browser, now_millis() - 1, &[], true, 400, "flow expired"),
+        (g, "github", "github", &other, later, &[], true, 400, "different browser"),
+        (b, "github", "acme", &browser, later, &[], true, 400, "another provider"),
+        (g, "nobody", "nobody", &browser, later, &[], true, 404, "sign-in settings unavailable"),
+    ];
+    for (root, started, at, sent_by, until, extra, code, status, detail) in cases {
+        let (answer, set) = link_callback(root, (started, at), id, sent_by, until, extra, code);
+        let p = page(&answer);
+        assert_eq!(p.status, status, "{detail}");
+        assert_ne!(p, &pages::link_unusable(), "{detail}");
+        assert_eq!(take_recorded(), [(Failed, detail, true)]);
+        let seen = take_seen();
+        assert_eq!((seen[0].provider.as_str(), seen[0].link.as_str()), (started, passkeys::prefix(id)), "{detail}");
+        assert!(set.iter().any(|c| c.contains("bd_flow_") && c.contains("Max-Age=0")), "{detail}: {set:?}");
+    }
+    // A provider's words reach no page as they were sent.
+    let (answer, _) = link_callback(g, ("github", "github"), id, &browser, later, broke, true);
+    assert!(!page(&answer).html.contains("server_error"), "{}", page(&answer).html);
+    assert!(page(&answer).html.contains("Open the link again."), "{}", page(&answer).html);
+}
+
+#[test]
+fn a_dead_link_is_refused_before_any_code_is_exchanged() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let later = now_millis() + 60_000;
+    let browser = "b".repeat(64);
+    // An attempted exchange would answer 502: GitHub can't be reached from a test.
+    let (answer, _) = link_callback(root.path(), ("github", "github"), "gone", &browser, later, &[], true);
+    is_uniform(&answer);
+    let recorded = link::take_recorded();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!((recorded[0].0, recorded[0].1), (link::Outcome::Unusable, "no live link"));
+}
+
+#[test]
+fn a_links_row_that_cannot_be_read_is_a_failure_and_no_notice_of_it() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let later = now_millis() + 60_000;
+    rusqlite::Connection::open(crate::server_db::path(root.path()))
+        .unwrap()
+        .execute_batch("DROP TABLE passkey_links")
+        .unwrap();
+    let (answer, _) = link_callback(root.path(), ("github", "github"), "any", &"b".repeat(64), later, &[], true);
+    assert_eq!(page(&answer).status, 500);
+    assert_eq!(link::take_recorded(), [(link::Outcome::Failed, "internal error", true)]);
+    // A store too busy to answer is told as that, whether it says `Busy` or, after a writer's wait, `Locked`.
+    for busy in [bd_core::Error::Busy("x".into()), bd_core::Error::Locked("x".into())] {
+        let answer = link::store_failed(&link::Seen::default(), &busy, "testing");
+        assert_eq!(page(&answer).status, 503);
+        assert_eq!(link::take_recorded(), [(link::Outcome::Busy, "server busy", true)]);
+    }
+}
+
+/// `link=<secret>`, as the landing page's script posts it.
+fn link_form(secret: &str) -> String {
+    form::encode(&[("link", secret)])
+}
+
+/// The row behind each way a link is dead, as a table a test walks: every one
+/// is the one notice, byte for byte, and tells nothing of which it was.
+fn dead_links(root: &std::path::Path) -> Vec<(&'static str, String)> {
+    let secret = |fill| link_secret(fill);
+    put_link(root, &secret('1'), ACME_SUBJECT, "proj", now_millis() - 1);
+
+    let used = kept_link(root, &secret('2'), "proj");
+    let key = SoftKey::es256();
+    let spki = key.spki();
+    let (id, _) = credential_of(&key);
+    let row = passkeys::NewRow {
+        credential: &id,
+        issuer: ACME_ISSUER,
+        subject: ACME_SUBJECT,
+        provider: "acme",
+        actor: "acme:alice",
+        alg: key.alg(),
+        public_key: &spki,
+        counter: 0,
+    };
+    assert!(matches!(passkeys::insert_linked(root, &used.id, &row).unwrap(), passkeys::Linked::Inserted { .. }));
+
+    kept_link(root, &secret('3'), "proj");
+    kept_link(root, &secret('4'), "proj");
+
+    kept_link(root, &secret('5'), "proj");
+    let account = auth::account_named(root, "acme:alice").unwrap();
+    assert!(passkeys::cancel_link(root, &account).unwrap());
+
+    vec![
+        ("expired", link_form(&secret('1'))),
+        ("used", link_form(&secret('2'))),
+        ("replaced", link_form(&secret('3'))),
+        ("cancelled", link_form(&secret('5'))),
+        ("unknown", link_form(&secret('6'))),
+        ("malformed: uppercase", link_form(&"A".repeat(64))),
+        ("malformed: short", link_form(&"a".repeat(63))),
+        ("malformed: long", link_form(&"a".repeat(65))),
+        ("malformed: empty", "link=".to_string()),
+        ("malformed: no field", String::new()),
+        ("malformed: twice", format!("{}&{}", link_form(&secret('6')), link_form(&secret('6')))),
+    ]
+}
+
+#[test]
+fn every_dead_link_gets_the_one_notice_and_goes_nowhere() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let bodies = dead_links(root.path());
+    assert_eq!(bodies.len(), 11);
+    // Malformed means unread: a row under such a secret, were there one, is not found by it.
+    put_link(root.path(), &"A".repeat(64), ACME_SUBJECT, "proj", now_millis() + 60_000);
+    let before = crate::metrics::PASSKEY_LINKS_UNUSABLE.get();
+    let kept = links(root.path());
+    let browser = "b".repeat(64);
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        for (what, body) in &bodies {
+            let answer = link::begin(cx, body, &browser, None);
+            is_uniform(&answer);
+            let p = page(&answer);
+            assert_eq!(p.status, 404, "{what}");
+            // No flow, nothing sealed, nothing that goes on to a provider.
+            assert!(!p.html.contains("flow=") && !p.html.contains("http-equiv"), "{what}: {}", p.html);
+            let recorded = link::take_recorded();
+            assert_eq!(recorded.len(), 1, "{what}");
+            assert_eq!((recorded[0].0, recorded[0].1), (link::Outcome::Unusable, "no live link"), "{what}");
+        }
+    });
+    assert!(crate::metrics::PASSKEY_LINKS_UNUSABLE.get() >= before + bodies.len() as u64, "counted every time");
+    assert_eq!(links(root.path()), kept, "nothing written");
+    // The copy names no reason.
+    let copy = pages::link_unusable().html.to_lowercase();
+    for reason in ["expired", "replaced", "cancelled", "revoked", "wrong", "another account", "not found"] {
+        assert!(!copy.contains(reason), "{reason}");
+    }
+}
+
+#[test]
+fn a_live_link_goes_on_to_sign_in_by_its_id_and_spends_nothing() {
+    use link::{Outcome::Started, take_recorded, take_seen};
+    let _ = (take_recorded(), take_seen());
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let secret = link_secret('a');
+    let kept = kept_link(root.path(), &secret, "proj");
+    let (rows_before, events) = (links(root.path()), crate::server_db::events(root.path(), 0, None, &[], 100));
+    let peer: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+    let browser = "b".repeat(64);
+    let answer =
+        with_link_ctx(ISSUER, root.path(), &flows, |cx| link::begin(cx, &link_form(&secret), &browser, Some(peer)));
+    let p = page(&answer);
+    assert_eq!(p.status, 200);
+    assert!(p.html.contains("https://bd.example.com/bd/oauth/choose?flow="), "{}", p.html);
+    assert!(!p.html.contains(&secret) && !p.html.contains(&kept.id), "{}", p.html);
+    let opened = lock(&flows).sealer.open(LINK_BEGIN, &flow_of(&p.html)).unwrap();
+    assert_eq!(opened.then, Then::Link { id: kept.id.clone() });
+    assert_eq!((opened.browser, opened.at), (auth::hash(&browser), None), "bound to the browser that posted it");
+    assert!(opened.until > now_millis());
+    assert_eq!(take_recorded(), [(Started, "", true)]);
+    let seen = take_seen();
+    assert_eq!(seen[0].peer, Some(peer));
+    assert_eq!((seen[0].link.as_str(), seen[0].vouched_by.len()), (passkeys::prefix(&kept.id), 12));
+    assert_eq!(links(root.path()), rows_before);
+    let events_after = crate::server_db::events(root.path(), 0, None, &[], 100);
+    assert_eq!(events_after.unwrap().len(), events.unwrap().len(), "nothing written");
+}
+
+#[test]
+fn a_link_refused_for_want_of_settings_says_so_before_reading_anything() {
+    let _ = link::take_recorded();
+    let root = tempfile::tempdir().unwrap();
+    let flows = Mutex::new(Flows::default());
+    let browser = "b".repeat(64);
+    let body = link_form(&link_secret('a'));
+    let answer = with_link_ctx(ISSUER, root.path(), &flows, |cx| link::begin(cx, &body, &browser, None));
+    assert_eq!(page(&answer).status, 404);
+    assert_ne!(page(&answer), &pages::link_unusable());
+    assert_eq!(link::take_recorded(), [(link::Outcome::Failed, "sign-in settings unavailable", true)]);
+}
+
+/// A link's hop to the chooser from `browser`, for a flow bound to the browser
+/// of `"b".repeat(64)`, as [`link::begin`] binds one: what [`choose`] answers.
+fn link_chosen(
+    root: &std::path::Path,
+    flows: &Mutex<Flows>,
+    until: i64,
+    provider: Option<&str>,
+    browser: Option<&str>,
+) -> (Answer, Vec<String>) {
+    let then = Then::Link { id: "l1".into() };
+    let pending = Pending { then, browser: auth::hash(&"b".repeat(64)), until, at: None };
+    let flow = lock(flows).sealer.seal(LINK_BEGIN, &pending).unwrap();
+    let mut query = vec![("flow", flow.as_str())];
+    query.extend(provider.map(|p| ("provider", p)));
+    with_link_ctx(ISSUER, root, flows, |cx| choose(cx, &form::encode(&query), browser))
+}
+
+#[test]
+fn the_chooser_takes_a_links_flow_on_in_its_own_browser() {
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let browser = "b".repeat(64);
+    let later = now_millis() + 60_000;
+    let (answer, cookies) = link_chosen(root.path(), &flows, later, None, Some(&browser));
+    let Answer::Redirect(url) = &answer else { panic!("{answer:?}") };
+    assert!(url.starts_with("https://github.com/login/oauth/authorize?"), "{url}");
+    assert_eq!(cookies.len(), 2, "{cookies:?}");
+    assert_eq!(cookies[0], set_cookie(ISSUER, &browser), "the browser's own cookie kept");
+    let state = form::decode(url.split_once('?').unwrap().1).unwrap();
+    let state = &state.iter().find(|(k, _)| k == "state").unwrap().1;
+    let headers = sent(&cookies);
+    let sealed = flow_cookie(ISSUER, &headers, state).unwrap();
+    let opened = lock(&flows).sealer.open(AT_PROVIDER, sealed).unwrap();
+    assert_eq!(opened.then, Then::Link { id: "l1".into() });
+    assert_eq!(opened.browser, auth::hash(&browser));
+
+    // This hop names no provider; and it has its own end.
+    let (answer, _) = link_chosen(root.path(), &flows, later, Some("github"), Some(&browser));
+    assert_eq!(page(&answer).status, 400);
+    assert!(page(&answer).html.contains(&pages::escape("This link isn't one this server gave.")), "{answer:?}");
+    let (answer, cookies) = link_chosen(root.path(), &flows, now_millis() - 1, None, Some(&browser));
+    assert_eq!(page(&answer).status, 400);
+    assert!(page(&answer).html.contains("Open the link again."), "{answer:?}");
+    assert_eq!(cookies, Vec::<String>::new());
+}
+
+#[test]
+fn a_links_flow_does_nothing_in_any_other_browser() {
+    let _ = link::take_recorded();
+    let flows = Mutex::new(Flows::default());
+    // Not run out, so this cannot be the expiry's refusal.
+    let later = now_millis() + 60_000;
+    let bound = "b".repeat(64);
+    for several in [false, true] {
+        let root = gate_root(several);
+        for other in [None, Some("c".repeat(64))] {
+            let (answer, cookies) = link_chosen(root.path(), &flows, later, None, other.as_deref());
+            assert!(!matches!(answer, Answer::Redirect(_)), "{other:?}: {answer:?}");
+            assert_eq!(page(&answer).status, 400, "{other:?}");
+            assert!(page(&answer).html.contains("started in a different browser"), "{answer:?}");
+            assert!(!page(&answer).html.contains("Sign in to add a passkey"), "{answer:?}");
+            assert_eq!(cookies, Vec::<String>::new(), "{other:?}");
+            assert!(link::take_recorded().is_empty(), "{other:?}");
+        }
+        // The browser it was bound to goes on.
+        let (answer, cookies) = link_chosen(root.path(), &flows, later, None, Some(&bound));
+        assert_eq!(cookies[0], set_cookie(ISSUER, &bound));
+        match several {
+            true => assert!(page(&answer).html.contains("Sign in to add a passkey"), "{answer:?}"),
+            false => assert!(matches!(answer, Answer::Redirect(_)), "{answer:?}"),
+        }
+    }
+}
+
+#[test]
+fn several_providers_are_chosen_from_naming_no_workspace_or_account() {
+    let root = gate_root(true);
+    let flows = Mutex::new(Flows::default());
+    let browser = "b".repeat(64);
+    let later = now_millis() + 60_000;
+    let (answer, cookies) = link_chosen(root.path(), &flows, later, None, Some(&browser));
+    let p = page(&answer);
+    assert_eq!(p.status, 200);
+    assert!(p.html.contains("Sign in to add a passkey"), "{}", p.html);
+    assert!(p.html.contains("Acme SSO") && p.html.contains("GitHub"), "{}", p.html);
+    assert!(!p.html.contains("alice") && !p.html.contains("proj"), "{}", p.html);
+    assert_eq!(cookies, vec![set_cookie(ISSUER, &browser)]);
+    let option = p.html.split("href=\"").find(|href| href.contains("provider=github")).unwrap();
+    let flow = flow_of(option);
+    let opened = lock(&flows).sealer.open(CHOOSING, &flow).unwrap();
+    assert_eq!(opened.then, Then::Link { id: "l1".into() });
+    assert_eq!(opened.browser, auth::hash(&browser));
+    // The way the choice comes back: on to the provider, bound to this browser alone.
+    let query = form::encode(&[("flow", flow.as_str()), ("provider", "github")]);
+    let (answer, _) = with_link_ctx(ISSUER, root.path(), &flows, |cx| choose(cx, &query, Some(&browser)));
+    assert!(matches!(answer, Answer::Redirect(_)), "{answer:?}");
+    let (answer, _) = with_link_ctx(ISSUER, root.path(), &flows, |cx| choose(cx, &query, Some(&"c".repeat(64))));
+    assert_eq!(page(&answer).status, 400);
+}
+
+/// The `Cookie` header of the browser a page kept by `link::test_keep_page` is
+/// bound to.
+fn page_browser() -> String {
+    format!("__Secure-bd_passkey_ab12={}", link::TEST_BROWSER)
+}
+
+/// POST `fields` to a page just kept for `link_id`, as `c` asked: its answer
+/// and the cookies it set.
+fn post_link_page(
+    cx: &Ctx<'_>,
+    flows: &Mutex<Flows>,
+    link_id: &str,
+    c: &Ceremony,
+    fields: &str,
+) -> (Answer, Vec<String>) {
+    let id = auth::random_hex(8).unwrap();
+    link::test_keep_page(flows, &id, link_id, c.clone());
+    link::register(cx, &format!("id={id}&{fields}"), &page_browser())
+}
+
+/// A POST of `fields` refused at the passkey: the notice, stored nothing, left
+/// the link as it was, and recorded `detail`.
+fn refused_page(cx: &Ctx<'_>, flows: &Mutex<Flows>, kept: &passkeys::Link, c: &Ceremony, fields: &str, detail: &str) {
+    let held = kept_passkeys(cx.root).len();
+    let (answer, set) = post_link_page(cx, flows, &kept.id, c, fields);
+    assert_eq!(page(&answer), &pages::link_failed(), "{detail}");
+    assert_eq!(set, vec![set_link_page_cookie(ISSUER, "ab12", "", Duration::ZERO)], "{detail}");
+    assert_eq!(kept_passkeys(cx.root).len(), held, "{detail}");
+    assert_eq!(passkeys::link_by_id(cx.root, &kept.id).unwrap().as_ref(), Some(kept), "{detail}: still live");
+    let recorded = link::take_recorded();
+    assert_eq!(recorded.len(), 1, "{detail}");
+    assert_eq!((recorded[0].0, recorded[0].1), (link::Outcome::PasskeyRefused, detail));
+}
+
+/// What a whole flow through a link leaves in `root`'s token tables.
+fn token_rows(root: &std::path::Path) -> (i64, i64) {
+    (rows(root, "tokens"), rows(root, "accounts"))
+}
+
+#[test]
+fn a_whole_flow_through_a_link_adds_a_passkey_and_nothing_else() {
+    use link::Outcome::{PageShown, Registered, Started};
+    use link::{take_recorded, take_seen};
+    let _ = (take_recorded(), take_seen(), passkey::take_registered());
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let secret = link_secret('a');
+    let kept = kept_link(root.path(), &secret, "proj");
+    let tokens = token_rows(root.path());
+    let before = kept_passkeys(root.path()).len();
+
+    let browser = "b".repeat(64);
+    let answer = with_link_ctx(ISSUER, root.path(), &flows, |cx| link::begin(cx, &link_form(&secret), &browser, None));
+    assert_eq!(page(&answer).status, 200);
+    let (answer, fresh) = link_signed_in(ISSUER, root.path(), &flows, the_account(), &kept);
+    let html = &page(&answer).html;
+    let id = html.split("name=\"id\" value=\"").nth(1).unwrap().split('"').next().unwrap();
+    let fresh = fresh.unwrap();
+    let cookie = fresh.split(';').next().unwrap();
+    let suffix = fresh.trim_start_matches("__Secure-bd_passkey_").split('=').next().unwrap();
+    let c = lock(&flows).link_pages.map.values().next().unwrap().1.ceremony.clone();
+    let key = SoftKey::es256();
+    let (credential, prefix) = credential_of(&key);
+    let body = format!("id={id}&{}", registration(&key, &c, &Tamper::default()));
+
+    let (answer, set) = with_link_ctx(ISSUER, root.path(), &flows, |cx| link::register(cx, &body, cookie));
+    assert_eq!(page(&answer), &pages::link_added());
+    assert_eq!(set, vec![set_link_page_cookie(ISSUER, suffix, "", Duration::ZERO)], "the page's cookie cleared");
+    assert_eq!(passkey::take_registered(), 1);
+    let held = kept_passkeys(root.path());
+    assert_eq!(held.len(), before + 1);
+    let added = held.iter().find(|p| p.credential == credential).expect("the new passkey");
+    assert_eq!(added.counter, 0);
+    assert_eq!(passkeys::link_by_id(root.path(), &kept.id).unwrap(), None, "the link is spent");
+    assert!(lock(&flows).link_pages.map.is_empty());
+    assert_eq!(token_rows(root.path()), tokens, "no token, no new account");
+    let recorded = take_recorded();
+    assert_eq!(recorded, [(Started, "", true), (PageShown, "", true), (Registered, "", true)]);
+    let seen = take_seen();
+    let registered = &seen[2];
+    assert_eq!(registered.credential, prefix);
+    assert_eq!(registered.vouched_by, passkeys::prefix(&kept.vouched_by));
+    assert_eq!(registered.link, passkeys::prefix(&kept.id));
+    assert_eq!((registered.provider.as_str(), registered.actor.as_str()), ("acme", "acme:alice"));
+    assert_eq!((registered.login.as_str(), registered.subject.as_str()), ("alice", ACME_SUBJECT));
+    assert_eq!(
+        (registered.credential.len(), registered.vouched_by.len(), registered.link.len()),
+        (12, 12, 12),
+        "every prefix is 12 characters"
+    );
+    // What is logged holds no secret, nor its hash.
+    let hash = auth::hash(&secret);
+    assert!(!format!("{seen:?}").contains(&secret) && !format!("{seen:?}").contains(&hash));
+    // The event names the three.
+    let events = events_of(root.path(), "passkey_registered");
+    assert_eq!(events.len(), 1);
+    let detail = events[0].detail.as_deref().unwrap();
+    assert!(detail.contains(&prefix) && detail.contains(passkeys::prefix(&kept.id)), "{detail}");
+
+    // Posted again: told it was used.
+    let (answer, set) = with_link_ctx(ISSUER, root.path(), &flows, |cx| link::register(cx, &body, cookie));
+    assert_eq!(page(&answer).status, 400);
+    assert!(page(&answer).html.contains("already used"), "{answer:?}");
+    assert_eq!(set, Vec::<String>::new());
+    assert_eq!(kept_passkeys(root.path()).len(), before + 1);
+}
+
+#[test]
+fn a_registration_page_is_taken_once_by_its_own_browser() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let c = ceremony(false);
+    let key = SoftKey::es256();
+    let fields = registration(&key, &c, &Tamper::default());
+    link::test_keep_page(&flows, "p1", &kept.id, c.clone());
+    let body = format!("id=p1&{fields}");
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        let held = kept_passkeys(root.path()).len();
+        // Another browser, or none, takes nothing.
+        for cookies in ["", "__Secure-bd_passkey_ab12=", &format!("__Secure-bd_passkey_ab12={}", "d".repeat(64))] {
+            let (answer, set) = link::register(cx, &body, cookies);
+            assert_eq!(page(&answer).status, 403, "{cookies}");
+            assert!(page(&answer).html.contains("different browser"), "{answer:?}");
+            assert_eq!(set, Vec::<String>::new());
+        }
+        assert_eq!(lock(&flows).link_pages.map.len(), 1, "still waiting");
+        // A form that names no page, or names it twice, takes nothing.
+        for bad in ["credential=x".to_string(), "id=".to_string(), format!("id=p1&id=p1&{fields}")] {
+            let (answer, _) = link::register(cx, &bad, &page_browser());
+            assert_eq!(page(&answer).status, 400, "{bad}");
+            assert!(page(&answer).html.contains("arrived incomplete"), "{answer:?}");
+        }
+        // Nor does a page that was never kept, or ran out.
+        let (answer, _) = link::register(cx, "id=nope", &page_browser());
+        assert_eq!(page(&answer).status, 400);
+        assert!(page(&answer).html.contains("has expired"), "{answer:?}");
+        lock(&flows).link_pages.map.get_mut(&auth::hash("p1")).unwrap().0 = std::time::Instant::now();
+        let (answer, _) = link::register(cx, &body, &page_browser());
+        assert_eq!(page(&answer).status, 400);
+        assert!(page(&answer).html.contains("has expired"), "{answer:?}");
+        assert_eq!(kept_passkeys(root.path()).len(), held);
+    });
+    assert_eq!(link::take_recorded(), [], "only a POST taken is recorded");
+    assert!(passkeys::link_by_id(root.path(), &kept.id).unwrap().is_some());
+}
+
+#[test]
+fn a_truncated_registration_is_refused_and_leaves_the_link_live() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let key = SoftKey::es256();
+    let c = ceremony(false);
+    let valid = key.register(&c.expect(), &Tamper::default());
+    let body = |f: &Fields| webauthn_body(f, true);
+    let refused_somehow = |cx: &Ctx<'_>, fields: &str, what: &str| {
+        let (answer, _) = post_link_page(cx, &flows, &kept.id, &c, fields);
+        assert_eq!(page(&answer), &pages::link_failed(), "{what}");
+        let recorded = link::take_recorded();
+        assert_eq!(recorded.len(), 1, "{what}");
+        assert_eq!(recorded[0].0, link::Outcome::PasskeyRefused, "{what}");
+    };
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        for n in 0..valid.client_data.len() {
+            let mut f = valid.clone();
+            f.client_data.truncate(n);
+            refused_somehow(cx, &body(&f), &format!("client data {n}"));
+        }
+        for n in 0..valid.authenticator_data.len() {
+            let mut f = valid.clone();
+            f.authenticator_data.truncate(n);
+            refused_somehow(cx, &body(&f), &format!("authenticator data {n}"));
+        }
+        for n in 0..valid.public_key.len() {
+            let mut f = valid.clone();
+            f.public_key.truncate(n);
+            refused_somehow(cx, &body(&f), &format!("public key {n}"));
+        }
+        for n in 0..valid.credential.len() {
+            let mut f = valid.clone();
+            f.credential.truncate(n);
+            refused_somehow(cx, &body(&f), &format!("credential {n}"));
+        }
+    });
+    assert_eq!(passkeys::link_by_id(root.path(), &kept.id).unwrap(), Some(kept));
+}
+
+#[test]
+fn a_links_registration_is_checked_as_a_first_registration_is() {
+    use crate::webauthn::Alg;
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let key = SoftKey::es256();
+    let c = ceremony(false);
+    let ok = Tamper::default;
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        for (tamper, detail) in [
+            (Tamper { kind: Some("webauthn.get"), ..ok() }, "wrong ceremony type"),
+            (Tamper { challenge: Some(vec![1; 32]), ..ok() }, "wrong challenge"),
+            (Tamper { origin: Some("https://evil.example".into()), ..ok() }, "wrong origin"),
+            (Tamper { cross_origin: Some(true), ..ok() }, "cross-origin"),
+            (Tamper { top_origin: Some("\"https://evil.example\""), ..ok() }, "top origin present"),
+            (Tamper { duplicate: true, ..ok() }, "client data unreadable"),
+            (Tamper { rp_id: Some("example.com".into()), ..ok() }, "wrong relying party"),
+            (Tamper { flags: Some(0x44), ..ok() }, "user not present"),
+            (Tamper { flags: Some(0x41), ..ok() }, "user not verified"),
+            (Tamper { flags: Some(0x05), ..ok() }, "no credential data"),
+            (Tamper { mismatch: true, ..ok() }, "credential mismatch"),
+        ] {
+            let fields = registration(&key, &c, &tamper);
+            refused_page(cx, &flows, &kept, &c, &fields, &format!("passkey refused: new passkey: {detail}"));
+        }
+        // What the form says of the key, each changed alone.
+        let valid = || key.register(&c.expect(), &ok());
+        let mut f = valid();
+        f.algorithm = -8;
+        let detail = "passkey refused: new passkey: unsupported algorithm";
+        refused_page(cx, &flows, &kept, &c, &webauthn_body(&f, true), detail);
+        let mut f = valid();
+        f.algorithm = Alg::Rs256.cose();
+        let detail = "passkey refused: new passkey: bad public key";
+        refused_page(cx, &flows, &kept, &c, &webauthn_body(&f, true), detail);
+        // The challenge is the page's own: another's is refused.
+        let other = ceremony(false);
+        let detail = "passkey refused: new passkey: wrong challenge";
+        refused_page(cx, &flows, &kept, &c, &registration(&key, &other, &ok()), detail);
+    });
+}
+
+#[test]
+fn a_links_fields_are_read_once_and_capped() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let key = SoftKey::es256();
+    let c = ceremony(false);
+    let valid = registration(&key, &c, &Tamper::default());
+    let pairs = form::decode(&valid).unwrap();
+    let names = ["credential", "client_data", "authenticator_data", "public_key", "algorithm"];
+    assert_eq!(pairs.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(), names);
+    let without = |name: &str| {
+        let kept: Vec<(&str, &str)> =
+            pairs.iter().filter(|(k, _)| k != name).map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        form::encode(&kept)
+    };
+    let (missing, malformed) = ("passkey refused: missing fields", "passkey refused: malformed fields");
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        for name in names {
+            refused_page(cx, &flows, &kept, &c, &without(name), missing);
+            refused_page(cx, &flows, &kept, &c, &format!("{}&{name}=", without(name)), missing);
+            refused_page(cx, &flows, &kept, &c, &format!("{valid}&{name}=x"), malformed);
+        }
+        let caps = [
+            ("credential", crate::webauthn::MAX_CREDENTIAL),
+            ("client_data", crate::webauthn::MAX_CLIENT_DATA),
+            ("authenticator_data", crate::webauthn::MAX_AUTH_DATA),
+            ("public_key", crate::webauthn::MAX_PUBLIC_KEY),
+        ];
+        for (name, cap) in caps {
+            let long = URL_SAFE_NO_PAD.encode(vec![0u8; cap + 1]);
+            refused_page(cx, &flows, &kept, &c, &format!("{}&{name}={long}", without(name)), malformed);
+        }
+        refused_page(cx, &flows, &kept, &c, &format!("{}&algorithm=ES256", without("algorithm")), malformed);
+        refused_page(cx, &flows, &kept, &c, &format!("{}&credential=%2B%2B", without("credential")), malformed);
+    });
+}
+
+#[test]
+fn nothing_of_an_approval_is_read_at_a_links_post() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let key = SoftKey::es256();
+    let c = ceremony(false);
+    let valid = registration(&key, &c, &Tamper::default());
+    let detail = "passkey refused: adding not offered";
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        let mut names = vec!["signature", "make_link"];
+        names.extend([
+            "new_credential",
+            "new_client_data",
+            "new_authenticator_data",
+            "new_public_key",
+            "new_algorithm",
+        ]);
+        names.extend(passkey::ALLOW_FIELDS);
+        assert_eq!(names.len(), 12);
+        for name in names {
+            for value in ["", "x"] {
+                let _ = link::take_seen();
+                refused_page(cx, &flows, &kept, &c, &format!("{valid}&{name}={value}"), detail);
+                assert_eq!(link::take_seen()[0].credential, "", "refused before anything is read");
+            }
+        }
+    });
+}
+
+#[test]
+fn a_page_opened_before_its_link_ended_is_refused_with_the_one_notice() {
+    let _ = link::take_recorded();
+    let key = SoftKey::es256();
+    let c = ceremony(false);
+    let fields = registration(&key, &c, &Tamper::default());
+    type End = (&'static str, fn(&std::path::Path));
+    let ends: [End; 4] = [
+        ("expired", |root| {
+            let conn = crate::server_db::open(root).unwrap();
+            conn.execute("UPDATE passkey_links SET expires_at = 1", []).unwrap();
+        }),
+        ("replaced", |root| {
+            kept_link(root, &link_secret('b'), "proj");
+        }),
+        ("cancelled", |root| {
+            let account = auth::account_named(root, "acme:alice").unwrap();
+            assert!(passkeys::cancel_link(root, &account).unwrap());
+        }),
+        ("vouching passkey gone", |root| {
+            let conn = crate::server_db::open(root).unwrap();
+            conn.execute("DELETE FROM passkeys WHERE credential LIKE 'VOUCH%'", []).unwrap();
+        }),
+    ];
+    for (what, end) in ends {
+        let root = gate_root(false);
+        let flows = Mutex::new(Flows::default());
+        let kept = kept_link(root.path(), &link_secret('a'), "proj");
+        end(root.path());
+        let held = kept_passkeys(root.path()).len();
+        let answer = with_link_ctx(ISSUER, root.path(), &flows, |cx| post_link_page(cx, &flows, &kept.id, &c, &fields));
+        is_uniform(&answer.0);
+        assert_eq!(answer.1, vec![set_link_page_cookie(ISSUER, "ab12", "", Duration::ZERO)], "{what}");
+        assert_eq!(kept_passkeys(root.path()).len(), held, "{what}");
+        let recorded = link::take_recorded();
+        assert_eq!(recorded.len(), 1, "{what}");
+        assert_eq!((recorded[0].0, recorded[0].1), (link::Outcome::Unusable, "no live link"), "{what}");
+    }
+}
+
+#[test]
+fn a_failed_post_leaves_the_link_live_and_its_page_spent() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let key = SoftKey::es256();
+    let c = ceremony(false);
+    let tampered = registration(&key, &c, &Tamper { flags: Some(0x41), ..Tamper::default() });
+    let good = registration(&key, &c, &Tamper::default());
+    link::test_keep_page(&flows, "p1", &kept.id, c.clone());
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        let (answer, _) = link::register(cx, &format!("id=p1&{tampered}"), &page_browser());
+        assert_eq!(page(&answer), &pages::link_failed());
+        assert_eq!(passkeys::link_by_id(root.path(), &kept.id).unwrap().as_ref(), Some(&kept));
+        // The same page can't be posted again, even with a good registration.
+        let (answer, _) = link::register(cx, &format!("id=p1&{good}"), &page_browser());
+        assert_eq!(page(&answer).status, 400);
+        assert!(page(&answer).html.contains("already used"), "{answer:?}");
+        // The link opens a new page, which can.
+        let (answer, _) = post_link_page(cx, &flows, &kept.id, &c, &good);
+        assert_eq!(page(&answer), &pages::link_added());
+    });
+    assert_eq!(passkeys::link_by_id(root.path(), &kept.id).unwrap(), None);
+}
+
+#[test]
+fn a_limit_or_a_taken_credential_at_the_post_stores_nothing() {
+    use link::Outcome::{Failed, PasskeyRefused};
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let key = SoftKey::es256();
+    let c = ceremony(false);
+    let fields = registration(&key, &c, &Tamper::default());
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        // The credential is another account's.
+        let (id, _) = credential_of(&key);
+        put_passkey(root.path(), &id, "someone-else", "acme:other", &SoftKey::es256());
+        let (answer, _) = post_link_page(cx, &flows, &kept.id, &c, &fields);
+        assert_eq!(page(&answer), &pages::link_failed());
+        assert_eq!(link::take_recorded(), [(PasskeyRefused, "passkey refused: credential taken", true)]);
+        crate::server_db::open(root.path())
+            .unwrap()
+            .execute("DELETE FROM passkeys WHERE credential = ?1", [&id])
+            .unwrap();
+
+        fill_to(root.path(), passkeys::MAX_PER_ACCOUNT);
+        let (answer, _) = post_link_page(cx, &flows, &kept.id, &c, &fields);
+        assert_eq!(page(&answer), &pages::link_limit());
+        assert_eq!(link::take_recorded(), [(PasskeyRefused, "limit reached", true)]);
+        assert_eq!(kept_passkeys(root.path()).len(), passkeys::MAX_PER_ACCOUNT);
+        assert_eq!(passkeys::link_by_id(root.path(), &kept.id).unwrap().as_ref(), Some(&kept), "still live");
+
+        // The store failing is a failure, and the page's cookie still goes.
+        crate::server_db::open(root.path()).unwrap().execute_batch("DROP TABLE passkey_links").unwrap();
+        let (answer, set) = post_link_page(cx, &flows, &kept.id, &c, &fields);
+        assert_eq!(page(&answer).status, 500);
+        assert_eq!(set.len(), 1, "{set:?}");
+        assert_eq!(link::take_recorded(), [(Failed, "internal error", true)]);
+    });
+    assert_eq!(passkey::take_registered(), 0);
+}
+
+#[test]
+fn a_post_with_no_settings_left_is_a_failure_and_clears_its_page() {
+    let _ = link::take_recorded();
+    let root = tempfile::tempdir().unwrap();
+    let flows = Mutex::new(Flows::default());
+    link::test_put_page(&flows, "p1", "l1");
+    let (answer, set) = with_link_ctx(ISSUER, root.path(), &flows, |cx| link::register(cx, "id=p1", &page_browser()));
+    assert_eq!(page(&answer).status, 404);
+    assert_eq!(set, vec![set_link_page_cookie(ISSUER, "ab12", "", Duration::ZERO)]);
+    assert_eq!(link::take_recorded(), [(link::Outcome::Failed, "sign-in settings unavailable", true)]);
+}
+
+#[test]
+fn ids_of_approvals_and_link_pages_do_not_cross() {
+    let _ = link::take_recorded();
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let kept = kept_link(root.path(), &link_secret('a'), "proj");
+    let value = "c".repeat(64);
+    let c = ceremony(false);
+    let fields = registration(&SoftKey::es256(), &c, &Tamper::default());
+    lock(&flows).approvals.put(auth::hash("gate1"), approval_with("ab12", &value, c.clone()));
+    lock(&flows).operations.put(auth::hash("op1"), op_approval("ab12", &value, close_request("proj", "bd-1")));
+    link::test_keep_page(&flows, "page1", &kept.id, c);
+    let cookies = format!("__Secure-bd_gate_ab12={value}; __Secure-bd_op_ab12={value}; {}", page_browser());
+    let waiting = |flows: &Mutex<Flows>| {
+        let f = lock(flows);
+        (f.approvals.map.len(), f.operations.map.len(), f.link_pages.map.len())
+    };
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        // An approval's id at a link's POST, a link page's at an approval's.
+        for id in ["gate1", "op1"] {
+            let (answer, _) = link::register(cx, &format!("id={id}&{fields}"), &cookies);
+            assert_eq!(page(&answer).status, 400, "{id}");
+            assert!(page(&answer).html.contains("has expired"), "{id}: {answer:?}");
+        }
+        let body = format!("approval=page1&{fields}");
+        let (answer, _) = gate::approve(cx, "proj", "bd-1", &body, &cookies);
+        assert_eq!(page(&answer).status, 400);
+        let (answer, _) = operation::approve(cx, "proj", "close", "bd-1", &body, &cookies);
+        assert_eq!(page(&answer).status, 400);
+    });
+    assert_eq!(waiting(&flows), (1, 1, 1), "nothing taken");
+    assert_eq!(link::take_recorded(), []);
+}
+
+#[test]
+fn a_live_link_changes_nothing_of_what_an_approval_finds() {
+    let root = gate_root(false);
+    let flows = Mutex::new(Flows::default());
+    let key = SoftKey::es256();
+    let found = |cx: &Ctx<'_>| {
+        let (c, credentials) = opened(cx);
+        let held: Vec<String> = kept_passkeys(root.path()).into_iter().map(|p| p.credential).collect();
+        let shape = (c.enroll, c.add.is_some(), c.allowance.is_some(), c.link, c.issuer, c.subject, c.actor);
+        (shape, credentials, held, acme().oidc_approver())
+    };
+    with_link_ctx(ISSUER, root.path(), &flows, |cx| {
+        put_passkey(root.path(), "VOUCHvouchvouch", ACME_SUBJECT, "acme:alice", &key);
+        let before = found(cx);
+        let hash = auth::hash(&link_secret('a'));
+        let link = passkeys::NewLink {
+            id: hash[..32].to_string(),
+            secret_hash: hash,
+            issuer: ACME_ISSUER.into(),
+            subject: ACME_SUBJECT.into(),
+            provider: "acme".into(),
+            actor: "acme:alice".into(),
+            vouched_by: "VOUCHvouchvouch".into(),
+            workspace: "proj".into(),
+            created_at: now_millis(),
+            expires_at: now_millis() + 60_000,
+        };
+        passkeys::test_put_link(root.path(), &link).unwrap();
+        assert_eq!(found(cx), before);
+    });
 }

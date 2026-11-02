@@ -195,6 +195,10 @@ const MAX_CONSENT_BODY: usize = 4 << 10;
 /// largest fields come to about 6 KiB; an assertion with an added
 /// passkey's registration, every field at its cap, about 13.3 KiB).
 const MAX_APPROVAL_BODY: usize = 16 << 10;
+/// The largest body of a passkey link's landing page's post: its one field,
+/// the link's secret. Anyone may post here, so it is read before any lookup
+/// and kept small.
+const MAX_LINK_BODY: usize = 1024;
 /// The largest provider's answer posted to a callback (an ID token and the
 /// user's name with the code, which are not read).
 const MAX_RELAYED_BODY: usize = 32 << 10;
@@ -1519,11 +1523,19 @@ mod tests {
             ("new_authenticator_data", encoded_len(MAX_AUTH_DATA)),
             ("new_public_key", encoded_len(MAX_PUBLIC_KEY)),
             ("new_algorithm", 20),
+            // The box asking for a link, ticked.
+            ("make_link", 1),
         ];
         let body: usize = fields.iter().map(|(name, len)| name.len() + len + 2).sum();
         assert!(body <= MAX_APPROVAL_BODY, "{body}");
         assert!(body > 8 << 10, "the former 8 KiB cap would refuse it: {body}");
         assert!(body > MAX_CONSENT_BODY, "the consent's cap would refuse it: {body}");
+        // A link's landing page posts its one field.
+        assert!("link=".len() + 64 <= MAX_LINK_BODY);
+        // A link's registration page posts its id and a registration: no more than an approval.
+        let body: usize =
+            fields[..7].iter().filter(|(name, _)| *name != "signature").map(|(name, len)| name.len() + len + 2).sum();
+        assert!(body <= MAX_APPROVAL_BODY, "{body}");
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1562,6 +1574,388 @@ mod tests {
                 .await;
         assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(take_recorded(), vec![]);
+    }
+
+    const LANDING: &str = "/bd/oauth/passkey-link";
+    const LINK_REGISTER: &str = "/bd/oauth/passkey-link/register";
+    /// What this server's own page says it is.
+    const SITE: (&str, &str) = ("origin", "https://bd.example.com");
+
+    /// A browser that holds the `bd_oauth` cookie.
+    fn link_browser() -> String {
+        format!("__Secure-bd_oauth={}", "c".repeat(64))
+    }
+
+    /// The browser `link::test_put_page` binds its page to.
+    fn page_browser() -> String {
+        format!("__Secure-bd_passkey_ab12={}", authorize::link::TEST_BROWSER)
+    }
+
+    /// What a landing page posts for the secret made of `fill`.
+    fn link_body(fill: char) -> String {
+        format!("link={}", fill.to_string().repeat(64))
+    }
+
+    /// A live link whose secret is made of `fill`: its id.
+    fn live_link(root: &Path, fill: char) -> String {
+        let hash = auth::hash(&fill.to_string().repeat(64));
+        let id = hash[..32].to_string();
+        let now = bd_core::Timestamp::now().millis();
+        let link = crate::passkeys::NewLink {
+            id: id.clone(),
+            secret_hash: hash,
+            issuer: "https://github.com".into(),
+            subject: "1".into(),
+            provider: "github".into(),
+            actor: "github:alice".into(),
+            vouched_by: "credential00".into(),
+            workspace: "proj".into(),
+            created_at: now,
+            expires_at: now + 60_000,
+        };
+        crate::passkeys::test_put_link(root, &link).unwrap();
+        id
+    }
+
+    /// A POST to `uri` with `headers` and no other, as something that is not this server's page sends it.
+    fn posted_with(
+        uri: &str,
+        headers: &[(&str, &str)],
+        cookie: &str,
+        body: &str,
+    ) -> Request<http_body_util::Full<Bytes>> {
+        let mut r = Request::builder().method(Method::POST).uri(uri);
+        for (name, value) in headers {
+            r = r.header(*name, *value);
+        }
+        if !cookie.is_empty() {
+            r = r.header(header::COOKIE, cookie);
+        }
+        r.body(http_body_util::Full::new(Bytes::from(body.to_string()))).unwrap()
+    }
+
+    /// What a browser gets of `r`: its status, the cookies it sets and its bytes.
+    async fn got(r: Response<Body>) -> (StatusCode, Vec<String>, Bytes) {
+        let (parts, body) = r.into_parts();
+        let cookies = parts.headers.get_all(header::SET_COOKIE).iter().map(|c| c.to_str().unwrap().to_string());
+        (parts.status, cookies.collect(), body.collect().await.unwrap().to_bytes())
+    }
+
+    /// A page as [`got`] gives it, when it sets no cookie.
+    fn page_of(status: StatusCode, page: pages::Page) -> (StatusCode, Vec<String>, Bytes) {
+        assert_eq!(page.status, status.as_u16());
+        (status, Vec::new(), Bytes::from(page.html))
+    }
+
+    /// A page's headers: no other site frames it or gets its address, nothing keeps it, and it has its policy.
+    fn hardened(r: &Response<Body>, what: &str) {
+        let value = |name| r.headers().get(name).and_then(|v| v.to_str().ok());
+        assert_eq!(value(header::X_FRAME_OPTIONS), Some("DENY"), "{what}");
+        assert_eq!(value(header::REFERRER_POLICY), Some("same-origin"), "{what}");
+        assert_eq!(value(header::CACHE_CONTROL), Some("no-store"), "{what}");
+        let csp = value(header::CONTENT_SECURITY_POLICY).unwrap_or_else(|| panic!("{what}: no policy"));
+        assert!(csp.starts_with("default-src 'none';") && !csp.contains("unsafe-inline"), "{what}: {csp}");
+    }
+
+    /// Every way a landing POST of `body` lacks what only the landing page, open in a browser, sends.
+    async fn landing_refusals(server: &Arc<Server>, body: &str) -> Vec<(StatusCode, Vec<String>, Bytes)> {
+        let browser = link_browser();
+        let requests = [
+            posted_with(LANDING, &[("origin", "https://evil.example")], &browser, body),
+            posted_with(LANDING, &[SITE, ("sec-fetch-site", "cross-site")], &browser, body),
+            posted_with(LANDING, &[("sec-fetch-site", "same-site")], &browser, body),
+            posted_with(LANDING, &[], &browser, body),
+            posted_with(LANDING, &[SITE], "", body),
+            posted_with(LANDING, &[SITE], "__Secure-bd_oauth=short", body),
+            posted_with(LANDING, &[SITE], &format!("__Secure-bd_oauth={}", "C".repeat(64)), body),
+            // Not the name an https issuer's cookie has.
+            posted_with(LANDING, &[SITE], &format!("bd_oauth={}", "c".repeat(64)), body),
+        ];
+        let mut answers = Vec::new();
+        for request in requests {
+            answers.push(got(passkey_link(server, request).await).await);
+        }
+        answers
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_landing_post_is_refused_before_any_lookup_with_one_answer() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Arc::new(offering(root.path()));
+        live_link(root.path(), 'a');
+        let (live, dead, browser) = (link_body('a'), link_body('b'), link_browser());
+        let long =
+            |body: &str| built(Method::POST, LANDING, &browser, &format!("{body}&x={}", "y".repeat(MAX_LINK_BODY)));
+        let refused = got(html_page(pages::refusal(
+            403,
+            "Couldn't open the link",
+            "This didn't come from the link's own page. Open the link again.",
+            None,
+        )))
+        .await;
+        let too_long = got(passkey_link(&server, long(&live)).await).await;
+        assert_eq!((too_long.0, too_long.1.len()), (StatusCode::BAD_REQUEST, 0));
+        // Told the same whatever the link, and again with its table gone, where any lookup would fail.
+        for gone in [false, true] {
+            for body in [&live, &dead] {
+                let answers = landing_refusals(&server, body).await;
+                assert_eq!(answers, vec![refused.clone(); answers.len()], "the table gone: {gone}");
+                assert_eq!(got(passkey_link(&server, long(body)).await).await, too_long, "the table gone: {gone}");
+                let slots = server.sign_ins.clone().try_acquire_many_owned(MAX_SIGN_INS as u32).unwrap();
+                let post = built(Method::POST, LANDING, &browser, body);
+                let (status, cookies, _) = got(passkey_link(&server, post).await).await;
+                assert_eq!((status, cookies.len()), (StatusCode::SERVICE_UNAVAILABLE, 0), "the table gone: {gone}");
+                drop(slots);
+            }
+            let post = built(Method::POST, LANDING, &browser, &live);
+            let open = got(passkey_link(&server, post).await).await.0;
+            assert_eq!(open, if gone { StatusCode::INTERNAL_SERVER_ERROR } else { StatusCode::OK }, "a lookup");
+            let db = crate::server_db::open(root.path()).unwrap();
+            db.execute_batch("DROP TABLE IF EXISTS passkey_links").unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_link_with_no_slot_is_busy_counted_once_and_looks_nothing_up() {
+        use authorize::link::{Outcome, take_recorded, take_seen};
+        let (_, _) = (take_recorded(), take_seen());
+        let root = tempfile::tempdir().unwrap();
+        let server = Arc::new(offering(root.path()));
+        let id = live_link(root.path(), 'a');
+        authorize::link::test_put_page(&server.flows, "page", &id);
+        crate::server_db::open(root.path()).unwrap().execute_batch("DROP TABLE passkey_links").unwrap();
+        let held = server.sign_ins.clone().try_acquire_many_owned(MAX_SIGN_INS as u32).unwrap();
+        let address: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let busy = (Outcome::Busy, "too many sign-ins", true);
+        let mut landing = built(Method::POST, LANDING, &link_browser(), &link_body('a'));
+        landing.extensions_mut().insert(Peer(address));
+        let r = passkey_link(&server, landing).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        hardened(&r, "the busy notice");
+        assert_eq!(take_recorded(), [busy]);
+        assert_eq!(take_seen().pop().unwrap().peer, Some(address));
+        let mut post = built(Method::POST, LINK_REGISTER, &page_browser(), "id=page");
+        post.extensions_mut().insert(Peer(address));
+        let r = passkey_link_register(&server, post).await;
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(take_recorded(), [busy]);
+        assert_eq!(take_seen().pop().unwrap().peer, Some(address));
+        // The page was not taken: with a slot free, its own POST still reaches it.
+        drop(held);
+        let post = built(Method::POST, LINK_REGISTER, &page_browser(), "id=page");
+        let own = got(passkey_link_register(&server, post).await).await;
+        assert_eq!((own.0, own.2), (StatusCode::FORBIDDEN, Bytes::from(pages::link_failed().html)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_register_post_takes_nothing_unless_it_is_the_pages_own() {
+        use authorize::link::take_recorded;
+        let _ = take_recorded();
+        let root = tempfile::tempdir().unwrap();
+        let server = Arc::new(offering(root.path()));
+        let id = live_link(root.path(), 'a');
+        authorize::link::test_put_page(&server.flows, "page", &id);
+        const REFUSED: (StatusCode, &str) = (StatusCode::FORBIDDEN, "came from another site");
+        const OTHER: (StatusCode, &str) = (StatusCode::FORBIDDEN, "started in a different browser");
+        let browser = page_browser();
+        let another = format!("__Secure-bd_passkey_ab12={}", "d".repeat(64));
+        let big = format!("id=page&x={}", "y".repeat(MAX_APPROVAL_BODY));
+        let post = |body: &str, cookie: &str| built(Method::POST, LINK_REGISTER, cookie, body);
+        for (request, (status, says)) in [
+            (posted_with(LINK_REGISTER, &[("origin", "https://evil.example")], &browser, "id=page"), REFUSED),
+            (posted_with(LINK_REGISTER, &[SITE, ("sec-fetch-site", "cross-site")], &browser, "id=page"), REFUSED),
+            (posted_with(LINK_REGISTER, &[], &browser, "id=page"), REFUSED),
+            (post("id=page", ""), OTHER),
+            (post("id=page", &another), OTHER),
+            (post("id=page", "__Secure-bd_passkey_ab12=short"), OTHER),
+            (post("id=page", &link_browser()), OTHER),
+            (post(&big, &browser), (StatusCode::BAD_REQUEST, "arrive complete")),
+            (post("id=page&id=page", &browser), (StatusCode::BAD_REQUEST, "incomplete")),
+            (post("id=other", &browser), (StatusCode::BAD_REQUEST, "expired")),
+        ] {
+            let (got_status, cookies, page) = got(passkey_link_register(&server, request).await).await;
+            let page = String::from_utf8_lossy(&page);
+            assert_eq!((got_status, cookies.len()), (status, 0), "{page}");
+            assert!(page.contains(says), "{says}: {page}");
+        }
+        assert!(take_recorded().is_empty(), "before the page is taken, nothing is recorded");
+        assert!(crate::passkeys::link_by_id(root.path(), &id).unwrap().is_some());
+
+        // All that left the page there for its own POST, which takes it, whatever the passkey's fields hold.
+        let own = got(passkey_link_register(&server, post("id=page", &browser)).await).await;
+        assert_eq!((own.0, own.2.clone()), (StatusCode::FORBIDDEN, Bytes::from(pages::link_failed().html)));
+        assert_eq!(own.1.len(), 1, "its cookie cleared");
+        assert!(own.1[0].starts_with("__Secure-bd_passkey_ab12=;") && own.1[0].contains("Max-Age=0"), "{:?}", own.1);
+        let again = got(passkey_link_register(&server, post("id=page", &browser)).await).await;
+        assert_eq!(again.0, StatusCode::BAD_REQUEST);
+        assert!(String::from_utf8_lossy(&again.2).contains("already used"));
+        assert!(crate::passkeys::link_by_id(root.path(), &id).unwrap().is_some(), "a refusal leaves the link live");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_links_pages_are_hardened_and_a_dead_link_is_told_one_way() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Arc::new(offering(root.path()));
+        live_link(root.path(), 'a');
+        let browser = link_browser();
+
+        let r = passkey_link(&server, built(Method::GET, LANDING, "", "")).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        hardened(&r, "the landing page");
+
+        let dead = passkey_link(&server, built(Method::POST, LANDING, &browser, &link_body('b'))).await;
+        hardened(&dead, "a dead link's notice");
+        let dead = got(dead).await;
+        assert_eq!(dead, page_of(StatusCode::NOT_FOUND, pages::link_unusable()));
+        for body in ["link=", "", "link=short", &format!("{0}&{0}", link_body('a')), &link_body('A')] {
+            let r = got(passkey_link(&server, built(Method::POST, LANDING, &browser, body)).await).await;
+            assert_eq!(r, dead, "{body}");
+        }
+
+        let live = passkey_link(&server, built(Method::POST, LANDING, &browser, &link_body('a'))).await;
+        assert_eq!(live.status(), StatusCode::OK);
+        hardened(&live, "a live link's onward page");
+        let (_, cookies, page) = got(live).await;
+        assert_eq!(cookies, [] as [String; 0], "nothing to carry: the flow is in the page");
+        let page = String::from_utf8_lossy(&page);
+        assert!(
+            page.contains("<meta http-equiv=\"refresh\" content=\"0; url=https://bd.example.com/bd/oauth/choose?flow=")
+        );
+        assert!(!page.contains(&"a".repeat(64)), "{page}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_landing_page_is_one_page_and_keeps_the_browsers_cookie() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Arc::new(offering(root.path()));
+        live_link(root.path(), 'a');
+        let get = |uri: &str, cookie: &str| built(Method::GET, uri, cookie, "");
+        let browser = link_browser();
+
+        let (status, kept, page) = got(passkey_link(&server, get(LANDING, &browser)).await).await;
+        assert_eq!((status, kept), (StatusCode::OK, Vec::new()), "it has one");
+        assert_eq!(page, Bytes::from(pages::landing_link("https://bd.example.com/bd/oauth/passkey-link").html));
+
+        let (status, given, without) = got(passkey_link(&server, get(LANDING, "")).await).await;
+        assert_eq!((status, &without), (StatusCode::OK, &page), "the same bytes");
+        let [cookie] = given.as_slice() else { panic!("{given:?}") };
+        let value = cookie.strip_prefix("__Secure-bd_oauth=").and_then(|c| c.split_once(';')).unwrap().0;
+        assert!(value.len() == 64 && value != "c".repeat(64), "{cookie}");
+        assert!(cookie.contains("Path=/bd/oauth;") && cookie.contains("Secure"), "{cookie}");
+        let malformed = get(LANDING, "__Secure-bd_oauth=short");
+        assert_eq!(got(passkey_link(&server, malformed).await).await.1.len(), 1, "not one to keep");
+
+        // The query is not read, whatever it holds.
+        let secret = "a".repeat(64);
+        for query in ["?link=x", "?flow=y&request=z", &format!("?link={secret}")] {
+            let uri = format!("{LANDING}{query}");
+            let (status, _, bytes) = got(passkey_link(&server, get(&uri, &browser)).await).await;
+            assert_eq!((status, bytes), (StatusCode::OK, page.clone()), "{query}");
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_links_urls_come_from_the_issuer_whatever_the_request_says() {
+        let root = tempfile::tempdir().unwrap();
+        let server = Arc::new(offering(root.path()));
+        live_link(root.path(), 'a');
+        let browser = link_browser();
+        let hostile = |mut r: Request<http_body_util::Full<Bytes>>| {
+            let headers = r.headers_mut();
+            headers.insert(header::HOST, HeaderValue::from_static("evil.example"));
+            headers.insert("x-forwarded-host", HeaderValue::from_static("evil.example"));
+            headers.insert("x-forwarded-proto", HeaderValue::from_static("http"));
+            headers.insert("x-forwarded-prefix", HeaderValue::from_static("/evil"));
+            r
+        };
+        let (_, cookies, page) = got(passkey_link(&server, hostile(built(Method::GET, LANDING, "", ""))).await).await;
+        let page = String::from_utf8_lossy(&page);
+        assert!(page.contains("action=\"https://bd.example.com/bd/oauth/passkey-link\""), "{page}");
+        assert!(!page.contains("evil") && !cookies[0].contains("evil"), "{page}");
+        let post = hostile(built(Method::POST, LANDING, &browser, &link_body('a')));
+        let (status, cookies, page) = got(passkey_link(&server, post).await).await;
+        let page = String::from_utf8_lossy(&page);
+        assert_eq!((status, cookies.len()), (StatusCode::OK, 0));
+        assert!(page.contains("url=https://bd.example.com/bd/oauth/choose?flow="), "{page}");
+        assert!(!page.contains("evil"), "{page}");
+    }
+
+    /// `request` answered by the step of a link its path names.
+    async fn link_step(server: &Arc<Server>, request: Request<http_body_util::Full<Bytes>>) -> Response<Body> {
+        if request.uri().path() == LINK_REGISTER {
+            passkey_link_register(server, request).await
+        } else {
+            passkey_link(server, request).await
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_links_paths_are_not_found_without_approvals_and_take_their_methods_once_served() {
+        let requests = || {
+            [Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::HEAD].into_iter().flat_map(|method| {
+                [
+                    built(method.clone(), LANDING, &link_browser(), &link_body('a')),
+                    built(method, LINK_REGISTER, &page_browser(), "id=page"),
+                ]
+            })
+        };
+        for spoiled in SPOILED {
+            let root = tempfile::tempdir().unwrap();
+            let server = Arc::new(offering(root.path()));
+            live_link(root.path(), 'a');
+            spoiled.apply(root.path());
+            for request in requests() {
+                assert_eq!(link_step(&server, request).await.status(), StatusCode::NOT_FOUND, "{spoiled:?}");
+            }
+        }
+        // Without --public-url, nothing is served either.
+        let root = tempfile::tempdir().unwrap();
+        let mut plain = offering(root.path());
+        plain.public_url = None;
+        let plain = Arc::new(plain);
+        live_link(root.path(), 'a');
+        for request in requests() {
+            assert_eq!(link_step(&plain, request).await.status(), StatusCode::NOT_FOUND);
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let server = Arc::new(offering(root.path()));
+        for method in [Method::PUT, Method::DELETE, Method::HEAD, Method::OPTIONS, Method::PATCH] {
+            let r = passkey_link(&server, built(method.clone(), LANDING, "", "")).await;
+            assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert_eq!(r.headers().get(header::ALLOW).unwrap(), "GET, POST", "{method}");
+        }
+        for method in [Method::GET, Method::PUT, Method::DELETE, Method::HEAD, Method::OPTIONS, Method::PATCH] {
+            let r = passkey_link_register(&server, built(method.clone(), LINK_REGISTER, "", "")).await;
+            assert_eq!(r.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert_eq!(r.headers().get(header::ALLOW).unwrap(), "POST", "{method}");
+        }
+    }
+
+    #[test]
+    fn a_links_paths_are_served_under_the_public_path_or_stripped_only() {
+        use oauth_server::{PASSKEY_LINK, PASSKEY_LINK_REGISTER};
+        let mut server = Server::new(PathBuf::from("."), 1, Waits::default());
+        server.public_url = Some("https://x/bd".into());
+        assert_eq!(oauth_endpoint(&server, LANDING), Some(PASSKEY_LINK));
+        assert_eq!(oauth_endpoint(&server, LINK_REGISTER), Some(PASSKEY_LINK_REGISTER));
+        assert_eq!(oauth_endpoint(&server, PASSKEY_LINK), Some(PASSKEY_LINK), "stripped");
+        assert_eq!(oauth_endpoint(&server, PASSKEY_LINK_REGISTER), Some(PASSKEY_LINK_REGISTER), "stripped");
+        for elsewhere in [
+            "/other/oauth/passkey-link",
+            "/bd/bd/oauth/passkey-link",
+            "/bdx/oauth/passkey-link",
+            "/bd/oauth/passkey-link/",
+            "/bd/oauth/passkey-link/register/",
+            "/bd/oauth/passkey-link/other",
+            "/w/proj/oauth/passkey-link",
+            "/bd/oauth/passkey-link/register/x",
+        ] {
+            assert_eq!(oauth_endpoint(&server, elsewhere), None, "{elsewhere}");
+        }
+        // Neither is taken for a provider's callback.
+        assert_eq!(oauth_server::callback_provider(PASSKEY_LINK), None);
+        assert_eq!(oauth_server::callback_provider(PASSKEY_LINK_REGISTER), None);
     }
 
     #[test]

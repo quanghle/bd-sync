@@ -83,17 +83,33 @@ malformed spec parts) do not.
   characters of the passkey's credential id once the posted one has been
   read, else empty), `added` (the first 12 characters of a passkey added
   at that approval, else empty) and `passkey` (`registered`, `verified`,
-  `verified and added`, `registered under allowance`, a refusal's reason
-  such as `adding not offered`, `limit reached`, `new passkey: <reason>` or
+  `verified and added`, `verified, link made`, `verified and added, link
+  made`, `registered under allowance`, a refusal's reason
+  such as `adding not offered`, `link not offered`, `limit reached`, `new
+  passkey: <reason>` or
   `allowance: <reason>`, `unavailable`). [Close and discard
   approvals](sign-in.md#approving-a-close-or-discard) log one `operation
   approval` line per outcome, with `outcome`, `provider`, `login`,
   `subject`, `actor`, `workspace`, `issue`, `op`, `detail`,
-  `credential`, `added` and, only on an allowance's outcome, `passkey`
-  (`registered under allowance` or `allowance: <reason>`), never the reason
+  `credential`, `added` and, only on an allowance's outcome or a link's,
+  `passkey` (`registered under allowance`, `allowance: <reason>`,
+  `verified, link made`, `verified and added, link made` or `link not
+  offered`), never the reason
   or a title. Under an allowance `credential` is the new passkey's and
   `added` is empty, on both lines. Neither ever carries a
   passkey's public key, signature, client data or whole credential id.
+  [Links for another
+  device](sign-in.md#approving-human-gates-in-the-browser) log one `passkey
+  link` line per step, with `outcome` (`started`, `unusable`, `wrong
+  account`, `not admitted`, `not human`, `page shown`, `registered`,
+  `passkey refused`, `busy` or `failed`), `provider`, `login`, `subject`,
+  `actor`, `link` (the first 12 characters of its id), `vouched_by` and
+  `credential` (those of the passkey that vouched for it and of the new
+  one), each empty until known, and a fixed `detail`. `unusable`, which
+  anyone can cause, is logged at most once a minute, with `peer` and
+  `skipped` alone. A link made or replaced has no line of its own: the
+  approval's line says `link made`, and the audit trail says the rest. No
+  line carries a link's secret or its hash.
 - **Sign-in secrets** ([from a command](sign-in.md#secrets-from-a-command)):
   at start, which command fetches how many secrets, then (once known, the
   server serving meanwhile) that it answered, or why the steps needing
@@ -135,6 +151,30 @@ by the prefix the event names, with `bd serve passkey remove --account
 logs, a run of `allowance: not offered` is someone probing the path: the
 server's own pages send those fields only under an allowance.
 
+**After each link** ([Adding a passkey from another
+device](sign-in.md#approving-human-gates-in-the-browser)), review what it did
+the same way: bd cannot tell the person when one is used.
+
+```bash
+bd serve token events --kind passkey_link_made,passkey_registered --root <root>
+```
+
+Every `passkey_link_made` should be followed by a `passkey_registered`
+through that link, by a `passkey_link_ended` naming it (add that kind to see
+them), or by nothing, when it ran out. A link's registration reads
+`credential <new prefix> (<algorithm>), through link <link prefix> vouched by
+<vouching prefix>`: the new credential, the link and the credential that
+vouched for it. One the person does not recognize is the alarm: remove the
+new passkey with `bd serve passkey remove --account <actor or login>
+--credential <new prefix>`, and check what it approved. While a link is live,
+`bd serve passkey cancel-link --account <actor or login>` ends it first.
+
+`passkey link` lines with outcome `wrong account`, counted as
+`bd_serve_passkey_links_total{outcome="wrong_account"}`, are worth an alert:
+someone holding a live link signed in as another account, so the link has
+reached a stranger. A rising `unusable` count is scanning, or links opened too
+late; `registered` should follow `made` closely.
+
 ## Server metrics
 
 `GET /metrics` on `bd serve`, with an admin token (`Authorization: Bearer
@@ -152,9 +192,10 @@ Prometheus text:
 | `bd_serve_commands_total` | commands run |
 | `bd_serve_tool_calls_total` | MCP tool calls |
 | `bd_serve_publishes_total{outcome}` | `bd publish` runs (dry runs aside), `applied` or `refused` |
-| `bd_serve_approvals_total{outcome}` | human gates [approved in the browser](sign-in.md#approving-human-gates-in-the-browser), `approved`, or approvals `refused` (an account not let in, whose actor is taken, not granted kind `human` or not an approver, a refusal when posting, a post from another site), or `passkey_refused` (the passkey's fields missing, a failed passkey check, a refused add of a passkey, a refused registration under an allowance, or an address passkeys cannot be used at); notices (expired, used, resolved, not ready, not found) are not counted |
-| `bd_serve_operation_approvals_total{outcome}` | closes and discards [approved in the browser](sign-in.md#approving-a-close-or-discard): `approved`, `refused`, `not_ready` (no longer held back, or no longer what was asked), `gone` (already closed, or no such workspace or issue), `busy`, `failed`, `passkey_refused` (the passkey's fields missing, a failed passkey check, a refused add of a passkey, a refused registration under an allowance, or an address passkeys cannot be used at); every callback of an operation's sign-in and every answer to its `POST` counts once, the page itself aside |
-| `bd_serve_passkeys_registered_total` | passkeys registered at a browser approval: an account's first, passkeys added at an approval with an existing one, and passkeys registered under an admin's allowance |
+| `bd_serve_approvals_total{outcome}` | human gates [approved in the browser](sign-in.md#approving-human-gates-in-the-browser), `approved`, or approvals `refused` (an account not let in, whose actor is taken, not granted kind `human` or not an approver, a refusal when posting, a post from another site), or `passkey_refused` (the passkey's fields missing, a failed passkey check, a refused add of a passkey, a refused registration under an allowance, a link asked for where none was offered, or an address passkeys cannot be used at); notices (expired, used, resolved, not ready, not found) are not counted |
+| `bd_serve_operation_approvals_total{outcome}` | closes and discards [approved in the browser](sign-in.md#approving-a-close-or-discard): `approved`, `refused`, `not_ready` (no longer held back, or no longer what was asked), `gone` (already closed, or no such workspace or issue), `busy`, `failed`, `passkey_refused` (the passkey's fields missing, a failed passkey check, a refused add of a passkey, a refused registration under an allowance, a link asked for where none was offered, or an address passkeys cannot be used at); every callback of an operation's sign-in and every answer to its `POST` counts once, the page itself aside |
+| `bd_serve_passkeys_registered_total` | passkeys registered in the browser: an account's first, passkeys added at an approval with an existing one, passkeys registered under an admin's allowance, and passkeys registered through a link |
+| `bd_serve_passkey_links_total{outcome}` | one-time [links for another device](sign-in.md#approving-human-gates-in-the-browser): `made`, `started` (a live link opened), `unusable` (no such live link; always counted, though its log line is limited), `wrong_account`, `refused` (every other refusal on the way: the account not admitted or not a person's, a refused passkey or the account's limit, the server busy, a failure), `registered`, and `ended` (a live link replaced by a new one, on either way of making one: only the replacements the server itself sees, as `cancel-link`, `remove` and forgetting an account run outside it and are in the audit trail instead); the registration page shown is not counted |
 | `bd_serve_panics_total` | panics |
 | `bd_serve_start_time_seconds` | when the server started |
 

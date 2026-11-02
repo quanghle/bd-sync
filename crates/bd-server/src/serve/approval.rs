@@ -5,7 +5,9 @@
 //! and discards that open human gates refused, approved from their sealed
 //! links `<public url>/w/<name>/(close|discard)/<id>?request=...`
 //! (`oauth_server/authorize/operation.rs`, [`authorize::Operations`] for
-//! [`Server`]).
+//! [`Server`]); and the one-time links an approval makes for adding a passkey
+//! on another device, at `<public url>/oauth/passkey-link`
+//! (`oauth_server/authorize/link.rs`).
 
 use bd_cli::approval_link::{Op, OperationRequest};
 use bd_core::gates::{self, GateKind};
@@ -220,6 +222,139 @@ where
             issue,
             "sign-in settings unavailable",
         );
+    }
+}
+
+/// The browser's `Cookie` headers, joined.
+fn cookie_header(headers: &HeaderMap) -> String {
+    headers.get_all(header::COOKIE).iter().filter_map(|v| v.to_str().ok()).collect::<Vec<_>>().join("; ")
+}
+
+/// The answer to a passkey link's POST with no sign-in slot free.
+fn link_busy(peer: Option<std::net::IpAddr>) -> Response<Body> {
+    use authorize::link::{Outcome, Seen, record};
+    record(Outcome::Busy, &Seen { peer, ..Seen::default() }, "too many sign-ins");
+    let why = "Too many sign-ins are in progress. Try again in a moment.";
+    html_page(pages::notice(503, "The server is busy", why))
+}
+
+/// The answer to a passkey link's step that did not finish (it panicked), so
+/// never recorded its outcome.
+fn link_unfinished(peer: Option<std::net::IpAddr>, e: Error) -> Response<Body> {
+    use authorize::link::{Outcome, Seen, record};
+    record(Outcome::Failed, &Seen { peer, ..Seen::default() }, "internal error");
+    Reject::internal(e).response()
+}
+
+/// `GET` (the constant page a link opens) or `POST` (its secret, on to the
+/// sign-in) at `<public url>/oauth/passkey-link`, as [`gate_approval`] serves a
+/// gate's page: 404 for every method while approvals are not served, 405 for
+/// other methods once they are. The query is never read. A POST is refused
+/// without a look at its link, one answer whatever the link: it must come from
+/// this server's own page, in a browser with its `bd_oauth` cookie, which the
+/// flow is bound to, and fit [`MAX_LINK_BODY`] and a sign-in slot. What a
+/// person is shown comes from the issuer alone, never from `Host` or
+/// `X-Forwarded-*`.
+pub(super) async fn passkey_link<B>(server: &Arc<Server>, req: Request<B>) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let issuer = match server.approvals_issuer() {
+        Ok(Some(issuer)) => issuer,
+        Ok(None) => return no_approvals(),
+        Err(e @ Error::Invalid(_)) => {
+            log_misconfigured(&e);
+            return no_approvals();
+        }
+        Err(e) => return sign_in_misconfigured(&e),
+    };
+    if req.method() != Method::GET && req.method() != Method::POST {
+        let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use GET or POST", 2).response();
+        r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("GET, POST"));
+        return r;
+    }
+    let cookies = cookie_header(req.headers());
+    if req.method() != Method::POST {
+        let (answer, set) = authorize::link::landing(&issuer, &cookies);
+        return answered(answer, &set, false);
+    }
+    const TITLE: &str = "Couldn't open the link";
+    // Only the landing page posts here, from a browser that has its cookie, which `begin` binds the flow to.
+    let browser = authorize::cookie(&issuer, &cookies).map(str::to_owned);
+    let Some(browser) = browser.filter(|_| same_origin(req.headers(), &issuer)) else {
+        let why = "This didn't come from the link's own page. Open the link again.";
+        return html_page(pages::refusal(403, TITLE, why, None));
+    };
+    let address = peer(req.extensions());
+    let Ok(body) = read_body(req.into_body(), MAX_LINK_BODY, HEADER_TIMEOUT).await else {
+        let why = "The link didn't arrive complete. Open the link again.";
+        return html_page(pages::refusal(400, TITLE, why, None));
+    };
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
+        return link_busy(address);
+    };
+    let srv = server.clone();
+    let done = blocking(move || {
+        let _permit = permit;
+        Ok(srv.authorizing(&issuer, |cx| authorize::link::begin(cx, &body, &browser, address)))
+    })
+    .await;
+    match done {
+        Ok(answer) => answered(answer, &[], true),
+        Err(e) => link_unfinished(address, e),
+    }
+}
+
+/// `POST <public url>/oauth/passkey-link/register`: the passkey a link's
+/// registration page made. 404 for every method while approvals are not
+/// served, 405 for any but POST once they are. What the page's cookie binds is
+/// checked by `authorize::link::register`, which takes the page once.
+pub(super) async fn passkey_link_register<B>(server: &Arc<Server>, req: Request<B>) -> Response<Body>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let issuer = match server.approvals_issuer() {
+        Ok(Some(issuer)) => issuer,
+        Ok(None) => return no_approvals(),
+        Err(e @ Error::Invalid(_)) => {
+            log_misconfigured(&e);
+            return no_approvals();
+        }
+        Err(e) => return sign_in_misconfigured(&e),
+    };
+    if req.method() != Method::POST {
+        let mut r = Reject::new(StatusCode::METHOD_NOT_ALLOWED, "invalid", "use POST", 2).response();
+        r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
+        return r;
+    }
+    const TITLE: &str = "Couldn't add a passkey";
+    // Only the registration page posts here: its cookie is SameSite=Strict, and this keeps out other sites' requests.
+    if !same_origin(req.headers(), &issuer) {
+        let why = "The passkey came from another site. Open the link again.";
+        return html_page(pages::refusal(403, TITLE, why, None));
+    }
+    let cookies = cookie_header(req.headers());
+    let address = peer(req.extensions());
+    let Ok(body) = read_body(req.into_body(), MAX_APPROVAL_BODY, HEADER_TIMEOUT).await else {
+        let why = "The passkey didn't arrive complete. Open the link again.";
+        return html_page(pages::refusal(400, TITLE, why, None));
+    };
+    let body = String::from_utf8_lossy(&body).into_owned();
+    let Ok(permit) = server.sign_ins.clone().try_acquire_owned() else {
+        return link_busy(address);
+    };
+    let srv = server.clone();
+    let done = blocking(move || {
+        let _permit = permit;
+        Ok(srv.authorizing(&issuer, |cx| authorize::link::register(cx, &body, &cookies)))
+    })
+    .await;
+    match done {
+        Ok((answer, set)) => answered(answer, &set, true),
+        Err(e) => link_unfinished(address, e),
     }
 }
 

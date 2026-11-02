@@ -1,10 +1,10 @@
 //! The cookies binding an authorization's steps to one browser: the authorization's, each consent's, each flow at a
-//! provider's, each gate approval's and each operation approval's; and those carrying an operation's link through
-//! its sign-in.
+//! provider's, each gate approval's, each operation approval's and each passkey link page's; and those carrying an
+//! operation's link through its sign-in.
 
 use std::time::Duration;
 
-use super::super::CONSENT;
+use super::super::{CONSENT, PASSKEY_LINK_REGISTER};
 use crate::auth;
 
 use super::*;
@@ -236,5 +236,34 @@ pub fn set_op_cookie(
     let secure = if issuer.starts_with("https://") { "; Secure" } else { "" };
     let path = format!("{}/w/{workspace}/{op}/{issue}", path_of(issuer));
     let name = op_cookie_name(issuer, suffix);
+    format!("{name}={value}; Path={path}; Max-Age={}; HttpOnly; SameSite=Strict{secure}", lasts.as_secs())
+}
+
+/// The name of the cookie that binds one passkey link page to the browser
+/// that signed in for it: its own, as for a gate's.
+fn link_page_cookie_name(issuer: &str, suffix: &str) -> String {
+    let prefix = if issuer.starts_with("https://") { "__Secure-" } else { "" };
+    format!("{prefix}bd_passkey_{suffix}")
+}
+
+/// The value of passkey link page cookie `suffix` in the browser's `Cookie`
+/// headers (joined with `;`), if well-formed.
+pub fn link_page_cookie<'h>(issuer: &str, headers: &'h str, suffix: &str) -> Option<&'h str> {
+    let wanted = link_page_cookie_name(issuer, suffix);
+    headers
+        .split(';')
+        .filter_map(|c| c.trim().split_once('='))
+        .find(|(name, _)| *name == wanted)
+        .map(|(_, value)| value)
+        .filter(|v| v.len() == 64 && v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+}
+
+/// The `Set-Cookie` value binding a passkey link page to this browser: sent
+/// back to the registration endpoint only, never with another site's request
+/// (`SameSite=Strict`), for as long as `lasts` (zero: removed).
+pub(super) fn set_link_page_cookie(issuer: &str, suffix: &str, value: &str, lasts: Duration) -> String {
+    let secure = if issuer.starts_with("https://") { "; Secure" } else { "" };
+    let path = format!("{}{PASSKEY_LINK_REGISTER}", path_of(issuer));
+    let name = link_page_cookie_name(issuer, suffix);
     format!("{name}={value}; Path={path}; Max-Age={}; HttpOnly; SameSite=Strict{secure}", lasts.as_secs())
 }

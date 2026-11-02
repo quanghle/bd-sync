@@ -67,8 +67,12 @@ pub(super) fn sign_in_path(path: &str) -> Option<(String, SignInStep)> {
 /// limiting requests to these paths sees them all.
 pub(super) fn oauth_endpoint(server: &Server, path: &str) -> Option<&'static str> {
     let rest = under_issuer(server, path);
-    use oauth_server::{AUTHORIZE, CALLBACK, CHOOSE, CONSENT, EVENTS, REGISTER, REVOKE, TOKEN};
-    let fixed = [REGISTER, TOKEN, REVOKE, AUTHORIZE, CHOOSE, CONSENT].into_iter().find(|e| *e == rest);
+    use oauth_server::{
+        AUTHORIZE, CALLBACK, CHOOSE, CONSENT, EVENTS, PASSKEY_LINK, PASSKEY_LINK_REGISTER, REGISTER, REVOKE, TOKEN,
+    };
+    let fixed = [REGISTER, TOKEN, REVOKE, AUTHORIZE, CHOOSE, CONSENT, PASSKEY_LINK, PASSKEY_LINK_REGISTER]
+        .into_iter()
+        .find(|e| *e == rest);
     // Every provider's callback is the callback endpoint; the step reads which from the path. Notifications alike.
     fixed
         .or_else(|| oauth_server::callback_provider(rest).map(|_| CALLBACK))
@@ -182,6 +186,10 @@ pub(super) async fn handle(
             r.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
             r
         }
+    } else if oauth == Some(oauth_server::PASSKEY_LINK) {
+        passkey_link(&server, req).await
+    } else if oauth == Some(oauth_server::PASSKEY_LINK_REGISTER) {
+        passkey_link_register(&server, req).await
     } else if let Some((workspace, gate)) = gate_path(&server, &path) {
         let (workspace, gate) = (workspace.to_string(), gate.to_string());
         gate_approval(&server, &workspace, &gate, req).await

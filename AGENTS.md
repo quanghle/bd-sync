@@ -128,7 +128,7 @@ target/release/bd bench --workers 8   # throughput + invariant verification on a
 
 The web UI (`web/`, SvelteKit, npm) has its own checks, run in `web/`: `npm ci && npm run check && npm run lint && npm run format:check && npm run build` (see `web/AGENTS.md`, which also covers its Svelte AI tooling).
 
-CI (`.github/workflows/ci.yml`) runs fmt, then clippy `-D warnings` and the tests on Linux, macOS, and Windows, plus an MSRV check, so keep all three platforms building. Releases are built by `.github/workflows/release.yml` when a `vX.Y.Z` tag is pushed; see RELEASING.md (and the `release` playbook in `.bd/source/playbooks/`).
+CI (`.github/workflows/ci.yml`) runs fmt, then clippy `-D warnings` and the tests on Linux, macOS, and Windows, plus an MSRV check, so keep all three platforms building. `.github/workflows/deny.yml` runs `cargo deny --all-features --locked check` (advisories, bans, licenses, sources; policy in `deny.toml`) on dependency changes and daily; see CONTRIBUTING.md (Dependencies). Releases are built by `.github/workflows/release.yml` when a `vX.Y.Z` tag is pushed; see RELEASING.md (and the `release` playbook in `.bd/source/playbooks/`).
 
 ### Architecture Overview
 

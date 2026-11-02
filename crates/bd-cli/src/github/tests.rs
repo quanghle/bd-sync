@@ -76,12 +76,16 @@ impl Fake {
     }
 
     fn comment(&self, n: u64, body: &str) -> i64 {
+        self.comment_by(n, "octo", body)
+    }
+
+    fn comment_by(&self, n: u64, login: &str, body: &str) -> i64 {
         let mut s = self.0.borrow_mut();
         s.clock += 1;
         s.next_comment += 1;
         let (id, t) = (s.next_comment, ts(s.clock));
         s.comments.entry(n).or_default().push(json!({
-            "id": id, "user": {"login": "octo"}, "body": body, "created_at": t, "updated_at": t,
+            "id": id, "user": {"login": login}, "body": body, "created_at": t, "updated_at": t,
             "html_url": format!("https://github.com/acme/app/issues/{n}#issuecomment-{id}")
         }));
         let count = s.comments[&n].len();
@@ -120,6 +124,11 @@ impl Fake {
 
 fn query(q: &str, key: &str) -> Option<String> {
     q.split('&').find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(String::from))
+}
+
+/// How many times a run asked GitHub who it is signed in as.
+fn user_lookups(log: &[String]) -> usize {
+    log.iter().filter(|l| *l == "GET user").count()
 }
 
 fn names(v: &Value, field: &str) -> Vec<String> {
@@ -771,8 +780,8 @@ fn markers_link_instead_of_duplicating() {
         v["body"] = json!(marker_body);
         v["labels"] = json!([{"name": "sync"}, {"name": "P2"}]);
     });
-    w.fake.comment(12, &format!("a note\n\n{}", github::comment_marker(&id, cid)));
-    w.fake.comment(12, &format!("again\n\n{}", github::comment_marker(&id, cid)));
+    w.fake.comment_by(12, SELF, &format!("a note\n\n{}", github::comment_marker(&id, cid)));
+    w.fake.comment_by(12, SELF, &format!("again\n\n{}", github::comment_marker(&id, cid)));
     let head = w.head();
     let r = w.run(Direction::Pull);
     assert_eq!(actions(&r), [(Some(12), "linked".to_string())], "{:?}", r.results);
@@ -815,8 +824,8 @@ fn a_crashed_create_with_comments_is_recovered_by_markers() {
         v["labels"] = json!(names_of(&body["labels"]).iter().map(|x| json!({"name": x})).collect::<Vec<_>>());
     });
     let comments = w.comments(&id);
-    w.fake.comment(12, &github::push_comment_body(&comments[0]));
-    w.fake.comment(12, &github::push_comment_body(&comments[1]));
+    w.fake.comment_by(12, SELF, &github::push_comment_body(&comments[0]));
+    w.fake.comment_by(12, SELF, &github::push_comment_body(&comments[1]));
     let head = w.head();
     let r = w.run(Direction::Pull);
     assert_eq!(row(&r, 12).action, "linked", "{:?}", r.results);
@@ -993,6 +1002,7 @@ fn pushed_comments_carry_markers_and_are_adopted_after_a_crash() {
     let posts = Fake::writes(&log);
     assert_eq!(posts.len(), 1);
     assert!(posts[0].contains("<!-- bd:t-1#c"), "{posts:?}");
+    assert_eq!(user_lookups(&log), 0, "no fetch, no login needed");
     let head = w.head();
     w.run(Direction::Pull);
     assert!(!w.ops_since(head).contains(&"commented".to_string()), "not imported back");
@@ -1001,17 +1011,191 @@ fn pushed_comments_carry_markers_and_are_adopted_after_a_crash() {
     // A crash after the POST: GitHub has the comment, bd never recorded it.
     let id3 = id.clone();
     let c = w.write("alice", |tx| tx.add_comment(&id3, "second"));
-    w.fake.comment(7, &github::push_comment_body(&c));
+    w.fake.comment_by(7, SELF, &github::push_comment_body(&c));
     w.fake.comment(7, "foreign");
     let stored = w.link(&id).comment_count.unwrap();
     w.fake.take_log();
     let r = w.run_with(&o);
     assert_eq!(row(&r, 7).comments_adopted, 1, "{:?}", r.results);
-    assert!(Fake::writes(&w.fake.take_log()).is_empty(), "nothing posted again");
+    let log = w.fake.take_log();
+    assert!(Fake::writes(&log).is_empty(), "nothing posted again");
+    assert_eq!(user_lookups(&log), 1);
     assert_eq!(w.link(&id).comment_count, Some(stored + 1));
     let head = w.head();
     w.run(Direction::Pull);
     assert_eq!(w.ops_since(head).iter().filter(|o| *o == "commented").count(), 1, "the foreign one");
+}
+
+/// #7, linked, and a bd comment on its bd issue that GitHub does not have yet.
+fn linked_with_comment(w: &mut Ws) -> (String, Comment) {
+    w.fake.add(7, "A", |_| {});
+    w.run(Direction::Both);
+    let id = w.by_ref(7).id;
+    let id2 = id.clone();
+    let c = w.write("alice", |tx| tx.add_comment(&id2, "from bd"));
+    (id, c)
+}
+
+#[test]
+fn foreign_comment_markers_are_ordinary_comments() {
+    let mut w = ws();
+    let (id, c) = linked_with_comment(&mut w);
+    let marker = github::comment_marker(&id, c.id);
+    let foreign = w.fake.comment_by(7, "mallory", &format!("hidden\n\n{marker}"));
+    let mut o = opts(Direction::Both);
+    o.comments = true;
+    w.fake.take_log();
+    let r = w.run_with(&o);
+    let done = row(&r, 7);
+    assert_eq!((done.comments_adopted, done.comments_imported, done.comments_pushed), (0, 1, 1), "{:?}", r.results);
+    let log = w.fake.take_log();
+    let posts = Fake::writes(&log);
+    assert_eq!(posts.len(), 1, "{log:?}");
+    assert!(posts[0].starts_with("POST repos/acme/app/issues/7/comments") && posts[0].contains(&marker), "{posts:?}");
+    assert_eq!(w.comments(&id).len(), 2);
+    let link = w.link(&id);
+    let imported = link.comments[&foreign.to_string()];
+    assert_ne!(imported, c.id, "{:?}", link.comments);
+    assert!(link.comments.iter().any(|(gh, bd)| *gh != foreign.to_string() && *bd == c.id), "{:?}", link.comments);
+
+    assert_quiet_rerun(&mut w, Direction::Both);
+    let head = w.head();
+    w.run_with(&o);
+    assert_eq!(w.head(), head);
+    let log = w.fake.take_log();
+    assert!(Fake::writes(&log).is_empty() && !log.iter().any(|l| l.contains("/comments")), "{log:?}");
+
+    // The same marker again, now naming a comment already on GitHub.
+    w.fake.comment_by(7, "mallory", &format!("again\n\n{marker}"));
+    let head = w.head();
+    let r = w.run(Direction::Pull);
+    assert_eq!((row(&r, 7).comments_adopted, row(&r, 7).comments_imported), (0, 1), "{:?}", r.results);
+    assert_eq!(w.ops_since(head).iter().filter(|o| *o == "commented").count(), 1);
+    assert!(Fake::writes(&w.fake.take_log()).is_empty());
+    assert_quiet_rerun(&mut w, Direction::Pull);
+}
+
+#[test]
+fn a_push_only_run_leaves_a_foreign_marker_for_the_next_pull() {
+    let mut w = ws();
+    let (id, c) = linked_with_comment(&mut w);
+    w.fake.comment_by(7, "mallory", &format!("hidden\n\n{}", github::comment_marker(&id, c.id)));
+    let stored = w.link(&id).comment_count.unwrap();
+    let mut o = opts(Direction::Push);
+    o.comments = true;
+    let head = w.head();
+    let r = w.run_with(&o);
+    let done = row(&r, 7);
+    assert_eq!((done.comments_adopted, done.comments_imported, done.comments_pushed), (0, 0, 1), "{:?}", r.results);
+    assert!(!w.ops_since(head).contains(&"commented".to_string()));
+    assert_eq!(w.link(&id).comment_count, Some(stored + 1), "the foreign one is left uncounted");
+
+    let head = w.head();
+    w.run(Direction::Pull);
+    assert_eq!(w.ops_since(head).iter().filter(|o| *o == "commented").count(), 1);
+    assert_quiet_rerun(&mut w, Direction::Pull);
+}
+
+#[test]
+fn a_run_with_nothing_to_adopt_never_looks_up_the_login() {
+    let mut w = ws();
+    let (id, _) = linked_with_comment(&mut w);
+    let mut o = opts(Direction::Push);
+    o.comments = true;
+    w.run_with(&o);
+    w.fake.comment(7, "plain");
+    w.fake.comment_by(7, "mallory", &format!("elsewhere\n\n{}", github::comment_marker("t-99", 1)));
+    w.fake.take_log();
+    let r = w.run(Direction::Pull);
+    assert_eq!(row(&r, 7).comments_imported, 2, "{:?}", r.results);
+    let log = w.fake.take_log();
+    assert!(log.iter().any(|l| l.contains("/comments")), "{log:?}");
+    assert_eq!(user_lookups(&log), 0, "{log:?}");
+
+    // A status run fetches no comments, so a leftover needs no login either.
+    let id2 = id.clone();
+    let c = w.write("alice", |tx| tx.add_comment(&id2, "second"));
+    w.fake.comment_by(7, SELF, &github::push_comment_body(&c));
+    let mut o = opts(Direction::Both);
+    o.comments = true;
+    o.status = true;
+    w.run_with(&o);
+    let log = w.fake.take_log();
+    assert!(!log.iter().any(|l| l.contains("/comments")), "{log:?}");
+    assert_eq!(user_lookups(&log), 0, "{log:?}");
+}
+
+#[test]
+fn a_refused_login_lookup_ignores_comment_markers() {
+    for status in [Some(401), Some(403), Some(404), None] {
+        let mut w = ws();
+        let (_, c) = linked_with_comment(&mut w);
+        w.fake.comment_by(7, SELF, &github::push_comment_body(&c));
+        match status {
+            Some(s) => w.fake.script("GET user", s, &[]),
+            None => w.fake.answer_with("GET user", &[], json!({"id": 1})),
+        }
+        let mut o = opts(Direction::Both);
+        o.comments = true;
+        w.fake.take_log();
+        let r = w.run_with(&o);
+        assert_eq!(r.aborted, None, "{status:?}");
+        let done = row(&r, 7);
+        let counts = (done.comments_adopted, done.comments_imported, done.comments_pushed);
+        assert_eq!(counts, (0, 1, 1), "{status:?}: {:?}", r.results);
+        assert_eq!(user_lookups(&w.fake.take_log()), 1, "{status:?}");
+    }
+}
+
+#[test]
+fn a_failed_login_lookup_for_a_comment_marker_writes_nothing() {
+    let mut w = ws();
+    let (id, c) = linked_with_comment(&mut w);
+    w.fake.comment_by(7, SELF, &github::push_comment_body(&c));
+    w.edit(&id, IssuePatch { title: Some("Local".into()), ..Default::default() });
+    let mut o = opts(Direction::Both);
+    o.comments = true;
+    let head = w.head();
+    w.fake.script("GET user", 502, &[]);
+    w.fake.take_log();
+    let e = run(&mut w.app, &w.fake, &o).unwrap_err().to_string();
+    assert!(e.contains("GET user") && e.contains("502"), "{e}");
+    assert_eq!(w.ops_since(head), Vec::<String>::new());
+    let log = w.fake.take_log();
+    assert!(Fake::writes(&log).is_empty(), "{log:?}");
+
+    let r = w.run_with(&o);
+    assert_eq!(row(&r, 7).comments_adopted, 1, "{:?}", r.results);
+    let log = w.fake.take_log();
+    let writes = Fake::writes(&log);
+    assert_eq!(writes.len(), 1, "no comment POST: {writes:?}");
+    assert!(writes[0].starts_with("PATCH repos/acme/app/issues/7"), "{writes:?}");
+}
+
+#[test]
+fn the_login_is_looked_up_once_a_run() {
+    // A refused lookup is not asked again: this 403 is answered once, so a
+    // second lookup would succeed and adopt.
+    for refused in [false, true] {
+        let mut w = ws();
+        let (_, c) = linked_with_comment(&mut w);
+        w.fake.comment_by(7, SELF, &github::push_comment_body(&c));
+        let other = w.write("alice", |tx| tx.create_issue(NewIssue::titled("Mine"))).id;
+        let marker_body = format!("\n\n{}", github::marker(&other));
+        w.fake.add(12, "Mine", |v| {
+            v["user"] = json!({ "login": SELF });
+            v["body"] = json!(marker_body);
+            v["labels"] = json!([{"name": "P2"}]);
+        });
+        if refused {
+            w.fake.script("GET user", 403, &[]);
+        }
+        w.fake.take_log();
+        let r = w.run(Direction::Pull);
+        assert_eq!(user_lookups(&w.fake.take_log()), 1, "refused: {refused}");
+        let (action, adopted) = if refused { ("created", 0) } else { ("linked", 1) };
+        assert_eq!((row(&r, 12).action.as_str(), row(&r, 7).comments_adopted), (action, adopted), "{:?}", r.results);
+    }
 }
 
 #[test]

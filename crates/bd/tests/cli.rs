@@ -5399,7 +5399,12 @@ fn gh_issue(n: u64, title: &str, updated: &str, extra: Value) -> Value {
 
 #[cfg(unix)]
 fn gh_comment(id: i64, body: &str) -> Value {
-    serde_json::json!({"id": id, "user": {"login": "octo"}, "body": body, "created_at": "2026-10-01T10:00:00Z",
+    gh_comment_by(id, "octo", body)
+}
+
+#[cfg(unix)]
+fn gh_comment_by(id: i64, login: &str, body: &str) -> Value {
+    serde_json::json!({"id": id, "user": {"login": login}, "body": body, "created_at": "2026-10-01T10:00:00Z",
         "updated_at": "2026-10-01T10:00:00Z", "html_url": format!("https://github.com/acme/app/issues/1#issuecomment-{id}")})
 }
 
@@ -5610,7 +5615,7 @@ fn github_pull_links_marker_instead_of_duplicating() {
     );
     gh.list("open", None, &[vec![issue.clone()]]);
     gh.list("open", Some("sync"), &[vec![issue]]);
-    gh.comments(12, &[gh_comment(50, &format!("a note\n\n<!-- bd:{id}#c{cid} -->"))]);
+    gh.comments(12, &[gh_comment_by(50, "bd-bot", &format!("a note\n\n<!-- bd:{id}#c{cid} -->"))]);
     let r = gh.json(&ws, &["github", "pull", "--repo", "acme/app"]);
     assert_eq!(sync_actions(&r), [(12, "linked".to_string())], "{r}");
     assert_eq!(ws.json(&["list"]).as_array().unwrap().len(), 1, "nothing created");
@@ -5653,6 +5658,32 @@ fn github_comments_flow_both_ways() {
     assert_eq!(head_seq(&ws), head);
     let log = gh.log();
     assert!(gh.writes().is_empty() && !log.contains("/comments"), "{log}");
+}
+
+#[cfg(unix)]
+#[test]
+fn github_comment_marker_from_another_login_is_not_adopted() {
+    let ws = Ws::new();
+    let gh = FakeGitHub::new(&ws);
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-01T10:00:00Z", serde_json::json!({}))]]);
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app"]);
+    let id = ws.json(&["list"])[0]["id"].as_str().unwrap().to_string();
+
+    ws.ok(&["comment", "add", &id, "from bd"]);
+    let cid = ws.json(&["comments", &id])[0]["id"].as_i64().unwrap();
+    let marker = format!("<!-- bd:{id}#c{cid} -->");
+    gh.list("open", None, &[vec![gh_issue(7, "A", "2026-10-01T11:00:00Z", serde_json::json!({"comments": 1}))]]);
+    gh.comments(7, &[gh_comment(11, &format!("hidden\n\n{marker}"))]);
+    let posted = gh_comment_by(12, "bd-bot", "x");
+    gh.serve("POST", "repos/acme/app/issues/7/comments", 201, &[], &posted.to_string());
+    gh.clear_log();
+    gh.json(&ws, &["github", "sync", "--repo", "acme/app", "--comments"]);
+    let log = gh.log();
+    assert_eq!(gh.writes().len(), 1, "{log}");
+    // Only a POST's body reaches the log: GET answers do not.
+    assert!(log.contains(&marker), "{log}");
+    assert_eq!(ws.json(&["comments", &id]).as_array().unwrap().len(), 2);
+    assert_eq!(log.lines().filter(|l| l.ends_with(" user")).count(), 1, "{log}");
 }
 
 #[cfg(unix)]

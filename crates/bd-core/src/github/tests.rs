@@ -84,9 +84,13 @@ fn comment(id: i64, issue_id: &str, text: &str) -> Comment {
 }
 
 fn gh_comment(id: i64, body: &str) -> GithubComment {
+    gh_comment_by(id, "octo", body)
+}
+
+fn gh_comment_by(id: i64, user: &str, body: &str) -> GithubComment {
     GithubComment {
         id,
-        user: "octo".into(),
+        user: user.into(),
         body: body.into(),
         created_at: at(2),
         updated_at: at(2),
@@ -394,6 +398,32 @@ fn newer_leaves_out_bd_githubs_own_writes() {
 }
 
 #[test]
+fn is_self_compares_logins_ignoring_ascii_case() {
+    assert!(is_self(Some("bd-bot"), Some("bd-bot")));
+    assert!(is_self(Some("BD-Bot"), Some("bd-bot")));
+    assert!(!is_self(Some("mallory"), Some("bd-bot")));
+    assert!(!is_self(None, Some("bd-bot")));
+    assert!(!is_self(Some("bd-bot"), None));
+    assert!(!is_self(None, None));
+}
+
+#[test]
+fn adoption_target_needs_an_unknown_comment_and_a_matching_marker() {
+    let local = vec![comment(5, "t-1", "mine")];
+    let marked = gh_comment(102, &format!("mine\n\n{}", comment_marker("t-1", 5)));
+    let target = |c: &GithubComment, link: Option<&Link>| adoption_target("t-1", link, c, &local);
+    let mut link = Link::new(REPO, 7);
+    assert_eq!(target(&marked, None), Some(5));
+    assert_eq!(target(&marked, Some(&link)), Some(5), "a Link that does not hold it");
+    link.comments.insert("102".into(), 5);
+    assert_eq!(target(&marked, Some(&link)), None, "already recorded");
+    assert_eq!(target(&gh_comment(103, &comment_marker("t-2", 5)), None), None, "another issue");
+    assert_eq!(target(&gh_comment(104, &comment_marker("t-1", 6)), None), None, "no such bd comment");
+    assert_eq!(target(&gh_comment(105, "no marker"), None), None);
+    assert_eq!(target(&gh_comment(106, &marker("t-1")), None), None, "an issue marker");
+}
+
+#[test]
 fn comment_plans_import_adopt_and_push() {
     let mut link = Link::new(REPO, 7);
     link.comments.insert("100".into(), 1);
@@ -401,10 +431,10 @@ fn comment_plans_import_adopt_and_push() {
     let fetched = vec![
         gh_comment(100, "seen"),
         gh_comment(101, "foreign"),
-        gh_comment(102, &format!("mine\n\n{}", comment_marker("t-1", 5))),
+        gh_comment_by(102, "bd-bot", &format!("mine\n\n{}", comment_marker("t-1", 5))),
     ];
     for dir in [Direction::Pull, Direction::Push, Direction::Both] {
-        let p = plan_comments("t-1", Some(&link), Some(&fetched), &local, dir, true);
+        let p = plan_comments("t-1", Some(&link), Some(&fetched), &local, dir, true, Some("bd-bot"));
         assert_eq!(p.adopt, [(102, 5)], "{dir:?}");
         let imported: Vec<i64> = p.import.iter().map(|c| c.id).collect();
         let pushed: Vec<i64> = p.push.iter().map(|c| c.id).collect();
@@ -428,6 +458,64 @@ fn comment_plans_import_adopt_and_push() {
     assert!(!needs_comment_fetch(Some(&link), &g));
     link.comment_count = Some(0);
     assert!(needs_comment_fetch(Some(&link), &g));
+}
+
+#[test]
+fn comment_markers_count_only_from_self_login() {
+    let local = vec![comment(5, "t-1", "mine")];
+    let marked = format!("mine\n\n{}", comment_marker("t-1", 5));
+    let link = Link::new(REPO, 7);
+    let ids = |p: &CommentPlan| -> (Vec<i64>, Vec<i64>) {
+        (p.import.iter().map(|c| c.id).collect(), p.push.iter().map(|c| c.id).collect())
+    };
+    const ALL: [Direction; 3] = [Direction::Pull, Direction::Push, Direction::Both];
+
+    // Anyone else's marker is an ordinary comment, and the bd comment it names still goes out.
+    let foreign = vec![gh_comment_by(200, "mallory", &marked)];
+    for dir in ALL {
+        let p = plan_comments("t-1", Some(&link), Some(&foreign), &local, dir, true, Some("bd-bot"));
+        assert!(p.adopt.is_empty(), "{dir:?}");
+        let (imported, pushed) = ids(&p);
+        match dir {
+            Direction::Pull => {
+                assert_eq!((imported, pushed.len(), p.fetched_count), (vec![200], 0, Some(1)));
+            }
+            Direction::Push => {
+                assert_eq!((imported.len(), pushed, p.fetched_count), (0, vec![5], None));
+                assert_eq!(p.count(Some(0), 1), 1, "left for the next pull, not counted");
+            }
+            Direction::Both => assert_eq!((imported, pushed), (vec![200], vec![5])),
+        }
+    }
+
+    // Logins compare ignoring ASCII case.
+    let own = vec![gh_comment_by(201, "BD-Bot", &marked)];
+    for dir in ALL {
+        let p = plan_comments("t-1", Some(&link), Some(&own), &local, dir, true, Some("bd-bot"));
+        assert_eq!(p.adopt, [(201, 5)], "{dir:?}");
+        assert_eq!(ids(&p), (vec![], vec![]), "{dir:?}");
+    }
+
+    // No login, no adoption, even of bd's own comment.
+    let own = vec![gh_comment_by(202, "bd-bot", &marked)];
+    for dir in ALL {
+        let p = plan_comments("t-1", Some(&link), Some(&own), &local, dir, true, None);
+        assert!(p.adopt.is_empty(), "{dir:?}");
+        let (imported, pushed) = ids(&p);
+        assert_eq!(imported, if dir.pulls() { vec![202] } else { vec![] }, "{dir:?}");
+        assert_eq!(pushed, if dir.pushes() { vec![5] } else { vec![] }, "{dir:?}");
+    }
+
+    // A marker naming a comment already mapped pushes nothing.
+    let mut mapped = Link::new(REPO, 7);
+    mapped.comments.insert("1".into(), 5);
+    for dir in ALL {
+        let p = plan_comments("t-1", Some(&mapped), Some(&foreign), &local, dir, true, Some("bd-bot"));
+        assert!(p.adopt.is_empty(), "{dir:?}");
+        let (imported, pushed) = ids(&p);
+        assert_eq!(imported, if dir.pulls() { vec![200] } else { vec![] }, "{dir:?}");
+        assert!(pushed.is_empty(), "{dir:?}");
+    }
 }
 
 struct Ws {

@@ -44,11 +44,13 @@
 //! count differs from `comment_count`, imported in every pulling direction
 //! (deduped by GitHub id in the Link's `comments` map), pushed with
 //! `--comments` ending with a comment marker `<!-- bd:<id>#c<cid> -->`. A
-//! fetched comment carrying the marker of a comment of the same issue is
-//! adopted (mapped, never imported or posted again) in every direction, so
-//! a run that crashed after posting duplicates nothing. A push-only run
-//! records the stored count plus what it adopted and posted, never GitHub's,
-//! so comments it did not import still differ for the next pull.
+//! fetched comment written by the account bd writes as and carrying the
+//! marker of a comment of the same issue is adopted (mapped, never imported
+//! or posted again) in every direction, so a run that crashed after posting
+//! duplicates nothing; anyone else's marker is an ordinary comment. A
+//! push-only run records the stored count plus what it adopted and posted,
+//! never GitHub's, so comments it did not import still differ for the next
+//! pull.
 //!
 //! **Issue markers.** An issue bd creates on GitHub ends with
 //! `<!-- bd:<id> -->`; a listed GitHub issue whose body ends with the marker
@@ -153,6 +155,8 @@ impl GithubIssue {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct GithubComment {
     pub id: i64,
+    /// Who wrote it (`user.login`, `ghost` when GitHub names no one): a
+    /// comment marker counts only from bd's own account.
     pub user: String,
     pub body: String,
     pub created_at: Timestamp,
@@ -740,6 +744,12 @@ pub enum MarkerMatch {
     Error(String),
 }
 
+/// Whether `author` is `self_login`, the account bd writes as, ignoring ASCII
+/// case as GitHub logins do. An unknown author or login is never self.
+pub fn is_self(author: Option<&str>, self_login: Option<&str>) -> bool {
+    matches!((author, self_login), (Some(a), Some(s)) if a.eq_ignore_ascii_case(s))
+}
+
 /// Resolve the issue markers of `unlinked` GitHub issues, one result each.
 /// Only a marker on an issue opened by `self_login` (the account bd writes
 /// as) counts: anyone else's is ignored, so it neither links nor collides.
@@ -748,10 +758,7 @@ pub fn resolve_markers(
     unlinked: &[GithubIssue],
     self_login: Option<&str>,
 ) -> Result<Vec<MarkerMatch>> {
-    let own = |g: &GithubIssue| match (g.author.as_deref(), self_login) {
-        (Some(a), Some(s)) => a.eq_ignore_ascii_case(s),
-        _ => false,
-    };
+    let own = |g: &GithubIssue| is_self(g.author.as_deref(), self_login);
     let markers: Vec<Option<String>> =
         unlinked.iter().map(|g| if own(g) { marker_of(&g.body) } else { None }).collect();
     let mut out = Vec::new();
@@ -969,7 +976,8 @@ pub fn needs_comment_fetch(link: Option<&Link>, gh: &GithubIssue) -> bool {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CommentPlan {
     pub import: Vec<GithubComment>,
-    /// (GitHub id, bd id) of comments bd posted before, found by their marker.
+    /// (GitHub id, bd id) of comments bd posted before, found by their
+    /// marker on a comment written by `self_login`.
     pub adopt: Vec<(i64, i64)>,
     pub push: Vec<Comment>,
     /// GitHub's count, recorded by a pulling direction that fetched.
@@ -988,9 +996,28 @@ impl CommentPlan {
     }
 }
 
-/// Plan the comments of bd issue `issue_id`: adopt fetched comments carrying
-/// the marker of one of `local_comments`, import the other unknown ones in a
-/// pulling direction, and push the bd comments GitHub does not have.
+/// The bd comment that fetched comment `c` could be adopted as: `c` is not in
+/// `link` yet and carries the marker of one of `local_comments` of `issue_id`.
+/// The author is not looked at here: this is "could be adopted", and the
+/// caller looks up the login only when this is `Some`.
+pub fn adoption_target(
+    issue_id: &str,
+    link: Option<&Link>,
+    c: &GithubComment,
+    local_comments: &[Comment],
+) -> Option<i64> {
+    if link.is_some_and(|k| k.comments.contains_key(&c.id.to_string())) {
+        return None;
+    }
+    let (id, cid) = comment_marker_of(&c.body)?;
+    (id == issue_id && local_comments.iter().any(|l| l.id == cid)).then_some(cid)
+}
+
+/// Plan the comments of bd issue `issue_id`: adopt fetched comments written
+/// by `self_login` (the account bd writes as; None adopts nothing) and
+/// carrying the marker of one of `local_comments`, import the other unknown
+/// ones in a pulling direction, anyone else's marker included, and push the
+/// bd comments GitHub does not have.
 pub fn plan_comments(
     issue_id: &str,
     link: Option<&Link>,
@@ -998,16 +1025,15 @@ pub fn plan_comments(
     local_comments: &[Comment],
     dir: Direction,
     push_comments: bool,
+    self_login: Option<&str>,
 ) -> CommentPlan {
     let mut plan = CommentPlan::default();
     let known: BTreeSet<String> = link.map(|k| k.comments.keys().cloned().collect()).unwrap_or_default();
     let mapped = link.map(Link::mapped).unwrap_or_default();
     if let Some(fetched) = fetched {
         for c in fetched.iter().filter(|c| !known.contains(&c.id.to_string())) {
-            match comment_marker_of(&c.body) {
-                Some((id, cid)) if id == issue_id && local_comments.iter().any(|l| l.id == cid) => {
-                    plan.adopt.push((c.id, cid));
-                }
+            match adoption_target(issue_id, link, c, local_comments) {
+                Some(cid) if is_self(Some(c.user.as_str()), self_login) => plan.adopt.push((c.id, cid)),
                 _ if dir.pulls() => plan.import.push(c.clone()),
                 _ => {}
             }

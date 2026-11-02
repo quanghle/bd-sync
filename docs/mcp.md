@@ -96,7 +96,7 @@ CORS headers.
 | 415 | another `Content-Type` | JSON-RPC `-32600`, id `null` |
 | 413 | a body over 1 MiB | bd error |
 | 503 | busy | bd error |
-| 400, 408 | an unreadable body, or one that came too late | bd error |
+| 400, 408 | an unreadable body, or one that came too late or too slowly | bd error |
 | 400 | invalid JSON (`-32700`), an invalid message (`-32600`), a header mismatch (`-32020`), an unsupported version (`-32022`) | JSON-RPC error |
 | 202 | a notification or a response | empty |
 | 404 | a `2026-07-28` method that is not served (`-32601`) | JSON-RPC error |

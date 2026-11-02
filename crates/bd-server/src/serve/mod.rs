@@ -20,7 +20,19 @@
 //!
 //! Memory and slots: up to `MAX_RUNNING` commands run at once. Requests in
 //! progress share a budget (`MIN_BODY_BUDGET`, or more for one maximum-size
-//! request): each reserves its body, twice, and a fixed share for its answer.
+//! request; `budget.rs`). A request holds about what it has been sent
+//! (`read_within`: `BODY_COPIES` times its bytes, and up to `FIRST_GRANT`),
+//! however much it declares, and a fixed share for its answer only once its
+//! body has arrived and parsed. Its body must arrive within `BODY_TIMEOUT`,
+//! at `MIN_BODY_RATE` or more over each `BODY_WINDOW`, so holding memory
+//! takes sending. A caller, a token's actor (`caller_of`), may hold half of
+//! the budget, or one maximum-size request if more, counting what it has
+//! declared, and past that is refused at once. Bodies past `ORDINARY_BODY`
+//! may not grow into the last `RESERVE`, and large uploads that do not fit
+//! together give way to the oldest, so the others retry once it is done. A
+//! request's waits for memory total at most `QUEUE_WAIT`, and none of them
+//! holds up a request that fits.
+//!
 //! A read's answer streams (see `stream.rs`): its output reaches the client
 //! as it is written, through buffers of a fixed size, so an export of any
 //! size holds about the same memory as a claim. At most `MAX_STREAMING`
@@ -74,6 +86,7 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls;
 
 use crate::auth::{self, Role, Token, Verified, Verifier};
+use crate::budget::{self, Budget, Busy, Caller, Class, Upload};
 use crate::follow::{self, Feeds, HeadReader, Subscription};
 use crate::jobs;
 use crate::mcp_http;
@@ -97,6 +110,8 @@ mod check;
 mod exec;
 mod listen;
 mod mcp_endpoint;
+#[cfg(test)]
+mod read_within_tests;
 mod routes;
 mod signin;
 
@@ -116,12 +131,31 @@ const MAX_CONNECTIONS: usize = 512;
 /// in front, whose connections are everyone's): one host cannot take them all.
 const MAX_CONNECTIONS_PER_PEER: usize = MAX_CONNECTIONS / 8;
 /// Memory for requests in progress, across all connections: this much, or
-/// enough for one maximum-size request if `--max-body-mib` is larger.
+/// enough for one maximum-size request and `RESERVE` if `--max-body-mib` is
+/// larger.
 const MIN_BODY_BUDGET: usize = 256 << 20;
-/// A request's body briefly exists twice (collected chunks and the parsed copy).
+/// A request's body briefly exists twice (the bytes received and the parsed
+/// copy), so it holds this many times what has arrived.
 const BODY_COPIES: usize = 2;
-/// How long a request waits for body budget or a command slot before the
-/// client is asked to retry (503).
+/// What a request holds before any of its body has arrived: it then holds
+/// `BODY_COPIES` times what it was sent, and this much more, so a body
+/// arriving in small frames does not touch the budget for each.
+const FIRST_GRANT: usize = 128 << 10;
+/// The last of the budget, which bodies past `ORDINARY_BODY` may not grow
+/// into: large uploads cannot crowd out ordinary requests.
+const RESERVE: usize = 32 << 20;
+/// The largest body that may use the whole budget.
+const ORDINARY_BODY: usize = 1 << 20;
+/// Body reading is timed in windows of this length, from its start.
+const BODY_WINDOW: Duration = Duration::from_secs(30);
+/// A window in which less than this rate arrived, in bytes a second, ends
+/// the request (408): a body is held open only by a client sending it.
+const MIN_BODY_RATE: u64 = 16 << 10;
+/// The most a body's bytes are kept in one allocation until they are joined,
+/// so a body costs what has arrived, in whatever frames it came.
+const BODY_SEGMENT: usize = 1 << 20;
+/// How long a request waits for a command slot, and for memory in total,
+/// however many waits that takes, before the client is asked to retry (503).
 const QUEUE_WAIT: Duration = Duration::from_secs(15);
 /// How long a request's headers may take, counted from when the connection
 /// waits for them: so also how long an idle keep-alive connection is kept
@@ -130,6 +164,7 @@ const QUEUE_WAIT: Duration = Duration::from_secs(15);
 /// default); a client trickling headers is bounded by it and by
 /// `MAX_CONNECTIONS_PER_PEER`.
 const HEADER_TIMEOUT: Duration = Duration::from_secs(75);
+/// The longest a body may take to arrive, time waiting for memory aside.
 /// Matches the client's own limit for a whole request.
 const BODY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Connections close after this long, so a client that stops reading cannot hold a response forever: gracefully,
@@ -157,9 +192,10 @@ const JOBS_GRACE: Duration = Duration::from_secs(10);
 /// A write's output, held back while it runs and stored to replay its answer
 /// to a retry; a write with more output streams, and is not kept.
 const REPLAY_LIMIT: usize = 1 << 20;
-/// Each request's share of the body budget for its answer, held until the
-/// answer is written or dropped: a streamed answer's buffers, or a held one
-/// sent whole (its output, a little larger once escaped in frames).
+/// A command's share of the memory budget for its answer, taken once its
+/// body has arrived and parsed, and held until the answer is written or
+/// dropped: a streamed answer's buffers, or a held one sent whole (its
+/// output, a little larger once escaped in frames).
 const ANSWER_BUDGET: usize = max(Limits::SERVE.memory(READ_BUFFER), REPLAY_LIMIT + REPLAY_LIMIT / 4);
 /// Reads streaming their answers at once: each holds a command slot while
 /// its client reads, so slow clients cannot take all of the slots.
@@ -200,9 +236,11 @@ const MAX_APPROVAL_BODY: usize = 16 << 10;
 const MAX_RELAYED_BODY: usize = 32 << 10;
 /// The longest MCP message a client may POST.
 const MAX_MCP_BODY: usize = 1 << 20;
-/// An MCP answer's share of the body budget: its tool's output (up to
+/// An MCP tool call's share of the memory budget, taken once its message
+/// has arrived and parsed: its tool's output (up to
 /// `mcp::local::OUTPUT_LIMIT`) is held, escaped into the result's text, and
-/// serialized, and the serialized answer is held until it is sent.
+/// serialized, and the serialized answer is held until it is sent. Other
+/// messages take none.
 const MCP_ANSWER_BUDGET: usize = 3 * mcp::local::OUTPUT_LIMIT;
 
 type Body = ResponseBody;
@@ -287,12 +325,17 @@ fn json_response(status: StatusCode, body: &impl serde::Serialize) -> Response<B
 
 /// Run `f` on a blocking thread.
 /// Why a request's body could not be had.
+#[derive(Debug)]
 enum BodyError {
     /// Longer than allowed.
     TooLarge,
     Unreadable(String),
     /// Not all there within the wait.
     Late(Duration),
+    /// A window passed with less than `MIN_BODY_RATE` arriving in it.
+    Slow,
+    /// No memory for what has arrived.
+    Busy(Busy),
 }
 
 /// The whole body of a request, at most `max` bytes, within `wait`.
@@ -307,6 +350,173 @@ where
         Ok(Err(e)) => Err(BodyError::Unreadable(e.to_string())),
         Err(_) => Err(BodyError::Late(wait)),
     }
+}
+
+/// A body's bytes as they arrive, in parts of at most `BODY_SEGMENT`. It
+/// takes no size: what a client declares allocates nothing, and each frame
+/// is copied, so the frames' own buffers go as soon as they are read.
+#[derive(Default)]
+struct Segments {
+    parts: Vec<Vec<u8>>,
+}
+
+impl Segments {
+    fn push(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            if self.parts.last().is_none_or(|part| part.len() == BODY_SEGMENT) {
+                self.parts.push(Vec::new());
+            }
+            let Some(part) = self.parts.last_mut() else { return };
+            let (now, rest) = data.split_at(data.len().min(BODY_SEGMENT - part.len()));
+            // A `Vec` doubles, which would pass `BODY_SEGMENT` from most sizes.
+            if now.len() > part.capacity() - part.len() {
+                part.reserve_exact((2 * part.capacity()).clamp(part.len() + now.len(), BODY_SEGMENT) - part.len());
+            }
+            part.extend_from_slice(now);
+            data = rest;
+        }
+    }
+
+    /// The bytes as one buffer, each part dropped once it is copied.
+    fn join(self) -> Vec<u8> {
+        let mut parts = self.parts;
+        if parts.len() == 1 {
+            return parts.pop().unwrap_or_default();
+        }
+        let mut whole = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+        for part in parts {
+            whole.extend_from_slice(&part);
+        }
+        whole
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.parts.iter().map(Vec::capacity).sum()
+    }
+}
+
+/// Closes the windows that have ended by `now`, starting the next one.
+fn roll(
+    now: tokio::time::Instant,
+    window_end: &mut tokio::time::Instant,
+    in_window: &mut u64,
+) -> std::result::Result<(), BodyError> {
+    while now >= *window_end {
+        if *in_window < MIN_BODY_RATE * BODY_WINDOW.as_secs() {
+            return Err(BodyError::Slow);
+        }
+        *in_window = 0;
+        *window_end += BODY_WINDOW;
+    }
+    Ok(())
+}
+
+/// The whole body of a request, at most `max` bytes, growing `upload`'s
+/// grant as bytes arrive: what a client declares decides the limit and
+/// nothing is held for it. All of it must arrive within `BODY_TIMEOUT`, at
+/// `MIN_BODY_RATE` or more over each `BODY_WINDOW`; a frame that comes after
+/// a window's end does not count towards that window. Time spent waiting for
+/// memory is the server's and counts in neither.
+async fn read_within<B>(body: B, max: usize, upload: &mut Upload) -> std::result::Result<Vec<u8>, BodyError>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    // First: hyper's hint shrinks as frames are read.
+    let declared = hyper::body::Body::size_hint(&body).exact();
+    let limit = declared.map_or(max, |n| n.min(max as u64) as usize);
+    let ceiling = BODY_COPIES * limit;
+    let mut body = std::pin::pin!(body);
+
+    let start = tokio::time::Instant::now();
+    let mut window_end = start + BODY_WINDOW;
+    let mut whole_end = start + BODY_TIMEOUT;
+    let mut in_window = 0;
+    let mut received = 0;
+    let mut segments = Segments::default();
+    loop {
+        let next = tokio::time::timeout_at(window_end.min(whole_end), body.as_mut().frame()).await;
+        let now = tokio::time::Instant::now();
+        let frame = match next {
+            Ok(None) => return Ok(segments.join()),
+            Ok(Some(Err(e))) => {
+                let e: Box<dyn std::error::Error + Send + Sync> = e.into();
+                return Err(BodyError::Unreadable(e.to_string()));
+            }
+            Ok(Some(Ok(frame))) => Some(frame),
+            Err(_) => None,
+        };
+        roll(now, &mut window_end, &mut in_window)?;
+        // Also for a frame: one always ready would never reach the timer.
+        if now >= whole_end {
+            return Err(BodyError::Late(BODY_TIMEOUT));
+        }
+        let Some(Ok(data)) = frame.map(|frame| frame.into_data()) else { continue };
+        if received + data.len() > limit {
+            return Err(BodyError::TooLarge);
+        }
+        received += data.len();
+        in_window += data.len() as u64;
+        let need = BODY_COPIES * received;
+        if need as u64 > upload.held() {
+            let to = (need + FIRST_GRANT).min(ceiling);
+            upload.grow(to as u64, class_of(received)).await.map_err(BodyError::Busy)?;
+            let waited = now.elapsed();
+            window_end += waited;
+            whole_end += waited;
+        }
+        segments.push(&data);
+    }
+}
+
+/// How a request that has received this many bytes stands to the reserve.
+fn class_of(received: usize) -> Class {
+    if received > ORDINARY_BODY { Class::Large } else { Class::Ordinary }
+}
+
+/// What a request takes at the start and what it pledges against its caller's
+/// cap, by the size it declares (`None` for chunked): a declared body counts
+/// whole, with its `answer`, so one that cannot fit is refused before it is
+/// read; a chunked one counts as it arrives.
+fn first_and_pledge(declared: Option<u64>, max: usize, answer: usize) -> (u64, u64) {
+    let ceiling = (BODY_COPIES as u64).saturating_mul(declared.unwrap_or(max as u64));
+    let first = ceiling.min(FIRST_GRANT as u64);
+    (first, if declared.is_some() { ceiling.saturating_add(answer as u64) } else { first })
+}
+
+/// The answer to a request refused for lack of memory.
+fn busy_reject(busy: Busy) -> Reject {
+    match busy {
+        Busy::Cap => Reject::busy("with other requests of yours"),
+        Busy::Full => Reject::busy("receiving other requests"),
+    }
+}
+
+/// Whose share of the memory budget a request counts against: the actor of
+/// its verified token, as `server_db` compares actors, so all of an actor's
+/// tokens and workspaces are one caller. Never anything the client chooses
+/// (`--actor`, a session, `?session=`), which would give it a fresh cap.
+fn caller_of(token: &Token) -> Caller {
+    Budget::caller(&crate::server_db::key(&token.actor))
+}
+
+/// Count and log a request refused while receiving its body, for what says
+/// something about the client: a body too slow, or a caller over its cap. A
+/// full budget says something about the server, and shows in `busy_total`.
+fn refuse_body(e: &BodyError, peer: Option<std::net::IpAddr>, token: &str, workspace: &str) {
+    let (counter, why) = match e {
+        BodyError::Slow => (&metrics::REFUSED_SLOW_BODY, "request body too slow"),
+        BodyError::Busy(Busy::Cap) => (&metrics::REFUSED_CALLER_BUDGET, "over its caller's share of memory"),
+        _ => return,
+    };
+    log_refused(counter, peer, Some(token), Some(workspace), why);
+}
+
+/// [`refuse_body`] for a request refused memory, and its answer.
+fn refuse_busy(busy: Busy, peer: Option<std::net::IpAddr>, token: &str, workspace: &str) -> Reject {
+    refuse_body(&BodyError::Busy(busy), peer, token, workspace);
+    busy_reject(busy)
 }
 
 impl BodyError {
@@ -324,6 +534,11 @@ impl BodyError {
                 let msg = format!("the request body did not arrive within {}s", wait.as_secs());
                 Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response()
             }
+            BodyError::Slow => {
+                let msg = format!("the request body arrived slower than {} KiB/s", MIN_BODY_RATE >> 10);
+                Reject::new(StatusCode::REQUEST_TIMEOUT, "remote", msg, 8).response()
+            }
+            BodyError::Busy(busy) => busy_reject(*busy).response(),
         }
     }
 
@@ -340,6 +555,13 @@ impl BodyError {
             BodyError::Late(wait) => {
                 let why = format!("the request body did not arrive within {}s", wait.as_secs());
                 oauth_error(StatusCode::REQUEST_TIMEOUT, "invalid_request", &why)
+            }
+            BodyError::Slow => {
+                let why = format!("the request body arrived slower than {} KiB/s", MIN_BODY_RATE >> 10);
+                oauth_error(StatusCode::REQUEST_TIMEOUT, "invalid_request", &why)
+            }
+            BodyError::Busy(busy) => {
+                oauth_error(StatusCode::SERVICE_UNAVAILABLE, "temporarily_unavailable", &busy_reject(*busy).message)
             }
         }
     }
@@ -383,10 +605,10 @@ fn peer(extensions: &hyper::http::Extensions) -> Option<std::net::IpAddr> {
     extensions.get::<Peer>().map(|p| p.0)
 }
 
-/// Log a request refused for its access token, or for what its token may
-/// not do: from where, with which token (by name, never its secret), and
-/// why. Requests without a token are not logged: MCP clients send one to
-/// learn where to get a token.
+/// Log a request refused for its access token, for what its token may not
+/// do, or for what its caller may not hold (`refuse_body`): from where, with
+/// which token (by name, never its secret), and why. Requests without a
+/// token are not logged: MCP clients send one to learn where to get a token.
 fn log_refused(
     counter: &metrics::Counter,
     peer: Option<std::net::IpAddr>,
@@ -462,11 +684,6 @@ const fn max(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
 }
 
-/// Semaphore permits for `bytes` of body budget (one per KiB).
-fn kib(bytes: usize) -> u32 {
-    u32::try_from(bytes.div_ceil(1024).max(1)).unwrap_or(u32::MAX)
-}
-
 fn too_large(max_body: usize) -> Response<Body> {
     let msg = format!("request larger than {} MiB (raise bd serve --max-body-mib)", max_body >> 20);
     Reject::new(StatusCode::PAYLOAD_TOO_LARGE, "invalid", msg, 2).response()
@@ -519,8 +736,8 @@ struct Server {
     streams: Arc<Semaphore>,
     /// Commands planning playbooks sent with them.
     planning: Arc<Semaphore>,
-    /// Memory of requests in progress, in KiB permits.
-    body_budget: Arc<Semaphore>,
+    /// Memory of requests in progress.
+    budget: Arc<Budget>,
     max_body: usize,
     open: OpenOptions,
     /// Requests waiting for events: one permit each.
@@ -722,8 +939,10 @@ fn resolve_token_actor(
 
 impl Server {
     fn new(root: PathBuf, max_body: usize, waits: Waits) -> Server {
-        let budget =
-            kib(max_body.saturating_mul(BODY_COPIES)).saturating_add(kib(ANSWER_BUDGET)).max(kib(MIN_BODY_BUDGET));
+        // What one maximum-size request needs, which fits below the reserve and under the cap.
+        let request = BODY_COPIES as u64 * max_body as u64 + ANSWER_BUDGET as u64;
+        let total = (MIN_BODY_BUDGET as u64).max(request + RESERVE as u64);
+        let cap = (total / 2).max(request);
         Server {
             tokens: Verifier::new(&root),
             root,
@@ -732,7 +951,7 @@ impl Server {
             running: Arc::new(Semaphore::new(MAX_RUNNING)),
             streams: Arc::new(Semaphore::new(MAX_STREAMING)),
             planning: Arc::new(Semaphore::new(MAX_PLANNING)),
-            body_budget: Arc::new(Semaphore::new(budget as usize)),
+            budget: Budget::new(total, RESERVE as u64, cap),
             max_body,
             open: OpenOptions::default(),
             followers: Arc::new(Semaphore::new(waits.followers)),
@@ -1657,16 +1876,103 @@ mod tests {
         assert_eq!(exec_path("/v2/auth/github/token"), None);
     }
 
+    const MIB: u64 = 1 << 20;
+
     #[test]
-    fn body_budget_permits_are_kib() {
-        assert_eq!((kib(0), kib(1), kib(1024), kib(1025)), (1, 1, 1, 2));
-        assert_eq!(kib((4096 << 20) * BODY_COPIES), 8 << 20, "the largest --max-body-mib fits");
-        // A maximum-size request, with its answer's share, fits in the budget.
-        for max_body in [1 << 20, 64 << 20, 4096 << 20] {
-            let server = Server::new(PathBuf::from("."), max_body, Waits::default());
-            let request = kib(max_body * BODY_COPIES) + kib(ANSWER_BUDGET);
-            assert!(server.body_budget.available_permits() >= request as usize, "--max-body-mib {}", max_body >> 20);
+    fn budget_fits_a_maximum_request() {
+        for mib in [1u64, 64, 112, 4096] {
+            let server = Server::new(PathBuf::from("."), (mib * MIB) as usize, Waits::default());
+            let (total, reserve, cap) = server.budget.limits();
+            let request = 2 * mib * MIB + ANSWER_BUDGET as u64;
+            assert_eq!(reserve, 32 * MIB, "--max-body-mib {mib}");
+            assert_eq!(total, (256 * MIB).max(request + 32 * MIB), "--max-body-mib {mib}");
+            assert_eq!(cap, (total / 2).max(request), "--max-body-mib {mib}");
+            assert!(request + reserve <= total, "--max-body-mib {mib}: fits below the reserve");
+            assert!(request <= cap, "--max-body-mib {mib}: fits under the cap");
         }
+        // 112 MiB is the first limit whose maximum request does not fit in the least budget.
+        let total = |mib: usize| Server::new(PathBuf::from("."), mib << 20, Waits::default()).budget.limits().0;
+        assert_eq!(total(111), 256 * MIB);
+        assert_eq!(total(112), 224 * MIB + ANSWER_BUDGET as u64 + 32 * MIB);
+    }
+
+    #[test]
+    fn the_default_budget_is_256_mib_with_a_cap_of_one_maximum_request() {
+        assert_eq!(ANSWER_BUDGET as u64, 5 * MIB / 4);
+        let server = Server::new(PathBuf::from("."), 64 << 20, Waits::default());
+        let (total, reserve, cap) = server.budget.limits();
+        assert_eq!((total, reserve), (256 * MIB, 32 * MIB));
+        assert_eq!(cap, 129 * MIB + MIB / 4);
+        assert_eq!(server.budget.free(), total);
+    }
+
+    #[test]
+    fn a_large_body_is_pledged_whole_and_a_chunked_one_as_it_arrives() {
+        let answer = ANSWER_BUDGET as u64;
+        let first = FIRST_GRANT as u64;
+        // Sized: its first grant, and its body twice over with its answer against the caller.
+        assert_eq!(first_and_pledge(Some(MIB), 64 << 20, ANSWER_BUDGET), (first, 2 * MIB + answer));
+        // Smaller than the first grant: it never holds more than twice its size.
+        assert_eq!(first_and_pledge(Some(1024), 64 << 20, ANSWER_BUDGET), (2048, 2048 + answer));
+        assert_eq!(first_and_pledge(Some(0), 64 << 20, ANSWER_BUDGET), (0, answer));
+        assert_eq!(first_and_pledge(Some(0), MAX_MCP_BODY, 0), (0, 0));
+        // Chunked: nothing but the first grant, whatever the limit.
+        assert_eq!(first_and_pledge(None, 64 << 20, ANSWER_BUDGET), (first, first));
+        assert_eq!(first_and_pledge(None, MAX_MCP_BODY, 0), (first, first));
+        // The largest sized request a default server takes is exactly a caller's cap.
+        let server = Server::new(PathBuf::from("."), 64 << 20, Waits::default());
+        let (_, pledge) = first_and_pledge(Some(64 * MIB), server.max_body, ANSWER_BUDGET);
+        assert_eq!(pledge, server.budget.limits().2);
+    }
+
+    fn token_of(actor: &str) -> Token {
+        Token {
+            id: "i".into(),
+            name: "laptop".into(),
+            actor: actor.into(),
+            role: Role::Write,
+            kind: auth::Kind::Agent,
+            workspaces: vec!["*".into()],
+            sha256: String::new(),
+            created_at: String::new(),
+            revoked_at: None,
+            expires_at: None,
+            identity: None,
+            max_claims: None,
+            refresh: None,
+            resource: None,
+            client: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_caller_is_its_tokens_actor_alone() {
+        let budget = Budget::new(1 << 20, 0, 1 << 20);
+        let alice = token_of("Alice");
+        let _held = budget.take(&caller_of(&alice), 100, Class::Ordinary, Duration::ZERO).await.ok();
+        assert_eq!(budget.used(&caller_of(&alice)), 100);
+        for same in [
+            token_of("alice"),
+            token_of("ALICE"),
+            Token { id: "another id".into(), ..token_of("Alice") },
+            Token { name: "another name".into(), ..token_of("Alice") },
+            Token { sha256: "another secret".into(), ..token_of("Alice") },
+        ] {
+            assert_eq!(budget.used(&caller_of(&same)), 100, "{} {} {}", same.actor, same.id, same.name);
+        }
+        assert_eq!(budget.used(&caller_of(&token_of("bob"))), 0, "another actor is another caller");
+    }
+
+    #[test]
+    fn busy_answers_show_no_figure_and_no_name() {
+        for busy in [Busy::Cap, Busy::Full] {
+            let reject = busy_reject(busy);
+            assert_eq!((reject.status, reject.code, reject.exit_code), (StatusCode::SERVICE_UNAVAILABLE, "busy", 5));
+            assert!(!reject.message.chars().any(|c| c.is_ascii_digit()), "{}", reject.message);
+            assert!(!reject.message.contains("alice"), "{}", reject.message);
+        }
+        assert_eq!(busy_reject(Busy::Cap).message, "the server is busy with other requests of yours; retry shortly");
+        assert_eq!(busy_reject(Busy::Full).message, "the server is busy receiving other requests; retry shortly");
     }
 
     fn parse(args: &[&str]) -> Command {

@@ -95,19 +95,22 @@ async fn message(
     if declared.is_some_and(|n| n > MAX_MCP_BODY as u64) {
         return mcp_too_large();
     }
-    // The body as large as it says it is (or may be).
-    let reserve = declared.map_or(MAX_MCP_BODY, |n| usize::try_from(n).unwrap_or(MAX_MCP_BODY));
-    // Its body's share and, for a tool call, its answer's, in one wait (a second wait on the same queue would hold
-    // up everyone behind it); the answer's is given back once the message turns out to be none.
-    let permits = kib(reserve * BODY_COPIES) + kib(MCP_ANSWER_BUDGET);
-    let mut budget = match queue(&server.body_budget, permits, "receiving other requests").await {
-        Ok(permit) => permit,
-        Err(reject) => return reject.response(),
+    // What has arrived of the body, as at `/v2/exec`. The body counts against
+    // its caller as it says it is; nothing is pledged for an answer, which
+    // only a tool call has.
+    let refused = |busy| refuse_busy(busy, peer, &token.name, &workspace).response();
+    let (first, pledge) = first_and_pledge(declared, MAX_MCP_BODY, 0);
+    let mut upload = match server.budget.admit(&caller_of(&token), first, pledge, QUEUE_WAIT).await {
+        Ok(upload) => upload,
+        Err(busy) => return refused(busy),
     };
-    let body = match read_body(body.take().expect("not read yet"), MAX_MCP_BODY, BODY_TIMEOUT).await {
+    let body = match read_within(body.take().expect("not read yet"), MAX_MCP_BODY, &mut upload).await {
         Ok(b) => b,
         Err(BodyError::TooLarge) => return mcp_too_large(),
-        Err(e) => return e.response("MCP request", MAX_MCP_BODY),
+        Err(e) => {
+            refuse_body(&e, peer, &token.name, &workspace);
+            return e.response("MCP request", MAX_MCP_BODY);
+        }
     };
     // A tool call runs a command: a slot, and memory for its output. Any other message (initialize, ping, tools/list,
     // a notification) needs neither.
@@ -117,14 +120,21 @@ async fn message(
         Err(answer) => return mcp_response(answer, None),
     };
     drop(body);
-    let answer = budget.split(kib(MCP_ANSWER_BUDGET) as usize);
     let (answer_budget, slot) = match mcp_http::runs_tools(&message) {
         false => (None, None),
-        true => match queue(&server.running, 1, "running other commands").await {
-            Ok(slot) => (answer, Some(slot)),
-            Err(reject) => return reject.response(),
-        },
+        true => {
+            // The memory first: a request waiting for it holds no command slot.
+            let answer = match upload.answer(MCP_ANSWER_BUDGET as u64, Class::Ordinary).await {
+                Ok(answer) => answer,
+                Err(busy) => return refused(busy),
+            };
+            match queue(&server.running, 1, "running other commands").await {
+                Ok(slot) => (Some(answer), Some(slot)),
+                Err(reject) => return reject.response(),
+            }
+        }
     };
+    let budget = upload.finish();
     let srv = server.clone();
     let job = tokio::task::spawn_blocking(move || {
         // The answer's share is held until it is sent; the body's, and the slot, until the message is answered.
@@ -161,7 +171,7 @@ pub(super) fn mcp_session(query: Option<&str>) -> Result<String> {
 }
 
 /// The response to an MCP message, its body holding `budget` until sent.
-fn mcp_response(answer: mcp_http::Answer, budget: Option<OwnedSemaphorePermit>) -> Response<Body> {
+fn mcp_response(answer: mcp_http::Answer, budget: Option<budget::Held>) -> Response<Body> {
     match answer {
         mcp_http::Answer::Accepted => response(StatusCode::ACCEPTED, "application/json", Body::whole(Bytes::new())),
         mcp_http::Answer::Message(status, message) => {

@@ -59,10 +59,13 @@ playbook run gets the same answer as a single command
 - **Claim limits.** `max_claims` caps the open issues a token's actors
   hold, so no one takes the whole ready queue. It guards against greed,
   not malice.
-- **Resource limits.** Request size, a shared memory budget, command and
+- **Resource limits.** Request size, a shared memory budget, each
+  caller's share of it (a token's actor, with all its tokens), command and
   streaming slots, waiting followers, and connections (512, and 64 per
-  address) are bounded; slow readers lose their answer, and excess
-  requests get 503, which clients retry ([Limits](remote.md#limits)).
+  address) are bounded. A request holds memory for what it has sent, not
+  what it declares, and a body under a minimum rate is cut; slow readers
+  lose their answer, and excess requests get 503, which clients retry
+  ([Limits](remote.md#limits)).
 - **The server's host is not limited by tokens.** `bd` run there opens
   `bd.db` directly; guard the root directory like the databases it holds.
   `bd serve` warns if the root is open to other users.

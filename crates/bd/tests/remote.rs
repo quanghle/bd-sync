@@ -2,10 +2,11 @@
 //! processes, each test with its own server on an ephemeral port.
 
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -3622,6 +3623,202 @@ fn raw_exec(addr: &str, secret: &str, argv: Value) -> (std::net::TcpStream, Stri
     (conn, String::from_utf8_lossy(&status).into_owned())
 }
 
+/// Workspace `proj`'s command endpoint.
+const EXEC: &str = "/w/proj/v2/exec";
+/// Workspace `proj`'s MCP endpoint.
+const MCP: &str = "/w/proj/mcp";
+/// A body large enough that it and its answer's share (126.25 MiB) leave a
+/// caller of the default limits 3 MiB under its cap of 129.25 MiB.
+const HELD_BODY: u64 = 125 << 19;
+
+/// How a raw upload says where its body ends.
+#[derive(Clone, Copy)]
+enum Framing {
+    Chunked,
+    Sized(u64),
+}
+
+/// Open an upload to `path`: its headers, with nothing of its body.
+fn open_upload(addr: &str, secret: &str, path: &str, framing: Framing) -> TcpStream {
+    let mut conn = TcpStream::connect(addr).unwrap();
+    let length = match framing {
+        Framing::Chunked => "Transfer-Encoding: chunked".to_string(),
+        Framing::Sized(n) => format!("Content-Length: {n}"),
+    };
+    write!(
+        conn,
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {secret}\r\n\
+         Content-Type: application/json\r\n{length}\r\n\r\n"
+    )
+    .unwrap();
+    conn
+}
+
+/// Send `bytes` of an upload's body. A refused or stalled upload stops being
+/// read, so a write that fails or times out is not a failure of the test. The
+/// timeouts here and below may fail to set on a closed connection, whose
+/// reads and writes end at once anyway.
+fn send_part(mut conn: &TcpStream, framing: Framing, bytes: &[u8]) {
+    let _ = conn.set_write_timeout(Some(Duration::from_secs(30)));
+    let _ = match framing {
+        Framing::Chunked => write!(conn, "{:x}\r\n", bytes.len())
+            .and_then(|()| conn.write_all(bytes))
+            .and_then(|()| conn.write_all(b"\r\n")),
+        Framing::Sized(_) => conn.write_all(bytes),
+    };
+}
+
+/// End an upload's body.
+fn end_body(mut conn: &TcpStream, framing: Framing) {
+    if let Framing::Chunked = framing {
+        let _ = conn.write_all(b"0\r\n\r\n");
+    }
+}
+
+/// A whole upload of `body`, leaving its answer to be read.
+fn post_whole(addr: &str, secret: &str, path: &str, framing: Framing, body: &[u8]) -> TcpStream {
+    let conn = open_upload(addr, secret, path, framing);
+    send_part(&conn, framing, body);
+    end_body(&conn, framing);
+    conn
+}
+
+/// An upload sending a byte of its body a second, until dropped.
+struct Trickle {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Trickle {
+    fn start(conn: TcpStream, framing: Framing) -> Trickle {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                send_part(&conn, framing, b"x");
+                for _ in 0..50 {
+                    if !stopped.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        });
+        Trickle { stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for Trickle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.thread.take().unwrap().join();
+    }
+}
+
+/// A valid exec request of exactly `len` bytes, running `list`.
+fn padded_exec(len: usize) -> Vec<u8> {
+    let (start, end) = (br#"{"argv":["list"],"stdin":""#.as_slice(), br#""}"#.as_slice());
+    let mut body = start.to_vec();
+    body.resize(len - end.len(), b'x');
+    body.extend_from_slice(end);
+    body
+}
+
+/// The status of the answer on `conn`.
+fn status_of(mut conn: &TcpStream) -> u16 {
+    let _ = conn.set_read_timeout(Some(Duration::from_secs(60)));
+    let mut status = [0u8; 12];
+    conn.read_exact(&mut status).unwrap();
+    String::from_utf8_lossy(&status[9..]).parse().unwrap()
+}
+
+/// The status and body of the answer on `conn`, which is whole or ends with the connection.
+fn answer_of(conn: &TcpStream) -> (u16, String) {
+    let _ = conn.set_read_timeout(Some(Duration::from_secs(60)));
+    let mut reader = BufReader::new(conn);
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let status = line.split_whitespace().nth(1).unwrap_or_else(|| panic!("{line}")).parse().unwrap();
+    let mut length = None;
+    loop {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        match line.trim_end().split_once(':') {
+            Some((name, value)) if name.eq_ignore_ascii_case("content-length") => {
+                length = Some(value.trim().parse::<u64>().unwrap());
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    let mut body = Vec::new();
+    match length {
+        Some(n) => reader.take(n).read_to_end(&mut body),
+        None => reader.read_to_end(&mut body),
+    }
+    .unwrap();
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// The `error` of a refusal's body.
+fn error_of(answer: &str) -> Value {
+    serde_json::from_str::<Value>(answer).unwrap_or_else(|e| panic!("{e}: {answer}"))["error"].clone()
+}
+
+/// One upload to `path` declaring `declared` bytes and sending none: was it
+/// refused? Its connection goes with the answer, and what it pledged with it.
+fn declared_refused(addr: &str, secret: &str, path: &str, declared: u64) -> bool {
+    let mut conn = open_upload(addr, secret, path, Framing::Sized(declared));
+    let _ = conn.set_read_timeout(Some(Duration::from_millis(250)));
+    let mut status = [0u8; 12];
+    conn.read_exact(&mut status).is_ok() && status.ends_with(b" 503")
+}
+
+/// Has the server neither answered nor closed `conn`?
+fn unanswered(conn: &TcpStream) -> bool {
+    let _ = conn.set_read_timeout(Some(Duration::from_millis(250)));
+    conn.peek(&mut [0u8; 1])
+        .is_err_and(|e| matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut))
+}
+
+/// Keep `holds` (paths and framings) open until `refused` says a probe was
+/// refused while the server has answered none of them, and return them.
+///
+/// A refusal alone does not show which request held the budget: connections
+/// have no order, so over a caller's cap the server can as well refuse the
+/// hold as the probe. A hold that lost that race is gone, and with it what
+/// the probe needs to be refused, so each round looks at the holds and opens
+/// again those that were answered, whether or not the probe was refused.
+fn hold_until(
+    what: &str,
+    addr: &str,
+    secret: &str,
+    holds: &[(&str, Framing)],
+    mut refused: impl FnMut() -> bool,
+) -> Vec<TcpStream> {
+    let mut open: Vec<Option<TcpStream>> = holds.iter().map(|_| None).collect();
+    eventually(what, || {
+        for (conn, (path, framing)) in open.iter_mut().zip(holds) {
+            conn.get_or_insert_with(|| open_upload(addr, secret, path, *framing));
+        }
+        let was_refused = refused();
+        for conn in &mut open {
+            if conn.as_ref().is_some_and(|c| !unanswered(c)) {
+                *conn = None;
+            }
+        }
+        was_refused && open.iter().all(Option::is_some)
+    });
+    open.into_iter().map(Option::unwrap).collect()
+}
+
+/// `bd list` with no retries answers while uploads are held open, well inside
+/// the 15 s a request stuck behind them waits before it is refused.
+fn lists_at_once(client: &Client) {
+    let started = Instant::now();
+    check(client.cmd(&["list"]).env("BD_REMOTE_RETRY_SECS", "0").output().unwrap(), "list beside held uploads");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+}
+
 #[test]
 fn large_outputs_stream_and_match_local_output() {
     let server = Server::start_logged();
@@ -3871,12 +4068,62 @@ fn servers_other_than_bd_serve_are_named() {
     assert!(out.stdout.is_empty());
 }
 
+/// The value of `field` in the process's `/proc/<pid>/status`, in KiB.
+#[cfg(target_os = "linux")]
+fn proc_kib(pid: u32, field: &str) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
+    let line = status.lines().find(|l| l.starts_with(field)).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
 /// The server's heap (anonymous memory), in KiB.
 #[cfg(target_os = "linux")]
 fn heap_kib(pid: u32) -> u64 {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).unwrap();
-    let line = status.lines().find(|l| l.starts_with("RssAnon:")).unwrap();
-    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+    proc_kib(pid, "RssAnon:")
+}
+
+/// `body` as chunks of one byte each, ended.
+#[cfg(target_os = "linux")]
+fn one_byte_chunks(body: &[u8]) -> Vec<u8> {
+    let mut wire = Vec::with_capacity(6 * body.len() + 5);
+    for byte in body {
+        wire.extend_from_slice(b"1\r\n");
+        wire.push(*byte);
+        wire.extend_from_slice(b"\r\n");
+    }
+    wire.extend_from_slice(b"0\r\n\r\n");
+    wire
+}
+
+/// What `f` returns, and the highest `RssAnon` and `VmData` of the process
+/// while it ran, read every 10 ms.
+#[cfg(target_os = "linux")]
+fn peak_during<T>(pid: u32, f: impl FnOnce() -> T) -> (T, u64, u64) {
+    /// Ends the sampling however `f` ends: a scope waits for its threads.
+    struct Stop<'a>(&'a AtomicBool);
+    impl Drop for Stop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let sampler = scope.spawn(|| {
+            let (mut rss, mut data) = (0, 0);
+            while !stop.load(Ordering::Relaxed) {
+                rss = proc_kib(pid, "RssAnon:").max(rss);
+                data = proc_kib(pid, "VmData:").max(data);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            (rss, data)
+        });
+        let result = {
+            let _stop = Stop(&stop);
+            f()
+        };
+        let (rss, data) = sampler.join().unwrap();
+        (result, rss, data)
+    })
 }
 
 #[test]
@@ -3914,6 +4161,340 @@ fn slow_readers_cannot_take_every_command_slot() {
 
     drop(stalled);
     assert!(alice.ok(&["export"]).lines().count() > 1000, "large answers stream again once they are gone");
+}
+
+#[test]
+fn trickled_uploads_leave_other_tokens_answered() {
+    let server = Server::start();
+    let secret = server.token("dashboard", "dash", &["--role", "read"]);
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    bob.ok(&["create", "Listed"]);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    // A byte a second, one chunked and one declaring 62.5 MiB: once these
+    // reserved all but 500 KiB of the budget, and `list` needs 1.25 MiB.
+    let sized = Framing::Sized(HELD_BODY);
+    let _uploads = [
+        Trickle::start(open_upload(&addr, &secret, EXEC, Framing::Chunked), Framing::Chunked),
+        Trickle::start(open_upload(&addr, &secret, EXEC, sized), sized),
+    ];
+    std::thread::sleep(Duration::from_millis(500));
+    lists_at_once(&bob);
+    lists_at_once(&bob);
+}
+
+#[test]
+fn trickled_mcp_posts_leave_other_tokens_answered() {
+    let server = Server::start();
+    let secret = server.token("dashboard", "dash", &["--role", "read"]);
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    bob.ok(&["create", "Listed"]);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    // Nineteen connections, each with nothing sent: 14 MiB each and 3 MiB
+    // once reserved 255 of the 256 MiB.
+    let mut uploads: Vec<TcpStream> = (0..18).map(|_| open_upload(&addr, &secret, MCP, Framing::Chunked)).collect();
+    uploads.push(open_upload(&addr, &secret, EXEC, Framing::Sized(860 << 10)));
+    std::thread::sleep(Duration::from_millis(500));
+    lists_at_once(&bob);
+    lists_at_once(&bob);
+}
+
+#[test]
+fn a_request_that_cannot_fit_holds_no_one_up() {
+    let server = Server::start();
+    let secret = server.token("dashboard", "dash", &["--role", "read"]);
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    let addr = server.base.trim_start_matches("http://").to_string();
+    // Two chunked uploads, once 129.25 MiB each: the second could not fit,
+    // and waited at the head of the queue with everyone behind it.
+    let _uploads: Vec<TcpStream> = (0..2).map(|_| open_upload(&addr, &secret, EXEC, Framing::Chunked)).collect();
+    std::thread::sleep(Duration::from_millis(500));
+    lists_at_once(&bob);
+}
+
+#[test]
+fn large_uploads_leave_room_for_ordinary_requests() {
+    let server = Server::start();
+    let alice = server.token("alice-laptop", "alice", &[]);
+    let bob = server.token("bob-laptop", "bob", &[]);
+    let carol = server.client(&server.token("carol-laptop", "carol", &[]));
+    let addr = server.base.trim_start_matches("http://").to_string();
+    // Two uploads of all but the end of the largest body would fill the 256 MiB
+    // to its last 250 KiB, too little for `list`, if nothing kept the rest back.
+    let framing = Framing::Sized(64 << 20);
+    let (part, parts) = (vec![b'x'; 128 << 10], 8 * 64 - 1);
+    let first = open_upload(&addr, &alice, EXEC, framing);
+    for _ in 0..parts {
+        send_part(&first, framing, &part);
+    }
+
+    let second = open_upload(&addr, &bob, EXEC, framing);
+    let writer = second.try_clone().unwrap();
+    let sent = Arc::new(AtomicUsize::new(0));
+    let progress = sent.clone();
+    let sender = std::thread::spawn(move || {
+        for _ in 0..parts {
+            send_part(&writer, framing, &part);
+            progress.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    // It runs into the reserve well short of its end, and waits there.
+    let mut seen = 0;
+    eventually("the second upload to stop", || {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = sent.load(Ordering::Relaxed);
+        std::mem::replace(&mut seen, now) == now
+    });
+    lists_at_once(&carol);
+
+    let _ = second.shutdown(Shutdown::Both);
+    sender.join().unwrap();
+}
+
+#[test]
+fn one_actor_is_one_caller() {
+    let root = Server::prepare();
+    let other = root.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    check(bd(&other).args(["init", "--prefix", "o", "--id-mode", "counter"]).output().unwrap(), "init other");
+    let server = Server::launch(root, "127.0.0.1:0", &[]);
+    let laptop = server.token("alice-laptop", "alice", &[]);
+    let desktop = server.token("alice-desktop", "alice", &[]);
+    let bob = server.token("bob-laptop", "bob", &[]);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let large = Framing::Sized(HELD_BODY);
+
+    // Only the hold can count for most of what refusing this 1 MiB probe takes.
+    let probe = || declared_refused(&addr, &laptop, EXEC, 1 << 20);
+    let _exec = hold_until("the upload counted", &addr, &laptop, &[(EXEC, large)], probe);
+
+    // Another token of the actor, in another workspace, is refused unread.
+    let started = Instant::now();
+    let (status, answer) = answer_of(&open_upload(&addr, &desktop, "/w/other/v2/exec", large));
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!(status, 503, "{answer}");
+    assert_eq!(error_of(&answer)["code"], "busy", "{answer}");
+
+    // There is room for one 2 MiB MCP message, and a client's session name
+    // buys no more: the second refused with the first still held.
+    let probe = || declared_refused(&addr, &desktop, "/w/proj/mcp?session=b", 1 << 20);
+    let holds = [("/w/proj/mcp?session=a", Framing::Sized(1 << 20))];
+    let _mcp = hold_until("the MCP message counted", &addr, &desktop, &holds, probe);
+
+    // Another actor's upload of the same size runs.
+    let conn = post_whole(&addr, &bob, EXEC, large, &padded_exec(HELD_BODY as usize));
+    assert_eq!(status_of(&conn), 200);
+}
+
+#[test]
+fn slow_bodies_are_cut_counted_and_never_run() {
+    let (server, log) = logged_server(Server::prepare(), &[]);
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let ops = server.token("ops", "ops", &["--role", "admin"]);
+    let alice = server.client(&secret);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let head = events_head(&alice);
+
+    // Half a write, then silence: cut when its first 30 seconds end, and the connection with it.
+    let marker = "body-text-for-no-log;";
+    let request = json!({ "argv": ["create", "Cut off", "-q"], "request_id": "cut-1", "stdin": marker.repeat(8) });
+    let body = request.to_string().into_bytes();
+    let framing = Framing::Sized(body.len() as u64);
+    let mut conn = open_upload(&addr, &secret, EXEC, framing);
+    send_part(&conn, framing, &body[..body.len() / 2]);
+    let (status, answer) = answer_of(&conn);
+    assert_eq!(status, 408, "{answer}");
+    let error = error_of(&answer);
+    assert_eq!((&error["code"], &error["exit_code"]), (&json!("remote"), &json!(8)), "{answer}");
+    let end = conn.read(&mut [0u8; 1]).map_err(|e| e.kind());
+    let reset = [std::io::ErrorKind::ConnectionReset, std::io::ErrorKind::ConnectionAborted];
+    assert!(matches!(end, Ok(0)) || end.is_err_and(|e| reset.contains(&e)), "closed: {end:?}");
+    assert_eq!(events_head(&alice), head, "it never ran");
+
+    // The same request whole runs, once.
+    let url = server.url();
+    let (status, first) = post(&url, &secret, &request);
+    assert_eq!((status, &first["exit_code"], &first["replayed"]), (200, &json!(0), &json!(false)), "{first}");
+    let (status, again) = post(&url, &secret, &request);
+    assert_eq!((status, &again["replayed"]), (200, &json!(true)), "{again}");
+    assert_eq!(alice.json(&["list"]).as_array().unwrap().len(), 1);
+
+    // A caller past its cap, as in `one_actor_is_one_caller`.
+    let probe = || declared_refused(&addr, &secret, EXEC, 1 << 20);
+    let hold = hold_until("a refusal", &addr, &secret, &[(EXEC, Framing::Sized(HELD_BODY))], probe);
+    drop(hold);
+
+    let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).proxy(None).build().into();
+    let metrics = agent.get(format!("{}/metrics", server.base)).header("authorization", format!("Bearer {ops}"));
+    let text = metrics.call().unwrap().body_mut().read_to_string().unwrap();
+    for reason in ["slow_body", "caller_budget"] {
+        let series = format!("bd_serve_refused_total{{reason=\"{reason}\"}} ");
+        let line = text.lines().find(|l| l.starts_with(&series)).unwrap_or_else(|| panic!("{series}: {text}"));
+        assert!(line.rsplit(' ').next().unwrap().parse::<u64>().unwrap() >= 1, "{line}");
+    }
+    assert!(!text.contains("alice"), "counts only, nothing that names anyone: {text}");
+
+    let text = std::fs::read_to_string(&log).unwrap();
+    for why in ["request body too slow", "over its caller's share of memory"] {
+        let line = text.lines().find(|l| l.contains("request refused") && l.contains(why));
+        let line = line.unwrap_or_else(|| panic!("{why}: {text}"));
+        assert!(line.contains(r#"token="alice-laptop""#) && line.contains(r#"workspace="proj""#), "{line}");
+        assert!(line.contains("peer=127.0.0.1"), "{line}");
+    }
+    assert!(!text.contains(marker), "never a body: {text}");
+    assert!(!text.contains(&secret), "never a secret: {text}");
+}
+
+#[test]
+fn two_large_uploads_that_do_not_fit_both_finish() {
+    let server = Server::start();
+    let alice = server.client(&server.token("alice-laptop", "alice", &[]));
+    let bob = server.client(&server.token("bob-laptop", "bob", &[]));
+    // 60 MiB of comments and one write: each needs 120 MiB, and only 224 MiB are for bodies this large.
+    let comment = format!("# {}\n", "x".repeat(997));
+    let comments = comment.repeat((60 << 20) / comment.len());
+    for (client, actor) in [(&alice, "alice"), (&bob, "bob")] {
+        write(client.dir.path(), "large.batch", &format!("{comments}create 'Imported by {actor}'\n"));
+    }
+    drop(comments);
+
+    let batch = |client: &Client| {
+        // Time for a slow host to refuse one and run the other, not a condition of the test.
+        client.cmd(&["batch", "-f", "large.batch"]).env("BD_REMOTE_RETRY_SECS", "60").output().unwrap()
+    };
+    let (first, second) = std::thread::scope(|scope| {
+        let (first, second) = (scope.spawn(|| batch(&alice)), scope.spawn(|| batch(&bob)));
+        (first.join().unwrap(), second.join().unwrap())
+    });
+    check(first, "alice's batch");
+    check(second, "bob's batch");
+
+    let list = alice.json(&["list"]);
+    for title in ["Imported by alice", "Imported by bob"] {
+        let once = list.as_array().unwrap().iter().filter(|i| i["title"] == title).count();
+        assert_eq!(once, 1, "{title}: {list}");
+    }
+}
+
+#[test]
+fn bodies_of_exactly_the_maximum_succeed() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let body = padded_exec(64 << 20);
+    for framing in [Framing::Sized(body.len() as u64), Framing::Chunked] {
+        assert_eq!(status_of(&post_whole(&addr, &secret, EXEC, framing, &body)), 200);
+    }
+}
+
+#[test]
+fn chunked_bodies_over_the_limit_get_413() {
+    let server = Server::start_with(&["--max-body-mib", "1"]);
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    // No end of the body: it is refused without one, and the connection goes with the answer.
+    let conn = open_upload(&addr, &secret, EXEC, Framing::Chunked);
+    send_part(&conn, Framing::Chunked, &vec![b'x'; (1 << 20) + 1]);
+    assert_eq!(status_of(&conn), 413);
+    server.client(&secret).ok(&["create", "Small requests still run"]);
+}
+
+#[test]
+fn an_mcp_message_of_exactly_1_mib_succeeds() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let mut ping = mcp_modern(1, "ping", json!({ "pad": "" }));
+    let pad = (1 << 20) - ping.to_string().len();
+    ping["params"]["pad"] = json!("x".repeat(pad));
+    assert_eq!(ping.to_string().len(), 1 << 20);
+    let (status, _, answer) = mcp_post(&server, Some(&secret), "", &[], &ping);
+    assert_eq!(status, 200, "{answer}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn tiny_chunks_and_declared_sizes_cost_only_what_arrived() {
+    let server = Server::start();
+    let pid = server.child.id();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    // Tokens first: minting them runs another process, and leaves the server's heap alone.
+    let others: Vec<String> = (0..8).map(|i| server.token(&format!("t{i}"), &format!("actor{i}"), &[])).collect();
+    server.client(&secret).ok(&["list"]);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let idle = heap_kib(pid);
+
+    // 192 KiB of 1-byte chunks: about 8 MiB of heap when memory follows frames,
+    // about 1 MiB when it does not. It takes the peak, not a reading after the
+    // write: 1.15 MiB on the wire fits in loopback's socket buffers, so the
+    // write can return with the server still at the start of it.
+    let ((conn, status), rss_peak, _) = peak_during(pid, || {
+        let mut conn = open_upload(&addr, &secret, EXEC, Framing::Chunked);
+        let _ = conn.write_all(&one_byte_chunks(&padded_exec(192 << 10)));
+        let status = status_of(&conn);
+        (conn, status)
+    });
+    assert_eq!(status, 200);
+    let tiny = rss_peak.saturating_sub(idle);
+    drop(conn);
+
+    // Eight uploads declaring 60 MiB, nothing sent. Both figures: RssAnon counts
+    // touched pages only, so an untouched `Vec::with_capacity(declared)` shows
+    // in VmData alone.
+    let (rss, data) = (heap_kib(pid), proc_kib(pid, "VmData:"));
+    let (uploads, rss_peak, data_peak) = peak_during(pid, || {
+        let open = |secret| open_upload(&addr, secret, EXEC, Framing::Sized(60 << 20));
+        let uploads: Vec<TcpStream> = others.iter().map(|s| open(s.as_str())).collect();
+        std::thread::sleep(Duration::from_secs(1));
+        uploads
+    });
+    let (declared_rss, declared_data) = (rss_peak.saturating_sub(rss), data_peak.saturating_sub(data));
+    drop(uploads);
+
+    eprintln!("KiB above idle: tiny chunks RssAnon {tiny}; declared RssAnon {declared_rss}, VmData {declared_data}");
+    assert!(tiny < 4 << 10, "192 KiB of 1-byte chunks cost {tiny} KiB of heap");
+    assert!(declared_rss < 16 << 10, "8 declared uploads cost {declared_rss} KiB of heap");
+    assert!(declared_data < 128 << 10, "8 declared uploads cost {declared_data} KiB of data");
+}
+
+#[test]
+fn messages_that_run_nothing_take_no_answer_share() {
+    let server = Server::start();
+    let secret = server.token("alice-laptop", "alice", &[]);
+    let addr = server.base.trim_start_matches("http://").to_string();
+    let list = br#"{"argv":["list"]}"#;
+    let chunked = |body: &[u8]| post_whole(&addr, &secret, EXEC, Framing::Chunked, body);
+
+    // Two uploads pledging 128.25 of the caller's 129.25 MiB, so the 128 KiB a
+    // chunked exec starts with and a small MCP message fit, and neither answer's
+    // share does: only a request that reaches its share gets a 503. It takes
+    // more than 127.875 MiB held, which only both uploads are.
+    let holds = [(EXEC, Framing::Sized(HELD_BODY)), (MCP, Framing::Sized(1 << 20))];
+    let held = hold_until("the uploads counted", &addr, &secret, &holds, || status_of(&chunked(list)) == 503);
+
+    let (status, answer) = answer_of(&chunked(b"{not json"));
+    assert_eq!(status, 400, "{answer}");
+    assert_eq!(error_of(&answer)["code"], "invalid", "{answer}");
+    let body = b"{not json";
+    let conn = post_whole(&addr, &secret, MCP, Framing::Sized(body.len() as u64), body);
+    assert_eq!(status_of(&conn), 400);
+    let ping = mcp_modern(1, "ping", json!({}));
+    let (status, _, answer) = mcp_post(&server, Some(&secret), "", &[], &ping);
+    assert_eq!(status, 200, "{answer}");
+    let tools = mcp_modern(2, "tools/list", json!({}));
+    let (status, _, answer) = mcp_post(&server, Some(&secret), "", &[], &tools);
+    assert_eq!(status, 200, "{answer}");
+    let note = json!({ "jsonrpc": "2.0", "method": "notifications/cancelled", "params": { "requestId": 1 } });
+    let (status, _, answer) = mcp_post(&server, Some(&secret), "", &[], &note);
+    assert_eq!(status, 202, "{answer}");
+
+    // A tool call does reach its share.
+    let call = mcp_tool_call("ready", json!({}));
+    let (status, _, answer) = mcp_post(&server, Some(&secret), "", &[], &call);
+    assert_eq!(status, 503, "{answer}");
+    assert_eq!(answer["error"]["code"], "busy", "{answer}");
+
+    // Everything held came back through the handlers.
+    drop(held);
+    eventually("the uploads given back", || status_of(&chunked(list)) == 200);
 }
 
 /// What a [`Proxy`] does to an answer.

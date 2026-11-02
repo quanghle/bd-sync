@@ -1,11 +1,12 @@
 //! `bd serve`'s counters since it started, served at `GET /metrics` in the
 //! Prometheus text format to admin tokens: answers by status class and the
-//! busy ones, requests refused for their access token, connections refused
-//! over the limits, panics, commands, MCP tool calls, publishes and browser
-//! approvals of gates and of refused closes and discards. Counts only: no
-//! actor, token, workspace or address is a label, so nothing here names
-//! anyone. And [`Throttle`], which keeps a warning repeated under load from
-//! flooding the log.
+//! busy ones, requests refused for their access token, for a body arriving
+//! too slowly or a caller over its memory cap, connections refused over the
+//! limits, panics, commands, MCP tool calls, publishes and browser approvals
+//! of gates and of refused closes and discards. Counts only: no actor, token,
+//! workspace or address is a label, so nothing here names anyone. And
+//! [`Throttle`], which keeps a warning repeated under load from flooding the
+//! log.
 
 use std::fmt::Write as _;
 use std::sync::OnceLock;
@@ -36,6 +37,10 @@ pub static REFUSED_UNKNOWN_TOKEN: Counter = Counter::new();
 pub static REFUSED_EXPIRED_TOKEN: Counter = Counter::new();
 /// Known tokens asking what they may not: another workspace, endpoint or actor, a write with a read token.
 pub static REFUSED_FORBIDDEN: Counter = Counter::new();
+/// Requests cut for a body arriving below the minimum rate.
+pub static REFUSED_SLOW_BODY: Counter = Counter::new();
+/// Requests refused for what their caller already holds of the memory budget.
+pub static REFUSED_CALLER_BUDGET: Counter = Counter::new();
 pub static CONNECTIONS: Counter = Counter::new();
 pub static CONNECTIONS_REFUSED_PEER: Counter = Counter::new();
 pub static CONNECTIONS_REFUSED_TOTAL: Counter = Counter::new();
@@ -118,11 +123,13 @@ pub fn render() -> String {
     counter("busy_total", "Answers 503: busy or shutting down; clients retry them.", &[("", BUSY.get())]);
     counter(
         "refused_total",
-        "Requests refused for their access token.",
+        "Requests refused for their access token, a body arriving too slowly or a caller over its memory cap.",
         &[
             ("{reason=\"unknown_token\"}", REFUSED_UNKNOWN_TOKEN.get()),
             ("{reason=\"expired_token\"}", REFUSED_EXPIRED_TOKEN.get()),
             ("{reason=\"forbidden\"}", REFUSED_FORBIDDEN.get()),
+            ("{reason=\"slow_body\"}", REFUSED_SLOW_BODY.get()),
+            ("{reason=\"caller_budget\"}", REFUSED_CALLER_BUDGET.get()),
         ],
     );
     counter("connections_total", "Connections accepted.", &[("", CONNECTIONS.get())]);
@@ -237,6 +244,22 @@ mod tests {
         assert!(text.contains("bd_serve_refused_total{reason=\"unknown_token\"} "), "{text}");
         assert!(text.lines().all(|l| l.starts_with('#') || l.split(' ').count() == 2), "{text}");
         assert!(BUSY.get() >= 1);
+    }
+
+    #[test]
+    fn refusals_render_a_slow_body_and_a_caller_over_its_budget() {
+        REFUSED_SLOW_BODY.add();
+        REFUSED_CALLER_BUDGET.add();
+        let text = render();
+        assert!(text.contains("# TYPE bd_serve_refused_total counter"), "{text}");
+        assert_eq!(text.lines().filter(|l| l.starts_with("bd_serve_refused_total")).count(), 5, "{text}");
+        for reason in ["slow_body", "caller_budget"] {
+            let series = format!("bd_serve_refused_total{{reason=\"{reason}\"}} ");
+            let lines: Vec<&str> = text.lines().filter(|l| l.starts_with(&series)).collect();
+            assert_eq!(lines.len(), 1, "{reason}: {text}");
+            let n: u64 = lines[0].rsplit(' ').next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            assert!(n >= 1, "{reason}: {text}");
+        }
     }
 
     #[test]

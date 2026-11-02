@@ -953,6 +953,145 @@ describe('plan-implement-review', () => {
 			expect(ctx.logs).toContain(`${UNMATCHED}bd-nx85b`)
 		})
 	})
+
+	// The guard reads one triage answer as a whole before anything applies, so a refused amendment escalates the run with
+	// the ledger as it was. Its reason text does not reach the result (bd-vojld): a refusal shows as the status, the
+	// `planner escalated <F>` reason and the ledger. A refusal of the wrong finding shows in that reason's list of ids.
+	describe('amendment guards', () => {
+		const SEEDED = { ...PLAN, decisions: [{ decision: 'one', rationale: 'x' }, { decision: 'two', rationale: 'y' }] }
+		const SEEDED3 = { ...SEEDED, decisions: [...SEEDED.decisions, { decision: 'three', rationale: 'z' }] }
+		const FOUND2 = { ...FOUND, line: 9, claim: 'Handles too much' }
+		const OK = { valid: true, blocking: true, reasoning: 'real', fixInstruction: 'fix it' }
+		const amend = (id, supersedes) => ({ id, action: 'amend', reason: 'r', instruction: 'i', newDecision: 'n', supersedes })
+		const triaged = (...items) => ({ 'planner:triage:r0': { items, converging: true } })
+		const run = async (over, extra) => {
+			const wf = await load('plan-implement-review', undefined)
+			const ctx = fakeCtx(
+				{ ...ARGS, plan: SEEDED, ...extra },
+				script({
+					'review:code:r0': { findings: [FOUND, FOUND2] },
+					'validate:r0:F1': OK,
+					'validate:r0:F2': OK,
+					'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }, { id: 'F2', change: 'c' }] },
+					...over,
+				}),
+			)
+			return { ctx, got: await wf.run(ctx) }
+		}
+		const entry = (got, id) => got.ledger.find((e) => e.id === id)
+		const fixCalled = (ctx) => ctx.calls.some((c) => c.label === 'coder:fix:r1')
+		const untouched = (got) => {
+			expect(got.amended).toEqual([])
+			expect(got.ledger.filter((e) => e.source === 'amend')).toEqual([])
+			expect(got.ledger.filter((e) => e.supersededBy)).toEqual([])
+		}
+
+		it('refuses an unknown id among known ones', async () => {
+			const fix = { id: 'F2', action: 'fix', reason: 'r', instruction: 'i' }
+			for (const sup of [['D1', 'D99'], ['D99']]) {
+				const { ctx, got } = await run(triaged(amend('F1', sup), fix))
+				expect(got.status).toBe('escalated')
+				expect(got.reason).toBe('planner escalated F1')
+				untouched(got)
+				expect(fixCalled(ctx)).toBe(false)
+			}
+		})
+
+		it('applies nothing beside a refused amendment', async () => {
+			const amended = await run(triaged(amend('F1', ['D1']), amend('F2', ['D99'])))
+			expect(amended.got.status).toBe('escalated')
+			expect(amended.got.reason).toBe('planner escalated F2')
+			untouched(amended.got)
+
+			const dropped = await run(triaged({ id: 'F1', action: 'drop', reason: 'r' }, amend('F2', ['D99'])))
+			expect(dropped.got.status).toBe('escalated')
+			expect(dropped.got.dropped).toEqual([])
+		})
+
+		it('refuses the amendment that crosses the budget', async () => {
+			const { got } = await run(triaged(amend('F1', ['D1']), amend('F2', ['D2'])), { maxAmendments: 1 })
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toBe('planner escalated F2')
+			untouched(got)
+		})
+
+		it('applies an answer landing exactly on the budget', async () => {
+			const { ctx, got } = await run(triaged(amend('F1', ['D1']), amend('F2', ['D2'])))
+			expect(got.status).toBe('done')
+			expect(got.amended).toHaveLength(2)
+			expect(entry(got, 'D1').supersededBy).toBe('D3')
+			expect(entry(got, 'D2').supersededBy).toBe('D4')
+			expect(fixCalled(ctx)).toBe(true)
+		})
+
+		it('counts an amendment of two entries as one', async () => {
+			const { got } = await run(triaged(amend('F1', ['D1', 'D2']), amend('F2', ['D3'])), { plan: SEEDED3 })
+			expect(got.status).toBe('done')
+			expect(got.amended).toHaveLength(2)
+			expect(entry(got, 'D2').supersededBy).toBe('D4')
+			expect(entry(got, 'D3').supersededBy).toBe('D5')
+		})
+
+		it('refuses a second amendment of one entry', async () => {
+			const { got } = await run(triaged(amend('F1', ['D1']), amend('F2', ['D1'])))
+			expect(got.status).toBe('escalated')
+			expect(got.reason).toBe('planner escalated F2')
+			untouched(got)
+		})
+
+		it('a refused amendment neither marks entries nor takes budget', async () => {
+			// A marked entry would refuse F2 too, giving `planner escalated F1, F2`.
+			const marks = await run(triaged(amend('F1', ['D1', 'D99']), amend('F2', ['D1'])))
+			expect(marks.got.reason).toBe('planner escalated F1')
+			untouched(marks.got)
+
+			const budget = await run(triaged(amend('F1', ['D99']), amend('F2', ['D1'])), { maxAmendments: 1 })
+			expect(budget.got.reason).toBe('planner escalated F1')
+			untouched(budget.got)
+		})
+
+		it('applies a valid amendment as before', async () => {
+			const { got } = await run({
+				'review:code:r0': { findings: [FOUND] },
+				...triaged(amend('F1', ['D1'])),
+				'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }] },
+			})
+			expect(got.status).toBe('done')
+			expect(got.amended).toEqual([{ finding: 'F1', supersedes: ['D1'], by: 'D3' }])
+			expect(entry(got, 'D1').supersededBy).toBe('D3')
+		})
+
+		// r0 amends D1 (the amendment is D3, its fix D4), so r1 can name an entry superseded or an amendment from a round before.
+		const laterRound = (sup, extra) =>
+			run(
+				{
+					'review:code:r0': { findings: [FOUND] },
+					...triaged(amend('F1', ['D1'])),
+					'coder:fix:r1': { summary: 's', filesChanged: ['src/a.rs'], changes: [{ id: 'F1', change: 'c' }] },
+					'review:code:r1': { findings: [FOUND2] },
+					'validate:r1:F2': OK,
+					'planner:triage:r1': { items: [amend('F2', sup)], converging: true },
+				},
+				extra,
+			)
+
+		for (const [name, sup, extra] of [
+			['an entry superseded in an earlier round', ['D1']],
+			['an earlier amendment', ['D3']],
+			['a budget spent in an earlier round', ['D2'], { maxAmendments: 1 }],
+			['an empty supersedes', []],
+		]) {
+			it(`refuses ${name}`, async () => {
+				const { got } = await laterRound(sup, extra)
+				expect(got.status).toBe('escalated')
+				expect(got.reason).toBe('planner escalated F2')
+				expect(got.amended).toEqual([{ finding: 'F1', supersedes: ['D1'], by: 'D3' }])
+				expect(got.ledger.filter((e) => e.source === 'amend')).toHaveLength(1)
+				expect(entry(got, 'D2').supersededBy).toBeUndefined()
+				expect(entry(got, 'D3').supersededBy).toBeUndefined()
+			})
+		}
+	})
 })
 
 describe('score-issue', () => {

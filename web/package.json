@@ -19,7 +19,7 @@
 		"typecheck": "svelte-kit sync && node node_modules/@typescript/native/bin/tsc --noEmit"
 	},
 	"devDependencies": {
-		"@sveltejs/adapter-static": "^4.0.0",
+		"@sveltejs/adapter-static": "^4.0.1",
 		"@sveltejs/kit": "^3.1.0",
 		"@sveltejs/vite-plugin-svelte": "^7.2.0",
 		"@types/node": "^26.6.5",
